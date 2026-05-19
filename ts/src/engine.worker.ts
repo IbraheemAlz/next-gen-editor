@@ -23,6 +23,28 @@ const A4_TEXT =
 
 let engine: Engine | null = null;
 
+/**
+ * Serial command queue.
+ *
+ * `engine.dispatch` is a `&mut self` async method. wasm-bindgen forbids
+ * aliasing a `&mut` borrow — if two `dispatch` futures overlap (which a
+ * plain `async onmessage` allows, since it yields at every `await`),
+ * wasm-bindgen panics with "recursive use of an object" and the command
+ * is lost. Fast typing reproduced this as dropped characters.
+ *
+ * Every INIT and COMMAND is chained onto `queue` so exactly one engine
+ * call is ever in flight.
+ */
+let queue: Promise<unknown> = Promise.resolve();
+function enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = queue.then(task, task);
+    queue = run.then(
+        () => undefined,
+        () => undefined,
+    );
+    return run;
+}
+
 async function fetchBytes(url: string): Promise<Uint8Array> {
     const r = await fetch(url);
     if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
@@ -34,181 +56,187 @@ async function dispatch(cmd: Command): Promise<Event> {
     return (await engine.dispatch(cmd)) as Event;
 }
 
-self.onmessage = async (ev: MessageEvent<Msg>) => {
-    const msg = ev.data;
+async function handleInit(msg: InitMsg): Promise<void> {
+    await init({
+        module_or_path: new URL(
+            '../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
+            import.meta.url,
+        ),
+    });
+    engine = new Engine(msg.canvas);
+    self.postMessage({ type: 'BOOT_OK' });
+
+    const pong = await dispatch({ type: 'PING' } as Command);
+    self.postMessage({ type: 'PING_RESULT', event: pong });
+
+    /* Default (no ?test= param) is the interactive A4 editor. */
+    const testCase = msg.testCase || 'interactive';
+
+    /* Pre-test font loading. */
+    if (
+        testCase === 'a4-justified-mixed' ||
+        testCase === 'hello-arabic' ||
+        testCase === 'editing-arabic' ||
+        testCase === 'docx-round-trip' ||
+        testCase === 'interactive'
+    ) {
+        const e = await dispatch({
+            type: 'LOAD_FONT',
+            id: ARABIC_ID,
+            bytes: await fetchBytes(ARABIC_URL),
+        } as Command);
+        self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
+    } else {
+        const e = await dispatch({
+            type: 'LOAD_FONT',
+            id: LATIN_ID,
+            bytes: await fetchBytes(LATIN_URL),
+        } as Command);
+        self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
+    }
+
+    let paintEvt: Event;
+    switch (testCase) {
+        case 'hello-latin':
+            paintEvt = await dispatch({
+                type: 'SHAPE_AND_RASTERIZE',
+                text: 'hello',
+                font_id: LATIN_ID,
+                direction: 'LTR',
+                px_size: 96,
+            } as Command);
+            break;
+
+        case 'hello-arabic':
+            paintEvt = await dispatch({
+                type: 'SHAPE_AND_RASTERIZE',
+                text: 'السلام',
+                font_id: ARABIC_ID,
+                direction: 'RTL',
+                px_size: 96,
+            } as Command);
+            break;
+
+        case 'a4-justified-mixed':
+            paintEvt = await dispatch({
+                type: 'RENDER_PAGE',
+                text: A4_TEXT,
+                font_id: ARABIC_ID,
+                base_direction: 'RTL',
+                px_size: 18,
+                line_height: 26,
+                align: 'JUSTIFY',
+            } as Command);
+            break;
+
+        case 'editing-arabic': {
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'السلام',
+                font_id: ARABIC_ID,
+                base_direction: 'RTL',
+                px_size: 28,
+                line_height: 42,
+                align: 'START',
+            } as Command);
+            const e1 = await dispatch({
+                type: 'INSERT_TEXT',
+                at: undefined,
+                text: ' عليكم',
+            } as Command);
+            self.postMessage({ type: 'EDIT_RESULT', step: 'insert-1', event: e1 });
+            const e2 = await dispatch({
+                type: 'INSERT_TEXT',
+                at: undefined,
+                text: ' ورحمة الله',
+            } as Command);
+            self.postMessage({ type: 'EDIT_RESULT', step: 'insert-2', event: e2 });
+            const u1 = await dispatch({ type: 'UNDO' } as Command);
+            self.postMessage({ type: 'EDIT_RESULT', step: 'undo', event: u1 });
+            const r1 = await dispatch({ type: 'REDO' } as Command);
+            self.postMessage({ type: 'EDIT_RESULT', step: 'redo', event: r1 });
+            paintEvt = r1;
+            break;
+        }
+
+        case 'docx-round-trip': {
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'افتح، عدِّل، احفظ.',
+                font_id: ARABIC_ID,
+                base_direction: 'RTL',
+                px_size: 28,
+                line_height: 42,
+                align: 'START',
+            } as Command);
+            const saved = await dispatch({ type: 'SAVE_DOCX' } as Command);
+            self.postMessage({ type: 'DOCX_RESULT', step: 'save', event: saved });
+            if (saved.type === 'DOCUMENT_SAVED') {
+                const reloaded = await dispatch({
+                    type: 'LOAD_DOCX',
+                    bytes: saved.bytes,
+                } as Command);
+                self.postMessage({ type: 'DOCX_RESULT', step: 'load', event: reloaded });
+            }
+            paintEvt = await dispatch({
+                type: 'INSERT_TEXT',
+                at: undefined,
+                text: ' تم التعديل',
+            } as Command);
+            break;
+        }
+
+        case 'interactive':
+            /* Blank A4 page seeded with one empty paragraph. RenderPage
+               caches the layout config so subsequent InsertText / Undo /
+               Redo commands from the textarea auto-repaint. */
+            paintEvt = await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: ARABIC_ID,
+                base_direction: 'RTL',
+                px_size: 24,
+                line_height: 36,
+                align: 'START',
+            } as Command);
+            break;
+
+        case 'glyph-a':
+        default:
+            paintEvt = await dispatch({
+                type: 'RASTERIZE_GLYPH',
+                font_id: LATIN_ID,
+                ch: 'A',
+                px_size: 128,
+            } as Command);
+            break;
+    }
+    self.postMessage({ type: 'PAINT_RESULT', event: paintEvt });
+    self.postMessage({ type: 'IDLE' });
+}
+
+async function handleCommand(msg: CommandMsg): Promise<void> {
     try {
-        if (msg.type === 'COMMAND') {
-            const result = await dispatch(msg.cmd);
-            self.postMessage({ type: 'COMMAND_RESULT', id: msg.id, event: result });
-            return;
-        }
-        if (msg.type !== 'INIT') return;
-
-        await init({
-            module_or_path: new URL(
-                '../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
-                import.meta.url,
-            ),
-        });
-        engine = new Engine(msg.canvas);
-        self.postMessage({ type: 'BOOT_OK' });
-
-        const pong = await dispatch({ type: 'PING' } as Command);
-        self.postMessage({ type: 'PING_RESULT', event: pong });
-
-        /* Default (no ?test= param) is the interactive A4 editor. */
-        const testCase = msg.testCase || 'interactive';
-
-        /* Pre-test font loading. */
-        if (testCase === 'a4-justified-mixed' || testCase === 'hello-arabic' ||
-            testCase === 'editing-arabic' || testCase === 'docx-round-trip' ||
-            testCase === 'interactive') {
-            const e = await dispatch({
-                type: 'LOAD_FONT',
-                id: ARABIC_ID,
-                bytes: await fetchBytes(ARABIC_URL),
-            } as Command);
-            self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
-        } else {
-            const e = await dispatch({
-                type: 'LOAD_FONT',
-                id: LATIN_ID,
-                bytes: await fetchBytes(LATIN_URL),
-            } as Command);
-            self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
-        }
-
-        let paintEvt: Event;
-        switch (testCase) {
-            case 'hello-latin':
-                paintEvt = await dispatch({
-                    type: 'SHAPE_AND_RASTERIZE',
-                    text: 'hello',
-                    font_id: LATIN_ID,
-                    direction: 'LTR',
-                    px_size: 96,
-                } as Command);
-                break;
-
-            case 'hello-arabic':
-                paintEvt = await dispatch({
-                    type: 'SHAPE_AND_RASTERIZE',
-                    text: 'السلام',
-                    font_id: ARABIC_ID,
-                    direction: 'RTL',
-                    px_size: 96,
-                } as Command);
-                break;
-
-            case 'a4-justified-mixed':
-                paintEvt = await dispatch({
-                    type: 'RENDER_PAGE',
-                    text: A4_TEXT,
-                    font_id: ARABIC_ID,
-                    base_direction: 'RTL',
-                    px_size: 18,
-                    line_height: 26,
-                    align: 'JUSTIFY',
-                } as Command);
-                break;
-
-            case 'editing-arabic': {
-                /* Phase 1 W15-18 demo:
-                   1. RenderPage seeds the document + caches layout config.
-                   2. Two InsertText calls each auto-repaint.
-                   3. Final canvas = "السلام عليكم ورحمة الله".
-                   undo/redo roundtrip verified via console events. */
-                await dispatch({
-                    type: 'RENDER_PAGE',
-                    text: 'السلام',
-                    font_id: ARABIC_ID,
-                    base_direction: 'RTL',
-                    px_size: 28,
-                    line_height: 42,
-                    align: 'START',
-                } as Command);
-                const e1 = await dispatch({
-                    type: 'INSERT_TEXT',
-                    at: undefined,
-                    text: ' عليكم',
-                } as Command);
-                self.postMessage({ type: 'EDIT_RESULT', step: 'insert-1', event: e1 });
-                const e2 = await dispatch({
-                    type: 'INSERT_TEXT',
-                    at: undefined,
-                    text: ' ورحمة الله',
-                } as Command);
-                self.postMessage({ type: 'EDIT_RESULT', step: 'insert-2', event: e2 });
-                /* Demonstrate undo + redo (final state = post-redo, same as e2). */
-                const u1 = await dispatch({ type: 'UNDO' } as Command);
-                self.postMessage({ type: 'EDIT_RESULT', step: 'undo', event: u1 });
-                const r1 = await dispatch({ type: 'REDO' } as Command);
-                self.postMessage({ type: 'EDIT_RESULT', step: 'redo', event: r1 });
-                paintEvt = r1;
-                break;
-            }
-
-            case 'docx-round-trip': {
-                /* Phase 1 W19-24 demo:
-                   1. SaveDocx on the current (empty) doc — produces minimal .docx.
-                   2. LoadDocx round-trips it.
-                   3. Insert + save again. */
-                await dispatch({
-                    type: 'RENDER_PAGE',
-                    text: 'افتح، عدِّل، احفظ.',
-                    font_id: ARABIC_ID,
-                    base_direction: 'RTL',
-                    px_size: 28,
-                    line_height: 42,
-                    align: 'START',
-                } as Command);
-                const saved = await dispatch({ type: 'SAVE_DOCX' } as Command);
-                self.postMessage({ type: 'DOCX_RESULT', step: 'save', event: saved });
-                if (saved.type === 'DOCUMENT_SAVED') {
-                    const reloaded = await dispatch({
-                        type: 'LOAD_DOCX',
-                        bytes: saved.bytes,
-                    } as Command);
-                    self.postMessage({ type: 'DOCX_RESULT', step: 'load', event: reloaded });
-                }
-                const inserted = await dispatch({
-                    type: 'INSERT_TEXT',
-                    at: undefined,
-                    text: ' تم التعديل',
-                } as Command);
-                paintEvt = inserted;
-                break;
-            }
-
-            case 'interactive':
-                /* Blank A4 page seeded with one empty paragraph. RenderPage
-                   caches the layout config so subsequent InsertText / Undo /
-                   Redo commands from the textarea auto-repaint. */
-                paintEvt = await dispatch({
-                    type: 'RENDER_PAGE',
-                    text: '',
-                    font_id: ARABIC_ID,
-                    base_direction: 'RTL',
-                    px_size: 24,
-                    line_height: 36,
-                    align: 'START',
-                } as Command);
-                break;
-
-            case 'glyph-a':
-            default:
-                paintEvt = await dispatch({
-                    type: 'RASTERIZE_GLYPH',
-                    font_id: LATIN_ID,
-                    ch: 'A',
-                    px_size: 128,
-                } as Command);
-                break;
-        }
-        self.postMessage({ type: 'PAINT_RESULT', event: paintEvt });
-        self.postMessage({ type: 'IDLE' });
+        const result = await dispatch(msg.cmd);
+        self.postMessage({ type: 'COMMAND_RESULT', id: msg.id, event: result });
     } catch (e: unknown) {
         const error = e instanceof Error ? e.message : String(e);
-        self.postMessage({ type: 'ERROR', error });
+        self.postMessage({
+            type: 'COMMAND_RESULT',
+            id: msg.id,
+            event: { type: 'ERROR', message: error } as Event,
+        });
+    }
+}
+
+self.onmessage = (ev: MessageEvent<Msg>): void => {
+    const msg = ev.data;
+    if (msg.type === 'INIT') {
+        enqueue(() => handleInit(msg)).catch((e: unknown) => {
+            const error = e instanceof Error ? e.message : String(e);
+            self.postMessage({ type: 'ERROR', error });
+        });
+    } else if (msg.type === 'COMMAND') {
+        void enqueue(() => handleCommand(msg));
     }
 };
