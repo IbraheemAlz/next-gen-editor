@@ -35,9 +35,20 @@ const diffPath = join(TMP_DIR, `${NAME}.diff.png`);
 
 console.log(`[visual-diff] case=${NAME} tol=${(TOL * 100).toFixed(2)}% url=${URL}`);
 
+/* Per-case viewport. A4 case is 595x842 pt so the engine's A4Page::a4()
+   matches the drawing surface 1:1. Override via VIEWPORT=WxH if needed. */
+const VIEWPORTS = {
+    'a4-justified-mixed': { width: 595, height: 842 },
+};
+const viewport = process.env.VIEWPORT
+    ? Object.fromEntries(
+        ['width', 'height'].map((k, i) => [k, parseInt(process.env.VIEWPORT.split('x')[i], 10)]),
+    )
+    : (VIEWPORTS[NAME] ?? { width: 400, height: 400 });
+
 const browser = await chromium.launch({ headless: true, channel: 'chrome' });
 try {
-    const ctx = await browser.newContext({ viewport: { width: 400, height: 400 } });
+    const ctx = await browser.newContext({ viewport });
     const page = await ctx.newPage();
 
     const errors = [];
@@ -62,7 +73,10 @@ try {
         process.exit(1);
     }
 
-    await page.screenshot({ path: actualPath, clip: { x: 0, y: 0, width: 400, height: 400 } });
+    await page.screenshot({
+        path: actualPath,
+        clip: { x: 0, y: 0, width: viewport.width, height: viewport.height },
+    });
 } finally {
     await browser.close();
 }

@@ -36,7 +36,7 @@ tsify-next = { version = "0.5", default-features = false, features = ["js"] }
 
 # Text / Unicode
 icu = "1.5"
-icu_bidi = "1.5"
+unicode-bidi = "0.3"
 icu_segmenter = "1.5"
 icu_normalizer = "1.5"
 icu_locale = "1.5"

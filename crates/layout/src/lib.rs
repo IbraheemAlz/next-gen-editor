@@ -1,4 +1,12 @@
-//! `layout` — paragraph / table / page box layout.
+//! `layout` — paragraph + page box layout on top of `text-pipeline`.
 //!
-//! Scaffolding only at week 2 of Phase 1. Implementation lands week 14+
-//! per PHASE_3_RENDER_RTL.md §5.
+//! Phase 1 week 14: A4 page + single-paragraph greedy line breaking +
+//! Latin/Kashida justification.
+
+pub mod line_box;
+pub mod page;
+pub mod paragraph;
+
+pub use line_box::{LineBox, PaintedGlyph};
+pub use page::{A4Page, Margins};
+pub use paragraph::{ParagraphConfig, layout_paragraph};

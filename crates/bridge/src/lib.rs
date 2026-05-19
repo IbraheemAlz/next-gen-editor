@@ -36,6 +36,19 @@ pub enum Command {
         direction: String,
         px_size: f32,
     },
+
+    /// Layout + paint a paragraph onto a synthesized A4 page. Runs the full
+    /// BiDi → shape → line-break → justify pipeline (`text-pipeline` + `layout`).
+    /// `base_direction` and `align` are case-insensitive strings (`"LTR"|"RTL"`,
+    /// `"START"|"END"|"CENTER"|"JUSTIFY"`).
+    RenderPage {
+        text: String,
+        font_id: String,
+        base_direction: String,
+        px_size: f32,
+        line_height: f32,
+        align: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
@@ -66,6 +79,12 @@ pub enum Event {
         total_advance: f32,
         ascent: f32,
         glyph_ids: Vec<u32>,
+    },
+    PageRendered {
+        page_width: f32,
+        page_height: f32,
+        line_count: u32,
+        glyph_count: u32,
     },
     Error {
         message: String,

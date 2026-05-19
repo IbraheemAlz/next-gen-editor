@@ -4,9 +4,10 @@
 //! `rustybuzz` shaping for both LTR and RTL.
 
 use bridge::{Command, Event, FontMetrics as BridgeMetrics};
+use layout::{A4Page, ParagraphConfig, layout_paragraph};
 use std::collections::HashMap;
 use std::sync::Arc;
-use text_pipeline::{LoadedFont, ShapingDirection, shape_text};
+use text_pipeline::{Alignment, LoadedFont, ShapingDirection, shape_text};
 use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
@@ -200,6 +201,111 @@ impl Engine {
                     total_advance: shaped.total_advance,
                     ascent: scaled.ascent,
                     glyph_ids,
+                }
+            }
+
+            Command::RenderPage {
+                text,
+                font_id,
+                base_direction,
+                px_size,
+                line_height,
+                align,
+            } => {
+                let dir = match base_direction.to_ascii_uppercase().as_str() {
+                    "RTL" => ShapingDirection::Rtl,
+                    _ => ShapingDirection::Ltr,
+                };
+                let alignment = match align.to_ascii_uppercase().as_str() {
+                    "JUSTIFY" => Alignment::Justify,
+                    "END" => Alignment::End,
+                    "CENTER" => Alignment::Center,
+                    _ => Alignment::Start,
+                };
+                let font = match self.fonts.get(&font_id) {
+                    Some(f) => f.clone(),
+                    None => {
+                        return Event::Error {
+                            message: format!("font `{font_id}` not loaded"),
+                        };
+                    }
+                };
+
+                let page = A4Page::a4();
+                let cfg = ParagraphConfig {
+                    text: &text,
+                    font: &font,
+                    base_direction: dir,
+                    px_size,
+                    max_width: page.content_width(),
+                    line_height,
+                    alignment,
+                };
+                let lines = layout_paragraph(cfg);
+
+                let glyph_count: u32 = lines.iter().map(|l| l.glyphs.len() as u32).sum();
+
+                if let Some(ctx) = &self.ctx {
+                    /* Page background (white) + light gray border. */
+                    ctx.set_fill_style_str("#ffffff");
+                    ctx.fill_rect(0.0, 0.0, page.width as f64, page.height as f64);
+                    ctx.set_stroke_style_str("#cccccc");
+                    ctx.set_line_width(1.0);
+                    ctx.stroke_rect(0.5, 0.5, page.width as f64 - 1.0, page.height as f64 - 1.0);
+
+                    /* Paint each line within the page margins. */
+                    let margin_left = page.margin.left as f64;
+                    let margin_top = page.margin.top as f64;
+                    let content_width = page.content_width() as f64;
+                    for line in &lines {
+                        let direction_is_rtl =
+                            matches!(line.direction, Some(ShapingDirection::Rtl));
+                        let natural_w = line.natural_width as f64;
+                        /* Decide x_origin per line:
+                           - For RTL paragraphs whose line doesn't fill the
+                             content width (last line, or non-justified
+                             alignment), hang from the right margin.
+                           - Center for explicit Center alignment.
+                           - Otherwise (LTR, or any line that fills the box),
+                             start at the left margin. */
+                        let x_origin = if matches!(alignment, Alignment::Center) {
+                            margin_left + (content_width - natural_w) / 2.0
+                        } else if direction_is_rtl && natural_w < content_width - 0.5 {
+                            margin_left + (content_width - natural_w)
+                        } else {
+                            margin_left
+                        };
+                        let baseline_y = margin_top + line.baseline_y as f64;
+                        for g in &line.glyphs {
+                            if g.glyph_id == 0 {
+                                continue;
+                            }
+                            let raster = match font.rasterize_glyph(g.glyph_id as u16, px_size) {
+                                Ok(r) => r,
+                                Err(_) => continue,
+                            };
+                            let dx = x_origin + g.x as f64 + g.x_offset as f64;
+                            let dy = baseline_y - g.y_offset as f64;
+                            if let Err(e) = render::canvas2d_backend::paint_alpha_glyph(
+                                ctx,
+                                &raster,
+                                dx,
+                                dy,
+                                [0, 0, 0],
+                            ) {
+                                return Event::Error {
+                                    message: format!("paint: {e:?}"),
+                                };
+                            }
+                        }
+                    }
+                }
+
+                Event::PageRendered {
+                    page_width: page.width,
+                    page_height: page.height,
+                    line_count: lines.len() as u32,
+                    glyph_count,
                 }
             }
         }

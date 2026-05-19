@@ -17,18 +17,26 @@ declare global {
     }
 }
 
+/* Per-case canvas dimensions. The a4 case uses the full A4 point grid
+   (595 × 842 pt = pixels at 1pt/px) so the engine's `A4Page::a4()` matches
+   the drawing surface 1:1. */
+function canvasSizeForCase(testCase: string): { w: number; h: number } {
+    if (testCase === 'a4-justified-mixed') return { w: 595, h: 842 };
+    return { w: 400, h: 400 };
+}
+
 async function main(): Promise<void> {
     const status = document.getElementById('status')!;
     const canvas = document.querySelector<HTMLCanvasElement>('#doc')!;
 
-    /* Fixed canvas resolution for deterministic visual-diff. */
-    canvas.width = 400;
-    canvas.height = 400;
-    canvas.style.width = '400px';
-    canvas.style.height = '400px';
-
     const params = new URLSearchParams(window.location.search);
     const testCase = params.get('test') ?? '';
+
+    const { w, h } = canvasSizeForCase(testCase);
+    canvas.width = w;
+    canvas.height = h;
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
 
     /* Test mode: hide chrome so the canvas is the only thing in the screenshot. */
     if (testCase) {
