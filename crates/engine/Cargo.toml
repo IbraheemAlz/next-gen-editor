@@ -4,4 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Pure-Rust document engine facade. No wasm dep."
+description = "Pure-Rust document model + undo/redo facade."
+
+[dependencies]
+im = { workspace = true }

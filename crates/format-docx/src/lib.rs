@@ -1,4 +1,11 @@
-//! `format-docx` — .docx reader/writer + PDF/A-1b export.
+//! `format-docx` — minimal `.docx` reader + writer.
 //!
-//! Scaffolding only at week 2 of Phase 1. Reader lands week 19;
-//! writer week 21 per PHASE_1_POC.md §10.
+//! Phase 1 weeks 19–24 scope: parse `word/document.xml` paragraphs + runs,
+//! ignore complex formatting. Preserve all other archive entries verbatim on
+//! round-trip so the saved file diffs only inside the edited region.
+
+pub mod reader;
+pub mod writer;
+
+pub use reader::{DocxArchive, DocxError, read_docx};
+pub use writer::write_docx;

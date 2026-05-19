@@ -8,6 +8,7 @@ members = [
     "crates/render",
     "crates/format-docx",
     "tools/shape-regression",
+    "tools/roundtrip",
 ]
 resolver = "2"
 
@@ -53,6 +54,7 @@ lru = "0.12"
 # Codecs
 quick-xml = "0.36"
 rc-zip = "5"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Errors / logging
 thiserror = "1"

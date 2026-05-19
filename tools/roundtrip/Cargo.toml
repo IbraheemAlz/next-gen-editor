@@ -1,0 +1,17 @@
+[package]
+name = "roundtrip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Native CLI: open .docx, edit, save, diff structural bytes."
+
+[[bin]]
+name = "roundtrip"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../../crates/engine" }
+format-docx = { path = "../../crates/format-docx" }
+zip = { workspace = true }
+anyhow = { workspace = true }

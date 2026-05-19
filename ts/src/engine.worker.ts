@@ -6,16 +6,14 @@ import type { Command, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js
 declare const self: DedicatedWorkerGlobalScope;
 
 type InitMsg = { type: 'INIT'; canvas: OffscreenCanvas; testCase: string };
+type CommandMsg = { type: 'COMMAND'; id: number; cmd: Command };
+type Msg = InitMsg | CommandMsg;
 
 const LATIN_URL = '/fonts/LiberationSans-Regular.ttf';
 const LATIN_ID = 'liberation-sans';
 const ARABIC_URL = '/fonts/NotoNaskhArabic-Regular.ttf';
 const ARABIC_ID = 'noto-naskh-arabic';
 
-/* Multi-line mixed paragraph for the A4 case. Picked to exercise:
-   - Latin run inside RTL surroundings (BiDi resolution)
-   - Multiple line breaks via icu_segmenter
-   - Both Latin space-justify and Arabic Kashida elongation on the same paragraph */
 const A4_TEXT =
     'هذا نص تجريبي مكتوب باللغة العربية لاختبار خوارزمية تخطيط الصفحة. ' +
     'This paragraph mixes Arabic and English text to validate BiDi run resolution, ' +
@@ -36,9 +34,14 @@ async function dispatch(cmd: Command): Promise<Event> {
     return (await engine.dispatch(cmd)) as Event;
 }
 
-self.onmessage = async (ev: MessageEvent<InitMsg>) => {
+self.onmessage = async (ev: MessageEvent<Msg>) => {
     const msg = ev.data;
     try {
+        if (msg.type === 'COMMAND') {
+            const result = await dispatch(msg.cmd);
+            self.postMessage({ type: 'COMMAND_RESULT', id: msg.id, event: result });
+            return;
+        }
         if (msg.type !== 'INIT') return;
 
         await init({
@@ -55,31 +58,20 @@ self.onmessage = async (ev: MessageEvent<InitMsg>) => {
 
         const testCase = msg.testCase || 'glyph-a';
 
-        /* Decide which fonts are needed for this case. A4 mixed loads BOTH so the
-           Arabic + Latin runs can paint from the same registry; engine resolves
-           by font_id (single font for the whole paragraph in PoC). */
-        if (testCase === 'a4-justified-mixed') {
-            const arabicBytes = await fetchBytes(ARABIC_URL);
+        /* Pre-test font loading. */
+        if (testCase === 'a4-justified-mixed' || testCase === 'hello-arabic' ||
+            testCase === 'editing-arabic' || testCase === 'docx-round-trip') {
             const e = await dispatch({
                 type: 'LOAD_FONT',
                 id: ARABIC_ID,
-                bytes: arabicBytes,
-            } as Command);
-            self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
-        } else if (testCase === 'hello-arabic') {
-            const arabicBytes = await fetchBytes(ARABIC_URL);
-            const e = await dispatch({
-                type: 'LOAD_FONT',
-                id: ARABIC_ID,
-                bytes: arabicBytes,
+                bytes: await fetchBytes(ARABIC_URL),
             } as Command);
             self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
         } else {
-            const latinBytes = await fetchBytes(LATIN_URL);
             const e = await dispatch({
                 type: 'LOAD_FONT',
                 id: LATIN_ID,
-                bytes: latinBytes,
+                bytes: await fetchBytes(LATIN_URL),
             } as Command);
             self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
         }
@@ -95,6 +87,7 @@ self.onmessage = async (ev: MessageEvent<InitMsg>) => {
                     px_size: 96,
                 } as Command);
                 break;
+
             case 'hello-arabic':
                 paintEvt = await dispatch({
                     type: 'SHAPE_AND_RASTERIZE',
@@ -104,10 +97,8 @@ self.onmessage = async (ev: MessageEvent<InitMsg>) => {
                     px_size: 96,
                 } as Command);
                 break;
+
             case 'a4-justified-mixed':
-                /* Base direction RTL because the paragraph starts and is
-                   majority Arabic — BiDi will still resolve the embedded
-                   English run correctly. */
                 paintEvt = await dispatch({
                     type: 'RENDER_PAGE',
                     text: A4_TEXT,
@@ -118,6 +109,75 @@ self.onmessage = async (ev: MessageEvent<InitMsg>) => {
                     align: 'JUSTIFY',
                 } as Command);
                 break;
+
+            case 'editing-arabic': {
+                /* Phase 1 W15-18 demo:
+                   1. RenderPage seeds the document + caches layout config.
+                   2. Two InsertText calls each auto-repaint.
+                   3. Final canvas = "السلام عليكم ورحمة الله".
+                   undo/redo roundtrip verified via console events. */
+                await dispatch({
+                    type: 'RENDER_PAGE',
+                    text: 'السلام',
+                    font_id: ARABIC_ID,
+                    base_direction: 'RTL',
+                    px_size: 28,
+                    line_height: 42,
+                    align: 'START',
+                } as Command);
+                const e1 = await dispatch({
+                    type: 'INSERT_TEXT',
+                    at: undefined,
+                    text: ' عليكم',
+                } as Command);
+                self.postMessage({ type: 'EDIT_RESULT', step: 'insert-1', event: e1 });
+                const e2 = await dispatch({
+                    type: 'INSERT_TEXT',
+                    at: undefined,
+                    text: ' ورحمة الله',
+                } as Command);
+                self.postMessage({ type: 'EDIT_RESULT', step: 'insert-2', event: e2 });
+                /* Demonstrate undo + redo (final state = post-redo, same as e2). */
+                const u1 = await dispatch({ type: 'UNDO' } as Command);
+                self.postMessage({ type: 'EDIT_RESULT', step: 'undo', event: u1 });
+                const r1 = await dispatch({ type: 'REDO' } as Command);
+                self.postMessage({ type: 'EDIT_RESULT', step: 'redo', event: r1 });
+                paintEvt = r1;
+                break;
+            }
+
+            case 'docx-round-trip': {
+                /* Phase 1 W19-24 demo:
+                   1. SaveDocx on the current (empty) doc — produces minimal .docx.
+                   2. LoadDocx round-trips it.
+                   3. Insert + save again. */
+                await dispatch({
+                    type: 'RENDER_PAGE',
+                    text: 'افتح، عدِّل، احفظ.',
+                    font_id: ARABIC_ID,
+                    base_direction: 'RTL',
+                    px_size: 28,
+                    line_height: 42,
+                    align: 'START',
+                } as Command);
+                const saved = await dispatch({ type: 'SAVE_DOCX' } as Command);
+                self.postMessage({ type: 'DOCX_RESULT', step: 'save', event: saved });
+                if (saved.type === 'DOCUMENT_SAVED') {
+                    const reloaded = await dispatch({
+                        type: 'LOAD_DOCX',
+                        bytes: saved.bytes,
+                    } as Command);
+                    self.postMessage({ type: 'DOCX_RESULT', step: 'load', event: reloaded });
+                }
+                const inserted = await dispatch({
+                    type: 'INSERT_TEXT',
+                    at: undefined,
+                    text: ' تم التعديل',
+                } as Command);
+                paintEvt = inserted;
+                break;
+            }
+
             case 'glyph-a':
             default:
                 paintEvt = await dispatch({

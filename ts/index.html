@@ -16,6 +16,12 @@
 </head>
 <body>
     <canvas id="doc"></canvas>
+    <textarea id="input"
+              aria-label="document input"
+              autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+              style="position:absolute; left:0; top:0; opacity:0.01; pointer-events:auto;
+                     width:200px; height:32px; border:0; outline:0; resize:none;
+                     overflow:hidden; z-index:1; background:transparent;"></textarea>
     <div id="status">booting…</div>
     <script type="module" src="/src/index.ts"></script>
 </body>

@@ -4,4 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = ".docx reader/writer + PDF/A-1b export."
+description = ".docx reader + writer + PDF/A-1b export."
+
+[dependencies]
+engine = { path = "../engine" }
+quick-xml = { workspace = true }
+zip = { workspace = true }
+thiserror = { workspace = true }
