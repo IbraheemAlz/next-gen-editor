@@ -13,6 +13,12 @@ const LATIN_URL = '/fonts/LiberationSans-Regular.ttf';
 const LATIN_ID = 'liberation-sans';
 const ARABIC_URL = '/fonts/NotoNaskhArabic-Regular.ttf';
 const ARABIC_ID = 'noto-naskh-arabic';
+/* Amiri is a book-quality Naskh face that ALSO ships Latin glyphs, so the
+   interactive editor can render mixed Arabic/English without engine-side
+   font fallback (that lands in Phase 3). The visual-diff test cases keep
+   their original single-script fonts so their goldens stay valid. */
+const DUAL_URL = '/fonts/Amiri-Regular.ttf';
+const DUAL_ID = 'amiri';
 
 const A4_TEXT =
     'هذا نص تجريبي مكتوب باللغة العربية لاختبار خوارزمية تخطيط الصفحة. ' +
@@ -72,13 +78,21 @@ async function handleInit(msg: InitMsg): Promise<void> {
     /* Default (no ?test= param) is the interactive A4 editor. */
     const testCase = msg.testCase || 'interactive';
 
-    /* Pre-test font loading. */
-    if (
+    /* Per-case font loading. Interactive uses the dual-script Amiri so
+       mixed Arabic/English renders; the test cases keep their original
+       single-script fonts so their committed goldens stay valid. */
+    if (testCase === 'interactive') {
+        const e = await dispatch({
+            type: 'LOAD_FONT',
+            id: DUAL_ID,
+            bytes: await fetchBytes(DUAL_URL),
+        } as Command);
+        self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
+    } else if (
         testCase === 'a4-justified-mixed' ||
         testCase === 'hello-arabic' ||
         testCase === 'editing-arabic' ||
-        testCase === 'docx-round-trip' ||
-        testCase === 'interactive'
+        testCase === 'docx-round-trip'
     ) {
         const e = await dispatch({
             type: 'LOAD_FONT',
@@ -193,7 +207,7 @@ async function handleInit(msg: InitMsg): Promise<void> {
             paintEvt = await dispatch({
                 type: 'RENDER_PAGE',
                 text: '',
-                font_id: ARABIC_ID,
+                font_id: DUAL_ID,
                 base_direction: 'RTL',
                 px_size: 24,
                 line_height: 36,
