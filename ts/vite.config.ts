@@ -13,6 +13,10 @@ const isolationHeaders = {
 
 export default defineConfig({
     root: '.',
+    /* Relative base so the built site works both at the domain root (local
+       `pnpm preview`) and under a GitHub Pages subpath
+       (https://<user>.github.io/next-gen-editor/). */
+    base: './',
     server: {
         headers: isolationHeaders,
         port: 5173,

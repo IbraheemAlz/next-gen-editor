@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "bridge"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -171,14 +171,14 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "im",
 ]
 
 [[package]]
 name = "engine-wasm"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bridge",
  "console_error_panic_hook",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "format-docx"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "engine",
  "quick-xml",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "layout"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "text-pipeline",
 ]
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "render"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "js-sys",
  "text-pipeline",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "roundtrip"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "engine",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "shape-regression"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "text-pipeline"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "icu_segmenter",
  "rustybuzz",

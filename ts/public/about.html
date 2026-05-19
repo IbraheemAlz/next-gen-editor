@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>About — Next-Gen Web Document Editor</title>
+    <style>
+        :root { color-scheme: light; }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font: 16px/1.6 system-ui, -apple-system, Segoe UI, sans-serif;
+            color: #1a1a1a;
+            background: #f6f6f6;
+        }
+        .wrap { max-width: 760px; margin: 0 auto; padding: 48px 24px 96px; }
+        h1 { font-size: 28px; margin: 0 0 4px; }
+        .tag { color: #555; margin: 0 0 28px; }
+        h2 { font-size: 18px; margin: 32px 0 8px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
+        a { color: #0052cc; }
+        code { background: #ececec; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+        .pill {
+            display: inline-block; background: #0052cc; color: #fff;
+            font-size: 12px; padding: 2px 9px; border-radius: 10px; vertical-align: middle;
+        }
+        table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+        td, th { text-align: left; padding: 6px 10px; border-bottom: 1px solid #e3e3e3; font-size: 14px; }
+        th { color: #555; font-weight: 600; }
+        .back { display: inline-block; margin-top: 32px; font-weight: 600; }
+        footer { margin-top: 48px; color: #888; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <h1>Next-Gen Web Document Editor <span class="pill">v0.0.1</span></h1>
+        <p class="tag">A Rust + WebAssembly document editor with first-class Arabic / RTL support.</p>
+
+        <h2>What this is</h2>
+        <p>
+            A document editor whose engine is compiled from Rust to WebAssembly
+            and runs entirely in your browser — no server, no <code>iframe</code>,
+            no vendored binary blobs. Arabic shaping, the Unicode Bidirectional
+            Algorithm, line breaking and A4 page layout were day-one requirements,
+            not afterthoughts.
+        </p>
+
+        <h2>Phase 1 — proof of concept</h2>
+        <p>
+            This release closes Phase 1: a working engine that loads fonts,
+            shapes Arabic with correct cursive joining, resolves mixed
+            Arabic/English BiDi per line, lays text out on an A4 page with
+            justification, supports editing with undo/redo, and round-trips
+            a <code>.docx</code> file.
+        </p>
+
+        <h2>Technology</h2>
+        <table>
+            <tr><th>Concern</th><th>Crate / tool</th></tr>
+            <tr><td>Text shaping</td><td>rustybuzz (pure-Rust HarfBuzz)</td></tr>
+            <tr><td>Bidirectional text</td><td>unicode-bidi</td></tr>
+            <tr><td>Line breaking</td><td>icu_segmenter (UAX #14)</td></tr>
+            <tr><td>Font parsing / raster</td><td>swash, read-fonts</td></tr>
+            <tr><td>Document model</td><td>im (immutable persistent vector)</td></tr>
+            <tr><td>WASM bindings</td><td>wasm-bindgen, tsify-next</td></tr>
+            <tr><td>UI shell</td><td>TypeScript + Vite + Web Worker</td></tr>
+            <tr><td>Rendering</td><td>OffscreenCanvas 2D (Vello/WebGPU in Phase 3)</td></tr>
+        </table>
+
+        <h2>Engine size</h2>
+        <p>
+            The WebAssembly artifact is ≈ 1.9 MB — about 12 % of the 15 MiB
+            budget. For comparison, the OnlyOffice WASM blob other editors
+            vendor is 57 MB and cannot be rebuilt from source.
+        </p>
+
+        <h2>Known limitations</h2>
+        <p>
+            Typing appends at end-of-document (click-to-place caret arrives in
+            Phase 4). Backspace and newline are not yet wired. Kashida
+            justification is a coarse first pass. These are tracked in the
+            phase plans in the repository.
+        </p>
+
+        <h2>Links</h2>
+        <table>
+            <tr><td>Source</td><td><a href="https://github.com/IbraheemAlz/next-gen-editor">github.com/IbraheemAlz/next-gen-editor</a></td></tr>
+            <tr><td>Roadmap</td><td><a href="https://github.com/IbraheemAlz/next-gen-editor/blob/main/MASTER_PLAN.md">MASTER_PLAN.md</a></td></tr>
+            <tr><td>Releases</td><td><a href="https://github.com/IbraheemAlz/next-gen-editor/releases">github.com/IbraheemAlz/next-gen-editor/releases</a></td></tr>
+        </table>
+
+        <a class="back" href="./">← Open the editor</a>
+
+        <footer>
+            Code: MIT OR Apache-2.0. Bundled fonts (Amiri, Noto Naskh Arabic,
+            Liberation Sans): SIL Open Font License 1.1.
+        </footer>
+    </div>
+</body>
+</html>
