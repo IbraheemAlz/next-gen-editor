@@ -54,6 +54,11 @@ async function main(): Promise<void> {
     if (interactive) {
         status.textContent = 'loading editor…';
         status.style.pointerEvents = 'none';
+        /* Center the A4 page horizontally with a small top gap, like a
+           document on a desk. Test mode keeps the canvas at (0,0) so the
+           visual-diff screenshot clip stays correct. */
+        canvas.style.margin = '24px auto';
+        canvas.style.boxShadow = '0 2px 12px rgba(0, 0, 0, 0.15)';
     } else {
         /* Visual-diff test mode: hide chrome so the canvas is the only
            thing in the screenshot. */
