@@ -2,6 +2,12 @@
 
 import init, { Engine } from '../../crates/engine-wasm/pkg/engine_wasm.js';
 import type { Command, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js';
+/* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
+   `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
+   GitHub Pages /next-gen-editor/); `?url` imports are hashed + base-aware. */
+import LATIN_URL from '../fonts/LiberationSans-Regular.ttf?url';
+import ARABIC_URL from '../fonts/NotoNaskhArabic-Regular.ttf?url';
+import DUAL_URL from '../fonts/Amiri-Regular.ttf?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -9,15 +15,12 @@ type InitMsg = { type: 'INIT'; canvas: OffscreenCanvas; testCase: string };
 type CommandMsg = { type: 'COMMAND'; id: number; cmd: Command };
 type Msg = InitMsg | CommandMsg;
 
-const LATIN_URL = '/fonts/LiberationSans-Regular.ttf';
 const LATIN_ID = 'liberation-sans';
-const ARABIC_URL = '/fonts/NotoNaskhArabic-Regular.ttf';
 const ARABIC_ID = 'noto-naskh-arabic';
 /* Amiri is a book-quality Naskh face that ALSO ships Latin glyphs, so the
    interactive editor can render mixed Arabic/English without engine-side
    font fallback (that lands in Phase 3). The visual-diff test cases keep
    their original single-script fonts so their goldens stay valid. */
-const DUAL_URL = '/fonts/Amiri-Regular.ttf';
 const DUAL_ID = 'amiri';
 
 const A4_TEXT =
