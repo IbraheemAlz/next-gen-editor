@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Next-Gen Editor — PoC</title>
+    <style>
+        html, body { margin: 0; height: 100%; background: #f6f6f6; font-family: system-ui, sans-serif; }
+        #doc { display: block; width: 100vw; height: 100vh; background: #fff; }
+        #status {
+            position: fixed; top: 8px; left: 8px; padding: 6px 10px;
+            background: rgba(0, 0, 0, 0.75); color: #fff; border-radius: 4px;
+            font: 12px / 1.4 ui-monospace, Menlo, Consolas, monospace; z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="doc"></canvas>
+    <div id="status">booting…</div>
+    <script type="module" src="/src/index.ts"></script>
+</body>
+</html>

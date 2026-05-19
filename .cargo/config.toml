@@ -1,0 +1,19 @@
+# Rustflags for the wasm32 target.
+#
+# We intentionally do NOT set `[build] target = "wasm32-unknown-unknown"`
+# at the global level: that would make `cargo check --workspace` (and tests)
+# default to wasm and fail for code that's compiled for native CI tooling.
+#
+# To build the wasm artifact, invoke explicitly:
+#   cargo build --release --target wasm32-unknown-unknown -p engine-wasm
+# or use wasm-pack which already targets wasm32.
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+bulk-memory,+mutable-globals,+sign-ext,+nontrapping-fptoint,+simd128",
+    "-C", "link-arg=--initial-memory=67108864",   # 64 MB
+    "-C", "link-arg=--max-memory=2147483648",     # 2 GB
+    "-C", "link-arg=-z",                          # stack-size needs `-z` prefix in modern wasm-ld
+    "-C", "link-arg=stack-size=1048576",          # 1 MB stack
+    "-C", "link-arg=--export=__heap_base",
+]

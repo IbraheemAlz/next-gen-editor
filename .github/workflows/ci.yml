@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust-native:
+    name: Native (fmt + clippy + test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --release
+
+  wasm:
+    name: WASM build + size budget
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: Build engine-wasm (release)
+        run: wasm-pack build --target web --release crates/engine-wasm
+
+      - name: Enforce WASM size budget (<15 MB)
+        run: |
+          set -euo pipefail
+          WASM_PATH="crates/engine-wasm/pkg/engine_wasm_bg.wasm"
+          if [ ! -f "$WASM_PATH" ]; then
+              echo "ERROR: $WASM_PATH not produced"
+              exit 1
+          fi
+          SIZE_BYTES=$(wc -c < "$WASM_PATH")
+          BUDGET_BYTES=15728640
+          echo "WASM size: $SIZE_BYTES bytes ($((SIZE_BYTES / 1024)) KiB)"
+          echo "Budget:    $BUDGET_BYTES bytes (15 MiB)"
+          if [ "$SIZE_BYTES" -ge "$BUDGET_BYTES" ]; then
+              echo "FAIL: WASM artifact exceeds 15 MiB budget"
+              exit 1
+          fi
+          echo "OK: under budget"
+
+      - name: Run WASM tests (headless Chrome)
+        run: wasm-pack test --headless --chrome crates/engine-wasm

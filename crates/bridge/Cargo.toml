@@ -1,0 +1,12 @@
+[package]
+name = "bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RPC command/event types shared between WASM engine and TS client."
+
+[dependencies]
+serde = { workspace = true }
+tsify-next = { workspace = true }
+wasm-bindgen = { workspace = true }

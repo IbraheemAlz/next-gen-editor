@@ -1,0 +1,68 @@
+[workspace]
+members = [
+    "crates/bridge",
+    "crates/engine",
+    "crates/engine-wasm",
+    "crates/text-pipeline",
+    "crates/layout",
+    "crates/render",
+    "crates/format-docx",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/example/next-gen-editor"
+
+[workspace.dependencies]
+# Bridge / FFI
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "DedicatedWorkerGlobalScope", "MessagePort", "MessageEvent",
+    "OffscreenCanvas", "OffscreenCanvasRenderingContext2d",
+    "ImageBitmap", "ImageData", "console",
+] }
+console_error_panic_hook = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+tsify-next = { version = "0.5", default-features = false, features = ["js"] }
+
+# Text / Unicode
+icu = "1.5"
+icu_bidi = "1.5"
+icu_segmenter = "1.5"
+icu_normalizer = "1.5"
+icu_locale = "1.5"
+rustybuzz = "0.20"
+swash = "0.2"
+read-fonts = "0.27"
+
+# Structures
+im = "15"
+smallvec = "1"
+indexmap = "2"
+lru = "0.12"
+
+# Codecs
+quick-xml = "0.36"
+rc-zip = "5"
+
+# Errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package.engine-wasm]
+opt-level = "z"

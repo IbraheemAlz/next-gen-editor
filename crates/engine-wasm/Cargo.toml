@@ -1,0 +1,22 @@
+[package]
+name = "engine-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wasm-bindgen surface for the engine. Built via wasm-pack."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bridge = { path = "../bridge" }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true }
+serde-wasm-bindgen = { workspace = true }
+console_error_panic_hook = { workspace = true }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
