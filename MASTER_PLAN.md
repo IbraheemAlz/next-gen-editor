@@ -6,6 +6,13 @@
 
 ---
 
+> **Phase 1 status (2026-05-20):** PoC W1–W24 complete and committed
+> (`355c334 feat(editor): implement document model, editing, and docx
+> round-trip (Phase 1 Complete)`). Engineering DNA captured in
+> [`CLAUDE.md`](./CLAUDE.md) — read that before booting future sessions.
+> Per-phase plans below have been amended with the deferred items learned
+> during the PoC.
+
 ## 0. Context
 
 We are building a **new web-based document editor** to replace dependence on outdated open-source solutions (e.g. `ranuts/document`, which vendors a 2-year-stale OnlyOffice 7.4/7.5 WASM blob, uses `iframe`-mode `DocsAPI.DocEditor`, and has zero Arabic/RTL support — see analysis in prior session).
@@ -533,9 +540,13 @@ Polish              ████████████   ← Hardening + fidel
 
 We analyzed `/home/ibrahim/Desktop/code/document` to extract what to do differently:
 
-| Anti-pattern in `ranuts/document` | Our approach |
+**Phase 1 reinforcement (2026-05-20):** every column on the right was proven
+in `crates/` and `ts/` during the PoC. The "Phase 1 PoC" entries below now
+exist as concrete code references, not aspirations.
+
+| Anti-pattern in `ranuts/document` | Our approach (Phase 1 PoC code path) |
 | --- | --- |
-| WASM runs on main thread (`lib/document-converter.ts:72–83`) → UI freeze on conversion | Dedicated Web Worker; main thread never blocks |
+| WASM runs on main thread (`lib/document-converter.ts:72–83`) → UI freeze on conversion | Dedicated Web Worker; main thread never blocks (`ts/src/engine.worker.ts`) |
 | `iframe`-based editor via `window.DocsAPI.DocEditor` (`lib/onlyoffice-editor.ts:237`) | Direct canvas; no iframe; we own input/event chain |
 | 57 MB vendored binary `x2t.wasm` with no source (`public/wasm/x2t/x2t.wasm`) | All Rust source in our repo; reproducible WASM builds in CI |
 | 300 s init timeout (`lib/document-converter.ts:18`) — engine treated as a black box | 3 s target cold start; engine is ours, latencies are measurable and budgeted |

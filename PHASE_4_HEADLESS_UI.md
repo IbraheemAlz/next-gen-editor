@@ -600,6 +600,45 @@ playwright test ts/e2e/rtl-ui.spec.ts
 
 ---
 
+## 14.A. Phase 1 PoC carryover
+
+PoC shipped a minimal interactive shell — enough to prove the engine path,
+not enough for production use.
+
+### What exists from Phase 1
+
+- `ts/index.html`: hidden `<textarea id="input">` with opacity 0.01 (not 0,
+  Safari skips events on opacity 0), `pointer-events: auto`.
+- `ts/src/index.ts`: `beforeinput` listener dispatches
+  `Command::InsertText { at: undefined, text: e.data }` via the
+  Promise-based `dispatch()` channel.
+- `ts/src/engine.worker.ts` exposes a `{ type: 'COMMAND', id, cmd }`
+  channel so the main thread can issue arbitrary commands after init.
+- `window.__dispatch` test hook for Playwright.
+
+### What Phase 4 MUST add
+
+1. **Caret rendering** (§7). PoC has no visible caret. Implement DOM
+   `<div class="caret">` overlay driven by `Event::SelectionChanged.caret`
+   rect.
+2. **Cursor positioning by click** (§7). PoC's `at: undefined` always
+   appends at end-of-document. Phase 4 sends pointer coords, engine returns
+   hit-test → logical position, UI updates caret.
+3. **Selection rectangles** (§8). PoC has no selection rendering. Phase 4
+   subscribes to `SelectionChanged.rects` and overlays them as `<div>`s
+   (one per rect, to support discontinuous BiDi selections).
+4. **IME composition** (§6). PoC's textarea has no `compositionstart` /
+   `compositionupdate` / `compositionend` handlers. Phase 4 sends
+   `BeginComposition` / `UpdateComposition` / `EndComposition` commands so
+   Arabic + CJK input composes correctly.
+5. **Textarea position follows caret** (§6). PoC pins the textarea at
+   `left:8, top:8`. Phase 4 repositions it on every `SelectionChanged` event
+   so OS IME popups anchor correctly.
+6. **Backspace / delete / arrows** wired. PoC's `beforeinput` handler
+   only handles `insertText`; logs a warning for `deleteContentBackward`.
+   Phase 4 maps each `InputType` to a `Command`.
+7. **Accessibility shadow tree** (§10). Not started in Phase 1.
+
 ## 15. Hand-off into Phase 5
 
 UI shell stable; engine + UI stable; Phase 5 hardens both and ships MVP. Phase 4 must deliver:

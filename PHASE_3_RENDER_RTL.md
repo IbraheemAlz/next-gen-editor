@@ -266,6 +266,25 @@ pub fn apply_kashida(line: &mut LineBox) {
 
 Acceptance: signed off by Arabic typographer against a 30-line corpus of book-quality Naskh typesetting reference (Amiri).
 
+**Phase 1 PoC carryover.** The PoC shipped a coarse Kashida implementation
+(`crates/text-pipeline/src/justify.rs` + `crates/layout/src/paragraph.rs::distribute_to_kashida_points`)
+which distributes extra width uniformly across consecutive-Arabic-glyph
+boundaries with no priority weighting. Phase 3 work in this section MUST:
+
+1. **Replace block detection** (`is_arabic_codepoint`) with `icu_properties`
+   `JoiningType` lookup. Only glyphs whose source codepoint is
+   `D` (Dual-joining), `R` (Right-joining), or `L` (Left-joining) — and whose
+   neighbor permits the join — qualify as Kashida candidates.
+2. **Implement Microsoft priority bands** per the algorithm above. The PoC
+   skipped this; ship it here.
+3. **Optionally insert U+0640** (tatweel) glyphs at top-priority candidates
+   instead of bumping `x_advance` of the existing glyph. Tatweel insertion
+   matches what GSUB-aware shapers expect; advance bumping is a fallback
+   when the font has no tatweel glyph.
+4. **Native-typographer review.** Hire/contract an Arabic typographer to
+   sign off on the 30-line acceptance corpus before declaring this section
+   done. The PoC author is not qualified for that sign-off.
+
 ---
 
 ## 7. BiDi cursor/selection mapping
@@ -614,6 +633,34 @@ node tools/memory-profile/run.mjs --doc 50p
 | 6 | PDF font subsetting bugs | Med | veraPDF | Use battle-tested subsetter (`subsetter` crate); embed full font if subset fails |
 
 ---
+
+## 13.A. Font fallback (Phase 1 PoC deferral)
+
+The PoC takes a single `font_id` per paragraph and emits `.notdef` glyphs
+for any codepoint the font doesn't cover. For the
+`a4-justified-mixed` PoC case this leaves the English chunks invisible.
+
+Phase 3 introduces a **FontStack** with per-script resolution:
+
+```rust
+pub struct FontStack {
+    by_script: HashMap<Script, Vec<FontId>>,   // priority order
+    fallback_chain: Vec<FontId>,               // last-resort scan
+}
+
+impl FontStack {
+    pub fn resolve(&self, script: Script, attrs: &TextAttrs) -> &LoadedFont { /* … */ }
+}
+```
+
+Replace `ParagraphConfig.font: &LoadedFont` with `&FontStack`. The shaper
+splits runs further by font (in addition to BiDi level + script + style) and
+each sub-run shapes against its own `rustybuzz::Face`. The
+`shape_text` API in `crates/text-pipeline/src/shape.rs` takes a single
+`LoadedFont` today; widen it to accept a `&FontStack` + return a vector of
+runs that each carry their font id.
+
+Acceptance: `a4-justified-mixed` golden refresh shows English glyphs.
 
 ## 14. Hand-off into Phase 4
 

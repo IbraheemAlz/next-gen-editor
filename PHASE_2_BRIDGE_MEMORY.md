@@ -575,7 +575,34 @@ playwright test ts/e2e/rpc-throughput.spec.ts
 
 ---
 
-## 13. Hand-off into Phase 3
+## 13. Phase 1 PoC deferrals to address here
+
+These items were stubbed during the PoC and explicitly tagged for Phase 2:
+
+- **Full Command/Event schema completion.** Phase 1 shipped a subset
+  (`Ping`, `LoadFont`, `RasterizeGlyph`, `ShapeAndRasterize`, `RenderPage`,
+  `InsertText`, `Undo`, `Redo`, `LoadDocx`, `SaveDocx`). Phase 2 adds the
+  remaining commands from §4 (selection, IME, viewport, formatting,
+  composition, telemetry).
+- **`tsify-next` Option marshalling.** Confirmed: `Option<T>` renders as
+  `T | undefined` in the generated `.d.ts`. TS callers MUST pass `undefined`,
+  not `null`. Document in the bridge crate.
+- **`serde_bytes` for binary fields.** All `Vec<u8>` that must travel as
+  zero-copy `Uint8Array` need `#[serde(with = "serde_bytes")]` PLUS
+  `#[tsify(type = "Uint8Array")]`. Without `serde_bytes`, decode fails with
+  `invalid type: byte array, expected a sequence` because the default
+  serializer wants a number-sequence.
+- **Promise RPC channel.** PoC implemented a simplified
+  `{ type: 'COMMAND', id, cmd }` / `{ type: 'COMMAND_RESULT', id, event }`
+  pattern in `ts/src/index.ts`. Phase 2 generalizes this with backpressure,
+  request timeout, and transferables list.
+- **Crash recovery.** PoC has no IndexedDB event log yet. Land the log +
+  snapshot persistence + replay in this phase per §10.
+- **SharedArrayBuffer paths.** PoC ships COOP/COEP headers but doesn't yet
+  use SAB for any payload (bytes traveled via `serde_bytes` Uint8Array).
+  Wire the SAB path for ≥1 MB binary payloads in this phase.
+
+## 14. Hand-off into Phase 3
 
 Phase 2 hands Phase 3 a stable bridge + memory contract. Phase 3 work is engine-internal:
 

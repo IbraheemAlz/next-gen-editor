@@ -117,6 +117,24 @@ git diff tests/corpus/goldens/tier-a/                  # review every pixel chan
 
 ---
 
+### 3.A. Phase 1 PoC carryover
+
+The PoC built `tools/visual-diff/run.mjs` with this setup; lift it directly:
+
+- **Playwright `channel: 'chrome'`** uses system Chrome, skips the 150 MB
+  chromium download.
+- **`page.waitForFunction(() => window.__paintIdle)`** is the canonical
+  ready signal. **Do not** use `chrome --virtual-time-budget` alone — it
+  does not wait for real network/WASM I/O and produces blank screenshots.
+- Per-case viewport mapping (`VIEWPORTS` const in `run.mjs`). A4 cases
+  use 595×842 (1 pt = 1 px so the engine's `A4Page::a4()` matches the
+  drawing surface 1:1). Override via `VIEWPORT=WxH` env var.
+- `UPDATE=1` regenerates the golden. **Every regeneration MUST be
+  eyeballed in the diff before merging** — the harness can't tell you the
+  new pixels are correct, only that they're consistent.
+- Filter `Failed to load resource` console errors (browser auto-fetches
+  `/favicon.ico`).
+
 ## 4. Document corpus
 
 200 documents across three tiers. Per-doc manifest entry:
@@ -155,6 +173,23 @@ Golden refresh policy:
 - Auto-generated goldens never merged without human inspection.
 
 ---
+
+### 4.A. Phase 1 PoC roundtrip harness
+
+`tools/roundtrip/` is the Phase 1 deliverable. Promote it from "demo" to
+CI gate in Phase 5:
+
+- Currently asserts two contracts:
+  1. **Sibling entries byte-identical** between fixture and saved .docx
+     (writer preserves `[Content_Types].xml`, `_rels/.rels`,
+     `word/_rels/document.xml.rels` verbatim — 0 byte drift).
+  2. **`word/document.xml` byte delta ≤ 2 × UTF-8 byte size of the insert**
+     (catches writer regressions that silently rewrite unrelated regions).
+
+Phase 5 extends the harness to a **multi-fixture corpus** (5–10 .docx
+fixtures: pure Latin, pure Arabic, mixed, tables, lists, footnotes), each
+with a defined edit script + assertion bounds. Run nightly + on every PR
+that touches `crates/format-docx/`.
 
 ## 5. Memory snapshot suite
 
