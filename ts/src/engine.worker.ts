@@ -56,11 +56,13 @@ self.onmessage = async (ev: MessageEvent<Msg>) => {
         const pong = await dispatch({ type: 'PING' } as Command);
         self.postMessage({ type: 'PING_RESULT', event: pong });
 
-        const testCase = msg.testCase || 'glyph-a';
+        /* Default (no ?test= param) is the interactive A4 editor. */
+        const testCase = msg.testCase || 'interactive';
 
         /* Pre-test font loading. */
         if (testCase === 'a4-justified-mixed' || testCase === 'hello-arabic' ||
-            testCase === 'editing-arabic' || testCase === 'docx-round-trip') {
+            testCase === 'editing-arabic' || testCase === 'docx-round-trip' ||
+            testCase === 'interactive') {
             const e = await dispatch({
                 type: 'LOAD_FONT',
                 id: ARABIC_ID,
@@ -177,6 +179,21 @@ self.onmessage = async (ev: MessageEvent<Msg>) => {
                 paintEvt = inserted;
                 break;
             }
+
+            case 'interactive':
+                /* Blank A4 page seeded with one empty paragraph. RenderPage
+                   caches the layout config so subsequent InsertText / Undo /
+                   Redo commands from the textarea auto-repaint. */
+                paintEvt = await dispatch({
+                    type: 'RENDER_PAGE',
+                    text: '',
+                    font_id: ARABIC_ID,
+                    base_direction: 'RTL',
+                    px_size: 24,
+                    line_height: 36,
+                    align: 'START',
+                } as Command);
+                break;
 
             case 'glyph-a':
             default:
