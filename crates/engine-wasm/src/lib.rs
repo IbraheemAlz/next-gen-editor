@@ -290,8 +290,8 @@ impl Engine {
         };
 
         /* Reset the document + undo stack to a single paragraph of `text`,
-           then cache the layout config so subsequent InsertText/Undo/Redo
-           commands can repaint without re-specifying params. */
+        then cache the layout config so subsequent InsertText/Undo/Redo
+        commands can repaint without re-specifying params. */
         self.undo = UndoStack::new(DocumentTree::from_text(&text), 100);
         self.layout_cfg = Some(RenderConfig {
             font_id,
@@ -426,8 +426,7 @@ impl Engine {
 
             for line in &lines {
                 total_lines += 1;
-                let direction_is_rtl =
-                    matches!(line.direction, Some(ShapingDirection::Rtl));
+                let direction_is_rtl = matches!(line.direction, Some(ShapingDirection::Rtl));
                 let natural_w = line.natural_width as f64;
                 let x_origin = if matches!(cfg.alignment, Alignment::Center) {
                     margin_left + (content_width - natural_w) / 2.0
@@ -436,8 +435,7 @@ impl Engine {
                 } else {
                     margin_left
                 };
-                let baseline_y =
-                    margin_top + (para_y_offset + line.baseline_y) as f64;
+                let baseline_y = margin_top + (para_y_offset + line.baseline_y) as f64;
 
                 for g in &line.glyphs {
                     total_glyphs += 1;
@@ -450,13 +448,9 @@ impl Engine {
                     };
                     let dx = x_origin + g.x as f64 + g.x_offset as f64;
                     let dy = baseline_y - g.y_offset as f64;
-                    if let Err(e) = render::canvas2d_backend::paint_alpha_glyph(
-                        ctx,
-                        &raster,
-                        dx,
-                        dy,
-                        [0, 0, 0],
-                    ) {
+                    if let Err(e) =
+                        render::canvas2d_backend::paint_alpha_glyph(ctx, &raster, dx, dy, [0, 0, 0])
+                    {
                         return Err(Event::Error {
                             message: format!("paint: {e:?}"),
                         });

@@ -34,8 +34,8 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> Vec<LineBox> {
     let breaks = break_opportunities(cfg.text);
 
     /* Greedy: walk through break opportunities; keep extending the line
-       while the candidate range fits in max_width; commit the longest fit
-       when the next opportunity would overflow. */
+    while the candidate range fits in max_width; commit the longest fit
+    when the next opportunity would overflow. */
     let mut lines: Vec<LineBox> = vec![];
     let mut start = 0_usize;
     let mut last_fit_end = start;
@@ -55,7 +55,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> Vec<LineBox> {
                 lines.push(build_line(&cfg, start, last_fit_end, true));
             } else {
                 /* Single segment from start..b doesn't fit — force-break at
-                   this opportunity. (PoC: no mid-word hyphenation.) */
+                this opportunity. (PoC: no mid-word hyphenation.) */
                 lines.push(build_line(&cfg, start, b, true));
                 last_fit_end = b;
             }
@@ -68,8 +68,8 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> Vec<LineBox> {
     }
 
     /* Justify all but the last line (and only lines that ended at an
-       opportunity, not a forced hard break — covered already by
-       `broken_at_opportunity`). */
+    opportunity, not a forced hard break — covered already by
+    `broken_at_opportunity`). */
     if cfg.alignment == Alignment::Justify {
         let last = lines.len().saturating_sub(1);
         for (i, line) in lines.iter_mut().enumerate() {

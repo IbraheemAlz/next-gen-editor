@@ -55,7 +55,7 @@ impl LoadedFont {
         let face = FontRef::from_index(&data, 0).ok_or(FontError::Parse)?;
         let upem = face.metrics(&[]).units_per_em;
         /* Also validate the same bytes are a valid rustybuzz Face — we share
-           the buffer between swash and rustybuzz at runtime. */
+        the buffer between swash and rustybuzz at runtime. */
         rustybuzz::Face::from_slice(&data, 0).ok_or(FontError::Parse)?;
         Ok(Self {
             id,

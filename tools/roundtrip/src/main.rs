@@ -15,8 +15,8 @@
 
 use anyhow::{Context, Result, bail};
 use engine::DocumentTree;
-use format_docx::{read_docx, write_docx};
 use format_docx::writer::build_minimal_docx;
+use format_docx::{read_docx, write_docx};
 use std::process::ExitCode;
 
 const SEED_TEXT: &str = "السلام عليكم ورحمة الله وبركاته";
@@ -60,7 +60,10 @@ fn run() -> Result<()> {
 
     /* 4. Save the edited tree (using archive_a's siblings). */
     let edited_bytes = write_docx(&archive_a, &edited).context("write edited")?;
-    println!("[roundtrip] saved edited .docx: {} bytes", edited_bytes.len());
+    println!(
+        "[roundtrip] saved edited .docx: {} bytes",
+        edited_bytes.len()
+    );
 
     /* 5. Re-open the saved blob; verify edited text round-trips. */
     let archive_b = read_docx(&edited_bytes).context("re-read edited")?;
@@ -87,11 +90,7 @@ fn run() -> Result<()> {
             }
             Some(b) => {
                 sibling_drift += b.len().abs_diff(bytes.len());
-                println!(
-                    "  [DRIFT] {name}: {} -> {} bytes",
-                    bytes.len(),
-                    b.len()
-                );
+                println!("  [DRIFT] {name}: {} -> {} bytes", bytes.len(), b.len());
             }
             None => {
                 bail!("entry `{name}` missing from saved archive");
@@ -106,8 +105,8 @@ fn run() -> Result<()> {
     println!("[roundtrip] step 6a OK — all sibling entries byte-identical");
 
     /* For word/document.xml: the saved bytes will differ since we serialized
-       fresh, but the only structural change vs. the seed should be the
-       inserted text. Assert the diff size is bounded. */
+    fresh, but the only structural change vs. the seed should be the
+    inserted text. Assert the diff size is bounded. */
     let extract_doc_xml = |bytes: &[u8]| -> Result<Vec<u8>> {
         use std::io::Read;
         let mut a = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
@@ -128,8 +127,8 @@ fn run() -> Result<()> {
         insert_len_utf8
     );
     /* The diff should be approximately `insert_len_utf8` (UTF-8 byte size of
-       the inserted text). Allow up to 2× headroom for any whitespace
-       normalization the writer applies. */
+    the inserted text). Allow up to 2× headroom for any whitespace
+    normalization the writer applies. */
     let bound = insert_len_utf8 * 2;
     if doc_diff > bound {
         bail!(

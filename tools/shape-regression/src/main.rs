@@ -52,10 +52,10 @@ fn project_root() -> PathBuf {
 
 fn run_case(case: &TestCase, root: &Path) -> Result<Expected> {
     let font_path = root.join(&case.font);
-    let bytes = fs::read(&font_path)
-        .with_context(|| format!("read font {}", font_path.display()))?;
-    let font = LoadedFont::parse(case.id.clone(), bytes)
-        .map_err(|e| anyhow!("LoadedFont::parse: {e}"))?;
+    let bytes =
+        fs::read(&font_path).with_context(|| format!("read font {}", font_path.display()))?;
+    let font =
+        LoadedFont::parse(case.id.clone(), bytes).map_err(|e| anyhow!("LoadedFont::parse: {e}"))?;
     let dir = match case.direction.as_str() {
         "RTL" | "rtl" => ShapingDirection::Rtl,
         _ => ShapingDirection::Ltr,
