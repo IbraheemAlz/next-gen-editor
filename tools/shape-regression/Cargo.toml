@@ -1,0 +1,17 @@
+[package]
+name = "shape-regression"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Native CLI: shape a corpus of strings via rustybuzz, diff against committed snapshots."
+
+[[bin]]
+name = "shape-regression"
+path = "src/main.rs"
+
+[dependencies]
+text-pipeline = { path = "../../crates/text-pipeline" }
+serde = { workspace = true }
+serde_json = "1"
+anyhow = { workspace = true }

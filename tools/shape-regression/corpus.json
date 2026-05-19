@@ -1,0 +1,116 @@
+{
+  "cases": [
+    {
+      "id": "hello-latin",
+      "text": "hello",
+      "font": "ts/public/fonts/LiberationSans-Regular.ttf",
+      "direction": "LTR",
+      "px_size": 96.0,
+      "expected": {
+        "glyph_count": 5,
+        "glyph_ids": [
+          75,
+          72,
+          79,
+          79,
+          82
+        ],
+        "total_advance_approx": 202.82812
+      }
+    },
+    {
+      "id": "salam-arabic",
+      "text": "السلام",
+      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "direction": "RTL",
+      "px_size": 96.0,
+      "expected": {
+        "glyph_count": 6,
+        "glyph_ids": [
+          482,
+          1565,
+          448,
+          249,
+          449,
+          3
+        ],
+        "total_advance_approx": 212.35199
+      }
+    },
+    {
+      "id": "lam-alef-ligature",
+      "text": "لا",
+      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "direction": "RTL",
+      "px_size": 96.0,
+      "expected": {
+        "glyph_count": 2,
+        "glyph_ids": [
+          6,
+          450
+        ],
+        "total_advance_approx": 49.728
+      }
+    },
+    {
+      "id": "arabic-with-tashkeel",
+      "text": "بِسْمِ",
+      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "direction": "RTL",
+      "px_size": 96.0,
+      "expected": {
+        "glyph_count": 6,
+        "glyph_ids": [
+          1424,
+          483,
+          1436,
+          249,
+          1424,
+          38
+        ],
+        "total_advance_approx": 140.736
+      }
+    },
+    {
+      "id": "arabic-eastern-numerals",
+      "text": "٢٠٢٦",
+      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "direction": "RTL",
+      "px_size": 96.0,
+      "expected": {
+        "glyph_count": 4,
+        "glyph_ids": [
+          1262,
+          1256,
+          1252,
+          1256
+        ],
+        "total_advance_approx": 152.15999
+      }
+    },
+    {
+      "id": "mixed-arabic-latin",
+      "text": "Hello مرحبا",
+      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "direction": "LTR",
+      "px_size": 96.0,
+      "expected": {
+        "glyph_count": 11,
+        "glyph_ids": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1364,
+          482,
+          211,
+          137,
+          35,
+          3
+        ],
+        "total_advance_approx": 573.312
+      }
+    }
+  ]
+}

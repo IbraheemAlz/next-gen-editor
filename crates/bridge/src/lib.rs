@@ -1,7 +1,7 @@
 //! `bridge` — RPC command/event types shared between the WASM engine and TS.
 //!
-//! Phase 1 weeks 5–6 subset: Ping/Pong + font load + glyph raster. Full
-//! schema lands in Phase 2 per PHASE_2_BRIDGE_MEMORY.md §4–§5.
+//! Phase 1 weeks 5–9 subset. Full schema lands in Phase 2 per
+//! PHASE_2_BRIDGE_MEMORY.md §4–§5.
 
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
@@ -21,10 +21,19 @@ pub enum Command {
         bytes: Vec<u8>,
     },
 
-    /// Rasterize and paint `ch` with `font_id` at the given pixel size.
+    /// Rasterize and paint a single glyph by character (no shaping).
     RasterizeGlyph {
         font_id: String,
         ch: String,
+        px_size: f32,
+    },
+
+    /// Shape `text` with `font_id` via rustybuzz, then rasterize and paint
+    /// each resulting glyph sequentially. `direction` is `"LTR"` or `"RTL"`.
+    ShapeAndRasterize {
+        text: String,
+        font_id: String,
+        direction: String,
         px_size: f32,
     },
 }
@@ -48,6 +57,15 @@ pub enum Event {
         ascent: f32,
         glyph_width: u32,
         glyph_height: u32,
+    },
+    ShapedAndPainted {
+        font_id: String,
+        text: String,
+        direction: String,
+        glyph_count: u32,
+        total_advance: f32,
+        ascent: f32,
+        glyph_ids: Vec<u32>,
     },
     Error {
         message: String,

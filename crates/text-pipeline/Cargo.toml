@@ -8,4 +8,5 @@ description = "Unicode BiDi + shaping + line-break + Kashida justification."
 
 [dependencies]
 swash = { workspace = true }
+rustybuzz = { workspace = true }
 thiserror = { workspace = true }

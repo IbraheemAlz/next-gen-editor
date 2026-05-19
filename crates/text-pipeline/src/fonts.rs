@@ -42,7 +42,8 @@ pub struct RasterizedGlyph {
     pub alpha: Vec<u8>,
 }
 
-/// Owns the font byte buffer; `swash::FontRef` is rebuilt on each access (zero-cost).
+/// Owns the font byte buffer; `swash::FontRef` and `rustybuzz::Face` are
+/// rebuilt on each access (both zero-cost; they just hold a slice reference).
 pub struct LoadedFont {
     id: String,
     data: Vec<u8>,
@@ -53,6 +54,9 @@ impl LoadedFont {
     pub fn parse(id: String, data: Vec<u8>) -> Result<Self, FontError> {
         let face = FontRef::from_index(&data, 0).ok_or(FontError::Parse)?;
         let upem = face.metrics(&[]).units_per_em;
+        /* Also validate the same bytes are a valid rustybuzz Face — we share
+           the buffer between swash and rustybuzz at runtime. */
+        rustybuzz::Face::from_slice(&data, 0).ok_or(FontError::Parse)?;
         Ok(Self {
             id,
             data,
@@ -66,6 +70,10 @@ impl LoadedFont {
 
     fn face(&self) -> FontRef<'_> {
         FontRef::from_index(&self.data, 0).expect("validated in parse")
+    }
+
+    pub fn face_rustybuzz(&self) -> Option<rustybuzz::Face<'_>> {
+        rustybuzz::Face::from_slice(&self.data, 0)
     }
 
     pub fn metrics(&self, px_size: f32) -> FontMetrics {
@@ -92,12 +100,23 @@ impl LoadedFont {
         })
     }
 
+    /// Rasterize a glyph by character (does charmap lookup internally).
     pub fn rasterize(&self, ch: char, px_size: f32) -> Result<RasterizedGlyph, FontError> {
+        let gid = {
+            let face = self.face();
+            let gid = face.charmap().map(ch);
+            if gid == 0 {
+                return Err(FontError::GlyphMissing(ch as u32));
+            }
+            gid
+        };
+        self.rasterize_glyph(gid, px_size)
+    }
+
+    /// Rasterize a glyph by its glyph id (skipping the charmap lookup;
+    /// used after `rustybuzz` shaping returns glyph ids directly).
+    pub fn rasterize_glyph(&self, gid: u16, px_size: f32) -> Result<RasterizedGlyph, FontError> {
         let face = self.face();
-        let gid = face.charmap().map(ch);
-        if gid == 0 {
-            return Err(FontError::GlyphMissing(ch as u32));
-        }
         let mut ctx = ScaleContext::new();
         let mut scaler = ctx.builder(face).size(px_size).hint(true).build();
         let image = Render::new(&[Source::Outline])

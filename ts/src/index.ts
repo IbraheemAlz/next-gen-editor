@@ -4,7 +4,7 @@ type WorkerMsg =
     | { type: 'BOOT_OK' }
     | { type: 'PING_RESULT'; event: unknown }
     | { type: 'FONT_LOADED_RESULT'; event: unknown }
-    | { type: 'GLYPH_RESULT'; event: unknown }
+    | { type: 'PAINT_RESULT'; event: unknown }
     | { type: 'IDLE' }
     | { type: 'ERROR'; error: string };
 
@@ -13,6 +13,7 @@ declare global {
     interface Window {
         __paintIdle?: boolean;
         __engineReady?: boolean;
+        __lastEvent?: unknown;
     }
 }
 
@@ -26,9 +27,11 @@ async function main(): Promise<void> {
     canvas.style.width = '400px';
     canvas.style.height = '400px';
 
-    /* Test mode (visual-diff harness): hide UI chrome so the canvas is the
-       only thing in the screenshot. */
-    if (new URLSearchParams(window.location.search).has('test')) {
+    const params = new URLSearchParams(window.location.search);
+    const testCase = params.get('test') ?? '';
+
+    /* Test mode: hide chrome so the canvas is the only thing in the screenshot. */
+    if (testCase) {
         status.style.display = 'none';
         document.documentElement.style.background = '#fff';
         document.body.style.background = '#fff';
@@ -55,11 +58,12 @@ async function main(): Promise<void> {
                 break;
             case 'FONT_LOADED_RESULT':
                 console.log('[PoC] font loaded:', JSON.stringify(msg.event));
-                status.textContent = `font loaded: ${JSON.stringify(msg.event)}`;
+                status.textContent = `font loaded`;
                 break;
-            case 'GLYPH_RESULT':
-                console.log('[PoC] glyph painted:', JSON.stringify(msg.event));
-                status.textContent = `glyph painted: ${JSON.stringify(msg.event)}`;
+            case 'PAINT_RESULT':
+                console.log('[PoC] paint result:', JSON.stringify(msg.event));
+                status.textContent = `painted: ${JSON.stringify(msg.event)}`;
+                window.__lastEvent = msg.event;
                 break;
             case 'IDLE':
                 console.log('[PoC] worker idle');
@@ -77,7 +81,7 @@ async function main(): Promise<void> {
         console.error('[PoC] worker fatal', e);
     };
 
-    worker.postMessage({ type: 'INIT', canvas: offscreen }, [offscreen]);
+    worker.postMessage({ type: 'INIT', canvas: offscreen, testCase }, [offscreen]);
 }
 
 void main();

@@ -1,14 +1,12 @@
 //! `engine-wasm` — `#[wasm_bindgen]` surface for the engine.
 //!
-//! Phase 1 weeks 5–6: load a TTF font, paint a single glyph from `swash`'s
-//! alpha-mask raster output to the `OffscreenCanvas` via `putImageData`.
-//! The green sentinel from week 4 is replaced by a white-cleared background
-//! over which the glyph is drawn in black.
+//! Phase 1 weeks 5–9: font load + glyph metrics + alpha-mask raster +
+//! `rustybuzz` shaping for both LTR and RTL.
 
 use bridge::{Command, Event, FontMetrics as BridgeMetrics};
 use std::collections::HashMap;
 use std::sync::Arc;
-use text_pipeline::LoadedFont;
+use text_pipeline::{LoadedFont, ShapingDirection, shape_text};
 use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
@@ -27,7 +25,7 @@ pub struct Engine {
 #[wasm_bindgen]
 impl Engine {
     /// Construct from an `OffscreenCanvas` transferred from the main thread.
-    /// Clears the canvas to white so the subsequent glyph paint is visible.
+    /// Clears the canvas to white so subsequent glyph paints are visible.
     #[wasm_bindgen(constructor)]
     pub fn new(canvas: web_sys::OffscreenCanvas) -> Result<Engine, JsValue> {
         let ctx_obj = canvas
@@ -51,7 +49,6 @@ impl Engine {
     }
 }
 
-/// Where on the canvas the PoC paints the glyph. Baseline pen position.
 const POC_BASELINE_X: f64 = 50.0;
 const POC_BASELINE_Y: f64 = 200.0;
 
@@ -62,8 +59,6 @@ impl Engine {
 
             Command::LoadFont { id, bytes } => match LoadedFont::parse(id.clone(), bytes) {
                 Ok(font) => {
-                    /* Report unscaled (in font units) metrics by passing 1.0 for px_size,
-                       which gives us per-em values; multiply by px_size in JS to scale. */
                     let m = font.metrics(1.0);
                     let bridge_metrics = BridgeMetrics {
                         units_per_em: m.units_per_em,
@@ -144,6 +139,69 @@ impl Engine {
                     glyph_height: raster.height,
                 }
             }
+
+            Command::ShapeAndRasterize {
+                text,
+                font_id,
+                direction,
+                px_size,
+            } => {
+                let dir = match direction.as_str() {
+                    "RTL" | "rtl" => ShapingDirection::Rtl,
+                    _ => ShapingDirection::Ltr,
+                };
+                let font = match self.fonts.get(&font_id) {
+                    Some(f) => f.clone(),
+                    None => {
+                        return Event::Error {
+                            message: format!("font `{font_id}` not loaded"),
+                        };
+                    }
+                };
+                let shaped = shape_text(&font, &text, dir, px_size);
+                let scaled = font.metrics(px_size);
+
+                if let Some(ctx) = &self.ctx {
+                    let mut pen_x = POC_BASELINE_X;
+                    let pen_y = POC_BASELINE_Y;
+                    for g in &shaped.glyphs {
+                        /* Skip `.notdef` (glyph 0) — typically only present for
+                           characters not covered by the font; they have no outline. */
+                        if g.glyph_id == 0 {
+                            pen_x += g.x_advance as f64;
+                            continue;
+                        }
+                        let raster = match font.rasterize_glyph(g.glyph_id as u16, px_size) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                pen_x += g.x_advance as f64;
+                                continue;
+                            }
+                        };
+                        let dx = pen_x + g.x_offset as f64;
+                        let dy = pen_y - g.y_offset as f64;
+                        if let Err(e) = render::canvas2d_backend::paint_alpha_glyph(
+                            ctx, &raster, dx, dy, [0, 0, 0],
+                        ) {
+                            return Event::Error {
+                                message: format!("paint: {e:?}"),
+                            };
+                        }
+                        pen_x += g.x_advance as f64;
+                    }
+                }
+
+                let glyph_ids: Vec<u32> = shaped.glyphs.iter().map(|g| g.glyph_id).collect();
+                Event::ShapedAndPainted {
+                    font_id,
+                    text,
+                    direction,
+                    glyph_count: shaped.glyphs.len() as u32,
+                    total_advance: shaped.total_advance,
+                    ascent: scaled.ascent,
+                    glyph_ids,
+                }
+            }
         }
     }
 }
@@ -155,9 +213,6 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    /// Ping → Pong round-trip without binding to a canvas. The constructor
-    /// is exercised separately by the browser-side PoC; this test isolates
-    /// the bridge serde path.
     #[wasm_bindgen_test]
     async fn ping_pong_round_trip() {
         let mut engine = Engine {
