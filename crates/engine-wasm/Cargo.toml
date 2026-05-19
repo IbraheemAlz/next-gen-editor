@@ -11,6 +11,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bridge = { path = "../bridge" }
+text-pipeline = { path = "../text-pipeline" }
+render = { path = "../render" }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }

@@ -1,0 +1,17 @@
+{
+  "name": "visual-diff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "run": "node run.mjs",
+    "update": "UPDATE=1 node run.mjs"
+  },
+  "dependencies": {
+    "pixelmatch": "^7.1.0",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
+  }
+}

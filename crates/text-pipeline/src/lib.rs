@@ -1,4 +1,8 @@
 //! `text-pipeline` — Unicode BiDi + shaping + line-break + Kashida justify.
 //!
-//! Scaffolding only at week 2 of Phase 1. Real pipeline lands weeks 7–13
-//! per PHASE_3_RENDER_RTL.md §3–§6.
+//! Phase 1 week 5–6: font load + glyph metrics + raster (`fonts.rs`).
+//! BiDi + shaping + segmentation land weeks 7+ per PHASE_3_RENDER_RTL.md §3.
+
+pub mod fonts;
+
+pub use fonts::{FontError, FontMetrics, GlyphMetrics, LoadedFont, RasterizedGlyph};

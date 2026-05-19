@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Unicode BiDi + shaping + line-break + Kashida justification."
+
+[dependencies]
+swash = { workspace = true }
+thiserror = { workspace = true }

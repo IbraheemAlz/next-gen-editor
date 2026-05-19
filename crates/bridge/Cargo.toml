@@ -8,5 +8,6 @@ description = "RPC command/event types shared between WASM engine and TS client.
 
 [dependencies]
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 tsify-next = { workspace = true }
 wasm-bindgen = { workspace = true }

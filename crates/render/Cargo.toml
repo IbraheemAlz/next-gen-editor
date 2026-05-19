@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Display list + Vello (WebGPU) + Canvas2D fallback backends."
+
+[dependencies]
+text-pipeline = { path = "../text-pipeline" }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true }
