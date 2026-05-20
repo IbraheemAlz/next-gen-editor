@@ -27,6 +27,10 @@ declare global {
         __engineClient?: EngineClient;
         /** Most recent EngineStats event (debugging / e2e hook). */
         __lastStats?: unknown;
+        /** Cold-boot duration in ms (e2e hook for boot.spec.ts). */
+        __bootMs?: number;
+        /** Set true after a successful crash recovery (e2e hook). */
+        __recovered?: boolean;
     }
 }
 
@@ -130,6 +134,7 @@ async function runInteractive(
                 loading.classList.add('hidden');
                 textarea.focus();
                 status.textContent = 'recovered — keep typing';
+                window.__recovered = true;
             } catch (e: unknown) {
                 const msg = e instanceof Error ? e.message : String(e);
                 status.textContent = `recovery failed: ${msg}`;
@@ -140,7 +145,9 @@ async function runInteractive(
     const client = new EngineClient('interactive', onCrash);
     window.__engineClient = client;
 
+    const bootStart = performance.now();
     await client.init(current.transferControlToOffscreen());
+    window.__bootMs = performance.now() - bootStart;
     window.__engineReady = true;
     await setupEngine(client);
     window.__paintIdle = true;

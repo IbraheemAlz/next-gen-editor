@@ -13,7 +13,15 @@
 import type { Command, DocFormat, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js';
 import { loadLatestEventLog } from './event-log';
 
-type Resolver = (v: { ok: boolean; evt?: Event; error?: string; trap?: boolean }) => void;
+type WorkerReply = {
+    ok: boolean;
+    evt?: Event;
+    error?: string;
+    trap?: boolean;
+    /** Worker-context cross-origin isolation, reported in the INIT reply. */
+    crossOriginIsolated?: boolean;
+};
+type Resolver = (v: WorkerReply) => void;
 
 export class EngineClient {
     private worker!: Worker;
@@ -23,6 +31,7 @@ export class EngineClient {
     private documentId: string;
     private onCrash: () => void;
     private recovering = false;
+    private workerIsolated = false;
 
     /**
      * @param documentId identifies the IndexedDB event log for this document.
@@ -46,7 +55,13 @@ export class EngineClient {
     }
 
     async init(canvas: OffscreenCanvas): Promise<void> {
-        await this.send({ type: 'INIT', canvas, documentId: this.documentId }, [canvas]);
+        const r = await this.send({ type: 'INIT', canvas, documentId: this.documentId }, [canvas]);
+        this.workerIsolated = r.crossOriginIsolated === true;
+    }
+
+    /** D2.3: whether the engine worker reported `crossOriginIsolated === true`. */
+    get crossOriginIsolated(): boolean {
+        return this.workerIsolated;
     }
 
     /**
@@ -99,8 +114,17 @@ export class EngineClient {
         };
     }
 
+    /**
+     * Test hook (ts/e2e/crash-recovery.spec.ts): simulate a worker crash by
+     * terminating the worker and running the trap-recovery path.
+     */
+    forceTrap(): void {
+        this.worker.terminate();
+        this.onTrap();
+    }
+
     private send(payload: any, transfer: Transferable[] = []) {
-        return new Promise<{ ok: boolean; evt?: Event; error?: string; trap?: boolean }>(
+        return new Promise<WorkerReply>(
             (resolve) => {
                 const id = this.nextId++;
                 this.pending.set(id, resolve);

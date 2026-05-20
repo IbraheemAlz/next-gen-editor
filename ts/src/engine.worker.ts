@@ -308,7 +308,12 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         });
         engine = new Engine(msg.canvas);
         await openEventLog(msg.documentId);
-        self.postMessage({ id: msg.id, ok: true });
+        /* Report worker-context cross-origin isolation (D2.3) in the reply. */
+        self.postMessage({
+            id: msg.id,
+            ok: true,
+            crossOriginIsolated: self.crossOriginIsolated,
+        });
     } catch (e: unknown) {
         replyError(msg.id, e);
     }
@@ -347,18 +352,32 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         const t0 = performance.now();
         const evt = await dispatch(msg.cmd);
         const elapsed = performance.now() - t0;
-
-        await appendCommand(++logSequence, msg.cmd);
-        if (logSequence - lastSnapshotAt >= SNAPSHOT_EVERY) {
-            /* TODO Phase 2 D2.6: persist engine.snapshot() once that engine
-               API exists; an empty buffer is a placeholder for now. */
-            await persistSnapshot(logSequence, new Uint8Array(0));
-            lastSnapshotAt = logSequence;
-        }
-
         self.postMessage({ id: msg.id, ok: true, evt, elapsed });
+        /* D2.8 backpressure (PHASE_2_BRIDGE_MEMORY.md §12 risk 5): persist to
+           the event log OFF the critical path. The RPC response is already
+           sent, so event-log latency never throttles command throughput. */
+        logCommand(msg.cmd);
     } catch (e: unknown) {
         replyError(msg.id, e);
+    }
+}
+
+/**
+ * Append a command to the durable log without blocking the RPC response.
+ * `logSequence` increments synchronously so sequence order is preserved even
+ * though the IndexedDB writes settle asynchronously.
+ */
+function logCommand(cmd: Command): void {
+    const seq = ++logSequence;
+    void appendCommand(seq, cmd).catch((e: unknown) =>
+        console.warn('[worker] event-log append failed', e),
+    );
+    if (seq - lastSnapshotAt >= SNAPSHOT_EVERY) {
+        lastSnapshotAt = seq;
+        /* TODO Phase 2 D2.6: persist engine.snapshot() once that API exists. */
+        void persistSnapshot(seq, new Uint8Array(0)).catch((e: unknown) =>
+            console.warn('[worker] event-log snapshot failed', e),
+        );
     }
 }
 

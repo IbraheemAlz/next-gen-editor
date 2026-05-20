@@ -10,6 +10,10 @@ node_modules/
 dist/
 .pnpm-store/
 
+# Playwright e2e output
+test-results/
+playwright-report/
+
 # Tooling
 tmp/
 .vscode/
