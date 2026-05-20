@@ -1,8 +1,10 @@
 /* EngineClient — typed RPC wrapper around the engine Web Worker.
- * PHASE_2_BRIDGE_MEMORY.md §7.
+ * PHASE_2_BRIDGE_MEMORY.md §7, plus the §10.3 crash-recovery flow.
  *
  * Spawns the dedicated worker, matches request/response by `id`, and fans
- * unidirectional events (Painted, SelectionChanged, …) out to subscribers.
+ * unidirectional events out to subscribers. On a WASM trap it rejects all
+ * in-flight requests and hands off to the UI-supplied `onCrash` callback,
+ * which must provide a fresh OffscreenCanvas and call `recover()`.
  *
  * Note: the §7 spec imports types from `crates/bridge/pkg/types`. The bridge
  * crate is not built standalone — its `Command`/`Event` types are generated
@@ -19,9 +21,19 @@ export class EngineClient {
     private pending = new Map<number, Resolver>();
     private subscribers = new Set<(e: Event) => void>();
     private documentId: string;
+    private onCrash: () => void;
+    private recovering = false;
 
-    constructor(documentId: string) {
+    /**
+     * @param documentId identifies the IndexedDB event log for this document.
+     * @param onCrash    invoked when the engine worker traps. The handler must
+     *                   create a fresh `<canvas>`, transfer it, and call
+     *                   `recover()` — `transferControlToOffscreen()` is
+     *                   one-shot, so the trapped surface cannot be reused.
+     */
+    constructor(documentId: string, onCrash: () => void) {
         this.documentId = documentId;
+        this.onCrash = onCrash;
         this.spawn();
     }
 
@@ -37,11 +49,24 @@ export class EngineClient {
         await this.send({ type: 'INIT', canvas, documentId: this.documentId }, [canvas]);
     }
 
-    async recover(canvas: OffscreenCanvas, snapshot: Uint8Array, log: Command[]): Promise<void> {
-        await this.send({ type: 'RECOVER', canvas, snapshot, log }, [
-            canvas,
-            snapshot.buffer as ArrayBuffer,
-        ]);
+    /**
+     * Recover after a trap: load the latest snapshot + command tail, spawn a
+     * fresh worker, and replay via `Command::Recover`. `canvas` must be a
+     * brand-new OffscreenCanvas — the trapped surface is gone.
+     */
+    async recover(canvas: OffscreenCanvas): Promise<void> {
+        try {
+            const { snapshot, log, snapshotSeq, lastSeq } = await loadLatestEventLog(
+                this.documentId,
+            );
+            this.spawn();
+            await this.send({ type: 'RECOVER', canvas, snapshot, log, snapshotSeq, lastSeq }, [
+                canvas,
+                snapshot.buffer as ArrayBuffer,
+            ]);
+        } finally {
+            this.recovering = false;
+        }
     }
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {
@@ -74,26 +99,28 @@ export class EngineClient {
             cb(msg);
         }
         if (msg.evt) this.subscribers.forEach((s) => s(msg.evt));
-        if (msg.trap) void this.onTrap();
+        if (msg.trap) this.onTrap();
     }
 
     private onWorkerError(e: ErrorEvent): void {
         console.error('worker error', e);
-        void this.onTrap();
+        this.onTrap();
     }
 
-    private async onTrap(): Promise<void> {
-        /* Phase 2 D2.7 crash-recovery: read the latest snapshot + command
-           tail, respawn the worker, and replay into a fresh engine. */
-        const { snapshot, log } = await loadLatestEventLog(this.documentId);
-        this.spawn();
-        const canvas = newOffscreenForTrapRecovery();
-        await this.recover(canvas, snapshot, log);
+    /**
+     * Trap handler. Rejects every in-flight request — the dead worker will
+     * never answer — then hands off to the UI shell via `onCrash`. The UI
+     * supplies a fresh canvas and calls `recover()`. The `recovering` guard
+     * drops a duplicate report (the worker posts `{ trap: true }` and may
+     * also fire `onerror`); `recover()` clears it.
+     */
+    private onTrap(): void {
+        if (this.recovering) return;
+        this.recovering = true;
+        for (const resolve of this.pending.values()) {
+            resolve({ ok: false, error: 'engine worker trapped; recovering', trap: true });
+        }
+        this.pending.clear();
+        this.onCrash();
     }
-}
-
-/* Placeholder recovery surface. Phase 2 D2.7 re-acquires the real
-   OffscreenCanvas from the main-thread canvas element. */
-function newOffscreenForTrapRecovery(): OffscreenCanvas {
-    return new OffscreenCanvas(1, 1);
 }

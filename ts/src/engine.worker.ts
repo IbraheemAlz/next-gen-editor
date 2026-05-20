@@ -32,6 +32,8 @@ type ClientRecoverMsg = {
     canvas: OffscreenCanvas;
     snapshot: Uint8Array;
     log: Command[];
+    snapshotSeq: number;
+    lastSeq: number;
 };
 type ClientCommandMsg = { id: number; cmd: Command };
 
@@ -321,6 +323,10 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             ),
         });
         engine = new Engine(msg.canvas);
+        /* Resume the event-log sequence past what was already persisted, so
+           post-recovery appends don't collide with or shadow prior rows. */
+        logSequence = msg.lastSeq;
+        lastSnapshotAt = msg.snapshotSeq;
         const evt = await dispatch({
             type: 'RECOVER',
             snapshot: msg.snapshot,

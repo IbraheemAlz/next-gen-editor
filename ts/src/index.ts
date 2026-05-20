@@ -1,6 +1,10 @@
 import EngineWorker from './engine.worker.ts?worker';
+import { EngineClient } from './engine-client';
 import type { Command, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js';
+import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
 
+/* Worker → main messages for the Phase 1 visual-diff harness path. The
+   interactive editor uses EngineClient instead (id-routed RPC). */
 type WorkerMsg =
     | { type: 'BOOT_OK' }
     | { type: 'PING_RESULT'; event: unknown }
@@ -17,13 +21,17 @@ declare global {
         __paintIdle?: boolean;
         __engineReady?: boolean;
         __lastEvent?: unknown;
-        /** Test hook: send a Command to the worker; resolves with the event. */
+        /** Test hook: send a Command to the engine; resolves with the Event. */
         __dispatch?: (cmd: Command) => Promise<Event>;
+        /** The interactive editor's client (debugging / e2e hook). */
+        __engineClient?: EngineClient;
     }
 }
 
-/* The interactive editor and the a4 visual-diff cases all paint a full A4
-   page (595 × 842 pt → 1:1 canvas px). Single-glyph cases stay 400 × 400. */
+const AMIRI_ID = 'amiri';
+
+/* The interactive editor and the a4 visual-diff cases paint a full A4 page
+   (595 × 842 pt → 1:1 canvas px). Single-glyph cases stay 400 × 400. */
 function canvasSizeForCase(testCase: string): { w: number; h: number } {
     if (
         testCase === '' ||
@@ -52,31 +60,119 @@ async function main(): Promise<void> {
     canvas.style.width = `${w}px`;
     canvas.style.height = `${h}px`;
 
-    if (interactive) {
-        status.textContent = 'loading editor…';
-        status.style.pointerEvents = 'none';
-        /* Center the A4 page horizontally with a small top gap, like a
-           document on a desk. Test mode keeps the canvas at (0,0) so the
-           visual-diff screenshot clip stays correct. */
-        canvas.style.margin = '24px auto';
-        canvas.style.boxShadow = '0 2px 12px rgba(0, 0, 0, 0.15)';
-    } else {
-        /* Visual-diff test mode: hide chrome so the canvas is the only
-           thing in the screenshot. */
-        status.style.display = 'none';
-        loading.classList.add('hidden');
-        document.documentElement.style.background = '#fff';
-        document.body.style.background = '#fff';
-    }
-
     if (!self.crossOriginIsolated) {
         console.warn('crossOriginIsolated is false — SAB unavailable');
     }
 
+    if (interactive) {
+        await runInteractive(canvas, textarea, status, loading);
+    } else {
+        runVisualDiffHarness(canvas, status, loading, testCase);
+    }
+}
+
+/* ===================================================================
+   Interactive editor — Phase 2 EngineClient path.
+   =================================================================== */
+
+/** Load the editor font and seed a blank A4 page. Reused on boot + recovery. */
+async function setupEngine(client: EngineClient): Promise<void> {
+    /* Amiri is a dual-script Naskh face — renders mixed Arabic/English without
+       engine-side font fallback (that lands in Phase 3). */
+    const fontBytes = new Uint8Array(await (await fetch(AMIRI_URL)).arrayBuffer());
+    /* D2.4: hand the font buffer to the worker as a Transferable — no copy. */
+    await client.dispatch({ type: 'LOAD_FONT', id: AMIRI_ID, bytes: fontBytes }, [
+        fontBytes.buffer as ArrayBuffer,
+    ]);
+    await client.dispatch({
+        type: 'RENDER_PAGE',
+        text: '',
+        font_id: AMIRI_ID,
+        base_direction: 'RTL',
+        px_size: 24,
+        line_height: 36,
+        align: 'START',
+    });
+}
+
+async function runInteractive(
+    canvas: HTMLCanvasElement,
+    textarea: HTMLTextAreaElement,
+    status: HTMLElement,
+    loading: HTMLElement,
+): Promise<void> {
+    status.textContent = 'loading editor…';
+    status.style.pointerEvents = 'none';
+    /* Center the A4 page like a document on a desk. */
+    canvas.style.margin = '24px auto';
+    canvas.style.boxShadow = '0 2px 12px rgba(0, 0, 0, 0.15)';
+
+    let current = canvas;
+
+    /* D2.7 crash recovery: the trapped worker consumed the OffscreenCanvas and
+       transferControlToOffscreen() is one-shot — so swap in a fresh <canvas>
+       element, transfer it, and hand it to recover(). */
+    const onCrash = (): void => {
+        status.textContent = 'engine crashed — recovering…';
+        loading.classList.remove('hidden');
+        const fresh = document.createElement('canvas');
+        fresh.id = current.id;
+        fresh.width = current.width;
+        fresh.height = current.height;
+        fresh.style.cssText = current.style.cssText;
+        current.replaceWith(fresh);
+        current = fresh;
+        const offscreen = fresh.transferControlToOffscreen();
+        void (async () => {
+            try {
+                await client.recover(offscreen);
+                await setupEngine(client);
+                loading.classList.add('hidden');
+                textarea.focus();
+                status.textContent = 'recovered — keep typing';
+            } catch (e: unknown) {
+                const msg = e instanceof Error ? e.message : String(e);
+                status.textContent = `recovery failed: ${msg}`;
+            }
+        })();
+    };
+
+    const client = new EngineClient('interactive', onCrash);
+    window.__engineClient = client;
+
+    await client.init(current.transferControlToOffscreen());
+    window.__engineReady = true;
+    await setupEngine(client);
+    window.__paintIdle = true;
+
+    loading.classList.add('hidden');
+    textarea.focus();
+    status.textContent = 'Ready — click the page and type. Ctrl+Z undo · Ctrl+Y redo';
+
+    const dispatch = (cmd: Command): Promise<Event> => client.dispatch(cmd);
+    window.__dispatch = dispatch;
+    wireInteractive(current, textarea, status, dispatch);
+}
+
+/* ===================================================================
+   Visual-diff harness — Phase 1 worker protocol (keeps the goldens green).
+   =================================================================== */
+
+function runVisualDiffHarness(
+    canvas: HTMLCanvasElement,
+    status: HTMLElement,
+    loading: HTMLElement,
+    testCase: string,
+): void {
+    /* Test mode: hide chrome so the canvas is the only thing screenshot. */
+    status.style.display = 'none';
+    loading.classList.add('hidden');
+    document.documentElement.style.background = '#fff';
+    document.body.style.background = '#fff';
+
     const worker = new EngineWorker();
     const offscreen = canvas.transferControlToOffscreen();
 
-    /* Promise-based command channel (main thread + Playwright tests). */
     let nextCommandId = 1;
     const pending = new Map<number, (e: Event) => void>();
     const dispatch = (cmd: Command): Promise<Event> => {
@@ -92,30 +188,17 @@ async function main(): Promise<void> {
         const msg = ev.data;
         switch (msg.type) {
             case 'BOOT_OK':
-                console.log('[editor] engine boot ok');
                 window.__engineReady = true;
                 break;
             case 'PING_RESULT':
-                console.log('[editor] ping/pong:', JSON.stringify(msg.event));
-                break;
             case 'FONT_LOADED_RESULT':
-                console.log('[editor] font loaded:', JSON.stringify(msg.event));
+            case 'EDIT_RESULT':
+            case 'DOCX_RESULT':
+                console.log(`[editor] ${msg.type}:`, JSON.stringify(msg.event));
                 break;
             case 'PAINT_RESULT':
-                console.log('[editor] paint result:', JSON.stringify(msg.event));
                 window.__lastEvent = msg.event;
-                if (interactive) {
-                    status.textContent =
-                        'Ready — click the page and type. Ctrl+Z undo · Ctrl+Y redo';
-                } else {
-                    status.textContent = `painted: ${JSON.stringify(msg.event)}`;
-                }
-                break;
-            case 'EDIT_RESULT':
-                console.log(`[editor] edit/${msg.step}:`, JSON.stringify(msg.event));
-                break;
-            case 'DOCX_RESULT':
-                console.log(`[editor] docx/${msg.step}:`, JSON.stringify(msg.event));
+                status.textContent = `painted: ${JSON.stringify(msg.event)}`;
                 break;
             case 'COMMAND_RESULT': {
                 const cb = pending.get(msg.id);
@@ -126,14 +209,7 @@ async function main(): Promise<void> {
                 break;
             }
             case 'IDLE':
-                console.log('[editor] worker idle');
                 window.__paintIdle = true;
-                /* Engine fully booted — drop the loading overlay and put the
-                   caret in the hidden input so typing works without a click. */
-                if (interactive) {
-                    loading.classList.add('hidden');
-                    textarea.focus();
-                }
                 break;
             case 'ERROR':
                 status.textContent = `error: ${msg.error}`;
@@ -150,10 +226,6 @@ async function main(): Promise<void> {
     };
 
     worker.postMessage({ type: 'INIT', canvas: offscreen, testCase }, [offscreen]);
-
-    if (interactive) {
-        wireInteractive(canvas, textarea, status, dispatch);
-    }
 }
 
 /**
@@ -176,10 +248,8 @@ function wireInteractive(
 
     const focusInput = (): void => textarea.focus();
     focusInput();
-    /* A single load-time focus() is unreliable — the window may not have
-       settled focus yet (user just hit Enter in the address bar). Re-grab the
-       caret on any pointer-down and whenever the window regains focus, so
-       "open page, start typing" works without an explicit click. */
+    /* A single load-time focus() is unreliable — re-grab the caret on any
+       pointer-down and when the window regains focus. */
     canvas.addEventListener('pointerdown', focusInput);
     document.body.addEventListener('pointerdown', focusInput);
     window.addEventListener('focus', focusInput);
@@ -194,9 +264,7 @@ function wireInteractive(
 
     const insert = (text: string): void => {
         if (!text) return;
-        void dispatch({ type: 'INSERT_TEXT', at: undefined, text } as Command).then(
-            showUndoState,
-        );
+        void dispatch({ type: 'INSERT_TEXT', at: undefined, text }).then(showUndoState);
     };
 
     /* Direct keyboard input. `beforeinput` with isComposing=true means an IME
@@ -223,10 +291,10 @@ function wireInteractive(
         const k = e.key.toLowerCase();
         if (k === 'z' && !e.shiftKey) {
             e.preventDefault();
-            void dispatch({ type: 'UNDO' } as Command).then(showUndoState);
+            void dispatch({ type: 'UNDO' }).then(showUndoState);
         } else if (k === 'y' || (k === 'z' && e.shiftKey)) {
             e.preventDefault();
-            void dispatch({ type: 'REDO' } as Command).then(showUndoState);
+            void dispatch({ type: 'REDO' }).then(showUndoState);
         }
     });
 }
