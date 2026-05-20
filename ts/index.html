@@ -12,9 +12,30 @@
             background: rgba(0, 0, 0, 0.75); color: #fff; border-radius: 4px;
             font: 12px / 1.4 ui-monospace, Menlo, Consolas, monospace; z-index: 10;
         }
+        /*
+         * Loading overlay. The canvas paints its own white A4 background only
+         * after the WASM engine boots — until then the bare #doc element shows
+         * CSS white and *looks* like a ready page. This overlay covers that
+         * trap so the user waits for boot instead of typing into a dead editor.
+         * Removed when the worker posts IDLE.
+         */
+        #loading {
+            position: fixed; inset: 0; z-index: 100;
+            display: flex; align-items: center; justify-content: center;
+            background: #f6f6f6; color: #555;
+            font: 15px / 1.5 system-ui, sans-serif;
+        }
+        #loading::before {
+            content: ""; width: 16px; height: 16px; margin-inline-end: 10px;
+            border: 2px solid #ccc; border-top-color: #0052cc; border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #loading.hidden { display: none; }
     </style>
 </head>
 <body>
+    <div id="loading">Loading editor…</div>
     <canvas id="doc"></canvas>
     <textarea id="input"
               aria-label="document input"

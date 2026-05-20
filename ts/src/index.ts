@@ -40,6 +40,7 @@ async function main(): Promise<void> {
     const status = document.getElementById('status')!;
     const canvas = document.querySelector<HTMLCanvasElement>('#doc')!;
     const textarea = document.querySelector<HTMLTextAreaElement>('#input')!;
+    const loading = document.getElementById('loading')!;
 
     const params = new URLSearchParams(window.location.search);
     const testCase = params.get('test') ?? '';
@@ -63,6 +64,7 @@ async function main(): Promise<void> {
         /* Visual-diff test mode: hide chrome so the canvas is the only
            thing in the screenshot. */
         status.style.display = 'none';
+        loading.classList.add('hidden');
         document.documentElement.style.background = '#fff';
         document.body.style.background = '#fff';
     }
@@ -126,6 +128,12 @@ async function main(): Promise<void> {
             case 'IDLE':
                 console.log('[editor] worker idle');
                 window.__paintIdle = true;
+                /* Engine fully booted — drop the loading overlay and put the
+                   caret in the hidden input so typing works without a click. */
+                if (interactive) {
+                    loading.classList.add('hidden');
+                    textarea.focus();
+                }
                 break;
             case 'ERROR':
                 status.textContent = `error: ${msg.error}`;
@@ -168,8 +176,13 @@ function wireInteractive(
 
     const focusInput = (): void => textarea.focus();
     focusInput();
+    /* A single load-time focus() is unreliable — the window may not have
+       settled focus yet (user just hit Enter in the address bar). Re-grab the
+       caret on any pointer-down and whenever the window regains focus, so
+       "open page, start typing" works without an explicit click. */
     canvas.addEventListener('pointerdown', focusInput);
     document.body.addEventListener('pointerdown', focusInput);
+    window.addEventListener('focus', focusInput);
 
     const showUndoState = (e: Event): void => {
         if (e.type === 'TEXT_INSERTED' || e.type === 'UNDO_STATE_CHANGED') {
