@@ -66,4 +66,13 @@ mod tests {
         /* Bounding box enclosing both. */
         assert_eq!(d.drain(), Some(Rect::new(0.0, 0.0, 30.0, 30.0)));
     }
+
+    #[test]
+    fn contained_rect_is_absorbed() {
+        let mut d = DirtyTracker::new();
+        d.invalidate(Rect::new(0.0, 0.0, 100.0, 100.0));
+        d.invalidate(Rect::new(40.0, 40.0, 60.0, 60.0));
+        /* The inner rect leaves the bounding region unchanged. */
+        assert_eq!(d.drain(), Some(Rect::new(0.0, 0.0, 100.0, 100.0)));
+    }
 }

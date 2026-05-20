@@ -246,4 +246,21 @@ mod tests {
             "font not embedded"
         );
     }
+
+    #[test]
+    fn empty_page_exports_valid_pdf() {
+        let stack = FontStack::from_faces(HashMap::new(), "none");
+        let page = PageBox {
+            size: Size {
+                width: 595.0,
+                height: 842.0,
+            },
+            margins: Margins::uniform(72.0),
+            paragraphs: vec![],
+        };
+        let mut out = Vec::new();
+        export_pdf(&page, &stack, &mut out).expect("export empty page");
+        assert!(out.starts_with(b"%PDF-"), "missing PDF header");
+        assert!(out.ends_with(b"%%EOF"), "missing EOF marker");
+    }
 }

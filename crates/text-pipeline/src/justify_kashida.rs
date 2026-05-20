@@ -147,4 +147,17 @@ mod tests {
         );
         assert!(KashidaPriority::P1 < KashidaPriority::P5);
     }
+
+    #[test]
+    fn taa_and_thaa_are_p3() {
+        // taa (ط) and thaa (ث), each before a dual-joining letter.
+        assert_eq!(
+            kashida_point('\u{0637}', '\u{0628}'),
+            Some(KashidaPriority::P3)
+        );
+        assert_eq!(
+            kashida_point('\u{062B}', '\u{0628}'),
+            Some(KashidaPriority::P3)
+        );
+    }
 }
