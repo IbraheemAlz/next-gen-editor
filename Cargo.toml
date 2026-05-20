@@ -45,6 +45,10 @@ rustybuzz = "0.20"
 swash = "0.2"
 read-fonts = "0.27"
 
+# Rendering (Phase 3)
+kurbo = "0.13.1"
+peniko = "0.6.1"
+
 # Structures
 im = "15"
 smallvec = "1"

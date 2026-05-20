@@ -9,7 +9,10 @@ use bridge::{
 };
 use engine::{DocumentTree, LogicalPos as EnginePos, UndoStack};
 use format_docx::writer::build_minimal_docx;
-use layout::{A4Page, ParagraphConfig, layout_paragraph};
+use layout::{A4Page, LineBox, ParagraphConfig, layout_paragraph};
+use render::atlas::GlyphAtlas;
+use render::canvas2d_backend::render_canvas2d;
+use render::scene::{PaintConfig, build_page_scene};
 use std::collections::HashMap;
 use std::sync::Arc;
 use text_pipeline::{Alignment, LoadedFont, ShapingDirection, shape_text};
@@ -36,6 +39,7 @@ pub struct Engine {
     fonts: HashMap<String, Arc<LoadedFont>>,
     undo: UndoStack,
     layout_cfg: Option<RenderConfig>,
+    atlas: GlyphAtlas,
 }
 
 #[wasm_bindgen]
@@ -53,6 +57,7 @@ impl Engine {
             fonts: HashMap::new(),
             undo: UndoStack::new(DocumentTree::new(), 100),
             layout_cfg: None,
+            atlas: GlyphAtlas::new(),
         })
     }
 
@@ -458,30 +463,12 @@ impl Engine {
             }
         };
         let page = A4Page::a4();
-        let ctx = match &self.ctx {
-            Some(c) => c,
-            None => {
-                return Err(Box::new(Event::Error {
-                    message: "no canvas".into(),
-                }));
-            }
-        };
 
-        /* Clear + border. */
-        ctx.set_fill_style_str("#ffffff");
-        ctx.fill_rect(0.0, 0.0, page.width as f64, page.height as f64);
-        ctx.set_stroke_style_str("#cccccc");
-        ctx.set_line_width(1.0);
-        ctx.stroke_rect(0.5, 0.5, page.width as f64 - 1.0, page.height as f64 - 1.0);
-
-        let margin_left = page.margin.left as f64;
-        let margin_top = page.margin.top as f64;
-        let content_width = page.content_width() as f64;
-
-        let mut total_lines = 0u32;
-        let mut total_glyphs = 0u32;
+        /* Lay out every paragraph and stack them into a flat line list whose
+        `baseline_y` is page-absolute, ready for the scene builder. */
+        let margin_top = page.margin.top;
+        let mut flat_lines: Vec<LineBox> = Vec::new();
         let mut para_y_offset = 0.0_f32;
-
         let doc = self.undo.current().clone();
         for para in &doc.paragraphs {
             if para.text.is_empty() {
@@ -498,49 +485,48 @@ impl Engine {
                 alignment: cfg.alignment,
             };
             let lines = layout_paragraph(para_cfg);
-
-            for line in &lines {
-                total_lines += 1;
-                let direction_is_rtl = matches!(line.direction, Some(ShapingDirection::Rtl));
-                let natural_w = line.natural_width as f64;
-                let x_origin = if matches!(cfg.alignment, Alignment::Center) {
-                    margin_left + (content_width - natural_w) / 2.0
-                } else if direction_is_rtl && natural_w < content_width - 0.5 {
-                    margin_left + (content_width - natural_w)
-                } else {
-                    margin_left
-                };
-                let baseline_y = margin_top + (para_y_offset + line.baseline_y) as f64;
-
-                for g in &line.glyphs {
-                    total_glyphs += 1;
-                    if g.glyph_id == 0 {
-                        continue;
-                    }
-                    let raster = match font.rasterize_glyph(g.glyph_id as u16, cfg.px_size) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    let dx = x_origin + g.x as f64 + g.x_offset as f64;
-                    let dy = baseline_y - g.y_offset as f64;
-                    if let Err(e) =
-                        render::canvas2d_backend::paint_alpha_glyph(ctx, &raster, dx, dy, [0, 0, 0])
-                    {
-                        return Err(Box::new(Event::Error {
-                            message: format!("paint: {e:?}"),
-                        }));
-                    }
-                }
+            let n_lines = lines.len();
+            for mut line in lines {
+                line.baseline_y += margin_top + para_y_offset;
+                flat_lines.push(line);
             }
+            para_y_offset += n_lines as f32 * cfg.line_height;
+        }
 
-            para_y_offset += lines.len() as f32 * cfg.line_height;
+        let line_count = flat_lines.len() as u32;
+        let glyph_count: u32 = flat_lines.iter().map(|l| l.glyphs.len() as u32).sum();
+
+        /* Layout → scene builder → Canvas2D backend. */
+        let scene = build_page_scene(
+            &page,
+            &flat_lines,
+            &PaintConfig {
+                font: cfg.font_id.clone(),
+                px_size: cfg.px_size,
+                alignment: cfg.alignment,
+            },
+        );
+        let ctx = match &self.ctx {
+            Some(c) => c.clone(),
+            None => {
+                return Err(Box::new(Event::Error {
+                    message: "no canvas".into(),
+                }));
+            }
+        };
+        if let Err(e) = render_canvas2d(&ctx, &scene, &mut self.atlas, |id| {
+            self.fonts.get(id).cloned()
+        }) {
+            return Err(Box::new(Event::Error {
+                message: format!("paint: {e:?}"),
+            }));
         }
 
         Ok(RenderStats {
             page_width: page.width,
             page_height: page.height,
-            line_count: total_lines,
-            glyph_count: total_glyphs,
+            line_count,
+            glyph_count,
         })
     }
 }
@@ -566,6 +552,7 @@ mod tests {
             fonts: HashMap::new(),
             undo: UndoStack::new(DocumentTree::new(), 8),
             layout_cfg: None,
+            atlas: GlyphAtlas::new(),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine

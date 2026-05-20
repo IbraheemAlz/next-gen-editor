@@ -1,7 +1,9 @@
-//! `render` — display list + Vello + Canvas2D backends.
+//! `render` — backend-agnostic display list + Canvas2D backend.
 //!
-//! Phase 1 weeks 5–6: minimal Canvas2D backend that blits a rasterized glyph
-//! alpha mask (`canvas2d_backend`). Full display list + Vello backend land
-//! week 14+ per PHASE_3_RENDER_RTL.md §9.
+//! Phase 3 batch 1: `scene` (display list + page scene builder), `atlas`
+//! (LRU glyph cache), `canvas2d_backend` (display-list interpreter). The
+//! Vello (WebGPU) backend lands in batch 2 (PHASE_3_RENDER_RTL.md §9.2).
 
+pub mod atlas;
 pub mod canvas2d_backend;
+pub mod scene;

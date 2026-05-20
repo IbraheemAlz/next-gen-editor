@@ -8,6 +8,10 @@ description = "Display list + Vello (WebGPU) + Canvas2D fallback backends."
 
 [dependencies]
 text-pipeline = { path = "../text-pipeline" }
+layout = { path = "../layout" }
+kurbo = { workspace = true }
+peniko = { workspace = true }
+lru = { workspace = true }
 wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }
 web-sys = { workspace = true }
