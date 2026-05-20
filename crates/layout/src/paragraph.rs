@@ -12,18 +12,17 @@
 use crate::boxes::{LineBox, ParagraphBox, Point, PositionedGlyph, Size, TextAttrs, VisualRun};
 use std::mem::take;
 use text_pipeline::{
-    Alignment, JustifyMode, LoadedFont, ShapingDirection, analyze_bidi, break_opportunities,
+    Alignment, FontStack, JustifyMode, ShapingDirection, analyze_bidi, break_opportunities,
     justify::is_arabic_codepoint,
     justify_kashida::{JoinRole, KashidaPriority, join_role, kashida_point},
-    shape_text,
+    segment_by_script, shape_text,
 };
 
 pub struct ParagraphConfig<'a> {
     pub text: &'a str,
-    pub font: &'a LoadedFont,
-    /// Font-map key stamped onto every `VisualRun` so the renderer can resolve
-    /// the face without a side channel.
-    pub font_id: &'a str,
+    /// Per-script font resolver — Latin and Arabic runs each shape against a
+    /// covering face (PHASE_3_RENDER_RTL.md §13.A).
+    pub fonts: &'a FontStack,
     pub base_direction: ShapingDirection,
     pub px_size: f32,
     pub max_width: f32,
@@ -100,9 +99,9 @@ fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
             continue;
         }
         let candidate = &cfg.text[start..b];
-        let probe = shape_text(cfg.font, candidate, cfg.base_direction, cfg.px_size);
+        let probe = measure_text(cfg.fonts, candidate, cfg.base_direction, cfg.px_size);
 
-        if probe.total_advance <= cfg.max_width {
+        if probe <= cfg.max_width {
             last_fit_end = b;
         } else {
             /* Overflow. Commit whatever fit so far. */
@@ -131,32 +130,47 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
     let line_text = &cfg.text[start..end];
     let bidi = analyze_bidi(line_text, cfg.base_direction);
 
-    let mut runs: Vec<VisualRun> = Vec::with_capacity(bidi.visual_runs.len());
+    let mut runs: Vec<VisualRun> = Vec::new();
     for brun in &bidi.visual_runs {
-        let substr = &line_text[brun.range.clone()];
-        let shaped = shape_text(cfg.font, substr, brun.direction, cfg.px_size);
-        let glyphs: Vec<PositionedGlyph> = shaped
-            .glyphs
-            .iter()
-            .map(|g| PositionedGlyph {
-                id: g.glyph_id as u16,
-                cluster: g.cluster,
-                x_advance: g.x_advance,
-                y_advance: g.y_advance,
-                x_offset: g.x_offset,
-                y_offset: g.y_offset,
-            })
-            .collect();
-        runs.push(VisualRun {
-            glyphs,
-            font: cfg.font_id.to_string(),
-            direction: brun.direction,
-            source_range: (start + brun.range.start) as u32..(start + brun.range.end) as u32,
-            attrs: TextAttrs {
-                px_size: cfg.px_size,
-                color: cfg.text_color,
-            },
-        });
+        let brun_text = &line_text[brun.range.clone()];
+        /* Split the BiDi run into single-script segments so each shapes
+        against a covering font. `segment_by_script` yields logical order; an
+        RTL run reverses to visual (left-to-right). */
+        let mut segments = segment_by_script(brun_text);
+        if matches!(brun.direction, ShapingDirection::Rtl) {
+            segments.reverse();
+        }
+        for (srange, script) in segments {
+            let Some((font_id, face)) = cfg.fonts.resolve(script) else {
+                continue;
+            };
+            let sub_text = &brun_text[srange.start..srange.end];
+            let shaped = shape_text(face, sub_text, brun.direction, cfg.px_size);
+            let glyphs: Vec<PositionedGlyph> = shaped
+                .glyphs
+                .iter()
+                .map(|g| PositionedGlyph {
+                    id: g.glyph_id as u16,
+                    cluster: g.cluster,
+                    x_advance: g.x_advance,
+                    y_advance: g.y_advance,
+                    x_offset: g.x_offset,
+                    y_offset: g.y_offset,
+                })
+                .collect();
+            let abs_start = (start + brun.range.start + srange.start) as u32;
+            let abs_end = (start + brun.range.start + srange.end) as u32;
+            runs.push(VisualRun {
+                glyphs,
+                font: font_id.clone(),
+                direction: brun.direction,
+                source_range: abs_start..abs_end,
+                attrs: TextAttrs {
+                    px_size: cfg.px_size,
+                    color: cfg.text_color,
+                },
+            });
+        }
     }
 
     LineBox {
@@ -175,6 +189,19 @@ fn line_advance(runs: &[VisualRun]) -> f32 {
         .flat_map(|r| &r.glyphs)
         .map(|g| g.x_advance)
         .sum()
+}
+
+/// Total advance of `text` shaped with per-script fonts — the greedy probe's
+/// width estimate. Mirrors [`build_line`]'s segmentation so a fitted candidate
+/// measures consistently with the line eventually built.
+fn measure_text(fonts: &FontStack, text: &str, direction: ShapingDirection, px_size: f32) -> f32 {
+    let mut total = 0.0_f32;
+    for (range, script) in segment_by_script(text) {
+        if let Some((_, face)) = fonts.resolve(script) {
+            total += shape_text(face, &text[range], direction, px_size).total_advance;
+        }
+    }
+    total
 }
 
 /// Horizontal offset of a line within its paragraph's content width. Mirrors

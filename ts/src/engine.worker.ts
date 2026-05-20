@@ -42,9 +42,9 @@ type Msg = InitMsg | CommandMsg | ClientInitMsg | ClientRecoverMsg | ClientComma
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
 /* Amiri is a book-quality Naskh face that ALSO ships Latin glyphs, so the
-   interactive editor can render mixed Arabic/English without engine-side
-   font fallback (that lands in Phase 3). The visual-diff test cases keep
-   their original single-script fonts so their goldens stay valid. */
+   interactive editor renders mixed Arabic/English from a single face.
+   `a4-justified-mixed` instead exercises the engine's §13.A FontStack with
+   two single-script faces; the other test cases stay single-script. */
 const DUAL_ID = 'amiri';
 
 const A4_TEXT =
@@ -110,9 +110,10 @@ async function handleInit(msg: InitMsg): Promise<void> {
     /* Default (no ?test= param) is the interactive A4 editor. */
     const testCase = msg.testCase || 'interactive';
 
-    /* Per-case font loading. Interactive uses the dual-script Amiri so
-       mixed Arabic/English renders; the test cases keep their original
-       single-script fonts so their committed goldens stay valid. */
+    /* Per-case font loading. Interactive uses the dual-script Amiri so mixed
+       Arabic/English renders. `a4-justified-mixed` loads both single-script
+       faces so the engine's FontStack falls back per script (§13.A); the
+       remaining test cases are single-script. */
     if (testCase === 'interactive') {
         const e = await dispatch({
             type: 'LOAD_FONT',
@@ -120,8 +121,20 @@ async function handleInit(msg: InitMsg): Promise<void> {
             bytes: await fetchBytes(DUAL_URL),
         } as Command);
         self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
+    } else if (testCase === 'a4-justified-mixed') {
+        const arabic = await dispatch({
+            type: 'LOAD_FONT',
+            id: ARABIC_ID,
+            bytes: await fetchBytes(ARABIC_URL),
+        } as Command);
+        self.postMessage({ type: 'FONT_LOADED_RESULT', event: arabic });
+        const latin = await dispatch({
+            type: 'LOAD_FONT',
+            id: LATIN_ID,
+            bytes: await fetchBytes(LATIN_URL),
+        } as Command);
+        self.postMessage({ type: 'FONT_LOADED_RESULT', event: latin });
     } else if (
-        testCase === 'a4-justified-mixed' ||
         testCase === 'hello-arabic' ||
         testCase === 'editing-arabic' ||
         testCase === 'docx-round-trip'

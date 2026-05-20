@@ -16,7 +16,7 @@ use render::scene::build_page_scene;
 use render::vello_backend::VelloRenderer;
 use std::collections::HashMap;
 use std::sync::Arc;
-use text_pipeline::{Alignment, LoadedFont, ShapingDirection, shape_text};
+use text_pipeline::{Alignment, FontStack, LoadedFont, ShapingDirection, shape_text};
 use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
@@ -498,15 +498,16 @@ impl Engine {
                 }));
             }
         };
-        let font = match self.fonts.get(&cfg.font_id) {
-            Some(f) => f.clone(),
-            None => {
-                return Err(Box::new(Event::Error {
-                    message: format!("font `{}` not loaded", cfg.font_id),
-                }));
-            }
-        };
+        if !self.fonts.contains_key(&cfg.font_id) {
+            return Err(Box::new(Event::Error {
+                message: format!("font `{}` not loaded", cfg.font_id),
+            }));
+        }
         let page = A4Page::a4();
+
+        /* Build a per-script font stack from every loaded face; the cached
+        `font_id` is the primary and the fallback-chain root (§13.A). */
+        let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
 
         /* Lay out each document paragraph into a ParagraphBox, stacking them
         down the page content area, then assemble the PageBox. */
@@ -520,8 +521,7 @@ impl Engine {
             }
             let para_cfg = ParagraphConfig {
                 text: &para.text,
-                font: &font,
-                font_id: &cfg.font_id,
+                fonts: &font_stack,
                 base_direction: cfg.base_direction,
                 px_size: cfg.px_size,
                 max_width: page.content_width(),

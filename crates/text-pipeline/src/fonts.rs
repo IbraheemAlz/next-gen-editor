@@ -1,9 +1,15 @@
 //! Font loading + glyph metrics + glyph rasterization via `swash`.
 
+use crate::script::Script;
+use std::collections::HashMap;
+use std::sync::Arc;
 use swash::FontRef;
 use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::Format;
 use thiserror::Error;
+
+/// Font identifier — a key into the engine's font map.
+pub type FontId = String;
 
 #[derive(Debug, Error)]
 pub enum FontError {
@@ -76,6 +82,11 @@ impl LoadedFont {
         rustybuzz::Face::from_slice(&self.data, 0)
     }
 
+    /// Whether the font's cmap maps `ch` to a real (non-`.notdef`) glyph.
+    pub fn covers(&self, ch: char) -> bool {
+        self.face().charmap().map(ch) != 0
+    }
+
     pub fn metrics(&self, px_size: f32) -> FontMetrics {
         let m = self.face().metrics(&[]).scale(px_size);
         FontMetrics {
@@ -130,5 +141,70 @@ impl LoadedFont {
             top: image.placement.top,
             alpha: image.data,
         })
+    }
+}
+
+/// A per-script font resolver (PHASE_3_RENDER_RTL.md §13.A).
+///
+/// Holds every loaded face plus, for each script, the ids of the faces that
+/// cover it. [`resolve`](FontStack::resolve) picks the best face for a script,
+/// falling through `fallback_chain` when no script-specific face exists.
+pub struct FontStack {
+    faces: HashMap<FontId, Arc<LoadedFont>>,
+    by_script: HashMap<Script, Vec<FontId>>,
+    fallback_chain: Vec<FontId>,
+}
+
+impl FontStack {
+    /// Build a stack from loaded faces, classifying each by the scripts it
+    /// covers (probed against a representative codepoint). `primary` seeds the
+    /// fallback chain so a script with no dedicated face still resolves.
+    pub fn from_faces(faces: HashMap<FontId, Arc<LoadedFont>>, primary: &str) -> Self {
+        let mut by_script: HashMap<Script, Vec<FontId>> = HashMap::new();
+        for (id, face) in &faces {
+            if face.covers('\u{0628}') {
+                by_script
+                    .entry(Script::Arabic)
+                    .or_default()
+                    .push(id.clone());
+            }
+            if face.covers('A') {
+                by_script.entry(Script::Latin).or_default().push(id.clone());
+            }
+        }
+        /* Deterministic priority within each script. */
+        for ids in by_script.values_mut() {
+            ids.sort();
+        }
+        /* Fallback chain: the primary first, then the rest in id order. */
+        let mut fallback_chain: Vec<FontId> = Vec::new();
+        if faces.contains_key(primary) {
+            fallback_chain.push(primary.to_string());
+        }
+        let mut others: Vec<FontId> = faces
+            .keys()
+            .filter(|k| k.as_str() != primary)
+            .cloned()
+            .collect();
+        others.sort();
+        fallback_chain.extend(others);
+        Self {
+            faces,
+            by_script,
+            fallback_chain,
+        }
+    }
+
+    /// Resolve `script` to a font id and its loaded face — script-specific
+    /// faces first, then the fallback chain. `None` only when the stack holds
+    /// no faces at all.
+    pub fn resolve(&self, script: Script) -> Option<(&FontId, &LoadedFont)> {
+        let preferred = self.by_script.get(&script).into_iter().flatten();
+        for id in preferred.chain(self.fallback_chain.iter()) {
+            if let Some((key, face)) = self.faces.get_key_value(id) {
+                return Some((key, face.as_ref()));
+            }
+        }
+        None
     }
 }
