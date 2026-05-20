@@ -9,10 +9,10 @@ use bridge::{
 };
 use engine::{DocumentTree, LogicalPos as EnginePos, UndoStack};
 use format_docx::writer::build_minimal_docx;
-use layout::{A4Page, LineBox, ParagraphConfig, layout_paragraph};
+use layout::{A4Page, PageBox, ParagraphBox, ParagraphConfig, Point, Size, layout_paragraph};
 use render::atlas::GlyphAtlas;
 use render::canvas2d_backend::render_canvas2d;
-use render::scene::{PaintConfig, build_page_scene};
+use render::scene::build_page_scene;
 use render::vello_backend::VelloRenderer;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -508,10 +508,9 @@ impl Engine {
         };
         let page = A4Page::a4();
 
-        /* Lay out every paragraph and stack them into a flat line list whose
-        `baseline_y` is page-absolute, ready for the scene builder. */
-        let margin_top = page.margin.top;
-        let mut flat_lines: Vec<LineBox> = Vec::new();
+        /* Lay out each document paragraph into a ParagraphBox, stacking them
+        down the page content area, then assemble the PageBox. */
+        let mut paragraphs: Vec<ParagraphBox> = Vec::new();
         let mut para_y_offset = 0.0_f32;
         let doc = self.undo.current().clone();
         for para in &doc.paragraphs {
@@ -522,34 +521,41 @@ impl Engine {
             let para_cfg = ParagraphConfig {
                 text: &para.text,
                 font: &font,
+                font_id: &cfg.font_id,
                 base_direction: cfg.base_direction,
                 px_size: cfg.px_size,
                 max_width: page.content_width(),
                 line_height: cfg.line_height,
                 alignment: cfg.alignment,
+                text_color: [0, 0, 0, 255],
             };
-            let lines = layout_paragraph(para_cfg);
-            let n_lines = lines.len();
-            for mut line in lines {
-                line.baseline_y += margin_top + para_y_offset;
-                flat_lines.push(line);
-            }
-            para_y_offset += n_lines as f32 * cfg.line_height;
+            let mut para_box = layout_paragraph(para_cfg);
+            para_box.origin = Point {
+                x: 0.0,
+                y: para_y_offset,
+            };
+            para_y_offset += para_box.size.height;
+            paragraphs.push(para_box);
         }
 
-        let line_count = flat_lines.len() as u32;
-        let glyph_count: u32 = flat_lines.iter().map(|l| l.glyphs.len() as u32).sum();
+        let line_count: u32 = paragraphs.iter().map(|p| p.lines.len() as u32).sum();
+        let glyph_count: u32 = paragraphs
+            .iter()
+            .flat_map(|p| &p.lines)
+            .flat_map(|l| &l.runs)
+            .map(|r| r.glyphs.len() as u32)
+            .sum();
 
-        /* Layout → scene builder → Canvas2D backend. */
-        let scene = build_page_scene(
-            &page,
-            &flat_lines,
-            &PaintConfig {
-                font: cfg.font_id.clone(),
-                px_size: cfg.px_size,
-                alignment: cfg.alignment,
+        /* Box tree → scene builder → Canvas2D backend. */
+        let page_box = PageBox {
+            size: Size {
+                width: page.width,
+                height: page.height,
             },
-        );
+            margins: page.margin,
+            paragraphs,
+        };
+        let scene = build_page_scene(&page_box);
         let ctx = match &self.ctx {
             Some(c) => c.clone(),
             None => {

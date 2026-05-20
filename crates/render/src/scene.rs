@@ -1,18 +1,17 @@
 //! Backend-agnostic display list + page scene builder
 //! (PHASE_3_RENDER_RTL.md §9.1).
 //!
-//! Layout produces geometry (`A4Page` + `LineBox`s); [`build_page_scene`]
-//! lowers it to a linear [`DisplayList`] that any backend — Canvas2D today,
-//! Vello next — interprets. `kurbo` is the geometry vocabulary, `peniko` the
-//! paint vocabulary.
+//! Layout produces the hierarchical box tree ([`layout::PageBox`]);
+//! [`build_page_scene`] walks `PageBox` → `ParagraphBox` → `LineBox` →
+//! `VisualRun`, accumulating parent-relative origins into absolute positions,
+//! and lowers it to a linear [`DisplayList`] any backend interprets. `kurbo`
+//! is the geometry vocabulary, `peniko` the paint vocabulary.
 
 use kurbo::{Affine, Rect};
-use layout::{A4Page, LineBox};
+use layout::PageBox;
 use peniko::{Brush, Color};
-use text_pipeline::{Alignment, ShapingDirection};
 
-/// Font identifier. A `String` id keyed into the engine's font map for now;
-/// becomes a numeric handle when the Phase 3 `FontStack` lands.
+/// Font identifier — a key into the engine's font map.
 pub type FontId = String;
 
 /// A solid paint. Wraps a `peniko::Brush`; batch 1 only ever uses `Solid`.
@@ -75,16 +74,6 @@ pub struct DisplayList {
     pub cmds: Vec<DisplayCmd>,
 }
 
-/// Paint parameters the Phase 1 `LineBox` does not yet carry (font, size,
-/// alignment). Dissolves into per-run `VisualRun` attributes once the §5 box
-/// model lands.
-#[derive(Debug, Clone)]
-pub struct PaintConfig {
-    pub font: FontId,
-    pub px_size: f32,
-    pub alignment: Alignment,
-}
-
 /* Page chrome colours — fixed in the PoC; configurable in a later batch. */
 fn page_color() -> Color {
     Color::from_rgba8(0xff, 0xff, 0xff, 0xff)
@@ -92,20 +81,19 @@ fn page_color() -> Color {
 fn border_color() -> Color {
     Color::from_rgba8(0xcc, 0xcc, 0xcc, 0xff)
 }
-fn glyph_color() -> Color {
-    Color::from_rgba8(0x00, 0x00, 0x00, 0xff)
-}
 
-/// Lower a laid-out page into a [`DisplayList`].
+/// Lower a laid-out [`PageBox`] into a [`DisplayList`].
 ///
-/// `lines` must carry **page-absolute** `baseline_y` (the caller stacks
-/// paragraphs). Reproduces the Phase 1 inline paint loop exactly: white page
-/// fill, a 1px border inset 0.5px, then one glyph run per line.
-pub fn build_page_scene(page: &A4Page, lines: &[LineBox], cfg: &PaintConfig) -> DisplayList {
-    let mut cmds: Vec<DisplayCmd> = Vec::with_capacity(lines.len() + 2);
+/// Pure traversal — layout already owns every coordinate. Emits a white page
+/// fill and a 1px border inset 0.5px, then walks `PageBox` → `ParagraphBox` →
+/// `LineBox` → `VisualRun`. Each level's `origin` is parent-relative, so the
+/// accumulated origin reaches absolute glyph positions; font size and colour
+/// come from each run's `attrs` (no `PaintConfig` side channel).
+pub fn build_page_scene(page: &PageBox) -> DisplayList {
+    let mut cmds: Vec<DisplayCmd> = Vec::new();
 
-    let w = page.width as f64;
-    let h = page.height as f64;
+    let w = page.size.width as f64;
+    let h = page.size.height as f64;
     cmds.push(DisplayCmd::FillRect {
         rect: Rect::new(0.0, 0.0, w, h),
         paint: Paint::solid(page_color()),
@@ -116,39 +104,42 @@ pub fn build_page_scene(page: &A4Page, lines: &[LineBox], cfg: &PaintConfig) -> 
         width: 1.0,
     });
 
-    let margin_left = page.margin.left as f64;
-    let content_width = page.content_width() as f64;
+    /* Page content origin — paragraph and line origins are relative to it. */
+    let content_x = page.margins.left;
+    let content_y = page.margins.top;
 
-    for line in lines {
-        let natural_w = line.natural_width as f64;
-        let rtl = matches!(line.direction, Some(ShapingDirection::Rtl));
-        let x_origin = if cfg.alignment == Alignment::Center {
-            margin_left + (content_width - natural_w) / 2.0
-        } else if rtl && natural_w < content_width - 0.5 {
-            margin_left + (content_width - natural_w)
-        } else {
-            margin_left
-        };
-        let baseline_y = line.baseline_y as f64;
-
-        let mut glyphs: Vec<RunGlyph> = Vec::with_capacity(line.glyphs.len());
-        for g in &line.glyphs {
-            if g.glyph_id == 0 {
-                continue;
+    for para in &page.paragraphs {
+        let para_x = content_x + para.origin.x;
+        let para_y = content_y + para.origin.y;
+        for line in &para.lines {
+            let line_x = para_x + line.origin.x;
+            let baseline = para_y + line.origin.y + line.baseline;
+            /* One pen across the whole line; runs lie left-to-right in
+            visual order, each glyph placed at the cumulative advance. */
+            let mut pen = 0.0_f32;
+            for run in &line.runs {
+                let [r, g, b, a] = run.attrs.color;
+                let mut glyphs: Vec<RunGlyph> = Vec::with_capacity(run.glyphs.len());
+                for glyph in &run.glyphs {
+                    /* glyph id 0 is .notdef — advance the pen, draw nothing. */
+                    if glyph.id != 0 {
+                        glyphs.push(RunGlyph {
+                            glyph_id: glyph.id,
+                            x: (line_x as f64) + (pen as f64) + (glyph.x_offset as f64),
+                            y: (baseline as f64) - (glyph.y_offset as f64),
+                        });
+                    }
+                    pen += glyph.x_advance;
+                }
+                if !glyphs.is_empty() {
+                    cmds.push(DisplayCmd::DrawGlyphRun(GlyphRun {
+                        font: run.font.clone(),
+                        px_size: run.attrs.px_size,
+                        paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+                        glyphs,
+                    }));
+                }
             }
-            glyphs.push(RunGlyph {
-                glyph_id: g.glyph_id as u16,
-                x: x_origin + g.x as f64 + g.x_offset as f64,
-                y: baseline_y - g.y_offset as f64,
-            });
-        }
-        if !glyphs.is_empty() {
-            cmds.push(DisplayCmd::DrawGlyphRun(GlyphRun {
-                font: cfg.font.clone(),
-                px_size: cfg.px_size,
-                paint: Paint::solid(glyph_color()),
-                glyphs,
-            }));
         }
     }
 

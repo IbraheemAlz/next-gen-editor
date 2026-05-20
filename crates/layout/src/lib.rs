@@ -1,12 +1,15 @@
 //! `layout` — paragraph + page box layout on top of `text-pipeline`.
 //!
-//! Phase 1 week 14: A4 page + single-paragraph greedy line breaking +
-//! Latin/Kashida justification.
+//! Phase 3: a hierarchical box model (`boxes`) — `PageBox` → `ParagraphBox` →
+//! `LineBox` → `VisualRun` → `PositionedGlyph` — with parent-relative origins.
+//! `layout_paragraph` owns all geometry; the renderer is a pure tree walk.
 
-pub mod line_box;
+pub mod boxes;
 pub mod page;
 pub mod paragraph;
 
-pub use line_box::{LineBox, PaintedGlyph};
+pub use boxes::{
+    FontId, LineBox, PageBox, ParagraphBox, Point, PositionedGlyph, Size, TextAttrs, VisualRun,
+};
 pub use page::{A4Page, Margins};
 pub use paragraph::{ParagraphConfig, layout_paragraph};

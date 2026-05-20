@@ -1,16 +1,16 @@
 //! Paragraph layout: greedy logical-order line break, per-line BiDi reorder,
-//! per-line shaping, optional justify.
+//! per-line shaping, optional justify. Produces a [`ParagraphBox`] — the
+//! hierarchical box tree of PHASE_3_RENDER_RTL.md §5.
 //!
-//! Earlier draft flattened paragraph-wide visual_runs and packed them by
-//! advance width — that mixes content from non-adjacent logical positions
-//! onto the same line. UAX #9 requires BiDi to be applied **per line**
-//! after line break positions are known. This implementation does that.
+//! `layout_paragraph` owns all geometry: it positions every line within the
+//! paragraph (`origin.y` stacks top-down, `origin.x` carries the alignment
+//! offset) so the renderer only has to accumulate parent origins.
 //!
 //! Cost: O(N) calls to `shape_text` where N = number of line-break
-//! opportunities (per greedy candidate). Acceptable for PoC; Phase 3 will
-//! cache widths and consider Knuth-Plass.
+//! opportunities. Acceptable for the PoC; Phase 3 will cache widths.
 
-use crate::line_box::{LineBox, PaintedGlyph};
+use crate::boxes::{LineBox, ParagraphBox, Point, PositionedGlyph, Size, TextAttrs, VisualRun};
+use std::mem::take;
 use text_pipeline::{
     Alignment, JustifyMode, LoadedFont, ShapingDirection, analyze_bidi, break_opportunities,
     justify::is_arabic_codepoint,
@@ -21,24 +21,77 @@ use text_pipeline::{
 pub struct ParagraphConfig<'a> {
     pub text: &'a str,
     pub font: &'a LoadedFont,
+    /// Font-map key stamped onto every `VisualRun` so the renderer can resolve
+    /// the face without a side channel.
+    pub font_id: &'a str,
     pub base_direction: ShapingDirection,
     pub px_size: f32,
     pub max_width: f32,
     pub line_height: f32,
     pub alignment: Alignment,
+    /// Straight-alpha RGBA fill colour for the text.
+    pub text_color: [u8; 4],
 }
 
-pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> Vec<LineBox> {
+/// Lay out `cfg.text` into a [`ParagraphBox`] with positioned lines.
+///
+/// The returned box has `origin == (0, 0)`; the page assembler sets the
+/// paragraph's position when stacking it onto a `PageBox`.
+pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
+    let mut composed = compose_lines(&cfg);
+
+    /* Justify every line except the last and any hard-broken (overflow) line. */
+    if cfg.alignment == Alignment::Justify {
+        let last = composed.len().saturating_sub(1);
+        for (i, (line, broke)) in composed.iter_mut().enumerate() {
+            if i == last || !*broke {
+                continue;
+            }
+            justify_line(line, cfg.max_width, cfg.text);
+        }
+    }
+
+    /* Position each line within the paragraph: `origin.y` stacks top-down,
+    `origin.x` carries the alignment offset so the renderer stays a pure
+    origin accumulator. */
+    let mut lines: Vec<LineBox> = Vec::with_capacity(composed.len());
+    for (i, (mut line, _)) in composed.into_iter().enumerate() {
+        line.origin = Point {
+            x: alignment_origin_x(
+                line.width,
+                cfg.max_width,
+                line.alignment,
+                cfg.base_direction,
+            ),
+            y: i as f32 * cfg.line_height,
+        };
+        line.baseline = cfg.line_height;
+        line.height = cfg.line_height;
+        lines.push(line);
+    }
+
+    let height = lines.len() as f32 * cfg.line_height;
+    ParagraphBox {
+        origin: Point::default(),
+        size: Size {
+            width: cfg.max_width,
+            height,
+        },
+        lines,
+        direction: cfg.base_direction,
+    }
+}
+
+/// Greedy line breaking. Returns each line paired with whether it ended at a
+/// break opportunity (`true`) rather than the end of the paragraph (`false`) —
+/// only opportunity-broken non-final lines are justified.
+fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
     if cfg.text.is_empty() {
         return vec![];
     }
-
     let breaks = break_opportunities(cfg.text);
 
-    /* Greedy: walk through break opportunities; keep extending the line
-    while the candidate range fits in max_width; commit the longest fit
-    when the next opportunity would overflow. */
-    let mut lines: Vec<LineBox> = vec![];
+    let mut lines: Vec<(LineBox, bool)> = vec![];
     let mut start = 0_usize;
     let mut last_fit_end = start;
 
@@ -54,11 +107,10 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> Vec<LineBox> {
         } else {
             /* Overflow. Commit whatever fit so far. */
             if last_fit_end > start {
-                lines.push(build_line(&cfg, start, last_fit_end, true));
+                lines.push((build_line(cfg, start, last_fit_end), true));
             } else {
-                /* Single segment from start..b doesn't fit — force-break at
-                this opportunity. (PoC: no mid-word hyphenation.) */
-                lines.push(build_line(&cfg, start, b, true));
+                /* Single segment doesn't fit — force-break here. */
+                lines.push((build_line(cfg, start, b), true));
                 last_fit_end = b;
             }
             start = last_fit_end;
@@ -66,87 +118,127 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> Vec<LineBox> {
     }
 
     if start < cfg.text.len() {
-        lines.push(build_line(&cfg, start, cfg.text.len(), false));
+        lines.push((build_line(cfg, start, cfg.text.len()), false));
     }
-
-    /* Justify all but the last line (and only lines that ended at an
-    opportunity, not a forced hard break — covered already by
-    `broken_at_opportunity`). */
-    if cfg.alignment == Alignment::Justify {
-        let last = lines.len().saturating_sub(1);
-        for (i, line) in lines.iter_mut().enumerate() {
-            if i == last || !line.broken_at_opportunity {
-                continue;
-            }
-            justify_line(line, cfg.max_width, cfg.text);
-        }
-    }
-
-    /* Baselines stacked from the top of the paragraph. */
-    for (i, line) in lines.iter_mut().enumerate() {
-        line.baseline_y = (i as f32 + 1.0) * cfg.line_height;
-    }
-
     lines
 }
 
-/// Shape one logical byte range as a single visual line.
-/// Runs UAX #9 BiDi on the slice, shapes each visual run with its resolved
-/// direction, concatenates glyphs left-to-right.
-fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize, broken: bool) -> LineBox {
+/// Shape one logical byte range into a [`LineBox`]. Runs UAX #9 BiDi on the
+/// slice and shapes each visual run with its resolved direction; one
+/// [`VisualRun`] per BiDi run. Geometry (`origin`/`baseline`/`height`) is left
+/// zeroed for [`layout_paragraph`] to fill.
+fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
     let line_text = &cfg.text[start..end];
     let bidi = analyze_bidi(line_text, cfg.base_direction);
 
-    let mut glyphs: Vec<PaintedGlyph> = Vec::new();
-    let mut x = 0.0_f32;
-    for run in &bidi.visual_runs {
-        let substr = &line_text[run.range.clone()];
-        let shaped = shape_text(cfg.font, substr, run.direction, cfg.px_size);
-        for g in shaped.glyphs {
-            glyphs.push(PaintedGlyph {
-                glyph_id: g.glyph_id,
-                source_offset: (start + run.range.start) as u32 + g.cluster,
-                x,
+    let mut runs: Vec<VisualRun> = Vec::with_capacity(bidi.visual_runs.len());
+    for brun in &bidi.visual_runs {
+        let substr = &line_text[brun.range.clone()];
+        let shaped = shape_text(cfg.font, substr, brun.direction, cfg.px_size);
+        let glyphs: Vec<PositionedGlyph> = shaped
+            .glyphs
+            .iter()
+            .map(|g| PositionedGlyph {
+                id: g.glyph_id as u16,
+                cluster: g.cluster,
+                x_advance: g.x_advance,
+                y_advance: g.y_advance,
                 x_offset: g.x_offset,
                 y_offset: g.y_offset,
-                x_advance: g.x_advance,
-            });
-            x += g.x_advance;
-        }
+            })
+            .collect();
+        runs.push(VisualRun {
+            glyphs,
+            font: cfg.font_id.to_string(),
+            direction: brun.direction,
+            source_range: (start + brun.range.start) as u32..(start + brun.range.end) as u32,
+            attrs: TextAttrs {
+                px_size: cfg.px_size,
+                color: cfg.text_color,
+            },
+        });
     }
 
     LineBox {
-        glyphs,
-        direction: Some(bidi.paragraph_direction),
-        natural_width: x,
-        baseline_y: 0.0,
-        broken_at_opportunity: broken,
+        width: line_advance(&runs),
+        origin: Point::default(),
+        baseline: 0.0,
+        height: 0.0,
+        runs,
+        alignment: cfg.alignment,
     }
 }
 
-/// Pick justify strategy per line: Kashida-style for Arabic-heavy, space for Latin.
+/// Sum of every glyph advance across a line's runs.
+fn line_advance(runs: &[VisualRun]) -> f32 {
+    runs.iter()
+        .flat_map(|r| &r.glyphs)
+        .map(|g| g.x_advance)
+        .sum()
+}
+
+/// Horizontal offset of a line within its paragraph's content width. Mirrors
+/// the Phase 1 inline rule: centre when centred, right-align a short RTL line,
+/// otherwise flush-left.
+fn alignment_origin_x(
+    line_width: f32,
+    content_width: f32,
+    alignment: Alignment,
+    base: ShapingDirection,
+) -> f32 {
+    if alignment == Alignment::Center {
+        (content_width - line_width) / 2.0
+    } else if matches!(base, ShapingDirection::Rtl) && line_width < content_width - 0.5 {
+        content_width - line_width
+    } else {
+        0.0
+    }
+}
+
+/// A glyph located within a line's run tree, tagged with the source character
+/// it maps to — the working unit for justification.
+struct JustifySlot {
+    run: usize,
+    glyph: usize,
+    ch: char,
+    arabic: bool,
+}
+
+/// Flatten a line's glyphs into [`JustifySlot`]s in visual order, resolving the
+/// source character of each via its run's `source_range` + `cluster`.
+fn line_glyph_slots(line: &LineBox, source_text: &str) -> Vec<JustifySlot> {
+    let mut slots: Vec<JustifySlot> = Vec::new();
+    for (ri, run) in line.runs.iter().enumerate() {
+        for (gi, g) in run.glyphs.iter().enumerate() {
+            let offset = (run.source_range.start + g.cluster) as usize;
+            let ch = source_text[offset..].chars().next().unwrap_or(' ');
+            slots.push(JustifySlot {
+                run: ri,
+                glyph: gi,
+                ch,
+                arabic: is_arabic_codepoint(ch),
+            });
+        }
+    }
+    slots
+}
+
+/// Pick a justify strategy for the line — Kashida for Arabic, spaces for Latin,
+/// a weighted split for mixed — and stretch glyph advances to `target_width`.
 fn justify_line(line: &mut LineBox, target_width: f32, source_text: &str) {
-    let extra = target_width - line.natural_width;
-    if extra <= 0.0 || line.glyphs.is_empty() {
+    let extra = target_width - line.width;
+    if extra <= 0.0 {
+        return;
+    }
+    let slots = line_glyph_slots(line, source_text);
+    if slots.is_empty() {
         return;
     }
 
-    let kinds: Vec<(bool, char)> = line
-        .glyphs
-        .iter()
-        .map(|g| {
-            let c = source_text[g.source_offset as usize..]
-                .chars()
-                .next()
-                .unwrap_or(' ');
-            (is_arabic_codepoint(c), c)
-        })
-        .collect();
-
-    let arabic_count = kinds.iter().filter(|k| k.0).count();
+    let arabic_count = slots.iter().filter(|s| s.arabic).count();
     let mode = if arabic_count == 0 {
         JustifyMode::Space
-    } else if arabic_count == line.glyphs.len() {
+    } else if arabic_count == slots.len() {
         JustifyMode::Kashida
     } else {
         JustifyMode::Mixed
@@ -154,83 +246,72 @@ fn justify_line(line: &mut LineBox, target_width: f32, source_text: &str) {
 
     match mode {
         JustifyMode::None => {}
-        JustifyMode::Space => distribute_to_spaces(line, &kinds, extra),
-        JustifyMode::Kashida => distribute_to_kashida_points(line, &kinds, extra),
+        JustifyMode::Space => distribute_to_spaces(line, &slots, extra),
+        JustifyMode::Kashida => distribute_to_kashida_points(line, &slots, extra),
         JustifyMode::Mixed => {
-            let space_count = kinds
+            let space_count = slots
                 .iter()
-                .filter(|(is_ar, c)| !*is_ar && c.is_whitespace())
+                .filter(|s| !s.arabic && s.ch.is_whitespace())
                 .count();
             let arabic_share = if space_count == 0 {
                 extra
             } else {
                 extra * (arabic_count as f32) / (arabic_count + space_count * 2) as f32
             };
-            let space_share = extra - arabic_share;
-            distribute_to_kashida_points(line, &kinds, arabic_share);
-            distribute_to_spaces(line, &kinds, space_share);
+            distribute_to_kashida_points(line, &slots, arabic_share);
+            distribute_to_spaces(line, &slots, extra - arabic_share);
         }
     }
 
-    /* After bumping advances, re-emit x positions in visual order. */
-    let mut x = 0.0;
-    for g in line.glyphs.iter_mut() {
-        g.x = x;
-        x += g.x_advance;
-    }
-    line.natural_width = x;
+    line.width = line_advance(&line.runs);
 }
 
-fn distribute_to_spaces(line: &mut LineBox, kinds: &[(bool, char)], extra: f32) {
-    let idx: Vec<usize> = kinds
+/// Distribute `extra` width evenly across the line's inter-word spaces.
+fn distribute_to_spaces(line: &mut LineBox, slots: &[JustifySlot], extra: f32) {
+    let targets: Vec<usize> = slots
         .iter()
         .enumerate()
-        .filter(|(_, (is_ar, c))| !*is_ar && c.is_whitespace())
+        .filter(|(_, s)| !s.arabic && s.ch.is_whitespace())
         .map(|(i, _)| i)
         .collect();
-    if idx.is_empty() {
+    if targets.is_empty() {
         return;
     }
-    let per = extra / idx.len() as f32;
-    for &i in &idx {
-        line.glyphs[i].x_advance += per;
+    let per = extra / targets.len() as f32;
+    for i in targets {
+        let s = &slots[i];
+        line.runs[s.run].glyphs[s.glyph].x_advance += per;
     }
 }
 
 /// Distribute `extra` width across Kashida elongation points.
 ///
 /// Candidates are cursive-joining boundaries identified by Unicode
-/// `Joining_Type` (PHASE_3_RENDER_RTL.md §6), not by Unicode block: the
-/// logically-earlier letter must carry a left-joining form and the next a
-/// right-joining form. Each candidate is scored into a Microsoft priority
-/// band (P1 best … P5 last resort).
-///
-/// One kashida per word, placed at the word's highest-priority connecting
-/// stroke. §6's pseudocode selects a band per line, but on a line whose top
-/// band is sparse that dumps all the slack into one gap; choosing a single
-/// stroke per word — as Uniscribe does — spreads the elongation so every word
-/// stretches at its own best joint instead of one word tearing apart.
-fn distribute_to_kashida_points(line: &mut LineBox, kinds: &[(bool, char)], extra: f32) {
-    /* Walk visual glyphs, grouping cursive letters into words — a non-joining
-    glyph (space, Latin) ends a word, combining marks are transparent. Arabic
-    shapes right-to-left, so of two adjacent letter glyphs the right-hand one
-    is logically earlier (the letter the stroke runs *after*); the kashida
-    widens the left glyph's advance, opening the gap between the pair. */
+/// `Joining_Type` (PHASE_3_RENDER_RTL.md §6): the logically-earlier letter must
+/// carry a left-joining form and the next a right-joining form. Each candidate
+/// is scored into a Microsoft priority band, and one kashida per word — at the
+/// word's highest-priority stroke — receives an equal share of `extra`.
+fn distribute_to_kashida_points(line: &mut LineBox, slots: &[JustifySlot], extra: f32) {
+    /* Walk glyph slots in visual order, grouping cursive letters into words —
+    a non-joining glyph ends a word, combining marks are transparent. Within a
+    word each connecting boundary is a candidate scored into a priority band.
+    Arabic shapes right-to-left, so of two adjacent letter glyphs the
+    right-hand one is logically earlier; the kashida widens the left glyph. */
     let mut words: Vec<Vec<(usize, KashidaPriority)>> = Vec::new();
     let mut word: Vec<(usize, KashidaPriority)> = Vec::new();
     let mut prev_letter: Option<usize> = None;
-    for vi in 0..line.glyphs.len() {
-        match join_role(kinds[vi].1) {
+    for vi in 0..slots.len() {
+        match join_role(slots[vi].ch) {
             JoinRole::Transparent => {}
             JoinRole::NonJoining => {
                 if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
+                    words.push(take(&mut word));
                 }
                 prev_letter = None;
             }
             JoinRole::Letter => {
                 if let Some(pvi) = prev_letter
-                    && let Some(priority) = kashida_point(kinds[vi].1, kinds[pvi].1)
+                    && let Some(priority) = kashida_point(slots[vi].ch, slots[pvi].ch)
                 {
                     word.push((pvi, priority));
                 }
@@ -243,18 +324,19 @@ fn distribute_to_kashida_points(line: &mut LineBox, kinds: &[(bool, char)], extr
     }
 
     /* One kashida per word, at its highest-priority stroke; `extra` splits
-    evenly across those points so each word stretches by the same amount. */
-    let mut points: Vec<usize> = Vec::new();
+    evenly across those points. */
+    let mut targets: Vec<usize> = Vec::new();
     for w in &words {
-        if let Some(&(idx, _)) = w.iter().min_by_key(|&&(_, p)| p) {
-            points.push(idx);
+        if let Some(&(slot, _)) = w.iter().min_by_key(|&&(_, p)| p) {
+            targets.push(slot);
         }
     }
-    if points.is_empty() {
+    if targets.is_empty() {
         return;
     }
-    let per = extra / points.len() as f32;
-    for i in points {
-        line.glyphs[i].x_advance += per;
+    let per = extra / targets.len() as f32;
+    for i in targets {
+        let s = &slots[i];
+        line.runs[s.run].glyphs[s.glyph].x_advance += per;
     }
 }
