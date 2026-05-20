@@ -11,9 +11,9 @@ paths:
 # Rust / WASM rules
 
 ## Toolchain
-- Pinned to **Rust 1.85.1** in `rust-toolchain.toml`. Do not bump without auditing every workspace member's MSRV.
-- `wasm-pack` comes from **Homebrew** (`brew install wasm-pack`). `cargo install wasm-pack --locked` fails on 1.85 because some transitive deps want rustc ≥ 1.86.
-- No **let-chains** (`if let X && let Y`). Stable in 1.88; nest as `if let X { if let Y { … } }`.
+- Pinned to **Rust 1.95.0** in `rust-toolchain.toml` (bumped from 1.85.1 for the Phase 3 render stack — `vello` 0.9 needs ≥ 1.88). Do not bump without auditing every workspace member's MSRV.
+- `wasm-pack` comes from **Homebrew** (`brew install wasm-pack`).
+- **let-chains** (`if let X && let Y`) are allowed — stable since 1.88. Existing nested `if let` from the 1.85 era may stay; new code may use let-chains.
 
 ## Build profile
 - `lto = "thin"` for the wasm artifact. **Never `"fat"`** — `compiler-builtins` ships precompiled object files for some intrinsics and fat LTO rejects them.

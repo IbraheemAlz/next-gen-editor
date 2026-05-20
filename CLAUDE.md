@@ -16,9 +16,9 @@ Booting into this repo? Read this first. Everything below is a learned-the-hard-
 
 ## Toolchain (pinned and load-bearing)
 
-- Rust **1.85.1** via `rust-toolchain.toml`. Do not bump without verifying every crate's MSRV.
+- Rust **1.95.0** via `rust-toolchain.toml`. Do not bump without verifying every crate's MSRV.
 - Targets: `wasm32-unknown-unknown` + native.
-- `wasm-pack` via **Homebrew** (`brew install wasm-pack`). `cargo install wasm-pack --locked` fails on 1.85 because some locked transitive deps require rustc ≥ 1.86.
+- `wasm-pack` via **Homebrew** (`brew install wasm-pack`).
 - `wasm-opt` is invoked automatically by `wasm-pack build --release`.
 - `pnpm` for TS. Node ≥ 22.
 
@@ -59,7 +59,7 @@ tools/
 - **`serde_bytes`** + `#[tsify(type = "Uint8Array")]` for `Vec<u8>` fields that must travel as binary. Without this, serde-wasm-bindgen rejects `Uint8Array` with `invalid type: byte array, expected a sequence` and falls back to a 4-8× heap-inflated number array.
 - Bridge command/event enums **always** carry `#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]`. TS sees `{ type: "INSERT_TEXT", ... }`.
 - Workspace member `Cargo.toml`s inherit via `.workspace = true` for `version`, `edition`, `license`, `rust-version`. Don't duplicate.
-- Rust 1.85 lacks let-chains. Split `if let X && let Y` into nested `if let`.
+- **let-chains** (`if let X && let Y`) are available (Rust ≥ 1.88; toolchain 1.95).
 
 ## TS / browser conventions
 
