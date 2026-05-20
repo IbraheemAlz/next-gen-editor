@@ -1,6 +1,8 @@
 # CLAUDE.md — engineering DNA
 
-Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phase 1 PoC. Don't relitigate without a measurement that contradicts it.
+Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–2. Don't relitigate without a measurement that contradicts it.
+
+**Phase status:** Phase 1 (PoC) and Phase 2 (worker bridge + memory architecture) are **complete** — exit gates green. Phase 3 (canvas rendering + native RTL, `PHASE_3_RENDER_RTL.md`) is next.
 
 ---
 
@@ -8,7 +10,7 @@ Booting into this repo? Read this first. Everything below is a learned-the-hard-
 
 - **Rust → WASM core.** Engine lives in `crates/engine-wasm/`. No vendored binary blobs, ever. If a feature requires C++, vendor the **source** under `vendor/` and build it in CI.
 - **Headless UI.** No `iframe`. The TypeScript shell owns the canvas, the worker, and the DOM chrome. The engine never touches the DOM.
-- **Single dedicated Web Worker.** WASM is loaded exactly once in `ts/src/engine.worker.ts`. `OffscreenCanvas` is `transferControlToOffscreen()`-ed at INIT and never re-transferred.
+- **Single dedicated Web Worker.** WASM is loaded exactly once in `ts/src/engine.worker.ts`. `OffscreenCanvas` is `transferControlToOffscreen()`-ed at INIT and never re-transferred — that call is one-shot per element, so crash recovery swaps in a **fresh** `<canvas>` element.
 - **Cross-origin isolated.** Vite dev and prod serve with `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`, `Cross-Origin-Resource-Policy: same-origin`. SAB depends on this; check `self.crossOriginIsolated` on boot.
 - **Memory budget.** Compressed WASM artifact ≤ **15 MiB** (CI gate). Initial WASM heap 64 MiB, max 2 GiB (linker flags). Per-worker soft budget ≤ 256 MiB on a 50-page document.
 
@@ -43,7 +45,7 @@ crates/
   layout/         A4Page + LineBox + paragraph layout (per-line BiDi)
   render/         Canvas2D backend; Vello backend later
   format-docx/    .docx reader (zip + quick-xml) + writer (preserves siblings)
-ts/               Vite + TS shell, worker, dispatch channel
+ts/               Vite + TS shell, worker, EngineClient, event log, e2e suite
 tools/
   visual-diff/    Playwright + pixelmatch golden suite
   shape-regression/  rustybuzz output snapshots
@@ -65,8 +67,17 @@ tools/
 - `tsify-next` renders `Option<T>` as `T | undefined`. Pass **`undefined`**, not `null`, from TS.
 - `web-sys 0.3.98+`: `set_fill_style_str(&str)`, not the deprecated `set_fill_style(&JsValue)`.
 - Worker boot via wasm-pack `--target web` output. `init({ module_or_path: new URL(...) })` — the bare-URL form is deprecated.
-- Worker ↔ main RPC: Promise-based `dispatch(cmd) → Event` channel with `{ type: 'COMMAND', id, cmd }` request and `{ type: 'COMMAND_RESULT', id, event }` reply. Expose `window.__dispatch` for tests.
+- Worker ↔ main RPC: the production path is **`EngineClient`** (`ts/src/engine-client.ts`) — `id`-routed `{ id, cmd }` requests, `{ id, ok, evt }` replies, a `pending` map, `subscribe()` for unidirectional events. The Phase-1 `{ type: 'COMMAND', id, cmd }` / `{ type: 'COMMAND_RESULT', id, event }` harness path still lives in the worker (visual-diff `?test=` cases only). Expose `window.__dispatch` for tests.
 - Hidden `<textarea>` overlay is the only legitimate text-input source. `beforeinput` is the canonical event; ignore `e.isComposing`.
+
+## Phase 2 — worker bridge, event log, crash recovery
+
+- **`EngineClient`** (`ts/src/engine-client.ts`) is the typed main-thread RPC layer: spawns the worker, matches replies by `id`, exposes `dispatch` / `subscribe` / `recover`, and `loadFont` / `openDocument` (which pass byte buffers as `Transferable`s — zero-copy).
+- **Worker dual-protocol** (`ts/src/engine.worker.ts`): the `EngineClient` `id`-routed path and the Phase-1 `?test=` visual-diff harness path coexist; a worker instance only ever sees one. The interactive editor uses `EngineClient`; `index.ts` keeps the harness path alive for the `?test=` goldens.
+- **Bridge schema** is split across `crates/bridge/src/{common,command,event}.rs`. The §4–§5 schema landed **additively** on the Phase-1 PoC subset — Phase-1 commands/events are kept and tagged `// TODO: Deprecate in Phase 3`. The §4–§5 schema is **frozen**.
+- **IndexedDB event log** (`ts/src/event-log.ts`): one `engine-log` DB; stores `commands` / `snapshots` / `meta`; snapshots pruned to the newest 3. The worker logs **off the critical path** — `handleClientCommand` posts the RPC reply *before* `logCommand()` runs (D2.8 backpressure; sustains 1000+ cmds/s).
+- **Crash recovery**: a WASM trap (`/RuntimeError|unreachable/`) → worker posts `{ trap: true }` + `self.close()` → `EngineClient.onTrap` rejects pending + fires the UI `onCrash` callback → `index.ts` swaps in a fresh `<canvas>` and calls `recover()` → respawn + `Command::Recover`. `loadLatestEventLog` returns `snapshotSeq` / `lastSeq` so the recovered worker resumes `logSequence` (never restarts at 0).
+- **e2e suite**: `ts/e2e/*.spec.ts` + `ts/playwright.config.ts` — `@playwright/test` with `channel: 'chrome'` (system Chrome, no download); `webServer` auto-boots Vite. Run: `pnpm exec playwright test` from `ts/`.
 
 ## Validation (CI gates, all -D warnings)
 
@@ -78,6 +89,7 @@ tools/
 - `cargo run -p shape-regression --release` — 0 failed on the corpus.
 - `cargo run -p roundtrip --release` — PASS.
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
+- `pnpm exec playwright test` (from `ts/`) — the 7 Phase 2 exit-gate e2e specs in `ts/e2e/` all green.
 
 ## Visual-diff harness
 
@@ -120,14 +132,21 @@ tools/
 - ❌ Skip the COOP/COEP server config "just for now".
 - ❌ Use `chrome --screenshot` + `--virtual-time-budget` for runtime assertions (use Playwright `waitForFunction`).
 - ❌ Regenerate goldens without visually diffing.
+- ❌ Block the RPC reply on the IndexedDB event-log write — log off the critical path.
+- ❌ Re-call `transferControlToOffscreen()` on a consumed canvas — swap in a fresh `<canvas>`.
 
 ## Where the deferred work landed
 
-Phase 1 PoC limitations are tagged in the next-phase plan documents. See:
+Phases 1–2 are complete. Remaining work is tagged in the next-phase plan documents:
 
-- `PHASE_2_BRIDGE_MEMORY.md` §13 — RPC channel & schema completion deferred items.
-- `PHASE_3_RENDER_RTL.md` §6 (Kashida), §8 (line break), §13 (Phase 1 deferrals).
+- `PHASE_3_RENDER_RTL.md` §6 (Kashida), §8 (line break), §13 (Phase 1 deferrals) — **next**.
 - `PHASE_4_HEADLESS_UI.md` §6–§8 (textarea, caret, selection rendering).
 - `PHASE_5_HARDENING_RELEASE.md` §3–§4 (visual-diff + roundtrip CI lifting).
 
-Don't add Phase 2+ scope to Phase 1 backports.
+Phase 2 → 3 hand-off items (stubbed, deliberate — not regressions):
+
+- Engine-side `Command::Recover` is a `phase3_stub`. The recovery *flow* (trap → canvas swap → respawn → replay → seq continuity) is tested green, but document-content rebuild needs the real `Engine::snapshot()` API — event-log snapshots are empty `Uint8Array(0)` placeholders today.
+- `EngineStats.last_paint_ms` / `last_command_ms` are `0.0` dummies; `wasm_heap_bytes` is real (`core::arch::wasm32::memory_size`).
+- Phase-1 PoC commands/events (`RenderPage`, `RasterizeGlyph`, `ShapeAndRasterize`, `LoadDocx`, `SaveDocx`, …) are tagged `// TODO: Deprecate in Phase 3` — retire them once the `RequestPaint` pipeline lands.
+
+Phase 3 work is engine-internal (layout + renderer behind `Engine::dispatch`). Don't change the frozen §4–§5 bridge schema.
