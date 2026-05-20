@@ -68,6 +68,14 @@ impl Engine {
         serde_wasm_bindgen::to_value(&evt)
             .map_err(|e| JsValue::from_str(&format!("encode event: {e}")))
     }
+
+    /// P3-5: detect the best renderer backend — `vello` when a WebGPU device
+    /// is acquired, else `canvas2d`. Worker-safe (no `web_sys::window()`).
+    /// Vello rendering itself is routed in a later batch; Canvas2D stays the
+    /// active path for now.
+    pub async fn detect_renderer(&self) -> String {
+        render::backend::detect_backend().await.as_str().to_string()
+    }
 }
 
 const POC_BASELINE_X: f64 = 50.0;

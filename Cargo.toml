@@ -25,7 +25,7 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
-    "DedicatedWorkerGlobalScope", "MessagePort", "MessageEvent",
+    "DedicatedWorkerGlobalScope", "WorkerGlobalScope", "MessagePort", "MessageEvent",
     "OffscreenCanvas", "OffscreenCanvasRenderingContext2d",
     "ImageBitmap", "ImageData", "console",
 ] }

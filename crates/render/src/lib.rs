@@ -5,5 +5,7 @@
 //! Vello (WebGPU) backend lands in batch 2 (PHASE_3_RENDER_RTL.md §9.2).
 
 pub mod atlas;
+pub mod backend;
 pub mod canvas2d_backend;
 pub mod scene;
+pub mod vello_backend;
