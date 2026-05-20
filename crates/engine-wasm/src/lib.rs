@@ -13,6 +13,7 @@ use layout::{A4Page, LineBox, ParagraphConfig, layout_paragraph};
 use render::atlas::GlyphAtlas;
 use render::canvas2d_backend::render_canvas2d;
 use render::scene::{PaintConfig, build_page_scene};
+use render::vello_backend::VelloRenderer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use text_pipeline::{Alignment, LoadedFont, ShapingDirection, shape_text};
@@ -40,6 +41,7 @@ pub struct Engine {
     undo: UndoStack,
     layout_cfg: Option<RenderConfig>,
     atlas: GlyphAtlas,
+    vello: Option<VelloRenderer>,
 }
 
 #[wasm_bindgen]
@@ -58,6 +60,7 @@ impl Engine {
             undo: UndoStack::new(DocumentTree::new(), 100),
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
+            vello: None,
         })
     }
 
@@ -75,6 +78,39 @@ impl Engine {
     /// active path for now.
     pub async fn detect_renderer(&self) -> String {
         render::backend::detect_backend().await.as_str().to_string()
+    }
+
+    /// Whether the Vello (WebGPU) pipeline has been initialized via
+    /// [`Engine::init_vello`]. Always `false` on the active Canvas2D path;
+    /// `init_vello` is a P3-4 reachability root the worker does not call.
+    pub fn vello_ready(&self) -> bool {
+        self.vello.is_some()
+    }
+}
+
+/// P3-4 dead-code-elimination retention root.
+///
+/// `init_vello` is a `#[wasm_bindgen]` export, so `wasm-ld --gc-sections`
+/// retains it and everything it transitively calls: `VelloRenderer::new`
+/// (WebGPU device + surface + `vello::Renderer`) and `VelloRenderer::render`
+/// (scene encoding + `render_to_texture` + surface blit). With no reachable
+/// caller the linker strips the whole `wgpu` + `vello` stack and the WASM
+/// artifact understates its true size. The worker never calls this, so
+/// Canvas2D stays the active renderer and the visual-diff goldens are
+/// unaffected.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl Engine {
+    /// Build the Vello (WebGPU) pipeline for `canvas` and run one frame.
+    /// Reachability root only — see the impl-block docs.
+    pub async fn init_vello(&mut self, canvas: web_sys::OffscreenCanvas) -> Result<(), JsValue> {
+        let mut vr = VelloRenderer::new(canvas)
+            .await
+            .map_err(|e| JsValue::from_str(&e))?;
+        vr.render(&render::scene::DisplayList::default(), |_| None)
+            .map_err(|e| JsValue::from_str(&e))?;
+        self.vello = Some(vr);
+        Ok(())
     }
 }
 
@@ -561,6 +597,7 @@ mod tests {
             undo: UndoStack::new(DocumentTree::new(), 8),
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
+            vello: None,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
