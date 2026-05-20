@@ -13,7 +13,9 @@
 use crate::line_box::{LineBox, PaintedGlyph};
 use text_pipeline::{
     Alignment, JustifyMode, LoadedFont, ShapingDirection, analyze_bidi, break_opportunities,
-    justify::is_arabic_codepoint, shape_text,
+    justify::is_arabic_codepoint,
+    justify_kashida::{JoinRole, KashidaPriority, join_role, kashida_point},
+    shape_text,
 };
 
 pub struct ParagraphConfig<'a> {
@@ -195,21 +197,64 @@ fn distribute_to_spaces(line: &mut LineBox, kinds: &[(bool, char)], extra: f32) 
     }
 }
 
-/// Distribute `extra` width across boundaries between two consecutive Arabic
-/// glyphs (cursive-joining points). PoC: even distribution. A font-aware
-/// implementation would weight by Microsoft priority bands.
+/// Distribute `extra` width across Kashida elongation points.
+///
+/// Candidates are cursive-joining boundaries identified by Unicode
+/// `Joining_Type` (PHASE_3_RENDER_RTL.md §6), not by Unicode block: the
+/// logically-earlier letter must carry a left-joining form and the next a
+/// right-joining form. Each candidate is scored into a Microsoft priority
+/// band (P1 best … P5 last resort).
+///
+/// One kashida per word, placed at the word's highest-priority connecting
+/// stroke. §6's pseudocode selects a band per line, but on a line whose top
+/// band is sparse that dumps all the slack into one gap; choosing a single
+/// stroke per word — as Uniscribe does — spreads the elongation so every word
+/// stretches at its own best joint instead of one word tearing apart.
 fn distribute_to_kashida_points(line: &mut LineBox, kinds: &[(bool, char)], extra: f32) {
-    let mut points: Vec<usize> = vec![];
-    for i in 0..line.glyphs.len().saturating_sub(1) {
-        if kinds[i].0 && kinds[i + 1].0 {
-            points.push(i);
+    /* Walk visual glyphs, grouping cursive letters into words — a non-joining
+    glyph (space, Latin) ends a word, combining marks are transparent. Arabic
+    shapes right-to-left, so of two adjacent letter glyphs the right-hand one
+    is logically earlier (the letter the stroke runs *after*); the kashida
+    widens the left glyph's advance, opening the gap between the pair. */
+    let mut words: Vec<Vec<(usize, KashidaPriority)>> = Vec::new();
+    let mut word: Vec<(usize, KashidaPriority)> = Vec::new();
+    let mut prev_letter: Option<usize> = None;
+    for vi in 0..line.glyphs.len() {
+        match join_role(kinds[vi].1) {
+            JoinRole::Transparent => {}
+            JoinRole::NonJoining => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                prev_letter = None;
+            }
+            JoinRole::Letter => {
+                if let Some(pvi) = prev_letter
+                    && let Some(priority) = kashida_point(kinds[vi].1, kinds[pvi].1)
+                {
+                    word.push((pvi, priority));
+                }
+                prev_letter = Some(vi);
+            }
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+
+    /* One kashida per word, at its highest-priority stroke; `extra` splits
+    evenly across those points so each word stretches by the same amount. */
+    let mut points: Vec<usize> = Vec::new();
+    for w in &words {
+        if let Some(&(idx, _)) = w.iter().min_by_key(|&&(_, p)| p) {
+            points.push(idx);
         }
     }
     if points.is_empty() {
         return;
     }
     let per = extra / points.len() as f32;
-    for &i in &points {
+    for i in points {
         line.glyphs[i].x_advance += per;
     }
 }

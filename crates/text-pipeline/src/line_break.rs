@@ -8,6 +8,6 @@ use icu_segmenter::LineSegmenter;
 /// (end of string); per UAX #14, these are "line break opportunities" the
 /// caller can use as break candidates.
 pub fn break_opportunities(text: &str) -> Vec<usize> {
-    let segmenter = LineSegmenter::new_auto();
+    let segmenter = LineSegmenter::new_auto(Default::default());
     segmenter.segment_str(text).collect()
 }

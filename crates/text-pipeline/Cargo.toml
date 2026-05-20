@@ -11,4 +11,5 @@ swash = { workspace = true }
 rustybuzz = { workspace = true }
 unicode-bidi = { workspace = true }
 icu_segmenter = { workspace = true }
+icu_properties = { workspace = true }
 thiserror = { workspace = true }

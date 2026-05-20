@@ -7,6 +7,7 @@
 pub mod bidi;
 pub mod fonts;
 pub mod justify;
+pub mod justify_kashida;
 pub mod line_break;
 pub mod shape;
 
