@@ -10,9 +10,97 @@ pub struct DocumentTree {
     pub paragraphs: Vector<Paragraph>,
 }
 
+/// Inline style for a run of characters. Phase 3 rich-text scope is font size
+/// and colour; bold / italic / underline land in a later typography PR.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SpanStyle {
+    pub font_size: Option<f32>,
+    pub color: Option<[u8; 4]>,
+}
+
+impl SpanStyle {
+    /// Overlay `patch`'s set fields onto `self`.
+    fn merged_with(self, patch: SpanStyle) -> SpanStyle {
+        SpanStyle {
+            font_size: patch.font_size.or(self.font_size),
+            color: patch.color.or(self.color),
+        }
+    }
+}
+
+/// A styled byte range `[start, end)` within a paragraph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StyleRun {
+    pub start: u32,
+    pub end: u32,
+    pub style: SpanStyle,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Paragraph {
     pub text: String,
+    /// Non-overlapping styled ranges, sorted by `start`; default-styled ranges
+    /// are omitted. An empty list is plain text.
+    pub spans: Vec<StyleRun>,
+}
+
+impl Paragraph {
+    /// Resolved style at byte offset `at` (default if no span covers it).
+    fn style_at(&self, at: u32) -> SpanStyle {
+        self.spans
+            .iter()
+            .find(|s| at >= s.start && at < s.end)
+            .map_or(SpanStyle::default(), |s| s.style)
+    }
+
+    /// Return a copy with `patch` overlaid on the byte range `[start, end)`.
+    /// Existing spans are split at the boundaries; every covered sub-range
+    /// merges the patch's set fields. Adjacent equal spans are coalesced and
+    /// default-only spans dropped, so the representation stays minimal.
+    pub fn apply_style(&self, start: u32, end: u32, patch: SpanStyle) -> Paragraph {
+        let text_len = self.text.len() as u32;
+        let start = start.min(text_len);
+        let end = end.min(text_len);
+        if start >= end {
+            return self.clone();
+        }
+
+        /* Every boundary: text extent, the patch range, existing span edges. */
+        let mut bounds: Vec<u32> = vec![0, text_len, start, end];
+        for s in &self.spans {
+            bounds.push(s.start);
+            bounds.push(s.end);
+        }
+        bounds.retain(|&b| b <= text_len);
+        bounds.sort_unstable();
+        bounds.dedup();
+
+        /* Re-derive each interval's style, merging the patch where covered. */
+        let mut spans: Vec<StyleRun> = Vec::new();
+        for win in bounds.windows(2) {
+            let (a, b) = (win[0], win[1]);
+            let mut style = self.style_at(a);
+            if a >= start && b <= end {
+                style = style.merged_with(patch);
+            }
+            if style == SpanStyle::default() {
+                continue;
+            }
+            match spans.last_mut() {
+                Some(prev) if prev.end == a && prev.style == style => prev.end = b,
+                _ => spans.push(StyleRun {
+                    start: a,
+                    end: b,
+                    style,
+                }),
+            }
+        }
+
+        Paragraph {
+            text: self.text.clone(),
+            spans,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,6 +122,7 @@ impl DocumentTree {
         let mut paragraphs = Vector::new();
         paragraphs.push_back(Paragraph {
             text: text.to_owned(),
+            spans: Vec::new(),
         });
         Self { paragraphs }
     }
@@ -42,7 +131,10 @@ impl DocumentTree {
     pub fn from_paragraphs<I: IntoIterator<Item = String>>(texts: I) -> Self {
         let mut paragraphs = Vector::new();
         for t in texts {
-            paragraphs.push_back(Paragraph { text: t });
+            paragraphs.push_back(Paragraph {
+                text: t,
+                spans: Vec::new(),
+            });
         }
         Self { paragraphs }
     }
@@ -78,6 +170,7 @@ impl DocumentTree {
         if paragraphs.is_empty() {
             paragraphs.push_back(Paragraph {
                 text: text.to_owned(),
+                spans: Vec::new(),
             });
             return Self { paragraphs };
         }
@@ -85,7 +178,43 @@ impl DocumentTree {
         let mut para = paragraphs[para_idx].clone();
         let offset = (at.offset as usize).min(para.text.len());
         para.text.insert_str(offset, text);
+        /* Shift styled spans across the insertion point — a span containing
+        the point grows, spans wholly after it slide right. */
+        let off = offset as u32;
+        let len = text.len() as u32;
+        for s in &mut para.spans {
+            if s.start >= off {
+                s.start += len;
+            }
+            if s.end > off {
+                s.end += len;
+            }
+        }
         paragraphs.set(para_idx, para);
+        Self { paragraphs }
+    }
+
+    /// Apply a style `patch` over the logical range `[start, end)`. Splits and
+    /// merges spans on every covered paragraph; unaffected paragraphs are
+    /// structurally shared.
+    pub fn apply_style(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
+        let mut paragraphs = self.paragraphs.clone();
+        if paragraphs.is_empty() {
+            return self.clone();
+        }
+        let last_idx = paragraphs.len() - 1;
+        let first = (start.para as usize).min(last_idx);
+        let last = (end.para as usize).min(last_idx);
+        for p in first..=last {
+            let lo = if p == first { start.offset } else { 0 };
+            let hi = if p == last {
+                end.offset
+            } else {
+                paragraphs[p].text.len() as u32
+            };
+            let styled = paragraphs[p].apply_style(lo, hi, patch);
+            paragraphs.set(p, styled);
+        }
         Self { paragraphs }
     }
 }
@@ -180,6 +309,89 @@ mod tests {
         let d = DocumentTree::from_text("hello world");
         let d = d.insert_text(LogicalPos { para: 0, offset: 5 }, ",");
         assert_eq!(d.paragraph_text(0), Some("hello, world"));
+    }
+
+    #[test]
+    fn apply_style_creates_span() {
+        let doc = DocumentTree::from_text("hello world");
+        let doc = doc.apply_style(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 5 },
+            SpanStyle {
+                font_size: Some(20.0),
+                color: None,
+            },
+        );
+        let spans = &doc.paragraphs[0].spans;
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0],
+            StyleRun {
+                start: 0,
+                end: 5,
+                style: SpanStyle {
+                    font_size: Some(20.0),
+                    color: None
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn overlapping_styles_split_and_merge() {
+        let doc = DocumentTree::from_text("hello world");
+        let red = SpanStyle {
+            font_size: None,
+            color: Some([255, 0, 0, 255]),
+        };
+        let big = SpanStyle {
+            font_size: Some(30.0),
+            color: None,
+        };
+        let doc = doc.apply_style(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 8 },
+            red,
+        );
+        let doc = doc.apply_style(
+            LogicalPos { para: 0, offset: 4 },
+            LogicalPos {
+                para: 0,
+                offset: 11,
+            },
+            big,
+        );
+        let spans = &doc.paragraphs[0].spans;
+        /* [0,4) red ; [4,8) red+big ; [8,11) big */
+        assert_eq!(spans.len(), 3);
+        assert_eq!((spans[0].start, spans[0].end), (0, 4));
+        assert_eq!(spans[0].style, red);
+        assert_eq!((spans[1].start, spans[1].end), (4, 8));
+        assert_eq!(
+            spans[1].style,
+            SpanStyle {
+                font_size: Some(30.0),
+                color: Some([255, 0, 0, 255]),
+            }
+        );
+        assert_eq!((spans[2].start, spans[2].end), (8, 11));
+        assert_eq!(spans[2].style, big);
+    }
+
+    #[test]
+    fn insert_shifts_spans() {
+        let doc = DocumentTree::from_text("abcdef");
+        let doc = doc.apply_style(
+            LogicalPos { para: 0, offset: 2 },
+            LogicalPos { para: 0, offset: 4 },
+            SpanStyle {
+                font_size: None,
+                color: Some([1, 2, 3, 255]),
+            },
+        );
+        let doc = doc.insert_text(LogicalPos { para: 0, offset: 0 }, "XX");
+        let span = doc.paragraphs[0].spans[0];
+        assert_eq!((span.start, span.end), (4, 6));
     }
 
     #[test]

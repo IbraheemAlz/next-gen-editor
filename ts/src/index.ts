@@ -42,6 +42,7 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
     if (
         testCase === '' ||
         testCase === 'a4-justified-mixed' ||
+        testCase === 'rich-text' ||
         testCase === 'editing-arabic' ||
         testCase === 'docx-round-trip'
     ) {

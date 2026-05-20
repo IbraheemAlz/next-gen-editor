@@ -121,7 +121,7 @@ async function handleInit(msg: InitMsg): Promise<void> {
             bytes: await fetchBytes(DUAL_URL),
         } as Command);
         self.postMessage({ type: 'FONT_LOADED_RESULT', event: e });
-    } else if (testCase === 'a4-justified-mixed') {
+    } else if (testCase === 'a4-justified-mixed' || testCase === 'rich-text') {
         const arabic = await dispatch({
             type: 'LOAD_FONT',
             id: ARABIC_ID,
@@ -241,6 +241,38 @@ async function handleInit(msg: InitMsg): Promise<void> {
                 type: 'INSERT_TEXT',
                 at: undefined,
                 text: ' تم التعديل',
+            } as Command);
+            break;
+        }
+
+        case 'rich-text': {
+            /* Rich text: a plain RenderPage, then ApplyFormatting spans of
+               colour + size over mixed Arabic/English. The 44px size span
+               starts at offset 3 — mid-"Hello" — so it splits a shaping run
+               purely on a style change; it also overlaps both colour spans. */
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'Hello أهلا world عالم done.',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 26,
+                line_height: 56,
+                align: 'START',
+            } as Command);
+            await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: { start: { para: 0, offset: 0 }, end: { para: 0, offset: 14 } },
+                attrs: { color: { r: 200, g: 30, b: 30, a: 255 } },
+            } as Command);
+            await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: { start: { para: 0, offset: 14 }, end: { para: 0, offset: 35 } },
+                attrs: { color: { r: 30, g: 70, b: 200, a: 255 } },
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: { start: { para: 0, offset: 3 }, end: { para: 0, offset: 29 } },
+                attrs: { font_size: 44 },
             } as Command);
             break;
         }

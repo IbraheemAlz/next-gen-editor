@@ -5,11 +5,15 @@
 //! repaint when a layout config was cached by a prior `RenderPage`.
 
 use bridge::{
-    Command, EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
+    Color, Command, EngineStats, Event, FontMetrics as BridgeMetrics,
+    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, TextAttrs, TextAttrsPatch,
+    UnderlineStyle, VerticalScript,
 };
-use engine::{DocumentTree, LogicalPos as EnginePos, UndoStack};
+use engine::{DocumentTree, LogicalPos as EnginePos, SpanStyle, UndoStack};
 use format_docx::writer::build_minimal_docx;
-use layout::{A4Page, PageBox, ParagraphBox, ParagraphConfig, Point, Size, layout_paragraph};
+use layout::{
+    A4Page, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan, layout_paragraph,
+};
 use render::atlas::GlyphAtlas;
 use render::canvas2d_backend::render_canvas2d;
 use render::scene::build_page_scene;
@@ -149,6 +153,67 @@ fn wasm_heap_bytes() -> u32 {
     }
 }
 
+/// Build a fully-resolved `TextAttrs` for the `FormattingChanged` reply,
+/// filling unset patch fields with defaults.
+fn resolved_attrs(patch: &TextAttrsPatch, default_size: f32) -> TextAttrs {
+    TextAttrs {
+        bold: patch.bold.unwrap_or(false),
+        italic: patch.italic.unwrap_or(false),
+        underline: patch.underline.unwrap_or(UnderlineStyle::None),
+        strike: patch.strike.unwrap_or(false),
+        font_family: patch.font_family.clone().unwrap_or_default(),
+        font_size: patch.font_size.unwrap_or(default_size),
+        color: patch.color.unwrap_or(Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        }),
+        bg_color: patch.bg_color,
+        script: patch.script.unwrap_or(VerticalScript::Normal),
+        language: patch.language.clone().unwrap_or_default(),
+    }
+}
+
+/// Expand a paragraph's sparse style runs into a gap-free list of resolved
+/// [`StyleSpan`]s covering `[0, text.len())`, filling unstyled gaps with the
+/// document defaults.
+fn build_style_spans(
+    para: &engine::Paragraph,
+    default_size: f32,
+    default_color: [u8; 4],
+) -> Vec<StyleSpan> {
+    let len = para.text.len() as u32;
+    let mut spans: Vec<StyleSpan> = Vec::new();
+    let mut cursor = 0_u32;
+    for run in &para.spans {
+        if run.start > cursor {
+            spans.push(StyleSpan {
+                start: cursor,
+                end: run.start,
+                px_size: default_size,
+                color: default_color,
+            });
+        }
+        spans.push(StyleSpan {
+            start: run.start,
+            end: run.end,
+            px_size: run.style.font_size.unwrap_or(default_size),
+            color: run.style.color.unwrap_or(default_color),
+        });
+        cursor = run.end;
+    }
+    if cursor < len {
+        spans.push(StyleSpan {
+            start: cursor,
+            end: len,
+            px_size: default_size,
+            color: default_color,
+        });
+    }
+    spans
+}
+
 impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         match cmd {
@@ -239,7 +304,7 @@ impl Engine {
             Command::CloseDocument => phase3_stub("CloseDocument"),
             Command::DeleteRange { .. } => phase3_stub("DeleteRange"),
             Command::ReplaceRange { .. } => phase3_stub("ReplaceRange"),
-            Command::ApplyFormatting { .. } => phase3_stub("ApplyFormatting"),
+            Command::ApplyFormatting { range, attrs } => self.apply_formatting(range, attrs),
             Command::SplitParagraph { .. } => phase3_stub("SplitParagraph"),
             Command::MergeParagraph { .. } => phase3_stub("MergeParagraph"),
             Command::InsertImage { .. } => phase3_stub("InsertImage"),
@@ -437,6 +502,27 @@ impl Engine {
         }
     }
 
+    fn apply_formatting(&mut self, range: BridgeLogicalRange, attrs: TextAttrsPatch) -> Event {
+        let patch = SpanStyle {
+            font_size: attrs.font_size,
+            color: attrs.color.map(|c| [c.r, c.g, c.b, c.a]),
+        };
+        let new_doc = self.undo.current().apply_style(
+            to_engine_pos(range.start),
+            to_engine_pos(range.end),
+            patch,
+        );
+        self.undo.push(new_doc);
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
+        Event::FormattingChanged {
+            range,
+            attrs: resolved_attrs(&attrs, default_size),
+        }
+    }
+
     fn do_undo(&mut self) -> Event {
         self.undo.undo();
         if let Err(e) = self.maybe_repaint_result() {
@@ -519,15 +605,15 @@ impl Engine {
                 para_y_offset += cfg.line_height;
                 continue;
             }
+            let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255]);
             let para_cfg = ParagraphConfig {
                 text: &para.text,
                 fonts: &font_stack,
+                spans: &spans,
                 base_direction: cfg.base_direction,
-                px_size: cfg.px_size,
                 max_width: page.content_width(),
                 line_height: cfg.line_height,
                 alignment: cfg.alignment,
-                text_color: [0, 0, 0, 255],
             };
             let mut para_box = layout_paragraph(para_cfg);
             para_box.origin = Point {

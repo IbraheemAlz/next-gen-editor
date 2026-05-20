@@ -40,6 +40,17 @@ pub struct TextAttrs {
     pub color: [u8; 4],
 }
 
+/// A resolved rich-text style span — a paragraph byte range `[start, end)` with
+/// its fully-resolved font size and colour (paragraph defaults already
+/// applied). `layout_paragraph` splits shaping runs at these boundaries.
+#[derive(Debug, Clone, Copy)]
+pub struct StyleSpan {
+    pub start: u32,
+    pub end: u32,
+    pub px_size: f32,
+    pub color: [u8; 4],
+}
+
 /// One shaped glyph, positioned by advance/offset relative to the pen. There is
 /// no stored absolute x: it is the run pen plus the cumulative `x_advance` of
 /// the prior glyphs in the run.

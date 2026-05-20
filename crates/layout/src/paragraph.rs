@@ -9,7 +9,9 @@
 //! Cost: O(N) calls to `shape_text` where N = number of line-break
 //! opportunities. Acceptable for the PoC; Phase 3 will cache widths.
 
-use crate::boxes::{LineBox, ParagraphBox, Point, PositionedGlyph, Size, TextAttrs, VisualRun};
+use crate::boxes::{
+    LineBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TextAttrs, VisualRun,
+};
 use std::mem::take;
 use text_pipeline::{
     Alignment, FontStack, JustifyMode, ShapingDirection, analyze_bidi, break_opportunities,
@@ -23,13 +25,13 @@ pub struct ParagraphConfig<'a> {
     /// Per-script font resolver — Latin and Arabic runs each shape against a
     /// covering face (PHASE_3_RENDER_RTL.md §13.A).
     pub fonts: &'a FontStack,
+    /// Resolved style spans covering `[0, text.len())` with no gaps. Runs split
+    /// at span boundaries and shape at the span's `px_size` (rich text).
+    pub spans: &'a [StyleSpan],
     pub base_direction: ShapingDirection,
-    pub px_size: f32,
     pub max_width: f32,
     pub line_height: f32,
     pub alignment: Alignment,
-    /// Straight-alpha RGBA fill colour for the text.
-    pub text_color: [u8; 4],
 }
 
 /// Lay out `cfg.text` into a [`ParagraphBox`] with positioned lines.
@@ -99,7 +101,13 @@ fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
             continue;
         }
         let candidate = &cfg.text[start..b];
-        let probe = measure_text(cfg.fonts, candidate, cfg.base_direction, cfg.px_size);
+        let probe = measure_text(
+            cfg.fonts,
+            candidate,
+            start as u32,
+            cfg.spans,
+            cfg.base_direction,
+        );
 
         if probe <= cfg.max_width {
             last_fit_end = b;
@@ -133,19 +141,39 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
     let mut runs: Vec<VisualRun> = Vec::new();
     for brun in &bidi.visual_runs {
         let brun_text = &line_text[brun.range.clone()];
-        /* Split the BiDi run into single-script segments so each shapes
-        against a covering font. `segment_by_script` yields logical order; an
-        RTL run reverses to visual (left-to-right). */
-        let mut segments = segment_by_script(brun_text);
-        if matches!(brun.direction, ShapingDirection::Rtl) {
-            segments.reverse();
+        let brun_abs = (start + brun.range.start) as u32;
+
+        /* Sub-segment the BiDi run by script (font) and by style span (size +
+        colour) — both are hard splits. Collect in logical order, then reverse
+        to visual (left-to-right) order for an RTL run. */
+        let mut subs = Vec::new();
+        for (srange, script) in segment_by_script(brun_text) {
+            let mut cursor = brun_abs + srange.start as u32;
+            let seg_end = brun_abs + srange.end as u32;
+            while cursor < seg_end {
+                let Some(span) = style_at(cfg.spans, cursor) else {
+                    break;
+                };
+                let piece_end = span.end.min(seg_end);
+                subs.push((
+                    (cursor - brun_abs) as usize,
+                    (piece_end - brun_abs) as usize,
+                    script,
+                    span,
+                ));
+                cursor = piece_end;
+            }
         }
-        for (srange, script) in segments {
+        if matches!(brun.direction, ShapingDirection::Rtl) {
+            subs.reverse();
+        }
+
+        for (rel_start, rel_end, script, span) in subs {
             let Some((font_id, face)) = cfg.fonts.resolve(script) else {
                 continue;
             };
-            let sub_text = &brun_text[srange.start..srange.end];
-            let shaped = shape_text(face, sub_text, brun.direction, cfg.px_size);
+            let sub_text = &brun_text[rel_start..rel_end];
+            let shaped = shape_text(face, sub_text, brun.direction, span.px_size);
             let glyphs: Vec<PositionedGlyph> = shaped
                 .glyphs
                 .iter()
@@ -158,16 +186,14 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     y_offset: g.y_offset,
                 })
                 .collect();
-            let abs_start = (start + brun.range.start + srange.start) as u32;
-            let abs_end = (start + brun.range.start + srange.end) as u32;
             runs.push(VisualRun {
                 glyphs,
                 font: font_id.clone(),
                 direction: brun.direction,
-                source_range: abs_start..abs_end,
+                source_range: brun_abs + rel_start as u32..brun_abs + rel_end as u32,
                 attrs: TextAttrs {
-                    px_size: cfg.px_size,
-                    color: cfg.text_color,
+                    px_size: span.px_size,
+                    color: span.color,
                 },
             });
         }
@@ -191,14 +217,41 @@ fn line_advance(runs: &[VisualRun]) -> f32 {
         .sum()
 }
 
-/// Total advance of `text` shaped with per-script fonts — the greedy probe's
-/// width estimate. Mirrors [`build_line`]'s segmentation so a fitted candidate
+/// The style span covering byte `offset`. `cfg.spans` covers the whole
+/// paragraph with no gaps, so a miss only happens past the text end.
+fn style_at(spans: &[StyleSpan], offset: u32) -> Option<StyleSpan> {
+    spans
+        .iter()
+        .copied()
+        .find(|s| offset >= s.start && offset < s.end)
+}
+
+/// Total advance of `text` shaped with per-script fonts and per-span sizes —
+/// the greedy probe's width estimate. `abs_start` is `text`'s byte offset in
+/// the paragraph. Mirrors [`build_line`]'s segmentation so a fitted candidate
 /// measures consistently with the line eventually built.
-fn measure_text(fonts: &FontStack, text: &str, direction: ShapingDirection, px_size: f32) -> f32 {
+fn measure_text(
+    fonts: &FontStack,
+    text: &str,
+    abs_start: u32,
+    spans: &[StyleSpan],
+    direction: ShapingDirection,
+) -> f32 {
     let mut total = 0.0_f32;
-    for (range, script) in segment_by_script(text) {
-        if let Some((_, face)) = fonts.resolve(script) {
-            total += shape_text(face, &text[range], direction, px_size).total_advance;
+    for (srange, script) in segment_by_script(text) {
+        let Some((_, face)) = fonts.resolve(script) else {
+            continue;
+        };
+        let mut cursor = abs_start + srange.start as u32;
+        let seg_end = abs_start + srange.end as u32;
+        while cursor < seg_end {
+            let Some(span) = style_at(spans, cursor) else {
+                break;
+            };
+            let piece_end = span.end.min(seg_end);
+            let sub = &text[(cursor - abs_start) as usize..(piece_end - abs_start) as usize];
+            total += shape_text(face, sub, direction, span.px_size).total_advance;
+            cursor = piece_end;
         }
     }
     total

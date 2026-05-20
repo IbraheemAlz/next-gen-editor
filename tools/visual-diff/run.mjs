@@ -39,6 +39,7 @@ console.log(`[visual-diff] case=${NAME} tol=${(TOL * 100).toFixed(2)}% url=${URL
    matches the drawing surface 1:1. Override via VIEWPORT=WxH if needed. */
 const VIEWPORTS = {
     'a4-justified-mixed': { width: 595, height: 842 },
+    'rich-text': { width: 595, height: 842 },
     'editing-arabic': { width: 595, height: 842 },
     'docx-round-trip': { width: 595, height: 842 },
 };
