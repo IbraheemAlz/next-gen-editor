@@ -4,7 +4,9 @@
 //! undo/redo + `.docx` load/save + InsertText that triggers an automatic
 //! repaint when a layout config was cached by a prior `RenderPage`.
 
-use bridge::{Command, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos};
+use bridge::{
+    Command, EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
+};
 use engine::{DocumentTree, LogicalPos as EnginePos, UndoStack};
 use format_docx::writer::build_minimal_docx;
 use layout::{A4Page, ParagraphConfig, layout_paragraph};
@@ -80,6 +82,21 @@ fn to_engine_pos(p: BridgeLogicalPos) -> EnginePos {
 fn phase3_stub(name: &str) -> Event {
     Event::Error {
         message: format!("{name}: accepted by the Phase 2 schema, implemented in Phase 3"),
+    }
+}
+
+/// Current WASM linear-memory size in bytes (PHASE_2_BRIDGE_MEMORY.md §8.2).
+/// Real on the `wasm32` artifact; `0` on native `cargo check`/`test` builds,
+/// where the `memory_size` intrinsic does not exist.
+fn wasm_heap_bytes() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pages = core::arch::wasm32::memory_size(0) as u64;
+        (pages * 65536).min(u32::MAX as u64) as u32
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0
     }
 }
 
@@ -187,7 +204,7 @@ impl Engine {
             Command::SetZoom { .. } => phase3_stub("SetZoom"),
             Command::RequestPaint { .. } => phase3_stub("RequestPaint"),
             Command::UnloadFont { .. } => phase3_stub("UnloadFont"),
-            Command::RequestStats => phase3_stub("RequestStats"),
+            Command::RequestStats => self.request_stats(),
         }
     }
 
@@ -393,6 +410,23 @@ impl Engine {
             can_redo: self.undo.can_redo(),
             undo_depth: self.undo.depth(),
         }
+    }
+
+    /// D2.5 telemetry. `wasm_heap_bytes` and undo/font counters are real;
+    /// `document_tree_bytes` is an estimate (sum of paragraph text bytes);
+    /// the glyph cache and frame timings land with the Phase 3 renderer.
+    fn request_stats(&self) -> Event {
+        let doc = self.undo.current();
+        let document_tree_bytes: usize = doc.paragraphs.iter().map(|p| p.text.len()).sum();
+        Event::Stats(EngineStats {
+            wasm_heap_bytes: wasm_heap_bytes(),
+            document_tree_bytes: document_tree_bytes as u32,
+            glyph_cache_entries: 0,
+            undo_stack_depth: self.undo.depth(),
+            fonts_resident: self.fonts.len() as u32,
+            last_paint_ms: 0.0,
+            last_command_ms: 0.0,
+        })
     }
 
     fn maybe_repaint(&mut self) {

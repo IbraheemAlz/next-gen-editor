@@ -25,6 +25,8 @@ declare global {
         __dispatch?: (cmd: Command) => Promise<Event>;
         /** The interactive editor's client (debugging / e2e hook). */
         __engineClient?: EngineClient;
+        /** Most recent EngineStats event (debugging / e2e hook). */
+        __lastStats?: unknown;
     }
 }
 
@@ -80,10 +82,8 @@ async function setupEngine(client: EngineClient): Promise<void> {
     /* Amiri is a dual-script Naskh face — renders mixed Arabic/English without
        engine-side font fallback (that lands in Phase 3). */
     const fontBytes = new Uint8Array(await (await fetch(AMIRI_URL)).arrayBuffer());
-    /* D2.4: hand the font buffer to the worker as a Transferable — no copy. */
-    await client.dispatch({ type: 'LOAD_FONT', id: AMIRI_ID, bytes: fontBytes }, [
-        fontBytes.buffer as ArrayBuffer,
-    ]);
+    /* D2.4: loadFont hands the buffer to the worker as a Transferable — no copy. */
+    await client.loadFont(AMIRI_ID, fontBytes);
     await client.dispatch({
         type: 'RENDER_PAGE',
         text: '',
@@ -152,6 +152,40 @@ async function runInteractive(
     const dispatch = (cmd: Command): Promise<Event> => client.dispatch(cmd);
     window.__dispatch = dispatch;
     wireInteractive(current, textarea, status, dispatch);
+
+    /* D2.5: poll engine memory/telemetry stats. */
+    startStatsPolling(client);
+}
+
+/** D2.5: poll EngineStats every 5 s; log to console + a small debug div. */
+function startStatsPolling(client: EngineClient): void {
+    const debug = document.createElement('div');
+    debug.id = 'stats';
+    debug.style.cssText =
+        'position:fixed;right:8px;bottom:8px;padding:6px 10px;z-index:10;' +
+        'background:rgba(0,0,0,0.78);color:#5f5;border-radius:4px;' +
+        'font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre;';
+    document.body.appendChild(debug);
+
+    const poll = async (): Promise<void> => {
+        try {
+            const evt = await client.dispatch({ type: 'REQUEST_STATS' });
+            if (evt.type !== 'STATS') return;
+            const heapMiB = (evt.wasm_heap_bytes / (1024 * 1024)).toFixed(1);
+            const line =
+                `EngineStats — heap ${evt.wasm_heap_bytes} B (${heapMiB} MiB) · ` +
+                `tree ${evt.document_tree_bytes} B · undo depth ${evt.undo_stack_depth} · ` +
+                `fonts ${evt.fonts_resident} · glyph cache ${evt.glyph_cache_entries}`;
+            console.log(`[stats] ${line}`);
+            debug.textContent = line;
+            window.__lastStats = evt;
+        } catch (e: unknown) {
+            console.warn('[stats] poll failed', e);
+        }
+    };
+
+    void poll();
+    setInterval(() => void poll(), 5000);
 }
 
 /* ===================================================================

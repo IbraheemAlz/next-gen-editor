@@ -10,7 +10,7 @@
  * crate is not built standalone — its `Command`/`Event` types are generated
  * (via `tsify-next`) into the `engine-wasm` wasm-pack package, so that is the
  * real import site. */
-import type { Command, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js';
+import type { Command, DocFormat, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js';
 import { loadLatestEventLog } from './event-log';
 
 type Resolver = (v: { ok: boolean; evt?: Event; error?: string; trap?: boolean }) => void;
@@ -73,6 +73,23 @@ export class EngineClient {
         const r = await this.send({ cmd }, transfer);
         if (!r.ok) throw new Error(r.error);
         return r.evt!;
+    }
+
+    /**
+     * D2.4: dispatch `LoadFont`, handing the font buffer to the worker as a
+     * Transferable so the payload moves zero-copy instead of being cloned.
+     */
+    async loadFont(id: string, bytes: Uint8Array): Promise<Event> {
+        return this.dispatch({ type: 'LOAD_FONT', id, bytes }, [bytes.buffer as ArrayBuffer]);
+    }
+
+    /**
+     * D2.4: dispatch `OpenDocument`, transferring the document buffer zero-copy.
+     */
+    async openDocument(bytes: Uint8Array, format: DocFormat, name?: string): Promise<Event> {
+        return this.dispatch({ type: 'OPEN_DOCUMENT', bytes, format, name }, [
+            bytes.buffer as ArrayBuffer,
+        ]);
     }
 
     subscribe(fn: (e: Event) => void): () => void {
