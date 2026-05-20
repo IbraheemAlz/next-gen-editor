@@ -297,6 +297,7 @@ dependencies = [
  "format-docx",
  "format-pdf",
  "js-sys",
+ "kurbo",
  "layout",
  "render",
  "serde-wasm-bindgen",

@@ -7,5 +7,6 @@
 pub mod atlas;
 pub mod backend;
 pub mod canvas2d_backend;
+pub mod dirty;
 pub mod scene;
 pub mod vello_backend;

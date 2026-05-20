@@ -6,16 +6,18 @@
 
 use bridge::{
     Color, Command, EngineStats, Event, FontMetrics as BridgeMetrics,
-    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, TextAttrs, TextAttrsPatch,
-    UnderlineStyle, VerticalScript,
+    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, Rect as BridgeRect,
+    TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{DocumentTree, LogicalPos as EnginePos, SpanStyle, UndoStack};
 use format_docx::writer::build_minimal_docx;
+use kurbo::Rect;
 use layout::{
     A4Page, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan, layout_paragraph,
 };
 use render::atlas::GlyphAtlas;
 use render::canvas2d_backend::render_canvas2d;
+use render::dirty::DirtyTracker;
 use render::scene::build_page_scene;
 use render::vello_backend::VelloRenderer;
 use std::collections::HashMap;
@@ -46,6 +48,7 @@ pub struct Engine {
     layout_cfg: Option<RenderConfig>,
     atlas: GlyphAtlas,
     vello: Option<VelloRenderer>,
+    dirty: DirtyTracker,
 }
 
 #[wasm_bindgen]
@@ -65,6 +68,7 @@ impl Engine {
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
             vello: None,
+            dirty: DirtyTracker::new(),
         })
     }
 
@@ -150,6 +154,33 @@ fn wasm_heap_bytes() -> u32 {
     #[cfg(not(target_arch = "wasm32"))]
     {
         0
+    }
+}
+
+/// The full A4 page rectangle — the dirty region an edit invalidates, since an
+/// edit can reflow the whole page.
+fn full_page_rect() -> Rect {
+    let page = A4Page::a4();
+    Rect::new(0.0, 0.0, f64::from(page.width), f64::from(page.height))
+}
+
+/// Convert a bridge `Rect` (x, y, w, h) to a `kurbo::Rect` (x0, y0, x1, y1).
+fn bridge_to_kurbo(r: BridgeRect) -> Rect {
+    Rect::new(
+        f64::from(r.x),
+        f64::from(r.y),
+        f64::from(r.x + r.w),
+        f64::from(r.y + r.h),
+    )
+}
+
+/// Convert a `kurbo::Rect` back to a bridge `Rect` for an event payload.
+fn kurbo_to_bridge(r: Rect) -> BridgeRect {
+    BridgeRect {
+        x: r.x0 as f32,
+        y: r.y0 as f32,
+        w: r.width() as f32,
+        h: r.height() as f32,
     }
 }
 
@@ -316,7 +347,7 @@ impl Engine {
             Command::EndComposition { .. } => phase3_stub("EndComposition"),
             Command::SetViewport { .. } => phase3_stub("SetViewport"),
             Command::SetZoom { .. } => phase3_stub("SetZoom"),
-            Command::RequestPaint { .. } => phase3_stub("RequestPaint"),
+            Command::RequestPaint { viewport, dirty } => self.do_request_paint(viewport, dirty),
             Command::UnloadFont { .. } => phase3_stub("UnloadFont"),
             Command::RequestStats => self.request_stats(),
         }
@@ -473,7 +504,7 @@ impl Engine {
             alignment,
         });
 
-        let stats = match self.render_document() {
+        let stats = match self.render_document(None) {
             Ok(s) => s,
             Err(e) => return *e,
         };
@@ -491,6 +522,7 @@ impl Engine {
             .unwrap_or_else(|| self.undo.current().end_of_document());
         let new_doc = self.undo.current().insert_text(pos, &text);
         self.undo.push(new_doc);
+        self.dirty.invalidate(full_page_rect());
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
@@ -513,6 +545,7 @@ impl Engine {
             patch,
         );
         self.undo.push(new_doc);
+        self.dirty.invalidate(full_page_rect());
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
@@ -525,6 +558,7 @@ impl Engine {
 
     fn do_undo(&mut self) -> Event {
         self.undo.undo();
+        self.dirty.invalidate(full_page_rect());
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
@@ -537,6 +571,7 @@ impl Engine {
 
     fn do_redo(&mut self) -> Event {
         self.undo.redo();
+        self.dirty.invalidate(full_page_rect());
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
@@ -565,14 +600,14 @@ impl Engine {
     }
 
     fn maybe_repaint(&mut self) {
-        let _ = self.render_document();
+        let _ = self.render_document(None);
     }
 
     fn maybe_repaint_result(&mut self) -> Result<(), Box<Event>> {
         if self.layout_cfg.is_none() {
             return Ok(());
         }
-        self.render_document().map(|_| ())
+        self.render_document(None).map(|_| ())
     }
 
     /// Lay out the current document into a `PageBox` plus the `FontStack` used
@@ -635,7 +670,7 @@ impl Engine {
         Ok((page_box, font_stack))
     }
 
-    fn render_document(&mut self) -> Result<RenderStats, Box<Event>> {
+    fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
         let (page_box, _font_stack) = self.build_page()?;
 
         let line_count: u32 = page_box
@@ -652,6 +687,14 @@ impl Engine {
             .sum();
 
         let scene = build_page_scene(&page_box);
+        let clip_rect = clip.unwrap_or_else(|| {
+            Rect::new(
+                0.0,
+                0.0,
+                f64::from(page_box.size.width),
+                f64::from(page_box.size.height),
+            )
+        });
         let ctx = match &self.ctx {
             Some(c) => c.clone(),
             None => {
@@ -660,9 +703,13 @@ impl Engine {
                 }));
             }
         };
-        if let Err(e) = render_canvas2d(&ctx, &scene, &mut self.atlas, |id| {
-            self.fonts.get(id).cloned()
-        }) {
+        if let Err(e) = render_canvas2d(
+            &ctx,
+            &scene,
+            &mut self.atlas,
+            |id| self.fonts.get(id).cloned(),
+            clip_rect,
+        ) {
             return Err(Box::new(Event::Error {
                 message: format!("paint: {e:?}"),
             }));
@@ -690,6 +737,25 @@ impl Engine {
         }
         Event::PdfExported { bytes, pages: 1 }
     }
+
+    /// D3.8: repaint the document clipped to the dirty region. The command's
+    /// `dirty` rect wins; else the accumulated [`DirtyTracker`] region; else
+    /// the full `viewport`.
+    fn do_request_paint(&mut self, viewport: BridgeRect, dirty: Option<BridgeRect>) -> Event {
+        let drained = self.dirty.drain();
+        let region = dirty
+            .map(bridge_to_kurbo)
+            .or(drained)
+            .unwrap_or_else(|| bridge_to_kurbo(viewport));
+        if let Err(e) = self.render_document(Some(region)) {
+            return *e;
+        }
+        Event::Painted {
+            dirty: kurbo_to_bridge(region),
+            version: u64::from(self.undo.depth()),
+            paint_ms: 0.0,
+        }
+    }
 }
 
 struct RenderStats {
@@ -715,6 +781,7 @@ mod tests {
             layout_cfg: None,
             atlas: GlyphAtlas::new(),
             vello: None,
+            dirty: DirtyTracker::new(),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine

@@ -5,7 +5,8 @@
 //! (`RasterizeGlyph` / `ShapeAndRasterize`) still call it directly.
 
 use crate::atlas::{GlyphAtlas, GlyphKey};
-use crate::scene::{DisplayCmd, DisplayList, Paint};
+use crate::scene::{DisplayCmd, DisplayList, GlyphRun, Paint};
+use kurbo::Rect;
 use std::sync::Arc;
 use text_pipeline::{LoadedFont, RasterizedGlyph};
 use wasm_bindgen::Clamped;
@@ -47,17 +48,28 @@ pub fn paint_alpha_glyph(
     Ok(())
 }
 
-/// Interpret a [`DisplayList`] onto a Canvas2D context. `resolve_font` maps a
-/// `FontId` to its `LoadedFont`.
+/// Interpret a [`DisplayList`] onto a Canvas2D context, clipped to the dirty
+/// `clip` region (D3.8). `resolve_font` maps a `FontId` to its `LoadedFont`.
 ///
-/// Lossless with respect to the Phase 1 inline paint loop: rects go through
-/// `fill_rect`/`stroke_rect`, glyphs through `paint_alpha_glyph`.
+/// Fills and strokes are bounded by the canvas clip path. Glyphs are blitted
+/// with `put_image_data`, which the Canvas2D spec exempts from the clip — so a
+/// glyph run whose bounding box misses `clip` is culled in the loop instead.
+///
+/// A `clip` covering the whole page is a no-op: every run intersects it and
+/// nothing is excluded, so a full repaint is byte-identical to the unclipped
+/// path.
 pub fn render_canvas2d(
     ctx: &web_sys::OffscreenCanvasRenderingContext2d,
     list: &DisplayList,
     atlas: &mut GlyphAtlas,
     resolve_font: impl Fn(&str) -> Option<Arc<LoadedFont>>,
+    clip: Rect,
 ) -> Result<(), JsValue> {
+    ctx.save();
+    ctx.begin_path();
+    ctx.rect(clip.x0, clip.y0, clip.width(), clip.height());
+    ctx.clip();
+
     for cmd in &list.cmds {
         match cmd {
             DisplayCmd::FillRect { rect, paint } => {
@@ -70,6 +82,13 @@ pub fn render_canvas2d(
                 ctx.stroke_rect(rect.x0, rect.y0, rect.width(), rect.height());
             }
             DisplayCmd::DrawGlyphRun(run) => {
+                /* `put_image_data` ignores the clip — cull off-region runs. */
+                if let Some(bbox) = run_bbox(run) {
+                    let hit = clip.intersect(bbox);
+                    if hit.width() <= 0.0 || hit.height() <= 0.0 {
+                        continue;
+                    }
+                }
                 let Some(font) = resolve_font(&run.font) else {
                     continue;
                 };
@@ -96,7 +115,30 @@ pub fn render_canvas2d(
             DisplayCmd::PopTransform => ctx.restore(),
         }
     }
+
+    ctx.restore();
     Ok(())
+}
+
+/// Conservative bounding box of a glyph run — the pen extents padded by the
+/// run's pixel size to cover ascenders, descenders, and side bearings. `None`
+/// for an empty run.
+fn run_bbox(run: &GlyphRun) -> Option<Rect> {
+    if run.glyphs.is_empty() {
+        return None;
+    }
+    let mut x0 = f64::MAX;
+    let mut y0 = f64::MAX;
+    let mut x1 = f64::MIN;
+    let mut y1 = f64::MIN;
+    for g in &run.glyphs {
+        x0 = x0.min(g.x);
+        y0 = y0.min(g.y);
+        x1 = x1.max(g.x);
+        y1 = y1.max(g.y);
+    }
+    let pad = f64::from(run.px_size);
+    Some(Rect::new(x0 - pad, y0 - 2.0 * pad, x1 + pad, y1 + pad))
 }
 
 /// Solid-paint channels as `[r, g, b, a]` u8. Non-solid brushes fall back to

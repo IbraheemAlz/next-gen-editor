@@ -17,6 +17,7 @@ layout = { path = "../layout" }
 render = { path = "../render" }
 format-docx = { path = "../format-docx" }
 format-pdf = { path = "../format-pdf" }
+kurbo = { workspace = true }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }
