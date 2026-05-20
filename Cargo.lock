@@ -295,6 +295,7 @@ dependencies = [
  "console_error_panic_hook",
  "engine",
  "format-docx",
+ "format-pdf",
  "js-sys",
  "layout",
  "render",
@@ -375,6 +376,15 @@ dependencies = [
  "quick-xml",
  "thiserror 1.0.69",
  "zip",
+]
+
+[[package]]
+name = "format-pdf"
+version = "0.0.1"
+dependencies = [
+ "layout",
+ "pdf-writer",
+ "text-pipeline",
 ]
 
 [[package]]
@@ -999,6 +1009,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf-writer"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92a79477295a713c2ed425aa82a8b5d20cec3fdee203706cbe6f3854880c1c81"
+dependencies = [
+ "bitflags",
+ "itoa",
+ "memchr",
+ "ryu",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1238,6 +1260,12 @@ dependencies = [
  "unicode-properties",
  "unicode-script",
 ]
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "same-file"

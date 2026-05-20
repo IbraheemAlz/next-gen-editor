@@ -1,0 +1,12 @@
+[package]
+name = "format-pdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PDF export — box tree to PDF content streams with full font embedding."
+
+[dependencies]
+layout = { path = "../layout" }
+text-pipeline = { path = "../text-pipeline" }
+pdf-writer = { workspace = true }

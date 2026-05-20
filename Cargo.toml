@@ -7,6 +7,7 @@ members = [
     "crates/layout",
     "crates/render",
     "crates/format-docx",
+    "crates/format-pdf",
     "tools/shape-regression",
     "tools/roundtrip",
 ]
@@ -60,6 +61,7 @@ lru = "0.12"
 quick-xml = "0.36"
 rc-zip = "5"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+pdf-writer = "0.14"
 
 # Errors / logging
 thiserror = "1"

@@ -300,7 +300,7 @@ impl Engine {
             Command::Tick { .. } => phase3_stub("Tick"),
             Command::OpenDocument { .. } => phase3_stub("OpenDocument"),
             Command::SaveDocument { .. } => phase3_stub("SaveDocument"),
-            Command::ExportPdf { .. } => phase3_stub("ExportPdf"),
+            Command::ExportPdf { .. } => self.do_export_pdf(),
             Command::CloseDocument => phase3_stub("CloseDocument"),
             Command::DeleteRange { .. } => phase3_stub("DeleteRange"),
             Command::ReplaceRange { .. } => phase3_stub("ReplaceRange"),
@@ -575,12 +575,14 @@ impl Engine {
         self.render_document().map(|_| ())
     }
 
-    fn render_document(&mut self) -> Result<RenderStats, Box<Event>> {
+    /// Lay out the current document into a `PageBox` plus the `FontStack` used
+    /// to shape it. Shared by the Canvas2D repaint and PDF export.
+    fn build_page(&self) -> Result<(PageBox, FontStack), Box<Event>> {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
                 return Err(Box::new(Event::Error {
-                    message: "render_document: no layout config cached".into(),
+                    message: "build_page: no layout config cached".into(),
                 }));
             }
         };
@@ -591,12 +593,10 @@ impl Engine {
         }
         let page = A4Page::a4();
 
-        /* Build a per-script font stack from every loaded face; the cached
-        `font_id` is the primary and the fallback-chain root (§13.A). */
+        /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
 
-        /* Lay out each document paragraph into a ParagraphBox, stacking them
-        down the page content area, then assemble the PageBox. */
+        /* Lay out each paragraph, stacking them down the content area. */
         let mut paragraphs: Vec<ParagraphBox> = Vec::new();
         let mut para_y_offset = 0.0_f32;
         let doc = self.undo.current().clone();
@@ -624,15 +624,6 @@ impl Engine {
             paragraphs.push(para_box);
         }
 
-        let line_count: u32 = paragraphs.iter().map(|p| p.lines.len() as u32).sum();
-        let glyph_count: u32 = paragraphs
-            .iter()
-            .flat_map(|p| &p.lines)
-            .flat_map(|l| &l.runs)
-            .map(|r| r.glyphs.len() as u32)
-            .sum();
-
-        /* Box tree → scene builder → Canvas2D backend. */
         let page_box = PageBox {
             size: Size {
                 width: page.width,
@@ -641,6 +632,25 @@ impl Engine {
             margins: page.margin,
             paragraphs,
         };
+        Ok((page_box, font_stack))
+    }
+
+    fn render_document(&mut self) -> Result<RenderStats, Box<Event>> {
+        let (page_box, _font_stack) = self.build_page()?;
+
+        let line_count: u32 = page_box
+            .paragraphs
+            .iter()
+            .map(|p| p.lines.len() as u32)
+            .sum();
+        let glyph_count: u32 = page_box
+            .paragraphs
+            .iter()
+            .flat_map(|p| &p.lines)
+            .flat_map(|l| &l.runs)
+            .map(|r| r.glyphs.len() as u32)
+            .sum();
+
         let scene = build_page_scene(&page_box);
         let ctx = match &self.ctx {
             Some(c) => c.clone(),
@@ -659,11 +669,26 @@ impl Engine {
         }
 
         Ok(RenderStats {
-            page_width: page.width,
-            page_height: page.height,
+            page_width: page_box.size.width,
+            page_height: page_box.size.height,
             line_count,
             glyph_count,
         })
+    }
+
+    /// Export the current document to a single-page PDF (D3.7).
+    fn do_export_pdf(&self) -> Event {
+        let (page_box, font_stack) = match self.build_page() {
+            Ok(v) => v,
+            Err(e) => return *e,
+        };
+        let mut bytes: Vec<u8> = Vec::new();
+        if let Err(e) = format_pdf::export_pdf(&page_box, &font_stack, &mut bytes) {
+            return Event::Error {
+                message: format!("ExportPdf: {e}"),
+            };
+        }
+        Event::PdfExported { bytes, pages: 1 }
     }
 }
 

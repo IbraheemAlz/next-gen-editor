@@ -74,6 +74,11 @@ impl LoadedFont {
         &self.id
     }
 
+    /// The raw font-file bytes — used to embed the full face in a PDF.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     fn face(&self) -> FontRef<'_> {
         FontRef::from_index(&self.data, 0).expect("validated in parse")
     }
@@ -206,5 +211,10 @@ impl FontStack {
             }
         }
         None
+    }
+
+    /// The loaded face for an exact font id, if the stack holds it.
+    pub fn face(&self, id: &str) -> Option<&LoadedFont> {
+        self.faces.get(id).map(|f| f.as_ref())
     }
 }
