@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "bridge"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -282,14 +282,14 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "im",
 ]
 
 [[package]]
 name = "engine-wasm"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "bridge",
  "console_error_panic_hook",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "format-docx"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "engine",
  "quick-xml",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "format-pdf"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "layout",
  "pdf-writer",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "layout"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "text-pipeline",
 ]
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "render"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "js-sys",
  "kurbo",
@@ -1224,7 +1224,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "roundtrip"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "engine",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "shape-regression"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "text-pipeline"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "icu_properties",
  "icu_segmenter",
