@@ -3,7 +3,7 @@
     {
       "id": "hello-latin",
       "text": "hello",
-      "font": "ts/public/fonts/LiberationSans-Regular.ttf",
+      "font": "ts/fonts/LiberationSans-Regular.ttf",
       "direction": "LTR",
       "px_size": 96.0,
       "expected": {
@@ -21,7 +21,7 @@
     {
       "id": "salam-arabic",
       "text": "السلام",
-      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "font": "ts/fonts/NotoNaskhArabic-Regular.ttf",
       "direction": "RTL",
       "px_size": 96.0,
       "expected": {
@@ -40,7 +40,7 @@
     {
       "id": "lam-alef-ligature",
       "text": "لا",
-      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "font": "ts/fonts/NotoNaskhArabic-Regular.ttf",
       "direction": "RTL",
       "px_size": 96.0,
       "expected": {
@@ -55,7 +55,7 @@
     {
       "id": "arabic-with-tashkeel",
       "text": "بِسْمِ",
-      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "font": "ts/fonts/NotoNaskhArabic-Regular.ttf",
       "direction": "RTL",
       "px_size": 96.0,
       "expected": {
@@ -74,7 +74,7 @@
     {
       "id": "arabic-eastern-numerals",
       "text": "٢٠٢٦",
-      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "font": "ts/fonts/NotoNaskhArabic-Regular.ttf",
       "direction": "RTL",
       "px_size": 96.0,
       "expected": {
@@ -91,7 +91,7 @@
     {
       "id": "mixed-arabic-latin",
       "text": "Hello مرحبا",
-      "font": "ts/public/fonts/NotoNaskhArabic-Regular.ttf",
+      "font": "ts/fonts/NotoNaskhArabic-Regular.ttf",
       "direction": "LTR",
       "px_size": 96.0,
       "expected": {

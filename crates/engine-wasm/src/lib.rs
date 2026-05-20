@@ -73,6 +73,16 @@ fn to_engine_pos(p: BridgeLogicalPos) -> EnginePos {
     }
 }
 
+/// Phase 2 schema stub. The §4 command is accepted by the typed RPC surface,
+/// but its engine behavior is implemented in Phase 3 behind the RequestPaint
+/// pipeline. Returns a descriptive error so callers fail loudly rather than
+/// silently no-op'ing.
+fn phase3_stub(name: &str) -> Event {
+    Event::Error {
+        message: format!("{name}: accepted by the Phase 2 schema, implemented in Phase 3"),
+    }
+}
+
 impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         match cmd {
@@ -147,6 +157,37 @@ impl Engine {
                     message: format!("SaveDocx: {e}"),
                 },
             },
+
+            // ===============================================================
+            // Phase 2 schema stubs — PHASE_2_BRIDGE_MEMORY.md §4.
+            // The typed RPC surface accepts these commands; real engine
+            // behavior lands in Phase 3 behind the RequestPaint pipeline.
+            // ===============================================================
+            Command::Init { .. } => phase3_stub("Init"),
+            Command::Recover { .. } => phase3_stub("Recover"),
+            Command::Dispose => phase3_stub("Dispose"),
+            Command::Tick { .. } => phase3_stub("Tick"),
+            Command::OpenDocument { .. } => phase3_stub("OpenDocument"),
+            Command::SaveDocument { .. } => phase3_stub("SaveDocument"),
+            Command::ExportPdf { .. } => phase3_stub("ExportPdf"),
+            Command::CloseDocument => phase3_stub("CloseDocument"),
+            Command::DeleteRange { .. } => phase3_stub("DeleteRange"),
+            Command::ReplaceRange { .. } => phase3_stub("ReplaceRange"),
+            Command::ApplyFormatting { .. } => phase3_stub("ApplyFormatting"),
+            Command::SplitParagraph { .. } => phase3_stub("SplitParagraph"),
+            Command::MergeParagraph { .. } => phase3_stub("MergeParagraph"),
+            Command::InsertImage { .. } => phase3_stub("InsertImage"),
+            Command::SetSelection { .. } => phase3_stub("SetSelection"),
+            Command::ExtendSelection { .. } => phase3_stub("ExtendSelection"),
+            Command::SelectAll => phase3_stub("SelectAll"),
+            Command::BeginComposition { .. } => phase3_stub("BeginComposition"),
+            Command::UpdateComposition { .. } => phase3_stub("UpdateComposition"),
+            Command::EndComposition { .. } => phase3_stub("EndComposition"),
+            Command::SetViewport { .. } => phase3_stub("SetViewport"),
+            Command::SetZoom { .. } => phase3_stub("SetZoom"),
+            Command::RequestPaint { .. } => phase3_stub("RequestPaint"),
+            Command::UnloadFont { .. } => phase3_stub("UnloadFont"),
+            Command::RequestStats => phase3_stub("RequestStats"),
         }
     }
 
@@ -303,7 +344,7 @@ impl Engine {
 
         let stats = match self.render_document() {
             Ok(s) => s,
-            Err(e) => return e,
+            Err(e) => return *e,
         };
         Event::PageRendered {
             page_width: stats.page_width,
@@ -320,7 +361,7 @@ impl Engine {
         let new_doc = self.undo.current().insert_text(pos, &text);
         self.undo.push(new_doc);
         if let Err(e) = self.maybe_repaint_result() {
-            return e;
+            return *e;
         }
         Event::TextInserted {
             paragraph_count: self.undo.current().paragraph_count(),
@@ -333,7 +374,7 @@ impl Engine {
     fn do_undo(&mut self) -> Event {
         self.undo.undo();
         if let Err(e) = self.maybe_repaint_result() {
-            return e;
+            return *e;
         }
         Event::UndoStateChanged {
             can_undo: self.undo.can_undo(),
@@ -345,7 +386,7 @@ impl Engine {
     fn do_redo(&mut self) -> Event {
         self.undo.redo();
         if let Err(e) = self.maybe_repaint_result() {
-            return e;
+            return *e;
         }
         Event::UndoStateChanged {
             can_undo: self.undo.can_undo(),
@@ -358,37 +399,37 @@ impl Engine {
         let _ = self.render_document();
     }
 
-    fn maybe_repaint_result(&mut self) -> Result<(), Event> {
+    fn maybe_repaint_result(&mut self) -> Result<(), Box<Event>> {
         if self.layout_cfg.is_none() {
             return Ok(());
         }
         self.render_document().map(|_| ())
     }
 
-    fn render_document(&mut self) -> Result<RenderStats, Event> {
+    fn render_document(&mut self) -> Result<RenderStats, Box<Event>> {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
-                return Err(Event::Error {
+                return Err(Box::new(Event::Error {
                     message: "render_document: no layout config cached".into(),
-                });
+                }));
             }
         };
         let font = match self.fonts.get(&cfg.font_id) {
             Some(f) => f.clone(),
             None => {
-                return Err(Event::Error {
+                return Err(Box::new(Event::Error {
                     message: format!("font `{}` not loaded", cfg.font_id),
-                });
+                }));
             }
         };
         let page = A4Page::a4();
         let ctx = match &self.ctx {
             Some(c) => c,
             None => {
-                return Err(Event::Error {
+                return Err(Box::new(Event::Error {
                     message: "no canvas".into(),
-                });
+                }));
             }
         };
 
@@ -451,9 +492,9 @@ impl Engine {
                     if let Err(e) =
                         render::canvas2d_backend::paint_alpha_glyph(ctx, &raster, dx, dy, [0, 0, 0])
                     {
-                        return Err(Event::Error {
+                        return Err(Box::new(Event::Error {
                             message: format!("paint: {e:?}"),
-                        });
+                        }));
                     }
                 }
             }

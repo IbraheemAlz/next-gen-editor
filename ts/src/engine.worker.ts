@@ -2,6 +2,7 @@
 
 import init, { Engine } from '../../crates/engine-wasm/pkg/engine_wasm.js';
 import type { Command, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js';
+import { openEventLog, appendCommand, persistSnapshot } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
    GitHub Pages /next-gen-editor/); `?url` imports are hashed + base-aware. */
@@ -11,9 +12,30 @@ import DUAL_URL from '../fonts/Amiri-Regular.ttf?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
+/* Phase 1 PoC harness envelope (driven by `index.ts` + the visual-diff
+   suite). TODO: Deprecate in Phase 3 once `index.ts` adopts `EngineClient`. */
 type InitMsg = { type: 'INIT'; canvas: OffscreenCanvas; testCase: string };
 type CommandMsg = { type: 'COMMAND'; id: number; cmd: Command };
-type Msg = InitMsg | CommandMsg;
+
+/* Phase 2 §6/§7 — EngineClient envelope. Every request carries a numeric
+   `id`; INIT carries a `documentId` (vs. the harness `testCase`), and a bare
+   command request has no `type` field at all. */
+type ClientInitMsg = {
+    id: number;
+    type: 'INIT';
+    canvas: OffscreenCanvas;
+    documentId: string;
+};
+type ClientRecoverMsg = {
+    id: number;
+    type: 'RECOVER';
+    canvas: OffscreenCanvas;
+    snapshot: Uint8Array;
+    log: Command[];
+};
+type ClientCommandMsg = { id: number; cmd: Command };
+
+type Msg = InitMsg | CommandMsg | ClientInitMsg | ClientRecoverMsg | ClientCommandMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -31,6 +53,11 @@ const A4_TEXT =
     'The justify alignment should stretch each non-final line to reach both margins.';
 
 let engine: Engine | null = null;
+
+/* Phase 2 §6 — event-log sequencing for the EngineClient command path. */
+let logSequence = 0;
+let lastSnapshotAt = 0;
+const SNAPSHOT_EVERY = 200;
 
 /**
  * Serial command queue.
@@ -246,14 +273,118 @@ async function handleCommand(msg: CommandMsg): Promise<void> {
     }
 }
 
+/* ===================================================================
+   Phase 2 §6/§7 — EngineClient (id-routed) message path.
+
+   This runs ALONGSIDE the Phase 1 test-harness path above. A given worker
+   instance only ever receives one protocol (`index.ts` uses the harness;
+   `EngineClient` uses this path), so the two coexist without interfering.
+   =================================================================== */
+
+/**
+ * Reply to an id-routed request with a failure. A WASM trap/panic
+ * (`RuntimeError` / `unreachable`) is fatal: flag it and close the worker so
+ * the client can spin up a fresh one and recover.
+ */
+function replyError(id: number, e: unknown): void {
+    const error = e instanceof Error ? e.message : String(e);
+    if (/RuntimeError|unreachable/.test(error)) {
+        self.postMessage({ id, ok: false, error, trap: true });
+        self.close();
+    } else {
+        self.postMessage({ id, ok: false, error });
+    }
+}
+
+async function handleClientInit(msg: ClientInitMsg): Promise<void> {
+    try {
+        await init({
+            module_or_path: new URL(
+                '../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
+                import.meta.url,
+            ),
+        });
+        engine = new Engine(msg.canvas);
+        await openEventLog(msg.documentId);
+        self.postMessage({ id: msg.id, ok: true });
+    } catch (e: unknown) {
+        replyError(msg.id, e);
+    }
+}
+
+async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
+    try {
+        await init({
+            module_or_path: new URL(
+                '../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
+                import.meta.url,
+            ),
+        });
+        engine = new Engine(msg.canvas);
+        const evt = await dispatch({
+            type: 'RECOVER',
+            snapshot: msg.snapshot,
+            log_tail: msg.log,
+        } as Command);
+        self.postMessage({ id: msg.id, ok: true, evt });
+    } catch (e: unknown) {
+        replyError(msg.id, e);
+    }
+}
+
+async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
+    if (!engine) {
+        self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
+        return;
+    }
+    try {
+        const t0 = performance.now();
+        const evt = await dispatch(msg.cmd);
+        const elapsed = performance.now() - t0;
+
+        await appendCommand(++logSequence, msg.cmd);
+        if (logSequence - lastSnapshotAt >= SNAPSHOT_EVERY) {
+            /* TODO Phase 2 D2.6: persist engine.snapshot() once that engine
+               API exists; an empty buffer is a placeholder for now. */
+            await persistSnapshot(logSequence, new Uint8Array(0));
+            lastSnapshotAt = logSequence;
+        }
+
+        self.postMessage({ id: msg.id, ok: true, evt, elapsed });
+    } catch (e: unknown) {
+        replyError(msg.id, e);
+    }
+}
+
 self.onmessage = (ev: MessageEvent<Msg>): void => {
     const msg = ev.data;
+
+    /* Phase 2 §7: a bare command request — `{ id, cmd }` — has no `type`. */
+    if (!('type' in msg)) {
+        void enqueue(() => handleClientCommand(msg));
+        return;
+    }
+
     if (msg.type === 'INIT') {
-        enqueue(() => handleInit(msg)).catch((e: unknown) => {
-            const error = e instanceof Error ? e.message : String(e);
-            self.postMessage({ type: 'ERROR', error });
-        });
-    } else if (msg.type === 'COMMAND') {
+        /* `documentId` distinguishes the EngineClient INIT from the Phase 1
+           harness INIT (which carries `testCase`). */
+        if ('documentId' in msg) {
+            void enqueue(() => handleClientInit(msg));
+        } else {
+            enqueue(() => handleInit(msg)).catch((e: unknown) => {
+                const error = e instanceof Error ? e.message : String(e);
+                self.postMessage({ type: 'ERROR', error });
+            });
+        }
+        return;
+    }
+
+    if (msg.type === 'RECOVER') {
+        void enqueue(() => handleClientRecover(msg));
+        return;
+    }
+
+    if (msg.type === 'COMMAND') {
         void enqueue(() => handleCommand(msg));
     }
 };
