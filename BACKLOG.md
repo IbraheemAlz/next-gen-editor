@@ -74,3 +74,17 @@ Canvas2D remains the hardcoded active renderer; the worker never calls
   (PHASE_3_RENDER_RTL.md §2, D3.4) is required.
 - **Runtime availability.** WebGPU in a Web Worker with `OffscreenCanvas` under
   headless Chrome is unverified.
+
+## 5. Line height — dynamic from run metrics
+
+**Shipped:** `layout_paragraph` stacks every line at a single fixed
+`line_height` taken from the render config.
+
+**Deferred:** line height should be computed per line as
+`max(run ascent + run descent)` over every `VisualRun` on it, so a line
+carrying a larger span (a bigger font size, a taller script) grows to fit
+instead of clipping or overlapping its neighbours. The `rich-text` golden
+currently sidesteps this by configuring a `line_height` generous enough for
+its largest span. Needs: per-run ascent/descent from `LoadedFont::metrics`, a
+max-reduce per line in `layout_paragraph`, and `LineBox.height` / `baseline`
+derived from that instead of the config constant.
