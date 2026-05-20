@@ -1,8 +1,8 @@
 # CLAUDE.md — engineering DNA
 
-Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–2. Don't relitigate without a measurement that contradicts it.
+Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–3. Don't relitigate without a measurement that contradicts it.
 
-**Phase status:** Phase 1 (PoC) and Phase 2 (worker bridge + memory architecture) are **complete** — exit gates green. Phase 3 (canvas rendering + native RTL, `PHASE_3_RENDER_RTL.md`) is next.
+**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), and 3 (canvas rendering + native RTL) are **complete** — exit gates green. Phase 4 (headless UI: caret, selection, IME — `PHASE_4_HEADLESS_UI.md`) is next.
 
 ---
 
@@ -39,12 +39,13 @@ Booting into this repo? Read this first. Everything below is a learned-the-hard-
 ```
 crates/
   bridge/         RPC Command/Event types (serde + tsify-next)
-  engine/         Pure-Rust document model (im::Vector) + UndoStack
+  engine/         Pure-Rust document model (im::Vector) + UndoStack + style spans
   engine-wasm/    #[wasm_bindgen] surface; orchestrates everything
-  text-pipeline/  fonts + shape (rustybuzz) + bidi + line_break + justify
-  layout/         A4Page + LineBox + paragraph layout (per-line BiDi)
-  render/         Canvas2D backend; Vello backend later
+  text-pipeline/  fonts + FontStack + shape + bidi + line_break + justify + script
+  layout/         hierarchical box model (PageBox→ParagraphBox→LineBox→VisualRun)
+  render/         backend-agnostic DisplayList; Canvas2D + Vello backends; DirtyTracker
   format-docx/    .docx reader (zip + quick-xml) + writer (preserves siblings)
+  format-pdf/     PDF export (pdf-writer) — box tree + full font embedding
 ts/               Vite + TS shell, worker, EngineClient, event log, e2e suite
 tools/
   visual-diff/    Playwright + pixelmatch golden suite
@@ -79,6 +80,17 @@ tools/
 - **Crash recovery**: a WASM trap (`/RuntimeError|unreachable/`) → worker posts `{ trap: true }` + `self.close()` → `EngineClient.onTrap` rejects pending + fires the UI `onCrash` callback → `index.ts` swaps in a fresh `<canvas>` and calls `recover()` → respawn + `Command::Recover`. `loadLatestEventLog` returns `snapshotSeq` / `lastSeq` so the recovered worker resumes `logSequence` (never restarts at 0).
 - **e2e suite**: `ts/e2e/*.spec.ts` + `ts/playwright.config.ts` — `@playwright/test` with `channel: 'chrome'` (system Chrome, no download); `webServer` auto-boots Vite. Run: `pnpm exec playwright test` from `ts/`.
 
+## Phase 3 — rendering, RTL, box model
+
+- **Hierarchical box model** (`layout/boxes.rs`): `PageBox → ParagraphBox → LineBox → VisualRun → PositionedGlyph`. Every box's `origin` is parent-relative; the renderer accumulates origins down the tree. `layout_paragraph` owns all geometry — line stacking and the alignment offset are baked into `LineBox.origin`, so the renderer is a pure traversal.
+- **ICU 2.x** — `icu_segmenter` / `icu_properties` bumped 1.5 → 2.2; `LineSegmenter::new_auto` now takes `LineBreakOptions`.
+- **Priority-band Kashida** (`text-pipeline/justify_kashida.rs`): candidates from Unicode `Joining_Type`, scored into Microsoft P1–P5 bands; one Kashida per word at its best stroke. Width is an `x_advance` bump, not yet a `U+0640` tatweel glyph.
+- **FontStack** (`text-pipeline/fonts.rs`, §13.A): per-script font fallback. `build_line` segments runs by BiDi level × script × style span.
+- **Rich text** — `engine::Paragraph` carries `Vec<StyleRun>` style spans; `Command::ApplyFormatting` applies font-size + colour (bold/italic/underline/bg deferred).
+- **PDF export** (`format-pdf`, D3.7): box tree → single-page PDF, Y-axis inverted, full `Type0`/`CIDFontType2` font embedding. Not PDF/A-1b — see `BACKLOG.md`.
+- **DirtyTracker** (`render/dirty.rs`, D3.8): bounding-rect invalidation; `render_canvas2d` clips fills/strokes and culls off-region glyph runs (`put_image_data` ignores the canvas clip).
+- **Vello/WebGPU** plumbed and reachable via `Engine::init_vello`, but Canvas2D stays the active renderer.
+
 ## Validation (CI gates, all -D warnings)
 
 - `cargo fmt --all -- --check` clean.
@@ -103,7 +115,7 @@ tools/
 
 - Document model is **immutable + structurally shared** (`im::Vector<Paragraph>`). Cloning a tree is O(1).
 - **`UndoStack`** is bounded (depth 100). Pushing a new snapshot truncates the redo branch.
-- After every mutation, if a `layout_cfg` was cached from a prior `RenderPage`/`RenderDocument`, the engine **auto-repaints** the full document. No dirty-rect optimization in PoC; Phase 3.
+- After every mutation, if a `layout_cfg` was cached, the engine **auto-repaints** the full document and invalidates the `DirtyTracker`. `Command::RequestPaint` does a clipped partial repaint (D3.8); the auto-repaint path stays full.
 - BiDi runs **per line**, not paragraph-wide. UAX #9 requires this. Don't flatten visual order across line breaks.
 - Line break opportunities come from `icu_segmenter::LineSegmenter::new_auto()`. Greedy fit is fine for PoC; Knuth-Plass is Phase 3.
 
@@ -137,16 +149,11 @@ tools/
 
 ## Where the deferred work landed
 
-Phases 1–2 are complete. Remaining work is tagged in the next-phase plan documents:
+Phases 1–3 are complete. Phase 3's deferred scope — full rich text, tatweel-glyph Kashida, PDF/A-1b, Vello activation, dynamic line height — is recorded in [`BACKLOG.md`](BACKLOG.md).
 
-- `PHASE_3_RENDER_RTL.md` §6 (Kashida), §8 (line break), §13 (Phase 1 deferrals) — **next**.
-- `PHASE_4_HEADLESS_UI.md` §6–§8 (textarea, caret, selection rendering).
-- `PHASE_5_HARDENING_RELEASE.md` §3–§4 (visual-diff + roundtrip CI lifting).
+Phase 3 → 4 hand-off:
 
-Phase 2 → 3 hand-off items (stubbed, deliberate — not regressions):
-
-- Engine-side `Command::Recover` is a `phase3_stub`. The recovery *flow* (trap → canvas swap → respawn → replay → seq continuity) is tested green, but document-content rebuild needs the real `Engine::snapshot()` API — event-log snapshots are empty `Uint8Array(0)` placeholders today.
-- `EngineStats.last_paint_ms` / `last_command_ms` are `0.0` dummies; `wasm_heap_bytes` is real (`core::arch::wasm32::memory_size`).
-- Phase-1 PoC commands/events (`RenderPage`, `RasterizeGlyph`, `ShapeAndRasterize`, `LoadDocx`, `SaveDocx`, …) are tagged `// TODO: Deprecate in Phase 3` — retire them once the `RequestPaint` pipeline lands.
-
-Phase 3 work is engine-internal (layout + renderer behind `Engine::dispatch`). Don't change the frozen §4–§5 bridge schema.
+- The §4–§5 bridge schema stays **frozen**. Phase-4 UI work is engine-internal behind `Engine::dispatch` plus TS-shell wiring.
+- Phase-1 PoC commands (`RenderPage`, `RasterizeGlyph`, `ShapeAndRasterize`, `LoadDocx`, `SaveDocx`) are still live for the visual-diff `?test=` harness — retire them once the editor drives the engine purely through the §4 schema.
+- `Command::Recover` is still a stub — real recovery needs `Engine::snapshot()` (event-log snapshots are empty placeholders). `EngineStats.last_paint_ms` / `last_command_ms` are still `0.0` dummies.
+- Phase 4 (`PHASE_4_HEADLESS_UI.md`): caret, selection rendering, the hidden-textarea input path, IME. Build on the box model — `VisualRun.source_range` + `PositionedGlyph.cluster` give the glyph↔source mapping that cursor hit-testing needs.

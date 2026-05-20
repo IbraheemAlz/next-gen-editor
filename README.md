@@ -7,10 +7,11 @@ No `iframe`s, no vendored binary blobs — the engine is built from source.
 [![pages](https://github.com/IbraheemAlz/next-gen-editor/actions/workflows/pages.yml/badge.svg)](https://github.com/IbraheemAlz/next-gen-editor/actions/workflows/pages.yml)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
-> **Status — Phase 1 proof-of-concept complete (v0.0.1).**
-> Document model, editing, undo/redo, `.docx` round-trip, native Arabic
-> shaping + BiDi + A4 layout. The full multi-phase roadmap lives in
-> [`MASTER_PLAN.md`](MASTER_PLAN.md).
+> **Status — Phase 3 complete (v0.3.0).**
+> Native RTL/Arabic typesetting: BiDi, priority-band Kashida, multi-script
+> font fallback, a hierarchical box model, rich-text style spans, PDF export,
+> and incremental Canvas2D repaint. The full roadmap lives in
+> [`MASTER_PLAN.md`](MASTER_PLAN.md); deferred scope in [`BACKLOG.md`](BACKLOG.md).
 
 ## Live demo
 
@@ -26,22 +27,30 @@ Existing browser editors either ship a 2-year-stale OnlyOffice WASM blob
 all. This project builds a lean engine from source, in Rust, with Arabic
 as a day-one requirement rather than an afterthought.
 
-## Features (Phase 1 PoC)
+## Features
 
-- **Rust → WASM engine** — ~1.9 MB artifact, 12 % of the 15 MiB budget.
+- **Rust → WASM engine** — ~3.1 MB artifact, 20 % of the 15 MiB budget.
 - **Native Arabic shaping** — `rustybuzz` (pure-Rust HarfBuzz); correct
   cursive joining, initial/medial/final forms.
 - **Unicode BiDi** — `unicode-bidi`, per-line resolution for mixed
   Arabic / English paragraphs.
-- **Line breaking** — `icu_segmenter` (UAX #14).
-- **A4 page layout** — 595 × 842 pt, justification with a basic Kashida
-  elongation strategy.
-- **Document model** — immutable `im::Vector` tree, bounded undo/redo.
+- **Priority-band Kashida** — Microsoft P1–P5 justification bands, with
+  candidates resolved from the Unicode `Joining_Type` property.
+- **Multi-script font fallback** — a `FontStack` resolves a covering font
+  per script, so Arabic and Latin share a line on one baseline.
+- **Hierarchical box model** — `PageBox → ParagraphBox → LineBox →
+  VisualRun → PositionedGlyph`, parent-relative coordinates.
+- **Rich-text formatting** — per-character style spans (font size +
+  colour) applied via `ApplyFormatting`.
+- **PDF export** — single-page PDF with full `Type0`/`CIDFontType2` font
+  embedding (`pdf-writer`).
+- **Incremental repaint** — a `DirtyTracker` clips Canvas2D draws to the
+  changed region.
 - **`.docx` round-trip** — read + write, sibling archive entries
   preserved byte-identical.
-- **Interactive editor** — type Arabic + English, live repaint.
 - **Headless architecture** — WASM engine in a dedicated Web Worker,
-  `OffscreenCanvas` rendering, typed RPC bridge. No `iframe`.
+  `OffscreenCanvas` rendering, typed RPC bridge. No `iframe`. A WebGPU /
+  Vello renderer is plumbed for a future activation.
 
 ## Architecture
 
@@ -49,18 +58,19 @@ as a day-one requirement rather than an afterthought.
 Browser main thread          Dedicated Web Worker
 ──────────────────           ────────────────────
 TS shell + <canvas>   ◄────►  Rust WASM engine
-hidden <textarea>     RPC      ├ document model + undo
-                               ├ text pipeline (BiDi, shape, break, justify)
-                               ├ layout (A4 page, paragraphs)
-                               ├ Canvas2D renderer
-                               └ .docx reader / writer
+hidden <textarea>     RPC      ├ document model + undo + style spans
+                               ├ text pipeline (BiDi, shape, break, justify, fonts)
+                               ├ layout (hierarchical box model)
+                               ├ Canvas2D renderer (+ Vello plumbed)
+                               ├ .docx reader / writer
+                               └ PDF export
 ```
 
 Engineering invariants are documented in [`CLAUDE.md`](CLAUDE.md).
 
 ## Build from source
 
-Prerequisites: Rust 1.85 (`rust-toolchain.toml` pins it), `wasm-pack`,
+Prerequisites: Rust 1.95 (`rust-toolchain.toml` pins it), `wasm-pack`,
 Node ≥ 22, `pnpm`.
 
 ```bash
@@ -89,12 +99,13 @@ you'll need `COOP`/`COEP` headers; Phase 1 does not require them.)
 ```
 crates/
   bridge/         RPC Command/Event types (serde + tsify-next)
-  engine/         document model (im::Vector) + undo stack
+  engine/         document model (im::Vector) + undo + style spans
   engine-wasm/    #[wasm_bindgen] surface
-  text-pipeline/  fonts, shaping, BiDi, line break, justify
-  layout/         A4 page + paragraph layout
-  render/         Canvas2D backend
+  text-pipeline/  fonts + FontStack, shaping, BiDi, line break, justify, script
+  layout/         hierarchical box model + paragraph layout
+  render/         Canvas2D + Vello backends, DirtyTracker
   format-docx/    .docx reader + writer
+  format-pdf/     PDF export with font embedding
 ts/               Vite + TypeScript shell, worker, dispatch channel
 tools/
   visual-diff/    Playwright + pixelmatch golden suite
@@ -102,6 +113,7 @@ tools/
   roundtrip/      .docx open → edit → save → byte-diff harness
 MASTER_PLAN.md    macro architecture + 5-phase roadmap
 PHASE_*.md        per-phase execution plans
+BACKLOG.md        deferred scope + technical debt
 ```
 
 ## Roadmap
@@ -109,20 +121,22 @@ PHASE_*.md        per-phase execution plans
 | Phase | Scope |
 | --- | --- |
 | **1 — PoC** ✅ | Engine, shaping, BiDi, layout, editing, `.docx` round-trip |
-| 2 | Worker bridge hardening, full RPC schema, memory + crash recovery |
-| 3 | Vello/WebGPU renderer, font fallback, real Kashida, font shaping fidelity |
+| **2** ✅ | Worker bridge hardening, full RPC schema, memory + crash recovery |
+| **3** ✅ | Box model, priority Kashida, font fallback, rich text, PDF export, dirty tracking |
 | 4 | Headless UI: caret, selection, IME, accessibility |
 | 5 | Hardening: visual-diff farm, fuzzing, PDF/A export, release validation |
 
 See [`MASTER_PLAN.md`](MASTER_PLAN.md) and the `PHASE_*.md` documents.
 
-## Known Phase 1 limitations
+## Known limitations
 
 - Editing appends at end-of-document; no click-to-place caret (Phase 4).
-- No backspace / newline key handling yet (Phase 2 commands + Phase 4 wiring).
-- Kashida is a coarse uniform elongation, not Microsoft priority bands (Phase 3).
-- No engine-side font fallback — the interactive editor uses the dual-script
-  Amiri font to cover Latin + Arabic (Phase 3 adds a proper FontStack).
+- No backspace / newline key handling yet (Phase 4 wiring).
+- Rich text covers font size + colour; bold/italic/underline and `.docx`
+  run-formatting round-trip are deferred — see [`BACKLOG.md`](BACKLOG.md).
+- Kashida elongation widens glyph advances; true `U+0640` tatweel-glyph
+  insertion is deferred.
+- Vello / WebGPU is plumbed but Canvas2D is the active renderer.
 
 ## Licenses
 
