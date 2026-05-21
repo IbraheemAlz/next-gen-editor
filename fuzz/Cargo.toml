@@ -1,0 +1,42 @@
+# Fuzz harness — Phase 5 D5.5.
+#
+# Its own workspace (`[workspace]` below) so the pinned-toolchain
+# `cargo check --workspace` / `cargo test --workspace` at the repo root never
+# pull it in — running the targets needs the nightly `cargo fuzz` flow.
+#
+# Build check (stable, no sanitizers): cargo check --manifest-path fuzz/Cargo.toml
+# Run (nightly, see PHASE_5 §8):        cargo +nightly fuzz run docx_reader
+[package]
+name = "engine-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+format-docx = { path = "../crates/format-docx" }
+bridge = { path = "../crates/bridge" }
+serde_json = "1"
+
+[[bin]]
+name = "docx_reader"
+path = "fuzz_targets/docx_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_command"
+path = "fuzz_targets/rpc_command.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+# Keep symbols so libFuzzer can symbolize crashes.
+debug = 1

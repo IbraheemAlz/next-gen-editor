@@ -116,8 +116,9 @@ jobs:
           pnpm --dir ts install --frozen-lockfile
           pnpm --dir tools/visual-diff install --frozen-lockfile
           pnpm --dir tools/memory-profile install --frozen-lockfile
+          pnpm --dir tools/perf install --frozen-lockfile
 
-      - name: Run visual-diff farm + memory snapshot
+      - name: Run visual-diff, memory + performance harnesses
         run: |
           set -uo pipefail
           pnpm --dir ts dev &
@@ -130,6 +131,8 @@ jobs:
           VD=$?
           node tools/memory-profile/run.mjs --budgets
           MP=$?
+          node tools/perf/run.mjs --strict
+          PF=$?
           kill "$DEV_PID" 2>/dev/null || true
-          echo "visual-diff exit=$VD  memory-profile exit=$MP"
-          [ "$VD" -eq 0 ] && [ "$MP" -eq 0 ]
+          echo "visual-diff exit=$VD  memory-profile exit=$MP  perf exit=$PF"
+          [ "$VD" -eq 0 ] && [ "$MP" -eq 0 ] && [ "$PF" -eq 0 ]
