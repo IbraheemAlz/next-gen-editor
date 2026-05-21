@@ -332,6 +332,8 @@ mod tests {
             end: 11,
             px_size: 18.0,
             color: [0, 0, 0, 255],
+            bold: false,
+            italic: false,
         }];
         let para = layout_paragraph(ParagraphConfig {
             text: "Hello world",

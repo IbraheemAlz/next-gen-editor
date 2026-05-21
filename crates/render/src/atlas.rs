@@ -12,19 +12,25 @@ use text_pipeline::{LoadedFont, RasterizedGlyph};
 const CAPACITY: usize = 4096;
 
 /// Cache key. `px_size` is fixed-point (pt × 100) so the key is `Eq`/`Hash`.
+/// `bold` / `italic` keep faux-styled masks (Backlog #1) distinct from the
+/// plain glyph and from each other.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
     pub font_id: FontId,
     pub glyph_id: u16,
     pub px_size: u16,
+    pub bold: bool,
+    pub italic: bool,
 }
 
 impl GlyphKey {
-    pub fn new(font_id: FontId, glyph_id: u16, px_size: f32) -> Self {
+    pub fn new(font_id: FontId, glyph_id: u16, px_size: f32, bold: bool, italic: bool) -> Self {
         Self {
             font_id,
             glyph_id,
             px_size: (px_size * 100.0).round() as u16,
+            bold,
+            italic,
         }
     }
 }
@@ -60,7 +66,15 @@ impl GlyphAtlas {
     ) -> Option<&RasterizedGlyph> {
         if !self.cache.contains(key) {
             match font.rasterize_glyph(key.glyph_id, px_size) {
-                Ok(raster) => {
+                Ok(mut raster) => {
+                    /* Faux styling (Backlog #1): emboldened / sheared masks
+                    are cached under their styled key. */
+                    if key.bold {
+                        raster = crate::synth::embolden(&raster, px_size);
+                    }
+                    if key.italic {
+                        raster = crate::synth::slant(&raster);
+                    }
                     self.cache.put(key.clone(), raster);
                 }
                 Err(_) => return None,

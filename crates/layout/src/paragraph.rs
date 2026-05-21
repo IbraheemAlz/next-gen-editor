@@ -48,7 +48,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             if i == last || !*broke {
                 continue;
             }
-            justify_line(line, cfg.max_width, cfg.text);
+            justify_line(line, cfg.max_width, cfg.text, cfg.fonts);
         }
     }
 
@@ -169,7 +169,8 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
         }
 
         for (rel_start, rel_end, script, span) in subs {
-            let Some((font_id, face)) = cfg.fonts.resolve(script) else {
+            let Some((font_id, face, synth)) = cfg.fonts.resolve(script, span.bold, span.italic)
+            else {
                 continue;
             };
             let sub_text = &brun_text[rel_start..rel_end];
@@ -184,6 +185,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     y_advance: g.y_advance,
                     x_offset: g.x_offset,
                     y_offset: g.y_offset,
+                    synthetic: false,
                 })
                 .collect();
             runs.push(VisualRun {
@@ -194,6 +196,8 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                 attrs: TextAttrs {
                     px_size: span.px_size,
                     color: span.color,
+                    faux_bold: synth.faux_bold,
+                    faux_italic: synth.faux_italic,
                 },
             });
         }
@@ -239,7 +243,9 @@ fn measure_text(
 ) -> f32 {
     let mut total = 0.0_f32;
     for (srange, script) in segment_by_script(text) {
-        let Some((_, face)) = fonts.resolve(script) else {
+        /* Faux bold / italic never change advances, so the probe measures
+        against the base face regardless of the span's weight / slant. */
+        let Some((_, face, _)) = fonts.resolve(script, false, false) else {
             continue;
         };
         let mut cursor = abs_start + srange.start as u32;
@@ -320,8 +326,8 @@ fn line_glyph_slots(line: &LineBox, source_text: &str) -> Vec<JustifySlot> {
 }
 
 /// Pick a justify strategy for the line — Kashida for Arabic, spaces for Latin,
-/// a weighted split for mixed — and stretch glyph advances to `target_width`.
-fn justify_line(line: &mut LineBox, target_width: f32, source_text: &str) {
+/// a weighted split for mixed — and stretch the line to `target_width`.
+fn justify_line(line: &mut LineBox, target_width: f32, source_text: &str, fonts: &FontStack) {
     let extra = target_width - line.width;
     if extra <= 0.0 {
         return;
@@ -343,7 +349,7 @@ fn justify_line(line: &mut LineBox, target_width: f32, source_text: &str) {
     match mode {
         JustifyMode::None => {}
         JustifyMode::Space => distribute_to_spaces(line, &slots, extra),
-        JustifyMode::Kashida => distribute_to_kashida_points(line, &slots, extra),
+        JustifyMode::Kashida => distribute_to_kashida_points(line, &slots, extra, fonts),
         JustifyMode::Mixed => {
             let space_count = slots
                 .iter()
@@ -354,8 +360,10 @@ fn justify_line(line: &mut LineBox, target_width: f32, source_text: &str) {
             } else {
                 extra * (arabic_count as f32) / (arabic_count + space_count * 2) as f32
             };
-            distribute_to_kashida_points(line, &slots, arabic_share);
+            /* Spaces first: `distribute_to_kashida_points` inserts Tatweel
+            glyphs, which would shift the space slots' glyph indices. */
             distribute_to_spaces(line, &slots, extra - arabic_share);
+            distribute_to_kashida_points(line, &slots, arabic_share, fonts);
         }
     }
 
@@ -387,7 +395,12 @@ fn distribute_to_spaces(line: &mut LineBox, slots: &[JustifySlot], extra: f32) {
 /// carry a left-joining form and the next a right-joining form. Each candidate
 /// is scored into a Microsoft priority band, and one kashida per word — at the
 /// word's highest-priority stroke — receives an equal share of `extra`.
-fn distribute_to_kashida_points(line: &mut LineBox, slots: &[JustifySlot], extra: f32) {
+fn distribute_to_kashida_points(
+    line: &mut LineBox,
+    slots: &[JustifySlot],
+    extra: f32,
+    fonts: &FontStack,
+) {
     /* Walk glyph slots in visual order, grouping cursive letters into words —
     a non-joining glyph ends a word, combining marks are transparent. Within a
     word each connecting boundary is a candidate scored into a priority band.
@@ -431,8 +444,57 @@ fn distribute_to_kashida_points(line: &mut LineBox, slots: &[JustifySlot], extra
         return;
     }
     let per = extra / targets.len() as f32;
-    for i in targets {
-        let s = &slots[i];
-        line.runs[s.run].glyphs[s.glyph].x_advance += per;
+    /* Resolve each kashida target to a (run, glyph) site, then inject the
+    Tatweel ink highest glyph-index first per run — inserting glyphs shifts
+    later indices, so earlier sites must be processed last. */
+    let mut sites: Vec<(usize, usize)> = targets
+        .iter()
+        .map(|&i| (slots[i].run, slots[i].glyph))
+        .collect();
+    sites.sort_unstable();
+    sites.dedup();
+    for &(run_idx, glyph_idx) in sites.iter().rev() {
+        inject_kashida(&mut line.runs[run_idx], glyph_idx, per, fonts);
+    }
+}
+
+/// Fill a Kashida elongation of width `extra`, sitting after
+/// `run.glyphs[glyph_idx]`, with real Tatweel (U+0640) ink instead of white
+/// space (Backlog #2).
+///
+/// Tiles `n` natural-width Tatweel glyphs — the count nearest `extra / tatweel
+/// advance` — and parks the sub-Tatweel remainder on the elongated glyph's
+/// own advance so the total elongation width stays exact. Every synthetic
+/// glyph copies the elongated glyph's `cluster`, so it maps to the same source
+/// byte and the byte<->glyph map used by hit-testing is preserved. Falls back
+/// to a plain advance bump when the font carries no Tatweel glyph.
+fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &FontStack) {
+    let tatweel = fonts.face(&run.font).and_then(|face| {
+        let gid = face.glyph_id('\u{0640}')?;
+        let adv = face
+            .glyph_metrics('\u{0640}', run.attrs.px_size)
+            .ok()?
+            .advance_width;
+        (adv > 0.0).then_some((gid, adv))
+    });
+    let Some((tw_gid, tw_adv)) = tatweel else {
+        /* No Tatweel in the font — keep the Phase 3 white-gap behaviour. */
+        run.glyphs[glyph_idx].x_advance += extra;
+        return;
+    };
+    let n = ((extra / tw_adv).round() as i64).max(1) as usize;
+    let remainder = extra - (n as f32) * tw_adv;
+    run.glyphs[glyph_idx].x_advance += remainder;
+    let tatweel_glyph = PositionedGlyph {
+        id: tw_gid,
+        cluster: run.glyphs[glyph_idx].cluster,
+        x_advance: tw_adv,
+        y_advance: 0.0,
+        x_offset: 0.0,
+        y_offset: 0.0,
+        synthetic: true,
+    };
+    for _ in 0..n {
+        run.glyphs.insert(glyph_idx + 1, tatweel_glyph);
     }
 }

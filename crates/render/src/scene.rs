@@ -44,6 +44,10 @@ pub struct GlyphRun {
     pub px_size: f32,
     pub paint: Paint,
     pub glyphs: Vec<RunGlyph>,
+    /// Render with synthetic bold / italic — no real face variant exists
+    /// (Backlog #1).
+    pub faux_bold: bool,
+    pub faux_italic: bool,
 }
 
 /// One backend-agnostic drawing command. Batch 1 freezes this set; paths,
@@ -137,6 +141,8 @@ pub fn build_page_scene(page: &PageBox) -> DisplayList {
                         px_size: run.attrs.px_size,
                         paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
                         glyphs,
+                        faux_bold: run.attrs.faux_bold,
+                        faux_italic: run.attrs.faux_italic,
                     }));
                 }
             }

@@ -331,6 +331,8 @@ fn build_style_spans(
                 end: run.start,
                 px_size: default_size * scale,
                 color: default_color,
+                bold: false,
+                italic: false,
             });
         }
         spans.push(StyleSpan {
@@ -338,6 +340,8 @@ fn build_style_spans(
             end: run.end,
             px_size: run.style.font_size.unwrap_or(default_size) * scale,
             color: run.style.color.unwrap_or(default_color),
+            bold: run.style.bold.unwrap_or(false),
+            italic: run.style.italic.unwrap_or(false),
         });
         cursor = run.end;
     }
@@ -347,6 +351,8 @@ fn build_style_spans(
             end: len,
             px_size: default_size * scale,
             color: default_color,
+            bold: false,
+            italic: false,
         });
     }
     spans
@@ -368,10 +374,14 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
             ShapingDirection::Ltr => {
                 let mut cum = 0.0_f32;
                 for g in &run.glyphs {
-                    slots.push(CaretSlot {
-                        x: run_start_x + cum,
-                        byte: run.source_range.start + g.cluster,
-                    });
+                    /* Synthetic glyphs (Kashida Tatweels) advance the pen but
+                    are not caret stops — they emit no slot (Backlog #2). */
+                    if !g.synthetic {
+                        slots.push(CaretSlot {
+                            x: run_start_x + cum,
+                            byte: run.source_range.start + g.cluster,
+                        });
+                    }
                     cum += g.x_advance;
                 }
                 slots.push(CaretSlot {
@@ -384,10 +394,12 @@ fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
                 side, and the run's logical end sits at its visual left edge. */
                 let mut cum = 0.0_f32;
                 for g in &run.glyphs {
-                    slots.push(CaretSlot {
-                        x: run_start_x + cum + g.x_advance,
-                        byte: run.source_range.start + g.cluster,
-                    });
+                    if !g.synthetic {
+                        slots.push(CaretSlot {
+                            x: run_start_x + cum + g.x_advance,
+                            byte: run.source_range.start + g.cluster,
+                        });
+                    }
                     cum += g.x_advance;
                 }
                 slots.push(CaretSlot {
@@ -1867,5 +1879,56 @@ mod tests {
         assert!(approx(rects[0].w, 20.0));
         assert!(approx(rects[0].y, 5.0));
         assert!(approx(rects[0].h, 20.0));
+    }
+
+    /// Backlog #2 — a synthetic glyph (an injected Kashida Tatweel) advances
+    /// the pen but emits no caret slot, so the byte<->glyph map stays intact.
+    #[test]
+    fn synthetic_glyphs_emit_no_caret_slot() {
+        let attrs = layout::TextAttrs {
+            px_size: 16.0,
+            color: [0, 0, 0, 255],
+            faux_bold: false,
+            faux_italic: false,
+        };
+        let glyph = |cluster: u32, adv: f32, synthetic: bool| layout::PositionedGlyph {
+            id: 1,
+            cluster,
+            x_advance: adv,
+            y_advance: 0.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            synthetic,
+        };
+        let run = layout::VisualRun {
+            glyphs: vec![
+                glyph(0, 10.0, false), // real letter at byte 0
+                glyph(0, 7.0, true),   // injected Tatweel — same cluster, no slot
+                glyph(1, 10.0, false), // real letter at byte 1
+            ],
+            font: "f".to_string(),
+            direction: ShapingDirection::Ltr,
+            source_range: 0..2,
+            attrs,
+        };
+        let line = LineBox {
+            origin: Point { x: 0.0, y: 0.0 },
+            baseline: 0.0,
+            height: 20.0,
+            width: 27.0,
+            runs: vec![run],
+            alignment: Alignment::Start,
+        };
+        let geom = build_line_run_geom(&line, 0.0);
+        assert_eq!(geom.len(), 1);
+        let slots = &geom[0].slots;
+        let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
+        /* Two real glyphs + the run-end slot — the Tatweel is skipped. */
+        assert_eq!(slots.len(), 3);
+        assert_eq!((slots[0].byte, slots[1].byte, slots[2].byte), (0, 1, 2));
+        /* Byte 1's slot is still pushed right by the Tatweel's 7px advance. */
+        assert!(approx(slots[0].x, 0.0));
+        assert!(approx(slots[1].x, 17.0));
+        assert!(approx(slots[2].x, 27.0));
     }
 }

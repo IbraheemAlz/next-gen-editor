@@ -94,7 +94,13 @@ pub fn render_canvas2d(
                 };
                 let rgb = paint_rgb(&run.paint);
                 for g in &run.glyphs {
-                    let key = GlyphKey::new(run.font.clone(), g.glyph_id, run.px_size);
+                    let key = GlyphKey::new(
+                        run.font.clone(),
+                        g.glyph_id,
+                        run.px_size,
+                        run.faux_bold,
+                        run.faux_italic,
+                    );
                     if let Some(raster) = atlas.get_or_rasterize(&key, &font, run.px_size) {
                         paint_alpha_glyph(ctx, raster, g.x, g.y, rgb)?;
                     }

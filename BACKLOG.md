@@ -13,6 +13,12 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
 - **Sprint 1 (2026-05-22)** — Pending (sticky) formatting (item 11, complete);
   paragraph alignment (item 9 — the `AlignmentPicker` half; per-span font
   family is still deferred).
+- **Sprint 2 (2026-05-22)** — Discontinuous BiDi selection rectangles
+  (item 7, complete); multi-line plain paste (item 12, complete).
+- **Sprint 3 (2026-05-22)** — Kashida Tatweel ink injection (item 2,
+  complete); bold / italic face resolution (item 1 — the bold/italic
+  sub-item, via faux synthesis; underline, strikethrough, background colour
+  and docx `<w:rPr>` are still deferred).
 
 ## 1. Rich text formatting
 
@@ -20,12 +26,17 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
 in the document model, `Command::ApplyFormatting` (split / merge / coalesce),
 and per-span **font size + colour** carried through layout and render.
 
-**Deferred:**
+**Partly shipped.** Bold / italic face resolution shipped in Phase 5 sprint 3;
+underline, strikethrough, background colour and docx `<w:rPr>` round-trip are
+still deferred.
 
-- **Bold / italic face resolution.** The bridge `TextAttrs` / `TextAttrsPatch`
-  already carry `bold` and `italic`, and engine spans can store them — but only
-  Regular faces are loaded and `FontStack` resolves by script alone. Needs
-  bold/italic font files plus `FontStack` variant selection keyed on the flags.
+- **✅ Bold / italic face resolution — shipped (Phase 5 sprint 3).** `FontStack`
+  now resolves a face by script **and** weight/slant; `LoadedFont` reports its
+  own bold/italic metadata so a real variant face is used when one is loaded.
+  No bold/italic `.ttf` ships for the bundled families (Amiri, an Arabic Naskh
+  face, has no italic at all), so the renderer **synthesizes** the missing
+  styles — faux bold dilates the rasterized alpha mask, faux italic shears it
+  (`render::synth`). Real designed faces remain a drop-in upgrade.
 - **Underline & strikethrough.** No `DisplayList` primitive draws decoration
   lines yet; needs a stroke/line command and baseline-relative metrics.
 - **Background colour.** `TextAttrs.bg_color` is unused; needs a `FillRect`
@@ -36,16 +47,17 @@ and per-span **font size + colour** carried through layout and render.
 
 ## 2. Kashida justification — Tatweel glyph insertion
 
-**Shipped (D3.5):** joining-type-aware candidate detection via
-`icu_properties`, the Microsoft P1–P5 priority bands, and one Kashida per word
-at its highest-priority stroke.
+**✅ Shipped (D3.5 + Phase 5 sprint 3).** D3.5 landed joining-type-aware
+candidate detection via `icu_properties`, the Microsoft P1–P5 priority bands,
+and one Kashida per word at its highest-priority stroke.
 
-**Deferred:** the elongation is applied by widening a glyph's `x_advance` —
-i.e. inserting a **white gap**, not ink. PHASE_3_RENDER_RTL.md §6's intended
-approach inserts `U+0640` Tatweel glyphs so the join renders as a real
-elongated stroke. Needs: font glyph lookup for U+0640, tiling/scaling the
-Tatweel to fill the target width, and inserting synthetic glyphs into a
-`VisualRun` without corrupting the `source_range` / `cluster` indices.
+Phase 5 sprint 3 replaced the white-gap elongation with real ink: `layout`
+injects synthetic `U+0640` Tatweel glyphs into the `VisualRun`, tiled to fill
+the elongation width with the sub-Tatweel remainder parked on the elongated
+glyph's advance. Every synthetic glyph copies the elongated glyph's `cluster`
+and carries a `synthetic` flag, so the renderer draws them while caret /
+hit-test slot emission skips them — the `source_range` / `cluster` byte-to-glyph
+map is preserved.
 
 ## 3. PDF export — compression, subsetting, ToUnicode
 
@@ -124,14 +136,12 @@ the engine emits one `Rect` per line spanning the selected range's leftmost to
 rightmost caret slot (`selection_rects_geom` in `engine-wasm`). Exact for
 LTR-only, RTL-only, and whole-line selections.
 
-**Deferred:** per-BiDi-visual-segment rectangles. A contiguous logical
-selection that crosses an LTR↔RTL boundary mid-line is visually discontinuous —
-the selected characters scatter into separate visual segments, and the single
-bounding rect over-covers the unselected gap between them. A faithful render
-emits one rect per visual segment. Needs: clipping the selected byte range
-against each line's `VisualRun`s and emitting a rect per run-clipped sub-span.
-The `SelectionOverlay` already renders an N-rect list, so only the engine side
-changes.
+**✅ Shipped (Phase 5 sprint 2).** `selection_rects_geom` clips the selected
+byte range against each line's `VisualRun`s and emits one tight rect per
+run-clipped sub-span. A contiguous logical selection crossing an LTR↔RTL seam
+now renders as separate, accurate segments instead of one bounding rect that
+over-covers the unselected gap. A single-run (non-BiDi) line still yields one
+rect, as before.
 
 ## 8. IME composition — inline on-canvas preview
 
@@ -212,10 +222,11 @@ native `copy` / `cut` / `paste` events.
   (HTML, or a Word `.docx` fragment) needs these two commands plus an
   HTML / `.docx`-fragment parser mapping to `StyleRun`s. The plain path already
   covers every paste as text — every clipboard write carries `text/plain`.
-- **Multi-line paste.** `PastePlain` inserts text verbatim, so a pasted `\n`
-  becomes a literal character. Newline-aware paste should split the text into
-  paragraphs (insert + `SplitParagraph` per line). Single-paragraph paste is
-  exact today.
+- **✅ Multi-line paste — shipped (Phase 5 sprint 2).** `DocumentTree::
+  insert_multiline` splits pasted text on newlines (`\r\n` / `\r` normalized)
+  into separate paragraphs, carrying the caret to the end of the last line;
+  `do_paste_plain` routes multi-line text through it. A newline-free paste
+  keeps the original single-line path.
 
 ## 13. Incremental relayout
 

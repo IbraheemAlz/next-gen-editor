@@ -38,6 +38,11 @@ pub struct TextAttrs {
     pub px_size: f32,
     /// Straight-alpha RGBA fill colour.
     pub color: [u8; 4],
+    /// Render this run with synthetic (faux) bold — set when no real bold
+    /// face was available (Backlog #1).
+    pub faux_bold: bool,
+    /// Render this run with synthetic (faux) italic via a shear transform.
+    pub faux_italic: bool,
 }
 
 /// A resolved rich-text style span — a paragraph byte range `[start, end)` with
@@ -49,6 +54,10 @@ pub struct StyleSpan {
     pub end: u32,
     pub px_size: f32,
     pub color: [u8; 4],
+    /// Requested bold — resolved to a real face or faux synthesis at layout.
+    pub bold: bool,
+    /// Requested italic — resolved to a real face or faux synthesis.
+    pub italic: bool,
 }
 
 /// One shaped glyph, positioned by advance/offset relative to the pen. There is
@@ -63,6 +72,10 @@ pub struct PositionedGlyph {
     pub y_advance: f32,
     pub x_offset: f32,
     pub y_offset: f32,
+    /// A synthetic glyph layout inserted — a Kashida Tatweel (U+0640). Drawn
+    /// like any glyph, but skipped by caret / hit-test slot emission so the
+    /// byte<->glyph map is not corrupted (Backlog #2).
+    pub synthetic: bool,
 }
 
 /// A maximal run of glyphs sharing one font, direction, and style — the unit

@@ -92,6 +92,23 @@ impl LoadedFont {
         self.face().charmap().map(ch) != 0
     }
 
+    /// Glyph id for `ch` via the font's cmap; `None` when unmapped
+    /// (`.notdef`). Used to look up the Tatweel (U+0640) for Kashida ink.
+    pub fn glyph_id(&self, ch: char) -> Option<u16> {
+        let gid = self.face().charmap().map(ch);
+        (gid != 0).then_some(gid)
+    }
+
+    /// Whether the font's own OS/2 metadata marks it a bold weight (>= 600).
+    pub fn is_bold(&self) -> bool {
+        self.face().attributes().weight().0 >= 600
+    }
+
+    /// Whether the font's own metadata marks it italic or oblique.
+    pub fn is_italic(&self) -> bool {
+        !matches!(self.face().attributes().style(), swash::Style::Normal)
+    }
+
     pub fn metrics(&self, px_size: f32) -> FontMetrics {
         let m = self.face().metrics(&[]).scale(px_size);
         FontMetrics {
@@ -149,11 +166,20 @@ impl LoadedFont {
     }
 }
 
+/// Which synthetic styles the renderer must apply because no real font face
+/// covered the requested weight / slant (Backlog #1 — faux bold / italic).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Synthesis {
+    pub faux_bold: bool,
+    pub faux_italic: bool,
+}
+
 /// A per-script font resolver (PHASE_3_RENDER_RTL.md §13.A).
 ///
 /// Holds every loaded face plus, for each script, the ids of the faces that
-/// cover it. [`resolve`](FontStack::resolve) picks the best face for a script,
-/// falling through `fallback_chain` when no script-specific face exists.
+/// cover it. [`resolve`](FontStack::resolve) picks the best face for a script
+/// and requested weight/slant, falling through `fallback_chain` and flagging
+/// synthetic styling when no real face variant exists.
 pub struct FontStack {
     faces: HashMap<FontId, Arc<LoadedFont>>,
     by_script: HashMap<Script, Vec<FontId>>,
@@ -200,14 +226,41 @@ impl FontStack {
         }
     }
 
-    /// Resolve `script` to a font id and its loaded face — script-specific
-    /// faces first, then the fallback chain. `None` only when the stack holds
-    /// no faces at all.
-    pub fn resolve(&self, script: Script) -> Option<(&FontId, &LoadedFont)> {
+    /// Resolve `script` plus the requested weight/slant to a font id, its
+    /// loaded face, and the [`Synthesis`] the renderer must apply. A real face
+    /// whose own metadata matches `bold`/`italic` is used verbatim (no faux);
+    /// otherwise the best covering face is returned and the missing weight /
+    /// slant is flagged for synthesis (Backlog #1). `None` only when the stack
+    /// holds no faces at all.
+    pub fn resolve(
+        &self,
+        script: Script,
+        bold: bool,
+        italic: bool,
+    ) -> Option<(&FontId, &LoadedFont, Synthesis)> {
         let preferred = self.by_script.get(&script).into_iter().flatten();
-        for id in preferred.chain(self.fallback_chain.iter()) {
-            if let Some((key, face)) = self.faces.get_key_value(id) {
-                return Some((key, face.as_ref()));
+        let chain: Vec<&FontId> = preferred.chain(self.fallback_chain.iter()).collect();
+        /* A real variant whose own metadata matches the request — no faux. */
+        for id in &chain {
+            if let Some((key, face)) = self.faces.get_key_value(*id)
+                && face.is_bold() == bold
+                && face.is_italic() == italic
+            {
+                return Some((key, face.as_ref(), Synthesis::default()));
+            }
+        }
+        /* No matching variant — fall back to the first covering face and
+        synthesize the missing weight / slant. */
+        for id in &chain {
+            if let Some((key, face)) = self.faces.get_key_value(*id) {
+                return Some((
+                    key,
+                    face.as_ref(),
+                    Synthesis {
+                        faux_bold: bold,
+                        faux_italic: italic,
+                    },
+                ));
             }
         }
         None
