@@ -7,18 +7,22 @@ No `iframe`s, no vendored binary blobs — the engine is built from source.
 [![pages](https://github.com/IbraheemAlz/next-gen-editor/actions/workflows/pages.yml/badge.svg)](https://github.com/IbraheemAlz/next-gen-editor/actions/workflows/pages.yml)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
-> **Status — Phase 3 complete (v0.3.1).**
-> Native RTL/Arabic typesetting: BiDi, priority-band Kashida, multi-script
-> font fallback, a hierarchical box model, rich-text style spans, PDF export,
-> and incremental Canvas2D repaint. The full roadmap lives in
-> [`MASTER_PLAN.md`](MASTER_PLAN.md); deferred scope in [`BACKLOG.md`](BACKLOG.md).
+> **Status — Phase 4 complete (v0.4.0).**
+> A fully interactive editor: a Solid.js UI shell over the Rust/WASM engine —
+> click-to-place caret, drag selection, native IME (Arabic + CJK), a
+> formatting toolbar, the system clipboard, drag-drop `.docx` open, and a
+> screen-reader accessibility tree — on the Phase 1–3 engine (BiDi,
+> priority-band Kashida, multi-script font fallback, hierarchical box model,
+> PDF export). The full roadmap lives in [`MASTER_PLAN.md`](MASTER_PLAN.md);
+> deferred scope in [`BACKLOG.md`](BACKLOG.md).
 
 ## Live demo
 
 **https://ibraheemalz.github.io/next-gen-editor/**
 
-Click the page and type. Arabic and English both render (mixed BiDi).
-`Ctrl+Z` / `Ctrl+Y` undo / redo.
+Click to place the caret and type — Arabic and English edit in real time
+(mixed BiDi). Drag to select, format with the toolbar, `Ctrl+C` / `Ctrl+V`
+to copy-paste, or drop a `.docx` file onto the page to open it.
 
 ## Why this exists
 
@@ -29,7 +33,7 @@ as a day-one requirement rather than an afterthought.
 
 ## Features
 
-- **Rust → WASM engine** — ~3.1 MB artifact, 20 % of the 15 MiB budget.
+- **Rust → WASM engine** — ~3.2 MB artifact, ~21 % of the 15 MiB budget.
 - **Native Arabic shaping** — `rustybuzz` (pure-Rust HarfBuzz); correct
   cursive joining, initial/medial/final forms.
 - **Unicode BiDi** — `unicode-bidi`, per-line resolution for mixed
@@ -48,6 +52,17 @@ as a day-one requirement rather than an afterthought.
   changed region.
 - **`.docx` round-trip** — read + write, sibling archive entries
   preserved byte-identical.
+- **Interactive UI shell** — a Solid.js app over the engine: click-to-place
+  caret, drag selection, double-click word select, DOM caret + selection
+  overlays, and a formatting toolbar (bold / italic / underline, size,
+  colour, undo / redo).
+- **Native IME + clipboard** — a hidden-`<textarea>` input path; Arabic
+  types directly, CJK composes through the OS IME and commits correctly.
+  Async system clipboard (copy / cut / paste) and drag-drop `.docx` open.
+- **Screen-reader accessibility** — a synchronized shadow DOM mirrors the
+  document (`role="document"`, one `<p dir>` per paragraph); BiDi is handled
+  by `dir` + the browser's UAX-#9, with an `aria-live` region for
+  announcements.
 - **Headless architecture** — WASM engine in a dedicated Web Worker,
   `OffscreenCanvas` rendering, typed RPC bridge. No `iframe`. A WebGPU /
   Vello renderer is plumbed for a future activation.
@@ -90,9 +105,10 @@ wasm-pack build --target web --release crates/engine-wasm
 cd ts && pnpm install && pnpm build    # → ts/dist/
 ```
 
-The `dist/` folder is a self-contained static site — serve it from any
-static host. (For `SharedArrayBuffer`-dependent features in later phases
-you'll need `COOP`/`COEP` headers; Phase 1 does not require them.)
+The `dist/` folder is a self-contained static site. Serve it with the
+cross-origin isolation headers (`COOP: same-origin`, `COEP: require-corp`)
+that the Vite config already sets for dev + preview — `SharedArrayBuffer`
+and the engine worker depend on them.
 
 ## Project structure
 
@@ -123,17 +139,18 @@ BACKLOG.md        deferred scope + technical debt
 | **1 — PoC** ✅ | Engine, shaping, BiDi, layout, editing, `.docx` round-trip |
 | **2** ✅ | Worker bridge hardening, full RPC schema, memory + crash recovery |
 | **3** ✅ | Box model, priority Kashida, font fallback, rich text, PDF export, dirty tracking |
-| 4 | Headless UI: caret, selection, IME, accessibility |
+| **4** ✅ | Headless UI shell: Solid.js, pointer + caret + selection, IME, toolbar, accessibility, clipboard, drag-drop |
 | 5 | Hardening: visual-diff farm, fuzzing, PDF/A export, release validation |
 
 See [`MASTER_PLAN.md`](MASTER_PLAN.md) and the `PHASE_*.md` documents.
 
 ## Known limitations
 
-- Editing appends at end-of-document; no click-to-place caret (Phase 4).
-- No backspace / newline key handling yet (Phase 4 wiring).
-- Rich text covers font size + colour; bold/italic/underline and `.docx`
-  run-formatting round-trip are deferred — see [`BACKLOG.md`](BACKLOG.md).
+- Bold / italic / underline are stored and round-trip (the toolbar reflects
+  them), but not yet rendered — bold/italic font faces and underline strokes
+  are deferred, along with paragraph alignment, rich (HTML / `.docx`)
+  clipboard, and `.docx` run-formatting round-trip — see
+  [`BACKLOG.md`](BACKLOG.md).
 - Kashida elongation widens glyph advances; true `U+0640` tatweel-glyph
   insertion is deferred.
 - Vello / WebGPU is plumbed but Canvas2D is the active renderer.

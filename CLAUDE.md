@@ -1,8 +1,8 @@
 # CLAUDE.md — engineering DNA
 
-Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–3. Don't relitigate without a measurement that contradicts it.
+Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–4. Don't relitigate without a measurement that contradicts it.
 
-**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), and 3 (canvas rendering + native RTL) are **complete** — exit gates green. Phase 4 (headless UI: caret, selection, IME — `PHASE_4_HEADLESS_UI.md`) is next.
+**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (hardening + release — `PHASE_5_HARDENING_RELEASE.md`) is next.
 
 ---
 
@@ -10,7 +10,7 @@ Booting into this repo? Read this first. Everything below is a learned-the-hard-
 
 - **Rust → WASM core.** Engine lives in `crates/engine-wasm/`. No vendored binary blobs, ever. If a feature requires C++, vendor the **source** under `vendor/` and build it in CI.
 - **Headless UI.** No `iframe`. The TypeScript shell owns the canvas, the worker, and the DOM chrome. The engine never touches the DOM.
-- **Single dedicated Web Worker.** WASM is loaded exactly once in `ts/src/engine.worker.ts`. `OffscreenCanvas` is `transferControlToOffscreen()`-ed at INIT and never re-transferred — that call is one-shot per element, so crash recovery swaps in a **fresh** `<canvas>` element.
+- **Single dedicated Web Worker.** WASM is loaded exactly once in `ts/src/engine/engine.worker.ts`. `OffscreenCanvas` is `transferControlToOffscreen()`-ed at INIT and never re-transferred — that call is one-shot per element, so crash recovery swaps in a **fresh** `<canvas>` element.
 - **Cross-origin isolated.** Vite dev and prod serve with `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`, `Cross-Origin-Resource-Policy: same-origin`. SAB depends on this; check `self.crossOriginIsolated` on boot.
 - **Memory budget.** Compressed WASM artifact ≤ **15 MiB** (CI gate). Initial WASM heap 64 MiB, max 2 GiB (linker flags). Per-worker soft budget ≤ 256 MiB on a 50-page document.
 
@@ -68,16 +68,16 @@ tools/
 - `tsify-next` renders `Option<T>` as `T | undefined`. Pass **`undefined`**, not `null`, from TS.
 - `web-sys 0.3.98+`: `set_fill_style_str(&str)`, not the deprecated `set_fill_style(&JsValue)`.
 - Worker boot via wasm-pack `--target web` output. `init({ module_or_path: new URL(...) })` — the bare-URL form is deprecated.
-- Worker ↔ main RPC: the production path is **`EngineClient`** (`ts/src/engine-client.ts`) — `id`-routed `{ id, cmd }` requests, `{ id, ok, evt }` replies, a `pending` map, `subscribe()` for unidirectional events. The Phase-1 `{ type: 'COMMAND', id, cmd }` / `{ type: 'COMMAND_RESULT', id, event }` harness path still lives in the worker (visual-diff `?test=` cases only). Expose `window.__dispatch` for tests.
-- Hidden `<textarea>` overlay is the only legitimate text-input source. `beforeinput` is the canonical event; ignore `e.isComposing`.
+- Worker ↔ main RPC: the production path is **`EngineClient`** (`ts/src/engine/engine-client.ts`) — `id`-routed `{ id, cmd }` requests, `{ id, ok, evt }` replies, a `pending` map, `subscribe()` for unidirectional events (the a11y tree rides this). The Phase-1 `{ type: 'COMMAND', id, cmd }` / `{ type: 'COMMAND_RESULT', id, event }` harness path still lives in the worker (visual-diff `?test=` cases only), driven by `ts/src/harness/visual-diff.ts`. Expose `window.__dispatch` for tests.
+- Hidden `<textarea>` (`components/HiddenInput.tsx`) is the only legitimate text-input source. `beforeinput` is the canonical event; when `e.isComposing` is set, defer to the composition handlers.
 
 ## Phase 2 — worker bridge, event log, crash recovery
 
 - **`EngineClient`** (`ts/src/engine-client.ts`) is the typed main-thread RPC layer: spawns the worker, matches replies by `id`, exposes `dispatch` / `subscribe` / `recover`, and `loadFont` / `openDocument` (which pass byte buffers as `Transferable`s — zero-copy).
-- **Worker dual-protocol** (`ts/src/engine.worker.ts`): the `EngineClient` `id`-routed path and the Phase-1 `?test=` visual-diff harness path coexist; a worker instance only ever sees one. The interactive editor uses `EngineClient`; `index.ts` keeps the harness path alive for the `?test=` goldens.
-- **Bridge schema** is split across `crates/bridge/src/{common,command,event}.rs`. The §4–§5 schema landed **additively** on the Phase-1 PoC subset — Phase-1 commands/events are kept and tagged `// TODO: Deprecate in Phase 3`. The §4–§5 schema is **frozen**.
+- **Worker dual-protocol** (`ts/src/engine/engine.worker.ts`): the `EngineClient` `id`-routed path and the Phase-1 `?test=` visual-diff harness path coexist; a worker instance only ever sees one. The interactive editor uses `EngineClient`; `harness/visual-diff.ts` keeps the harness path alive for the `?test=` goldens.
+- **Bridge schema** is split across `crates/bridge/src/{common,command,event}.rs`. Every layer landed **additively**: §4–§5 on the Phase-1 PoC subset, then Phase 4's pointer / IME / clipboard / a11y commands on §4–§5 (see the Phase 4 section). The discipline is permanent — extend, never break a consumer.
 - **IndexedDB event log** (`ts/src/event-log.ts`): one `engine-log` DB; stores `commands` / `snapshots` / `meta`; snapshots pruned to the newest 3. The worker logs **off the critical path** — `handleClientCommand` posts the RPC reply *before* `logCommand()` runs (D2.8 backpressure; sustains 1000+ cmds/s).
-- **Crash recovery**: a WASM trap (`/RuntimeError|unreachable/`) → worker posts `{ trap: true }` + `self.close()` → `EngineClient.onTrap` rejects pending + fires the UI `onCrash` callback → `index.ts` swaps in a fresh `<canvas>` and calls `recover()` → respawn + `Command::Recover`. `loadLatestEventLog` returns `snapshotSeq` / `lastSeq` so the recovered worker resumes `logSequence` (never restarts at 0).
+- **Crash recovery**: a WASM trap (`/RuntimeError|unreachable/`) → worker posts `{ trap: true }` + `self.close()` → `EngineClient.onTrap` rejects pending + fires the UI `onCrash` callback → `App` bumps the `canvasGen` signal, remounting `EditorCanvas` with a fresh `<canvas>`, and calls `recover()` → respawn + `Command::Recover`. `loadLatestEventLog` returns `snapshotSeq` / `lastSeq` so the recovered worker resumes `logSequence` (never restarts at 0).
 - **e2e suite**: `ts/e2e/*.spec.ts` + `ts/playwright.config.ts` — `@playwright/test` with `channel: 'chrome'` (system Chrome, no download); `webServer` auto-boots Vite. Run: `pnpm exec playwright test` from `ts/`.
 
 ## Phase 3 — rendering, RTL, box model
@@ -86,10 +86,20 @@ tools/
 - **ICU 2.x** — `icu_segmenter` / `icu_properties` bumped 1.5 → 2.2; `LineSegmenter::new_auto` now takes `LineBreakOptions`.
 - **Priority-band Kashida** (`text-pipeline/justify_kashida.rs`): candidates from Unicode `Joining_Type`, scored into Microsoft P1–P5 bands; one Kashida per word at its best stroke. Width is an `x_advance` bump, not yet a `U+0640` tatweel glyph.
 - **FontStack** (`text-pipeline/fonts.rs`, §13.A): per-script font fallback. `build_line` segments runs by BiDi level × script × style span.
-- **Rich text** — `engine::Paragraph` carries `Vec<StyleRun>` style spans; `Command::ApplyFormatting` applies font-size + colour (bold/italic/underline/bg deferred).
+- **Rich text** — `engine::Paragraph` carries `Vec<StyleRun>` style spans; `Command::ApplyFormatting` applies font-size + colour, plus bold/italic/underline **flags** stored on `SpanStyle` in Phase 4 (rendering of bold/italic faces + underline strokes deferred — BACKLOG.md).
 - **PDF export** (`format-pdf`, D3.7): box tree → single-page PDF, Y-axis inverted, full `Type0`/`CIDFontType2` font embedding. Not PDF/A-1b — see `BACKLOG.md`.
 - **DirtyTracker** (`render/dirty.rs`, D3.8): bounding-rect invalidation; `render_canvas2d` clips fills/strokes and culls off-region glyph runs (`put_image_data` ignores the canvas clip).
 - **Vello/WebGPU** plumbed and reachable via `Engine::init_vello`, but Canvas2D stays the active renderer.
+
+## Phase 4 — headless UI shell
+
+- **Solid.js shell.** `ts/src/index.tsx` is the entry: a `?test=<case>` query routes to the preserved visual-diff harness and never mounts Solid; otherwise it mounts `App.tsx`. Built with `vite-plugin-solid`. `ts/src/` is split into `engine/`, `components/`, `input/`, `state/`, `styles/`, `harness/`.
+- **`EditorCanvas`** (`components/EditorCanvas.tsx`) owns the `<canvas>` and `transferControlToOffscreen()`s it once. Crash recovery is a Solid remount: `App` bumps a `canvasGen` signal, `<For each={[canvasGen()]}>` disposes the dead `<canvas>` and mounts a fresh one. The canvas carries **no `tabindex`** — a focusable canvas steals focus from the hidden textarea.
+- **The engine owns the selection.** It holds `selection` (anchor + caret) and `composition` state; every interactive edit is caret-relative, advances the engine caret, and emits `SelectionChanged`. The worker queue serializes commands, so a stale UI-side caret never misplaces text — fast typing and async clipboard stay correct. This is *the* invariant that makes the UI race-free.
+- **Hit-testing** (`engine-wasm`): `document_geometry` flattens the box tree into per-line `CaretSlot`s (absolute x ↔ source byte), inverting the renderer's coordinate walk. pixel→logical, logical→caret-rect, and selection rects all go through it. Selection rects are per-line bounding boxes (discontinuous BiDi → BACKLOG).
+- **`HiddenInput`** (`components/HiddenInput.tsx`): the `<textarea>` is the OS text-input citizen. `beforeinput` → engine commands; IME via `Begin`/`Update`/`EndComposition`, committed on end (no on-canvas preview); native `copy`/`cut`/`paste` events → the async `navigator.clipboard`. It tracks the caret so IME popups anchor, and refocuses on `pointerup` — a canvas click blurs focus to `<body>` first.
+- **Caret / selection / a11y are DOM overlays**, not canvas-drawn — `CaretOverlay`, `SelectionOverlay`, and a visually-hidden `AccessibilityTree` (`role="document"`, one `<p dir>` per paragraph, `<span>` per style run; the browser's UAX-#9 handles BiDi for the screen reader). The worker broadcasts a full `A11yTree` after every doc mutation. Engine geometry is device-px; overlays divide by `devicePixelRatio`.
+- **Schema growth (additive).** Phase 4 added the `HitTest`, `SelectWordAt`, `DeleteAtCaret`, `RequestAccessibilityTree`, `GetSelectionAsClipboard`, `PastePlain` commands; the `HitResult` and `ClipboardPayload` events; the `Point` type; and `can_undo`/`can_redo` on `SelectionChanged`. The dead `AccessibilityTreeChanged` + `A11yDelta`/`A11yNode` were repurposed (the event now carries `A11yTree`) — done only because they had zero consumers.
 
 ## Validation (CI gates, all -D warnings)
 
@@ -149,11 +159,23 @@ tools/
 
 ## Where the deferred work landed
 
-Phases 1–3 are complete. Phase 3's deferred scope — full rich text, tatweel-glyph Kashida, PDF/A-1b, Vello activation, dynamic line height — is recorded in [`BACKLOG.md`](BACKLOG.md).
+Phases 1–4 are complete. Deferred scope — full rich-text rendering (bold/italic
+faces, underline strokes), tatweel-glyph Kashida, PDF/A-1b, Vello activation,
+dynamic line height, discontinuous BiDi selection rects, inline IME preview,
+pending formatting, rich clipboard, paragraph alignment + per-span font family,
+and accessibility deltas — is recorded in [`BACKLOG.md`](BACKLOG.md).
 
-Phase 3 → 4 hand-off:
+Phase 4 → 5 hand-off:
 
-- The §4–§5 bridge schema stays **frozen**. Phase-4 UI work is engine-internal behind `Engine::dispatch` plus TS-shell wiring.
-- Phase-1 PoC commands (`RenderPage`, `RasterizeGlyph`, `ShapeAndRasterize`, `LoadDocx`, `SaveDocx`) are still live for the visual-diff `?test=` harness — retire them once the editor drives the engine purely through the §4 schema.
-- `Command::Recover` is still a stub — real recovery needs `Engine::snapshot()` (event-log snapshots are empty placeholders). `EngineStats.last_paint_ms` / `last_command_ms` are still `0.0` dummies.
-- Phase 4 (`PHASE_4_HEADLESS_UI.md`): caret, selection rendering, the hidden-textarea input path, IME. Build on the box model — `VisualRun.source_range` + `PositionedGlyph.cluster` give the glyph↔source mapping that cursor hit-testing needs.
+- The bridge schema grew **additively** through Phase 4 (see the Phase 4
+  section). Phase-1 PoC commands (`RenderPage`, `RasterizeGlyph`,
+  `ShapeAndRasterize`, `LoadDocx`, `SaveDocx`) are still live for the
+  visual-diff `?test=` harness.
+- `Command::Recover` is still a stub — real recovery needs `Engine::snapshot()`
+  (event-log snapshots are empty placeholders). `EngineStats.last_paint_ms` /
+  `last_command_ms` are still `0.0` dummies.
+- Interactive editing re-lays-out the whole document twice per keystroke (one
+  repaint pass, one geometry pass). Fine for a one-page document; incremental
+  relayout is a Phase-5 performance item.
+- Phase 5 (`PHASE_5_HARDENING_RELEASE.md`): hardening — fuzzing, the
+  visual-diff farm, PDF/A export, telemetry hooks, and release validation.
