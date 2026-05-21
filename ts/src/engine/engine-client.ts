@@ -10,7 +10,7 @@
  * crate is not built standalone — its `Command`/`Event` types are generated
  * (via `tsify-next`) into the `engine-wasm` wasm-pack package, so that is the
  * real import site. */
-import type { Command, DocFormat, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js';
+import type { Command, DocFormat, Event } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { loadLatestEventLog } from './event-log';
 
 type WorkerReply = {

@@ -1,19 +1,20 @@
 /// <reference lib="webworker" />
 
-import init, { Engine } from '../../crates/engine-wasm/pkg/engine_wasm.js';
-import type { Command, Event } from '../../crates/engine-wasm/pkg/engine_wasm.js';
+import init, { Engine } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import type { Command, Event } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
    GitHub Pages /next-gen-editor/); `?url` imports are hashed + base-aware. */
-import LATIN_URL from '../fonts/LiberationSans-Regular.ttf?url';
-import ARABIC_URL from '../fonts/NotoNaskhArabic-Regular.ttf?url';
-import DUAL_URL from '../fonts/Amiri-Regular.ttf?url';
+import LATIN_URL from '../../fonts/LiberationSans-Regular.ttf?url';
+import ARABIC_URL from '../../fonts/NotoNaskhArabic-Regular.ttf?url';
+import DUAL_URL from '../../fonts/Amiri-Regular.ttf?url';
 
 declare const self: DedicatedWorkerGlobalScope;
 
-/* Phase 1 PoC harness envelope (driven by `index.ts` + the visual-diff
-   suite). TODO: Deprecate in Phase 3 once `index.ts` adopts `EngineClient`. */
+/* Phase 1 PoC harness envelope — used only by the visual-diff harness
+   (ts/src/harness/visual-diff.ts) for the `?test=` golden cases. The
+   interactive editor drives the engine through the EngineClient path below. */
 type InitMsg = { type: 'INIT'; canvas: OffscreenCanvas; testCase: string };
 type CommandMsg = { type: 'COMMAND'; id: number; cmd: Command };
 
@@ -97,7 +98,7 @@ async function dispatch(cmd: Command): Promise<Event> {
 async function handleInit(msg: InitMsg): Promise<void> {
     await init({
         module_or_path: new URL(
-            '../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
+            '../../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
             import.meta.url,
         ),
     });
@@ -324,8 +325,9 @@ async function handleCommand(msg: CommandMsg): Promise<void> {
    Phase 2 §6/§7 — EngineClient (id-routed) message path.
 
    This runs ALONGSIDE the Phase 1 test-harness path above. A given worker
-   instance only ever receives one protocol (`index.ts` uses the harness;
-   `EngineClient` uses this path), so the two coexist without interfering.
+   instance only ever receives one protocol (the visual-diff harness uses the
+   harness path; `EngineClient` uses this path), so they coexist without
+   interfering.
    =================================================================== */
 
 /**
@@ -347,7 +349,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
     try {
         await init({
             module_or_path: new URL(
-                '../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
+                '../../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
                 import.meta.url,
             ),
         });
@@ -368,7 +370,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
     try {
         await init({
             module_or_path: new URL(
-                '../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
+                '../../../crates/engine-wasm/pkg/engine_wasm_bg.wasm',
                 import.meta.url,
             ),
         });

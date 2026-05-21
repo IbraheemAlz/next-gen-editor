@@ -5,7 +5,7 @@
  *   - commands  (keyPath "seq") — every dispatched command, in order
  *   - snapshots (keyPath "seq") — periodic engine snapshots; pruned to 3
  *   - meta      (keyPath "id")  — bookkeeping (which document is logged) */
-import type { Command } from '../../crates/engine-wasm/pkg/engine_wasm.js';
+import type { Command } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 const DB_NAME = 'engine-log';
 const DB_VERSION = 1;

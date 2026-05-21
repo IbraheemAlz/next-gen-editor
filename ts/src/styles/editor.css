@@ -1,0 +1,31 @@
+/* Phase 4 §5 — editor shell + canvas styling. */
+
+.editor-shell {
+    height: 100%;
+}
+
+/* The engine canvas. Fills the viewport; the backing store is sized to
+   devicePixelRatio in EditorCanvas before transferControlToOffscreen(). */
+.editor-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    background: #fff;
+    cursor: text;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+/* Boot overlay — covers the bare white canvas until the engine's first
+   paint, so the user does not type into a not-yet-ready editor. */
+.boot-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #f6f6f6;
+    color: #555;
+    font: 15px / 1.5 system-ui, sans-serif;
+}

@@ -4,6 +4,8 @@
     "lib": ["ES2024", "DOM", "DOM.Iterable", "WebWorker"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,

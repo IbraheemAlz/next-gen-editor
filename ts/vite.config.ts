@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import path from 'node:path';
+import solid from 'vite-plugin-solid';
 
 /**
  * Cross-origin isolation headers — required for SharedArrayBuffer + WASM
@@ -17,6 +18,7 @@ export default defineConfig({
        `pnpm preview`) and under a GitHub Pages subpath
        (https://<user>.github.io/next-gen-editor/). */
     base: './',
+    plugins: [solid()],
     server: {
         headers: isolationHeaders,
         port: 5173,
