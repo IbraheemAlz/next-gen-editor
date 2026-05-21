@@ -130,18 +130,20 @@ export function App() {
         <div class="editor-shell">
             <Toolbar client={client} store={store} />
             <div class="editor-viewport">
-                <For each={[canvasGen()]}>
-                    {(generation) => (
-                        <EditorCanvas
-                            client={client}
-                            generation={generation}
-                            onReady={onReady}
-                        />
-                    )}
-                </For>
-                <SelectionOverlay store={store} />
-                <CaretOverlay store={store} />
-                <HiddenInput client={client} store={store} />
+                <div class="editor-page">
+                    <For each={[canvasGen()]}>
+                        {(generation) => (
+                            <EditorCanvas
+                                client={client}
+                                generation={generation}
+                                onReady={onReady}
+                            />
+                        )}
+                    </For>
+                    <SelectionOverlay store={store} />
+                    <CaretOverlay store={store} />
+                    <HiddenInput client={client} store={store} />
+                </div>
             </div>
             <AccessibilityTree store={store} />
             <Announcements store={store} />
