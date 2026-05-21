@@ -4,6 +4,16 @@ Work consciously deferred during Phase 2 / Phase 3. Each feature below shipped a
 deliberate, scoped subset; the remainder is recorded here so it is not lost.
 None of these are regressions — they are known, bounded follow-ups.
 
+## Shipped in Phase 5 backlog sprints
+
+Items completed after the `v0.5.0-beta.1` cut, in the continuous
+backlog-sprint phase. Each stays in its numbered section below — annotated
+**✅ Shipped** — so the cross-references between items keep resolving.
+
+- **Sprint 1 (2026-05-22)** — Pending (sticky) formatting (item 11, complete);
+  paragraph alignment (item 9 — the `AlignmentPicker` half; per-span font
+  family is still deferred).
+
 ## 1. Rich text formatting
 
 **Shipped (rich-text spans):** per-character style spans (`engine::StyleRun`)
@@ -145,13 +155,16 @@ Underline, font size, text colour. Bold/italic/underline are stored on
 `SpanStyle` and round-trip (the buttons reflect them), though layout/render
 still ignore them (item 1 above). Size + colour render immediately.
 
-**Deferred:** §11's `AlignmentPicker` and `FontFamilyPicker`.
+**Partly shipped.** §11's `AlignmentPicker` shipped in Phase 5 sprint 1; the
+`FontFamilyPicker` is still deferred.
 
-- **Paragraph alignment.** There is no `SET_PARAGRAPH_ALIGN` command and no
-  per-paragraph alignment in the document model — `engine::Paragraph` has no
-  alignment field, and `layout_paragraph` takes one global `Alignment` from
-  the render config. Needs an alignment field on `Paragraph`, a command to set
-  it over a range, and `build_page` passing each paragraph's own value.
+- **✅ Paragraph alignment — shipped (Phase 5 sprint 1).** `engine::Paragraph`
+  carries an `alignment: Option<Alignment>`, threaded through every model
+  mutation; `Command::SetParagraphAlign` sets it over a range; `build_page`
+  passes each paragraph's own value to `layout_paragraph`; `alignment_origin_x`
+  resolves `End` direction-relatively. The toolbar `AlignmentPicker` maps the
+  absolute Left/Center/Right/Justify buttons onto the engine's
+  direction-relative model via the document base direction.
 - **Per-span font family.** `SpanStyle` has no `font_family`, and `FontStack`
   resolves a face by script, not by a requested family. Needs a family field
   on `SpanStyle`, multiple loaded families, and family-aware `FontStack`
@@ -171,14 +184,17 @@ per-paragraph ids so Solid reconciles only the changed `<p>`s. The repurposed
 
 ## 11. Pending (sticky) formatting
 
-**Shipped:** `ApplyFormatting` over a collapsed caret is a no-op — there is
-no text to style.
+**✅ Shipped (Phase 5 sprint 1).** Clicking Bold/Italic/Underline with a
+collapsed caret arms a pending `SpanStyle` overlay on the engine
+(`Engine::pending_format`). The next interactive `InsertText` applies it to
+the typed run; it persists across keystrokes and is cleared on a caret move
+(`SetSelection` / `ExtendSelection` / `SelectWordAt`). `attrs_at_caret`
+reflects the armed style, so the toolbar button reads as pressed before any
+text exists.
 
-**Deferred:** pending formatting — clicking Bold with no selection should arm
-a sticky style the next typed text adopts (standard word-processor
-behaviour). Needs the engine to hold a pending `SpanStyle` overlay, applied on
-the next `InsertText` and cleared on caret move; the toolbar reflects the
-pending state so the button reads as pressed before any text exists.
+One refinement over the original sketch: the overlay is cleared on the caret
+move, **not** on the consuming `InsertText` — clearing on insert would style
+only the first character of a multi-character typed run.
 
 ## 12. Clipboard — rich payloads + multi-line paste
 
