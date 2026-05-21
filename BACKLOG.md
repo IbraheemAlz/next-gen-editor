@@ -37,24 +37,27 @@ elongated stroke. Needs: font glyph lookup for U+0640, tiling/scaling the
 Tatweel to fill the target width, and inserting synthetic glyphs into a
 `VisualRun` without corrupting the `source_range` / `cluster` indices.
 
-## 3. PDF export — strict PDF/A-1b compliance
+## 3. PDF export — compression, subsetting, ToUnicode
 
 **Shipped (D3.7):** `crates/format-pdf` — box tree to a single-page PDF, Y-axis
 inversion, full `Type0` / `CIDFontType2` / `Identity-H` font embedding.
 
+**Shipped (D5.4):** strict PDF/A-1b conformance for `PdfProfile::A1b` — a PDF
+1.4 header, an `OutputIntent` with an embedded sRGB ICC profile, an XMP
+metadata packet, and a document `/ID`. The ICC profile is **synthesized at
+build time** by `crates/format-pdf/build.rs`, so no binary blob lands in the
+source tree — CLAUDE.md's no-blobs rule holds without an exception.
+`tools/pdf-validate` is the veraPDF harness, surfaced by the non-blocking CI.
+
 **Deferred:**
 
-- **PDF/A-1b conformance.** `Command::ExportPdf` accepts a `conformance` field
-  but ignores it. Genuine /A-1b requires an `OutputIntent` referencing an
-  embedded sRGB **ICC profile** (a binary blob — needs an explicit exception to
-  CLAUDE.md's no-blobs rule), an XMP metadata packet, and a document ID.
-- **veraPDF CI gate.** /A-1b cannot be honestly *claimed* without
-  `veraPDF --profile 1b` validating the output in CI (PHASE_3_RENDER_RTL.md
-  §10). Compliance is unverifiable until this gate exists.
 - **Stream compression.** Content and `FontFile2` streams are uncompressed;
   with full font embedding the output is large. Needs `FlateDecode`.
 - **`/ToUnicode` CMap.** Without it, text copy / extraction from the PDF is
-  broken. Also `/W` glyph widths and font subsetting (smaller files).
+  broken — not required for PDF/A-1**b**, but needed for /A-1a and good UX.
+  Also `/W` glyph widths and font subsetting (smaller files).
+- **PDF/A-2 / PDF/X.** `PdfConformance::A2u` and `X3` currently fall back to a
+  plain PDF; only `A1b` is implemented.
 
 ## 4. Vello (WebGPU) render path
 
@@ -197,3 +200,18 @@ native `copy` / `cut` / `paste` events.
   becomes a literal character. Newline-aware paste should split the text into
   paragraphs (insert + `SplitParagraph` per line). Single-paragraph paste is
   exact today.
+
+## 13. Incremental relayout
+
+**Shipped:** every edit and every document load relays out and repaints the
+whole document. Correct, and fast enough for a one-page document — the D5.3
+perf harness measures insert-char @ caret p95 ≈ 10 ms.
+
+**Deferred:** incremental relayout. Opening or editing a multi-page document
+re-runs `layout_paragraph` for *every* paragraph — the D5.3 harness measures
+~9 s to open the synthetic 50-page document (1000 paragraphs), far over the §6
+2.5 s budget. Needs paragraph-level layout caching keyed on a content + config
+hash, so only paragraphs whose text or style changed are re-shaped, and line
+stacking below an edit shifts by a delta instead of re-flowing the rest. This
+is why `tools/perf/run.mjs` keeps the open-doc metric out of its `--strict`
+gate — a known, tracked cost must not mask a real regression.

@@ -14,6 +14,7 @@ import { AccessibilityTree } from './components/AccessibilityTree';
 import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
 import { createEngineStore } from './state/engine-store';
+import { startTelemetry } from './state/telemetry';
 import { attachDragDrop } from './input/dnd';
 import type { Command, Event } from './engine/types';
 import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
@@ -126,6 +127,9 @@ export function App() {
         if (firstReady) {
             firstReady = false;
             startStatsPolling(client);
+            /* D5.7 — mock telemetry pipeline: batches engine samples and
+               console.logs them every 60 s (a real collector would POST). */
+            startTelemetry(client);
         }
     };
 

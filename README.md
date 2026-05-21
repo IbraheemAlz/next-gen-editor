@@ -7,14 +7,18 @@ No `iframe`s, no vendored binary blobs — the engine is built from source.
 [![pages](https://github.com/IbraheemAlz/next-gen-editor/actions/workflows/pages.yml/badge.svg)](https://github.com/IbraheemAlz/next-gen-editor/actions/workflows/pages.yml)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
-> **Status — Phase 4 complete (v0.4.0).**
+> **Status — Phase 5 engineering complete (`v0.5.0-beta.1`).**
 > A fully interactive editor: a Solid.js UI shell over the Rust/WASM engine —
 > click-to-place caret, drag selection, native IME (Arabic + CJK), a
 > formatting toolbar, the system clipboard, drag-drop `.docx` open, and a
 > screen-reader accessibility tree — on the Phase 1–3 engine (BiDi,
-> priority-band Kashida, multi-script font fallback, hierarchical box model,
-> PDF export). The full roadmap lives in [`MASTER_PLAN.md`](MASTER_PLAN.md);
-> deferred scope in [`BACKLOG.md`](BACKLOG.md).
+> priority-band Kashida, multi-script font fallback, hierarchical box model).
+> Phase 5 added **PDF/A-1b export**, a **QA harness farm** (visual-diff /
+> memory / performance), a **`cargo-fuzz`** suite, **telemetry** scaffolding
+> and a tag-triggered **release pipeline**. This is a **beta** — the external
+> security audit, operator runbook and Arabic typography sign-off are still
+> pending. Roadmap in [`MASTER_PLAN.md`](MASTER_PLAN.md); deferred scope in
+> [`BACKLOG.md`](BACKLOG.md).
 
 ## Live demo
 
@@ -46,8 +50,10 @@ as a day-one requirement rather than an afterthought.
   VisualRun → PositionedGlyph`, parent-relative coordinates.
 - **Rich-text formatting** — per-character style spans (font size +
   colour) applied via `ApplyFormatting`.
-- **PDF export** — single-page PDF with full `Type0`/`CIDFontType2` font
-  embedding (`pdf-writer`).
+- **PDF / PDF-A export** — single-page PDF with full `Type0`/`CIDFontType2`
+  font embedding (`pdf-writer`); a PDF/A-1b archival mode adds an embedded
+  sRGB output intent + XMP metadata, with the ICC profile synthesized at
+  build time rather than vendored.
 - **Incremental repaint** — a `DirtyTracker` clips Canvas2D draws to the
   changed region.
 - **`.docx` round-trip** — read + write, sibling archive entries
@@ -66,6 +72,10 @@ as a day-one requirement rather than an afterthought.
 - **Headless architecture** — WASM engine in a dedicated Web Worker,
   `OffscreenCanvas` rendering, typed RPC bridge. No `iframe`. A WebGPU /
   Vello renderer is plumbed for a future activation.
+- **QA + release infrastructure** — a tiered Playwright visual-diff farm,
+  memory-snapshot and performance harnesses, a `cargo-fuzz` suite (`.docx`
+  reader + RPC schema), mock telemetry batching, and a tag-triggered release
+  pipeline that builds the artifact + an SBOM.
 
 ## Architecture
 
@@ -124,9 +134,14 @@ crates/
   format-pdf/     PDF export with font embedding
 ts/               Vite + TypeScript shell, worker, dispatch channel
 tools/
-  visual-diff/    Playwright + pixelmatch golden suite
+  visual-diff/    Playwright golden farm (tiered)
+  memory-profile/ engine + JS heap snapshot harness
+  perf/           cold-start + insert-latency + open-doc harness
+  pdf-validate/   veraPDF PDF/A-1b validation harness
+  perf-fixtures/  generates the synthetic perf .docx load files
   shape-regression/  rustybuzz output snapshots
   roundtrip/      .docx open → edit → save → byte-diff harness
+fuzz/             cargo-fuzz crate — .docx reader + RPC command targets
 MASTER_PLAN.md    macro architecture + 5-phase roadmap
 PHASE_*.md        per-phase execution plans
 BACKLOG.md        deferred scope + technical debt
@@ -140,7 +155,7 @@ BACKLOG.md        deferred scope + technical debt
 | **2** ✅ | Worker bridge hardening, full RPC schema, memory + crash recovery |
 | **3** ✅ | Box model, priority Kashida, font fallback, rich text, PDF export, dirty tracking |
 | **4** ✅ | Headless UI shell: Solid.js, pointer + caret + selection, IME, toolbar, accessibility, clipboard, drag-drop |
-| 5 | Hardening: visual-diff farm, fuzzing, PDF/A export, release validation |
+| **5 — Hardening** 🚧 | QA harness farm (visual-diff / memory / perf), `cargo-fuzz`, PDF/A-1b export, telemetry, release pipeline — engineering complete (`v0.5.0-beta.1`); external security audit, operator runbook + Arabic typography sign-off pending |
 
 See [`MASTER_PLAN.md`](MASTER_PLAN.md) and the `PHASE_*.md` documents.
 
@@ -154,6 +169,10 @@ See [`MASTER_PLAN.md`](MASTER_PLAN.md) and the `PHASE_*.md` documents.
 - Kashida elongation widens glyph advances; true `U+0640` tatweel-glyph
   insertion is deferred.
 - Vello / WebGPU is plumbed but Canvas2D is the active renderer.
+- Opening or editing a multi-page document relays out every paragraph — fast
+  for one page (insert p95 ≈ 10 ms), but the synthetic 50-page open takes
+  ~9 s. Incremental relayout is the open performance item — see
+  [`BACKLOG.md`](BACKLOG.md).
 
 ## Licenses
 

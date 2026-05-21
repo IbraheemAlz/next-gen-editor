@@ -27,6 +27,8 @@ declare global {
         __bootMs?: number;
         /** Set true after a successful crash recovery (e2e hook). */
         __recovered?: boolean;
+        /** Force a telemetry batch flush now (D5.7 debug + e2e hook). */
+        __telemetryFlush?: () => Promise<void>;
     }
 }
 

@@ -9,6 +9,7 @@
 //! - [`common`] — types shared by both `Command` and `Event`.
 //! - [`command`] — the `Command` enum + command-only payload types.
 //! - [`event`] — the `Event` enum + event-only payload types.
+//! - [`telemetry`] — the D5.7 telemetry schema (§11).
 //!
 //! `tsify-next` notes: `Option<T>` renders as `T | undefined` in the generated
 //! `.d.ts` — TS callers MUST pass `undefined`, not `null`. Binary `Vec<u8>`
@@ -18,7 +19,9 @@
 mod command;
 mod common;
 mod event;
+mod telemetry;
 
 pub use command::*;
 pub use common::*;
 pub use event::*;
+pub use telemetry::*;

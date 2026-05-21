@@ -2,7 +2,7 @@
 
 Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–4. Don't relitigate without a measurement that contradicts it.
 
-**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (hardening + release — `PHASE_5_HARDENING_RELEASE.md`) is next.
+**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**; the cut is `v0.5.0-beta.1`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
 
 ---
 
@@ -48,9 +48,14 @@ crates/
   format-pdf/     PDF export (pdf-writer) — box tree + full font embedding
 ts/               Vite + TS shell, worker, EngineClient, event log, e2e suite
 tools/
-  visual-diff/    Playwright + pixelmatch golden suite
+  visual-diff/    Playwright + pixelmatch golden farm (tiered, D5.1)
+  memory-profile/ engine + JS heap snapshot harness (D5.2)
+  perf/           cold-start + insert-latency + open-doc harness (D5.3)
+  pdf-validate/   veraPDF PDF/A-1b validation harness (D5.4)
+  perf-fixtures/  generates the synthetic perf .docx load files
   shape-regression/  rustybuzz output snapshots
   roundtrip/      .docx open → edit → save → byte-diff harness
+fuzz/             cargo-fuzz crate, own workspace (D5.5)
 ```
 
 ## Crate / dep conventions
@@ -101,6 +106,40 @@ tools/
 - **Caret / selection / a11y are DOM overlays**, not canvas-drawn — `CaretOverlay`, `SelectionOverlay`, and a visually-hidden `AccessibilityTree` (`role="document"`, one `<p dir>` per paragraph, `<span>` per style run; the browser's UAX-#9 handles BiDi for the screen reader). The worker broadcasts a full `A11yTree` after every doc mutation. Engine geometry is device-px; overlays divide by `devicePixelRatio`.
 - **Schema growth (additive).** Phase 4 added the `HitTest`, `SelectWordAt`, `DeleteAtCaret`, `RequestAccessibilityTree`, `GetSelectionAsClipboard`, `PastePlain` commands; the `HitResult` and `ClipboardPayload` events; the `Point` type; and `can_undo`/`can_redo` on `SelectionChanged`. The dead `AccessibilityTreeChanged` + `A11yDelta`/`A11yNode` were repurposed (the event now carries `A11yTree`) — done only because they had zero consumers.
 
+## Phase 5 — hardening, QA harnesses, telemetry, release
+
+The Phase 5 **engineering** work is complete (`v0.5.0-beta.1`). D5.6 / D5.9 /
+D5.10 are external/human sign-offs, not code.
+
+- **Visual-diff farm (D5.1).** `tools/visual-diff/run.mjs` gained a `TIERS`
+  config + farm mode — `--tier A|B|C` runs every committed golden in one
+  invocation at the tier tolerance; single-case mode is preserved. The §3
+  200-doc tier corpus is not populated, so the farm runs the real Phase-3
+  goldens under `tools/visual-diff/golden/`.
+- **Memory snapshot (D5.2).** `tools/memory-profile/run.mjs` loads each
+  `tests/perf/{50,100,250,500}p.docx` and checks the engine WASM heap + JS
+  heap against the §5 budgets. `tools/perf-fixtures` (a workspace crate)
+  generates those `.docx` files with `build_minimal_docx`.
+- **Performance harness (D5.3).** `tools/perf/run.mjs` measures cold start,
+  insert-char p95 (one-page seeded doc) and open-50p-doc against §6 tier
+  budgets. `--strict` gates cold start + insert p95; open-doc is reported but
+  **ungated** — it is bounded by the deferred incremental relayout (BACKLOG).
+- **PDF/A-1b (D5.4).** `format-pdf` emits true PDF/A-1b for `PdfProfile::A1b`;
+  `crates/format-pdf/build.rs` synthesizes the sRGB ICC profile — no binary
+  blob in the tree. `tools/pdf-validate` is the veraPDF harness.
+- **Fuzzing (D5.5).** `fuzz/` is a cargo-fuzz crate in its **own workspace** —
+  `docx_reader` fuzzes `read_docx`, `rpc_command` fuzzes `Command` JSON.
+  Compile-checked on stable; `cargo +nightly fuzz run` is the nightly flow.
+- **Telemetry (D5.7).** Schema in `crates/bridge/src/telemetry.rs`; the UI
+  collector `ts/src/state/telemetry.ts` batches samples and `console.log`s
+  them every 60 s — a **mock** transport (no live collector for the MVP).
+- **Release pipeline (D5.8).** `.github/workflows/release.yml` is
+  tag-triggered (`v*`): builds the WASM artifact + static site + SBOM and
+  publishes a GitHub Release. Cosign signing is a commented-out stub.
+- **CI.** A **non-blocking** `qa-harness` job in `ci.yml` runs the visual-diff,
+  memory and perf harnesses — non-blocking because golden pixel-reproducibility
+  on the GitHub runner is unproven across machines.
+
 ## Validation (CI gates, all -D warnings)
 
 - `cargo fmt --all -- --check` clean.
@@ -112,6 +151,9 @@ tools/
 - `cargo run -p roundtrip --release` — PASS.
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
 - `pnpm exec playwright test` (from `ts/`) — the 7 Phase 2 exit-gate e2e specs in `ts/e2e/` all green.
+- `cargo check --manifest-path fuzz/Cargo.toml` — the D5.5 fuzz crate compiles.
+- The non-blocking `qa-harness` job runs the D5.1–D5.3 browser harnesses
+  (`tools/visual-diff` farm, `tools/memory-profile`, `tools/perf`).
 
 ## Visual-diff harness
 
@@ -159,23 +201,27 @@ tools/
 
 ## Where the deferred work landed
 
-Phases 1–4 are complete. Deferred scope — full rich-text rendering (bold/italic
-faces, underline strokes), tatweel-glyph Kashida, PDF/A-1b, Vello activation,
-dynamic line height, discontinuous BiDi selection rects, inline IME preview,
-pending formatting, rich clipboard, paragraph alignment + per-span font family,
-and accessibility deltas — is recorded in [`BACKLOG.md`](BACKLOG.md).
+Phases 1–4 are complete, and Phase 5's engineering deliverables shipped at
+`v0.5.0-beta.1`. Deferred scope — full rich-text rendering (bold/italic faces,
+underline strokes), tatweel-glyph Kashida, Vello activation, dynamic line
+height, discontinuous BiDi selection rects, inline IME preview, pending
+formatting, rich clipboard, paragraph alignment + per-span font family,
+accessibility deltas, and **incremental relayout** — is recorded in
+[`BACKLOG.md`](BACKLOG.md).
 
-Phase 4 → 5 hand-off:
+Phase 5 → MVP hand-off:
 
-- The bridge schema grew **additively** through Phase 4 (see the Phase 4
-  section). Phase-1 PoC commands (`RenderPage`, `RasterizeGlyph`,
-  `ShapeAndRasterize`, `LoadDocx`, `SaveDocx`) are still live for the
-  visual-diff `?test=` harness.
+- The bridge schema grew **additively** through Phases 4–5 — the D5.7
+  `telemetry` module is the latest addition. Phase-1 PoC commands
+  (`RenderPage`, `RasterizeGlyph`, `ShapeAndRasterize`, `LoadDocx`, `SaveDocx`)
+  are still live for the visual-diff `?test=` harness.
 - `Command::Recover` is still a stub — real recovery needs `Engine::snapshot()`
   (event-log snapshots are empty placeholders). `EngineStats.last_paint_ms` /
-  `last_command_ms` are still `0.0` dummies.
-- Interactive editing re-lays-out the whole document twice per keystroke (one
-  repaint pass, one geometry pass). Fine for a one-page document; incremental
-  relayout is a Phase-5 performance item.
-- Phase 5 (`PHASE_5_HARDENING_RELEASE.md`): hardening — fuzzing, the
-  visual-diff farm, PDF/A export, telemetry hooks, and release validation.
+  `last_command_ms` and `Event::Painted.paint_ms` are still `0.0` dummies — the
+  D5.7 telemetry pipeline is wired and will carry real numbers once they are.
+- Interactive editing re-lays-out the whole document on every edit. Fine for a
+  one-page document (insert p95 ≈ 10 ms, D5.3); **incremental relayout** is the
+  open performance item — the D5.3 harness keeps open-50p-doc ungated for it.
+- Remaining for the MVP `v0.1.0`: D5.6 (external security audit), D5.9
+  (operator runbook), D5.10 (Arabic typography sign-off), then the §10 exit
+  gate. This `v0.5.0-beta.1` cut is the engineering-complete beta.

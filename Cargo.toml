@@ -15,11 +15,11 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0-beta.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
-repository = "https://github.com/example/next-gen-editor"
+repository = "https://github.com/IbraheemAlz/next-gen-editor"
 
 [workspace.dependencies]
 # Bridge / FFI

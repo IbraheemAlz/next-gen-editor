@@ -1,0 +1,89 @@
+name: release
+
+# Tag-triggered release pipeline — Phase 5 D5.8
+# (PHASE_5_HARDENING_RELEASE.md §12). Pushing a `v*` tag builds the versioned
+# WASM artifact, the static site and an SBOM, then publishes a GitHub Release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  # softprops/action-gh-release needs write access to create the Release.
+  contents: write
+
+jobs:
+  release:
+    name: Build artifact + GitHub Release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Build engine-wasm (release)
+        run: wasm-pack build --target web --release crates/engine-wasm
+
+      - name: Enforce WASM size budget (<15 MiB)
+        run: |
+          set -euo pipefail
+          SIZE_BYTES=$(wc -c < crates/engine-wasm/pkg/engine_wasm_bg.wasm)
+          echo "WASM size: $SIZE_BYTES bytes ($((SIZE_BYTES / 1024)) KiB)"
+          if [ "$SIZE_BYTES" -ge 15728640 ]; then
+              echo "FAIL: WASM artifact exceeds the 15 MiB budget"
+              exit 1
+          fi
+
+      - name: Build the static site
+        run: |
+          pnpm --dir ts install --frozen-lockfile
+          pnpm --dir ts build
+
+      - name: Package the static site
+        run: tar -czf next-gen-editor-site.tar.gz -C ts/dist .
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json
+
+      # Artifact signing is intentionally omitted for the MVP — provisioning
+      # Cosign keys in GitHub Actions is out of scope here. To enable, add:
+      #   - name: Sign the WASM artifact (cosign)
+      #     run: cosign sign-blob --yes \
+      #            --output-signature engine.wasm.sig \
+      #            crates/engine-wasm/pkg/engine_wasm_bg.wasm
+      # and append engine.wasm.sig to the release `files` list below.
+
+      # The §12 visual-diff Tier-A and PDF/A-1b gates need a running dev server
+      # (the harnesses drive a browser). They run in ci.yml's non-blocking
+      # qa-harness job rather than blocking the release here.
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            crates/engine-wasm/pkg/engine_wasm_bg.wasm
+            crates/engine-wasm/pkg/engine_wasm.js
+            next-gen-editor-site.tar.gz
+            **/*.cdx.json
