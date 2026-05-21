@@ -1,0 +1,15 @@
+[package]
+name = "perf-fixtures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Generates synthetic .docx load files for the memory-profile harness (D5.2)."
+
+[[bin]]
+name = "perf-fixtures"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../../crates/engine" }
+format-docx = { path = "../../crates/format-docx" }

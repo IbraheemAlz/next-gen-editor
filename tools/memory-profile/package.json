@@ -1,0 +1,14 @@
+{
+  "name": "memory-profile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Memory snapshot harness (Phase 5 D5.2) — profiles the engine + JS heap against per-document-size budgets.",
+  "scripts": {
+    "run": "node run.mjs",
+    "budgets": "node run.mjs --budgets"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
+  }
+}
