@@ -555,6 +555,13 @@ impl Engine {
                 Ok(archive) => {
                     let paragraph_count = archive.document.paragraph_count();
                     self.undo = UndoStack::new(archive.document, 100);
+                    /* The prior selection points into the replaced document —
+                    reset the caret to the start of the loaded one. */
+                    self.selection = Some(SelectionState {
+                        anchor: BridgeLogicalPos { para: 0, offset: 0 },
+                        caret: BridgeLogicalPos { para: 0, offset: 0 },
+                    });
+                    self.dirty.invalidate(full_page_rect());
                     self.maybe_repaint();
                     Event::DocumentLoaded { paragraph_count }
                 }
@@ -617,6 +624,10 @@ impl Engine {
             Command::RequestAccessibilityTree => Event::AccessibilityTreeChanged {
                 tree: self.build_a11y_tree(),
             },
+
+            // Phase 4 §12 — clipboard.
+            Command::GetSelectionAsClipboard => self.do_get_selection_as_clipboard(),
+            Command::PastePlain { text } => self.do_paste_plain(text),
         }
     }
 
@@ -1477,6 +1488,34 @@ impl Engine {
             })
             .collect();
         A11yTree { paragraphs }
+    }
+
+    /// `Command::GetSelectionAsClipboard` — the selection text as clipboard
+    /// payloads. `html` / `docx_fragment` await rich clipboard generation.
+    fn do_get_selection_as_clipboard(&self) -> Event {
+        let plain = match self.selection {
+            Some(sel) => {
+                let (start, end) = ordered(sel.anchor, sel.caret);
+                self.undo
+                    .current()
+                    .text_range(to_engine_pos(start), to_engine_pos(end))
+            }
+            None => String::new(),
+        };
+        Event::ClipboardPayload {
+            plain,
+            html: String::new(),
+            docx_fragment: Vec::new(),
+        }
+    }
+
+    /// `Command::PastePlain` — insert clipboard text at the caret, replacing
+    /// any non-empty selection.
+    fn do_paste_plain(&mut self, text: String) -> Event {
+        let at = self
+            .selection
+            .map_or(BridgeLogicalPos { para: 0, offset: 0 }, |s| s.caret);
+        self.do_insert_text_interactive(at, text)
     }
 }
 

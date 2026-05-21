@@ -156,6 +156,17 @@ pub enum Event {
     HitResult {
         pos: LogicalPos,
     },
+
+    /// Reply to `Command::GetSelectionAsClipboard` — the selection as
+    /// clipboard MIME payloads. `html` / `docx_fragment` stay empty until
+    /// rich clipboard generation lands (see BACKLOG.md).
+    ClipboardPayload {
+        plain: String,
+        html: String,
+        #[serde(with = "serde_bytes")]
+        #[tsify(type = "Uint8Array")]
+        docx_fragment: Vec<u8>,
+    },
 }
 
 /// Font vertical metrics, scaled to a requested pixel size.

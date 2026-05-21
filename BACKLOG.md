@@ -176,3 +176,24 @@ a sticky style the next typed text adopts (standard word-processor
 behaviour). Needs the engine to hold a pending `SpanStyle` overlay, applied on
 the next `InsertText` and cleared on caret move; the toolbar reflects the
 pending state so the button reads as pressed before any text exists.
+
+## 12. Clipboard — rich payloads + multi-line paste
+
+**Shipped (D4.9):** plain-text clipboard — `GetSelectionAsClipboard` returns
+the selection text, `copy`/`cut` write it via `navigator.clipboard.writeText`,
+`paste` reads `readText` into `PastePlain`. Bound to the hidden textarea's
+native `copy` / `cut` / `paste` events.
+
+**Deferred:**
+
+- **Rich copy.** `ClipboardPayload.html` / `docx_fragment` are returned empty.
+  A faithful copy generates an HTML fragment and a `.docx` clipboard fragment,
+  written together via a multi-MIME `ClipboardItem` + `navigator.clipboard.write`.
+- **`PasteHtml` / `PasteDocxFragment`.** Pasting rich content from another app
+  (HTML, or a Word `.docx` fragment) needs these two commands plus an
+  HTML / `.docx`-fragment parser mapping to `StyleRun`s. The plain path already
+  covers every paste as text — every clipboard write carries `text/plain`.
+- **Multi-line paste.** `PastePlain` inserts text verbatim, so a pasted `\n`
+  becomes a literal character. Newline-aware paste should split the text into
+  paragraphs (insert + `SplitParagraph` per line). Single-paragraph paste is
+  exact today.

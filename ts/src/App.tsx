@@ -4,7 +4,7 @@
  * drives crash recovery, and mirrors the `window.__*` hooks the Phase 2
  * exit-gate e2e specs depend on. Document state lives in the engine (§9) —
  * App holds only UI signals. */
-import { createSignal, For, Show } from 'solid-js';
+import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { EditorCanvas } from './components/EditorCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
 import { SelectionOverlay } from './components/SelectionOverlay';
@@ -14,6 +14,7 @@ import { AccessibilityTree } from './components/AccessibilityTree';
 import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
 import { createEngineStore } from './state/engine-store';
+import { attachDragDrop } from './input/dnd';
 import type { Command, Event } from './engine/types';
 import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
 import './styles/editor.css';
@@ -103,6 +104,9 @@ export function App() {
     /* §9 store — mirrors engine SELECTION_CHANGED events into signals the
        caret + selection overlays render from. */
     const store = createEngineStore(client);
+
+    /* §10 D4.10 — drop a .docx anywhere on the page to load it. */
+    onMount(() => onCleanup(attachDragDrop(client)));
 
     /* Runs once EditorCanvas has handed the engine its surface (init/recover). */
     const onReady = async (generation: number, initMs: number): Promise<void> => {

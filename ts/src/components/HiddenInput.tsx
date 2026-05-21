@@ -9,6 +9,7 @@ import { createEffect, onCleanup, onMount } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type { Command, LogicalPos } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
+import { copy, cut, paste } from '../input/clipboard';
 
 /** Map a non-composition `InputEvent` to an engine command. */
 function mapInputEventToCommand(e: InputEvent, caret: LogicalPos): Command | null {
@@ -104,6 +105,22 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         }
     };
 
+    /* §12 — clipboard. The native copy/cut/paste events fire inside a
+       user-gesture context, which the async navigator.clipboard API requires;
+       preventDefault stops the textarea acting on its own (empty) content. */
+    const onCopy = (e: ClipboardEvent): void => {
+        e.preventDefault();
+        void copy(props.client);
+    };
+    const onCut = (e: ClipboardEvent): void => {
+        e.preventDefault();
+        void cut(props.client);
+    };
+    const onPaste = (e: ClipboardEvent): void => {
+        e.preventDefault();
+        void paste(props.client);
+    };
+
     return (
         <textarea
             ref={ref}
@@ -118,6 +135,9 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
             onCompositionEnd={onCompositionEnd}
             onBeforeInput={onBeforeInput}
             onKeyDown={onKeyDown}
+            onCopy={onCopy}
+            onCut={onCut}
+            onPaste={onPaste}
         />
     );
 }

@@ -414,6 +414,44 @@ impl DocumentTree {
         paragraphs.insert(idx + 1, right);
         Self { paragraphs }
     }
+
+    /// Extract the text of the logical range `[start, end)`. Paragraphs the
+    /// range spans are joined by `\n`. Used for clipboard copy.
+    pub fn text_range(&self, start: LogicalPos, end: LogicalPos) -> String {
+        let (start, end) = if (start.para, start.offset) <= (end.para, end.offset) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        if self.paragraphs.is_empty() {
+            return String::new();
+        }
+        let last = self.paragraphs.len() - 1;
+        let sp = (start.para as usize).min(last);
+        let ep = (end.para as usize).min(last);
+        let mut out = String::new();
+        for p in sp..=ep {
+            let para = &self.paragraphs[p];
+            let len = para.text.len();
+            let lo = if p == sp {
+                (start.offset as usize).min(len)
+            } else {
+                0
+            };
+            let hi = if p == ep {
+                (end.offset as usize).min(len)
+            } else {
+                len
+            };
+            if p > sp {
+                out.push('\n');
+            }
+            if lo < hi {
+                out.push_str(&para.text[lo..hi]);
+            }
+        }
+        out
+    }
 }
 
 /// Bounded undo/redo snapshot stack. Pushing a new snapshot truncates the
@@ -697,6 +735,33 @@ mod tests {
         assert_eq!(p.next_offset(1), 3);
         assert_eq!(p.prev_offset(4), 3);
         assert_eq!(p.prev_offset(3), 1);
+    }
+
+    #[test]
+    fn text_range_within_and_across() {
+        let d = DocumentTree::from_paragraphs(["hello world".to_string(), "second".to_string()]);
+        assert_eq!(
+            d.text_range(
+                LogicalPos { para: 0, offset: 0 },
+                LogicalPos { para: 0, offset: 5 },
+            ),
+            "hello"
+        );
+        assert_eq!(
+            d.text_range(
+                LogicalPos { para: 0, offset: 6 },
+                LogicalPos { para: 1, offset: 6 },
+            ),
+            "world\nsecond"
+        );
+        /* reversed args normalize to document order */
+        assert_eq!(
+            d.text_range(
+                LogicalPos { para: 0, offset: 5 },
+                LogicalPos { para: 0, offset: 0 },
+            ),
+            "hello"
+        );
     }
 
     #[test]

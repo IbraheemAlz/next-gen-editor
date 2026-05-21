@@ -220,6 +220,15 @@ pub enum Command {
     /// `Event::AccessibilityTreeChanged`. The worker issues this after every
     /// document mutation to keep the screen-reader shadow tree synced (§10).
     RequestAccessibilityTree,
+
+    /// Snapshot the current selection for the clipboard — the engine replies
+    /// with `Event::ClipboardPayload` (PHASE_4_HEADLESS_UI.md §12).
+    GetSelectionAsClipboard,
+
+    /// Paste plain text at the caret, replacing any non-empty selection.
+    PastePlain {
+        text: String,
+    },
 }
 
 /// Browser/runtime capabilities advertised to the engine at `Init`.
