@@ -466,6 +466,38 @@ impl DocumentTree {
         Self { paragraphs }
     }
 
+    /// Insert `text` at `at`, splitting it into separate paragraphs on every
+    /// newline — `\r\n` and bare `\r` are normalized to `\n` first. A `text`
+    /// with no newline behaves exactly like [`DocumentTree::insert_text`].
+    /// Returns the new tree and the caret position at the end of the last
+    /// inserted line (Backlog #12, multi-line paste).
+    pub fn insert_multiline(&self, at: LogicalPos, text: &str) -> (Self, LogicalPos) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let lines: Vec<&str> = normalized.split('\n').collect();
+        let mut doc = self.clone();
+        let mut cur = at;
+        for (i, line) in lines.iter().enumerate() {
+            doc = doc.insert_text(cur, line);
+            let after = LogicalPos {
+                para: cur.para,
+                offset: cur.offset + line.len() as u32,
+            };
+            if i + 1 < lines.len() {
+                /* A newline follows this line — break the paragraph so the
+                next line lands in a fresh one; the remainder of the original
+                paragraph rides along on the tail. */
+                doc = doc.split_paragraph(after);
+                cur = LogicalPos {
+                    para: cur.para + 1,
+                    offset: 0,
+                };
+            } else {
+                cur = after;
+            }
+        }
+        (doc, cur)
+    }
+
     /// Extract the text of the logical range `[start, end)`. Paragraphs the
     /// range spans are joined by `\n`. Used for clipboard copy.
     pub fn text_range(&self, start: LogicalPos, end: LogicalPos) -> String {
@@ -955,5 +987,58 @@ mod tests {
         assert_eq!(d.paragraph_text(0), Some("abcdef"));
         /* the surviving paragraph keeps the first paragraph's alignment */
         assert_eq!(d.paragraphs[0].alignment, Some(Alignment::Center));
+    }
+
+    #[test]
+    fn insert_multiline_single_line_is_plain_insert() {
+        let d = DocumentTree::from_text("abcd");
+        let (d, caret) = d.insert_multiline(LogicalPos { para: 0, offset: 2 }, "XY");
+        assert_eq!(d.paragraph_count(), 1);
+        assert_eq!(d.paragraph_text(0), Some("abXYcd"));
+        assert_eq!(caret, LogicalPos { para: 0, offset: 4 });
+    }
+
+    #[test]
+    fn insert_multiline_splits_into_paragraphs() {
+        let d = DocumentTree::from_text("abcd");
+        let (d, caret) = d.insert_multiline(LogicalPos { para: 0, offset: 2 }, "L0\nL1\nL2");
+        assert_eq!(d.paragraph_count(), 3);
+        /* the original paragraph splits around the caret; the tail rides the
+        last pasted line's paragraph */
+        assert_eq!(d.paragraph_text(0), Some("abL0"));
+        assert_eq!(d.paragraph_text(1), Some("L1"));
+        assert_eq!(d.paragraph_text(2), Some("L2cd"));
+        assert_eq!(caret, LogicalPos { para: 2, offset: 2 });
+    }
+
+    #[test]
+    fn insert_multiline_normalizes_crlf_and_cr() {
+        let d = DocumentTree::from_text("");
+        let (d, _) = d.insert_multiline(LogicalPos { para: 0, offset: 0 }, "a\r\nb\rc");
+        assert_eq!(d.paragraph_count(), 3);
+        assert_eq!(d.paragraph_text(0), Some("a"));
+        assert_eq!(d.paragraph_text(1), Some("b"));
+        assert_eq!(d.paragraph_text(2), Some("c"));
+    }
+
+    #[test]
+    fn insert_multiline_trailing_newline_makes_empty_paragraph() {
+        let d = DocumentTree::from_text("xy");
+        let (d, caret) = d.insert_multiline(LogicalPos { para: 0, offset: 2 }, "Z\n");
+        assert_eq!(d.paragraph_count(), 2);
+        assert_eq!(d.paragraph_text(0), Some("xyZ"));
+        assert_eq!(d.paragraph_text(1), Some(""));
+        assert_eq!(caret, LogicalPos { para: 1, offset: 0 });
+    }
+
+    #[test]
+    fn insert_multiline_into_second_paragraph() {
+        let d = DocumentTree::from_paragraphs(["first".to_string(), "second".to_string()]);
+        let (d, caret) = d.insert_multiline(LogicalPos { para: 1, offset: 3 }, "A\nB");
+        assert_eq!(d.paragraph_count(), 3);
+        assert_eq!(d.paragraph_text(0), Some("first"));
+        assert_eq!(d.paragraph_text(1), Some("secA"));
+        assert_eq!(d.paragraph_text(2), Some("Bond"));
+        assert_eq!(caret, LogicalPos { para: 2, offset: 1 });
     }
 }

@@ -85,6 +85,19 @@ struct LineGeom {
     start_byte: u32,
     end_byte: u32,
     /// Caret slots in visual emission order — searched by nearest x or byte.
+    /// The flat concatenation of every run's slots.
+    slots: Vec<CaretSlot>,
+    /// Per-`VisualRun` geometry, in visual order. Selection rectangles clip
+    /// the selected byte range against each run (Backlog #7).
+    runs: Vec<RunGeom>,
+}
+
+/// One `VisualRun` flattened — its source byte span plus its caret slots. A
+/// run is unidirectional, so a selection clipped to its byte span is visually
+/// contiguous and yields exactly one rectangle.
+struct RunGeom {
+    src_start: u32,
+    src_end: u32,
     slots: Vec<CaretSlot>,
 }
 
@@ -339,16 +352,18 @@ fn build_style_spans(
     spans
 }
 
-/// Flatten one line into [`CaretSlot`]s — one caret position per cluster
-/// boundary. `line_abs_x` is the line's absolute left edge. Mirrors the pen
-/// walk in `render::scene::build_page_scene` so hit-testing inverts exactly
-/// the geometry the renderer drew.
-fn build_line_slots(line: &LineBox, line_abs_x: f32) -> Vec<CaretSlot> {
-    let mut slots: Vec<CaretSlot> = Vec::new();
+/// Flatten one line into per-[`VisualRun`] geometry — each run's source byte
+/// span plus a [`CaretSlot`] per cluster boundary. `line_abs_x` is the line's
+/// absolute left edge. Mirrors the pen walk in
+/// `render::scene::build_page_scene` so hit-testing inverts exactly the
+/// geometry the renderer drew.
+fn build_line_run_geom(line: &LineBox, line_abs_x: f32) -> Vec<RunGeom> {
+    let mut runs: Vec<RunGeom> = Vec::new();
     let mut pen = 0.0_f32;
     for run in &line.runs {
         let run_start_x = line_abs_x + pen;
         let run_advance: f32 = run.glyphs.iter().map(|g| g.x_advance).sum();
+        let mut slots: Vec<CaretSlot> = Vec::new();
         match run.direction {
             ShapingDirection::Ltr => {
                 let mut cum = 0.0_f32;
@@ -381,9 +396,14 @@ fn build_line_slots(line: &LineBox, line_abs_x: f32) -> Vec<CaretSlot> {
                 });
             }
         }
+        runs.push(RunGeom {
+            src_start: run.source_range.start,
+            src_end: run.source_range.end,
+            slots,
+        });
         pen += run_advance;
     }
-    slots
+    runs
 }
 
 /// Vertical distance from `y` to a line's band; `0.0` when inside it.
@@ -420,12 +440,18 @@ fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
     }
 }
 
-/// Absolute x of the caret slot whose byte is nearest `byte`.
-fn slot_x_for_byte(line: &LineGeom, byte: u32) -> f32 {
-    line.slots
+/// Absolute x of the slot whose byte is nearest `byte`, within one slot list.
+fn nearest_slot_x(slots: &[CaretSlot], byte: u32, fallback: f32) -> f32 {
+    slots
         .iter()
         .min_by_key(|s| s.byte.abs_diff(byte))
-        .map_or(line.start_x, |s| s.x)
+        .map_or(fallback, |s| s.x)
+}
+
+/// Absolute x of the caret slot whose byte is nearest `byte`, across the
+/// whole line.
+fn slot_x_for_byte(line: &LineGeom, byte: u32) -> f32 {
+    nearest_slot_x(&line.slots, byte, line.start_x)
 }
 
 /// Caret rectangle for `pos`, `caret_w` device px wide. Falls back to
@@ -451,9 +477,13 @@ fn caret_rect_geom(
     }
 }
 
-/// Per-line bounding selection rectangles for `[start, end]` — the D4.6
-/// pragmatic subset (one rect per line). Discontinuous per-BiDi-run rects
-/// are deferred (see BACKLOG.md).
+/// Per-`VisualRun` selection rectangles for `[start, end]` — the discontinuous
+/// BiDi subset (Backlog #7). The selected byte range is clipped against each
+/// run's byte span; every intersected run yields one tight rect. A run is
+/// unidirectional, so its clipped sub-span is visually contiguous — a
+/// selection crossing an LTR↔RTL seam renders as separate, accurate segments
+/// instead of one rect that over-covers the gap between them. A line with a
+/// single run (no BiDi) still yields exactly one rect, as before.
 fn selection_rects_geom(
     geom: &[LineGeom],
     start: BridgeLogicalPos,
@@ -477,15 +507,24 @@ fn selection_rects_geom(
         if lo >= hi {
             continue;
         }
-        let xa = slot_x_for_byte(line, lo);
-        let xb = slot_x_for_byte(line, hi);
-        let (x0, x1) = if xa <= xb { (xa, xb) } else { (xb, xa) };
-        rects.push(BridgeRect {
-            x: x0,
-            y: line.y_top,
-            w: x1 - x0,
-            h: line.height,
-        });
+        for run in &line.runs {
+            /* Clip the selected byte range to this run's source span. Runs
+            partition the line's bytes, so the clips are disjoint. */
+            let clip_lo = lo.max(run.src_start);
+            let clip_hi = hi.min(run.src_end);
+            if clip_lo >= clip_hi {
+                continue;
+            }
+            let xa = nearest_slot_x(&run.slots, clip_lo, line.start_x);
+            let xb = nearest_slot_x(&run.slots, clip_hi, line.start_x);
+            let (x0, x1) = if xa <= xb { (xa, xb) } else { (xb, xa) };
+            rects.push(BridgeRect {
+                x: x0,
+                y: line.y_top,
+                w: x1 - x0,
+                h: line.height,
+            });
+        }
     }
     rects
 }
@@ -1150,6 +1189,9 @@ impl Engine {
                     .map(|r| r.source_range.end)
                     .max()
                     .unwrap_or(0);
+                let runs = build_line_run_geom(line, line_x);
+                let slots: Vec<CaretSlot> =
+                    runs.iter().flat_map(|r| r.slots.iter().copied()).collect();
                 geom.push(LineGeom {
                     para: doc_idx,
                     start_x: line_x,
@@ -1157,7 +1199,8 @@ impl Engine {
                     height: line.height,
                     start_byte,
                     end_byte,
-                    slots: build_line_slots(line, line_x),
+                    slots,
+                    runs,
                 });
             }
         }
@@ -1636,12 +1679,40 @@ impl Engine {
     }
 
     /// `Command::PastePlain` — insert clipboard text at the caret, replacing
-    /// any non-empty selection.
+    /// any non-empty selection. Newlines split the text into separate
+    /// paragraphs (Backlog #12); a newline-free paste keeps the single-line
+    /// caret-relative path (so it still picks up any pending sticky style).
     fn do_paste_plain(&mut self, text: String) -> Event {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         let at = self
             .selection
             .map_or(BridgeLogicalPos { para: 0, offset: 0 }, |s| s.caret);
-        self.do_insert_text_interactive(at, text)
+        if !normalized.contains('\n') {
+            return self.do_insert_text_interactive(at, normalized);
+        }
+        /* Multi-line: replace any non-empty selection, then insert the text
+        with a paragraph break at every newline. The caret lands at the end
+        of the final pasted line. */
+        let sel = self.selection.unwrap_or(SelectionState {
+            anchor: at,
+            caret: at,
+        });
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        let base = if start == end {
+            self.undo.current().clone()
+        } else {
+            self.undo
+                .current()
+                .delete_range(to_engine_pos(start), to_engine_pos(end))
+        };
+        let (new_doc, caret) = base.insert_multiline(to_engine_pos(start), &normalized);
+        self.commit_edit(
+            new_doc,
+            BridgeLogicalPos {
+                para: caret.para,
+                offset: caret.offset,
+            },
+        )
     }
 
     /// `Command::SetParagraphAlign` (Backlog #9) — set the alignment of every
@@ -1703,5 +1774,98 @@ mod tests {
             .expect("dispatch should succeed");
         let evt: Event = serde_wasm_bindgen::from_value(evt_js).expect("decode event");
         assert!(matches!(evt, Event::Pong), "expected Pong, got {evt:?}");
+    }
+
+    /// Backlog #7 — a line with one LTR run and one RTL run; a selection
+    /// crossing the seam must yield two disjoint rects, not one box that
+    /// over-covers the gap.
+    #[test]
+    fn selection_rects_split_at_bidi_seam() {
+        let ltr = RunGeom {
+            src_start: 0,
+            src_end: 4,
+            slots: vec![
+                CaretSlot { x: 0.0, byte: 0 },
+                CaretSlot { x: 10.0, byte: 1 },
+                CaretSlot { x: 20.0, byte: 2 },
+                CaretSlot { x: 30.0, byte: 3 },
+                CaretSlot { x: 40.0, byte: 4 },
+            ],
+        };
+        /* RTL run: byte order is the reverse of x order. */
+        let rtl = RunGeom {
+            src_start: 4,
+            src_end: 8,
+            slots: vec![
+                CaretSlot { x: 90.0, byte: 4 },
+                CaretSlot { x: 80.0, byte: 5 },
+                CaretSlot { x: 70.0, byte: 6 },
+                CaretSlot { x: 60.0, byte: 7 },
+                CaretSlot { x: 50.0, byte: 8 },
+            ],
+        };
+        let line = LineGeom {
+            para: 0,
+            start_x: 0.0,
+            y_top: 5.0,
+            height: 20.0,
+            start_byte: 0,
+            end_byte: 8,
+            slots: Vec::new(),
+            runs: vec![ltr, rtl],
+        };
+        let rects = selection_rects_geom(
+            &[line],
+            BridgeLogicalPos { para: 0, offset: 2 },
+            BridgeLogicalPos { para: 0, offset: 6 },
+        );
+        assert_eq!(rects.len(), 2, "one rect per intersected run");
+        let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
+        /* LTR clip [2,4): x 20..40. */
+        assert!(approx(rects[0].x, 20.0), "rect0.x = {}", rects[0].x);
+        assert!(approx(rects[0].w, 20.0), "rect0.w = {}", rects[0].w);
+        /* RTL clip [4,6): bytes 4@90 and 6@70 → x 70..90. */
+        assert!(approx(rects[1].x, 70.0), "rect1.x = {}", rects[1].x);
+        assert!(approx(rects[1].w, 20.0), "rect1.w = {}", rects[1].w);
+        /* The whole point: the two segments do not overlap. */
+        assert!(rects[0].x + rects[0].w <= rects[1].x);
+    }
+
+    /// A non-BiDi line (one run) still yields exactly one rect — the
+    /// single-run path matches the old per-line behaviour.
+    #[test]
+    fn selection_rects_single_run_one_rect() {
+        let run = RunGeom {
+            src_start: 0,
+            src_end: 4,
+            slots: vec![
+                CaretSlot { x: 0.0, byte: 0 },
+                CaretSlot { x: 10.0, byte: 1 },
+                CaretSlot { x: 20.0, byte: 2 },
+                CaretSlot { x: 30.0, byte: 3 },
+                CaretSlot { x: 40.0, byte: 4 },
+            ],
+        };
+        let line = LineGeom {
+            para: 0,
+            start_x: 0.0,
+            y_top: 5.0,
+            height: 20.0,
+            start_byte: 0,
+            end_byte: 4,
+            slots: Vec::new(),
+            runs: vec![run],
+        };
+        let rects = selection_rects_geom(
+            &[line],
+            BridgeLogicalPos { para: 0, offset: 1 },
+            BridgeLogicalPos { para: 0, offset: 3 },
+        );
+        assert_eq!(rects.len(), 1);
+        let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
+        assert!(approx(rects[0].x, 10.0));
+        assert!(approx(rects[0].w, 20.0));
+        assert!(approx(rects[0].y, 5.0));
+        assert!(approx(rects[0].h, 20.0));
     }
 }
