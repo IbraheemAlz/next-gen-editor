@@ -767,6 +767,10 @@ impl Engine {
         let patch = SpanStyle {
             font_size: attrs.font_size,
             color: attrs.color.map(|c| [c.r, c.g, c.b, c.a]),
+            bold: attrs.bold,
+            italic: attrs.italic,
+            /* Underline is a stored on/off flag in the model. */
+            underline: attrs.underline.map(|u| !matches!(u, UnderlineStyle::None)),
         };
         let new_doc = self.undo.current().apply_style(
             to_engine_pos(range.start),
@@ -778,10 +782,17 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
-        let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
-        Event::FormattingChanged {
-            range,
-            attrs: resolved_attrs(&attrs, default_size),
+        /* Interactive (a selection is set) → SelectionChanged so the toolbar
+        sees the new attrs; the visual-diff harness has no selection and
+        keeps the Phase-1 FormattingChanged reply. */
+        if self.selection.is_some() {
+            self.selection_changed()
+        } else {
+            let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
+            Event::FormattingChanged {
+                range,
+                attrs: resolved_attrs(&attrs, default_size),
+            }
         }
     }
 
@@ -1112,12 +1123,35 @@ impl Engine {
             caret: caret_rect_geom(&geom, sel.caret, fallback),
             direction,
             rects,
-            attrs_at_caret: self.attrs_at(sel.caret),
+            attrs_at_caret: self.attrs_at(self.attrs_probe(start, end)),
+            can_undo: self.undo.can_undo(),
+            can_redo: self.undo.can_redo(),
         }
     }
 
-    /// Resolved text attributes at `pos`. Phase 3 spans carry size + colour;
-    /// the remaining fields default until the typography PR.
+    /// The offset whose style the toolbar should reflect: the selection start
+    /// for a range, or the char before a collapsed caret (the style typing
+    /// there would extend). `style_at(caret)` alone reads the char *after* the
+    /// caret, which is unstyled right after formatting a selection.
+    fn attrs_probe(&self, start: BridgeLogicalPos, end: BridgeLogicalPos) -> BridgeLogicalPos {
+        if start != end || start.offset == 0 {
+            return start;
+        }
+        let prev = self
+            .undo
+            .current()
+            .paragraphs
+            .get(start.para as usize)
+            .map_or(start.offset, |p| p.prev_offset(start.offset));
+        BridgeLogicalPos {
+            para: start.para,
+            offset: prev,
+        }
+    }
+
+    /// Resolved text attributes at `pos`. Spans carry size + colour + the
+    /// bold/italic/underline flags; `strike`, `bg_color`, `script` and
+    /// `language` default until those land.
     fn attrs_at(&self, pos: BridgeLogicalPos) -> TextAttrs {
         let style = self
             .undo
@@ -1127,10 +1161,15 @@ impl Engine {
             .map_or(SpanStyle::default(), |p| p.style_at(pos.offset));
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let [r, g, b, a] = style.color.unwrap_or([0, 0, 0, 255]);
+        let underline = if style.underline.unwrap_or(false) {
+            UnderlineStyle::Single
+        } else {
+            UnderlineStyle::None
+        };
         TextAttrs {
-            bold: false,
-            italic: false,
-            underline: UnderlineStyle::None,
+            bold: style.bold.unwrap_or(false),
+            italic: style.italic.unwrap_or(false),
+            underline,
             strike: false,
             font_family: self
                 .layout_cfg

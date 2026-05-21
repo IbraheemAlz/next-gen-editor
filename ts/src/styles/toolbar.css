@@ -1,0 +1,80 @@
+/* Phase 4 §11 — formatting toolbar. */
+
+.toolbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 10px;
+    background: #f0f0f0;
+    border-bottom: 1px solid #c4c4c4;
+    font: 13px / 1 system-ui, sans-serif;
+    user-select: none;
+}
+
+.tb-btn {
+    min-width: 30px;
+    height: 28px;
+    padding: 0 6px;
+    border: 1px solid #c4c4c4;
+    border-radius: 3px;
+    background: #fff;
+    color: #222;
+    font: inherit;
+    cursor: pointer;
+}
+
+.tb-btn:hover:not(:disabled) {
+    background: #eaeaea;
+}
+
+.tb-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.tb-btn.active {
+    background: #d3e6ff;
+    border-color: #4a90d9;
+}
+
+.tb-b {
+    font-weight: 700;
+}
+
+.tb-i {
+    font-style: italic;
+}
+
+.tb-u {
+    text-decoration: underline;
+}
+
+.tb-sep {
+    width: 1px;
+    height: 18px;
+    background: #c4c4c4;
+    margin: 0 3px;
+}
+
+.tb-field {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: #444;
+}
+
+.tb-field select,
+.tb-field input[type='color'] {
+    height: 28px;
+    border: 1px solid #c4c4c4;
+    border-radius: 3px;
+    background: #fff;
+    font: inherit;
+}
+
+.tb-field input[type='color'] {
+    width: 36px;
+    padding: 2px;
+    cursor: pointer;
+}

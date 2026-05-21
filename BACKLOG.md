@@ -134,3 +134,22 @@ re-rendered on every `UpdateComposition`. Needs a transient composition layer
 threaded through layout + render so the engine can paint text that is not in
 the document model, plus `target_range` underline styling. Until then a
 composition is visible only in the OS popup, not in the page itself.
+
+## 9. Toolbar — paragraph alignment + font family
+
+**Shipped (D4.7):** the formatting toolbar — Undo, Redo, Bold, Italic,
+Underline, font size, text colour. Bold/italic/underline are stored on
+`SpanStyle` and round-trip (the buttons reflect them), though layout/render
+still ignore them (item 1 above). Size + colour render immediately.
+
+**Deferred:** §11's `AlignmentPicker` and `FontFamilyPicker`.
+
+- **Paragraph alignment.** There is no `SET_PARAGRAPH_ALIGN` command and no
+  per-paragraph alignment in the document model — `engine::Paragraph` has no
+  alignment field, and `layout_paragraph` takes one global `Alignment` from
+  the render config. Needs an alignment field on `Paragraph`, a command to set
+  it over a range, and `build_page` passing each paragraph's own value.
+- **Per-span font family.** `SpanStyle` has no `font_family`, and `FontStack`
+  resolves a face by script, not by a requested family. Needs a family field
+  on `SpanStyle`, multiple loaded families, and family-aware `FontStack`
+  resolution. Related to item 1 (bold/italic face resolution).

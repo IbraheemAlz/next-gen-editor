@@ -1,14 +1,19 @@
 /* Phase 4 §5 — editor shell + canvas styling. */
 
+/* Column shell — toolbar on top, editor viewport fills the rest. */
 .editor-shell {
     height: 100%;
+    display: flex;
+    flex-direction: column;
 }
 
 /* Positioned container — the caret + selection overlays absolutely position
-   themselves against this box, which the canvas exactly fills. */
+   themselves against this box, which the canvas exactly fills. `min-height: 0`
+   lets it shrink inside the flex column instead of overflowing. */
 .editor-viewport {
     position: relative;
-    height: 100%;
+    flex: 1 1 0;
+    min-height: 0;
 }
 
 /* The engine canvas. Fills the viewport; the backing store is sized to

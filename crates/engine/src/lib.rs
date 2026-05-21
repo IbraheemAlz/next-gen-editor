@@ -10,12 +10,17 @@ pub struct DocumentTree {
     pub paragraphs: Vector<Paragraph>,
 }
 
-/// Inline style for a run of characters. Phase 3 rich-text scope is font size
-/// and colour; bold / italic / underline land in a later typography PR.
+/// Inline style for a run of characters. Phase 3 carried font size + colour;
+/// Phase 4 §11 adds bold / italic / underline as stored flags — the toolbar
+/// reflects them, but layout/render still ignore them until bold/italic faces
+/// and underline decoration land (see BACKLOG.md).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SpanStyle {
     pub font_size: Option<f32>,
     pub color: Option<[u8; 4]>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<bool>,
 }
 
 impl SpanStyle {
@@ -24,6 +29,9 @@ impl SpanStyle {
         SpanStyle {
             font_size: patch.font_size.or(self.font_size),
             color: patch.color.or(self.color),
+            bold: patch.bold.or(self.bold),
+            italic: patch.italic.or(self.italic),
+            underline: patch.underline.or(self.underline),
         }
     }
 }
@@ -509,6 +517,7 @@ mod tests {
             SpanStyle {
                 font_size: Some(20.0),
                 color: None,
+                ..Default::default()
             },
         );
         let spans = &doc.paragraphs[0].spans;
@@ -520,7 +529,8 @@ mod tests {
                 end: 5,
                 style: SpanStyle {
                     font_size: Some(20.0),
-                    color: None
+                    color: None,
+                    ..Default::default()
                 },
             }
         );
@@ -532,10 +542,12 @@ mod tests {
         let red = SpanStyle {
             font_size: None,
             color: Some([255, 0, 0, 255]),
+            ..Default::default()
         };
         let big = SpanStyle {
             font_size: Some(30.0),
             color: None,
+            ..Default::default()
         };
         let doc = doc.apply_style(
             LogicalPos { para: 0, offset: 0 },
@@ -561,6 +573,7 @@ mod tests {
             SpanStyle {
                 font_size: Some(30.0),
                 color: Some([255, 0, 0, 255]),
+                ..Default::default()
             }
         );
         assert_eq!((spans[2].start, spans[2].end), (8, 11));
@@ -576,6 +589,7 @@ mod tests {
             SpanStyle {
                 font_size: None,
                 color: Some([1, 2, 3, 255]),
+                ..Default::default()
             },
         );
         let doc = doc.insert_text(LogicalPos { para: 0, offset: 0 }, "XX");
@@ -650,6 +664,7 @@ mod tests {
             SpanStyle {
                 font_size: Some(20.0),
                 color: None,
+                ..Default::default()
             },
         );
         let doc = doc.delete_range(

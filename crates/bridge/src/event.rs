@@ -106,6 +106,10 @@ pub enum Event {
         direction: Direction,
         rects: Vec<Rect>,
         attrs_at_caret: TextAttrs,
+        /// Undo/redo availability — every interactive edit emits this event,
+        /// so the toolbar stays reactive without polling (Phase 4 §11).
+        can_undo: bool,
+        can_redo: bool,
     },
 
     /* IME */

@@ -9,12 +9,14 @@ import { EditorCanvas } from './components/EditorCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
 import { SelectionOverlay } from './components/SelectionOverlay';
 import { HiddenInput } from './components/HiddenInput';
+import { Toolbar } from './components/Toolbar';
 import { EngineClient } from './engine/engine-client';
 import { createEngineStore } from './state/engine-store';
 import type { Command, Event } from './engine/types';
 import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
 import './styles/editor.css';
 import './styles/caret.css';
+import './styles/toolbar.css';
 
 /* Amiri is a dual-script Naskh face — renders mixed Arabic/English from a
    single face without engine-side font fallback. */
@@ -119,6 +121,7 @@ export function App() {
 
     return (
         <div class="editor-shell">
+            <Toolbar client={client} store={store} />
             <div class="editor-viewport">
                 <For each={[canvasGen()]}>
                     {(generation) => (

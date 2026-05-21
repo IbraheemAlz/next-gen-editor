@@ -15,6 +15,12 @@ export interface SelectionView {
     rects: Rect[];
 }
 
+/** Undo/redo availability — drives the toolbar's Undo/Redo buttons. */
+export interface UndoState {
+    canUndo: boolean;
+    canRedo: boolean;
+}
+
 const EMPTY_RANGE: LogicalRange = {
     start: { para: 0, offset: 0 },
     end: { para: 0, offset: 0 },
@@ -37,6 +43,10 @@ export function createEngineStore(client: EngineClient) {
         rects: [],
     });
     const [attrsAtCaret, setAttrsAtCaret] = createSignal<TextAttrs | null>(null);
+    const [undoState, setUndoState] = createSignal<UndoState>({
+        canUndo: false,
+        canRedo: false,
+    });
 
     client.subscribe((ev: Event) => {
         if (ev.type !== 'SELECTION_CHANGED') return;
@@ -48,9 +58,10 @@ export function createEngineStore(client: EngineClient) {
             rects: ev.rects.map((r) => toCssRect(r, dpr)),
         });
         setAttrsAtCaret(ev.attrs_at_caret);
+        setUndoState({ canUndo: ev.can_undo, canRedo: ev.can_redo });
     });
 
-    return { caret, caretLogical, selection, attrsAtCaret };
+    return { caret, caretLogical, selection, attrsAtCaret, undoState };
 }
 
 export type EngineStore = ReturnType<typeof createEngineStore>;
