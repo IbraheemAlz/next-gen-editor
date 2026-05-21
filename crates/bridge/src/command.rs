@@ -57,6 +57,9 @@ pub enum Command {
         px_size: f32,
         line_height: f32,
         align: String,
+        /// Device-pixel ratio. The engine lays out + paints the page scaled by
+        /// this so HiDPI canvases stay crisp; `None` ⇒ 1.0 (the golden suite).
+        device_pixel_ratio: Option<f32>,
     },
 
     /// Insert `text` into the in-engine document. `at == None` appends.

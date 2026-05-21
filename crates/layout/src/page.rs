@@ -43,4 +43,20 @@ impl A4Page {
     pub fn content_height(&self) -> f32 {
         self.height - self.margin.top - self.margin.bottom
     }
+
+    /// This page with every dimension multiplied by `s`. Used to lay out and
+    /// paint at device-pixel scale on HiDPI canvases while the logical model
+    /// stays at 1 pt/unit.
+    pub fn scaled(self, s: f32) -> Self {
+        Self {
+            width: self.width * s,
+            height: self.height * s,
+            margin: Margins {
+                top: self.margin.top * s,
+                right: self.margin.right * s,
+                bottom: self.margin.bottom * s,
+                left: self.margin.left * s,
+            },
+        }
+    }
 }

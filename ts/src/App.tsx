@@ -41,6 +41,9 @@ async function setupEngine(client: EngineClient): Promise<void> {
         px_size: 24,
         line_height: 36,
         align: 'START',
+        /* HiDPI: the engine lays out + paints scaled by this so the page
+           fills the device-pixel canvas backing store crisply. */
+        device_pixel_ratio: window.devicePixelRatio,
     });
     /* Seed a collapsed caret at the document start so the hidden input has a
        position to insert at before the first pointer click. */

@@ -40,6 +40,9 @@ struct RenderConfig {
     px_size: f32,
     line_height: f32,
     alignment: Alignment,
+    /// Device-pixel ratio. Layout + paint are scaled by this; `px_size` and
+    /// `line_height` stay logical (the toolbar + document model use them raw).
+    scale: f32,
 }
 
 /// Width of the rendered caret, in canvas device pixels.
@@ -204,10 +207,10 @@ fn wasm_heap_bytes() -> u32 {
     }
 }
 
-/// The full A4 page rectangle — the dirty region an edit invalidates, since an
-/// edit can reflow the whole page.
-fn full_page_rect() -> Rect {
-    let page = A4Page::a4();
+/// The full A4 page rectangle (scaled by `scale`) — the dirty region an edit
+/// invalidates, since an edit can reflow the whole page.
+fn full_page_rect(scale: f32) -> Rect {
+    let page = A4Page::a4().scaled(scale);
     Rect::new(0.0, 0.0, f64::from(page.width), f64::from(page.height))
 }
 
@@ -255,11 +258,13 @@ fn resolved_attrs(patch: &TextAttrsPatch, default_size: f32) -> TextAttrs {
 
 /// Expand a paragraph's sparse style runs into a gap-free list of resolved
 /// [`StyleSpan`]s covering `[0, text.len())`, filling unstyled gaps with the
-/// document defaults.
+/// document defaults. Every `px_size` is multiplied by `scale` so glyphs
+/// rasterize at device resolution (`default_size` arrives logical).
 fn build_style_spans(
     para: &engine::Paragraph,
     default_size: f32,
     default_color: [u8; 4],
+    scale: f32,
 ) -> Vec<StyleSpan> {
     let len = para.text.len() as u32;
     let mut spans: Vec<StyleSpan> = Vec::new();
@@ -269,14 +274,14 @@ fn build_style_spans(
             spans.push(StyleSpan {
                 start: cursor,
                 end: run.start,
-                px_size: default_size,
+                px_size: default_size * scale,
                 color: default_color,
             });
         }
         spans.push(StyleSpan {
             start: run.start,
             end: run.end,
-            px_size: run.style.font_size.unwrap_or(default_size),
+            px_size: run.style.font_size.unwrap_or(default_size) * scale,
             color: run.style.color.unwrap_or(default_color),
         });
         cursor = run.end;
@@ -285,7 +290,7 @@ fn build_style_spans(
         spans.push(StyleSpan {
             start: cursor,
             end: len,
-            px_size: default_size,
+            px_size: default_size * scale,
             color: default_color,
         });
     }
@@ -381,9 +386,14 @@ fn slot_x_for_byte(line: &LineGeom, byte: u32) -> f32 {
         .map_or(line.start_x, |s| s.x)
 }
 
-/// Caret rectangle for `pos`. Falls back to `fallback` when the document has
-/// no geometry yet (empty document).
-fn caret_rect_geom(geom: &[LineGeom], pos: BridgeLogicalPos, fallback: BridgeRect) -> BridgeRect {
+/// Caret rectangle for `pos`, `caret_w` device px wide. Falls back to
+/// `fallback` when the document has no geometry yet (empty document).
+fn caret_rect_geom(
+    geom: &[LineGeom],
+    pos: BridgeLogicalPos,
+    fallback: BridgeRect,
+    caret_w: f32,
+) -> BridgeRect {
     let line = geom
         .iter()
         .find(|l| l.para == pos.para && pos.offset >= l.start_byte && pos.offset <= l.end_byte)
@@ -392,7 +402,7 @@ fn caret_rect_geom(geom: &[LineGeom], pos: BridgeLogicalPos, fallback: BridgeRec
         Some(line) => BridgeRect {
             x: slot_x_for_byte(line, pos.offset),
             y: line.y_top,
-            w: CARET_WIDTH,
+            w: caret_w,
             h: line.height,
         },
         None => fallback,
@@ -539,7 +549,26 @@ impl Engine {
                 px_size,
                 line_height,
                 align,
-            } => self.render_page(text, font_id, base_direction, px_size, line_height, align),
+                device_pixel_ratio,
+            } => {
+                let cfg = RenderConfig {
+                    font_id,
+                    base_direction: match base_direction.to_ascii_uppercase().as_str() {
+                        "RTL" => ShapingDirection::Rtl,
+                        _ => ShapingDirection::Ltr,
+                    },
+                    px_size,
+                    line_height,
+                    alignment: match align.to_ascii_uppercase().as_str() {
+                        "JUSTIFY" => Alignment::Justify,
+                        "END" => Alignment::End,
+                        "CENTER" => Alignment::Center,
+                        _ => Alignment::Start,
+                    },
+                    scale: device_pixel_ratio.unwrap_or(1.0).max(1.0),
+                };
+                self.render_page(text, cfg)
+            }
 
             Command::InsertText { at, text } => match at {
                 /* A set `at` is the interactive caret path — selection-aware,
@@ -561,7 +590,7 @@ impl Engine {
                         anchor: BridgeLogicalPos { para: 0, offset: 0 },
                         caret: BridgeLogicalPos { para: 0, offset: 0 },
                     });
-                    self.dirty.invalidate(full_page_rect());
+                    self.dirty.invalidate(full_page_rect(self.scale()));
                     self.maybe_repaint();
                     Event::DocumentLoaded { paragraph_count }
                 }
@@ -750,37 +779,12 @@ impl Engine {
         }
     }
 
-    fn render_page(
-        &mut self,
-        text: String,
-        font_id: String,
-        base_direction: String,
-        px_size: f32,
-        line_height: f32,
-        align: String,
-    ) -> Event {
-        let dir = match base_direction.to_ascii_uppercase().as_str() {
-            "RTL" => ShapingDirection::Rtl,
-            _ => ShapingDirection::Ltr,
-        };
-        let alignment = match align.to_ascii_uppercase().as_str() {
-            "JUSTIFY" => Alignment::Justify,
-            "END" => Alignment::End,
-            "CENTER" => Alignment::Center,
-            _ => Alignment::Start,
-        };
-
-        /* Reset the document + undo stack to a single paragraph of `text`,
-        then cache the layout config so subsequent InsertText/Undo/Redo
-        commands can repaint without re-specifying params. */
+    /// Reset the document + undo stack to a single paragraph of `text`, cache
+    /// `cfg` so subsequent InsertText/Undo/Redo commands repaint without
+    /// re-specifying params, then paint the first frame.
+    fn render_page(&mut self, text: String, cfg: RenderConfig) -> Event {
         self.undo = UndoStack::new(DocumentTree::from_text(&text), 100);
-        self.layout_cfg = Some(RenderConfig {
-            font_id,
-            base_direction: dir,
-            px_size,
-            line_height,
-            alignment,
-        });
+        self.layout_cfg = Some(cfg);
 
         let stats = match self.render_document(None) {
             Ok(s) => s,
@@ -800,7 +804,7 @@ impl Engine {
             .unwrap_or_else(|| self.undo.current().end_of_document());
         let new_doc = self.undo.current().insert_text(pos, &text);
         self.undo.push(new_doc);
-        self.dirty.invalidate(full_page_rect());
+        self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
@@ -827,7 +831,7 @@ impl Engine {
             patch,
         );
         self.undo.push(new_doc);
-        self.dirty.invalidate(full_page_rect());
+        self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
@@ -847,7 +851,7 @@ impl Engine {
 
     fn do_undo(&mut self) -> Event {
         self.undo.undo();
-        self.dirty.invalidate(full_page_rect());
+        self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
@@ -856,7 +860,7 @@ impl Engine {
 
     fn do_redo(&mut self) -> Event {
         self.undo.redo();
-        self.dirty.invalidate(full_page_rect());
+        self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
@@ -891,9 +895,17 @@ impl Engine {
         self.render_document(None).map(|_| ())
     }
 
+    /// The device-pixel ratio the page is currently laid out + painted at.
+    /// `1.0` until a `RenderPage` caches a config.
+    fn scale(&self) -> f32 {
+        self.layout_cfg.as_ref().map_or(1.0, |c| c.scale)
+    }
+
     /// Lay out the current document into a `PageBox` plus the `FontStack` used
-    /// to shape it. Shared by the Canvas2D repaint and PDF export.
-    fn build_page(&self) -> Result<(PageBox, FontStack, Vec<u32>), Box<Event>> {
+    /// to shape it. Shared by the Canvas2D repaint and PDF export. Every
+    /// dimension is multiplied by `scale` — `dpr` for the HiDPI canvas, `1.0`
+    /// for PDF (PDF user space is logical points).
+    fn build_page(&self, scale: f32) -> Result<(PageBox, FontStack, Vec<u32>), Box<Event>> {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
@@ -907,7 +919,7 @@ impl Engine {
                 message: format!("font `{}` not loaded", cfg.font_id),
             }));
         }
-        let page = A4Page::a4();
+        let page = A4Page::a4().scaled(scale);
 
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
@@ -921,17 +933,17 @@ impl Engine {
         let doc = self.undo.current().clone();
         for (doc_idx, para) in doc.paragraphs.iter().enumerate() {
             if para.text.is_empty() {
-                para_y_offset += cfg.line_height;
+                para_y_offset += cfg.line_height * scale;
                 continue;
             }
-            let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255]);
+            let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
             let para_cfg = ParagraphConfig {
                 text: &para.text,
                 fonts: &font_stack,
                 spans: &spans,
                 base_direction: cfg.base_direction,
                 max_width: page.content_width(),
-                line_height: cfg.line_height,
+                line_height: cfg.line_height * scale,
                 alignment: cfg.alignment,
             };
             let mut para_box = layout_paragraph(para_cfg);
@@ -956,7 +968,7 @@ impl Engine {
     }
 
     fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
-        let (page_box, _font_stack, _box_doc_index) = self.build_page()?;
+        let (page_box, _font_stack, _box_doc_index) = self.build_page(self.scale())?;
 
         let line_count: u32 = page_box
             .paragraphs
@@ -1008,9 +1020,10 @@ impl Engine {
         })
     }
 
-    /// Export the current document to a single-page PDF (D3.7).
+    /// Export the current document to a single-page PDF (D3.7). Always laid
+    /// out at scale `1.0` — PDF user space is logical points, never device px.
     fn do_export_pdf(&self) -> Event {
-        let (page_box, font_stack, _box_doc_index) = match self.build_page() {
+        let (page_box, font_stack, _box_doc_index) = match self.build_page(1.0) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -1046,7 +1059,7 @@ impl Engine {
     /// out the document — cheap for the single-page PoC; cache when editing
     /// lands.
     fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
-        let (page, _fonts, box_doc_index) = self.build_page()?;
+        let (page, _fonts, box_doc_index) = self.build_page(self.scale())?;
         let content_x = page.margins.left;
         let content_y = page.margins.top;
         let mut geom: Vec<LineGeom> = Vec::new();
@@ -1151,12 +1164,13 @@ impl Engine {
             Err(e) => return *e,
         };
         let (start, end) = ordered(sel.anchor, sel.caret);
-        let page = A4Page::a4();
+        let scale = self.scale();
+        let page = A4Page::a4().scaled(scale);
         let fallback = BridgeRect {
             x: page.margin.left,
             y: page.margin.top,
-            w: CARET_WIDTH,
-            h: self.layout_cfg.as_ref().map_or(16.0, |c| c.line_height),
+            w: CARET_WIDTH * scale,
+            h: self.layout_cfg.as_ref().map_or(16.0, |c| c.line_height) * scale,
         };
         let rects = if start == end {
             Vec::new()
@@ -1169,7 +1183,7 @@ impl Engine {
         };
         Event::SelectionChanged {
             range: BridgeLogicalRange { start, end },
-            caret: caret_rect_geom(&geom, sel.caret, fallback),
+            caret: caret_rect_geom(&geom, sel.caret, fallback, CARET_WIDTH * scale),
             direction,
             rects,
             attrs_at_caret: self.attrs_at(self.attrs_probe(start, end)),
@@ -1241,7 +1255,7 @@ impl Engine {
             anchor: caret,
             caret,
         });
-        self.dirty.invalidate(full_page_rect());
+        self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
