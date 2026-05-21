@@ -257,21 +257,37 @@ fn measure_text(
     total
 }
 
-/// Horizontal offset of a line within its paragraph's content width. Mirrors
-/// the Phase 1 inline rule: centre when centred, right-align a short RTL line,
-/// otherwise flush-left.
+/// Horizontal offset of a line within its paragraph's content width.
+/// `Center` centres the line; `End` flushes it to the writing-direction
+/// trailing edge; `Start` / `Justify` flush to the leading edge — which is the
+/// right edge for an RTL base, so a short RTL line still hugs the margin.
 fn alignment_origin_x(
     line_width: f32,
     content_width: f32,
     alignment: Alignment,
     base: ShapingDirection,
 ) -> f32 {
-    if alignment == Alignment::Center {
-        (content_width - line_width) / 2.0
-    } else if matches!(base, ShapingDirection::Rtl) && line_width < content_width - 0.5 {
-        content_width - line_width
-    } else {
-        0.0
+    let rtl = matches!(base, ShapingDirection::Rtl);
+    match alignment {
+        Alignment::Center => (content_width - line_width) / 2.0,
+        /* `End` — the trailing edge: visual-right for an LTR base, visual-left
+        (offset 0) for RTL. */
+        Alignment::End => {
+            if rtl {
+                0.0
+            } else {
+                content_width - line_width
+            }
+        }
+        /* `Start` leads; `Justify` already stretched the line to the full
+        width, so its leftover offset follows the same leading-edge rule. */
+        Alignment::Start | Alignment::Justify => {
+            if rtl && line_width < content_width - 0.5 {
+                content_width - line_width
+            } else {
+                0.0
+            }
+        }
     }
 }
 

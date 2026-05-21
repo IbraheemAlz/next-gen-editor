@@ -7,7 +7,16 @@
  * high-DPI displays. */
 import { createSignal } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
-import type { A11yTree, Event, LogicalPos, LogicalRange, Rect, TextAttrs } from '../engine/types';
+import type {
+    A11yTree,
+    Alignment,
+    Direction,
+    Event,
+    LogicalPos,
+    LogicalRange,
+    Rect,
+    TextAttrs,
+} from '../engine/types';
 
 /** The current selection: its logical range plus rendered rectangles. */
 export interface SelectionView {
@@ -47,6 +56,10 @@ export function createEngineStore(client: EngineClient) {
         canUndo: false,
         canRedo: false,
     });
+    /* Effective alignment of the caret's paragraph + the document base
+       direction — together they drive the toolbar's alignment picker. */
+    const [paragraphAlignment, setParagraphAlignment] = createSignal<Alignment>('Start');
+    const [baseDirection, setBaseDirection] = createSignal<Direction>('Ltr');
     const [a11yTree, setA11yTree] = createSignal<A11yTree | null>(null);
     const [announcement, setAnnouncement] = createSignal('');
     let announced = false;
@@ -62,6 +75,8 @@ export function createEngineStore(client: EngineClient) {
             });
             setAttrsAtCaret(ev.attrs_at_caret);
             setUndoState({ canUndo: ev.can_undo, canRedo: ev.can_redo });
+            setParagraphAlignment(ev.paragraph_alignment);
+            setBaseDirection(ev.direction);
         } else if (ev.type === 'ACCESSIBILITY_TREE_CHANGED') {
             setA11yTree(ev.tree);
             if (!announced) {
@@ -78,6 +93,8 @@ export function createEngineStore(client: EngineClient) {
         selection,
         attrsAtCaret,
         undoState,
+        paragraphAlignment,
+        baseDirection,
         a11yTree,
         announcement,
     };

@@ -8,6 +8,7 @@ export type {
     A11yParagraph,
     A11yRun,
     A11yTree,
+    Alignment,
     ClientCapabilities,
     Color,
     Command,

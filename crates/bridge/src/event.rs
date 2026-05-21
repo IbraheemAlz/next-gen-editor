@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
-use crate::common::{Direction, DocFormat, LogicalPos, LogicalRange, Rect, Script, TextAttrs};
+use crate::common::{
+    Alignment, Direction, DocFormat, LogicalPos, LogicalRange, Rect, Script, TextAttrs,
+};
 
 /// An event emitted by the engine. Serialized internally-tagged
 /// (`{ "type": "PAINTED", ... }`).
@@ -106,6 +108,11 @@ pub enum Event {
         direction: Direction,
         rects: Vec<Rect>,
         attrs_at_caret: TextAttrs,
+        /// Effective alignment of the caret's paragraph — its own override, or
+        /// the document default. With a pending (sticky) style armed this is
+        /// unaffected; `attrs_at_caret` carries the pending overlay instead.
+        /// Drives the toolbar's alignment picker (Backlog #9, #11).
+        paragraph_alignment: Alignment,
         /// Undo/redo availability — every interactive edit emits this event,
         /// so the toolbar stays reactive without polling (Phase 4 §11).
         can_undo: bool,

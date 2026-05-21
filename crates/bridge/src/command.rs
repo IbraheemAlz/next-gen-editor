@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{
-    Color, DocFormat, LogicalPos, LogicalRange, Point, Rect, UnderlineStyle, VerticalScript,
+    Alignment, Color, DocFormat, LogicalPos, LogicalRange, Point, Rect, UnderlineStyle,
+    VerticalScript,
 };
 
 /// A command issued to the engine. Serialized internally-tagged
@@ -231,6 +232,18 @@ pub enum Command {
     /// Paste plain text at the caret, replacing any non-empty selection.
     PastePlain {
         text: String,
+    },
+
+    // ===================================================================
+    // Backlog sprint 1 — editor UX. Additive: paragraph alignment (Backlog
+    // #9). Sticky/pending formatting (Backlog #11) reuses `ApplyFormatting`
+    // over a collapsed caret and needs no new command.
+    // ===================================================================
+    /// Set the paragraph alignment of every paragraph the `range` spans. A
+    /// real edit — pushes undo and reflows — but the selection is preserved.
+    SetParagraphAlign {
+        range: LogicalRange,
+        align: Alignment,
     },
 }
 

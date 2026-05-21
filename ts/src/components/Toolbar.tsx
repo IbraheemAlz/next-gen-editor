@@ -7,11 +7,13 @@
  * Phase 5 D5.4 adds the Export PDF button — it dispatches `ExportPdf` and turns
  * the returned `PdfExported` bytes into a browser download.
  *
- * Alignment + font-family pickers from §11 are deferred — neither has engine
- * support yet (see BACKLOG.md). */
+ * Backlog sprint 1 adds the paragraph AlignmentPicker (Backlog #9). The B/I/U
+ * buttons also drive sticky formatting (Backlog #11): clicking one with a
+ * collapsed caret arms a pending style the engine applies to the next typed
+ * run. The font-family picker from §11 is still deferred (see BACKLOG.md). */
 import { createSignal, For } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
-import type { Color, TextAttrsPatch } from '../engine/types';
+import type { Alignment, Color, TextAttrsPatch } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
 
 const FONT_SIZES = [12, 14, 16, 18, 20, 24, 32, 48, 64];
@@ -84,8 +86,11 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
     const color = () => attrs()?.color ?? DEFAULT_COLOR;
     const undo = () => props.store.undoState();
 
-    /* ApplyFormatting acts on the current selection; a collapsed caret is a
-       no-op in the engine (nothing to format). */
+    /* ApplyFormatting over a real selection styles it; over a collapsed caret
+       the engine arms it as sticky/pending formatting (Backlog #11) — the
+       next typed run adopts it. Either way the engine answers with
+       SelectionChanged, so `attrsAtCaret` (and the B/I/U pressed state) stays
+       correct without the toolbar tracking anything itself. */
     const apply = (patch: Partial<TextAttrsPatch>): void => {
         void props.client.dispatch({
             type: 'APPLY_FORMATTING',
@@ -93,6 +98,29 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
             attrs: { ...emptyPatch(), ...patch },
         });
     };
+
+    /* Backlog #9 — paragraph alignment. Toolbar buttons are absolute
+       (left/center/right/justify); the engine model is direction-relative
+       (Start/End/Center/Justify). The mapping pivots on the document base
+       direction — in an RTL document the leading edge is the right one, so
+       "align left" is the logical `End`. */
+    const align = (): Alignment => props.store.paragraphAlignment();
+    const rtl = (): boolean => props.store.baseDirection() === 'Rtl';
+    const leftAlign = (): Alignment => (rtl() ? 'End' : 'Start');
+    const rightAlign = (): Alignment => (rtl() ? 'Start' : 'End');
+    const setAlign = (a: Alignment): void => {
+        void props.client.dispatch({
+            type: 'SET_PARAGRAPH_ALIGN',
+            range: props.store.selection().range,
+            align: a,
+        });
+    };
+    const alignButtons = (): { cls: string; label: string; value: Alignment }[] => [
+        { cls: 'al-left', label: 'Align left', value: leftAlign() },
+        { cls: 'al-center', label: 'Align center', value: 'Center' },
+        { cls: 'al-right', label: 'Align right', value: rightAlign() },
+        { cls: 'al-justify', label: 'Justify', value: 'Justify' },
+    ];
 
     /* `exporting` disables the button for the duration of the round-trip so a
        second click cannot start a concurrent export. */
@@ -170,6 +198,24 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
                     onChange={(e) => apply({ color: hexToColor(e.currentTarget.value) })}
                 />
             </label>
+            <span class="tb-sep" />
+            <For each={alignButtons()}>
+                {(b) => (
+                    <button
+                        class={`tb-btn tb-align ${b.cls}`}
+                        classList={{ active: align() === b.value }}
+                        aria-pressed={align() === b.value}
+                        aria-label={b.label}
+                        onClick={() => setAlign(b.value)}
+                    >
+                        <span class="al-bars">
+                            <i />
+                            <i />
+                            <i />
+                        </span>
+                    </button>
+                )}
+            </For>
             <span class="tb-spacer" />
             <button
                 class="tb-btn tb-export"

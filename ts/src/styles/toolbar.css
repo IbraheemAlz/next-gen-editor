@@ -95,3 +95,41 @@
 .tb-export:hover:not(:disabled) {
     background: #3a82d8;
 }
+
+/* Backlog #9 — paragraph alignment buttons. The icon is three stacked bars;
+   the middle bar's width + cross-axis position encodes the alignment. */
+.tb-align {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.al-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 16px;
+}
+
+.al-bars i {
+    width: 100%;
+    height: 2px;
+    background: currentColor;
+    border-radius: 1px;
+}
+
+/* Left / center / right: the middle bar is short, and where it sits within
+   the icon distinguishes the three. Justify keeps every bar full-width. */
+.al-left .al-bars i:nth-child(2),
+.al-center .al-bars i:nth-child(2),
+.al-right .al-bars i:nth-child(2) {
+    width: 62%;
+}
+
+.al-center .al-bars i:nth-child(2) {
+    align-self: center;
+}
+
+.al-right .al-bars i:nth-child(2) {
+    align-self: flex-end;
+}

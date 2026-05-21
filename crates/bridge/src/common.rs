@@ -79,6 +79,18 @@ pub enum Direction {
     Rtl,
 }
 
+/// Paragraph text alignment (Backlog #9). `Start` / `End` are
+/// writing-direction-relative — they resolve against the paragraph's base
+/// direction at layout time; `Center` and `Justify` are absolute. Serializes
+/// as the bare variant string (`"Start"`, `"Center"`, …).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alignment {
+    Start,
+    End,
+    Center,
+    Justify,
+}
+
 /// Unicode script, reported when a glyph needs a font the engine lacks.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
 pub enum Script {

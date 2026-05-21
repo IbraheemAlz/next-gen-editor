@@ -5,12 +5,14 @@
 //! repaint when a layout config was cached by a prior `RenderPage`.
 
 use bridge::{
-    A11yParagraph, A11yRun, A11yTree, Color, Command, Direction, EngineStats, Event,
-    FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
+    A11yParagraph, A11yRun, A11yTree, Alignment as BridgeAlignment, Color, Command, Direction,
+    EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
     LogicalRange as BridgeLogicalRange, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
     TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
-use engine::{DocumentTree, LogicalPos as EnginePos, SpanStyle, UndoStack};
+use engine::{
+    Alignment as EngineAlignment, DocumentTree, LogicalPos as EnginePos, SpanStyle, UndoStack,
+};
 use format_docx::writer::build_minimal_docx;
 use kurbo::Rect;
 use layout::{
@@ -97,6 +99,11 @@ pub struct Engine {
     dirty: DirtyTracker,
     selection: Option<SelectionState>,
     composition: Option<CompositionState>,
+    /// Sticky / pending formatting (Backlog #11). Armed when the toolbar
+    /// dispatches `ApplyFormatting` over a collapsed caret; the next
+    /// interactive `InsertText` overlays it onto the typed text. It persists
+    /// across keystrokes and is cleared only when the caret moves.
+    pending_format: Option<SpanStyle>,
 }
 
 #[wasm_bindgen]
@@ -119,6 +126,7 @@ impl Engine {
             dirty: DirtyTracker::new(),
             selection: None,
             composition: None,
+            pending_format: None,
         })
     }
 
@@ -253,6 +261,40 @@ fn resolved_attrs(patch: &TextAttrsPatch, default_size: f32) -> TextAttrs {
         bg_color: patch.bg_color,
         script: patch.script.unwrap_or(VerticalScript::Normal),
         language: patch.language.clone().unwrap_or_default(),
+    }
+}
+
+/* Alignment crosses three crates with identical shapes: the pure document
+model (`engine`), the layout / shaping crate (`text_pipeline`), and the RPC
+wire (`bridge`). These map between them. */
+
+/// `engine::Alignment` → the layout crate's `Alignment`.
+fn layout_align(a: EngineAlignment) -> Alignment {
+    match a {
+        EngineAlignment::Start => Alignment::Start,
+        EngineAlignment::End => Alignment::End,
+        EngineAlignment::Center => Alignment::Center,
+        EngineAlignment::Justify => Alignment::Justify,
+    }
+}
+
+/// The layout crate's `Alignment` → the RPC `bridge::Alignment`.
+fn bridge_align(a: Alignment) -> BridgeAlignment {
+    match a {
+        Alignment::Start => BridgeAlignment::Start,
+        Alignment::End => BridgeAlignment::End,
+        Alignment::Center => BridgeAlignment::Center,
+        Alignment::Justify => BridgeAlignment::Justify,
+    }
+}
+
+/// The RPC `bridge::Alignment` → `engine::Alignment` for the document model.
+fn engine_align(a: BridgeAlignment) -> EngineAlignment {
+    match a {
+        BridgeAlignment::Start => EngineAlignment::Start,
+        BridgeAlignment::End => EngineAlignment::End,
+        BridgeAlignment::Center => EngineAlignment::Center,
+        BridgeAlignment::Justify => EngineAlignment::Justify,
     }
 }
 
@@ -657,6 +699,11 @@ impl Engine {
             // Phase 4 §12 — clipboard.
             Command::GetSelectionAsClipboard => self.do_get_selection_as_clipboard(),
             Command::PastePlain { text } => self.do_paste_plain(text),
+
+            // Backlog sprint 1 — paragraph alignment (Backlog #9).
+            Command::SetParagraphAlign { range, align } => {
+                self.do_set_paragraph_align(range, align)
+            }
         }
     }
 
@@ -825,6 +872,17 @@ impl Engine {
             /* Underline is a stored on/off flag in the model. */
             underline: attrs.underline.map(|u| !matches!(u, UnderlineStyle::None)),
         };
+        /* Sticky formatting (Backlog #11): a collapsed caret has no text to
+        style. Rather than push a no-op edit, arm the patch as the pending
+        style — the next interactive InsertText overlays it onto the typed
+        text. Toggling the same button merges over the prior pending value.
+        Gated on an active selection so the visual-diff harness (which has no
+        selection) keeps its original no-op path. */
+        if range.start == range.end && self.selection.is_some() {
+            let armed = self.pending_format.unwrap_or_default().merged_with(patch);
+            self.pending_format = Some(armed);
+            return self.selection_changed();
+        }
         let new_doc = self.undo.current().apply_style(
             to_engine_pos(range.start),
             to_engine_pos(range.end),
@@ -944,7 +1002,9 @@ impl Engine {
                 base_direction: cfg.base_direction,
                 max_width: page.content_width(),
                 line_height: cfg.line_height * scale,
-                alignment: cfg.alignment,
+                /* A paragraph's own alignment overrides the document default
+                (Backlog #9). */
+                alignment: para.alignment.map_or(cfg.alignment, layout_align),
             };
             let mut para_box = layout_paragraph(para_cfg);
             para_box.origin = Point {
@@ -1122,6 +1182,8 @@ impl Engine {
         } else {
             range.start
         };
+        /* A caret move discards any armed sticky style (Backlog #11). */
+        self.pending_format = None;
         self.selection = Some(SelectionState { anchor, caret });
         self.selection_changed()
     }
@@ -1129,6 +1191,7 @@ impl Engine {
     /// `Command::ExtendSelection` — keep the anchor, move the caret to `to`.
     fn do_extend_selection(&mut self, to: BridgeLogicalPos) -> Event {
         let anchor = self.selection.map_or(to, |s| s.anchor);
+        self.pending_format = None;
         self.selection = Some(SelectionState { anchor, caret: to });
         self.selection_changed()
     }
@@ -1147,6 +1210,7 @@ impl Engine {
             .paragraphs
             .get(hit.para as usize)
             .map_or((hit.offset, hit.offset), |p| p.word_bounds(hit.offset));
+        self.pending_format = None;
         self.selection = Some(SelectionState {
             anchor: BridgeLogicalPos {
                 para: hit.para,
@@ -1194,10 +1258,30 @@ impl Engine {
             caret: caret_rect_geom(&geom, sel.caret, fallback, CARET_WIDTH * scale),
             direction,
             rects,
-            attrs_at_caret: self.attrs_at(self.attrs_probe(start, end)),
+            /* A collapsed caret reflects any armed pending style; a real
+            selection reports the document's own attributes (Backlog #11). */
+            attrs_at_caret: self.attrs_at(self.attrs_probe(start, end), start == end),
+            paragraph_alignment: self.paragraph_alignment_at(sel.caret.para),
             can_undo: self.undo.can_undo(),
             can_redo: self.undo.can_redo(),
         }
+    }
+
+    /// Effective alignment of paragraph `para` for the toolbar — the
+    /// paragraph's own override, else the document's render-config default.
+    fn paragraph_alignment_at(&self, para: u32) -> BridgeAlignment {
+        let stored = self
+            .undo
+            .current()
+            .paragraphs
+            .get(para as usize)
+            .and_then(|p| p.alignment)
+            .map(layout_align);
+        let default = self
+            .layout_cfg
+            .as_ref()
+            .map_or(Alignment::Start, |c| c.alignment);
+        bridge_align(stored.unwrap_or(default))
     }
 
     /// The offset whose style the toolbar should reflect: the selection start
@@ -1222,14 +1306,19 @@ impl Engine {
 
     /// Resolved text attributes at `pos`. Spans carry size + colour + the
     /// bold/italic/underline flags; `strike`, `bg_color`, `script` and
-    /// `language` default until those land.
-    fn attrs_at(&self, pos: BridgeLogicalPos) -> TextAttrs {
-        let style = self
+    /// `language` default until those land. When `apply_pending` is set (a
+    /// collapsed caret), any armed sticky style is overlaid so the toolbar
+    /// previews what the next keystroke will adopt (Backlog #11).
+    fn attrs_at(&self, pos: BridgeLogicalPos, apply_pending: bool) -> TextAttrs {
+        let mut style = self
             .undo
             .current()
             .paragraphs
             .get(pos.para as usize)
             .map_or(SpanStyle::default(), |p| p.style_at(pos.offset));
+        if apply_pending && let Some(pending) = self.pending_format {
+            style = style.merged_with(pending);
+        }
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let [r, g, b, a] = style.color.unwrap_or([0, 0, 0, 255]);
         let underline = if style.underline.unwrap_or(false) {
@@ -1285,10 +1374,25 @@ impl Engine {
                 .current()
                 .delete_range(to_engine_pos(start), to_engine_pos(end))
         };
-        let new_doc = base.insert_text(to_engine_pos(start), &text);
+        let mut new_doc = base.insert_text(to_engine_pos(start), &text);
+        let inserted_end = start.offset + text.len() as u32;
+        /* Sticky formatting (Backlog #11): overlay any armed pending style
+        onto the just-inserted run. It is intentionally NOT cleared here — it
+        stays armed across consecutive keystrokes so a whole typed run shares
+        the style, and is dropped only when the caret moves. */
+        if let Some(pending) = self.pending_format {
+            new_doc = new_doc.apply_style(
+                to_engine_pos(start),
+                EnginePos {
+                    para: start.para,
+                    offset: inserted_end,
+                },
+                pending,
+            );
+        }
         let caret = BridgeLogicalPos {
             para: start.para,
-            offset: start.offset + text.len() as u32,
+            offset: inserted_end,
         };
         self.commit_edit(new_doc, caret)
     }
@@ -1539,6 +1643,29 @@ impl Engine {
             .map_or(BridgeLogicalPos { para: 0, offset: 0 }, |s| s.caret);
         self.do_insert_text_interactive(at, text)
     }
+
+    /// `Command::SetParagraphAlign` (Backlog #9) — set the alignment of every
+    /// paragraph the range spans. A real edit (undo snapshot + reflow), but
+    /// unlike a text edit it leaves the selection in place so the user can
+    /// re-align without losing their place.
+    fn do_set_paragraph_align(
+        &mut self,
+        range: BridgeLogicalRange,
+        align: BridgeAlignment,
+    ) -> Event {
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self.undo.current().set_alignment(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            engine_align(align),
+        );
+        self.undo.push(new_doc);
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
 }
 
 struct RenderStats {
@@ -1567,6 +1694,7 @@ mod tests {
             dirty: DirtyTracker::new(),
             selection: None,
             composition: None,
+            pending_format: None,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine

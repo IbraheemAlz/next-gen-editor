@@ -25,7 +25,7 @@ pub struct SpanStyle {
 
 impl SpanStyle {
     /// Overlay `patch`'s set fields onto `self`.
-    fn merged_with(self, patch: SpanStyle) -> SpanStyle {
+    pub fn merged_with(self, patch: SpanStyle) -> SpanStyle {
         SpanStyle {
             font_size: patch.font_size.or(self.font_size),
             color: patch.color.or(self.color),
@@ -44,12 +44,28 @@ pub struct StyleRun {
     pub style: SpanStyle,
 }
 
+/// Paragraph text alignment (Backlog #9). `Start` / `End` are
+/// writing-direction-relative — they resolve against the base direction at
+/// layout time; `Center` and `Justify` are absolute. Mirrors
+/// `text_pipeline::Alignment`; kept here so the pure document model carries no
+/// dependency on the text-shaping crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    Start,
+    End,
+    Center,
+    Justify,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Paragraph {
     pub text: String,
     /// Non-overlapping styled ranges, sorted by `start`; default-styled ranges
     /// are omitted. An empty list is plain text.
     pub spans: Vec<StyleRun>,
+    /// Per-paragraph alignment override. `None` inherits the document /
+    /// render-config default; `Some` is an explicit choice (Backlog #9).
+    pub alignment: Option<Alignment>,
 }
 
 impl Paragraph {
@@ -107,6 +123,7 @@ impl Paragraph {
         Paragraph {
             text: self.text.clone(),
             spans,
+            alignment: self.alignment,
         }
     }
 
@@ -183,7 +200,11 @@ impl Paragraph {
                 });
             }
         }
-        Paragraph { text, spans }
+        Paragraph {
+            text,
+            spans,
+            alignment: self.alignment,
+        }
     }
 
     /// Split into `[0, at)` and `[at, len)`. Spans straddling `at` are split.
@@ -212,15 +233,19 @@ impl Paragraph {
             Paragraph {
                 text: self.text[..at as usize].to_owned(),
                 spans: left,
+                alignment: self.alignment,
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
                 spans: right,
+                alignment: self.alignment,
             },
         )
     }
 
     /// Append `other` to a copy of `self`, shifting `other`'s spans right.
+    /// The merged paragraph keeps `self`'s alignment — the surviving
+    /// paragraph mark wins when a paragraph break is deleted.
     pub fn concat(&self, other: &Paragraph) -> Paragraph {
         let shift = self.text.len() as u32;
         let mut text = self.text.clone();
@@ -233,7 +258,11 @@ impl Paragraph {
                 style: run.style,
             });
         }
-        Paragraph { text, spans }
+        Paragraph {
+            text,
+            spans,
+            alignment: self.alignment,
+        }
     }
 
     /// Byte offset of the char boundary immediately before `o` (clamped to 0).
@@ -275,6 +304,7 @@ impl DocumentTree {
         paragraphs.push_back(Paragraph {
             text: text.to_owned(),
             spans: Vec::new(),
+            alignment: None,
         });
         Self { paragraphs }
     }
@@ -286,6 +316,7 @@ impl DocumentTree {
             paragraphs.push_back(Paragraph {
                 text: t,
                 spans: Vec::new(),
+                alignment: None,
             });
         }
         Self { paragraphs }
@@ -323,6 +354,7 @@ impl DocumentTree {
             paragraphs.push_back(Paragraph {
                 text: text.to_owned(),
                 spans: Vec::new(),
+                alignment: None,
             });
             return Self { paragraphs };
         }
@@ -366,6 +398,25 @@ impl DocumentTree {
             };
             let styled = paragraphs[p].apply_style(lo, hi, patch);
             paragraphs.set(p, styled);
+        }
+        Self { paragraphs }
+    }
+
+    /// Set `align` on every paragraph the logical range `[start, end)` spans
+    /// (Backlog #9). Paragraphs outside the range are structurally shared.
+    /// `start`/`end` are expected in document order.
+    pub fn set_alignment(&self, start: LogicalPos, end: LogicalPos, align: Alignment) -> Self {
+        let mut paragraphs = self.paragraphs.clone();
+        if paragraphs.is_empty() {
+            return self.clone();
+        }
+        let last = paragraphs.len() - 1;
+        let first = (start.para as usize).min(last);
+        let final_para = (end.para as usize).min(last);
+        for p in first..=final_para {
+            let mut para = paragraphs[p].clone();
+            para.alignment = Some(align);
+            paragraphs.set(p, para);
         }
         Self { paragraphs }
     }
@@ -640,6 +691,7 @@ mod tests {
         let p = Paragraph {
             text: "hello world".into(),
             spans: Vec::new(),
+            alignment: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -654,6 +706,7 @@ mod tests {
         let p = Paragraph {
             text: "مرحبا بالعالم".into(),
             spans: Vec::new(),
+            alignment: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -665,6 +718,7 @@ mod tests {
         let p = Paragraph {
             text: String::new(),
             spans: Vec::new(),
+            alignment: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -730,6 +784,7 @@ mod tests {
         let p = Paragraph {
             text: "aمb".into(),
             spans: Vec::new(),
+            alignment: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -817,5 +872,88 @@ mod tests {
 
         undo.redo();
         assert_eq!(undo.current().paragraph_text(0), Some("abcdef"));
+    }
+
+    #[test]
+    fn set_alignment_marks_spanned_paragraphs() {
+        let d = DocumentTree::from_paragraphs(["a".into(), "b".into(), "c".into()]);
+        let d = d.set_alignment(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 1, offset: 0 },
+            Alignment::Center,
+        );
+        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::Center));
+        assert_eq!(d.paragraphs[1].alignment, Some(Alignment::Center));
+        /* outside the range — untouched */
+        assert_eq!(d.paragraphs[2].alignment, None);
+    }
+
+    #[test]
+    fn alignment_survives_text_edits() {
+        let d = DocumentTree::from_text("hello world");
+        let d = d.set_alignment(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 0 },
+            Alignment::End,
+        );
+        /* insertion clones the paragraph in place — alignment rides along */
+        let d = d.insert_text(LogicalPos { para: 0, offset: 0 }, "X");
+        assert_eq!(d.paragraph_text(0), Some("Xhello world"));
+        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::End));
+        /* a style change preserves alignment */
+        let d = d.apply_style(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 3 },
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::End));
+        /* and so does a deletion */
+        let d = d.delete_range(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 1 },
+        );
+        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::End));
+    }
+
+    #[test]
+    fn split_paragraph_inherits_alignment() {
+        let d = DocumentTree::from_text("hello world");
+        let d = d.set_alignment(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 0 },
+            Alignment::Center,
+        );
+        let d = d.split_paragraph(LogicalPos { para: 0, offset: 5 });
+        assert_eq!(d.paragraph_count(), 2);
+        /* both halves carry the original paragraph's alignment */
+        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::Center));
+        assert_eq!(d.paragraphs[1].alignment, Some(Alignment::Center));
+    }
+
+    #[test]
+    fn merge_keeps_first_paragraph_alignment() {
+        let d = DocumentTree::from_paragraphs(["abc".into(), "def".into()]);
+        let d = d.set_alignment(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 0 },
+            Alignment::Center,
+        );
+        let d = d.set_alignment(
+            LogicalPos { para: 1, offset: 0 },
+            LogicalPos { para: 1, offset: 0 },
+            Alignment::End,
+        );
+        /* deleting the paragraph break merges the two */
+        let d = d.delete_range(
+            LogicalPos { para: 0, offset: 3 },
+            LogicalPos { para: 1, offset: 0 },
+        );
+        assert_eq!(d.paragraph_count(), 1);
+        assert_eq!(d.paragraph_text(0), Some("abcdef"));
+        /* the surviving paragraph keeps the first paragraph's alignment */
+        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::Center));
     }
 }
