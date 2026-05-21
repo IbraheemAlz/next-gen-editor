@@ -103,3 +103,19 @@ resolve-before-layout pass), first-strong detection per **paragraph** (base
 direction is a paragraph property, not per line), and a UI / keyboard toggle
 to override the detected direction. Until then the Arabic-first RTL default
 stands.
+
+## 7. Selection rendering — discontinuous BiDi rectangles
+
+**Shipped (D4.6 pragmatic subset):** per-line bounding selection rectangles —
+the engine emits one `Rect` per line spanning the selected range's leftmost to
+rightmost caret slot (`selection_rects_geom` in `engine-wasm`). Exact for
+LTR-only, RTL-only, and whole-line selections.
+
+**Deferred:** per-BiDi-visual-segment rectangles. A contiguous logical
+selection that crosses an LTR↔RTL boundary mid-line is visually discontinuous —
+the selected characters scatter into separate visual segments, and the single
+bounding rect over-covers the unselected gap between them. A faithful render
+emits one rect per visual segment. Needs: clipping the selected byte range
+against each line's `VisualRun`s and emitting a rect per run-clipped sub-span.
+The `SelectionOverlay` already renders an N-rect list, so only the engine side
+changes.

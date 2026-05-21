@@ -4,6 +4,13 @@
     height: 100%;
 }
 
+/* Positioned container — the caret + selection overlays absolutely position
+   themselves against this box, which the canvas exactly fills. */
+.editor-viewport {
+    position: relative;
+    height: 100%;
+}
+
 /* The engine canvas. Fills the viewport; the backing store is sized to
    devicePixelRatio in EditorCanvas before transferControlToOffscreen(). */
 .editor-canvas {
@@ -28,4 +35,12 @@
     background: #f6f6f6;
     color: #555;
     font: 15px / 1.5 system-ui, sans-serif;
+}
+
+/* Phase 4 §8 — one rectangle of the selection highlight. */
+.selection-rect {
+    position: absolute;
+    background: rgba(0, 100, 200, 0.25);
+    pointer-events: none;
+    z-index: 1;
 }

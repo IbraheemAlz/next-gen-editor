@@ -26,6 +26,14 @@ pub struct Rect {
     pub h: f32,
 }
 
+/// A point in canvas device pixels — a pointer hit-test coordinate
+/// (PHASE_4_HEADLESS_UI.md §7).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+
 /// Document container format.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]

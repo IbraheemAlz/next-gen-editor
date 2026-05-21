@@ -6,10 +6,14 @@
  * App holds only UI signals. */
 import { createSignal, For, Show } from 'solid-js';
 import { EditorCanvas } from './components/EditorCanvas';
+import { CaretOverlay } from './components/CaretOverlay';
+import { SelectionOverlay } from './components/SelectionOverlay';
 import { EngineClient } from './engine/engine-client';
+import { createEngineStore } from './state/engine-store';
 import type { Command, Event } from './engine/types';
 import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
 import './styles/editor.css';
+import './styles/caret.css';
 
 /* Amiri is a dual-script Naskh face — renders mixed Arabic/English from a
    single face without engine-side font fallback. */
@@ -22,7 +26,9 @@ async function setupEngine(client: EngineClient): Promise<void> {
     await client.loadFont(AMIRI_ID, fontBytes);
     await client.dispatch({
         type: 'RENDER_PAGE',
-        text: '',
+        /* Seed mixed Arabic/English so the pointer + selection overlays have
+           BiDi text to hit-test against. */
+        text: 'Hello world مرحبا بالعالم',
         font_id: AMIRI_ID,
         base_direction: 'RTL',
         px_size: 24,
@@ -81,6 +87,10 @@ export function App() {
     window.__engineClient = client;
     window.__dispatch = dispatch;
 
+    /* §9 store — mirrors engine SELECTION_CHANGED events into signals the
+       caret + selection overlays render from. */
+    const store = createEngineStore(client);
+
     /* Runs once EditorCanvas has handed the engine its surface (init/recover). */
     const onReady = async (generation: number, initMs: number): Promise<void> => {
         if (generation === 0) {
@@ -101,11 +111,19 @@ export function App() {
 
     return (
         <div class="editor-shell">
-            <For each={[canvasGen()]}>
-                {(generation) => (
-                    <EditorCanvas client={client} generation={generation} onReady={onReady} />
-                )}
-            </For>
+            <div class="editor-viewport">
+                <For each={[canvasGen()]}>
+                    {(generation) => (
+                        <EditorCanvas
+                            client={client}
+                            generation={generation}
+                            onReady={onReady}
+                        />
+                    )}
+                </For>
+                <SelectionOverlay store={store} />
+                <CaretOverlay store={store} />
+            </div>
             <Show when={booting()}>
                 <div class="boot-overlay">Loading editor…</div>
             </Show>

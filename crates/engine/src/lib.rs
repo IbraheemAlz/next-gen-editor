@@ -46,7 +46,7 @@ pub struct Paragraph {
 
 impl Paragraph {
     /// Resolved style at byte offset `at` (default if no span covers it).
-    fn style_at(&self, at: u32) -> SpanStyle {
+    pub fn style_at(&self, at: u32) -> SpanStyle {
         self.spans
             .iter()
             .find(|s| at >= s.start && at < s.end)
@@ -100,6 +100,46 @@ impl Paragraph {
             text: self.text.clone(),
             spans,
         }
+    }
+
+    /// Byte range `[start, end)` of the word containing caret position
+    /// `offset` — a whitespace-delimited span (PHASE_4_HEADLESS_UI.md §7,
+    /// double-click select). When `offset` sits on whitespace, the run of
+    /// whitespace is returned. `offset` is clamped to a char boundary.
+    pub fn word_bounds(&self, offset: u32) -> (u32, u32) {
+        let text = self.text.as_str();
+        let len = text.len();
+        if len == 0 {
+            return (0, 0);
+        }
+        let mut off = (offset as usize).min(len);
+        while off > 0 && !text.is_char_boundary(off) {
+            off -= 1;
+        }
+        /* Classify by the char to the right; at end-of-text, the char left. */
+        let ws = text[off..]
+            .chars()
+            .next()
+            .or_else(|| text[..off].chars().next_back())
+            .is_some_and(char::is_whitespace);
+
+        let mut start = off;
+        for (i, c) in text[..off].char_indices().rev() {
+            if c.is_whitespace() == ws {
+                start = i;
+            } else {
+                break;
+            }
+        }
+        let mut end = off;
+        for (i, c) in text[off..].char_indices() {
+            if c.is_whitespace() == ws {
+                end = off + i + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        (start as u32, end as u32)
     }
 }
 
@@ -392,6 +432,40 @@ mod tests {
         let doc = doc.insert_text(LogicalPos { para: 0, offset: 0 }, "XX");
         let span = doc.paragraphs[0].spans[0];
         assert_eq!((span.start, span.end), (4, 6));
+    }
+
+    #[test]
+    fn word_bounds_latin() {
+        let p = Paragraph {
+            text: "hello world".into(),
+            spans: Vec::new(),
+        };
+        assert_eq!(p.word_bounds(2), (0, 5));
+        assert_eq!(p.word_bounds(0), (0, 5));
+        assert_eq!(p.word_bounds(5), (5, 6)); // on the space
+        assert_eq!(p.word_bounds(8), (6, 11));
+        assert_eq!(p.word_bounds(11), (6, 11)); // end of text → last word
+    }
+
+    #[test]
+    fn word_bounds_arabic() {
+        /* "مرحبا بالعالم" — 5-char word, space, 7-char word; 2 bytes/char. */
+        let p = Paragraph {
+            text: "مرحبا بالعالم".into(),
+            spans: Vec::new(),
+        };
+        assert_eq!(p.word_bounds(4), (0, 10));
+        assert_eq!(p.word_bounds(0), (0, 10));
+        assert_eq!(p.word_bounds(12), (11, 25)); // mid-char offset clamps
+    }
+
+    #[test]
+    fn word_bounds_empty() {
+        let p = Paragraph {
+            text: String::new(),
+            spans: Vec::new(),
+        };
+        assert_eq!(p.word_bounds(0), (0, 0));
     }
 
     #[test]

@@ -5,6 +5,7 @@
  * viewport resizes. The engine never touches this element again — it draws
  * into the transferred OffscreenCanvas from the worker. */
 import { onCleanup, onMount } from 'solid-js';
+import { attachPointer } from '../input/pointer';
 import type { EngineClient } from '../engine/engine-client';
 
 export interface EditorCanvasProps {
@@ -22,6 +23,7 @@ export interface EditorCanvasProps {
 export function EditorCanvas(props: EditorCanvasProps) {
     let canvasRef: HTMLCanvasElement | undefined;
     let resizeObserver: ResizeObserver | undefined;
+    let detachPointer: (() => void) | undefined;
 
     onMount(async () => {
         const canvas = canvasRef!;
@@ -44,17 +46,24 @@ export function EditorCanvas(props: EditorCanvasProps) {
 
         await props.onReady(props.generation, initMs);
 
-        /* Viewport resize → engine. `SET_VIEWPORT` is an engine-side stub
-           today (engine-wasm `phase3_stub`); the dispatch lands in D4.3 once
-           the engine resizes the OffscreenCanvas. The observer is wired now
-           so the plumbing is already in place. */
+        /* Viewport resize → engine. `SET_VIEWPORT` is still an engine-side
+           stub (engine-wasm `phase3_stub`); the dispatch lands with the
+           scroll/viewport work. The observer is wired now so the plumbing
+           is in place. */
         resizeObserver = new ResizeObserver(() => {
-            /* D4.3: props.client.dispatch({ type: 'SET_VIEWPORT', rect }) */
+            /* TODO: dispatch SET_VIEWPORT once the engine implements it. */
         });
         resizeObserver.observe(canvas);
+
+        /* §7 — pointer → engine hit-testing. Pointer events still fire on a
+           canvas whose drawing surface has been transferred to the worker. */
+        detachPointer = attachPointer(canvas, props.client);
     });
 
-    onCleanup(() => resizeObserver?.disconnect());
+    onCleanup(() => {
+        resizeObserver?.disconnect();
+        detachPointer?.();
+    });
 
     return <canvas ref={canvasRef} class="editor-canvas" tabindex="-1" />;
 }

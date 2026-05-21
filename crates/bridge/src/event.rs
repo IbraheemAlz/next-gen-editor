@@ -140,6 +140,15 @@ pub enum Event {
     Trap {
         stack: String,
     },
+
+    // ===================================================================
+    // Phase 4 schema — PHASE_4_HEADLESS_UI.md §7.
+    // ===================================================================
+    /// Reply to [`crate::Command::HitTest`] — the logical position under
+    /// the hit-tested pixel.
+    HitResult {
+        pos: LogicalPos,
+    },
 }
 
 /// Font vertical metrics, scaled to a requested pixel size.

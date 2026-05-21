@@ -5,15 +5,16 @@
 //! repaint when a layout config was cached by a prior `RenderPage`.
 
 use bridge::{
-    Color, Command, EngineStats, Event, FontMetrics as BridgeMetrics,
-    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, Rect as BridgeRect,
-    TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
+    Color, Command, Direction, EngineStats, Event, FontMetrics as BridgeMetrics,
+    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, Point as BridgePoint,
+    Rect as BridgeRect, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{DocumentTree, LogicalPos as EnginePos, SpanStyle, UndoStack};
 use format_docx::writer::build_minimal_docx;
 use kurbo::Rect;
 use layout::{
-    A4Page, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan, layout_paragraph,
+    A4Page, LineBox, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan,
+    layout_paragraph,
 };
 use render::atlas::GlyphAtlas;
 use render::canvas2d_backend::render_canvas2d;
@@ -40,6 +41,39 @@ struct RenderConfig {
     alignment: Alignment,
 }
 
+/// Width of the rendered caret, in canvas device pixels.
+const CARET_WIDTH: f32 = 2.0;
+
+/// The current selection: a fixed `anchor` and a moving `caret` end. The
+/// selected range is the two ends ordered into document order.
+#[derive(Clone, Copy)]
+struct SelectionState {
+    anchor: BridgeLogicalPos,
+    caret: BridgeLogicalPos,
+}
+
+/// A candidate caret position on a line — an absolute x (canvas device px)
+/// paired with the source byte offset a caret there maps to.
+#[derive(Clone, Copy)]
+struct CaretSlot {
+    x: f32,
+    byte: u32,
+}
+
+/// One laid-out line flattened for pointer hit-testing and caret/selection
+/// geometry. All coordinates are absolute page points (= canvas device px).
+struct LineGeom {
+    /// Document paragraph index (not the box-tree index — empties are skipped).
+    para: u32,
+    start_x: f32,
+    y_top: f32,
+    height: f32,
+    start_byte: u32,
+    end_byte: u32,
+    /// Caret slots in visual emission order — searched by nearest x or byte.
+    slots: Vec<CaretSlot>,
+}
+
 #[wasm_bindgen]
 pub struct Engine {
     ctx: Option<OffscreenCanvasRenderingContext2d>,
@@ -49,6 +83,7 @@ pub struct Engine {
     atlas: GlyphAtlas,
     vello: Option<VelloRenderer>,
     dirty: DirtyTracker,
+    selection: Option<SelectionState>,
 }
 
 #[wasm_bindgen]
@@ -69,6 +104,7 @@ impl Engine {
             atlas: GlyphAtlas::new(),
             vello: None,
             dirty: DirtyTracker::new(),
+            selection: None,
         })
     }
 
@@ -245,6 +281,161 @@ fn build_style_spans(
     spans
 }
 
+/// Flatten one line into [`CaretSlot`]s — one caret position per cluster
+/// boundary. `line_abs_x` is the line's absolute left edge. Mirrors the pen
+/// walk in `render::scene::build_page_scene` so hit-testing inverts exactly
+/// the geometry the renderer drew.
+fn build_line_slots(line: &LineBox, line_abs_x: f32) -> Vec<CaretSlot> {
+    let mut slots: Vec<CaretSlot> = Vec::new();
+    let mut pen = 0.0_f32;
+    for run in &line.runs {
+        let run_start_x = line_abs_x + pen;
+        let run_advance: f32 = run.glyphs.iter().map(|g| g.x_advance).sum();
+        match run.direction {
+            ShapingDirection::Ltr => {
+                let mut cum = 0.0_f32;
+                for g in &run.glyphs {
+                    slots.push(CaretSlot {
+                        x: run_start_x + cum,
+                        byte: run.source_range.start + g.cluster,
+                    });
+                    cum += g.x_advance;
+                }
+                slots.push(CaretSlot {
+                    x: run_start_x + run_advance,
+                    byte: run.source_range.end,
+                });
+            }
+            ShapingDirection::Rtl => {
+                /* Visual L→R; an RTL glyph's logical-start edge is its right
+                side, and the run's logical end sits at its visual left edge. */
+                let mut cum = 0.0_f32;
+                for g in &run.glyphs {
+                    slots.push(CaretSlot {
+                        x: run_start_x + cum + g.x_advance,
+                        byte: run.source_range.start + g.cluster,
+                    });
+                    cum += g.x_advance;
+                }
+                slots.push(CaretSlot {
+                    x: run_start_x,
+                    byte: run.source_range.end,
+                });
+            }
+        }
+        pen += run_advance;
+    }
+    slots
+}
+
+/// Vertical distance from `y` to a line's band; `0.0` when inside it.
+fn line_y_dist(line: &LineGeom, y: f32) -> f32 {
+    if y < line.y_top {
+        line.y_top - y
+    } else if y > line.y_top + line.height {
+        y - line.y_top - line.height
+    } else {
+        0.0
+    }
+}
+
+/// The line nearest `y` — the band containing it, else the closest above/below.
+fn nearest_line(geom: &[LineGeom], y: f32) -> Option<&LineGeom> {
+    geom.iter()
+        .min_by(|a, b| line_y_dist(a, y).total_cmp(&line_y_dist(b, y)))
+}
+
+/// Map an absolute pixel to a logical position — nearest line by `y`, then
+/// nearest caret slot by `x`.
+fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
+    let Some(line) = nearest_line(geom, y) else {
+        return BridgeLogicalPos { para: 0, offset: 0 };
+    };
+    let offset = line
+        .slots
+        .iter()
+        .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
+        .map_or(line.start_byte, |s| s.byte);
+    BridgeLogicalPos {
+        para: line.para,
+        offset,
+    }
+}
+
+/// Absolute x of the caret slot whose byte is nearest `byte`.
+fn slot_x_for_byte(line: &LineGeom, byte: u32) -> f32 {
+    line.slots
+        .iter()
+        .min_by_key(|s| s.byte.abs_diff(byte))
+        .map_or(line.start_x, |s| s.x)
+}
+
+/// Caret rectangle for `pos`. Falls back to `fallback` when the document has
+/// no geometry yet (empty document).
+fn caret_rect_geom(geom: &[LineGeom], pos: BridgeLogicalPos, fallback: BridgeRect) -> BridgeRect {
+    let line = geom
+        .iter()
+        .find(|l| l.para == pos.para && pos.offset >= l.start_byte && pos.offset <= l.end_byte)
+        .or_else(|| geom.first());
+    match line {
+        Some(line) => BridgeRect {
+            x: slot_x_for_byte(line, pos.offset),
+            y: line.y_top,
+            w: CARET_WIDTH,
+            h: line.height,
+        },
+        None => fallback,
+    }
+}
+
+/// Per-line bounding selection rectangles for `[start, end]` — the D4.6
+/// pragmatic subset (one rect per line). Discontinuous per-BiDi-run rects
+/// are deferred (see BACKLOG.md).
+fn selection_rects_geom(
+    geom: &[LineGeom],
+    start: BridgeLogicalPos,
+    end: BridgeLogicalPos,
+) -> Vec<BridgeRect> {
+    let mut rects: Vec<BridgeRect> = Vec::new();
+    for line in geom {
+        if line.para < start.para || line.para > end.para {
+            continue;
+        }
+        let lo = if line.para == start.para {
+            start.offset.max(line.start_byte)
+        } else {
+            line.start_byte
+        };
+        let hi = if line.para == end.para {
+            end.offset.min(line.end_byte)
+        } else {
+            line.end_byte
+        };
+        if lo >= hi {
+            continue;
+        }
+        let xa = slot_x_for_byte(line, lo);
+        let xb = slot_x_for_byte(line, hi);
+        let (x0, x1) = if xa <= xb { (xa, xb) } else { (xb, xa) };
+        rects.push(BridgeRect {
+            x: x0,
+            y: line.y_top,
+            w: x1 - x0,
+            h: line.height,
+        });
+    }
+    rects
+}
+
+/// Order two positions into document order (paragraph, then offset).
+fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, BridgeLogicalPos) {
+    if (a.para, a.offset) <= (b.para, b.offset) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         match cmd {
@@ -339,8 +530,8 @@ impl Engine {
             Command::SplitParagraph { .. } => phase3_stub("SplitParagraph"),
             Command::MergeParagraph { .. } => phase3_stub("MergeParagraph"),
             Command::InsertImage { .. } => phase3_stub("InsertImage"),
-            Command::SetSelection { .. } => phase3_stub("SetSelection"),
-            Command::ExtendSelection { .. } => phase3_stub("ExtendSelection"),
+            Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
+            Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => phase3_stub("SelectAll"),
             Command::BeginComposition { .. } => phase3_stub("BeginComposition"),
             Command::UpdateComposition { .. } => phase3_stub("UpdateComposition"),
@@ -350,6 +541,10 @@ impl Engine {
             Command::RequestPaint { viewport, dirty } => self.do_request_paint(viewport, dirty),
             Command::UnloadFont { .. } => phase3_stub("UnloadFont"),
             Command::RequestStats => self.request_stats(),
+
+            // Phase 4 — PHASE_4_HEADLESS_UI.md §7. Additive pointer commands.
+            Command::HitTest { at } => self.do_hit_test(at),
+            Command::SelectWordAt { at } => self.do_select_word_at(at),
         }
     }
 
@@ -612,7 +807,7 @@ impl Engine {
 
     /// Lay out the current document into a `PageBox` plus the `FontStack` used
     /// to shape it. Shared by the Canvas2D repaint and PDF export.
-    fn build_page(&self) -> Result<(PageBox, FontStack), Box<Event>> {
+    fn build_page(&self) -> Result<(PageBox, FontStack, Vec<u32>), Box<Event>> {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
@@ -633,9 +828,12 @@ impl Engine {
 
         /* Lay out each paragraph, stacking them down the content area. */
         let mut paragraphs: Vec<ParagraphBox> = Vec::new();
+        /* Document paragraph index of each emitted `ParagraphBox` — empty
+        paragraphs produce no box, so box index != document index. */
+        let mut box_doc_index: Vec<u32> = Vec::new();
         let mut para_y_offset = 0.0_f32;
         let doc = self.undo.current().clone();
-        for para in &doc.paragraphs {
+        for (doc_idx, para) in doc.paragraphs.iter().enumerate() {
             if para.text.is_empty() {
                 para_y_offset += cfg.line_height;
                 continue;
@@ -657,6 +855,7 @@ impl Engine {
             };
             para_y_offset += para_box.size.height;
             paragraphs.push(para_box);
+            box_doc_index.push(doc_idx as u32);
         }
 
         let page_box = PageBox {
@@ -667,11 +866,11 @@ impl Engine {
             margins: page.margin,
             paragraphs,
         };
-        Ok((page_box, font_stack))
+        Ok((page_box, font_stack, box_doc_index))
     }
 
     fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
-        let (page_box, _font_stack) = self.build_page()?;
+        let (page_box, _font_stack, _box_doc_index) = self.build_page()?;
 
         let line_count: u32 = page_box
             .paragraphs
@@ -725,7 +924,7 @@ impl Engine {
 
     /// Export the current document to a single-page PDF (D3.7).
     fn do_export_pdf(&self) -> Event {
-        let (page_box, font_stack) = match self.build_page() {
+        let (page_box, font_stack, _box_doc_index) = match self.build_page() {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -756,6 +955,168 @@ impl Engine {
             paint_ms: 0.0,
         }
     }
+
+    /// Flatten the current document into per-line hit-test geometry. Re-lays
+    /// out the document — cheap for the single-page PoC; cache when editing
+    /// lands.
+    fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
+        let (page, _fonts, box_doc_index) = self.build_page()?;
+        let content_x = page.margins.left;
+        let content_y = page.margins.top;
+        let mut geom: Vec<LineGeom> = Vec::new();
+        for (k, para_box) in page.paragraphs.iter().enumerate() {
+            let doc_idx = box_doc_index.get(k).copied().unwrap_or(0);
+            let para_x = content_x + para_box.origin.x;
+            let para_y = content_y + para_box.origin.y;
+            for line in &para_box.lines {
+                let line_x = para_x + line.origin.x;
+                let line_y = para_y + line.origin.y;
+                let start_byte = line
+                    .runs
+                    .iter()
+                    .map(|r| r.source_range.start)
+                    .min()
+                    .unwrap_or(0);
+                let end_byte = line
+                    .runs
+                    .iter()
+                    .map(|r| r.source_range.end)
+                    .max()
+                    .unwrap_or(0);
+                geom.push(LineGeom {
+                    para: doc_idx,
+                    start_x: line_x,
+                    y_top: line_y,
+                    height: line.height,
+                    start_byte,
+                    end_byte,
+                    slots: build_line_slots(line, line_x),
+                });
+            }
+        }
+        Ok(geom)
+    }
+
+    /// `Command::HitTest` — pixel → logical position. A pure query; the
+    /// selection is not mutated.
+    fn do_hit_test(&self, at: BridgePoint) -> Event {
+        match self.document_geometry() {
+            Ok(geom) => Event::HitResult {
+                pos: hit_test_geom(&geom, at.x, at.y),
+            },
+            Err(e) => *e,
+        }
+    }
+
+    /// `Command::SetSelection` — set the selection to `range`, caret at `caret`.
+    fn do_set_selection(&mut self, range: BridgeLogicalRange, caret: BridgeLogicalPos) -> Event {
+        let anchor = if caret == range.start {
+            range.end
+        } else {
+            range.start
+        };
+        self.selection = Some(SelectionState { anchor, caret });
+        self.selection_changed()
+    }
+
+    /// `Command::ExtendSelection` — keep the anchor, move the caret to `to`.
+    fn do_extend_selection(&mut self, to: BridgeLogicalPos) -> Event {
+        let anchor = self.selection.map_or(to, |s| s.anchor);
+        self.selection = Some(SelectionState { anchor, caret: to });
+        self.selection_changed()
+    }
+
+    /// `Command::SelectWordAt` — hit-test, then select the whole word
+    /// (double-click).
+    fn do_select_word_at(&mut self, at: BridgePoint) -> Event {
+        let geom = match self.document_geometry() {
+            Ok(g) => g,
+            Err(e) => return *e,
+        };
+        let hit = hit_test_geom(&geom, at.x, at.y);
+        let (lo, hi) = self
+            .undo
+            .current()
+            .paragraphs
+            .get(hit.para as usize)
+            .map_or((hit.offset, hit.offset), |p| p.word_bounds(hit.offset));
+        self.selection = Some(SelectionState {
+            anchor: BridgeLogicalPos {
+                para: hit.para,
+                offset: lo,
+            },
+            caret: BridgeLogicalPos {
+                para: hit.para,
+                offset: hi,
+            },
+        });
+        self.selection_changed()
+    }
+
+    /// Assemble a `SelectionChanged` event from the current selection.
+    fn selection_changed(&self) -> Event {
+        let Some(sel) = self.selection else {
+            return Event::Error {
+                message: "selection_changed: no active selection".into(),
+            };
+        };
+        let geom = match self.document_geometry() {
+            Ok(g) => g,
+            Err(e) => return *e,
+        };
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        let page = A4Page::a4();
+        let fallback = BridgeRect {
+            x: page.margin.left,
+            y: page.margin.top,
+            w: CARET_WIDTH,
+            h: self.layout_cfg.as_ref().map_or(16.0, |c| c.line_height),
+        };
+        let rects = if start == end {
+            Vec::new()
+        } else {
+            selection_rects_geom(&geom, start, end)
+        };
+        let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
+            Some(ShapingDirection::Rtl) => Direction::Rtl,
+            _ => Direction::Ltr,
+        };
+        Event::SelectionChanged {
+            range: BridgeLogicalRange { start, end },
+            caret: caret_rect_geom(&geom, sel.caret, fallback),
+            direction,
+            rects,
+            attrs_at_caret: self.attrs_at(sel.caret),
+        }
+    }
+
+    /// Resolved text attributes at `pos`. Phase 3 spans carry size + colour;
+    /// the remaining fields default until the typography PR.
+    fn attrs_at(&self, pos: BridgeLogicalPos) -> TextAttrs {
+        let style = self
+            .undo
+            .current()
+            .paragraphs
+            .get(pos.para as usize)
+            .map_or(SpanStyle::default(), |p| p.style_at(pos.offset));
+        let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
+        let [r, g, b, a] = style.color.unwrap_or([0, 0, 0, 255]);
+        TextAttrs {
+            bold: false,
+            italic: false,
+            underline: UnderlineStyle::None,
+            strike: false,
+            font_family: self
+                .layout_cfg
+                .as_ref()
+                .map_or(String::new(), |c| c.font_id.clone()),
+            font_size: style.font_size.unwrap_or(default_size),
+            color: Color { r, g, b, a },
+            bg_color: None,
+            script: VerticalScript::Normal,
+            language: String::new(),
+        }
+    }
 }
 
 struct RenderStats {
@@ -782,6 +1143,7 @@ mod tests {
             atlas: GlyphAtlas::new(),
             vello: None,
             dirty: DirtyTracker::new(),
+            selection: None,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine

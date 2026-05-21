@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{
-    Color, DocFormat, LogicalPos, LogicalRange, Rect, UnderlineStyle, VerticalScript,
+    Color, DocFormat, LogicalPos, LogicalRange, Point, Rect, UnderlineStyle, VerticalScript,
 };
 
 /// A command issued to the engine. Serialized internally-tagged
@@ -188,6 +188,23 @@ pub enum Command {
 
     /* Telemetry */
     RequestStats,
+
+    // ===================================================================
+    // Phase 4 schema — PHASE_4_HEADLESS_UI.md §7.
+    // Additive: the frozen §4 schema carries selection commands keyed by
+    // `LogicalPos` but no pixel→logical path. These supply it.
+    // ===================================================================
+    /// Hit-test a canvas pixel to a logical document position. The engine
+    /// replies with [`crate::Event::HitResult`]; selection is not mutated.
+    HitTest {
+        at: Point,
+    },
+
+    /// Select the word under a canvas pixel (double-click). The engine
+    /// updates the selection and replies with `Event::SelectionChanged`.
+    SelectWordAt {
+        at: Point,
+    },
 }
 
 /// Browser/runtime capabilities advertised to the engine at `Init`.

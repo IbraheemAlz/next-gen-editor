@@ -1,0 +1,15 @@
+/* Phase 4 §8 — caret overlay. */
+
+.caret {
+    position: absolute;
+    background: var(--caret-color, currentColor);
+    pointer-events: none;
+    animation: caret-blink 1.06s steps(1) infinite;
+    z-index: 2;
+}
+
+@keyframes caret-blink {
+    50% {
+        opacity: 0;
+    }
+}

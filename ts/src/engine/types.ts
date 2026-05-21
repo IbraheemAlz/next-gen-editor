@@ -22,6 +22,7 @@ export type {
     LogicalRange,
     ParagraphId,
     PdfConformance,
+    Point,
     Rect,
     Script,
     SelectionModifier,

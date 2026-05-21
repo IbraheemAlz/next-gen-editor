@@ -1,0 +1,56 @@
+/* Phase 4 §9 — engine-derived UI state.
+ *
+ * The store mirrors engine selection events into Solid signals. It never
+ * holds document content — only the geometry the engine reports (§9
+ * invariant). Engine rects arrive in canvas device pixels; they are
+ * converted to CSS pixels here so the DOM overlays land correctly on
+ * high-DPI displays. */
+import { createSignal } from 'solid-js';
+import type { EngineClient } from '../engine/engine-client';
+import type { Event, LogicalPos, LogicalRange, Rect, TextAttrs } from '../engine/types';
+
+/** The current selection: its logical range plus rendered rectangles. */
+export interface SelectionView {
+    range: LogicalRange;
+    rects: Rect[];
+}
+
+const EMPTY_RANGE: LogicalRange = {
+    start: { para: 0, offset: 0 },
+    end: { para: 0, offset: 0 },
+};
+
+/** Device-pixel rect → CSS-pixel rect. */
+function toCssRect(r: Rect, dpr: number): Rect {
+    return { x: r.x / dpr, y: r.y / dpr, w: r.w / dpr, h: r.h / dpr };
+}
+
+/**
+ * Subscribe to the engine and expose its selection state as Solid signals.
+ * Created once by `App` and passed to the overlays.
+ */
+export function createEngineStore(client: EngineClient) {
+    const [caret, setCaret] = createSignal<Rect | null>(null);
+    const [caretLogical, setCaretLogical] = createSignal<LogicalPos | null>(null);
+    const [selection, setSelection] = createSignal<SelectionView>({
+        range: EMPTY_RANGE,
+        rects: [],
+    });
+    const [attrsAtCaret, setAttrsAtCaret] = createSignal<TextAttrs | null>(null);
+
+    client.subscribe((ev: Event) => {
+        if (ev.type !== 'SELECTION_CHANGED') return;
+        const dpr = window.devicePixelRatio || 1;
+        setCaret(toCssRect(ev.caret, dpr));
+        setCaretLogical(ev.range.end);
+        setSelection({
+            range: ev.range,
+            rects: ev.rects.map((r) => toCssRect(r, dpr)),
+        });
+        setAttrsAtCaret(ev.attrs_at_caret);
+    });
+
+    return { caret, caretLogical, selection, attrsAtCaret };
+}
+
+export type EngineStore = ReturnType<typeof createEngineStore>;
