@@ -5,8 +5,9 @@
  * standalone). Re-exporting them here keeps the deep `../../../crates/...`
  * relative path in one place — UI code imports from `../engine/types`. */
 export type {
-    A11yDelta,
-    A11yNode,
+    A11yParagraph,
+    A11yRun,
+    A11yTree,
     ClientCapabilities,
     Color,
     Command,

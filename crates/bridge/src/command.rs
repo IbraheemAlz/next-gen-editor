@@ -215,6 +215,11 @@ pub enum Command {
         forward: bool,
         by_word: bool,
     },
+
+    /// Request a full accessibility snapshot; the engine replies with
+    /// `Event::AccessibilityTreeChanged`. The worker issues this after every
+    /// document mutation to keep the screen-reader shadow tree synced (§10).
+    RequestAccessibilityTree,
 }
 
 /// Browser/runtime capabilities advertised to the engine at `Init`.

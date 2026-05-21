@@ -390,6 +390,29 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
     }
 }
 
+/**
+ * Commands whose dispatch changes document content — they invalidate the
+ * accessibility tree, so the worker re-broadcasts it afterward (§10).
+ */
+function mutatesDocument(cmd: Command): boolean {
+    switch (cmd.type) {
+        case 'INSERT_TEXT':
+        case 'DELETE_RANGE':
+        case 'DELETE_AT_CARET':
+        case 'SPLIT_PARAGRAPH':
+        case 'APPLY_FORMATTING':
+        case 'END_COMPOSITION':
+        case 'UNDO':
+        case 'REDO':
+        case 'RENDER_PAGE':
+        case 'LOAD_DOCX':
+        case 'OPEN_DOCUMENT':
+            return true;
+        default:
+            return false;
+    }
+}
+
 async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
     if (!engine) {
         self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
@@ -404,6 +427,13 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
            the event log OFF the critical path. The RPC response is already
            sent, so event-log latency never throttles command throughput. */
         logCommand(msg.cmd);
+        /* §10: after a document mutation, broadcast a fresh accessibility
+           tree. The message carries no `id`, so EngineClient fans it out to
+           subscribers — the screen-reader shadow DOM stays synced. */
+        if (mutatesDocument(msg.cmd)) {
+            const tree = await dispatch({ type: 'REQUEST_ACCESSIBILITY_TREE' } as Command);
+            self.postMessage({ evt: tree });
+        }
     } catch (e: unknown) {
         replyError(msg.id, e);
     }

@@ -153,3 +153,26 @@ still ignore them (item 1 above). Size + colour render immediately.
   resolves a face by script, not by a requested family. Needs a family field
   on `SpanStyle`, multiple loaded families, and family-aware `FontStack`
   resolution. Related to item 1 (bold/italic face resolution).
+
+## 10. Accessibility tree — fine-grained deltas
+
+**Shipped (D4.8):** the engine emits a full `A11yTree` (every paragraph, each
+split into style runs) via `AccessibilityTreeChanged` after every document
+mutation; the UI replaces the whole `.a11y-mirror` shadow DOM.
+
+**Deferred:** incremental `A11yDelta`s — a per-edit patch (changed paragraphs
++ removed ids) instead of a full snapshot. A full rebuild per keystroke is
+fine for the one-page PoC; a long document wants deltas plus stable
+per-paragraph ids so Solid reconciles only the changed `<p>`s. The repurposed
+`AccessibilityTreeChanged` event would gain a delta-carrying form.
+
+## 11. Pending (sticky) formatting
+
+**Shipped:** `ApplyFormatting` over a collapsed caret is a no-op — there is
+no text to style.
+
+**Deferred:** pending formatting — clicking Bold with no selection should arm
+a sticky style the next typed text adopts (standard word-processor
+behaviour). Needs the engine to hold a pending `SpanStyle` overlay, applied on
+the next `InsertText` and cleared on caret move; the toolbar reflects the
+pending state so the button reads as pressed before any text exists.

@@ -10,6 +10,8 @@ import { CaretOverlay } from './components/CaretOverlay';
 import { SelectionOverlay } from './components/SelectionOverlay';
 import { HiddenInput } from './components/HiddenInput';
 import { Toolbar } from './components/Toolbar';
+import { AccessibilityTree } from './components/AccessibilityTree';
+import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
 import { createEngineStore } from './state/engine-store';
 import type { Command, Event } from './engine/types';
@@ -17,6 +19,7 @@ import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
 import './styles/editor.css';
 import './styles/caret.css';
 import './styles/toolbar.css';
+import './styles/a11y.css';
 
 /* Amiri is a dual-script Naskh face — renders mixed Arabic/English from a
    single face without engine-side font fallback. */
@@ -136,6 +139,8 @@ export function App() {
                 <CaretOverlay store={store} />
                 <HiddenInput client={client} store={store} />
             </div>
+            <AccessibilityTree store={store} />
+            <Announcements store={store} />
             <Show when={booting()}>
                 <div class="boot-overlay">Loading editor…</div>
             </Show>

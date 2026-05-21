@@ -1,0 +1,25 @@
+/* Phase 4 §10 — accessibility shadow tree + live region.
+   Both are visually hidden but present in the DOM + accessibility tree. */
+
+.a11y-mirror {
+    position: absolute;
+    left: -10000px;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+}
+
+/* Standard screen-reader-only pattern — clipped to nothing, never display:none
+   (which would drop it from the accessibility tree too). */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+}

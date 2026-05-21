@@ -126,8 +126,11 @@ pub enum Event {
     },
 
     /* Accessibility */
+    /// Full accessibility snapshot — emitted after every document mutation
+    /// (PHASE_4_HEADLESS_UI.md §10). Fine-grained deltas are deferred; see
+    /// BACKLOG.md.
     AccessibilityTreeChanged {
-        delta: A11yDelta,
+        tree: A11yTree,
     },
 
     /* Telemetry */
@@ -187,18 +190,27 @@ pub struct EngineStats {
     pub last_command_ms: f32,
 }
 
-/// One node in an accessibility-tree delta.
+/// A full accessibility snapshot of the document — the structure mirrored
+/// into the screen-reader shadow DOM (PHASE_4_HEADLESS_UI.md §10).
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
-pub struct A11yNode {
-    pub id: u32,
-    pub role: String,
-    pub label: String,
-    pub bounds: Rect,
+pub struct A11yTree {
+    pub paragraphs: Vec<A11yParagraph>,
 }
 
-/// Incremental update to the accessibility tree.
+/// One paragraph in the accessibility tree — a `<p>` in the shadow DOM.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
-pub struct A11yDelta {
-    pub updated: Vec<A11yNode>,
-    pub removed: Vec<u32>,
+pub struct A11yParagraph {
+    pub id: u32,
+    pub direction: Direction,
+    pub runs: Vec<A11yRun>,
+}
+
+/// One styled text run within an accessibility paragraph — a `<span>` in the
+/// shadow DOM, so screen readers can announce formatting boundaries.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+pub struct A11yRun {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
 }

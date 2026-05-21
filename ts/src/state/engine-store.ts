@@ -7,7 +7,7 @@
  * high-DPI displays. */
 import { createSignal } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
-import type { Event, LogicalPos, LogicalRange, Rect, TextAttrs } from '../engine/types';
+import type { A11yTree, Event, LogicalPos, LogicalRange, Rect, TextAttrs } from '../engine/types';
 
 /** The current selection: its logical range plus rendered rectangles. */
 export interface SelectionView {
@@ -47,21 +47,40 @@ export function createEngineStore(client: EngineClient) {
         canUndo: false,
         canRedo: false,
     });
+    const [a11yTree, setA11yTree] = createSignal<A11yTree | null>(null);
+    const [announcement, setAnnouncement] = createSignal('');
+    let announced = false;
 
     client.subscribe((ev: Event) => {
-        if (ev.type !== 'SELECTION_CHANGED') return;
-        const dpr = window.devicePixelRatio || 1;
-        setCaret(toCssRect(ev.caret, dpr));
-        setCaretLogical(ev.range.end);
-        setSelection({
-            range: ev.range,
-            rects: ev.rects.map((r) => toCssRect(r, dpr)),
-        });
-        setAttrsAtCaret(ev.attrs_at_caret);
-        setUndoState({ canUndo: ev.can_undo, canRedo: ev.can_redo });
+        if (ev.type === 'SELECTION_CHANGED') {
+            const dpr = window.devicePixelRatio || 1;
+            setCaret(toCssRect(ev.caret, dpr));
+            setCaretLogical(ev.range.end);
+            setSelection({
+                range: ev.range,
+                rects: ev.rects.map((r) => toCssRect(r, dpr)),
+            });
+            setAttrsAtCaret(ev.attrs_at_caret);
+            setUndoState({ canUndo: ev.can_undo, canRedo: ev.can_redo });
+        } else if (ev.type === 'ACCESSIBILITY_TREE_CHANGED') {
+            setA11yTree(ev.tree);
+            if (!announced) {
+                announced = true;
+                const n = ev.tree.paragraphs.length;
+                setAnnouncement(`Document loaded — ${n} paragraph${n === 1 ? '' : 's'}.`);
+            }
+        }
     });
 
-    return { caret, caretLogical, selection, attrsAtCaret, undoState };
+    return {
+        caret,
+        caretLogical,
+        selection,
+        attrsAtCaret,
+        undoState,
+        a11yTree,
+        announcement,
+    };
 }
 
 export type EngineStore = ReturnType<typeof createEngineStore>;

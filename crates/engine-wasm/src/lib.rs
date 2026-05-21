@@ -5,9 +5,10 @@
 //! repaint when a layout config was cached by a prior `RenderPage`.
 
 use bridge::{
-    Color, Command, Direction, EngineStats, Event, FontMetrics as BridgeMetrics,
-    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, Point as BridgePoint,
-    Rect as BridgeRect, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
+    A11yParagraph, A11yRun, A11yTree, Color, Command, Direction, EngineStats, Event,
+    FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
+    LogicalRange as BridgeLogicalRange, Point as BridgePoint, Rect as BridgeRect, TextAttrs,
+    TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{DocumentTree, LogicalPos as EnginePos, SpanStyle, UndoStack};
 use format_docx::writer::build_minimal_docx;
@@ -459,6 +460,38 @@ fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     }
 }
 
+/// Append a non-empty `[s, e)` slice of `text` as an accessibility run.
+fn push_run(runs: &mut Vec<A11yRun>, text: &str, s: u32, e: u32, style: SpanStyle) {
+    if s < e {
+        runs.push(A11yRun {
+            text: text[s as usize..e as usize].to_string(),
+            bold: style.bold.unwrap_or(false),
+            italic: style.italic.unwrap_or(false),
+            underline: style.underline.unwrap_or(false),
+        });
+    }
+}
+
+/// Split a paragraph into gap-free accessibility runs by its style spans.
+fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
+    let len = para.text.len() as u32;
+    let mut runs: Vec<A11yRun> = Vec::new();
+    let mut cursor = 0_u32;
+    for sr in &para.spans {
+        push_run(
+            &mut runs,
+            &para.text,
+            cursor,
+            sr.start,
+            SpanStyle::default(),
+        );
+        push_run(&mut runs, &para.text, sr.start, sr.end, sr.style);
+        cursor = sr.end;
+    }
+    push_run(&mut runs, &para.text, cursor, len, SpanStyle::default());
+    runs
+}
+
 impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         match cmd {
@@ -579,6 +612,11 @@ impl Engine {
             Command::DeleteAtCaret { forward, by_word } => {
                 self.do_delete_at_caret(forward, by_word)
             }
+
+            // Phase 4 §10 — accessibility shadow tree.
+            Command::RequestAccessibilityTree => Event::AccessibilityTreeChanged {
+                tree: self.build_a11y_tree(),
+            },
         }
     }
 
@@ -1417,6 +1455,28 @@ impl Engine {
                 undo_depth: self.undo.depth(),
             },
         }
+    }
+
+    /// Build a full accessibility snapshot of the current document — every
+    /// paragraph, split into style runs (PHASE_4_HEADLESS_UI.md §10).
+    fn build_a11y_tree(&self) -> A11yTree {
+        let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
+            Some(ShapingDirection::Rtl) => Direction::Rtl,
+            _ => Direction::Ltr,
+        };
+        let paragraphs = self
+            .undo
+            .current()
+            .paragraphs
+            .iter()
+            .enumerate()
+            .map(|(i, para)| A11yParagraph {
+                id: i as u32,
+                direction,
+                runs: a11y_runs(para),
+            })
+            .collect();
+        A11yTree { paragraphs }
     }
 }
 
