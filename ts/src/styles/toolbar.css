@@ -78,3 +78,20 @@
     padding: 2px;
     cursor: pointer;
 }
+
+/* Pushes everything after it to the trailing edge of the toolbar. */
+.tb-spacer {
+    flex: 1 1 auto;
+}
+
+.tb-export {
+    min-width: 92px;
+    font-weight: 600;
+    color: #fff;
+    background: #2f6fbf;
+    border-color: #2f6fbf;
+}
+
+.tb-export:hover:not(:disabled) {
+    background: #3a82d8;
+}

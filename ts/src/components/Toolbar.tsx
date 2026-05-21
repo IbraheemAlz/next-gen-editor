@@ -4,9 +4,12 @@
  * `ApplyFormatting` / `Undo` / `Redo`. It holds no document state — the B/I/U
  * pressed state is whatever the engine last reported (§9 invariant).
  *
+ * Phase 5 D5.4 adds the Export PDF button — it dispatches `ExportPdf` and turns
+ * the returned `PdfExported` bytes into a browser download.
+ *
  * Alignment + font-family pickers from §11 are deferred — neither has engine
  * support yet (see BACKLOG.md). */
-import { For } from 'solid-js';
+import { createSignal, For } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type { Color, TextAttrsPatch } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
@@ -44,6 +47,34 @@ function hexToColor(hex: string): Color {
     };
 }
 
+/* D5.4 — export the current document and hand the bytes to the browser as a
+   download. The engine runs in the worker, so the only main-thread work is
+   wrapping the returned `Uint8Array` in a Blob and clicking a synthetic <a>. */
+async function exportPdf(client: EngineClient): Promise<void> {
+    const evt = await client.dispatch({ type: 'EXPORT_PDF', conformance: 'A1b' });
+    if (evt.type === 'ERROR') {
+        console.error('[export] PDF export failed:', evt.message);
+        return;
+    }
+    if (evt.type !== 'PDF_EXPORTED') {
+        console.error('[export] unexpected reply to EXPORT_PDF:', evt.type);
+        return;
+    }
+    /* Copy into a fresh ArrayBuffer-backed view: the worker's Uint8Array is
+       typed over `ArrayBufferLike`, which a Blob part will not accept. */
+    const blob = new Blob([new Uint8Array(evt.bytes)], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'document.pdf';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    /* Revoke on the next tick so the navigation that the click started has
+       already taken the blob. */
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
     const attrs = () => props.store.attrsAtCaret();
     const bold = () => attrs()?.bold ?? false;
@@ -61,6 +92,18 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
             range: props.store.selection().range,
             attrs: { ...emptyPatch(), ...patch },
         });
+    };
+
+    /* `exporting` disables the button for the duration of the round-trip so a
+       second click cannot start a concurrent export. */
+    const [exporting, setExporting] = createSignal(false);
+    const doExport = async (): Promise<void> => {
+        setExporting(true);
+        try {
+            await exportPdf(props.client);
+        } finally {
+            setExporting(false);
+        }
     };
 
     return (
@@ -127,6 +170,15 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
                     onChange={(e) => apply({ color: hexToColor(e.currentTarget.value) })}
                 />
             </label>
+            <span class="tb-spacer" />
+            <button
+                class="tb-btn tb-export"
+                onClick={() => void doExport()}
+                disabled={exporting()}
+                aria-label="Export as PDF/A-1b"
+            >
+                {exporting() ? 'Exporting…' : 'Export PDF'}
+            </button>
         </div>
     );
 }

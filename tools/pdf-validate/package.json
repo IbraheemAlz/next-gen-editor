@@ -1,0 +1,14 @@
+{
+  "name": "pdf-validate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PDF/A-1b validation harness (Phase 5 D5.4) — exports the engine's PDF output and checks it with veraPDF.",
+  "scripts": {
+    "run": "node run.mjs",
+    "strict": "node run.mjs --strict"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
+  }
+}

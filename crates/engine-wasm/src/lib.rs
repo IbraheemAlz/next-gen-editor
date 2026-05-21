@@ -7,8 +7,8 @@
 use bridge::{
     A11yParagraph, A11yRun, A11yTree, Color, Command, Direction, EngineStats, Event,
     FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
-    LogicalRange as BridgeLogicalRange, Point as BridgePoint, Rect as BridgeRect, TextAttrs,
-    TextAttrsPatch, UnderlineStyle, VerticalScript,
+    LogicalRange as BridgeLogicalRange, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
+    TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{DocumentTree, LogicalPos as EnginePos, SpanStyle, UndoStack};
 use format_docx::writer::build_minimal_docx;
@@ -620,7 +620,7 @@ impl Engine {
             Command::Tick { .. } => phase3_stub("Tick"),
             Command::OpenDocument { .. } => phase3_stub("OpenDocument"),
             Command::SaveDocument { .. } => phase3_stub("SaveDocument"),
-            Command::ExportPdf { .. } => self.do_export_pdf(),
+            Command::ExportPdf { conformance } => self.do_export_pdf(conformance),
             Command::CloseDocument => phase3_stub("CloseDocument"),
             Command::DeleteRange { range } => self.do_delete_range(range),
             Command::ReplaceRange { .. } => phase3_stub("ReplaceRange"),
@@ -1022,13 +1022,21 @@ impl Engine {
 
     /// Export the current document to a single-page PDF (D3.7). Always laid
     /// out at scale `1.0` — PDF user space is logical points, never device px.
-    fn do_export_pdf(&self) -> Event {
+    ///
+    /// `conformance` selects the output profile (D5.4): `A1b` emits a
+    /// PDF/A-1b-conformant file; the unimplemented `A2u` / `X3` targets fall
+    /// back to a plain PDF.
+    fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
         let (page_box, font_stack, _box_doc_index) = match self.build_page(1.0) {
             Ok(v) => v,
             Err(e) => return *e,
         };
+        let profile = match conformance {
+            PdfConformance::A1b => format_pdf::PdfProfile::A1b,
+            PdfConformance::A2u | PdfConformance::X3 => format_pdf::PdfProfile::Plain,
+        };
         let mut bytes: Vec<u8> = Vec::new();
-        if let Err(e) = format_pdf::export_pdf(&page_box, &font_stack, &mut bytes) {
+        if let Err(e) = format_pdf::export_pdf(&page_box, &font_stack, profile, &mut bytes) {
             return Event::Error {
                 message: format!("ExportPdf: {e}"),
             };
