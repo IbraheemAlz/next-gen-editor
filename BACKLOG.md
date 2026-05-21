@@ -88,3 +88,18 @@ currently sidesteps this by configuring a `line_height` generous enough for
 its largest span. Needs: per-run ascent/descent from `LoadedFont::metrics`, a
 max-reduce per line in `layout_paragraph`, and `LineBox.height` / `baseline`
 derived from that instead of the config constant.
+
+## 6. Paragraph base direction — auto-detection
+
+**Shipped (global RTL base):** the editor seeds every document with one RTL
+base direction (`ts/src/index.ts` → `RenderPage { base_direction: 'RTL' }`).
+Per-line BiDi resolves mixed Arabic / English runs correctly within that base.
+
+**Deferred:** UAX #9 first-strong auto-detection. `ShapingDirection` is
+`Ltr | Rtl` only and the base is global — so an English-only paragraph
+right-aligns like an Arabic one instead of detecting LTR from its first strong
+character. Needs: an `Auto` mode (a `ShapingDirection::Auto` variant or a
+resolve-before-layout pass), first-strong detection per **paragraph** (base
+direction is a paragraph property, not per line), and a UI / keyboard toggle
+to override the detected direction. Until then the Arabic-first RTL default
+stands.

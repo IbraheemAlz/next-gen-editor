@@ -326,15 +326,16 @@ function wireInteractive(
         textarea.value = '';
     });
 
-    /* Undo / redo. Ctrl+Z, Ctrl+Y, and Ctrl+Shift+Z (mac-style redo). */
+    /* Undo / redo: Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z (mac-style redo). Match
+       e.code (physical key), not e.key — e.key is keyboard-layout dependent,
+       so under an Arabic layout the Z key reports 'ئ' and never matches. */
     window.addEventListener('keydown', (e: KeyboardEvent) => {
         const mod = e.ctrlKey || e.metaKey;
         if (!mod) return;
-        const k = e.key.toLowerCase();
-        if (k === 'z' && !e.shiftKey) {
+        if (e.code === 'KeyZ' && !e.shiftKey) {
             e.preventDefault();
             void dispatch({ type: 'UNDO' }).then(showUndoState);
-        } else if (k === 'y' || (k === 'z' && e.shiftKey)) {
+        } else if (e.code === 'KeyY' || (e.code === 'KeyZ' && e.shiftKey)) {
             e.preventDefault();
             void dispatch({ type: 'REDO' }).then(showUndoState);
         }

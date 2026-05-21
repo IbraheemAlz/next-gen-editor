@@ -7,7 +7,7 @@ No `iframe`s, no vendored binary blobs — the engine is built from source.
 [![pages](https://github.com/IbraheemAlz/next-gen-editor/actions/workflows/pages.yml/badge.svg)](https://github.com/IbraheemAlz/next-gen-editor/actions/workflows/pages.yml)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
-> **Status — Phase 3 complete (v0.3.0).**
+> **Status — Phase 3 complete (v0.3.1).**
 > Native RTL/Arabic typesetting: BiDi, priority-band Kashida, multi-script
 > font fallback, a hierarchical box model, rich-text style spans, PDF export,
 > and incremental Canvas2D repaint. The full roadmap lives in
