@@ -8,6 +8,7 @@ import { createSignal, For, Show } from 'solid-js';
 import { EditorCanvas } from './components/EditorCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
 import { SelectionOverlay } from './components/SelectionOverlay';
+import { HiddenInput } from './components/HiddenInput';
 import { EngineClient } from './engine/engine-client';
 import { createEngineStore } from './state/engine-store';
 import type { Command, Event } from './engine/types';
@@ -34,6 +35,13 @@ async function setupEngine(client: EngineClient): Promise<void> {
         px_size: 24,
         line_height: 36,
         align: 'START',
+    });
+    /* Seed a collapsed caret at the document start so the hidden input has a
+       position to insert at before the first pointer click. */
+    await client.dispatch({
+        type: 'SET_SELECTION',
+        range: { start: { para: 0, offset: 0 }, end: { para: 0, offset: 0 } },
+        caret: { para: 0, offset: 0 },
     });
 }
 
@@ -123,6 +131,7 @@ export function App() {
                 </For>
                 <SelectionOverlay store={store} />
                 <CaretOverlay store={store} />
+                <HiddenInput client={client} store={store} />
             </div>
             <Show when={booting()}>
                 <div class="boot-overlay">Loading editor…</div>

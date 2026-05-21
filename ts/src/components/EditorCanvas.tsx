@@ -65,5 +65,7 @@ export function EditorCanvas(props: EditorCanvasProps) {
         detachPointer?.();
     });
 
-    return <canvas ref={canvasRef} class="editor-canvas" tabindex="-1" />;
+    /* No `tabindex` — a focusable canvas would steal focus from the hidden
+       textarea on click, killing keyboard input. The textarea owns focus. */
+    return <canvas ref={canvasRef} class="editor-canvas" />;
 }

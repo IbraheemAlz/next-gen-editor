@@ -52,6 +52,14 @@ struct SelectionState {
     caret: BridgeLogicalPos,
 }
 
+/// An in-progress IME composition (PHASE_4_HEADLESS_UI.md §6). Tracked
+/// between `BeginComposition` and `EndComposition`; the latest `text` is
+/// committed on a committing end. No on-canvas preview — see BACKLOG.md.
+struct CompositionState {
+    at: BridgeLogicalPos,
+    text: String,
+}
+
 /// A candidate caret position on a line — an absolute x (canvas device px)
 /// paired with the source byte offset a caret there maps to.
 #[derive(Clone, Copy)]
@@ -84,6 +92,7 @@ pub struct Engine {
     vello: Option<VelloRenderer>,
     dirty: DirtyTracker,
     selection: Option<SelectionState>,
+    composition: Option<CompositionState>,
 }
 
 #[wasm_bindgen]
@@ -105,6 +114,7 @@ impl Engine {
             vello: None,
             dirty: DirtyTracker::new(),
             selection: None,
+            composition: None,
         })
     }
 
@@ -436,6 +446,19 @@ fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, Bridg
     }
 }
 
+/// Clamp a position into `doc` — paragraph index and byte offset both in range.
+fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    if doc.paragraphs.is_empty() {
+        return BridgeLogicalPos { para: 0, offset: 0 };
+    }
+    let para = (pos.para as usize).min(doc.paragraphs.len() - 1);
+    let offset = pos.offset.min(doc.paragraphs[para].text.len() as u32);
+    BridgeLogicalPos {
+        para: para as u32,
+        offset,
+    }
+}
+
 impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         match cmd {
@@ -485,7 +508,13 @@ impl Engine {
                 align,
             } => self.render_page(text, font_id, base_direction, px_size, line_height, align),
 
-            Command::InsertText { at, text } => self.insert_text(at, text),
+            Command::InsertText { at, text } => match at {
+                /* A set `at` is the interactive caret path — selection-aware,
+                emits SelectionChanged. `None` is the Phase-1 harness path
+                (append at end-of-document, emits TextInserted). */
+                Some(p) => self.do_insert_text_interactive(p, text),
+                None => self.insert_text(None, text),
+            },
             Command::Undo => self.do_undo(),
             Command::Redo => self.do_redo(),
 
@@ -524,18 +553,20 @@ impl Engine {
             Command::SaveDocument { .. } => phase3_stub("SaveDocument"),
             Command::ExportPdf { .. } => self.do_export_pdf(),
             Command::CloseDocument => phase3_stub("CloseDocument"),
-            Command::DeleteRange { .. } => phase3_stub("DeleteRange"),
+            Command::DeleteRange { range } => self.do_delete_range(range),
             Command::ReplaceRange { .. } => phase3_stub("ReplaceRange"),
             Command::ApplyFormatting { range, attrs } => self.apply_formatting(range, attrs),
-            Command::SplitParagraph { .. } => phase3_stub("SplitParagraph"),
+            Command::SplitParagraph { at } => self.do_split_paragraph(at),
             Command::MergeParagraph { .. } => phase3_stub("MergeParagraph"),
             Command::InsertImage { .. } => phase3_stub("InsertImage"),
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => phase3_stub("SelectAll"),
-            Command::BeginComposition { .. } => phase3_stub("BeginComposition"),
-            Command::UpdateComposition { .. } => phase3_stub("UpdateComposition"),
-            Command::EndComposition { .. } => phase3_stub("EndComposition"),
+            Command::BeginComposition { at } => self.do_begin_composition(at),
+            Command::UpdateComposition { text, target_range } => {
+                self.do_update_composition(text, target_range)
+            }
+            Command::EndComposition { commit } => self.do_end_composition(commit),
             Command::SetViewport { .. } => phase3_stub("SetViewport"),
             Command::SetZoom { .. } => phase3_stub("SetZoom"),
             Command::RequestPaint { viewport, dirty } => self.do_request_paint(viewport, dirty),
@@ -545,6 +576,9 @@ impl Engine {
             // Phase 4 — PHASE_4_HEADLESS_UI.md §7. Additive pointer commands.
             Command::HitTest { at } => self.do_hit_test(at),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
+            Command::DeleteAtCaret { forward, by_word } => {
+                self.do_delete_at_caret(forward, by_word)
+            }
         }
     }
 
@@ -757,11 +791,7 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
-        Event::UndoStateChanged {
-            can_undo: self.undo.can_undo(),
-            can_redo: self.undo.can_redo(),
-            undo_depth: self.undo.depth(),
-        }
+        self.after_history_change()
     }
 
     fn do_redo(&mut self) -> Event {
@@ -770,11 +800,7 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
-        Event::UndoStateChanged {
-            can_undo: self.undo.can_undo(),
-            can_redo: self.undo.can_redo(),
-            undo_depth: self.undo.depth(),
-        }
+        self.after_history_change()
     }
 
     /// D2.5 telemetry. `wasm_heap_bytes` and undo/font counters are real;
@@ -1117,6 +1143,242 @@ impl Engine {
             language: String::new(),
         }
     }
+
+    /// Commit a document edit: push undo, collapse the caret at `caret`,
+    /// invalidate + repaint, then emit `SelectionChanged`.
+    fn commit_edit(&mut self, new_doc: DocumentTree, caret: BridgeLogicalPos) -> Event {
+        self.undo.push(new_doc);
+        let caret = clamp_pos(self.undo.current(), caret);
+        self.selection = Some(SelectionState {
+            anchor: caret,
+            caret,
+        });
+        self.dirty.invalidate(full_page_rect());
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// Interactive `InsertText` — replace any non-empty selection with `text`,
+    /// then place the caret after it.
+    fn do_insert_text_interactive(&mut self, at: BridgeLogicalPos, text: String) -> Event {
+        let sel = self.selection.unwrap_or(SelectionState {
+            anchor: at,
+            caret: at,
+        });
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        let base = if start == end {
+            self.undo.current().clone()
+        } else {
+            self.undo
+                .current()
+                .delete_range(to_engine_pos(start), to_engine_pos(end))
+        };
+        let new_doc = base.insert_text(to_engine_pos(start), &text);
+        let caret = BridgeLogicalPos {
+            para: start.para,
+            offset: start.offset + text.len() as u32,
+        };
+        self.commit_edit(new_doc, caret)
+    }
+
+    /// `Command::DeleteRange` — delete an explicit logical range.
+    fn do_delete_range(&mut self, range: BridgeLogicalRange) -> Event {
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self
+            .undo
+            .current()
+            .delete_range(to_engine_pos(start), to_engine_pos(end));
+        self.commit_edit(new_doc, start)
+    }
+
+    /// `Command::SplitParagraph` — break the paragraph at the caret (replacing
+    /// any non-empty selection first); the caret moves to the new paragraph.
+    fn do_split_paragraph(&mut self, at: BridgeLogicalPos) -> Event {
+        let (base, split_at) = match self.selection {
+            Some(s) => {
+                let (start, end) = ordered(s.anchor, s.caret);
+                let doc = if start == end {
+                    self.undo.current().clone()
+                } else {
+                    self.undo
+                        .current()
+                        .delete_range(to_engine_pos(start), to_engine_pos(end))
+                };
+                (doc, start)
+            }
+            None => (self.undo.current().clone(), at),
+        };
+        let new_doc = base.split_paragraph(to_engine_pos(split_at));
+        let caret = BridgeLogicalPos {
+            para: split_at.para + 1,
+            offset: 0,
+        };
+        self.commit_edit(new_doc, caret)
+    }
+
+    /// `Command::DeleteAtCaret` — delete the selection if non-empty, else one
+    /// grapheme (or word) in the `forward` direction from the caret.
+    fn do_delete_at_caret(&mut self, forward: bool, by_word: bool) -> Event {
+        let Some(sel) = self.selection else {
+            return Event::Error {
+                message: "DeleteAtCaret: no active selection".into(),
+            };
+        };
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        if start != end {
+            let new_doc = self
+                .undo
+                .current()
+                .delete_range(to_engine_pos(start), to_engine_pos(end));
+            return self.commit_edit(new_doc, start);
+        }
+        let Some((del_start, del_end)) = self.delete_target(sel.caret, forward, by_word) else {
+            /* Caret at a document edge — nothing to delete. */
+            return self.selection_changed();
+        };
+        let new_doc = self
+            .undo
+            .current()
+            .delete_range(to_engine_pos(del_start), to_engine_pos(del_end));
+        self.commit_edit(new_doc, del_start)
+    }
+
+    /// The range a collapsed-caret delete should remove. `None` at the matching
+    /// document edge. A paragraph-boundary delete returns a cross-paragraph
+    /// range, which `delete_range` resolves as a merge.
+    fn delete_target(
+        &self,
+        caret: BridgeLogicalPos,
+        forward: bool,
+        by_word: bool,
+    ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
+        let doc = self.undo.current();
+        let para = doc.paragraphs.get(caret.para as usize)?;
+        let para_len = para.text.len() as u32;
+        if forward {
+            if caret.offset < para_len {
+                let to = if by_word {
+                    para.word_bounds(caret.offset).1
+                } else {
+                    para.next_offset(caret.offset)
+                };
+                Some((
+                    caret,
+                    BridgeLogicalPos {
+                        para: caret.para,
+                        offset: to,
+                    },
+                ))
+            } else if (caret.para as usize) + 1 < doc.paragraphs.len() {
+                Some((
+                    caret,
+                    BridgeLogicalPos {
+                        para: caret.para + 1,
+                        offset: 0,
+                    },
+                ))
+            } else {
+                None
+            }
+        } else if caret.offset > 0 {
+            let from = if by_word {
+                para.word_bounds(para.prev_offset(caret.offset)).0
+            } else {
+                para.prev_offset(caret.offset)
+            };
+            Some((
+                BridgeLogicalPos {
+                    para: caret.para,
+                    offset: from,
+                },
+                caret,
+            ))
+        } else if caret.para > 0 {
+            let prev_len = doc
+                .paragraphs
+                .get(caret.para as usize - 1)
+                .map_or(0, |p| p.text.len() as u32);
+            Some((
+                BridgeLogicalPos {
+                    para: caret.para - 1,
+                    offset: prev_len,
+                },
+                caret,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// `Command::BeginComposition` — start tracking an IME composition.
+    fn do_begin_composition(&mut self, at: BridgeLogicalPos) -> Event {
+        self.composition = Some(CompositionState {
+            at,
+            text: String::new(),
+        });
+        Event::CompositionUpdated {
+            at,
+            text: String::new(),
+            target_range: None,
+        }
+    }
+
+    /// `Command::UpdateComposition` — record the in-progress composed text.
+    fn do_update_composition(
+        &mut self,
+        text: String,
+        target_range: Option<BridgeLogicalRange>,
+    ) -> Event {
+        let at = match &self.composition {
+            Some(c) => c.at,
+            None => self
+                .selection
+                .map_or(BridgeLogicalPos { para: 0, offset: 0 }, |s| s.caret),
+        };
+        self.composition = Some(CompositionState {
+            at,
+            text: text.clone(),
+        });
+        Event::CompositionUpdated {
+            at,
+            text,
+            target_range,
+        }
+    }
+
+    /// `Command::EndComposition` — commit the tracked composed text (when
+    /// `commit`), inserting it at the composition start.
+    fn do_end_composition(&mut self, commit: bool) -> Event {
+        match self.composition.take() {
+            Some(c) if commit && !c.text.is_empty() => {
+                self.do_insert_text_interactive(c.at, c.text)
+            }
+            _ => self.selection_changed(),
+        }
+    }
+
+    /// Re-emit selection after an undo/redo, clamping the caret into the
+    /// restored document. Falls back to `UndoStateChanged` when no selection
+    /// exists (the Phase-1 harness path).
+    fn after_history_change(&mut self) -> Event {
+        match self.selection {
+            Some(sel) => {
+                let doc = self.undo.current();
+                self.selection = Some(SelectionState {
+                    anchor: clamp_pos(doc, sel.anchor),
+                    caret: clamp_pos(doc, sel.caret),
+                });
+                self.selection_changed()
+            }
+            None => Event::UndoStateChanged {
+                can_undo: self.undo.can_undo(),
+                can_redo: self.undo.can_redo(),
+                undo_depth: self.undo.depth(),
+            },
+        }
+    }
 }
 
 struct RenderStats {
@@ -1144,6 +1406,7 @@ mod tests {
             vello: None,
             dirty: DirtyTracker::new(),
             selection: None,
+            composition: None,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine

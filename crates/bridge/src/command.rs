@@ -205,6 +205,16 @@ pub enum Command {
     SelectWordAt {
         at: Point,
     },
+
+    /// Delete relative to the caret (Backspace / Delete). If the selection
+    /// is non-empty it is deleted; otherwise one grapheme — or one word when
+    /// `by_word` — is removed in the `forward` direction. The frozen
+    /// `DeleteRange` needs explicit positions a document-blind UI cannot
+    /// compute for a collapsed caret; this supplies the caret-relative path.
+    DeleteAtCaret {
+        forward: bool,
+        by_word: bool,
+    },
 }
 
 /// Browser/runtime capabilities advertised to the engine at `Init`.

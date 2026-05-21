@@ -141,6 +141,110 @@ impl Paragraph {
         }
         (start as u32, end as u32)
     }
+
+    /// Return a copy with bytes `[s, e)` removed. Style spans are clipped and
+    /// shifted across the deletion.
+    pub fn delete_text(&self, s: u32, e: u32) -> Paragraph {
+        let len = self.text.len() as u32;
+        let s = s.min(len);
+        let e = e.min(len);
+        if s >= e {
+            return self.clone();
+        }
+        let mut text = self.text.clone();
+        text.replace_range(s as usize..e as usize, "");
+        let gap = e - s;
+        /* Map a pre-delete offset to its post-delete position. */
+        let map = |p: u32| -> u32 {
+            if p <= s {
+                p
+            } else if p >= e {
+                p - gap
+            } else {
+                s
+            }
+        };
+        let mut spans = Vec::new();
+        for run in &self.spans {
+            let (ns, ne) = (map(run.start), map(run.end));
+            if ns < ne {
+                spans.push(StyleRun {
+                    start: ns,
+                    end: ne,
+                    style: run.style,
+                });
+            }
+        }
+        Paragraph { text, spans }
+    }
+
+    /// Split into `[0, at)` and `[at, len)`. Spans straddling `at` are split.
+    pub fn split_at(&self, at: u32) -> (Paragraph, Paragraph) {
+        let len = self.text.len() as u32;
+        let at = at.min(len);
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for run in &self.spans {
+            if run.start < at {
+                left.push(StyleRun {
+                    start: run.start,
+                    end: run.end.min(at),
+                    style: run.style,
+                });
+            }
+            if run.end > at {
+                right.push(StyleRun {
+                    start: run.start.max(at) - at,
+                    end: run.end - at,
+                    style: run.style,
+                });
+            }
+        }
+        (
+            Paragraph {
+                text: self.text[..at as usize].to_owned(),
+                spans: left,
+            },
+            Paragraph {
+                text: self.text[at as usize..].to_owned(),
+                spans: right,
+            },
+        )
+    }
+
+    /// Append `other` to a copy of `self`, shifting `other`'s spans right.
+    pub fn concat(&self, other: &Paragraph) -> Paragraph {
+        let shift = self.text.len() as u32;
+        let mut text = self.text.clone();
+        text.push_str(&other.text);
+        let mut spans = self.spans.clone();
+        for run in &other.spans {
+            spans.push(StyleRun {
+                start: run.start + shift,
+                end: run.end + shift,
+                style: run.style,
+            });
+        }
+        Paragraph { text, spans }
+    }
+
+    /// Byte offset of the char boundary immediately before `o` (clamped to 0).
+    pub fn prev_offset(&self, o: u32) -> u32 {
+        let o = (o as usize).min(self.text.len());
+        self.text[..o]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(i, _)| i as u32)
+    }
+
+    /// Byte offset of the char boundary immediately after `o` (clamped to len).
+    pub fn next_offset(&self, o: u32) -> u32 {
+        let o = (o as usize).min(self.text.len());
+        self.text[o..]
+            .chars()
+            .next()
+            .map_or(o as u32, |c| (o + c.len_utf8()) as u32)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -255,6 +359,51 @@ impl DocumentTree {
             let styled = paragraphs[p].apply_style(lo, hi, patch);
             paragraphs.set(p, styled);
         }
+        Self { paragraphs }
+    }
+
+    /// Delete the logical range `[start, end)`. A range spanning paragraphs
+    /// merges the partial first and last paragraphs and drops those between.
+    pub fn delete_range(&self, start: LogicalPos, end: LogicalPos) -> Self {
+        let (start, end) = if (start.para, start.offset) <= (end.para, end.offset) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let mut paragraphs = self.paragraphs.clone();
+        if paragraphs.is_empty() {
+            return self.clone();
+        }
+        let last = paragraphs.len() - 1;
+        let sp = (start.para as usize).min(last);
+        let ep = (end.para as usize).min(last);
+        if sp == ep {
+            let edited = paragraphs[sp].delete_text(start.offset, end.offset);
+            paragraphs.set(sp, edited);
+        } else {
+            let head = paragraphs[sp].split_at(start.offset).0;
+            let tail = paragraphs[ep].split_at(end.offset).1;
+            let merged = head.concat(&tail);
+            for _ in sp..ep {
+                paragraphs.remove(sp + 1);
+            }
+            paragraphs.set(sp, merged);
+        }
+        Self { paragraphs }
+    }
+
+    /// Split the paragraph at `at`, the break falling between the two halves.
+    pub fn split_paragraph(&self, at: LogicalPos) -> Self {
+        let mut paragraphs = self.paragraphs.clone();
+        if paragraphs.is_empty() {
+            paragraphs.push_back(Paragraph::default());
+            paragraphs.push_back(Paragraph::default());
+            return Self { paragraphs };
+        }
+        let idx = (at.para as usize).min(paragraphs.len() - 1);
+        let (left, right) = paragraphs[idx].split_at(at.offset);
+        paragraphs.set(idx, left);
+        paragraphs.insert(idx + 1, right);
         Self { paragraphs }
     }
 }
@@ -466,6 +615,73 @@ mod tests {
             spans: Vec::new(),
         };
         assert_eq!(p.word_bounds(0), (0, 0));
+    }
+
+    #[test]
+    fn delete_within_paragraph() {
+        let d = DocumentTree::from_text("hello world");
+        let d = d.delete_range(
+            LogicalPos { para: 0, offset: 5 },
+            LogicalPos {
+                para: 0,
+                offset: 11,
+            },
+        );
+        assert_eq!(d.paragraph_text(0), Some("hello"));
+    }
+
+    #[test]
+    fn delete_merges_paragraphs() {
+        let d = DocumentTree::from_paragraphs(["abc".to_string(), "def".to_string()]);
+        let d = d.delete_range(
+            LogicalPos { para: 0, offset: 3 },
+            LogicalPos { para: 1, offset: 0 },
+        );
+        assert_eq!(d.paragraph_count(), 1);
+        assert_eq!(d.paragraph_text(0), Some("abcdef"));
+    }
+
+    #[test]
+    fn delete_clips_spans() {
+        let doc = DocumentTree::from_text("hello world");
+        let doc = doc.apply_style(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 5 },
+            SpanStyle {
+                font_size: Some(20.0),
+                color: None,
+            },
+        );
+        let doc = doc.delete_range(
+            LogicalPos { para: 0, offset: 3 },
+            LogicalPos { para: 0, offset: 5 },
+        );
+        assert_eq!(doc.paragraph_text(0), Some("hel world"));
+        let spans = &doc.paragraphs[0].spans;
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (0, 3));
+    }
+
+    #[test]
+    fn split_paragraph_in_two() {
+        let d = DocumentTree::from_text("hello world");
+        let d = d.split_paragraph(LogicalPos { para: 0, offset: 5 });
+        assert_eq!(d.paragraph_count(), 2);
+        assert_eq!(d.paragraph_text(0), Some("hello"));
+        assert_eq!(d.paragraph_text(1), Some(" world"));
+    }
+
+    #[test]
+    fn prev_next_offset_utf8() {
+        /* "a"=1 byte, "م"=2 bytes, "b"=1 byte → char boundaries 0,1,3,4. */
+        let p = Paragraph {
+            text: "aمb".into(),
+            spans: Vec::new(),
+        };
+        assert_eq!(p.next_offset(0), 1);
+        assert_eq!(p.next_offset(1), 3);
+        assert_eq!(p.prev_offset(4), 3);
+        assert_eq!(p.prev_offset(3), 1);
     }
 
     #[test]

@@ -44,3 +44,20 @@
     pointer-events: none;
     z-index: 1;
 }
+
+/* Phase 4 §6 — hidden textarea: the OS text-input surface. opacity 0.01
+   (not 0 — Safari drops events on opacity:0); positioned at the caret so IME
+   composition popups anchor there. */
+.hidden-input {
+    position: absolute;
+    opacity: 0.01;
+    pointer-events: none;
+    width: 1px;
+    height: 1em;
+    font-size: 16px;
+    border: 0;
+    outline: 0;
+    resize: none;
+    overflow: hidden;
+    z-index: 1;
+}

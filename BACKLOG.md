@@ -119,3 +119,18 @@ emits one rect per visual segment. Needs: clipping the selected byte range
 against each line's `VisualRun`s and emitting a rect per run-clipped sub-span.
 The `SelectionOverlay` already renders an N-rect list, so only the engine side
 changes.
+
+## 8. IME composition — inline on-canvas preview
+
+**Shipped (D4.4 commit-on-end):** the engine tracks an IME composition
+(`BeginComposition` / `UpdateComposition` / `EndComposition`) and commits the
+composed string on a committing end. The in-progress text shows in the OS IME
+candidate popup, which anchors at the caret-tracked hidden textarea. Arabic
+(direct `insertText`, no composition) and CJK both commit correctly.
+
+**Deferred:** rendering the in-progress composition inline on the canvas — the
+provisional underlined text appearing in the document flow as it is typed,
+re-rendered on every `UpdateComposition`. Needs a transient composition layer
+threaded through layout + render so the engine can paint text that is not in
+the document model, plus `target_range` underline styling. Until then a
+composition is visible only in the OS popup, not in the page itself.
