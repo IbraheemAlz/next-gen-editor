@@ -765,6 +765,38 @@ mod tests {
     }
 
     #[test]
+    fn apply_style_bold_italic_underline() {
+        let doc = DocumentTree::from_text("hello world");
+        /* Apply bold over [0,5). */
+        let doc = doc.apply_style(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 5 },
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(doc.paragraphs[0].spans.len(), 1);
+        assert_eq!(doc.paragraphs[0].spans[0].style.bold, Some(true));
+        /* Overlay italic + underline on the same range — they merge in. */
+        let doc = doc.apply_style(
+            LogicalPos { para: 0, offset: 0 },
+            LogicalPos { para: 0, offset: 5 },
+            SpanStyle {
+                italic: Some(true),
+                underline: Some(true),
+                ..Default::default()
+            },
+        );
+        let style = doc.paragraphs[0].style_at(2);
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(style.italic, Some(true));
+        assert_eq!(style.underline, Some(true));
+        /* Outside the styled range — unstyled. */
+        assert_eq!(doc.paragraphs[0].style_at(8), SpanStyle::default());
+    }
+
+    #[test]
     fn undo_redo_cycle() {
         let initial = DocumentTree::from_text("abc");
         let mut undo = UndoStack::new(initial.clone(), 16);
