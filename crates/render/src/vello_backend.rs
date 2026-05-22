@@ -73,6 +73,14 @@ pub fn render_vello(
     }
 }
 
+/// Wrap leaked-`'static` font bytes as a [`peniko::FontData`] for the Vello
+/// glyph path. Zero-copy: the bytes already live for the engine's lifetime, so
+/// the `Blob` borrows them through an `Arc` rather than copying the face every
+/// frame. Index `0` — the first (only) face in the file.
+pub fn font_data(bytes: &'static [u8]) -> FontData {
+    FontData::new(peniko::Blob::new(std::sync::Arc::new(bytes)), 0)
+}
+
 /// A persistent WebGPU device + Vello renderer bound to one `OffscreenCanvas`.
 ///
 /// P3-4: this exists to make the `wgpu` + `vello` GPU stack reachable so the

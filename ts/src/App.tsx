@@ -127,6 +127,7 @@ export function App() {
         if (generation === 0) {
             window.__bootMs = initMs;
             window.__engineReady = true;
+            window.__renderer = client.renderer;
         }
         await setupEngine(client);
         setBooting(false);

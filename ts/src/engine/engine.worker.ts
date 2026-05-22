@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 
-import init, { Engine } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import init, { Engine, detect_backend } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import type { Command, Event } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
@@ -370,13 +370,23 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
                 import.meta.url,
             ),
         });
-        engine = new Engine(msg.canvas);
+        /* Pick the renderer once, before the canvas takes a context: Vello
+           (WebGPU) when a GPU device is available, else the Canvas2D fallback.
+           transferControlToOffscreen is one-shot, so this choice is permanent
+           for the canvas (Backlog #4). */
+        const renderer = await detect_backend();
+        engine =
+            renderer === 'vello'
+                ? await Engine.with_vello(msg.canvas)
+                : new Engine(msg.canvas);
         await openEventLog(msg.documentId);
-        /* Report worker-context cross-origin isolation (D2.3) in the reply. */
+        /* Report worker-context cross-origin isolation (D2.3) + the chosen
+           renderer (Backlog #4) in the reply. */
         self.postMessage({
             id: msg.id,
             ok: true,
             crossOriginIsolated: self.crossOriginIsolated,
+            renderer,
         });
     } catch (e: unknown) {
         replyError(msg.id, e);

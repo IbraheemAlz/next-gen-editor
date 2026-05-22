@@ -147,8 +147,33 @@ fn new_layout_cache() -> RefCell<LruCache<u64, ParagraphBox>> {
     ))
 }
 
+/// Assemble an `Engine` around a chosen renderer surface. Exactly one of `ctx`
+/// (Canvas2D) and `vello` (WebGPU) is `Some` — the backend is picked once at
+/// INIT, since an `OffscreenCanvas` is one-context-for-life.
+fn assemble_engine(
+    ctx: Option<OffscreenCanvasRenderingContext2d>,
+    vello: Option<VelloRenderer>,
+) -> Engine {
+    Engine {
+        ctx,
+        fonts: HashMap::new(),
+        undo: UndoStack::new(DocumentTree::new(), 100),
+        layout_cfg: None,
+        atlas: GlyphAtlas::new(),
+        vello,
+        dirty: DirtyTracker::new(),
+        selection: None,
+        composition: None,
+        pending_format: None,
+        layout_cache: new_layout_cache(),
+        a11y_cache: None,
+    }
+}
+
 #[wasm_bindgen]
 impl Engine {
+    /// Construct a Canvas2D engine — the always-available CPU renderer. The
+    /// worker uses this directly, or falls back to it when WebGPU is absent.
     #[wasm_bindgen(constructor)]
     pub fn new(canvas: web_sys::OffscreenCanvas) -> Result<Engine, JsValue> {
         let ctx_obj = canvas
@@ -157,20 +182,7 @@ impl Engine {
         let ctx: OffscreenCanvasRenderingContext2d = ctx_obj.dyn_into()?;
         ctx.set_fill_style_str("#ffffff");
         ctx.fill_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
-        Ok(Engine {
-            ctx: Some(ctx),
-            fonts: HashMap::new(),
-            undo: UndoStack::new(DocumentTree::new(), 100),
-            layout_cfg: None,
-            atlas: GlyphAtlas::new(),
-            vello: None,
-            dirty: DirtyTracker::new(),
-            selection: None,
-            composition: None,
-            pending_format: None,
-            layout_cache: new_layout_cache(),
-            a11y_cache: None,
-        })
+        Ok(assemble_engine(Some(ctx), None))
     }
 
     pub async fn dispatch(&mut self, cmd: JsValue) -> Result<JsValue, JsValue> {
@@ -180,47 +192,34 @@ impl Engine {
         serde_wasm_bindgen::to_value(&evt)
             .map_err(|e| JsValue::from_str(&format!("encode event: {e}")))
     }
-
-    /// P3-5: detect the best renderer backend — `vello` when a WebGPU device
-    /// is acquired, else `canvas2d`. Worker-safe (no `web_sys::window()`).
-    /// Vello rendering itself is routed in a later batch; Canvas2D stays the
-    /// active path for now.
-    pub async fn detect_renderer(&self) -> String {
-        render::backend::detect_backend().await.as_str().to_string()
-    }
-
-    /// Whether the Vello (WebGPU) pipeline has been initialized via
-    /// [`Engine::init_vello`]. Always `false` on the active Canvas2D path;
-    /// `init_vello` is a P3-4 reachability root the worker does not call.
-    pub fn vello_ready(&self) -> bool {
-        self.vello.is_some()
-    }
 }
 
-/// P3-4 dead-code-elimination retention root.
+/// Vello (WebGPU) activation — wasm-only, since WebGPU surface creation is.
 ///
-/// `init_vello` is a `#[wasm_bindgen]` export, so `wasm-ld --gc-sections`
-/// retains it and everything it transitively calls: `VelloRenderer::new`
-/// (WebGPU device + surface + `vello::Renderer`) and `VelloRenderer::render`
-/// (scene encoding + `render_to_texture` + surface blit). With no reachable
-/// caller the linker strips the whole `wgpu` + `vello` stack and the WASM
-/// artifact understates its true size. The worker never calls this, so
-/// Canvas2D stays the active renderer and the visual-diff goldens are
-/// unaffected.
+/// An `OffscreenCanvas` is one-context-for-life: `Engine::new` claims a `2d`
+/// context, so the Vello path needs its own constructor that hands the still-
+/// uncontexted canvas straight to `wgpu`. The worker chooses between the two
+/// at INIT, after [`detect_backend`].
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl Engine {
-    /// Build the Vello (WebGPU) pipeline for `canvas` and run one frame.
-    /// Reachability root only — see the impl-block docs.
-    pub async fn init_vello(&mut self, canvas: web_sys::OffscreenCanvas) -> Result<(), JsValue> {
-        let mut vr = VelloRenderer::new(canvas)
+    /// Construct an engine that renders through Vello on `canvas`. `canvas`
+    /// must not have had a context taken — `wgpu` claims a `webgpu` one.
+    pub async fn with_vello(canvas: web_sys::OffscreenCanvas) -> Result<Engine, JsValue> {
+        let vr = VelloRenderer::new(canvas)
             .await
             .map_err(|e| JsValue::from_str(&e))?;
-        vr.render(&render::scene::DisplayList::default(), |_| None)
-            .map_err(|e| JsValue::from_str(&e))?;
-        self.vello = Some(vr);
-        Ok(())
+        Ok(assemble_engine(None, Some(vr)))
     }
+}
+
+/// Detect the best renderer from inside the Web Worker — `"vello"` when a
+/// WebGPU device is acquired, `"canvas2d"` otherwise. Canvas-free, so the
+/// worker calls it *before* constructing the engine and claiming a context.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn detect_backend() -> String {
+    render::backend::detect_backend().await.as_str().to_string()
 }
 
 const POC_BASELINE_X: f64 = 50.0;
@@ -1301,6 +1300,33 @@ impl Engine {
             .sum();
 
         let scene = build_page_scene(&page_box);
+        let stats = RenderStats {
+            page_width: page_box.size.width,
+            page_height: page_box.size.height,
+            line_count,
+            glyph_count,
+        };
+
+        /* Vello path: encode the whole display list and present it over
+        WebGPU. Vello runs its own GPU-side glyph cache, so the Canvas2D
+        `GlyphAtlas` stays untouched. Clipped partial repaint is not wired on
+        this path yet — Vello redraws the full scene each frame. */
+        if let Some(vr) = self.vello.as_mut() {
+            let fonts = &self.fonts;
+            vr.render(&scene, |id| {
+                fonts
+                    .get(id)
+                    .map(|f| render::vello_backend::font_data(f.data_static()))
+            })
+            .map_err(|e| {
+                Box::new(Event::Error {
+                    message: format!("vello paint: {e}"),
+                })
+            })?;
+            return Ok(stats);
+        }
+
+        /* Canvas2D path — clipped to the dirty region (D3.8). */
         let clip_rect = clip.unwrap_or_else(|| {
             Rect::new(
                 0.0,
@@ -1329,12 +1355,7 @@ impl Engine {
             }));
         }
 
-        Ok(RenderStats {
-            page_width: page_box.size.width,
-            page_height: page_box.size.height,
-            line_count,
-            glyph_count,
-        })
+        Ok(stats)
     }
 
     /// Export the current document to a single-page PDF (D3.7). Always laid

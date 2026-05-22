@@ -20,6 +20,8 @@ type WorkerReply = {
     trap?: boolean;
     /** Worker-context cross-origin isolation, reported in the INIT reply. */
     crossOriginIsolated?: boolean;
+    /** Active renderer the worker picked at INIT — `vello` or `canvas2d`. */
+    renderer?: string;
 };
 type Resolver = (v: WorkerReply) => void;
 
@@ -32,6 +34,7 @@ export class EngineClient {
     private onCrash: () => void;
     private recovering = false;
     private workerIsolated = false;
+    private activeRenderer = 'canvas2d';
 
     /**
      * @param documentId identifies the IndexedDB event log for this document.
@@ -57,11 +60,18 @@ export class EngineClient {
     async init(canvas: OffscreenCanvas): Promise<void> {
         const r = await this.send({ type: 'INIT', canvas, documentId: this.documentId }, [canvas]);
         this.workerIsolated = r.crossOriginIsolated === true;
+        this.activeRenderer = r.renderer ?? 'canvas2d';
     }
 
     /** D2.3: whether the engine worker reported `crossOriginIsolated === true`. */
     get crossOriginIsolated(): boolean {
         return this.workerIsolated;
+    }
+
+    /** Backlog #4: the renderer the worker picked at INIT — `vello` or
+     *  `canvas2d`. Set by `init()`; `canvas2d` before INIT completes. */
+    get renderer(): string {
+        return this.activeRenderer;
     }
 
     /**

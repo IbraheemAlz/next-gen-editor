@@ -89,6 +89,13 @@ impl LoadedFont {
         self.data
     }
 
+    /// The font bytes as a `'static` slice. The bytes are leaked at parse
+    /// (see [`Self::parse`]), so this hands out their real `'static` lifetime —
+    /// the Vello path needs it to build a zero-copy `peniko::Blob`.
+    pub fn data_static(&self) -> &'static [u8] {
+        self.data
+    }
+
     fn face(&self) -> FontRef<'_> {
         FontRef::from_index(self.data, 0).expect("validated in parse")
     }

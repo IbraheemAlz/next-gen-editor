@@ -39,6 +39,11 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
 - **Sprint 9 (2026-05-22)** — Fine-grained accessibility deltas (item 10): the
   per-mutation broadcast is now an `AccessibilityTreeDelta` of `A11yPatch`es; a
   keystroke patches one mirror `<p>` instead of rebuilding the whole tree.
+- **Sprint 10 (2026-05-22)** — Vello/WebGPU runtime activation (item 4): the
+  worker detects the backend at INIT and builds the engine via
+  `Engine::with_vello` or `Engine::new`; `render_document` dispatches to either
+  surface. #4 stays open — Canvas2D is still the default, pending a GPU-runner
+  golden suite.
 
 ## 1. Rich text formatting
 
@@ -127,22 +132,37 @@ source tree — CLAUDE.md's no-blobs rule holds without an exception.
 
 ## 4. Vello (WebGPU) render path
 
-**Shipped (P3-4):** the full `wgpu` + `vello` pipeline is implemented and kept
-reachable via `Engine::init_vello` (a dead-code-elimination retention root).
-Canvas2D remains the hardcoded active renderer; the worker never calls
-`init_vello`.
+**Shipped (P3-4):** the full `wgpu` + `vello` pipeline — `render::vello_backend`
+encodes a `DisplayList` into a `vello::Scene` and presents it through a `wgpu`
+surface; `render::backend::detect_backend` is the worker-safe WebGPU probe.
 
-**Deferred:** making Vello the default active path. Blockers identified:
+**✅ Shipped (Phase 5 sprint 10) — runtime activation.** The worker picks the
+renderer at INIT: `detect_backend()` runs **before** the canvas takes a
+context, then the engine is built via `Engine::with_vello` (WebGPU) or
+`Engine::new` (Canvas2D), and `render_document` dispatches to whichever surface
+the engine holds. The **canvas context conflict** is resolved by construction —
+the `OffscreenCanvas` is handed to exactly one of `getContext("2d")` (inside
+`Engine::new`) or `wgpu` (inside `VelloRenderer::new`), decided once and never
+revisited. Canvas2D stays the default and is byte-for-byte untouched: Vello is
+chosen only on a fresh interactive INIT; crash recovery and the visual-diff
+`?test=` harness both stay on Canvas2D. The old `init_vello` DCE-retention root
+is gone — superseded by the real path.
 
-- **Canvas context conflict.** A canvas element is one-context-for-life — a
-  `2d` and a `webgpu` context cannot coexist on the same element, so renderer
-  activation must choose at INIT.
-- **Separate golden suite.** Vello (skrifa, GPU compute) rasterizes glyphs
-  differently from Canvas2D (Skia). The current 0.000 %-diff goldens will not
-  match a Vello render; a Vello-specific suite at ~0.5 % tolerance
-  (PHASE_3_RENDER_RTL.md §2, D3.4) is required.
-- **Runtime availability.** WebGPU in a Web Worker with `OffscreenCanvas` under
-  headless Chrome is unverified.
+**Still deferred — #4 stays open until Vello is the *default*:**
+
+- **Separate golden suite.** Vello (GPU compute) rasterizes glyphs differently
+  from Canvas2D (Skia); the 0.000 %-diff goldens will not match a Vello render.
+  A Vello-specific corpus under `tools/visual-diff/golden/vello/` at ~0.5 %
+  tolerance (PHASE_3_RENDER_RTL.md §2, D3.4) is required — generated and run on
+  a **GPU CI runner**, since the `?test=` harness has no Vello mode and this
+  environment has no WebGPU.
+- **Runtime verification.** WebGPU in a Web Worker with `OffscreenCanvas` is
+  still unverified — no WebGPU adapter is available in the dev/CI environment,
+  so `detect_backend()` resolves to `canvas2d` here. The activation path
+  compiles and is reachable; confirming a real GPU frame needs WebGPU-capable
+  hardware.
+- **Promoting Vello to default.** Canvas2D stays the default until the Vello
+  golden suite is green on a GPU runner.
 
 ## 5. Line height — dynamic from run metrics
 
