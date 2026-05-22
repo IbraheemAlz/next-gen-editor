@@ -4,7 +4,7 @@
 //! `word/document.xml` is regenerated.
 
 use crate::reader::{DOC_XML, DocxArchive, DocxError};
-use engine::DocumentTree;
+use engine::{DocumentTree, FontFamily, Paragraph, SpanStyle};
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
 
@@ -17,12 +17,17 @@ const DOC_XML_HEADER: &str = concat!(
 );
 const DOC_XML_FOOTER: &str = "<w:sectPr/></w:body></w:document>";
 
-/// Serialize one paragraph as a single-run `<w:p><w:r><w:t xml:space="preserve">…</w:t></w:r></w:p>`.
-/// `xml:space="preserve"` keeps leading/trailing whitespace; matters for Arabic
-/// trailing-shadda etc.
-fn serialize_paragraph(text: &str, out: &mut String) {
-    out.push_str("<w:p><w:r><w:t xml:space=\"preserve\">");
-    /* XML escape: &, <, >. Quotes don't matter inside character data. */
+fn family_docx_name(f: FontFamily) -> &'static str {
+    match f {
+        FontFamily::Amiri => "Amiri",
+        FontFamily::LiberationSans => "Liberation Sans",
+        FontFamily::NotoNaskhArabic => "Noto Naskh Arabic",
+    }
+}
+
+/// XML-escape character data (`&`, `<`, `>`) into `out`. Quotes don't matter
+/// inside character data.
+fn push_escaped(text: &str, out: &mut String) {
     for c in text.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -31,14 +36,94 @@ fn serialize_paragraph(text: &str, out: &mut String) {
             _ => out.push(c),
         }
     }
-    out.push_str("</w:t></w:r></w:p>");
+}
+
+/// Emit a `<w:rPr>` block for `style`, or nothing when it is the default.
+/// Children follow the CT_RPr schema order (rFonts, b, i, strike, color, u,
+/// shd). A background colour is written as `<w:shd w:fill>` — that carries
+/// arbitrary hex, where `<w:highlight>` is limited to a named palette.
+fn emit_rpr(style: &SpanStyle, out: &mut String) {
+    if *style == SpanStyle::default() {
+        return;
+    }
+    out.push_str("<w:rPr>");
+    if let Some(f) = style.font_family {
+        let n = family_docx_name(f);
+        out.push_str("<w:rFonts w:ascii=\"");
+        out.push_str(n);
+        out.push_str("\" w:hAnsi=\"");
+        out.push_str(n);
+        out.push_str("\" w:cs=\"");
+        out.push_str(n);
+        out.push_str("\"/>");
+    }
+    if style.bold == Some(true) {
+        out.push_str("<w:b/>");
+    }
+    if style.italic == Some(true) {
+        out.push_str("<w:i/>");
+    }
+    if style.strike == Some(true) {
+        out.push_str("<w:strike/>");
+    }
+    if let Some([r, g, b, _]) = style.color {
+        out.push_str(&format!("<w:color w:val=\"{r:02X}{g:02X}{b:02X}\"/>"));
+    }
+    if style.underline == Some(true) {
+        out.push_str("<w:u w:val=\"single\"/>");
+    }
+    if let Some([r, g, b, _]) = style.bg_color {
+        out.push_str(&format!(
+            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
+        ));
+    }
+    out.push_str("</w:rPr>");
+}
+
+/// Serialize one run: `<w:r>[<w:rPr>…]<w:t xml:space="preserve">…</w:t></w:r>`.
+/// `xml:space="preserve"` keeps leading/trailing whitespace; matters for
+/// Arabic trailing-shadda etc.
+fn serialize_run(text: &str, style: &SpanStyle, out: &mut String) {
+    out.push_str("<w:r>");
+    emit_rpr(style, out);
+    out.push_str("<w:t xml:space=\"preserve\">");
+    push_escaped(text, out);
+    out.push_str("</w:t></w:r>");
+}
+
+/// Serialize one paragraph. A span-free paragraph emits a single default run —
+/// byte-identical to the pre-`rPr` writer, so the round-trip harness's plain
+/// fixtures see no drift. A styled paragraph emits one `<w:r>` per maximal
+/// (range, style) segment, the default-styled gaps included.
+fn serialize_paragraph(para: &Paragraph, out: &mut String) {
+    out.push_str("<w:p>");
+    if para.spans.is_empty() {
+        serialize_run(&para.text, &SpanStyle::default(), out);
+    } else {
+        let len = para.text.len();
+        let mut cursor = 0usize;
+        for run in &para.spans {
+            let (rs, re) = (run.start as usize, run.end as usize);
+            if rs > cursor {
+                serialize_run(&para.text[cursor..rs], &SpanStyle::default(), out);
+            }
+            if re > rs {
+                serialize_run(&para.text[rs..re], &run.style, out);
+            }
+            cursor = re;
+        }
+        if cursor < len {
+            serialize_run(&para.text[cursor..len], &SpanStyle::default(), out);
+        }
+    }
+    out.push_str("</w:p>");
 }
 
 fn build_document_xml(doc: &DocumentTree) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str(DOC_XML_HEADER);
     for para in &doc.paragraphs {
-        serialize_paragraph(&para.text, &mut out);
+        serialize_paragraph(para, &mut out);
     }
     out.push_str(DOC_XML_FOOTER);
     out
@@ -110,6 +195,78 @@ const DOC_RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="y
 mod tests {
     use super::*;
     use crate::reader::read_docx;
+    use engine::{Paragraph, StyleRun};
+
+    #[test]
+    fn round_trip_run_properties() {
+        /* "hello world": bold + red over "hello", underline over "world". */
+        let bold_red = SpanStyle {
+            bold: Some(true),
+            color: Some([255, 0, 0, 255]),
+            ..Default::default()
+        };
+        let ul = SpanStyle {
+            underline: Some(true),
+            ..Default::default()
+        };
+        let para = Paragraph {
+            text: "hello world".into(),
+            spans: vec![
+                StyleRun {
+                    start: 0,
+                    end: 5,
+                    style: bold_red,
+                },
+                StyleRun {
+                    start: 6,
+                    end: 11,
+                    style: ul,
+                },
+            ],
+            alignment: None,
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("read");
+        let p = &parsed.document.paragraphs[0];
+        assert_eq!(p.text, "hello world");
+        assert_eq!(p.style_at(0), bold_red);
+        assert_eq!(p.style_at(4), bold_red);
+        assert_eq!(p.style_at(5), SpanStyle::default());
+        assert_eq!(p.style_at(6), ul);
+    }
+
+    #[test]
+    fn round_trip_highlight_and_family() {
+        let styled = SpanStyle {
+            bg_color: Some([255, 235, 120, 255]),
+            font_family: Some(FontFamily::LiberationSans),
+            ..Default::default()
+        };
+        let para = Paragraph {
+            text: "abc".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 3,
+                style: styled,
+            }],
+            alignment: None,
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("read");
+        assert_eq!(parsed.document.paragraphs[0].style_at(1), styled);
+    }
+
+    #[test]
+    fn plain_paragraph_emits_no_run_properties() {
+        /* A span-free paragraph must serialize without a <w:rPr> so the
+        round-trip harness's plain fixtures stay byte-stable. */
+        let doc = DocumentTree::from_text("plain text");
+        let xml = build_document_xml(&doc);
+        assert!(!xml.contains("<w:rPr>"));
+        assert!(xml.contains("<w:p><w:r><w:t xml:space=\"preserve\">plain text</w:t></w:r></w:p>"));
+    }
 
     #[test]
     fn round_trip_minimal() {

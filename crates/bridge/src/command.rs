@@ -245,6 +245,18 @@ pub enum Command {
         range: LogicalRange,
         align: Alignment,
     },
+
+    // ===================================================================
+    // Backlog sprint 7 — interoperability (Backlog #12). Additive: rich
+    // HTML paste. Copy/cut keep using `GetSelectionAsClipboard`, whose
+    // `ClipboardPayload` reply now also carries the `html` + `docx_fragment`.
+    // ===================================================================
+    /// Paste HTML at the caret, replacing any non-empty selection. The engine
+    /// parses the markup into styled paragraphs (`engine::html`) and splices
+    /// them in — the rich counterpart of [`Command::PastePlain`].
+    PasteHtml {
+        html: String,
+    },
 }
 
 /// Browser/runtime capabilities advertised to the engine at `Init`.

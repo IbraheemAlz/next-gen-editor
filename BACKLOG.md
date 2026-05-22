@@ -28,8 +28,11 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
   still deferred).
 - **Sprint 6 (2026-05-22)** — Text decorations and per-span font family:
   underline + strikethrough strokes and background-colour highlight (item 1 —
-  the render sub-items; the docx `<w:rPr>` round-trip stays deferred); the
-  toolbar `FontFamilyPicker` (item 9, now complete).
+  the render sub-items; the docx `<w:rPr>` round-trip followed in sprint 7);
+  the toolbar `FontFamilyPicker` (item 9, now complete).
+- **Sprint 7 (2026-05-22)** — Interoperability: the docx `<w:rPr>`
+  run-property round-trip closes item 1; rich clipboard — HTML + `.docx`-
+  fragment copy and an HTML-parsing `PasteHtml` — closes item 12.
 
 ## 1. Rich text formatting
 
@@ -37,9 +40,9 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
 in the document model, `Command::ApplyFormatting` (split / merge / coalesce),
 and per-span **font size + colour** carried through layout and render.
 
-**Partly shipped.** Bold / italic faces (sprint 3) and underline /
-strikethrough / background colour (sprint 6) all render; only the docx
-`<w:rPr>` round-trip is still deferred.
+**✅ Fully shipped.** Per-span styling renders (size, colour, bold/italic
+faces, underline, strikethrough, background colour) and now survives the
+`.docx` round-trip — every numbered sub-item below is complete.
 
 - **✅ Bold / italic face resolution — shipped (Phase 5 sprint 3).** `FontStack`
   now resolves a face by script **and** weight/slant; `LoadedFont` reports its
@@ -56,9 +59,14 @@ strikethrough / background colour (sprint 6) all render; only the docx
   emits a `FillRect` spanning the run's advance and the line height *before*
   its glyphs; `paint_alpha_glyph` then composites each glyph over the
   highlight, so `put_image_data` does not punch transparent holes through it.
-- **docx `<w:rPr>` round-trip.** `format-docx` flattens runs to plain text;
-  `Paragraph.spans` is empty on import and ignored on export. A faithful
-  reader/writer would map `<w:rPr>` to and from `StyleRun`s.
+- **✅ docx `<w:rPr>` round-trip — shipped (Phase 5 sprint 7).** The
+  `format-docx` reader maps each `<w:r>`'s `<w:rPr>` (`<w:b>`, `<w:i>`,
+  `<w:u>`, `<w:strike>`, `<w:color>`, `<w:highlight>` / `<w:shd>`,
+  `<w:rFonts>`) onto a `SpanStyle`; the writer emits one `<w:r>` per style
+  segment with the matching `<w:rPr>`. A span-free paragraph still serializes
+  as a single bare run, so the round-trip harness's plain fixtures stay
+  byte-stable. Font *size* is excluded — `px` ↔ half-point reconciliation is a
+  separate follow-up.
 
 ## 2. Kashida justification — Tatweel glyph insertion
 
@@ -227,15 +235,22 @@ the selection text, `copy`/`cut` write it via `navigator.clipboard.writeText`,
 `paste` reads `readText` into `PastePlain`. Bound to the hidden textarea's
 native `copy` / `cut` / `paste` events.
 
-**Deferred:**
+**✅ Fully shipped** — rich copy/paste landed in Phase 5 sprint 7.
 
-- **Rich copy.** `ClipboardPayload.html` / `docx_fragment` are returned empty.
-  A faithful copy generates an HTML fragment and a `.docx` clipboard fragment,
-  written together via a multi-MIME `ClipboardItem` + `navigator.clipboard.write`.
-- **`PasteHtml` / `PasteDocxFragment`.** Pasting rich content from another app
-  (HTML, or a Word `.docx` fragment) needs these two commands plus an
-  HTML / `.docx`-fragment parser mapping to `StyleRun`s. The plain path already
-  covers every paste as text — every clipboard write carries `text/plain`.
+- **✅ Rich copy — shipped (Phase 5 sprint 7).** `GetSelectionAsClipboard`
+  fills `ClipboardPayload.html` (semantic HTML from `engine::html::to_html`)
+  and `docx_fragment` (a minimal standalone `.docx` of the selection). `copy`
+  / `cut` write a multi-MIME `ClipboardItem` carrying `text/plain` +
+  `text/html` via `navigator.clipboard.write`.
+- **✅ `PasteHtml` — shipped (Phase 5 sprint 7).** `Command::PasteHtml` parses
+  HTML into styled paragraphs (`engine::html::from_html`, a hand-rolled tag
+  tokenizer over a style stack) and splices them at the caret via
+  `DocumentTree::insert_rich`. `paste` reads `text/html` when present, else
+  `text/plain`. A dedicated `PasteDocxFragment` is intentionally **not** built:
+  no browser exposes a raw `.docx` blob from a system paste — Word and Google
+  Docs both place `text/html` on the clipboard, which `PasteHtml` consumes.
+  The custom-MIME `.docx` clipboard *write* is likewise skipped (negligible
+  browser support); `docx_fragment` is still generated for completeness.
 - **✅ Multi-line paste — shipped (Phase 5 sprint 2).** `DocumentTree::
   insert_multiline` splits pasted text on newlines (`\r\n` / `\r` normalized)
   into separate paragraphs, carrying the caret to the end of the last line;

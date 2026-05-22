@@ -5,6 +5,8 @@
 
 use im::Vector;
 
+pub mod html;
+
 #[derive(Debug, Clone, Default)]
 pub struct DocumentTree {
     pub paragraphs: Vector<Paragraph>,
@@ -337,6 +339,16 @@ impl DocumentTree {
         Self { paragraphs }
     }
 
+    /// Build a document from pre-styled paragraphs — the `.docx` reader (run
+    /// properties → spans) and the HTML paste path both produce these.
+    pub fn from_rich_paragraphs<I: IntoIterator<Item = Paragraph>>(paras: I) -> Self {
+        let mut paragraphs = Vector::new();
+        for p in paras {
+            paragraphs.push_back(p);
+        }
+        Self { paragraphs }
+    }
+
     pub fn paragraph_count(&self) -> u32 {
         self.paragraphs.len() as u32
     }
@@ -511,6 +523,69 @@ impl DocumentTree {
             }
         }
         (doc, cur)
+    }
+
+    /// Extract the logical range `[start, end)` as standalone paragraphs,
+    /// style spans clipped and shifted to local offsets. Drives rich
+    /// clipboard copy — HTML + `.docx`-fragment generation (Backlog #12).
+    pub fn slice(&self, start: LogicalPos, end: LogicalPos) -> Vec<Paragraph> {
+        let (start, end) = if (start.para, start.offset) <= (end.para, end.offset) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        if self.paragraphs.is_empty() {
+            return Vec::new();
+        }
+        let last = self.paragraphs.len() - 1;
+        let sp = (start.para as usize).min(last);
+        let ep = (end.para as usize).min(last);
+        if sp == ep {
+            /* Clip to `end`, then take the tail from `start`. */
+            let head = self.paragraphs[sp].split_at(end.offset).0;
+            return vec![head.split_at(start.offset).1];
+        }
+        let mut out = Vec::with_capacity(ep - sp + 1);
+        out.push(self.paragraphs[sp].split_at(start.offset).1);
+        for p in (sp + 1)..ep {
+            out.push(self.paragraphs[p].clone());
+        }
+        out.push(self.paragraphs[ep].split_at(end.offset).0);
+        out
+    }
+
+    /// Insert pre-styled `paras` at `at`; returns the new tree and the caret
+    /// at the end of the inserted content. The caller deletes any active
+    /// selection first. Drives HTML paste (Backlog #12).
+    pub fn insert_rich(&self, at: LogicalPos, paras: &[Paragraph]) -> (Self, LogicalPos) {
+        if paras.is_empty() {
+            return (self.clone(), at);
+        }
+        let mut paragraphs = self.paragraphs.clone();
+        if paragraphs.is_empty() {
+            paragraphs.push_back(Paragraph::default());
+        }
+        let idx = (at.para as usize).min(paragraphs.len() - 1);
+        let (head, tail) = paragraphs[idx].split_at(at.offset);
+        if paras.len() == 1 {
+            let caret = LogicalPos {
+                para: idx as u32,
+                offset: (head.text.len() + paras[0].text.len()) as u32,
+            };
+            paragraphs.set(idx, head.concat(&paras[0]).concat(&tail));
+            return (Self { paragraphs }, caret);
+        }
+        let lastp = &paras[paras.len() - 1];
+        let caret = LogicalPos {
+            para: (idx + paras.len() - 1) as u32,
+            offset: lastp.text.len() as u32,
+        };
+        paragraphs.set(idx, head.concat(&paras[0]));
+        for (k, p) in paras[1..paras.len() - 1].iter().enumerate() {
+            paragraphs.insert(idx + 1 + k, p.clone());
+        }
+        paragraphs.insert(idx + paras.len() - 1, lastp.concat(&tail));
+        (Self { paragraphs }, caret)
     }
 
     /// Extract the text of the logical range `[start, end)`. Paragraphs the
@@ -1055,5 +1130,91 @@ mod tests {
         assert_eq!(d.paragraph_text(1), Some("secA"));
         assert_eq!(d.paragraph_text(2), Some("Bond"));
         assert_eq!(caret, LogicalPos { para: 2, offset: 1 });
+    }
+
+    #[test]
+    fn slice_single_paragraph_clips_and_shifts_spans() {
+        /* "hello world" with bold over "world" (bytes 6-11). */
+        let bold = SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        };
+        let para = Paragraph {
+            text: "hello world".into(),
+            spans: vec![StyleRun {
+                start: 6,
+                end: 11,
+                style: bold,
+            }],
+            alignment: None,
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
+        let cut = doc.slice(
+            LogicalPos { para: 0, offset: 3 },
+            LogicalPos { para: 0, offset: 9 },
+        );
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].text, "lo wor");
+        assert_eq!(
+            cut[0].spans,
+            vec![StyleRun {
+                start: 3,
+                end: 6,
+                style: bold,
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_rich_single_paragraph_merges_inline() {
+        let doc = DocumentTree::from_text("hello world");
+        let frag = vec![Paragraph {
+            text: "BRAVE ".into(),
+            spans: vec![],
+            alignment: None,
+        }];
+        let (out, caret) = doc.insert_rich(LogicalPos { para: 0, offset: 6 }, &frag);
+        assert_eq!(out.paragraph_count(), 1);
+        assert_eq!(out.paragraph_text(0), Some("hello BRAVE world"));
+        assert_eq!(
+            caret,
+            LogicalPos {
+                para: 0,
+                offset: 12
+            }
+        );
+    }
+
+    #[test]
+    fn insert_rich_multi_paragraph_splices_and_keeps_spans() {
+        let doc = DocumentTree::from_text("ABCD");
+        let bold = SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        };
+        let frag = vec![
+            Paragraph {
+                text: "one".into(),
+                spans: vec![],
+                alignment: None,
+            },
+            Paragraph {
+                text: "two".into(),
+                spans: vec![StyleRun {
+                    start: 0,
+                    end: 3,
+                    style: bold,
+                }],
+                alignment: None,
+            },
+        ];
+        let (out, caret) = doc.insert_rich(LogicalPos { para: 0, offset: 2 }, &frag);
+        assert_eq!(out.paragraph_count(), 2);
+        assert_eq!(out.paragraph_text(0), Some("ABone"));
+        assert_eq!(out.paragraph_text(1), Some("twoCD"));
+        assert_eq!(caret, LogicalPos { para: 1, offset: 3 });
+        assert_eq!(out.paragraphs[1].style_at(0).bold, Some(true));
+        assert_eq!(out.paragraphs[1].style_at(3).bold, None);
     }
 }

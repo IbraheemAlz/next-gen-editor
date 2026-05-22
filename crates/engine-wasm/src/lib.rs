@@ -856,9 +856,10 @@ impl Engine {
                 tree: self.build_a11y_tree(),
             },
 
-            // Phase 4 §12 — clipboard.
+            // Phase 4 §12 — clipboard. Backlog sprint 7 adds rich HTML paste.
             Command::GetSelectionAsClipboard => self.do_get_selection_as_clipboard(),
             Command::PastePlain { text } => self.do_paste_plain(text),
+            Command::PasteHtml { html } => self.do_paste_html(html),
 
             // Backlog sprint 1 — paragraph alignment (Backlog #9).
             Command::SetParagraphAlign { range, align } => {
@@ -1813,22 +1814,36 @@ impl Engine {
         A11yTree { paragraphs }
     }
 
-    /// `Command::GetSelectionAsClipboard` — the selection text as clipboard
-    /// payloads. `html` / `docx_fragment` await rich clipboard generation.
+    /// `Command::GetSelectionAsClipboard` — snapshot the selection as the
+    /// three clipboard MIME payloads (Backlog #12): plain text, semantic
+    /// HTML, and a minimal standalone `.docx`. An empty selection yields all
+    /// three empty.
     fn do_get_selection_as_clipboard(&self) -> Event {
-        let plain = match self.selection {
-            Some(sel) => {
-                let (start, end) = ordered(sel.anchor, sel.caret);
-                self.undo
-                    .current()
-                    .text_range(to_engine_pos(start), to_engine_pos(end))
-            }
-            None => String::new(),
-        };
-        Event::ClipboardPayload {
-            plain,
+        let empty = Event::ClipboardPayload {
+            plain: String::new(),
             html: String::new(),
             docx_fragment: Vec::new(),
+        };
+        let Some(sel) = self.selection else {
+            return empty;
+        };
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        if start == end {
+            return empty;
+        }
+        let doc = self.undo.current();
+        let (estart, eend) = (to_engine_pos(start), to_engine_pos(end));
+        let plain = doc.text_range(estart, eend);
+        /* The selection's styled paragraphs, clipped to local offsets — fed
+        to the HTML serializer and packed into a one-document `.docx`. */
+        let slice = doc.slice(estart, eend);
+        let html = engine::html::to_html(&slice);
+        let docx_fragment =
+            build_minimal_docx(&DocumentTree::from_rich_paragraphs(slice)).unwrap_or_default();
+        Event::ClipboardPayload {
+            plain,
+            html,
+            docx_fragment,
         }
     }
 
@@ -1860,6 +1875,40 @@ impl Engine {
                 .delete_range(to_engine_pos(start), to_engine_pos(end))
         };
         let (new_doc, caret) = base.insert_multiline(to_engine_pos(start), &normalized);
+        self.commit_edit(
+            new_doc,
+            BridgeLogicalPos {
+                para: caret.para,
+                offset: caret.offset,
+            },
+        )
+    }
+
+    /// `Command::PasteHtml` (Backlog #12) — parse HTML into styled paragraphs
+    /// and splice them in at the caret, replacing any non-empty selection.
+    /// The rich counterpart of `do_paste_plain`.
+    fn do_paste_html(&mut self, html: String) -> Event {
+        let paras = engine::html::from_html(&html);
+        if paras.is_empty() {
+            /* No parseable content — leave the document untouched. */
+            return self.selection_changed();
+        }
+        let at = self
+            .selection
+            .map_or(BridgeLogicalPos { para: 0, offset: 0 }, |s| s.caret);
+        let sel = self.selection.unwrap_or(SelectionState {
+            anchor: at,
+            caret: at,
+        });
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        let base = if start == end {
+            self.undo.current().clone()
+        } else {
+            self.undo
+                .current()
+                .delete_range(to_engine_pos(start), to_engine_pos(end))
+        };
+        let (new_doc, caret) = base.insert_rich(to_engine_pos(start), &paras);
         self.commit_edit(
             new_doc,
             BridgeLogicalPos {
