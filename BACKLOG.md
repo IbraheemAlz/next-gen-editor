@@ -23,6 +23,9 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
   layout caching, an O(N) line breaker, and a cached parsed font face. The
   50-page open dropped ~22 s → ~4.7 s and insert p95 ~27 ms → ~8 ms;
   sub-budget cold open still needs viewport culling.
+- **Sprint 5 (2026-05-22)** — Dynamic line height (item 5, complete);
+  first-strong paragraph auto-direction (item 6 — a UI override toggle is
+  still deferred).
 
 ## 1. Rich text formatting
 
@@ -106,32 +109,29 @@ Canvas2D remains the hardcoded active renderer; the worker never calls
 
 ## 5. Line height — dynamic from run metrics
 
-**Shipped:** `layout_paragraph` stacks every line at a single fixed
-`line_height` taken from the render config.
-
-**Deferred:** line height should be computed per line as
-`max(run ascent + run descent)` over every `VisualRun` on it, so a line
-carrying a larger span (a bigger font size, a taller script) grows to fit
-instead of clipping or overlapping its neighbours. The `rich-text` golden
-currently sidesteps this by configuring a `line_height` generous enough for
-its largest span. Needs: per-run ascent/descent from `LoadedFont::metrics`, a
-max-reduce per line in `layout_paragraph`, and `LineBox.height` / `baseline`
-derived from that instead of the config constant.
+**✅ Shipped (Phase 5 sprint 5).** `layout_paragraph` computes each line's
+height from its runs: `line_extents` max-reduces ascent and descent over the
+line's `VisualRun`s (each from `LoadedFont::metrics` at the run's pixel size),
+so `LineBox.height = max_ascent + max_descent` and `LineBox.baseline =
+max_ascent`. Lines stack by accumulated height, so a line carrying a larger
+font size or a taller script grows to fit instead of clipping its neighbours.
+A line with no resolvable run metrics falls back to the configured
+`line_height`.
 
 ## 6. Paragraph base direction — auto-detection
 
-**Shipped (global RTL base):** the editor seeds every document with one RTL
-base direction (`ts/src/index.ts` → `RenderPage { base_direction: 'RTL' }`).
-Per-line BiDi resolves mixed Arabic / English runs correctly within that base.
+**✅ Shipped (Phase 5 sprint 5).** `text_pipeline::first_strong_direction`
+scans a paragraph's text for its first strong character (UAX #9 P2/P3) via
+`icu_properties`' `BidiClass` — class `L` → LTR, class `R`/`AL` → RTL.
+`build_page` resolves each paragraph's base direction from it, falling back to
+the document direction when the text has no strong character. BiDi resolution
+and direction-relative alignment then follow per paragraph, so an English
+paragraph below an Arabic one aligns left while the Arabic aligns right,
+automatically.
 
-**Deferred:** UAX #9 first-strong auto-detection. `ShapingDirection` is
-`Ltr | Rtl` only and the base is global — so an English-only paragraph
-right-aligns like an Arabic one instead of detecting LTR from its first strong
-character. Needs: an `Auto` mode (a `ShapingDirection::Auto` variant or a
-resolve-before-layout pass), first-strong detection per **paragraph** (base
-direction is a paragraph property, not per line), and a UI / keyboard toggle
-to override the detected direction. Until then the Arabic-first RTL default
-stands.
+**Still deferred:** a UI / keyboard toggle to override the auto-detected
+direction; `Event::SelectionChanged.direction` still reports the document
+direction rather than the caret paragraph's.
 
 ## 7. Selection rendering — discontinuous BiDi rectangles
 

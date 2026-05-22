@@ -29,7 +29,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use text_pipeline::{Alignment, FontStack, LoadedFont, ShapingDirection, shape_text};
+use text_pipeline::{
+    Alignment, FontStack, LoadedFont, ShapingDirection, first_strong_direction, shape_text,
+};
 use wasm_bindgen::prelude::*;
 use web_sys::OffscreenCanvasRenderingContext2d;
 
@@ -1137,7 +1139,11 @@ impl Engine {
                     text: &para.text,
                     fonts: &font_stack,
                     spans: &spans,
-                    base_direction: cfg.base_direction,
+                    /* Per-paragraph base direction from its first strong
+                    character; the document direction is the fallback
+                    (Backlog #6). */
+                    base_direction: first_strong_direction(&para.text)
+                        .unwrap_or(cfg.base_direction),
                     max_width: page.content_width(),
                     line_height: cfg.line_height * scale,
                     /* A paragraph's own alignment overrides the document

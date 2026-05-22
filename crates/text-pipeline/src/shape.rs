@@ -6,7 +6,7 @@
 use crate::fonts::LoadedFont;
 use rustybuzz::{Direction, UnicodeBuffer};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapingDirection {
     Ltr,
     Rtl,

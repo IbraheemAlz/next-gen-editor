@@ -52,11 +52,15 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         }
     }
 
-    /* Position each line within the paragraph: `origin.y` stacks top-down,
-    `origin.x` carries the alignment offset so the renderer stays a pure
-    origin accumulator. */
+    /* Position each line within the paragraph. `origin.y` stacks by the
+    accumulated height of preceding lines; each line's height is its own max
+    ascent + max descent over its runs (Backlog #5 — dynamic line height), so
+    a line carrying a larger span grows to fit instead of clipping. `origin.x`
+    carries the alignment offset so the renderer stays a pure accumulator. */
     let mut lines: Vec<LineBox> = Vec::with_capacity(composed.len());
-    for (i, (mut line, _)) in composed.into_iter().enumerate() {
+    let mut y = 0.0_f32;
+    for (mut line, _) in composed {
+        let (ascent, descent) = line_extents(&line, cfg.fonts, cfg.line_height);
         line.origin = Point {
             x: alignment_origin_x(
                 line.width,
@@ -64,14 +68,15 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
                 line.alignment,
                 cfg.base_direction,
             ),
-            y: i as f32 * cfg.line_height,
+            y,
         };
-        line.baseline = cfg.line_height;
-        line.height = cfg.line_height;
+        line.baseline = ascent;
+        line.height = ascent + descent;
+        y += line.height;
         lines.push(line);
     }
 
-    let height = lines.len() as f32 * cfg.line_height;
+    let height = y;
     ParagraphBox {
         origin: Point::default(),
         size: Size {
@@ -80,6 +85,27 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         },
         lines,
         direction: cfg.base_direction,
+    }
+}
+
+/// Maximum ascent and descent across a line's runs, from each run's font
+/// metrics at its pixel size (Backlog #5). A line carrying a larger font size
+/// or a taller script grows to fit the tallest run. A line with no resolvable
+/// run metrics falls back to the configured line height as pure ascent.
+fn line_extents(line: &LineBox, fonts: &FontStack, fallback: f32) -> (f32, f32) {
+    let mut ascent = 0.0_f32;
+    let mut descent = 0.0_f32;
+    for run in &line.runs {
+        if let Some(face) = fonts.face(&run.font) {
+            let m = face.metrics(run.attrs.px_size);
+            ascent = ascent.max(m.ascent);
+            descent = descent.max(m.descent.abs());
+        }
+    }
+    if ascent + descent <= 0.0 {
+        (fallback, 0.0)
+    } else {
+        (ascent, descent)
     }
 }
 

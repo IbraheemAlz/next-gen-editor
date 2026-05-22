@@ -14,7 +14,7 @@ pub mod line_break;
 pub mod script;
 pub mod shape;
 
-pub use bidi::{BidiAnalysis, VisualRun, analyze_bidi};
+pub use bidi::{BidiAnalysis, VisualRun, analyze_bidi, first_strong_direction};
 pub use fonts::{
     FontError, FontId, FontMetrics, FontStack, GlyphMetrics, LoadedFont, RasterizedGlyph, Synthesis,
 };
