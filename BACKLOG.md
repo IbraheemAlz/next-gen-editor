@@ -19,6 +19,10 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
   complete); bold / italic face resolution (item 1 — the bold/italic
   sub-item, via faux synthesis; underline, strikethrough, background colour
   and docx `<w:rPr>` are still deferred).
+- **Sprint 4 (2026-05-22)** — Incremental relayout (item 13): paragraph
+  layout caching, an O(N) line breaker, and a cached parsed font face. The
+  50-page open dropped ~22 s → ~4.7 s and insert p95 ~27 ms → ~8 ms;
+  sub-budget cold open still needs viewport culling.
 
 ## 1. Rich text formatting
 
@@ -230,15 +234,24 @@ native `copy` / `cut` / `paste` events.
 
 ## 13. Incremental relayout
 
-**Shipped:** every edit and every document load relays out and repaints the
-whole document. Correct, and fast enough for a one-page document — the D5.3
-perf harness measures insert-char @ caret p95 ≈ 10 ms.
+**✅ Shipped (Phase 5 sprint 4).** Three changes took the synthetic 50-page
+open from ~22 s to ~4.7 s and insert-char p95 from ~27 ms to ~8 ms:
 
-**Deferred:** incremental relayout. Opening or editing a multi-page document
-re-runs `layout_paragraph` for *every* paragraph — the D5.3 harness measures
-~9 s to open the synthetic 50-page document (1000 paragraphs), far over the §6
-2.5 s budget. Needs paragraph-level layout caching keyed on a content + config
-hash, so only paragraphs whose text or style changed are re-shaped, and line
-stacking below an edit shifts by a delta instead of re-flowing the rest. This
-is why `tools/perf/run.mjs` keeps the open-doc metric out of its `--strict`
-gate — a known, tracked cost must not mask a real regression.
+- **Paragraph layout cache.** `build_page` memoizes `layout_paragraph` in an
+  LRU keyed by a content + render-config hash (`engine-wasm`). An edit changes
+  only the edited paragraph's hash — every other paragraph is a cheap clone
+  shifted by a Y delta, with no re-shaping. Editing a multi-page document is
+  now incremental.
+- **O(N) line breaker.** `compose_lines` accumulates per-segment widths
+  instead of re-measuring every growing prefix — O(breaks²) → O(breaks).
+- **Cached parsed face.** `LoadedFont` builds its `rustybuzz::Face` once at
+  load instead of re-parsing the whole font file on every `shape_text` call —
+  this was the dominant cold-open cost.
+
+**Still deferred:** a *cold* open is still ~4.7 s — over the §6 2.5 s budget —
+because all 1000 paragraphs are genuinely laid out once (the cache is empty on
+the first open). Driving the cold open under budget needs **viewport
+culling**: laying out only the visible page and deferring the rest. That is a
+larger architectural change than caching — `build_page`, hit-testing and the
+`PageBox` contract all assume a whole-document layout — so `tools/perf/run.mjs`
+keeps the open-doc metric out of its `--strict` gate until then.

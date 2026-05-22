@@ -41,9 +41,7 @@ pub fn shape_text(
     direction: ShapingDirection,
     px_size: f32,
 ) -> ShapedRun {
-    let face = font
-        .face_rustybuzz()
-        .expect("rustybuzz face (validated in parse)");
+    let face = font.face_rustybuzz();
 
     let mut buffer = UnicodeBuffer::new();
     buffer.push_str(text);
@@ -54,7 +52,7 @@ pub fn shape_text(
     /* Infer script + language from the input codepoints unless caller has set them. */
     buffer.guess_segment_properties();
 
-    let glyph_buf = rustybuzz::shape(&face, &[], buffer);
+    let glyph_buf = rustybuzz::shape(face, &[], buffer);
     let infos = glyph_buf.glyph_infos();
     let positions = glyph_buf.glyph_positions();
 

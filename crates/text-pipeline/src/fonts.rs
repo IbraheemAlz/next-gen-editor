@@ -48,24 +48,34 @@ pub struct RasterizedGlyph {
     pub alpha: Vec<u8>,
 }
 
-/// Owns the font byte buffer; `swash::FontRef` and `rustybuzz::Face` are
-/// rebuilt on each access (both zero-cost; they just hold a slice reference).
+/// A loaded font face. The `rustybuzz::Face` — whose construction parses and
+/// table-indexes the whole font file — is built once at load and cached;
+/// re-parsing it per `shape_text` call dominated multi-page layout
+/// (Backlog #13). `swash::FontRef` stays rebuilt per access (genuinely cheap).
 pub struct LoadedFont {
     id: String,
-    data: Vec<u8>,
+    /// Font bytes, leaked to `'static` so the cached `rustybuzz::Face` may
+    /// borrow them. A loaded font lives for the engine's lifetime regardless,
+    /// so this leak is bounded and intentional.
+    data: &'static [u8],
+    /// The parsed + table-indexed rustybuzz face — built once, reused for
+    /// every shaping call.
+    rb_face: rustybuzz::Face<'static>,
     units_per_em: u16,
 }
 
 impl LoadedFont {
     pub fn parse(id: String, data: Vec<u8>) -> Result<Self, FontError> {
-        let face = FontRef::from_index(&data, 0).ok_or(FontError::Parse)?;
+        /* Leak the bytes to `'static`: the cached `rustybuzz::Face` borrows
+        them, and a loaded font is never freed during a session anyway. */
+        let data: &'static [u8] = Vec::leak(data);
+        let face = FontRef::from_index(data, 0).ok_or(FontError::Parse)?;
         let upem = face.metrics(&[]).units_per_em;
-        /* Also validate the same bytes are a valid rustybuzz Face — we share
-        the buffer between swash and rustybuzz at runtime. */
-        rustybuzz::Face::from_slice(&data, 0).ok_or(FontError::Parse)?;
+        let rb_face = rustybuzz::Face::from_slice(data, 0).ok_or(FontError::Parse)?;
         Ok(Self {
             id,
             data,
+            rb_face,
             units_per_em: upem,
         })
     }
@@ -76,15 +86,16 @@ impl LoadedFont {
 
     /// The raw font-file bytes — used to embed the full face in a PDF.
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data
     }
 
     fn face(&self) -> FontRef<'_> {
-        FontRef::from_index(&self.data, 0).expect("validated in parse")
+        FontRef::from_index(self.data, 0).expect("validated in parse")
     }
 
-    pub fn face_rustybuzz(&self) -> Option<rustybuzz::Face<'_>> {
-        rustybuzz::Face::from_slice(&self.data, 0)
+    /// The cached rustybuzz face — parsed and table-indexed once at load.
+    pub fn face_rustybuzz(&self) -> &rustybuzz::Face<'static> {
+        &self.rb_face
     }
 
     /// Whether the font's cmap maps `ch` to a real (non-`.notdef`) glyph.

@@ -86,6 +86,12 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
 /// Greedy line breaking. Returns each line paired with whether it ended at a
 /// break opportunity (`true`) rather than the end of the paragraph (`false`) —
 /// only opportunity-broken non-final lines are justified.
+///
+/// Each inter-break segment is measured exactly once and its width accumulated
+/// into a running line total — so the greedy walk is O(breaks) per paragraph,
+/// not the O(breaks²) of re-measuring every growing prefix. Segment widths
+/// sum cleanly because break opportunities fall on spaces, where no ligature,
+/// kerning or cursive join crosses the boundary.
 fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
     if cfg.text.is_empty() {
         return vec![];
@@ -95,22 +101,27 @@ fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
     let mut lines: Vec<(LineBox, bool)> = vec![];
     let mut start = 0_usize;
     let mut last_fit_end = start;
+    /* `line_width` is the accumulated width of `[start..seg_from]` — the run
+    of segments already accepted onto the current line. */
+    let mut seg_from = start;
+    let mut line_width = 0.0_f32;
 
     for &b in breaks.iter() {
         if b <= start {
             continue;
         }
-        let candidate = &cfg.text[start..b];
-        let probe = measure_text(
+        let seg_width = measure_text(
             cfg.fonts,
-            candidate,
-            start as u32,
+            &cfg.text[seg_from..b],
+            seg_from as u32,
             cfg.spans,
             cfg.base_direction,
         );
 
-        if probe <= cfg.max_width {
+        if line_width + seg_width <= cfg.max_width {
             last_fit_end = b;
+            line_width += seg_width;
+            seg_from = b;
         } else {
             /* Overflow. Commit whatever fit so far. */
             if last_fit_end > start {
@@ -121,6 +132,9 @@ fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
                 last_fit_end = b;
             }
             start = last_fit_end;
+            /* Restart the running measurement for the fresh line. */
+            seg_from = start;
+            line_width = 0.0;
         }
     }
 

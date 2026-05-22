@@ -19,12 +19,15 @@ use layout::{
     A4Page, LineBox, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan,
     layout_paragraph,
 };
+use lru::LruCache;
 use render::atlas::GlyphAtlas;
 use render::canvas2d_backend::render_canvas2d;
 use render::dirty::DirtyTracker;
 use render::scene::build_page_scene;
 use render::vello_backend::VelloRenderer;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use text_pipeline::{Alignment, FontStack, LoadedFont, ShapingDirection, shape_text};
 use wasm_bindgen::prelude::*;
@@ -117,6 +120,22 @@ pub struct Engine {
     /// interactive `InsertText` overlays it onto the typed text. It persists
     /// across keystrokes and is cleared only when the caret moves.
     pending_format: Option<SpanStyle>,
+    /// Incremental-relayout cache (Backlog #13): memoizes `layout_paragraph`
+    /// keyed by a content + render-config hash. An edit only re-shapes the
+    /// changed paragraph; the rest are clones shifted by a Y delta. `RefCell`
+    /// because `build_page` populates it behind a `&self` borrow.
+    layout_cache: RefCell<LruCache<u64, ParagraphBox>>,
+}
+
+/// Capacity of the paragraph layout cache — comfortably covers a 50-page
+/// document (1000 paragraphs) plus edit churn.
+const LAYOUT_CACHE_CAP: usize = 4096;
+
+/// A fresh, empty paragraph layout cache.
+fn new_layout_cache() -> RefCell<LruCache<u64, ParagraphBox>> {
+    RefCell::new(LruCache::new(
+        NonZeroUsize::new(LAYOUT_CACHE_CAP).expect("LAYOUT_CACHE_CAP is non-zero"),
+    ))
 }
 
 #[wasm_bindgen]
@@ -140,6 +159,7 @@ impl Engine {
             selection: None,
             composition: None,
             pending_format: None,
+            layout_cache: new_layout_cache(),
         })
     }
 
@@ -356,6 +376,59 @@ fn build_style_spans(
         });
     }
     spans
+}
+
+/// Content + render-config hash that keys the paragraph layout cache
+/// (Backlog #13). Two paragraphs hash equal only when `layout_paragraph`
+/// would produce identical boxes: same text, same style runs, same paragraph
+/// alignment, and the same layout-affecting `RenderConfig` fields. `scale` is
+/// the value passed to `build_page` — PDF export lays out at `1.0` regardless
+/// of the cached device scale — so it is hashed explicitly.
+fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    para.text.hash(&mut h);
+    (para.spans.len() as u64).hash(&mut h);
+    for run in &para.spans {
+        run.start.hash(&mut h);
+        run.end.hash(&mut h);
+        run.style.font_size.map(f32::to_bits).hash(&mut h);
+        run.style.color.hash(&mut h);
+        run.style.bold.hash(&mut h);
+        run.style.italic.hash(&mut h);
+        run.style.underline.hash(&mut h);
+    }
+    /* `engine::Alignment` / `text_pipeline::Alignment` carry no `Hash` derive —
+    hash a small discriminant instead. */
+    engine_align_disc(para.alignment).hash(&mut h);
+    cfg.font_id.hash(&mut h);
+    matches!(cfg.base_direction, ShapingDirection::Rtl).hash(&mut h);
+    cfg.px_size.to_bits().hash(&mut h);
+    cfg.line_height.to_bits().hash(&mut h);
+    tp_align_disc(cfg.alignment).hash(&mut h);
+    scale.to_bits().hash(&mut h);
+    h.finish()
+}
+
+/// Discriminant for an optional paragraph alignment (the enum has no `Hash`).
+fn engine_align_disc(a: Option<EngineAlignment>) -> u8 {
+    match a {
+        None => 0,
+        Some(EngineAlignment::Start) => 1,
+        Some(EngineAlignment::End) => 2,
+        Some(EngineAlignment::Center) => 3,
+        Some(EngineAlignment::Justify) => 4,
+    }
+}
+
+/// Discriminant for a layout-crate alignment (the enum has no `Hash`).
+fn tp_align_disc(a: Alignment) -> u8 {
+    match a {
+        Alignment::Start => 0,
+        Alignment::End => 1,
+        Alignment::Center => 2,
+        Alignment::Justify => 3,
+    }
 }
 
 /// Flatten one line into per-[`VisualRun`] geometry — each run's source byte
@@ -612,6 +685,8 @@ impl Engine {
                         x_height: m.x_height,
                     };
                     self.fonts.insert(id.clone(), Arc::new(font));
+                    /* The font set feeds layout; stale boxes must not survive. */
+                    self.layout_cache.get_mut().clear();
                     Event::FontLoaded {
                         id,
                         metrics: bridge_metrics,
@@ -683,6 +758,7 @@ impl Engine {
                         anchor: BridgeLogicalPos { para: 0, offset: 0 },
                         caret: BridgeLogicalPos { para: 0, offset: 0 },
                     });
+                    self.layout_cache.get_mut().clear();
                     self.dirty.invalidate(full_page_rect(self.scale()));
                     self.maybe_repaint();
                     Event::DocumentLoaded { paragraph_count }
@@ -883,6 +959,8 @@ impl Engine {
     fn render_page(&mut self, text: String, cfg: RenderConfig) -> Event {
         self.undo = UndoStack::new(DocumentTree::from_text(&text), 100);
         self.layout_cfg = Some(cfg);
+        /* New document + config — drop every cached paragraph layout. */
+        self.layout_cache.get_mut().clear();
 
         let stats = match self.render_document(None) {
             Ok(s) => s,
@@ -1040,24 +1118,38 @@ impl Engine {
         let mut box_doc_index: Vec<u32> = Vec::new();
         let mut para_y_offset = 0.0_f32;
         let doc = self.undo.current().clone();
+        let mut cache = self.layout_cache.borrow_mut();
         for (doc_idx, para) in doc.paragraphs.iter().enumerate() {
             if para.text.is_empty() {
                 para_y_offset += cfg.line_height * scale;
                 continue;
             }
-            let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
-            let para_cfg = ParagraphConfig {
-                text: &para.text,
-                fonts: &font_stack,
-                spans: &spans,
-                base_direction: cfg.base_direction,
-                max_width: page.content_width(),
-                line_height: cfg.line_height * scale,
-                /* A paragraph's own alignment overrides the document default
-                (Backlog #9). */
-                alignment: para.alignment.map_or(cfg.alignment, layout_align),
+            /* Backlog #13 — incremental relayout: reuse the cached box when
+            this paragraph's content + config hash is unchanged, skipping BiDi
+            and shaping entirely. An edit changes only the edited paragraph's
+            hash, so every other paragraph is a cheap clone. */
+            let key = paragraph_layout_key(para, &cfg, scale);
+            let mut para_box = if let Some(cached) = cache.get(&key) {
+                cached.clone()
+            } else {
+                let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
+                let para_cfg = ParagraphConfig {
+                    text: &para.text,
+                    fonts: &font_stack,
+                    spans: &spans,
+                    base_direction: cfg.base_direction,
+                    max_width: page.content_width(),
+                    line_height: cfg.line_height * scale,
+                    /* A paragraph's own alignment overrides the document
+                    default (Backlog #9). */
+                    alignment: para.alignment.map_or(cfg.alignment, layout_align),
+                };
+                let laid = layout_paragraph(para_cfg);
+                cache.put(key, laid.clone());
+                laid
             };
-            let mut para_box = layout_paragraph(para_cfg);
+            /* Cached and fresh boxes carry identical local line geometry —
+            only the global Y shift differs (the vertical-shift step). */
             para_box.origin = Point {
                 x: 0.0,
                 y: para_y_offset,
@@ -1066,6 +1158,7 @@ impl Engine {
             paragraphs.push(para_box);
             box_doc_index.push(doc_idx as u32);
         }
+        drop(cache);
 
         let page_box = PageBox {
             size: Size {
@@ -1778,6 +1871,7 @@ mod tests {
             selection: None,
             composition: None,
             pending_format: None,
+            layout_cache: new_layout_cache(),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -1930,5 +2024,47 @@ mod tests {
         assert!(approx(slots[0].x, 0.0));
         assert!(approx(slots[1].x, 17.0));
         assert!(approx(slots[2].x, 27.0));
+    }
+
+    /// Backlog #13 — the layout cache key is stable for identical input and
+    /// distinct when the text, alignment, or scale changes.
+    #[test]
+    fn paragraph_layout_key_is_content_sensitive() {
+        let cfg = RenderConfig {
+            font_id: "f".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 16.0,
+            line_height: 24.0,
+            alignment: Alignment::Start,
+            scale: 1.0,
+        };
+        let para = |text: &str| engine::Paragraph {
+            text: text.to_string(),
+            spans: Vec::new(),
+            alignment: None,
+        };
+        let a = para("hello world");
+        /* Identical content + config -> identical key. */
+        assert_eq!(
+            paragraph_layout_key(&a, &cfg, 1.0),
+            paragraph_layout_key(&a, &cfg, 1.0),
+        );
+        /* Different text -> different key. */
+        assert_ne!(
+            paragraph_layout_key(&a, &cfg, 1.0),
+            paragraph_layout_key(&para("hello there"), &cfg, 1.0),
+        );
+        /* A paragraph alignment override -> different key. */
+        let mut centered = para("hello world");
+        centered.alignment = Some(EngineAlignment::Center);
+        assert_ne!(
+            paragraph_layout_key(&a, &cfg, 1.0),
+            paragraph_layout_key(&centered, &cfg, 1.0),
+        );
+        /* A different device scale -> different key. */
+        assert_ne!(
+            paragraph_layout_key(&a, &cfg, 1.0),
+            paragraph_layout_key(&a, &cfg, 2.0),
+        );
     }
 }

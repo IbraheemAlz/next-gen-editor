@@ -299,6 +299,7 @@ dependencies = [
  "js-sys",
  "kurbo",
  "layout",
+ "lru",
  "render",
  "serde-wasm-bindgen",
  "text-pipeline",
