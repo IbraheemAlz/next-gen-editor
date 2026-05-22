@@ -1278,7 +1278,7 @@ impl Engine {
     /// PDF/A-1b-conformant file; the unimplemented `A2u` / `X3` targets fall
     /// back to a plain PDF.
     fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
-        let (page_box, font_stack, _box_doc_index) = match self.build_page(1.0) {
+        let (page_box, font_stack, box_doc_index) = match self.build_page(1.0) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -1286,8 +1286,19 @@ impl Engine {
             PdfConformance::A1b => format_pdf::PdfProfile::A1b,
             PdfConformance::A2u | PdfConformance::X3 => format_pdf::PdfProfile::Plain,
         };
+        /* Per-paragraph source text, aligned with `page_box.paragraphs` — the
+        PDF `/ToUnicode` CMap resolves each glyph's cluster against it so the
+        exported text stays selectable. `box_doc_index` maps box index back to
+        document paragraph index (empty paragraphs emit no box). */
+        let doc = self.undo.current();
+        let para_texts: Vec<&str> = box_doc_index
+            .iter()
+            .map(|&di| doc.paragraphs[di as usize].text.as_str())
+            .collect();
         let mut bytes: Vec<u8> = Vec::new();
-        if let Err(e) = format_pdf::export_pdf(&page_box, &font_stack, profile, &mut bytes) {
+        if let Err(e) =
+            format_pdf::export_pdf(&page_box, &font_stack, &para_texts, profile, &mut bytes)
+        {
             return Event::Error {
                 message: format!("ExportPdf: {e}"),
             };

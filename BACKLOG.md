@@ -33,6 +33,9 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
 - **Sprint 7 (2026-05-22)** — Interoperability: the docx `<w:rPr>`
   run-property round-trip closes item 1; rich clipboard — HTML + `.docx`-
   fragment copy and an HTML-parsing `PasteHtml` — closes item 12.
+- **Sprint 8 (2026-05-22)** — Professional PDF export (item 3): `FlateDecode`
+  stream compression and a `/ToUnicode` CMap for text extraction. `/W` glyph
+  widths, font subsetting and PDF/A-2 / PDF/X are still deferred.
 
 ## 1. Rich text formatting
 
@@ -94,13 +97,28 @@ build time** by `crates/format-pdf/build.rs`, so no binary blob lands in the
 source tree — CLAUDE.md's no-blobs rule holds without an exception.
 `tools/pdf-validate` is the veraPDF harness, surfaced by the non-blocking CI.
 
+**✅ Shipped (Phase 5 sprint 8):** `FlateDecode` stream compression and a
+`/ToUnicode` CMap.
+
+- **Stream compression.** The content stream and every embedded `FontFile2`
+  program are zlib-compressed and tagged `/Filter /FlateDecode`; a
+  `FontFile2`'s `/Length1` keeps the *uncompressed* program length, per the
+  spec. A mixed Arabic/English page embedding the 431 KB Amiri face exports at
+  ~215 KB — half the raw font alone, where an uncompressed export would exceed
+  it.
+- **`/ToUnicode` CMap.** Each `Type0` font carries a `/ToUnicode` CMap (built
+  with `pdf_writer`'s `UnicodeCmap`) harvested from the box tree: a glyph's
+  `cluster` byte-range over its run's `source_range` resolves to the source
+  characters it consumed. A ligature glyph maps to *all* its characters, and
+  the four Arabic positional forms all map back to one base letter — so
+  `pdftotext` / `mutool` extract real Unicode, not glyph-id gibberish.
+
 **Deferred:**
 
-- **Stream compression.** Content and `FontFile2` streams are uncompressed;
-  with full font embedding the output is large. Needs `FlateDecode`.
-- **`/ToUnicode` CMap.** Without it, text copy / extraction from the PDF is
-  broken — not required for PDF/A-1**b**, but needed for /A-1a and good UX.
-  Also `/W` glyph widths and font subsetting (smaller files).
+- **`/W` glyph widths + font subsetting.** Glyph advances still ride the
+  content stream's per-glyph text matrices rather than a `/W` array, and the
+  whole font embeds rather than just the used glyphs. Subsetting would shrink
+  the output further.
 - **PDF/A-2 / PDF/X.** `PdfConformance::A2u` and `X3` currently fall back to a
   plain PDF; only `A1b` is implemented.
 

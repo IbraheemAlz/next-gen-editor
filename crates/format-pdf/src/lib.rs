@@ -25,10 +25,23 @@
 //! minimal valid sRGB v2 profile from plain Rust at build time and `lib.rs`
 //! pulls it in from `OUT_DIR` with `include_bytes!`. Nothing binary lands in
 //! the source tree, and the build stays hermetic — no network fetch.
+//!
+//! # Stream compression & text extraction
+//!
+//! Content streams and the embedded `FontFile2` programs are zlib-compressed
+//! and tagged `/Filter /FlateDecode`; a `FontFile2`'s `/Length1` still records
+//! the *uncompressed* program length, as the spec requires. Each `Type0` font
+//! also carries a `/ToUnicode` CMap mapping the shaped glyph ids back to their
+//! source characters, so a viewer can extract and copy the text — ligatures
+//! and Kashida-justified Arabic included.
 
-use layout::PageBox;
-use pdf_writer::types::{CidFontType, FontFlags, OutputIntentSubtype, SystemInfo};
-use pdf_writer::{Content, Name, Pdf, Rect, Ref, Str, TextStr};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use layout::{PageBox, VisualRun};
+use pdf_writer::types::{CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, UnicodeCmap};
+use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use text_pipeline::{FontStack, LoadedFont};
 
 /// The synthesized sRGB ICC profile the PDF/A-1b output intent embeds. Built by
@@ -67,22 +80,27 @@ pub enum PdfProfile {
     A1b,
 }
 
-/// The four indirect objects + resource name an embedded font occupies.
+/// The five indirect objects + resource name an embedded font occupies.
 struct FontObj {
     type0: Ref,
     cid: Ref,
     descriptor: Ref,
     file: Ref,
+    to_unicode: Ref,
     resource: String,
 }
 
 /// Export `page` to a single-page PDF, appending the bytes to `out`.
 ///
 /// `fonts` must contain every face referenced by the page's runs; each is
-/// embedded in full. `profile` selects plain output or PDF/A-1b conformance.
+/// embedded in full. `para_texts[i]` is the source text of `page.paragraphs[i]`
+/// — the `/ToUnicode` CMap resolves each glyph's cluster against it; a short or
+/// empty slice just yields a sparser CMap. `profile` selects plain output or
+/// PDF/A-1b conformance.
 pub fn export_pdf(
     page: &PageBox,
     fonts: &FontStack,
+    para_texts: &[&str],
     profile: PdfProfile,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
@@ -129,6 +147,7 @@ pub fn export_pdf(
                     cid: alloc(),
                     descriptor: alloc(),
                     file: alloc(),
+                    to_unicode: alloc(),
                     resource: format!("F{i}"),
                 },
             )
@@ -147,7 +166,11 @@ pub fn export_pdf(
         let id = document_id(&content);
         pdf.set_file_id((id.to_vec(), id.to_vec()));
     }
-    pdf.stream(content_id, &content);
+    /* Compress the drawing commands; `document_id` above stays keyed on the
+    uncompressed bytes so the PDF/A `/ID` is a stable, meaningful digest. */
+    let content_z = deflate(&content);
+    pdf.stream(content_id, &content_z)
+        .filter(Filter::FlateDecode);
 
     /* Catalog — plus, for PDF/A-1b, the `/Metadata` and `/OutputIntents`. */
     {
@@ -184,11 +207,16 @@ pub fn export_pdf(
         }
     }
 
+    /* glyph-id → Unicode per font, harvested from the box-tree clusters. */
+    let to_unicode = collect_to_unicode(page, para_texts);
     for (id, fo) in &font_objs {
         let face = fonts
             .face(id)
             .ok_or_else(|| format!("export_pdf: font `{id}` not in the stack"))?;
         embed_font(&mut pdf, id, face, fo);
+        let cmap_z = deflate(&build_unicode_cmap(to_unicode.get(id)));
+        pdf.stream(fo.to_unicode, &cmap_z)
+            .filter(Filter::FlateDecode);
     }
 
     /* PDF/A-1b output intent objects: the embedded sRGB profile + XMP packet. */
@@ -253,8 +281,10 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
     content.finish().to_vec()
 }
 
-/// Embed one face as a `Type0` / `CIDFontType2` font with the raw TrueType
-/// bytes in a `FontFile2` stream.
+/// Embed one face as a `Type0` / `CIDFontType2` font with the TrueType bytes in
+/// a FlateDecode-compressed `FontFile2` stream. The `/ToUnicode` reference is
+/// wired into the `Type0` dict here; the CMap stream itself is a separate
+/// object written by the caller.
 fn embed_font(pdf: &mut Pdf, id: &str, face: &LoadedFont, fo: &FontObj) {
     let base = Name(id.as_bytes());
     let data = face.data();
@@ -264,6 +294,7 @@ fn embed_font(pdf: &mut Pdf, id: &str, face: &LoadedFont, fo: &FontObj) {
     pdf.type0_font(fo.type0)
         .base_font(base)
         .encoding_predefined(Name(b"Identity-H"))
+        .to_unicode(fo.to_unicode)
         .descendant_font(fo.cid);
 
     {
@@ -291,8 +322,107 @@ fn embed_font(pdf: &mut Pdf, id: &str, face: &LoadedFont, fo: &FontObj) {
         .stem_v(80.0)
         .font_file2(fo.file);
 
-    pdf.stream(fo.file, data)
+    /* Compress the font program; `/Length1` keeps the *uncompressed* length. */
+    let file_z = deflate(data);
+    pdf.stream(fo.file, &file_z)
+        .filter(Filter::FlateDecode)
         .pair(Name(b"Length1"), data.len() as i32);
+}
+
+/// zlib-compress `data` for a PDF `/FlateDecode` stream. Deterministic for a
+/// fixed input — the PDF/A `/ID` and the byte-stability test rely on that.
+fn deflate(data: &[u8]) -> Vec<u8> {
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data)
+        .expect("zlib encode into a Vec cannot fail");
+    enc.finish().expect("zlib finish into a Vec cannot fail")
+}
+
+/// Harvest a glyph-id → Unicode map, per font, from the laid-out page.
+///
+/// `para_texts[i]` is the source text of `page.paragraphs[i]`. Every glyph
+/// carries a `cluster` byte offset into its run's `source_range`; a run's
+/// distinct clusters partition its source bytes into segments, and a glyph
+/// decodes to the characters of its segment. A ligature glyph therefore maps to
+/// *all* the characters it consumed — the property that lets shaped Arabic copy
+/// back as real text.
+fn collect_to_unicode(
+    page: &PageBox,
+    para_texts: &[&str],
+) -> HashMap<String, BTreeMap<u16, Vec<char>>> {
+    let mut out: HashMap<String, BTreeMap<u16, Vec<char>>> = HashMap::new();
+    for (pi, para) in page.paragraphs.iter().enumerate() {
+        let Some(&text) = para_texts.get(pi) else {
+            continue;
+        };
+        for line in &para.lines {
+            for run in &line.runs {
+                let map = out.entry(run.font.clone()).or_default();
+                add_run_mappings(run, text, map);
+            }
+        }
+    }
+    out
+}
+
+/// Fold one run's glyph→Unicode mappings into `map`. The first non-empty decode
+/// seen for a glyph id wins — a glyph always renders the same characters, so
+/// later repeats agree.
+fn add_run_mappings(run: &VisualRun, text: &str, map: &mut BTreeMap<u16, Vec<char>>) {
+    let base = run.source_range.start as usize;
+    let run_end = (run.source_range.end as usize).min(text.len());
+
+    /* Distinct absolute cluster offsets, sorted — they partition the run's
+    source bytes; a glyph's segment runs up to the next-larger cluster. */
+    let mut bounds: Vec<usize> = run
+        .glyphs
+        .iter()
+        .filter(|g| !g.synthetic)
+        .map(|g| base + g.cluster as usize)
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    for g in &run.glyphs {
+        /* A synthetic Kashida tatweel is justification ink, not content —
+        leaving it unmapped lets a viewer drop it on copy. */
+        if g.synthetic {
+            continue;
+        }
+        let start = base + g.cluster as usize;
+        let end = bounds
+            .iter()
+            .copied()
+            .find(|&b| b > start)
+            .unwrap_or(run_end)
+            .min(run_end);
+        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        let chars: Vec<char> = text[start..end].chars().collect();
+        if !chars.is_empty() {
+            map.entry(g.id).or_insert(chars);
+        }
+    }
+}
+
+/// Serialize a `/ToUnicode` CMap for one font. `mappings` is `None` for a font
+/// with no harvested text — the CMap is still structurally valid, just empty.
+fn build_unicode_cmap(mappings: Option<&BTreeMap<u16, Vec<char>>>) -> Vec<u8> {
+    let mut cmap = UnicodeCmap::<u16>::new(
+        Name(b"Adobe-Identity-UCS"),
+        SystemInfo {
+            registry: Str(b"Adobe"),
+            ordering: Str(b"UCS"),
+            supplement: 0,
+        },
+    );
+    if let Some(map) = mappings {
+        for (&gid, chars) in map {
+            cmap.pair_with_multiple(gid, chars.iter().copied());
+        }
+    }
+    cmap.finish().into_vec()
 }
 
 /// A 16-byte document identifier derived from the content stream. Deterministic
@@ -321,7 +451,7 @@ fn fnv1a64(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use layout::{Margins, ParagraphConfig, Size, StyleSpan, layout_paragraph};
-    use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use text_pipeline::{Alignment, ShapingDirection};
 
@@ -372,7 +502,7 @@ mod tests {
         let page = hello_page(&stack);
 
         let mut out = Vec::new();
-        export_pdf(&page, &stack, PdfProfile::Plain, &mut out).expect("export");
+        export_pdf(&page, &stack, &["Hello world"], PdfProfile::Plain, &mut out).expect("export");
 
         assert!(out.starts_with(b"%PDF-"), "missing PDF header");
         assert!(out.ends_with(b"%%EOF"), "missing EOF marker");
@@ -394,7 +524,7 @@ mod tests {
             paragraphs: vec![],
         };
         let mut out = Vec::new();
-        export_pdf(&page, &stack, PdfProfile::Plain, &mut out).expect("export empty page");
+        export_pdf(&page, &stack, &[], PdfProfile::Plain, &mut out).expect("export empty page");
         assert!(out.starts_with(b"%PDF-"), "missing PDF header");
         assert!(out.ends_with(b"%%EOF"), "missing EOF marker");
     }
@@ -405,7 +535,7 @@ mod tests {
         let page = hello_page(&stack);
 
         let mut out = Vec::new();
-        export_pdf(&page, &stack, PdfProfile::A1b, &mut out).expect("export A1b");
+        export_pdf(&page, &stack, &["Hello world"], PdfProfile::A1b, &mut out).expect("export A1b");
 
         let has = |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
         assert!(out.starts_with(b"%PDF-1.4"), "PDF/A-1 must declare PDF 1.4");
@@ -427,8 +557,50 @@ mod tests {
         let page = hello_page(&stack);
         let mut a = Vec::new();
         let mut b = Vec::new();
-        export_pdf(&page, &stack, PdfProfile::A1b, &mut a).expect("export a");
-        export_pdf(&page, &stack, PdfProfile::A1b, &mut b).expect("export b");
+        export_pdf(&page, &stack, &["Hello world"], PdfProfile::A1b, &mut a).expect("export a");
+        export_pdf(&page, &stack, &["Hello world"], PdfProfile::A1b, &mut b).expect("export b");
         assert_eq!(a, b, "A1b export must be byte-stable for identical input");
+    }
+
+    #[test]
+    fn deflate_round_trips() {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+        let data: &[u8] = b"PDF content PDF content PDF content PDF content";
+        let z = deflate(data);
+        let mut back = Vec::new();
+        ZlibDecoder::new(&z[..])
+            .read_to_end(&mut back)
+            .expect("inflate");
+        assert_eq!(back, data, "zlib round-trip must be lossless");
+    }
+
+    #[test]
+    fn compressed_pdf_declares_filters_and_tounicode() {
+        let stack = liberation_stack();
+        let page = hello_page(&stack);
+        let mut out = Vec::new();
+        export_pdf(&page, &stack, &["Hello world"], PdfProfile::Plain, &mut out).expect("export");
+
+        let has = |n: &[u8]| out.windows(n.len()).any(|w| w == n);
+        assert!(has(b"/FlateDecode"), "streams must declare FlateDecode");
+        assert!(
+            has(b"/ToUnicode"),
+            "Type0 font must reference a ToUnicode CMap"
+        );
+        /* FontFile2 keeps the uncompressed program length in Length1. */
+        assert!(has(b"/Length1"), "FontFile2 missing Length1");
+    }
+
+    #[test]
+    fn to_unicode_map_covers_source_chars() {
+        let stack = liberation_stack();
+        let page = hello_page(&stack);
+        let map = collect_to_unicode(&page, &["Hello world"]);
+        let liberation = map.get("liberation").expect("liberation font mapped");
+        let covered: HashSet<char> = liberation.values().flatten().copied().collect();
+        for ch in "Helo wrd".chars() {
+            assert!(covered.contains(&ch), "ToUnicode map missing {ch:?}");
+        }
     }
 }

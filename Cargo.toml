@@ -63,6 +63,10 @@ quick-xml = "0.36"
 rc-zip = "5"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 pdf-writer = "0.14"
+# flate2 default features select the pure-Rust `miniz_oxide` backend — no C,
+# wasm-safe. PDF `/FlateDecode` streams are zlib (RFC 1950), which flate2's
+# `ZlibEncoder` produces directly.
+flate2 = "1"
 
 # Errors / logging
 thiserror = "1"
