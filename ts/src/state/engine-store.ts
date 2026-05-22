@@ -8,7 +8,6 @@
 import { createSignal } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type {
-    A11yTree,
     Alignment,
     Direction,
     Event,
@@ -60,7 +59,6 @@ export function createEngineStore(client: EngineClient) {
        direction — together they drive the toolbar's alignment picker. */
     const [paragraphAlignment, setParagraphAlignment] = createSignal<Alignment>('Start');
     const [baseDirection, setBaseDirection] = createSignal<Direction>('Ltr');
-    const [a11yTree, setA11yTree] = createSignal<A11yTree | null>(null);
     const [announcement, setAnnouncement] = createSignal('');
     let announced = false;
 
@@ -77,11 +75,14 @@ export function createEngineStore(client: EngineClient) {
             setUndoState({ canUndo: ev.can_undo, canRedo: ev.can_redo });
             setParagraphAlignment(ev.paragraph_alignment);
             setBaseDirection(ev.direction);
-        } else if (ev.type === 'ACCESSIBILITY_TREE_CHANGED') {
-            setA11yTree(ev.tree);
+        } else if (ev.type === 'ACCESSIBILITY_TREE_DELTA') {
+            /* The first delta from a fresh engine is a single REPLACE; use its
+               paragraph count for the one-time "document loaded" announcement.
+               The reconciler in AccessibilityTree consumes the patches. */
             if (!announced) {
                 announced = true;
-                const n = ev.tree.paragraphs.length;
+                const first = ev.patches[0];
+                const n = first && first.type === 'REPLACE' ? first.tree.paragraphs.length : 0;
                 setAnnouncement(`Document loaded — ${n} paragraph${n === 1 ? '' : 's'}.`);
             }
         }
@@ -95,7 +96,6 @@ export function createEngineStore(client: EngineClient) {
         undoState,
         paragraphAlignment,
         baseDirection,
-        a11yTree,
         announcement,
     };
 }

@@ -36,6 +36,9 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
 - **Sprint 8 (2026-05-22)** — Professional PDF export (item 3): `FlateDecode`
   stream compression and a `/ToUnicode` CMap for text extraction. `/W` glyph
   widths, font subsetting and PDF/A-2 / PDF/X are still deferred.
+- **Sprint 9 (2026-05-22)** — Fine-grained accessibility deltas (item 10): the
+  per-mutation broadcast is now an `AccessibilityTreeDelta` of `A11yPatch`es; a
+  keystroke patches one mirror `<p>` instead of rebuilding the whole tree.
 
 ## 1. Rich text formatting
 
@@ -223,14 +226,23 @@ still ignore them (item 1 above). Size + colour render immediately.
 ## 10. Accessibility tree — fine-grained deltas
 
 **Shipped (D4.8):** the engine emits a full `A11yTree` (every paragraph, each
-split into style runs) via `AccessibilityTreeChanged` after every document
-mutation; the UI replaces the whole `.a11y-mirror` shadow DOM.
+split into style runs) after every document mutation.
 
-**Deferred:** incremental `A11yDelta`s — a per-edit patch (changed paragraphs
-+ removed ids) instead of a full snapshot. A full rebuild per keystroke is
-fine for the one-page PoC; a long document wants deltas plus stable
-per-paragraph ids so Solid reconciles only the changed `<p>`s. The repurposed
-`AccessibilityTreeChanged` event would gain a delta-carrying form.
+**✅ Shipped (Phase 5 sprint 9).** The per-mutation broadcast is now an
+`AccessibilityTreeDelta` carrying `A11yPatch`es — `Replace` (the first sync of
+any engine instance, including post-recovery), `Update`, `Insert` and
+`Remove`. `engine-wasm` caches the last broadcast tree and `diff_a11y` runs a
+prefix/suffix trim against the freshly built one, so a keystroke confined to
+one paragraph emits a single `Update`. `ts/src/a11y/tree.ts` reconciles the
+patches into the `.a11y-mirror` DOM, replacing only the changed `<p>` — the
+browser no longer rebuilds the whole accessibility subtree per keystroke.
+
+**Still deferred:** stable per-paragraph ids. `diff_a11y` matches paragraphs
+by content, which is optimal for typing, Enter and delete-merge but re-emits a
+genuinely *moved* paragraph as remove + insert. True positional identity needs
+an id on `engine::Paragraph` — a wider document-model change left for later.
+The `A11yParagraph.id` field (previously the array index, which is not stable)
+was dropped rather than kept as a misleading value.
 
 ## 11. Pending (sticky) formatting
 

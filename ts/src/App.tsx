@@ -162,7 +162,7 @@ export function App() {
                     <HiddenInput client={client} store={store} />
                 </div>
             </div>
-            <AccessibilityTree store={store} />
+            <AccessibilityTree client={client} />
             <Announcements store={store} />
             <Show when={booting()}>
                 <div class="boot-overlay">Loading editor…</div>

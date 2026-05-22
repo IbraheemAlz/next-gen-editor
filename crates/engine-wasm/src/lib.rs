@@ -5,8 +5,8 @@
 //! repaint when a layout config was cached by a prior `RenderPage`.
 
 use bridge::{
-    A11yParagraph, A11yRun, A11yTree, Alignment as BridgeAlignment, Color, Command, Direction,
-    EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
+    A11yParagraph, A11yPatch, A11yRun, A11yTree, Alignment as BridgeAlignment, Color, Command,
+    Direction, EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
     LogicalRange as BridgeLogicalRange, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
     TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
@@ -128,6 +128,12 @@ pub struct Engine {
     /// changed paragraph; the rest are clones shifted by a Y delta. `RefCell`
     /// because `build_page` populates it behind a `&self` borrow.
     layout_cache: RefCell<LruCache<u64, ParagraphBox>>,
+    /// Last accessibility tree broadcast to the UI (Backlog #10).
+    /// `build_a11y_delta` diffs the freshly built tree against this so a
+    /// keystroke emits only the changed paragraph. `None` until the first
+    /// delta — that one is a full `Replace`, so a fresh engine after crash
+    /// recovery hands the mirror a clean rebuild.
+    a11y_cache: Option<Vec<A11yParagraph>>,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -163,6 +169,7 @@ impl Engine {
             composition: None,
             pending_format: None,
             layout_cache: new_layout_cache(),
+            a11y_cache: None,
         })
     }
 
@@ -701,6 +708,65 @@ fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
     runs
 }
 
+/// Diff two accessibility paragraph lists into the minimal patch set (Backlog
+/// #10).
+///
+/// A prefix/suffix trim: paragraphs equal at the front and back are skipped,
+/// leaving one changed region. Overlapping positions in that region become
+/// `Update`s; then the longer side contributes `Insert`s or `Remove`s — never
+/// both, since trimming leaves a single region that only grows or shrinks.
+/// Typing in paragraph K trims to `{K}` → one `Update`; pressing Enter in K
+/// yields `Update(K)` + `Insert(K+1)`.
+fn diff_a11y(prev: &[A11yParagraph], next: &[A11yParagraph]) -> Vec<A11yPatch> {
+    let max_common = prev.len().min(next.len());
+
+    /* Common prefix: paragraphs identical from the front. */
+    let mut pre = 0;
+    while pre < max_common && prev[pre] == next[pre] {
+        pre += 1;
+    }
+
+    /* Common suffix: paragraphs identical from the back, not overrunning the
+    prefix already matched on either side. */
+    let mut suf = 0;
+    while suf < max_common - pre && prev[prev.len() - 1 - suf] == next[next.len() - 1 - suf] {
+        suf += 1;
+    }
+
+    let old_mid = &prev[pre..prev.len() - suf];
+    let new_mid = &next[pre..next.len() - suf];
+    let overlap = old_mid.len().min(new_mid.len());
+
+    let mut patches: Vec<A11yPatch> = Vec::new();
+    /* Overlapping positions: replace where the paragraph actually differs. */
+    for (j, (old, new)) in old_mid.iter().zip(new_mid.iter()).enumerate() {
+        if old != new {
+            patches.push(A11yPatch::Update {
+                index: (pre + j) as u32,
+                paragraph: new.clone(),
+            });
+        }
+    }
+    /* The longer side: grow with `Insert`s or shrink with `Remove`s. */
+    if new_mid.len() > overlap {
+        for (j, para) in new_mid.iter().enumerate().skip(overlap) {
+            patches.push(A11yPatch::Insert {
+                index: (pre + j) as u32,
+                paragraph: para.clone(),
+            });
+        }
+    } else {
+        /* Each removal shrinks the list, so the next stale paragraph slides
+        into the same index — remove there repeatedly. */
+        for _ in overlap..old_mid.len() {
+            patches.push(A11yPatch::Remove {
+                index: (pre + overlap) as u32,
+            });
+        }
+    }
+    patches
+}
+
 impl Engine {
     async fn apply(&mut self, cmd: Command) -> Event {
         match cmd {
@@ -851,9 +917,9 @@ impl Engine {
                 self.do_delete_at_caret(forward, by_word)
             }
 
-            // Phase 4 §10 — accessibility shadow tree.
-            Command::RequestAccessibilityTree => Event::AccessibilityTreeChanged {
-                tree: self.build_a11y_tree(),
+            // Phase 4 §10 — accessibility mirror (Backlog #10: fine-grained deltas).
+            Command::RequestAccessibilityDelta => Event::AccessibilityTreeDelta {
+                patches: self.build_a11y_delta(),
             },
 
             // Phase 4 §12 — clipboard. Backlog sprint 7 adds rich HTML paste.
@@ -1803,26 +1869,41 @@ impl Engine {
         }
     }
 
-    /// Build a full accessibility snapshot of the current document — every
+    /// Build the accessibility paragraph list for the current document — every
     /// paragraph, split into style runs (PHASE_4_HEADLESS_UI.md §10).
-    fn build_a11y_tree(&self) -> A11yTree {
+    fn build_a11y_paragraphs(&self) -> Vec<A11yParagraph> {
         let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
         };
-        let paragraphs = self
-            .undo
+        self.undo
             .current()
             .paragraphs
             .iter()
-            .enumerate()
-            .map(|(i, para)| A11yParagraph {
-                id: i as u32,
+            .map(|para| A11yParagraph {
                 direction,
                 runs: a11y_runs(para),
             })
-            .collect();
-        A11yTree { paragraphs }
+            .collect()
+    }
+
+    /// Build an incremental accessibility delta (Backlog #10). The first call
+    /// on an engine instance emits a single `Replace` — there is no prior tree
+    /// to diff, and a post-recovery engine must hand the UI a clean rebuild.
+    /// Every later call diffs against the cached tree, so a keystroke that
+    /// touches one paragraph emits exactly one `Update`.
+    fn build_a11y_delta(&mut self) -> Vec<A11yPatch> {
+        let next = self.build_a11y_paragraphs();
+        let patches = match &self.a11y_cache {
+            None => vec![A11yPatch::Replace {
+                tree: A11yTree {
+                    paragraphs: next.clone(),
+                },
+            }],
+            Some(prev) => diff_a11y(prev, &next),
+        };
+        self.a11y_cache = Some(next);
+        patches
     }
 
     /// `Command::GetSelectionAsClipboard` — snapshot the selection as the
@@ -1981,6 +2062,7 @@ mod tests {
             composition: None,
             pending_format: None,
             layout_cache: new_layout_cache(),
+            a11y_cache: None,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -2177,6 +2259,100 @@ mod tests {
         assert_ne!(
             paragraph_layout_key(&a, &cfg, 1.0),
             paragraph_layout_key(&a, &cfg, 2.0),
+        );
+    }
+
+    /// Build a single-run accessibility paragraph for the `diff_a11y` tests.
+    fn a11y_para(text: &str) -> A11yParagraph {
+        A11yParagraph {
+            direction: Direction::Ltr,
+            runs: vec![A11yRun {
+                text: text.to_string(),
+                bold: false,
+                italic: false,
+                underline: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn diff_a11y_identical_is_empty() {
+        let tree = vec![a11y_para("a"), a11y_para("b")];
+        assert_eq!(diff_a11y(&tree, &tree), vec![]);
+    }
+
+    #[test]
+    fn diff_a11y_typing_emits_one_update() {
+        /* A keystroke in paragraph 1 — the rest of the document is untouched. */
+        let prev = vec![a11y_para("a"), a11y_para("b"), a11y_para("c")];
+        let next = vec![a11y_para("a"), a11y_para("bX"), a11y_para("c")];
+        assert_eq!(
+            diff_a11y(&prev, &next),
+            vec![A11yPatch::Update {
+                index: 1,
+                paragraph: a11y_para("bX"),
+            }],
+        );
+    }
+
+    #[test]
+    fn diff_a11y_split_emits_update_then_insert() {
+        /* Enter inside paragraph 1: "bc" -> "b" + "c". Paragraph "d" shifts
+        down a slot but its content is unchanged, so it is not re-emitted. */
+        let prev = vec![a11y_para("a"), a11y_para("bc"), a11y_para("d")];
+        let next = vec![
+            a11y_para("a"),
+            a11y_para("b"),
+            a11y_para("c"),
+            a11y_para("d"),
+        ];
+        assert_eq!(
+            diff_a11y(&prev, &next),
+            vec![
+                A11yPatch::Update {
+                    index: 1,
+                    paragraph: a11y_para("b"),
+                },
+                A11yPatch::Insert {
+                    index: 2,
+                    paragraph: a11y_para("c"),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn diff_a11y_merge_emits_update_then_remove() {
+        /* Backspace at the start of paragraph 2: "b" + "c" -> "bc". */
+        let prev = vec![
+            a11y_para("a"),
+            a11y_para("b"),
+            a11y_para("c"),
+            a11y_para("d"),
+        ];
+        let next = vec![a11y_para("a"), a11y_para("bc"), a11y_para("d")];
+        assert_eq!(
+            diff_a11y(&prev, &next),
+            vec![
+                A11yPatch::Update {
+                    index: 1,
+                    paragraph: a11y_para("bc"),
+                },
+                A11yPatch::Remove { index: 2 },
+            ],
+        );
+    }
+
+    #[test]
+    fn diff_a11y_append_emits_insert_only() {
+        let prev = vec![a11y_para("a")];
+        let next = vec![a11y_para("a"), a11y_para("b")];
+        assert_eq!(
+            diff_a11y(&prev, &next),
+            vec![A11yPatch::Insert {
+                index: 1,
+                paragraph: a11y_para("b"),
+            }],
         );
     }
 }

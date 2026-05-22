@@ -444,12 +444,13 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
            the event log OFF the critical path. The RPC response is already
            sent, so event-log latency never throttles command throughput. */
         logCommand(msg.cmd);
-        /* §10: after a document mutation, broadcast a fresh accessibility
-           tree. The message carries no `id`, so EngineClient fans it out to
-           subscribers — the screen-reader shadow DOM stays synced. */
+        /* §10 / Backlog #10: after a document mutation, broadcast an
+           accessibility delta. The message carries no `id`, so EngineClient
+           fans it out to subscribers — the mirror DOM reconciler patches only
+           the paragraphs that changed. */
         if (mutatesDocument(msg.cmd)) {
-            const tree = await dispatch({ type: 'REQUEST_ACCESSIBILITY_TREE' } as Command);
-            self.postMessage({ evt: tree });
+            const delta = await dispatch({ type: 'REQUEST_ACCESSIBILITY_DELTA' } as Command);
+            self.postMessage({ evt: delta });
         }
     } catch (e: unknown) {
         replyError(msg.id, e);

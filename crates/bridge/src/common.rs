@@ -73,7 +73,7 @@ pub enum VerticalScript {
 }
 
 /// Directionality of a selection or a resolved text run.
-#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Ltr,
     Rtl,

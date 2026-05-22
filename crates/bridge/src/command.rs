@@ -220,10 +220,11 @@ pub enum Command {
         by_word: bool,
     },
 
-    /// Request a full accessibility snapshot; the engine replies with
-    /// `Event::AccessibilityTreeChanged`. The worker issues this after every
-    /// document mutation to keep the screen-reader shadow tree synced (§10).
-    RequestAccessibilityTree,
+    /// Request an incremental accessibility delta — the engine diffs the
+    /// document against its last broadcast and replies with
+    /// `Event::AccessibilityTreeDelta` (§10, Backlog #10). The worker issues
+    /// this after every document mutation to keep the mirror DOM synced.
+    RequestAccessibilityDelta,
 
     /// Snapshot the current selection for the clipboard — the engine replies
     /// with `Event::ClipboardPayload` (PHASE_4_HEADLESS_UI.md §12).

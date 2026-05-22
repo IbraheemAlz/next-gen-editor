@@ -1,35 +1,29 @@
-/* Phase 4 §10 — accessibility shadow tree.
+/* Phase 4 §10 — accessibility mirror.
  *
  * A <canvas> is invisible to screen readers, so this mirrors the engine's
  * document into a visually-hidden but ARIA-visible DOM tree that NVDA /
- * VoiceOver / Orca can read and navigate. It is rebuilt from the engine's
- * `A11yTree` after every edit (the worker broadcasts a fresh tree). The
- * mirror holds no authority — it only reflects engine state. */
-import { For } from 'solid-js';
-import type { A11yRun } from '../engine/types';
-import type { EngineStore } from '../state/engine-store';
+ * VoiceOver / Orca can read and navigate.
+ *
+ * Backlog #10: the engine broadcasts incremental `A11yPatch` deltas after each
+ * mutation; the reconciler patches only the changed <p> nodes, so a keystroke
+ * no longer rebuilds the whole mirror. This component is a bare `ref` host —
+ * `createA11yReconciler` owns everything inside it; Solid never re-renders the
+ * children. The mirror holds no authority — it only reflects engine state. */
+import { onCleanup, onMount } from 'solid-js';
+import { createA11yReconciler } from '../a11y/tree';
+import type { EngineClient } from '../engine/engine-client';
 
-/** Inline CSS for a run, so a screen reader can announce its formatting. */
-function runStyle(r: A11yRun): string {
-    const parts: string[] = [];
-    if (r.bold) parts.push('font-weight:bold');
-    if (r.italic) parts.push('font-style:italic');
-    if (r.underline) parts.push('text-decoration:underline');
-    return parts.join(';');
-}
+export function AccessibilityTree(props: { client: EngineClient }) {
+    let mirror: HTMLDivElement | undefined;
+    let unsubscribe: (() => void) | undefined;
 
-export function AccessibilityTree(props: { store: EngineStore }) {
-    return (
-        <div role="document" class="a11y-mirror" aria-label="Document">
-            <For each={props.store.a11yTree()?.paragraphs ?? []}>
-                {(p) => (
-                    <p data-pid={p.id} dir={p.direction === 'Rtl' ? 'rtl' : 'ltr'}>
-                        <For each={p.runs}>
-                            {(r) => <span style={runStyle(r)}>{r.text}</span>}
-                        </For>
-                    </p>
-                )}
-            </For>
-        </div>
-    );
+    onMount(() => {
+        const reconciler = createA11yReconciler(mirror!);
+        unsubscribe = props.client.subscribe((ev) => {
+            if (ev.type === 'ACCESSIBILITY_TREE_DELTA') reconciler.apply(ev.patches);
+        });
+    });
+    onCleanup(() => unsubscribe?.());
+
+    return <div role="document" class="a11y-mirror" aria-label="Document" ref={mirror} />;
 }

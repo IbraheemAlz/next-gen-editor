@@ -6,6 +6,7 @@
  * relative path in one place — UI code imports from `../engine/types`. */
 export type {
     A11yParagraph,
+    A11yPatch,
     A11yRun,
     A11yTree,
     Alignment,

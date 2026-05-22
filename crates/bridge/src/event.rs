@@ -133,11 +133,12 @@ pub enum Event {
     },
 
     /* Accessibility */
-    /// Full accessibility snapshot — emitted after every document mutation
-    /// (PHASE_4_HEADLESS_UI.md §10). Fine-grained deltas are deferred; see
-    /// BACKLOG.md.
-    AccessibilityTreeChanged {
-        tree: A11yTree,
+    /// Fine-grained accessibility patches — broadcast after every document
+    /// mutation (PHASE_4_HEADLESS_UI.md §10, Backlog #10). The first delta from
+    /// any engine instance (boot or post-recovery) is a single `Replace`; every
+    /// later delta carries only the paragraphs that actually changed.
+    AccessibilityTreeDelta {
+        patches: Vec<A11yPatch>,
     },
 
     /* Telemetry */
@@ -208,27 +209,58 @@ pub struct EngineStats {
     pub last_command_ms: f32,
 }
 
-/// A full accessibility snapshot of the document — the structure mirrored
-/// into the screen-reader shadow DOM (PHASE_4_HEADLESS_UI.md §10).
-#[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+/// A full accessibility snapshot of the document — the structure mirrored into
+/// the screen-reader DOM (PHASE_4_HEADLESS_UI.md §10). Carried by the
+/// `A11yPatch::Replace` reset patch.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 pub struct A11yTree {
     pub paragraphs: Vec<A11yParagraph>,
 }
 
-/// One paragraph in the accessibility tree — a `<p>` in the shadow DOM.
-#[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+/// One paragraph in the accessibility tree — a `<p>` in the mirror DOM.
+///
+/// Carries no id: the engine has no stable paragraph identity, so `diff_a11y`
+/// matches paragraphs by content and the patches address them by position.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 pub struct A11yParagraph {
-    pub id: u32,
     pub direction: Direction,
     pub runs: Vec<A11yRun>,
 }
 
 /// One styled text run within an accessibility paragraph — a `<span>` in the
-/// shadow DOM, so screen readers can announce formatting boundaries.
-#[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+/// mirror DOM, so screen readers can announce formatting boundaries.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 pub struct A11yRun {
     pub text: String,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+}
+
+/// One incremental patch to the mirrored accessibility tree (Backlog #10).
+///
+/// Patches in a delta apply in order against the current paragraph list:
+/// every `Update` first, then either the `Insert`s (ascending index) or the
+/// `Remove`s — a prefix/suffix diff only ever grows or shrinks one contiguous
+/// region, so a single delta never mixes inserts and removes.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum A11yPatch {
+    /// Discard the whole mirror and rebuild it — the first delta from any
+    /// engine instance (boot or post-recovery), where there is no prior tree
+    /// to diff against.
+    Replace { tree: A11yTree },
+    /// Replace the paragraph at `index` in place — its text or style changed
+    /// (the common case: a keystroke lands in one paragraph).
+    Update {
+        index: u32,
+        paragraph: A11yParagraph,
+    },
+    /// Insert a new paragraph at `index`, shifting later paragraphs down.
+    Insert {
+        index: u32,
+        paragraph: A11yParagraph,
+    },
+    /// Remove the paragraph at `index`, shifting later paragraphs up.
+    Remove { index: u32 },
 }
