@@ -209,7 +209,9 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
         }
 
         for (rel_start, rel_end, script, span) in subs {
-            let Some((font_id, face, synth)) = cfg.fonts.resolve(script, span.bold, span.italic)
+            let Some((font_id, face, synth)) =
+                cfg.fonts
+                    .resolve(script, span.font_family.as_deref(), span.bold, span.italic)
             else {
                 continue;
             };
@@ -238,6 +240,9 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     color: span.color,
                     faux_bold: synth.faux_bold,
                     faux_italic: synth.faux_italic,
+                    underline: span.underline,
+                    strike: span.strike,
+                    bg_color: span.bg_color,
                 },
             });
         }
@@ -266,8 +271,8 @@ fn line_advance(runs: &[VisualRun]) -> f32 {
 fn style_at(spans: &[StyleSpan], offset: u32) -> Option<StyleSpan> {
     spans
         .iter()
-        .copied()
         .find(|s| offset >= s.start && offset < s.end)
+        .cloned()
 }
 
 /// Total advance of `text` shaped with per-script fonts and per-span sizes —
@@ -283,11 +288,6 @@ fn measure_text(
 ) -> f32 {
     let mut total = 0.0_f32;
     for (srange, script) in segment_by_script(text) {
-        /* Faux bold / italic never change advances, so the probe measures
-        against the base face regardless of the span's weight / slant. */
-        let Some((_, face, _)) = fonts.resolve(script, false, false) else {
-            continue;
-        };
         let mut cursor = abs_start + srange.start as u32;
         let seg_end = abs_start + srange.end as u32;
         while cursor < seg_end {
@@ -295,6 +295,13 @@ fn measure_text(
                 break;
             };
             let piece_end = span.end.min(seg_end);
+            /* Resolve per span: an explicit font family changes shaping (and
+            width); faux bold/italic do not, so weight/slant stay `false`. */
+            let Some((_, face, _)) =
+                fonts.resolve(script, span.font_family.as_deref(), false, false)
+            else {
+                break;
+            };
             let sub = &text[(cursor - abs_start) as usize..(piece_end - abs_start) as usize];
             total += shape_text(face, sub, direction, span.px_size).total_advance;
             cursor = piece_end;

@@ -334,6 +334,10 @@ mod tests {
             color: [0, 0, 0, 255],
             bold: false,
             italic: false,
+            underline: false,
+            strike: false,
+            bg_color: None,
+            font_family: None,
         }];
         let para = layout_paragraph(ParagraphConfig {
             text: "Hello world",

@@ -26,6 +26,10 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
 - **Sprint 5 (2026-05-22)** — Dynamic line height (item 5, complete);
   first-strong paragraph auto-direction (item 6 — a UI override toggle is
   still deferred).
+- **Sprint 6 (2026-05-22)** — Text decorations and per-span font family:
+  underline + strikethrough strokes and background-colour highlight (item 1 —
+  the render sub-items; the docx `<w:rPr>` round-trip stays deferred); the
+  toolbar `FontFamilyPicker` (item 9, now complete).
 
 ## 1. Rich text formatting
 
@@ -33,9 +37,9 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
 in the document model, `Command::ApplyFormatting` (split / merge / coalesce),
 and per-span **font size + colour** carried through layout and render.
 
-**Partly shipped.** Bold / italic face resolution shipped in Phase 5 sprint 3;
-underline, strikethrough, background colour and docx `<w:rPr>` round-trip are
-still deferred.
+**Partly shipped.** Bold / italic faces (sprint 3) and underline /
+strikethrough / background colour (sprint 6) all render; only the docx
+`<w:rPr>` round-trip is still deferred.
 
 - **✅ Bold / italic face resolution — shipped (Phase 5 sprint 3).** `FontStack`
   now resolves a face by script **and** weight/slant; `LoadedFont` reports its
@@ -44,10 +48,14 @@ still deferred.
   face, has no italic at all), so the renderer **synthesizes** the missing
   styles — faux bold dilates the rasterized alpha mask, faux italic shears it
   (`render::synth`). Real designed faces remain a drop-in upgrade.
-- **Underline & strikethrough.** No `DisplayList` primitive draws decoration
-  lines yet; needs a stroke/line command and baseline-relative metrics.
-- **Background colour.** `TextAttrs.bg_color` is unused; needs a `FillRect`
-  emitted behind each run before its glyphs.
+- **✅ Underline & strikethrough — shipped (Phase 5 sprint 6).**
+  `build_page_scene` emits a thin `FillRect` per decoration — the underline
+  just below the baseline, the strikethrough centred near the x-height
+  midpoint — each positioned and sized from the run's pixel size.
+- **✅ Background colour — shipped (Phase 5 sprint 6).** `build_page_scene`
+  emits a `FillRect` spanning the run's advance and the line height *before*
+  its glyphs; `paint_alpha_glyph` then composites each glyph over the
+  highlight, so `put_image_data` does not punch transparent holes through it.
 - **docx `<w:rPr>` round-trip.** `format-docx` flattens runs to plain text;
   `Paragraph.spans` is empty on import and ignored on export. A faithful
   reader/writer would map `<w:rPr>` to and from `StyleRun`s.
@@ -169,8 +177,8 @@ Underline, font size, text colour. Bold/italic/underline are stored on
 `SpanStyle` and round-trip (the buttons reflect them), though layout/render
 still ignore them (item 1 above). Size + colour render immediately.
 
-**Partly shipped.** §11's `AlignmentPicker` shipped in Phase 5 sprint 1; the
-`FontFamilyPicker` is still deferred.
+**✅ Shipped.** §11's `AlignmentPicker` shipped in Phase 5 sprint 1 and the
+`FontFamilyPicker` in Phase 5 sprint 6 — this item is complete.
 
 - **✅ Paragraph alignment — shipped (Phase 5 sprint 1).** `engine::Paragraph`
   carries an `alignment: Option<Alignment>`, threaded through every model
@@ -179,10 +187,12 @@ still ignore them (item 1 above). Size + colour render immediately.
   resolves `End` direction-relatively. The toolbar `AlignmentPicker` maps the
   absolute Left/Center/Right/Justify buttons onto the engine's
   direction-relative model via the document base direction.
-- **Per-span font family.** `SpanStyle` has no `font_family`, and `FontStack`
-  resolves a face by script, not by a requested family. Needs a family field
-  on `SpanStyle`, multiple loaded families, and family-aware `FontStack`
-  resolution. Related to item 1 (bold/italic face resolution).
+- **✅ Per-span font family — shipped (Phase 5 sprint 6).** `engine::SpanStyle`
+  carries a `font_family: Option<FontFamily>` (an enum, so `SpanStyle` stays
+  `Copy`); `Command::ApplyFormatting` sets it, and `FontStack::resolve` takes
+  a family override that wins over the script default when that face is
+  loaded. `App.tsx` loads three families (Amiri, Liberation Sans, Noto Naskh
+  Arabic) and the toolbar `FontFamilyPicker` dispatches the change.
 
 ## 10. Accessibility tree — fine-grained deltas
 

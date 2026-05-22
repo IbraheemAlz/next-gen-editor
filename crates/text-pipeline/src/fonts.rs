@@ -237,18 +237,34 @@ impl FontStack {
         }
     }
 
-    /// Resolve `script` plus the requested weight/slant to a font id, its
-    /// loaded face, and the [`Synthesis`] the renderer must apply. A real face
-    /// whose own metadata matches `bold`/`italic` is used verbatim (no faux);
-    /// otherwise the best covering face is returned and the missing weight /
-    /// slant is flagged for synthesis (Backlog #1). `None` only when the stack
-    /// holds no faces at all.
+    /// Resolve `script` plus an optional explicit font `family` and the
+    /// requested weight/slant to a font id, its loaded face, and the
+    /// [`Synthesis`] the renderer must apply. An explicit `family` (a loaded
+    /// font id) wins when present (Backlog #9); otherwise a real face whose
+    /// own metadata matches `bold`/`italic` is used verbatim, falling back to
+    /// the best covering face with the missing weight/slant flagged for
+    /// synthesis (Backlog #1). `None` only when the stack holds no faces.
     pub fn resolve(
         &self,
         script: Script,
+        family: Option<&str>,
         bold: bool,
         italic: bool,
     ) -> Option<(&FontId, &LoadedFont, Synthesis)> {
+        /* An explicit font-family request wins when that face is loaded;
+        faux styling still fills any weight/slant gap. */
+        if let Some(fam) = family
+            && let Some((key, face)) = self.faces.get_key_value(fam)
+        {
+            return Some((
+                key,
+                face.as_ref(),
+                Synthesis {
+                    faux_bold: bold && !face.is_bold(),
+                    faux_italic: italic && !face.is_italic(),
+                },
+            ));
+        }
         let preferred = self.by_script.get(&script).into_iter().flatten();
         let chain: Vec<&FontId> = preferred.chain(self.fallback_chain.iter()).collect();
         /* A real variant whose own metadata matches the request — no faux. */

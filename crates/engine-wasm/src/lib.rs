@@ -11,7 +11,8 @@ use bridge::{
     TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{
-    Alignment as EngineAlignment, DocumentTree, LogicalPos as EnginePos, SpanStyle, UndoStack,
+    Alignment as EngineAlignment, DocumentTree, FontFamily as EngineFontFamily,
+    LogicalPos as EnginePos, SpanStyle, UndoStack,
 };
 use format_docx::writer::build_minimal_docx;
 use kurbo::Rect;
@@ -337,6 +338,26 @@ fn engine_align(a: BridgeAlignment) -> EngineAlignment {
 /// [`StyleSpan`]s covering `[0, text.len())`, filling unstyled gaps with the
 /// document defaults. Every `px_size` is multiplied by `scale` so glyphs
 /// rasterize at device resolution (`default_size` arrives logical).
+/// Map a font family to its loaded font id. The TS shell loads each family
+/// under exactly this id (Backlog #9).
+fn font_family_id(family: EngineFontFamily) -> &'static str {
+    match family {
+        EngineFontFamily::Amiri => "amiri",
+        EngineFontFamily::LiberationSans => "liberation",
+        EngineFontFamily::NotoNaskhArabic => "noto-naskh",
+    }
+}
+
+/// Parse a toolbar font-family id back to the document-model enum.
+fn parse_font_family(id: &str) -> Option<EngineFontFamily> {
+    match id {
+        "amiri" => Some(EngineFontFamily::Amiri),
+        "liberation" => Some(EngineFontFamily::LiberationSans),
+        "noto-naskh" => Some(EngineFontFamily::NotoNaskhArabic),
+        _ => None,
+    }
+}
+
 fn build_style_spans(
     para: &engine::Paragraph,
     default_size: f32,
@@ -346,16 +367,22 @@ fn build_style_spans(
     let len = para.text.len() as u32;
     let mut spans: Vec<StyleSpan> = Vec::new();
     let mut cursor = 0_u32;
+    /* A default-styled gap span — covers text between or outside style runs. */
+    let gap = |start: u32, end: u32| StyleSpan {
+        start,
+        end,
+        px_size: default_size * scale,
+        color: default_color,
+        bold: false,
+        italic: false,
+        underline: false,
+        strike: false,
+        bg_color: None,
+        font_family: None,
+    };
     for run in &para.spans {
         if run.start > cursor {
-            spans.push(StyleSpan {
-                start: cursor,
-                end: run.start,
-                px_size: default_size * scale,
-                color: default_color,
-                bold: false,
-                italic: false,
-            });
+            spans.push(gap(cursor, run.start));
         }
         spans.push(StyleSpan {
             start: run.start,
@@ -364,18 +391,19 @@ fn build_style_spans(
             color: run.style.color.unwrap_or(default_color),
             bold: run.style.bold.unwrap_or(false),
             italic: run.style.italic.unwrap_or(false),
+            underline: run.style.underline.unwrap_or(false),
+            strike: run.style.strike.unwrap_or(false),
+            bg_color: run.style.bg_color,
+            font_family: run
+                .style
+                .font_family
+                .map(font_family_id)
+                .map(str::to_string),
         });
         cursor = run.end;
     }
     if cursor < len {
-        spans.push(StyleSpan {
-            start: cursor,
-            end: len,
-            px_size: default_size * scale,
-            color: default_color,
-            bold: false,
-            italic: false,
-        });
+        spans.push(gap(cursor, len));
     }
     spans
 }
@@ -399,6 +427,9 @@ fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32
         run.style.bold.hash(&mut h);
         run.style.italic.hash(&mut h);
         run.style.underline.hash(&mut h);
+        run.style.strike.hash(&mut h);
+        run.style.bg_color.hash(&mut h);
+        run.style.font_family.hash(&mut h);
     }
     /* `engine::Alignment` / `text_pipeline::Alignment` carry no `Hash` derive —
     hash a small discriminant instead. */
@@ -877,6 +908,7 @@ impl Engine {
                 POC_BASELINE_X,
                 POC_BASELINE_Y,
                 [0, 0, 0],
+                None,
             ) {
                 return Event::Error {
                     message: format!("paint: {e:?}"),
@@ -932,9 +964,14 @@ impl Engine {
                 };
                 let dx = pen_x + g.x_offset as f64;
                 let dy = pen_y - g.y_offset as f64;
-                if let Err(e) =
-                    render::canvas2d_backend::paint_alpha_glyph(ctx, &raster, dx, dy, [0, 0, 0])
-                {
+                if let Err(e) = render::canvas2d_backend::paint_alpha_glyph(
+                    ctx,
+                    &raster,
+                    dx,
+                    dy,
+                    [0, 0, 0],
+                    None,
+                ) {
                     return Event::Error {
                         message: format!("paint: {e:?}"),
                     };
@@ -1002,6 +1039,9 @@ impl Engine {
             italic: attrs.italic,
             /* Underline is a stored on/off flag in the model. */
             underline: attrs.underline.map(|u| !matches!(u, UnderlineStyle::None)),
+            strike: attrs.strike,
+            bg_color: attrs.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
+            font_family: attrs.font_family.as_deref().and_then(parse_font_family),
         };
         /* Sticky formatting (Backlog #11): a collapsed caret has no text to
         style. Rather than push a no-op edit, arm the patch as the pending
@@ -1484,14 +1524,17 @@ impl Engine {
             bold: style.bold.unwrap_or(false),
             italic: style.italic.unwrap_or(false),
             underline,
-            strike: false,
-            font_family: self
-                .layout_cfg
-                .as_ref()
-                .map_or(String::new(), |c| c.font_id.clone()),
+            strike: style.strike.unwrap_or(false),
+            /* The span's own family, else the document's default font id. */
+            font_family: style
+                .font_family
+                .map(font_family_id)
+                .map(str::to_string)
+                .or_else(|| self.layout_cfg.as_ref().map(|c| c.font_id.clone()))
+                .unwrap_or_default(),
             font_size: style.font_size.unwrap_or(default_size),
             color: Color { r, g, b, a },
-            bg_color: None,
+            bg_color: style.bg_color.map(|[r, g, b, a]| Color { r, g, b, a }),
             script: VerticalScript::Normal,
             language: String::new(),
         }
@@ -1990,6 +2033,9 @@ mod tests {
             color: [0, 0, 0, 255],
             faux_bold: false,
             faux_italic: false,
+            underline: false,
+            strike: false,
+            bg_color: None,
         };
         let glyph = |cluster: u32, adv: f32, synthetic: bool| layout::PositionedGlyph {
             id: 1,

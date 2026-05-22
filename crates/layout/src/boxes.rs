@@ -43,12 +43,18 @@ pub struct TextAttrs {
     pub faux_bold: bool,
     /// Render this run with synthetic (faux) italic via a shear transform.
     pub faux_italic: bool,
+    /// Draw an underline stroke below the run (Backlog #1).
+    pub underline: bool,
+    /// Draw a strikethrough stroke through the run (Backlog #1).
+    pub strike: bool,
+    /// Highlight colour painted behind the run's glyphs (Backlog #1).
+    pub bg_color: Option<[u8; 4]>,
 }
 
 /// A resolved rich-text style span — a paragraph byte range `[start, end)` with
-/// its fully-resolved font size and colour (paragraph defaults already
-/// applied). `layout_paragraph` splits shaping runs at these boundaries.
-#[derive(Debug, Clone, Copy)]
+/// its fully-resolved style (paragraph defaults already applied).
+/// `layout_paragraph` splits shaping runs at these boundaries.
+#[derive(Debug, Clone)]
 pub struct StyleSpan {
     pub start: u32,
     pub end: u32,
@@ -58,6 +64,12 @@ pub struct StyleSpan {
     pub bold: bool,
     /// Requested italic — resolved to a real face or faux synthesis.
     pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    pub bg_color: Option<[u8; 4]>,
+    /// Resolved font id for an explicit family request; `None` keeps the
+    /// per-script default face (Backlog #9).
+    pub font_family: Option<String>,
 }
 
 /// One shaped glyph, positioned by advance/offset relative to the pen. There is

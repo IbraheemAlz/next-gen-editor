@@ -7,10 +7,11 @@
  * Phase 5 D5.4 adds the Export PDF button — it dispatches `ExportPdf` and turns
  * the returned `PdfExported` bytes into a browser download.
  *
- * Backlog sprint 1 adds the paragraph AlignmentPicker (Backlog #9). The B/I/U
- * buttons also drive sticky formatting (Backlog #11): clicking one with a
- * collapsed caret arms a pending style the engine applies to the next typed
- * run. The font-family picker from §11 is still deferred (see BACKLOG.md). */
+ * Backlog sprint 1 added the AlignmentPicker; sprint 6 completes the rich-text
+ * controls — strikethrough, a highlight (background) colour, and the
+ * FontFamilyPicker (Backlog #1, #9). The B/I/U/S buttons also drive sticky
+ * formatting (Backlog #11): clicking one with a collapsed caret arms a pending
+ * style the engine applies to the next typed run. */
 import { createSignal, For } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type { Alignment, Color, TextAttrsPatch } from '../engine/types';
@@ -18,6 +19,14 @@ import type { EngineStore } from '../state/engine-store';
 
 const FONT_SIZES = [12, 14, 16, 18, 20, 24, 32, 48, 64];
 const DEFAULT_COLOR: Color = { r: 0, g: 0, b: 0, a: 255 };
+/* Shown in the highlight picker when the run has no background colour. */
+const NO_HIGHLIGHT: Color = { r: 255, g: 255, b: 255, a: 255 };
+/* Font families loaded by `App.tsx`; `id` is the engine's loaded font id. */
+const FONT_FAMILIES: ReadonlyArray<{ id: string; label: string }> = [
+    { id: 'amiri', label: 'Amiri' },
+    { id: 'liberation', label: 'Liberation Sans' },
+    { id: 'noto-naskh', label: 'Noto Naskh Arabic' },
+];
 
 /** A `TextAttrsPatch` with every field unset — the base for a sparse patch. */
 function emptyPatch(): TextAttrsPatch {
@@ -82,8 +91,11 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
     const bold = () => attrs()?.bold ?? false;
     const italic = () => attrs()?.italic ?? false;
     const underline = () => (attrs()?.underline ?? 'None') !== 'None';
+    const strike = () => attrs()?.strike ?? false;
     const fontSize = () => attrs()?.font_size ?? 24;
     const color = () => attrs()?.color ?? DEFAULT_COLOR;
+    const bgColor = () => attrs()?.bg_color ?? NO_HIGHLIGHT;
+    const fontFamily = () => attrs()?.font_family ?? 'amiri';
     const undo = () => props.store.undoState();
 
     /* ApplyFormatting over a real selection styles it; over a collapsed caret
@@ -180,6 +192,15 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
             >
                 U
             </button>
+            <button
+                class="tb-btn tb-s"
+                classList={{ active: strike() }}
+                aria-pressed={strike()}
+                aria-label="Strikethrough"
+                onClick={() => apply({ strike: !strike() })}
+            >
+                S
+            </button>
             <span class="tb-sep" />
             <label class="tb-field">
                 Size
@@ -197,6 +218,25 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
                     value={colorToHex(color())}
                     onChange={(e) => apply({ color: hexToColor(e.currentTarget.value) })}
                 />
+            </label>
+            <label class="tb-field">
+                Highlight
+                <input
+                    type="color"
+                    value={colorToHex(bgColor())}
+                    onChange={(e) => apply({ bg_color: hexToColor(e.currentTarget.value) })}
+                />
+            </label>
+            <label class="tb-field">
+                Font
+                <select
+                    value={fontFamily()}
+                    onChange={(e) => apply({ font_family: e.currentTarget.value })}
+                >
+                    <For each={FONT_FAMILIES}>
+                        {(f) => <option value={f.id}>{f.label}</option>}
+                    </For>
+                </select>
             </label>
             <span class="tb-sep" />
             <For each={alignButtons()}>

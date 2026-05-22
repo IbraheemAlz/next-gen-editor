@@ -10,10 +10,19 @@ pub struct DocumentTree {
     pub paragraphs: Vector<Paragraph>,
 }
 
-/// Inline style for a run of characters. Phase 3 carried font size + colour;
-/// Phase 4 §11 adds bold / italic / underline as stored flags — the toolbar
-/// reflects them, but layout/render still ignore them until bold/italic faces
-/// and underline decoration land (see BACKLOG.md).
+/// A selectable font family (Backlog #9). `engine-wasm` resolves it to a
+/// loaded font face when building layout style spans; the pure document model
+/// just stores the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FontFamily {
+    Amiri,
+    LiberationSans,
+    NotoNaskhArabic,
+}
+
+/// Inline style for a run of characters: font size, colour, the
+/// bold / italic / underline / strikethrough flags, a background (highlight)
+/// colour, and a font family. All are carried through layout and render.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SpanStyle {
     pub font_size: Option<f32>,
@@ -21,6 +30,9 @@ pub struct SpanStyle {
     pub bold: Option<bool>,
     pub italic: Option<bool>,
     pub underline: Option<bool>,
+    pub strike: Option<bool>,
+    pub bg_color: Option<[u8; 4]>,
+    pub font_family: Option<FontFamily>,
 }
 
 impl SpanStyle {
@@ -32,6 +44,9 @@ impl SpanStyle {
             bold: patch.bold.or(self.bold),
             italic: patch.italic.or(self.italic),
             underline: patch.underline.or(self.underline),
+            strike: patch.strike.or(self.strike),
+            bg_color: patch.bg_color.or(self.bg_color),
+            font_family: patch.font_family.or(self.font_family),
         }
     }
 }

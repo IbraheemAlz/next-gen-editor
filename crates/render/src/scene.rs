@@ -48,6 +48,10 @@ pub struct GlyphRun {
     /// (Backlog #1).
     pub faux_bold: bool,
     pub faux_italic: bool,
+    /// Highlight colour painted behind the run. The glyph blit composites
+    /// over it, since `put_image_data` would otherwise punch holes through a
+    /// background rect (Backlog #1).
+    pub bg_color: Option<[u8; 4]>,
 }
 
 /// One backend-agnostic drawing command. Batch 1 freezes this set; paths,
@@ -117,12 +121,16 @@ pub fn build_page_scene(page: &PageBox) -> DisplayList {
         let para_y = content_y + para.origin.y;
         for line in &para.lines {
             let line_x = para_x + line.origin.x;
-            let baseline = para_y + line.origin.y + line.baseline;
+            let baseline = (para_y + line.origin.y + line.baseline) as f64;
+            let line_top = (para_y + line.origin.y) as f64;
+            let line_bottom = line_top + line.height as f64;
             /* One pen across the whole line; runs lie left-to-right in
             visual order, each glyph placed at the cumulative advance. */
             let mut pen = 0.0_f32;
             for run in &line.runs {
                 let [r, g, b, a] = run.attrs.color;
+                let text_color = Color::from_rgba8(r, g, b, a);
+                let run_x0 = (line_x as f64) + (pen as f64);
                 let mut glyphs: Vec<RunGlyph> = Vec::with_capacity(run.glyphs.len());
                 for glyph in &run.glyphs {
                     /* glyph id 0 is .notdef — advance the pen, draw nothing. */
@@ -130,20 +138,61 @@ pub fn build_page_scene(page: &PageBox) -> DisplayList {
                         glyphs.push(RunGlyph {
                             glyph_id: glyph.id,
                             x: (line_x as f64) + (pen as f64) + (glyph.x_offset as f64),
-                            y: (baseline as f64) - (glyph.y_offset as f64),
+                            y: baseline - (glyph.y_offset as f64),
                         });
                     }
                     pen += glyph.x_advance;
+                }
+                let run_x1 = (line_x as f64) + (pen as f64);
+
+                /* Background highlight — emitted before the glyphs so it sits
+                behind them, spanning the run's advance and the line's full
+                height so adjacent highlights tile seamlessly (Backlog #1). */
+                if let Some([br, bgc, bb, ba]) = run.attrs.bg_color
+                    && run_x1 > run_x0
+                {
+                    cmds.push(DisplayCmd::FillRect {
+                        rect: Rect::new(run_x0, line_top, run_x1, line_bottom),
+                        paint: Paint::solid(Color::from_rgba8(br, bgc, bb, ba)),
+                    });
                 }
                 if !glyphs.is_empty() {
                     cmds.push(DisplayCmd::DrawGlyphRun(GlyphRun {
                         font: run.font.clone(),
                         px_size: run.attrs.px_size,
-                        paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+                        paint: Paint::solid(text_color),
                         glyphs,
                         faux_bold: run.attrs.faux_bold,
                         faux_italic: run.attrs.faux_italic,
+                        bg_color: run.attrs.bg_color,
                     }));
+                }
+                /* Decoration strokes — thin `FillRect`s drawn over the glyphs.
+                Y positions are px-size-relative approximations (Backlog #1):
+                the underline sits just below the baseline, the strikethrough
+                is centred ~one quarter em above it (≈ x-height / 2). */
+                if (run.attrs.underline || run.attrs.strike) && run_x1 > run_x0 {
+                    let px = run.attrs.px_size as f64;
+                    let thickness = (px * 0.06).max(1.0);
+                    if run.attrs.underline {
+                        let top = baseline + px * 0.10;
+                        cmds.push(DisplayCmd::FillRect {
+                            rect: Rect::new(run_x0, top, run_x1, top + thickness),
+                            paint: Paint::solid(text_color),
+                        });
+                    }
+                    if run.attrs.strike {
+                        let mid = baseline - px * 0.25;
+                        cmds.push(DisplayCmd::FillRect {
+                            rect: Rect::new(
+                                run_x0,
+                                mid - thickness / 2.0,
+                                run_x1,
+                                mid + thickness / 2.0,
+                            ),
+                            paint: Paint::solid(text_color),
+                        });
+                    }
                 }
             }
         }

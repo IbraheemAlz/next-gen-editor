@@ -18,20 +18,30 @@ import { startTelemetry } from './state/telemetry';
 import { attachDragDrop } from './input/dnd';
 import type { Command, Event } from './engine/types';
 import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
+import LIBERATION_URL from '../fonts/LiberationSans-Regular.ttf?url';
+import NOTO_URL from '../fonts/NotoNaskhArabic-Regular.ttf?url';
 import './styles/editor.css';
 import './styles/caret.css';
 import './styles/toolbar.css';
 import './styles/a11y.css';
 
 /* Amiri is a dual-script Naskh face — renders mixed Arabic/English from a
-   single face without engine-side font fallback. */
+   single face. The three families load under the ids the engine's font
+   picker resolves against (Backlog #9). */
 const AMIRI_ID = 'amiri';
+const FONT_URLS: ReadonlyArray<readonly [string, string]> = [
+    [AMIRI_ID, AMIRI_URL],
+    ['liberation', LIBERATION_URL],
+    ['noto-naskh', NOTO_URL],
+];
 
-/** Load the editor font and seed a blank A4 page. Runs on boot + recovery. */
+/** Load the editor fonts and seed a blank A4 page. Runs on boot + recovery. */
 async function setupEngine(client: EngineClient): Promise<void> {
-    const fontBytes = new Uint8Array(await (await fetch(AMIRI_URL)).arrayBuffer());
-    /* loadFont hands the buffer to the worker as a Transferable — zero-copy. */
-    await client.loadFont(AMIRI_ID, fontBytes);
+    /* loadFont hands each buffer to the worker as a Transferable — zero-copy. */
+    for (const [id, url] of FONT_URLS) {
+        const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
+        await client.loadFont(id, bytes);
+    }
     await client.dispatch({
         type: 'RENDER_PAGE',
         /* Seed mixed Arabic/English so the pointer + selection overlays have

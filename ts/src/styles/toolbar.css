@@ -50,6 +50,10 @@
     text-decoration: underline;
 }
 
+.tb-s {
+    text-decoration: line-through;
+}
+
 .tb-sep {
     width: 1px;
     height: 18px;

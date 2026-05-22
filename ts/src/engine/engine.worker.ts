@@ -270,10 +270,27 @@ async function handleInit(msg: InitMsg): Promise<void> {
                 range: { start: { para: 0, offset: 14 }, end: { para: 0, offset: 35 } },
                 attrs: { color: { r: 30, g: 70, b: 200, a: 255 } },
             } as Command);
-            paintEvt = await dispatch({
+            await dispatch({
                 type: 'APPLY_FORMATTING',
                 range: { start: { para: 0, offset: 3 }, end: { para: 0, offset: 29 } },
                 attrs: { font_size: 44 },
+            } as Command);
+            /* Sprint 6 — exercise the decoration + highlight render paths:
+               underline + strikethrough strokes and a background colour. */
+            await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: { start: { para: 0, offset: 15 }, end: { para: 0, offset: 20 } },
+                attrs: { underline: 'Single' },
+            } as Command);
+            await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: { start: { para: 0, offset: 30 }, end: { para: 0, offset: 35 } },
+                attrs: { strike: true },
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: { start: { para: 0, offset: 6 }, end: { para: 0, offset: 14 } },
+                attrs: { bg_color: { r: 255, g: 235, b: 120, a: 255 } },
             } as Command);
             break;
         }

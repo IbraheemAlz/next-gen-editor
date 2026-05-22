@@ -19,23 +19,44 @@ use wasm_bindgen::JsValue;
 /// distance above baseline → subtracted from y because canvas y grows down).
 ///
 /// `color` is RGB applied uniformly; the per-pixel alpha comes from `glyph.alpha`.
+///
+/// When `bg` is set the glyph is composited over that background colour and
+/// the output is fully opaque — `put_image_data` replaces pixels wholesale, so
+/// a transparent surround would punch a hole through a background highlight
+/// (Backlog #1). With `bg == None` the surround stays transparent as before.
 pub fn paint_alpha_glyph(
     ctx: &web_sys::OffscreenCanvasRenderingContext2d,
     glyph: &RasterizedGlyph,
     origin_x: f64,
     origin_y: f64,
     color: [u8; 3],
+    bg: Option<[u8; 4]>,
 ) -> Result<(), JsValue> {
     if glyph.width == 0 || glyph.height == 0 {
         return Ok(());
     }
     let pixel_count = (glyph.width as usize) * (glyph.height as usize);
     let mut rgba = Vec::with_capacity(pixel_count * 4);
-    for &a in &glyph.alpha {
-        rgba.push(color[0]);
-        rgba.push(color[1]);
-        rgba.push(color[2]);
-        rgba.push(a);
+    match bg {
+        Some([br, bg_g, bb, _]) => {
+            for &a in &glyph.alpha {
+                let t = f32::from(a) / 255.0;
+                let mix =
+                    |fg: u8, bk: u8| (f32::from(fg) * t + f32::from(bk) * (1.0 - t)).round() as u8;
+                rgba.push(mix(color[0], br));
+                rgba.push(mix(color[1], bg_g));
+                rgba.push(mix(color[2], bb));
+                rgba.push(255);
+            }
+        }
+        None => {
+            for &a in &glyph.alpha {
+                rgba.push(color[0]);
+                rgba.push(color[1]);
+                rgba.push(color[2]);
+                rgba.push(a);
+            }
+        }
     }
     let image_data = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
         Clamped(&rgba),
@@ -102,7 +123,7 @@ pub fn render_canvas2d(
                         run.faux_italic,
                     );
                     if let Some(raster) = atlas.get_or_rasterize(&key, &font, run.px_size) {
-                        paint_alpha_glyph(ctx, raster, g.x, g.y, rgb)?;
+                        paint_alpha_glyph(ctx, raster, g.x, g.y, rgb, run.bg_color)?;
                     }
                 }
             }
