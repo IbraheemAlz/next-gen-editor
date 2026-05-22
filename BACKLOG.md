@@ -7,8 +7,9 @@ None of these are regressions — they are known, bounded follow-ups.
 ## Shipped in Phase 5 backlog sprints
 
 Items completed after the `v0.5.0-beta.1` cut, in the continuous
-backlog-sprint phase. Each stays in its numbered section below — annotated
-**✅ Shipped** — so the cross-references between items keep resolving.
+backlog-sprint phase — sprints 1–11, released as `v0.5.0-beta.2`. Each stays
+in its numbered section below — annotated **✅ Shipped** — so the
+cross-references between items keep resolving.
 
 - **Sprint 1 (2026-05-22)** — Pending (sticky) formatting (item 11, complete);
   paragraph alignment (item 9 — the `AlignmentPicker` half; per-span font

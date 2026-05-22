@@ -2,7 +2,7 @@
 
 Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–4. Don't relitigate without a measurement that contradicts it.
 
-**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**; the cut is `v0.5.0-beta.1`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
+**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**. Eleven post-`beta.1` backlog / tech-debt sprints then closed the bulk of [`BACKLOG.md`](BACKLOG.md) — rich-text decorations + faces, Kashida ink, incremental relayout, typography, `.docx` interoperability, the Vello/WebGPU activation, fine-grained accessibility deltas and the inline IME preview; the cut is now `v0.5.0-beta.2`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
 
 ---
 
@@ -102,8 +102,8 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **`EditorCanvas`** (`components/EditorCanvas.tsx`) owns the `<canvas>` and `transferControlToOffscreen()`s it once. Crash recovery is a Solid remount: `App` bumps a `canvasGen` signal, `<For each={[canvasGen()]}>` disposes the dead `<canvas>` and mounts a fresh one. The canvas carries **no `tabindex`** — a focusable canvas steals focus from the hidden textarea.
 - **The engine owns the selection.** It holds `selection` (anchor + caret) and `composition` state; every interactive edit is caret-relative, advances the engine caret, and emits `SelectionChanged`. The worker queue serializes commands, so a stale UI-side caret never misplaces text — fast typing and async clipboard stay correct. This is *the* invariant that makes the UI race-free.
 - **Hit-testing** (`engine-wasm`): `document_geometry` flattens the box tree into per-line `CaretSlot`s (absolute x ↔ source byte), inverting the renderer's coordinate walk. pixel→logical, logical→caret-rect, and selection rects all go through it. Selection rects are per-line bounding boxes (discontinuous BiDi → BACKLOG).
-- **`HiddenInput`** (`components/HiddenInput.tsx`): the `<textarea>` is the OS text-input citizen. `beforeinput` → engine commands; IME via `Begin`/`Update`/`EndComposition`, committed on end (no on-canvas preview); native `copy`/`cut`/`paste` events → the async `navigator.clipboard`. It tracks the caret so IME popups anchor, and refocuses on `pointerup` — a canvas click blurs focus to `<body>` first.
-- **Caret / selection / a11y are DOM overlays**, not canvas-drawn — `CaretOverlay`, `SelectionOverlay`, and a visually-hidden `AccessibilityTree` (`role="document"`, one `<p dir>` per paragraph, `<span>` per style run; the browser's UAX-#9 handles BiDi for the screen reader). The worker broadcasts a full `A11yTree` after every doc mutation. Engine geometry is device-px; overlays divide by `devicePixelRatio`.
+- **`HiddenInput`** (`components/HiddenInput.tsx`): the `<textarea>` is the OS text-input citizen. `beforeinput` → engine commands; IME via `Begin`/`Update`/`EndComposition`, committed on end, with an inline underlined on-canvas preview during composition (Backlog #8); native `copy`/`cut`/`paste` events → the async `navigator.clipboard`. It tracks the caret so IME popups anchor, and refocuses on `pointerup` — a canvas click blurs focus to `<body>` first.
+- **Caret / selection / a11y are DOM overlays**, not canvas-drawn — `CaretOverlay`, `SelectionOverlay`, and a visually-hidden `AccessibilityTree` (`role="document"`, one `<p dir>` per paragraph, `<span>` per style run; the browser's UAX-#9 handles BiDi for the screen reader). The worker broadcasts an `AccessibilityTreeDelta` (changed-paragraph patches) after every doc mutation (Backlog #10). Engine geometry is device-px; overlays divide by `devicePixelRatio`.
 - **Schema growth (additive).** Phase 4 added the `HitTest`, `SelectWordAt`, `DeleteAtCaret`, `RequestAccessibilityTree`, `GetSelectionAsClipboard`, `PastePlain` commands; the `HitResult` and `ClipboardPayload` events; the `Point` type; and `can_undo`/`can_redo` on `SelectionChanged`. The dead `AccessibilityTreeChanged` + `A11yDelta`/`A11yNode` were repurposed (the event now carries `A11yTree`) — done only because they had zero consumers.
 
 ## Phase 5 — hardening, QA harnesses, telemetry, release
@@ -220,27 +220,32 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 
 ## Where the deferred work landed
 
-Phases 1–4 are complete, and Phase 5's engineering deliverables shipped at
-`v0.5.0-beta.1`. Deferred scope — full rich-text rendering (bold/italic faces,
-underline strokes), tatweel-glyph Kashida, Vello activation, dynamic line
-height, discontinuous BiDi selection rects, inline IME preview, pending
-formatting, rich clipboard, paragraph alignment + per-span font family,
-accessibility deltas, and **incremental relayout** — is recorded in
-[`BACKLOG.md`](BACKLOG.md).
+Phases 1–4 are complete; Phase 5's engineering deliverables shipped at
+`v0.5.0-beta.1`. Eleven post-`beta.1` backlog sprints then closed the bulk of
+[`BACKLOG.md`](BACKLOG.md) — rich-text decorations + bold/italic faces,
+tatweel-glyph Kashida, incremental relayout, dynamic line height, paragraph
+auto-direction, discontinuous BiDi selection rects, the toolbar pickers,
+pending formatting, rich clipboard + the `.docx` `<w:rPr>` round-trip, PDF
+`FlateDecode` + `/ToUnicode`, fine-grained accessibility deltas, the
+Vello/WebGPU render-path activation, and the inline IME composition preview.
+The cut is `v0.5.0-beta.2`.
+
+Still open in [`BACKLOG.md`](BACKLOG.md): PDF `/W` widths + font subsetting and
+PDF/A-2 / PDF/X (#3); Vello as the *default* renderer plus its GPU-runner
+golden suite (#4 — GitHub issue #1); IME `target_range` sub-segment styling
+(#8 — GitHub issue #2); stable per-paragraph accessibility ids (#10); and
+viewport culling for a sub-budget cold open (#13).
 
 Phase 5 → MVP hand-off:
 
-- The bridge schema grew **additively** through Phases 4–5 — the D5.7
-  `telemetry` module is the latest addition. Phase-1 PoC commands
-  (`RenderPage`, `RasterizeGlyph`, `ShapeAndRasterize`, `LoadDocx`, `SaveDocx`)
-  are still live for the visual-diff `?test=` harness.
+- The bridge schema grew **additively** throughout — the latest additions are
+  the D5.7 `telemetry` module and the §10 `AccessibilityTreeDelta`. Phase-1 PoC
+  commands (`RenderPage`, `RasterizeGlyph`, `ShapeAndRasterize`, `LoadDocx`,
+  `SaveDocx`) are still live for the visual-diff `?test=` harness.
 - `Command::Recover` is still a stub — real recovery needs `Engine::snapshot()`
   (event-log snapshots are empty placeholders). `EngineStats.last_paint_ms` /
   `last_command_ms` and `Event::Painted.paint_ms` are still `0.0` dummies — the
   D5.7 telemetry pipeline is wired and will carry real numbers once they are.
-- Interactive editing re-lays-out the whole document on every edit. Fine for a
-  one-page document (insert p95 ≈ 10 ms, D5.3); **incremental relayout** is the
-  open performance item — the D5.3 harness keeps open-50p-doc ungated for it.
 - Remaining for the MVP `v0.1.0`: D5.6 (external security audit), D5.9
   (operator runbook), D5.10 (Arabic typography sign-off), then the §10 exit
-  gate. This `v0.5.0-beta.1` cut is the engineering-complete beta.
+  gate. `v0.5.0-beta.2` is the engineering-complete beta.
