@@ -163,6 +163,25 @@ D5.10 are external/human sign-offs, not code.
 - Tests pass `?test=<case>` which hides UI chrome so the canvas is the only thing in the screenshot.
 - `UPDATE=1` env var regenerates the golden. Every regeneration must be eyeballed in the diff before merging.
 
+## Known issue — headless Chrome does not composite the interactive canvas
+
+A headless-Chrome screenshot of the **full interactive app** (`localhost:5173/`,
+the Solid `App`) shows a **blank page**. This is a headless-only compositing
+artifact — **not an engine bug. Do not re-investigate it.**
+
+- The engine renders correctly: `render_canvas2d` paints every glyph and a
+  `get_image_data` readback confirms the pixels land on the `OffscreenCanvas`.
+- Headless Chrome simply never syncs the `transferControlToOffscreen`
+  placeholder `<canvas>` to the displayed DOM for the full app. It is not the
+  DOM nesting, the canvas creation path, DPR, fonts, or a boot race — all were
+  ruled out (Phase 5 backlog sprint 7 investigation).
+- The `?test=<case>` visual-diff harness path **does** screenshot correctly in
+  the same headless Chrome — so the golden suite is unaffected and trustworthy.
+- The real app renders perfectly in a normal (non-headless) Chrome window.
+
+**Verify interactive-app rendering in a real browser — never via a headless
+screenshot.** Headless screenshots are valid only for the `?test=` harness.
+
 ## Editor invariants
 
 - Document model is **immutable + structurally shared** (`im::Vector<Paragraph>`). Cloning a tree is O(1).
