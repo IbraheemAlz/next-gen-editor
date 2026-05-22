@@ -44,6 +44,9 @@ backlog-sprint phase. Each stays in its numbered section below — annotated
   `Engine::with_vello` or `Engine::new`; `render_document` dispatches to either
   surface. #4 stays open — Canvas2D is still the default, pending a GPU-runner
   golden suite.
+- **Sprint 11 (2026-05-22)** — Inline IME composition preview (item 8): the
+  active composition is spliced into its paragraph's layout as a transient
+  underlined preview and repainted on every `UpdateComposition`.
 
 ## 1. Rich text formatting
 
@@ -208,16 +211,24 @@ rect, as before.
 
 **Shipped (D4.4 commit-on-end):** the engine tracks an IME composition
 (`BeginComposition` / `UpdateComposition` / `EndComposition`) and commits the
-composed string on a committing end. The in-progress text shows in the OS IME
-candidate popup, which anchors at the caret-tracked hidden textarea. Arabic
-(direct `insertText`, no composition) and CJK both commit correctly.
+composed string on a committing end; the in-progress text also shows in the OS
+IME candidate popup, anchored at the caret-tracked hidden textarea.
 
-**Deferred:** rendering the in-progress composition inline on the canvas — the
-provisional underlined text appearing in the document flow as it is typed,
-re-rendered on every `UpdateComposition`. Needs a transient composition layer
-threaded through layout + render so the engine can paint text that is not in
-the document model, plus `target_range` underline styling. Until then a
-composition is visible only in the OS popup, not in the page itself.
+**✅ Shipped (Phase 5 sprint 11).** `build_page` splices the active composition
+into its paragraph's layout: `composition_layout_spans` shifts the committed
+style spans past the inserted bytes and gives the composition an `underline`
+span, so the Sprint-6 decoration renderer draws the IME marker and the line
+reflows around it. The splice is transient — gated by a `with_composition`
+flag, it reaches only the interactive paint, never the document model, the
+layout cache, PDF export, or hit-test geometry. `UpdateComposition` (and a
+cancelled `EndComposition`) repaint, so the preview tracks every keystroke and
+clears on commit / cancel. Riding the normal `DisplayList`, the preview renders
+on both the Canvas2D and Vello backends with no backend-specific code.
+
+**Still deferred:** `target_range`-specific styling — the whole composition is
+underlined uniformly rather than distinguishing the actively-converting
+sub-segment. Real-OS-IME verification (CJK conversion, candidate windows)
+needs macOS / Windows hardware — GitHub issue #2.
 
 ## 9. Toolbar — paragraph alignment + font family
 

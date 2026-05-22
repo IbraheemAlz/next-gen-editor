@@ -414,6 +414,62 @@ fn build_style_spans(
     spans
 }
 
+/// Style spans for a paragraph with an IME composition spliced in at `off`.
+///
+/// The committed spans are shifted — and split where one straddles `off` — to
+/// make room for the `comp_len` inserted bytes, and the composition itself
+/// gets an `underline` span, the on-canvas preview marker (Backlog #8). The
+/// composition inherits the resolved style at `off`, so its size / font match
+/// the text it is being typed into.
+fn composition_layout_spans(
+    para: &engine::Paragraph,
+    off: u32,
+    comp_len: u32,
+    default_size: f32,
+    scale: f32,
+) -> Vec<StyleSpan> {
+    let base = build_style_spans(para, default_size, [0, 0, 0, 255], scale);
+    let mut out: Vec<StyleSpan> = Vec::with_capacity(base.len() + 2);
+    for s in base {
+        if s.end <= off {
+            out.push(s);
+        } else if s.start >= off {
+            out.push(StyleSpan {
+                start: s.start + comp_len,
+                end: s.end + comp_len,
+                ..s
+            });
+        } else {
+            /* One committed span straddles `off` — split it so the
+            composition span slots cleanly into the gap. */
+            out.push(StyleSpan {
+                end: off,
+                ..s.clone()
+            });
+            out.push(StyleSpan {
+                start: off + comp_len,
+                end: s.end + comp_len,
+                ..s
+            });
+        }
+    }
+    let st = para.style_at(off);
+    out.push(StyleSpan {
+        start: off,
+        end: off + comp_len,
+        px_size: st.font_size.unwrap_or(default_size) * scale,
+        color: st.color.unwrap_or([0, 0, 0, 255]),
+        bold: st.bold.unwrap_or(false),
+        italic: st.italic.unwrap_or(false),
+        underline: true,
+        strike: st.strike.unwrap_or(false),
+        bg_color: st.bg_color,
+        font_family: st.font_family.map(font_family_id).map(str::to_string),
+    });
+    out.sort_by_key(|s| s.start);
+    out
+}
+
 /// Content + render-config hash that keys the paragraph layout cache
 /// (Backlog #13). Two paragraphs hash equal only when `layout_paragraph`
 /// would produce identical boxes: same text, same style runs, same paragraph
@@ -1200,7 +1256,11 @@ impl Engine {
     /// to shape it. Shared by the Canvas2D repaint and PDF export. Every
     /// dimension is multiplied by `scale` — `dpr` for the HiDPI canvas, `1.0`
     /// for PDF (PDF user space is logical points).
-    fn build_page(&self, scale: f32) -> Result<(PageBox, FontStack, Vec<u32>), Box<Event>> {
+    fn build_page(
+        &self,
+        scale: f32,
+        with_composition: bool,
+    ) -> Result<(PageBox, FontStack, Vec<u32>), Box<Event>> {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
@@ -1227,38 +1287,79 @@ impl Engine {
         let mut para_y_offset = 0.0_f32;
         let doc = self.undo.current().clone();
         let mut cache = self.layout_cache.borrow_mut();
+        /* The IME composition, if any — spliced into its paragraph's layout
+        as a transient underlined preview (Backlog #8). It never reaches the
+        document model, the layout cache, PDF, or hit-test geometry. */
+        let composition = if with_composition {
+            self.composition.as_ref()
+        } else {
+            None
+        };
         for (doc_idx, para) in doc.paragraphs.iter().enumerate() {
-            if para.text.is_empty() {
+            let comp = composition.filter(|c| {
+                c.at.para as usize == doc_idx
+                    && !c.text.is_empty()
+                    && (c.at.offset as usize) <= para.text.len()
+                    && para.text.is_char_boundary(c.at.offset as usize)
+            });
+            if para.text.is_empty() && comp.is_none() {
                 para_y_offset += cfg.line_height * scale;
                 continue;
             }
-            /* Backlog #13 — incremental relayout: reuse the cached box when
-            this paragraph's content + config hash is unchanged, skipping BiDi
-            and shaping entirely. An edit changes only the edited paragraph's
-            hash, so every other paragraph is a cheap clone. */
-            let key = paragraph_layout_key(para, &cfg, scale);
-            let mut para_box = if let Some(cached) = cache.get(&key) {
-                cached.clone()
-            } else {
-                let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
-                let para_cfg = ParagraphConfig {
-                    text: &para.text,
+            let mut para_box = if let Some(c) = comp {
+                /* Composition paragraph: splice the composed text in and lay
+                it out fresh — never cached, since the text differs from the
+                committed `para.text`. */
+                let off = c.at.offset as usize;
+                let mut text = String::with_capacity(para.text.len() + c.text.len());
+                text.push_str(&para.text[..off]);
+                text.push_str(&c.text);
+                text.push_str(&para.text[off..]);
+                let spans = composition_layout_spans(
+                    para,
+                    off as u32,
+                    c.text.len() as u32,
+                    cfg.px_size,
+                    scale,
+                );
+                layout_paragraph(ParagraphConfig {
+                    text: &text,
                     fonts: &font_stack,
                     spans: &spans,
-                    /* Per-paragraph base direction from its first strong
-                    character; the document direction is the fallback
-                    (Backlog #6). */
-                    base_direction: first_strong_direction(&para.text)
-                        .unwrap_or(cfg.base_direction),
+                    base_direction: first_strong_direction(&text).unwrap_or(cfg.base_direction),
                     max_width: page.content_width(),
                     line_height: cfg.line_height * scale,
-                    /* A paragraph's own alignment overrides the document
-                    default (Backlog #9). */
                     alignment: para.alignment.map_or(cfg.alignment, layout_align),
-                };
-                let laid = layout_paragraph(para_cfg);
-                cache.put(key, laid.clone());
-                laid
+                })
+            } else {
+                /* Backlog #13 — incremental relayout: reuse the cached box
+                when this paragraph's content + config hash is unchanged,
+                skipping BiDi and shaping. An edit changes only the edited
+                paragraph's hash, so every other paragraph is a cheap clone. */
+                let key = paragraph_layout_key(para, &cfg, scale);
+                if let Some(cached) = cache.get(&key) {
+                    cached.clone()
+                } else {
+                    let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
+                    let para_cfg = ParagraphConfig {
+                        text: &para.text,
+                        fonts: &font_stack,
+                        spans: &spans,
+                        /* Per-paragraph base direction from its first strong
+                        character; the document direction is the fallback
+                        (Backlog #6). */
+                        base_direction: first_strong_direction(&para.text)
+                            .unwrap_or(cfg.base_direction),
+                        max_width: page.content_width(),
+                        line_height: cfg.line_height * scale,
+                        /* A paragraph's own alignment overrides the document
+                        default (Backlog #9). */
+                        alignment: para.alignment.map_or(cfg.alignment, layout_align),
+                    };
+                    let laid = layout_paragraph(para_cfg);
+                    cache.put(key, laid.clone());
+                    laid
+                }
             };
             /* Cached and fresh boxes carry identical local line geometry —
             only the global Y shift differs (the vertical-shift step). */
@@ -1284,7 +1385,8 @@ impl Engine {
     }
 
     fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
-        let (page_box, _font_stack, _box_doc_index) = self.build_page(self.scale())?;
+        /* `true` — splice the live IME composition preview into the paint. */
+        let (page_box, _font_stack, _box_doc_index) = self.build_page(self.scale(), true)?;
 
         let line_count: u32 = page_box
             .paragraphs
@@ -1365,7 +1467,9 @@ impl Engine {
     /// PDF/A-1b-conformant file; the unimplemented `A2u` / `X3` targets fall
     /// back to a plain PDF.
     fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
-        let (page_box, font_stack, box_doc_index) = match self.build_page(1.0) {
+        /* `false` — a PDF export is the committed document, never the
+        in-progress IME composition. */
+        let (page_box, font_stack, box_doc_index) = match self.build_page(1.0, false) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -1416,7 +1520,9 @@ impl Engine {
     /// out the document — cheap for the single-page PoC; cache when editing
     /// lands.
     fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
-        let (page, _fonts, box_doc_index) = self.build_page(self.scale())?;
+        /* `false` — hit-test + caret geometry run on committed document
+        offsets, which `self.selection` is also expressed in. */
+        let (page, _fonts, box_doc_index) = self.build_page(self.scale(), false)?;
         let content_x = page.margins.left;
         let content_y = page.margins.top;
         let mut geom: Vec<LineGeom> = Vec::new();
@@ -1851,6 +1957,9 @@ impl Engine {
             at,
             text: text.clone(),
         });
+        /* Backlog #8: repaint so the inline composition preview tracks the
+        latest composed text. */
+        let _ = self.render_document(None);
         Event::CompositionUpdated {
             at,
             text,
@@ -1865,7 +1974,12 @@ impl Engine {
             Some(c) if commit && !c.text.is_empty() => {
                 self.do_insert_text_interactive(c.at, c.text)
             }
-            _ => self.selection_changed(),
+            _ => {
+                /* Cancelled or empty — drop the preview and repaint the
+                committed document so the canvas no longer shows it. */
+                let _ = self.render_document(None);
+                self.selection_changed()
+            }
         }
     }
 
@@ -2375,5 +2489,41 @@ mod tests {
                 paragraph: a11y_para("b"),
             }],
         );
+    }
+
+    /// Backlog #8 — the IME composition is spliced into the layout spans:
+    /// committed spans shift past it, the composition itself is underlined.
+    #[test]
+    fn composition_spans_splice_and_underline() {
+        let p = engine::Paragraph {
+            text: "abcdef".to_string(),
+            spans: Vec::new(),
+            alignment: None,
+        };
+        /* Compose 3 bytes at offset 3 — splits the one committed span. */
+        let spans = composition_layout_spans(&p, 3, 3, 16.0, 1.0);
+        assert_eq!(spans.len(), 3, "split + composition span");
+        assert_eq!((spans[0].start, spans[0].end), (0, 3));
+        assert!(!spans[0].underline);
+        assert_eq!((spans[1].start, spans[1].end), (3, 6));
+        assert!(spans[1].underline, "composition span must be underlined");
+        assert_eq!((spans[2].start, spans[2].end), (6, 9));
+        assert!(!spans[2].underline);
+    }
+
+    /// Composing at the end of a paragraph appends an underlined span past
+    /// the committed text — no split needed.
+    #[test]
+    fn composition_spans_at_paragraph_end() {
+        let p = engine::Paragraph {
+            text: "abc".to_string(),
+            spans: Vec::new(),
+            alignment: None,
+        };
+        let spans = composition_layout_spans(&p, 3, 2, 16.0, 1.0);
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].start, spans[0].end), (0, 3));
+        assert_eq!((spans[1].start, spans[1].end), (3, 5));
+        assert!(spans[1].underline);
     }
 }
