@@ -5,7 +5,10 @@
 
 use crate::error::DocxError;
 use crate::opc::archive::{DOC_XML, DocxArchive};
-use engine::{DocumentTree, FontFamily, Paragraph, SpanStyle};
+use engine::{
+    Alignment, DocumentTree, FontFamily, LineHeight, ParaProperties, Paragraph, SpanStyle,
+    TextDirection,
+};
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
 
@@ -92,12 +95,99 @@ fn serialize_run(text: &str, style: &SpanStyle, out: &mut String) {
     out.push_str("</w:t></w:r>");
 }
 
-/// Serialize one paragraph. A span-free paragraph emits a single default run —
-/// byte-identical to the pre-`rPr` writer, so the round-trip harness's plain
-/// fixtures see no drift. A styled paragraph emits one `<w:r>` per maximal
-/// (range, style) segment, the default-styled gaps included.
+/// `<w:jc w:val="…"/>` token for an `Alignment`. Word emits writing-direction-
+/// relative `start` / `end` in modern docs; we match that.
+fn jc_val(a: Alignment) -> &'static str {
+    match a {
+        Alignment::Start => "start",
+        Alignment::End => "end",
+        Alignment::Center => "center",
+        Alignment::Justify => "both",
+    }
+}
+
+/// Emit `<w:pPr>` for `props`, or nothing when it is the default — a default
+/// `ParaProperties` must produce an empty pPr to keep the Phase 1 plain
+/// fixtures byte-stable. Children follow the CT_PPr schema order: keepNext,
+/// keepLines, pageBreakBefore, spacing, ind, jc, bidi.
+fn emit_ppr(props: &ParaProperties, out: &mut String) {
+    if *props == ParaProperties::default() {
+        return;
+    }
+    out.push_str("<w:pPr>");
+    if props.keep_next {
+        out.push_str("<w:keepNext/>");
+    }
+    if props.keep_lines {
+        out.push_str("<w:keepLines/>");
+    }
+    if props.page_break_before {
+        out.push_str("<w:pageBreakBefore/>");
+    }
+    /* `<w:spacing>` carries both before/after gaps and the line rule. We
+    omit the element entirely when none of its attributes are set. */
+    let has_gap = props.spacing.before_twips != 0 || props.spacing.after_twips != 0;
+    if has_gap || props.line_height.is_some() {
+        out.push_str("<w:spacing");
+        if props.spacing.before_twips != 0 {
+            out.push_str(&format!(" w:before=\"{}\"", props.spacing.before_twips));
+        }
+        if props.spacing.after_twips != 0 {
+            out.push_str(&format!(" w:after=\"{}\"", props.spacing.after_twips));
+        }
+        if let Some(lh) = props.line_height {
+            let (line, rule) = match lh {
+                LineHeight::Auto { twips } => (twips, "auto"),
+                LineHeight::Exact { twips } => (twips, "exact"),
+                LineHeight::AtLeast { twips } => (twips, "atLeast"),
+            };
+            out.push_str(&format!(" w:line=\"{line}\" w:lineRule=\"{rule}\""));
+        }
+        out.push_str("/>");
+    }
+    let ind = &props.indent;
+    if ind.start_twips != 0
+        || ind.end_twips != 0
+        || ind.first_line_twips != 0
+        || ind.hanging_twips != 0
+    {
+        out.push_str("<w:ind");
+        if ind.start_twips != 0 {
+            out.push_str(&format!(" w:start=\"{}\"", ind.start_twips));
+        }
+        if ind.end_twips != 0 {
+            out.push_str(&format!(" w:end=\"{}\"", ind.end_twips));
+        }
+        if ind.first_line_twips != 0 {
+            out.push_str(&format!(" w:firstLine=\"{}\"", ind.first_line_twips));
+        }
+        if ind.hanging_twips != 0 {
+            out.push_str(&format!(" w:hanging=\"{}\"", ind.hanging_twips));
+        }
+        out.push_str("/>");
+    }
+    if let Some(a) = props.alignment {
+        out.push_str(&format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
+    }
+    if let Some(d) = props.direction {
+        match d {
+            TextDirection::Rtl => out.push_str("<w:bidi/>"),
+            /* LTR is the default; we still emit `<w:bidi w:val="false"/>` so
+            an explicit user override round-trips faithfully. */
+            TextDirection::Ltr => out.push_str("<w:bidi w:val=\"false\"/>"),
+        }
+    }
+    out.push_str("</w:pPr>");
+}
+
+/// Serialize one paragraph. A span-free paragraph with default `props` emits
+/// a single default run — byte-identical to the pre-Phase-2 writer, so the
+/// round-trip harness's plain fixtures see no drift. A styled paragraph
+/// emits one `<w:r>` per maximal (range, style) segment, the default-styled
+/// gaps included.
 fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("<w:p>");
+    emit_ppr(&para.props, out);
     if para.spans.is_empty() {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
@@ -196,7 +286,7 @@ const DOC_RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="y
 mod tests {
     use super::*;
     use crate::opc::archive::read_docx;
-    use engine::{Paragraph, StyleRun};
+    use engine::{ParaProperties, Paragraph, StyleRun};
 
     #[test]
     fn round_trip_run_properties() {
@@ -224,7 +314,7 @@ mod tests {
                     style: ul,
                 },
             ],
-            alignment: None,
+            props: ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -251,7 +341,7 @@ mod tests {
                 end: 3,
                 style: styled,
             }],
-            alignment: None,
+            props: ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -266,7 +356,85 @@ mod tests {
         let doc = DocumentTree::from_text("plain text");
         let xml = build_document_xml(&doc);
         assert!(!xml.contains("<w:rPr>"));
+        assert!(!xml.contains("<w:pPr>"));
         assert!(xml.contains("<w:p><w:r><w:t xml:space=\"preserve\">plain text</w:t></w:r></w:p>"));
+    }
+
+    #[test]
+    fn round_trip_para_properties() {
+        use engine::{Indent, LineHeight, Spacing, TextDirection};
+        let props = ParaProperties {
+            alignment: Some(engine::Alignment::Center),
+            indent: Indent {
+                start_twips: 720,
+                first_line_twips: 360,
+                ..Default::default()
+            },
+            spacing: Spacing {
+                before_twips: 120,
+                after_twips: 240,
+            },
+            line_height: Some(LineHeight::Auto { twips: 360 }),
+            direction: Some(TextDirection::Rtl),
+            keep_next: true,
+            keep_lines: false,
+            page_break_before: false,
+        };
+        let para = Paragraph {
+            text: "hello world".into(),
+            spans: Vec::new(),
+            props: props.clone(),
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("read");
+        assert_eq!(parsed.document.paragraphs[0].props, props);
+    }
+
+    #[test]
+    fn ppr_child_order_matches_schema() {
+        /* Schema mandates keepNext, keepLines, pageBreakBefore, spacing, ind,
+        jc, bidi in that order. Word rejects out-of-order children with a
+        repair dialog, so this is load-bearing. */
+        use engine::{Indent, Spacing, TextDirection};
+        let para = Paragraph {
+            text: "x".into(),
+            spans: Vec::new(),
+            props: ParaProperties {
+                alignment: Some(engine::Alignment::End),
+                indent: Indent {
+                    start_twips: 720,
+                    ..Default::default()
+                },
+                spacing: Spacing {
+                    before_twips: 120,
+                    ..Default::default()
+                },
+                direction: Some(TextDirection::Rtl),
+                keep_next: true,
+                keep_lines: true,
+                page_break_before: true,
+                ..Default::default()
+            },
+        };
+        let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]));
+        let p = xml.find("<w:pPr>").unwrap();
+        let order = [
+            "<w:keepNext/>",
+            "<w:keepLines/>",
+            "<w:pageBreakBefore/>",
+            "<w:spacing",
+            "<w:ind",
+            "<w:jc",
+            "<w:bidi",
+        ];
+        let mut cursor = p;
+        for tag in order {
+            let off = xml[cursor..]
+                .find(tag)
+                .unwrap_or_else(|| panic!("expected {tag} after offset {cursor}; xml={xml}"));
+            cursor += off + tag.len();
+        }
     }
 
     #[test]

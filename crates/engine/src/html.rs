@@ -12,7 +12,7 @@
 //! way a browser would. That is enough for our own `to_html` output and for
 //! the well-formed HTML Google Docs / Word place on the clipboard.
 
-use crate::{FontFamily, Paragraph, SpanStyle, StyleRun};
+use crate::{FontFamily, ParaProperties, Paragraph, SpanStyle, StyleRun};
 
 /* ---- font family <-> CSS name ------------------------------------------ */
 
@@ -384,7 +384,7 @@ impl ParaBuilder {
         Some(Paragraph {
             text,
             spans,
-            alignment: None,
+            props: ParaProperties::default(),
         })
     }
 }
@@ -481,7 +481,7 @@ mod tests {
         let p = Paragraph {
             text: "hello".into(),
             spans: vec![],
-            alignment: None,
+            props: ParaProperties::default(),
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -491,7 +491,7 @@ mod tests {
         let p = Paragraph {
             text: "a < b & c".into(),
             spans: vec![],
-            alignment: None,
+            props: ParaProperties::default(),
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -509,7 +509,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
-            alignment: None,
+            props: ParaProperties::default(),
         };
         assert_eq!(
             to_html(&[p]),
@@ -530,7 +530,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
-            alignment: None,
+            props: ParaProperties::default(),
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);

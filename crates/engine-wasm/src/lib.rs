@@ -501,7 +501,28 @@ fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32
     }
     /* `engine::Alignment` / `text_pipeline::Alignment` carry no `Hash` derive —
     hash a small discriminant instead. */
-    engine_align_disc(para.alignment).hash(&mut h);
+    engine_align_disc(para.props.alignment).hash(&mut h);
+    /* Phase 2 — indent + line-height override change layout geometry, so the
+    cache key must mix them in or stale boxes leak across edits. */
+    para.props.indent.start_twips.hash(&mut h);
+    para.props.indent.end_twips.hash(&mut h);
+    para.props.indent.first_line_twips.hash(&mut h);
+    para.props.indent.hanging_twips.hash(&mut h);
+    match para.props.line_height {
+        None => 0u8.hash(&mut h),
+        Some(engine::LineHeight::Auto { twips }) => {
+            1u8.hash(&mut h);
+            twips.hash(&mut h);
+        }
+        Some(engine::LineHeight::Exact { twips }) => {
+            2u8.hash(&mut h);
+            twips.hash(&mut h);
+        }
+        Some(engine::LineHeight::AtLeast { twips }) => {
+            3u8.hash(&mut h);
+            twips.hash(&mut h);
+        }
+    }
     cfg.font_id.hash(&mut h);
     matches!(cfg.base_direction, ShapingDirection::Rtl).hash(&mut h);
     cfg.px_size.to_bits().hash(&mut h);
@@ -509,6 +530,24 @@ fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32
     tp_align_disc(cfg.alignment).hash(&mut h);
     scale.to_bits().hash(&mut h);
     h.finish()
+}
+
+/// OOXML twips → layout px at the current device scale. 1 CSS px = 15 twips
+/// (= 0.75 pt = 1/96 inch when DPI = 96); multiplying by `scale` lifts to
+/// device px, which is the unit layout / render operate in.
+fn twips_to_layout_px(twips: i32, scale: f32) -> f32 {
+    (twips as f32) / 15.0 * scale
+}
+
+/// Pull the four Phase-2 indent fields off `para.props`, convert to layout
+/// px. Returned in `(indent_start, indent_end, first_line, hanging)`.
+fn props_to_layout_indents(props: &engine::ParaProperties, scale: f32) -> (f32, f32, f32, f32) {
+    (
+        twips_to_layout_px(props.indent.start_twips, scale),
+        twips_to_layout_px(props.indent.end_twips, scale),
+        twips_to_layout_px(props.indent.first_line_twips, scale),
+        twips_to_layout_px(props.indent.hanging_twips, scale),
+    )
 }
 
 /// Discriminant for an optional paragraph alignment (the enum has no `Hash`).
@@ -1399,6 +1438,7 @@ impl Engine {
                     cfg.px_size,
                     scale,
                 );
+                let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&para.props, scale);
                 layout_paragraph(ParagraphConfig {
                     text: &text,
                     fonts: &font_stack,
@@ -1406,7 +1446,11 @@ impl Engine {
                     base_direction: first_strong_direction(&text).unwrap_or(cfg.base_direction),
                     max_width: page.content_width(),
                     line_height: cfg.line_height * scale,
-                    alignment: para.alignment.map_or(cfg.alignment, layout_align),
+                    alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+                    indent_start_px: ind_s,
+                    indent_end_px: ind_e,
+                    first_line_indent_px: ind_fl,
+                    hanging_indent_px: ind_h,
                 })
             } else {
                 /* Backlog #13 — incremental relayout: reuse the cached box
@@ -1418,6 +1462,7 @@ impl Engine {
                     cached.clone()
                 } else {
                     let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
+                    let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&para.props, scale);
                     let para_cfg = ParagraphConfig {
                         text: &para.text,
                         fonts: &font_stack,
@@ -1431,7 +1476,13 @@ impl Engine {
                         line_height: cfg.line_height * scale,
                         /* A paragraph's own alignment overrides the document
                         default (Backlog #9). */
-                        alignment: para.alignment.map_or(cfg.alignment, layout_align),
+                        alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+                        /* Phase 2 — <w:ind>. Zero by default; non-zero shrinks
+                        content width + offsets the first line. */
+                        indent_start_px: ind_s,
+                        indent_end_px: ind_e,
+                        first_line_indent_px: ind_fl,
+                        hanging_indent_px: ind_h,
                     };
                     let laid = layout_paragraph(para_cfg);
                     cache.put(key, laid.clone());
@@ -1440,11 +1491,18 @@ impl Engine {
             };
             /* Cached and fresh boxes carry identical local line geometry —
             only the global Y shift differs (the vertical-shift step). */
+            /* Phase 2 — <w:spacing w:before|after> adds vertical padding
+            around the paragraph. Before-spacing shifts this paragraph's
+            origin down; after-spacing pushes the *next* paragraph further
+            down. Twips → layout px through `twips_to_layout_px`. */
+            let before_px = twips_to_layout_px(para.props.spacing.before_twips, scale);
+            let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
+            para_y_offset += before_px;
             para_box.origin = Point {
                 x: 0.0,
                 y: para_y_offset,
             };
-            para_y_offset += para_box.size.height;
+            para_y_offset += para_box.size.height + after_px;
             paragraphs.push(para_box);
             box_doc_index.push(doc_idx as u32);
         }
@@ -1873,7 +1931,7 @@ impl Engine {
             .current()
             .paragraphs
             .get(para as usize)
-            .and_then(|p| p.alignment)
+            .and_then(|p| p.props.alignment)
             .map(layout_align);
         let default = self
             .layout_cfg
@@ -2574,7 +2632,7 @@ mod tests {
         let para = |text: &str| engine::Paragraph {
             text: text.to_string(),
             spans: Vec::new(),
-            alignment: None,
+            props: engine::ParaProperties::default(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -2589,7 +2647,7 @@ mod tests {
         );
         /* A paragraph alignment override -> different key. */
         let mut centered = para("hello world");
-        centered.alignment = Some(EngineAlignment::Center);
+        centered.props.alignment = Some(EngineAlignment::Center);
         assert_ne!(
             paragraph_layout_key(&a, &cfg, 1.0),
             paragraph_layout_key(&centered, &cfg, 1.0),
@@ -2702,7 +2760,7 @@ mod tests {
         let p = engine::Paragraph {
             text: "abcdef".to_string(),
             spans: Vec::new(),
-            alignment: None,
+            props: engine::ParaProperties::default(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, 3, 3, 16.0, 1.0);
@@ -2722,7 +2780,7 @@ mod tests {
         let p = engine::Paragraph {
             text: "abc".to_string(),
             spans: Vec::new(),
-            alignment: None,
+            props: engine::ParaProperties::default(),
         };
         let spans = composition_layout_spans(&p, 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);

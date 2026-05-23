@@ -19,16 +19,18 @@
 //!      byte-stable; Phase 3's passthrough optimisation will preserve
 //!      this bound for Word-generated fixtures too).
 //!
-//! - **`--gen-seed [dir]`**: materialises the Phase 1 seed corpus
-//!   (`simple_text.docx`, `simple_arabic.docx`, `simple_xml_escapes.docx`)
-//!   plus `_manifest.json` into the target dir. Idempotent; commit the
-//!   output. Phase 2+ fixtures arrive from Microsoft Word / LibreOffice
-//!   directly and don't pass through this codepath.
+//! - **`--gen-seed [dir]`**: materialises the seed corpus + `_manifest.json`
+//!   into the target dir. Idempotent; commit the output.
+//!   - Phase 1: plain-text + Arabic + XML-escape fixtures.
+//!   - Phase 2: `pPr_jc_center.docx`, `pPr_ind_firstline.docx`,
+//!     `pPr_spacing.docx`, `pPr_bidi_rtl.docx` — handcrafted via our own
+//!     writer (the Word-authored ground-truth fixtures aren't in the tree
+//!     at Phase 2 cut; Phase 3 will replace them with real Word output).
 //!
 //! Exit 0 on PASS, non-zero on FAIL.
 
 use anyhow::{Context, Result, bail};
-use engine::DocumentTree;
+use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
 use format_docx::writer::build_minimal_docx;
 use format_docx::{DocxArchive, read_docx, write_docx};
 use serde::{Deserialize, Serialize};
@@ -313,7 +315,7 @@ fn documents_equivalent(a: &DocxArchive, b: &DocxArchive) -> bool {
         return false;
     }
     for (x, y) in pa.iter().zip(pb.iter()) {
-        if x.text != y.text || x.alignment != y.alignment {
+        if x.text != y.text || x.props != y.props {
             return false;
         }
         if x.spans.len() != y.spans.len() {
@@ -335,17 +337,17 @@ fn run_gen_seed(dir: &Path) -> Result<()> {
     let mut manifest = ManifestFile {
         fixtures: BTreeMap::new(),
     };
-    for (name, doc) in seed_fixtures() {
-        let bytes = build_minimal_docx(&doc).context("build seed")?;
-        let path = dir.join(name);
+    for fx in seed_fixtures() {
+        let bytes = build_minimal_docx(&fx.doc).context("build seed")?;
+        let path = dir.join(fx.name);
         std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
 
-        let texts: Vec<String> = doc.paragraphs.iter().map(|p| p.text.clone()).collect();
+        let texts: Vec<String> = fx.doc.paragraphs.iter().map(|p| p.text.clone()).collect();
         manifest.fixtures.insert(
-            name.to_owned(),
+            fx.name.to_owned(),
             FixtureEntry {
-                generator: "build_minimal_docx".into(),
-                phase_introduced: 1,
+                generator: fx.generator.into(),
+                phase_introduced: fx.phase,
                 asserts: FixtureAsserts {
                     paragraph_count: texts.len() as u32,
                     paragraph_texts: texts,
@@ -363,13 +365,94 @@ fn run_gen_seed(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn seed_fixtures() -> Vec<(&'static str, DocumentTree)> {
+struct SeedFixture {
+    name: &'static str,
+    phase: u8,
+    generator: &'static str,
+    doc: DocumentTree,
+}
+
+fn seed_fixtures() -> Vec<SeedFixture> {
+    let mut out = vec![
+        SeedFixture {
+            name: "simple_text.docx",
+            phase: 1,
+            generator: "build_minimal_docx",
+            doc: DocumentTree::from_text("hello world"),
+        },
+        SeedFixture {
+            name: "simple_arabic.docx",
+            phase: 1,
+            generator: "build_minimal_docx",
+            doc: DocumentTree::from_text("السلام عليكم"),
+        },
+        SeedFixture {
+            name: "simple_xml_escapes.docx",
+            phase: 1,
+            generator: "build_minimal_docx",
+            doc: DocumentTree::from_text("<a> & </a>"),
+        },
+    ];
+    out.extend(ppr_fixtures());
+    out
+}
+
+/* --- Phase 2: paragraph-properties fixtures.
+Each one isolates one `<w:pPr>` child element. The Word-authored
+ground-truth `.docx` files were not in the tree at Phase 2 kickoff;
+these are `handcrafted` via our own writer so the harness exercises the
+pPr reader + writer end-to-end. Phase 3 / 5 swap in true Word fixtures. */
+fn ppr_fixtures() -> Vec<SeedFixture> {
+    let mk = |name, props: ParaProperties, text: &str| SeedFixture {
+        name,
+        phase: 2,
+        generator: "handcrafted",
+        doc: DocumentTree::from_rich_paragraphs([Paragraph {
+            text: text.to_owned(),
+            spans: Vec::new(),
+            props,
+        }]),
+    };
     vec![
-        ("simple_text.docx", DocumentTree::from_text("hello world")),
-        ("simple_arabic.docx", DocumentTree::from_text("السلام عليكم")),
-        (
-            "simple_xml_escapes.docx",
-            DocumentTree::from_text("<a> & </a>"),
+        mk(
+            "pPr_jc_center.docx",
+            ParaProperties {
+                alignment: Some(Alignment::Center),
+                ..Default::default()
+            },
+            "centered heading",
+        ),
+        mk(
+            "pPr_ind_firstline.docx",
+            ParaProperties {
+                indent: Indent {
+                    start_twips: 720,
+                    first_line_twips: 360,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            "first line is indented further than the body of this paragraph",
+        ),
+        mk(
+            "pPr_spacing.docx",
+            ParaProperties {
+                spacing: Spacing {
+                    before_twips: 120,
+                    after_twips: 240,
+                },
+                ..Default::default()
+            },
+            "paragraph with extra space above and below",
+        ),
+        mk(
+            "pPr_bidi_rtl.docx",
+            ParaProperties {
+                direction: Some(TextDirection::Rtl),
+                alignment: Some(Alignment::End),
+                ..Default::default()
+            },
+            "السلام عليكم ورحمة الله وبركاته",
         ),
     ]
 }

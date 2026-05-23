@@ -1,6 +1,7 @@
 # OOXML (ECMA-376) Compliance Roadmap
 
-**Status:** Draft — awaiting approval before Phase 1 execution.
+**Status:** Approved. Phase 1 shipped (commit `669b155`, 2026-05-23). Phase 2
+in flight.
 **Starting point:** `v0.5.0-beta.3`. `crates/format-docx` already handles the
 OPC ZIP pass-through, `<w:p>` / `<w:r>` boundaries, and a subset of `<w:rPr>`
 (bold, italic, underline, strike, color, highlight / `<w:shd>`, `<w:rFonts>`).
@@ -35,6 +36,30 @@ Every phase obeys five invariants:
 5. **No regression of the current `2 × N` document.xml bound** on the
    existing fixtures. New features that need a looser bound must justify it
    in the roundtrip harness with a per-fixture override.
+
+### 0.1. Decisions log
+
+Frozen after Phase 1 sign-off (2026-05-23). Supersedes the §6 open questions.
+
+1. **Microsoft Word access.** Ground-truth fixtures are authored against
+   **Office 365 Web** running in a dedicated Windows VM. **LibreOffice
+   Writer** is the secondary baseline, exposing vendor-specific schema
+   deviations.
+2. **Phase 5 block-enum RFC.** Reaffirmed. A separate
+   `PHASE_5_BLOCK_ENUM_RFC.md` will land before Phase 5 kickoff to scope
+   the cascade across `engine`, `engine-wasm`, `bridge`, `layout`,
+   `render`, `format-pdf`, and the TS shell.
+3. **Schema validation.** Always validate against the **ECMA-376 Part 4
+   Transitional** schemas, never Strict. Word's emissions are
+   Transitional; Strict would be over-strict relative to the reference
+   implementation.
+4. **PDF table export.** Deferred to **Phase 5b**. Phase 5 ships
+   `.docx` table read / write / on-screen render only; PDF table export
+   does not block the Phase 5 release.
+5. **Round-trip strictness.** **Strict zero-drift on unmutated
+   paragraphs** is mandatory. The Phase 3 per-paragraph dirty tracking +
+   passthrough optimisation are non-negotiable — template corruption on
+   save is the failure mode they exist to prevent.
 
 ---
 

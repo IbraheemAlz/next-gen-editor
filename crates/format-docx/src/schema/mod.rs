@@ -5,6 +5,7 @@
 //! shared between every `parts::*` parser — writer-side serialization stays
 //! local to each part for now.
 
+pub mod ct_ppr;
 pub mod ct_rpr;
 
 /// WordprocessingML namespace.

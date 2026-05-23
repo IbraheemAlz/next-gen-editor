@@ -477,6 +477,10 @@ mod tests {
             max_width: 451.0,
             line_height: 26.0,
             alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
         });
         PageBox {
             size: Size {

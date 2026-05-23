@@ -74,15 +74,72 @@ pub enum Alignment {
     Justify,
 }
 
+/// Paragraph indentation. OOXML carries these as twips (1/1440 inch); the
+/// engine stores them in the same unit and converts to layout pixels at
+/// `engine-wasm` boundary so the pure document model has no float-DPI
+/// dependency. `first_line` and `hanging` are mutually exclusive in OOXML;
+/// the reader sets the matching field and zeroes the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Indent {
+    pub start_twips: i32,
+    pub end_twips: i32,
+    pub first_line_twips: i32,
+    pub hanging_twips: i32,
+}
+
+/// Per-paragraph vertical spacing. Twips, matching `<w:spacing>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Spacing {
+    pub before_twips: i32,
+    pub after_twips: i32,
+}
+
+/// Explicit paragraph base direction (`<w:bidi/>` for RTL). `None` lets
+/// `text_pipeline::first_strong_direction` infer from the first strong
+/// character — the current document-wide default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDirection {
+    Ltr,
+    Rtl,
+}
+
+/// Per-paragraph line-height override (`<w:spacing w:line>` /
+/// `w:lineRule>`). `None` inherits the renderer's default line height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    /// `w:lineRule="auto"` — `w:line` is a 240-ths multiple of single line
+    /// height; we store the integer twips for round-trip, layout converts.
+    Auto { twips: i32 },
+    /// `w:lineRule="exact"` — fixed twip height; overflow clips.
+    Exact { twips: i32 },
+    /// `w:lineRule="atLeast"` — minimum; grows for tall glyphs.
+    AtLeast { twips: i32 },
+}
+
+/// Paragraph-level properties parsed from `<w:pPr>`. Holds every field the
+/// engine needs to round-trip a Word paragraph; layout consumes the
+/// alignment / indent / spacing / direction / line-height subset.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ParaProperties {
+    pub alignment: Option<Alignment>,
+    pub indent: Indent,
+    pub spacing: Spacing,
+    pub direction: Option<TextDirection>,
+    pub line_height: Option<LineHeight>,
+    pub keep_next: bool,
+    pub keep_lines: bool,
+    pub page_break_before: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Paragraph {
     pub text: String,
     /// Non-overlapping styled ranges, sorted by `start`; default-styled ranges
     /// are omitted. An empty list is plain text.
     pub spans: Vec<StyleRun>,
-    /// Per-paragraph alignment override. `None` inherits the document /
-    /// render-config default; `Some` is an explicit choice (Backlog #9).
-    pub alignment: Option<Alignment>,
+    /// Paragraph-level properties (`<w:pPr>`). Default = inherit everything
+    /// from the render config / document defaults.
+    pub props: ParaProperties,
 }
 
 impl Paragraph {
@@ -140,7 +197,7 @@ impl Paragraph {
         Paragraph {
             text: self.text.clone(),
             spans,
-            alignment: self.alignment,
+            props: self.props.clone(),
         }
     }
 
@@ -220,7 +277,7 @@ impl Paragraph {
         Paragraph {
             text,
             spans,
-            alignment: self.alignment,
+            props: self.props.clone(),
         }
     }
 
@@ -250,12 +307,12 @@ impl Paragraph {
             Paragraph {
                 text: self.text[..at as usize].to_owned(),
                 spans: left,
-                alignment: self.alignment,
+                props: self.props.clone(),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
                 spans: right,
-                alignment: self.alignment,
+                props: self.props.clone(),
             },
         )
     }
@@ -278,7 +335,7 @@ impl Paragraph {
         Paragraph {
             text,
             spans,
-            alignment: self.alignment,
+            props: self.props.clone(),
         }
     }
 
@@ -321,7 +378,7 @@ impl DocumentTree {
         paragraphs.push_back(Paragraph {
             text: text.to_owned(),
             spans: Vec::new(),
-            alignment: None,
+            props: ParaProperties::default(),
         });
         Self { paragraphs }
     }
@@ -333,7 +390,7 @@ impl DocumentTree {
             paragraphs.push_back(Paragraph {
                 text: t,
                 spans: Vec::new(),
-                alignment: None,
+                props: ParaProperties::default(),
             });
         }
         Self { paragraphs }
@@ -381,7 +438,7 @@ impl DocumentTree {
             paragraphs.push_back(Paragraph {
                 text: text.to_owned(),
                 spans: Vec::new(),
-                alignment: None,
+                props: ParaProperties::default(),
             });
             return Self { paragraphs };
         }
@@ -442,7 +499,7 @@ impl DocumentTree {
         let final_para = (end.para as usize).min(last);
         for p in first..=final_para {
             let mut para = paragraphs[p].clone();
-            para.alignment = Some(align);
+            para.props.alignment = Some(align);
             paragraphs.set(p, para);
         }
         Self { paragraphs }
@@ -813,7 +870,7 @@ mod tests {
         let p = Paragraph {
             text: "hello world".into(),
             spans: Vec::new(),
-            alignment: None,
+            props: ParaProperties::default(),
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -828,7 +885,7 @@ mod tests {
         let p = Paragraph {
             text: "مرحبا بالعالم".into(),
             spans: Vec::new(),
-            alignment: None,
+            props: ParaProperties::default(),
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -840,7 +897,7 @@ mod tests {
         let p = Paragraph {
             text: String::new(),
             spans: Vec::new(),
-            alignment: None,
+            props: ParaProperties::default(),
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -906,7 +963,7 @@ mod tests {
         let p = Paragraph {
             text: "aمb".into(),
             spans: Vec::new(),
-            alignment: None,
+            props: ParaProperties::default(),
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -1004,10 +1061,10 @@ mod tests {
             LogicalPos { para: 1, offset: 0 },
             Alignment::Center,
         );
-        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::Center));
-        assert_eq!(d.paragraphs[1].alignment, Some(Alignment::Center));
+        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::Center));
+        assert_eq!(d.paragraphs[1].props.alignment, Some(Alignment::Center));
         /* outside the range — untouched */
-        assert_eq!(d.paragraphs[2].alignment, None);
+        assert_eq!(d.paragraphs[2].props.alignment, None);
     }
 
     #[test]
@@ -1021,7 +1078,7 @@ mod tests {
         /* insertion clones the paragraph in place — alignment rides along */
         let d = d.insert_text(LogicalPos { para: 0, offset: 0 }, "X");
         assert_eq!(d.paragraph_text(0), Some("Xhello world"));
-        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::End));
+        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::End));
         /* a style change preserves alignment */
         let d = d.apply_style(
             LogicalPos { para: 0, offset: 0 },
@@ -1031,13 +1088,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::End));
+        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::End));
         /* and so does a deletion */
         let d = d.delete_range(
             LogicalPos { para: 0, offset: 0 },
             LogicalPos { para: 0, offset: 1 },
         );
-        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::End));
+        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::End));
     }
 
     #[test]
@@ -1051,8 +1108,8 @@ mod tests {
         let d = d.split_paragraph(LogicalPos { para: 0, offset: 5 });
         assert_eq!(d.paragraph_count(), 2);
         /* both halves carry the original paragraph's alignment */
-        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::Center));
-        assert_eq!(d.paragraphs[1].alignment, Some(Alignment::Center));
+        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::Center));
+        assert_eq!(d.paragraphs[1].props.alignment, Some(Alignment::Center));
     }
 
     #[test]
@@ -1076,7 +1133,7 @@ mod tests {
         assert_eq!(d.paragraph_count(), 1);
         assert_eq!(d.paragraph_text(0), Some("abcdef"));
         /* the surviving paragraph keeps the first paragraph's alignment */
-        assert_eq!(d.paragraphs[0].alignment, Some(Alignment::Center));
+        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::Center));
     }
 
     #[test]
@@ -1146,7 +1203,7 @@ mod tests {
                 end: 11,
                 style: bold,
             }],
-            alignment: None,
+            props: ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -1172,7 +1229,7 @@ mod tests {
         let frag = vec![Paragraph {
             text: "BRAVE ".into(),
             spans: vec![],
-            alignment: None,
+            props: ParaProperties::default(),
         }];
         let (out, caret) = doc.insert_rich(LogicalPos { para: 0, offset: 6 }, &frag);
         assert_eq!(out.paragraph_count(), 1);
@@ -1197,7 +1254,7 @@ mod tests {
             Paragraph {
                 text: "one".into(),
                 spans: vec![],
-                alignment: None,
+                props: ParaProperties::default(),
             },
             Paragraph {
                 text: "two".into(),
@@ -1206,7 +1263,7 @@ mod tests {
                     end: 3,
                     style: bold,
                 }],
-                alignment: None,
+                props: ParaProperties::default(),
             },
         ];
         let (out, caret) = doc.insert_rich(LogicalPos { para: 0, offset: 2 }, &frag);

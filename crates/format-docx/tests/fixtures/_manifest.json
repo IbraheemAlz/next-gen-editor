@@ -1,5 +1,57 @@
 {
   "fixtures": {
+    "pPr_bidi_rtl.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 2,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "السلام عليكم ورحمة الله وبركاته"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "pPr_ind_firstline.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 2,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "first line is indented further than the body of this paragraph"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "pPr_jc_center.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 2,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "centered heading"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "pPr_spacing.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 2,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "paragraph with extra space above and below"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "simple_arabic.docx": {
       "generator": "build_minimal_docx",
       "phase_introduced": 1,

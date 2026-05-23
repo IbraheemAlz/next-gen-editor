@@ -32,6 +32,18 @@ pub struct ParagraphConfig<'a> {
     pub max_width: f32,
     pub line_height: f32,
     pub alignment: Alignment,
+    /// `<w:ind w:start>` — distance every line is offset from the leading
+    /// margin. In layout px (already DPR-scaled).
+    pub indent_start_px: f32,
+    /// `<w:ind w:end>` — distance every line is offset from the trailing
+    /// margin (shrinks the available content width).
+    pub indent_end_px: f32,
+    /// `<w:ind w:firstLine>` — extra leading-edge offset on the first line
+    /// only. Mutually exclusive with `hanging_indent_px` (one is 0).
+    pub first_line_indent_px: f32,
+    /// `<w:ind w:hanging>` — distance the first line shifts back from
+    /// `indent_start_px` (so subsequent lines hang in).
+    pub hanging_indent_px: f32,
 }
 
 /// Lay out `cfg.text` into a [`ParagraphBox`] with positioned lines.
@@ -39,7 +51,12 @@ pub struct ParagraphConfig<'a> {
 /// The returned box has `origin == (0, 0)`; the page assembler sets the
 /// paragraph's position when stacking it onto a `PageBox`.
 pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
-    let mut composed = compose_lines(&cfg);
+    /* `<w:ind w:start|end>` shrinks the available content width. First-line
+    indent is applied per-line below. The remaining alignment math operates
+    in the shrunken content space — alignment_origin_x positions inside it
+    — and the leading-edge shift drops onto the line origin. */
+    let content_width = (cfg.max_width - cfg.indent_start_px - cfg.indent_end_px).max(0.0);
+    let mut composed = compose_lines_with_width(&cfg, content_width);
 
     /* Justify every line except the last and any hard-broken (overflow) line. */
     if cfg.alignment == Alignment::Justify {
@@ -48,32 +65,55 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             if i == last || !*broke {
                 continue;
             }
-            justify_line(line, cfg.max_width, cfg.text, cfg.fonts);
+            justify_line(line, content_width, cfg.text, cfg.fonts);
         }
     }
+
+    let rtl = matches!(cfg.base_direction, ShapingDirection::Rtl);
+    /* Leading-edge offset: distance from the box's logical-left edge (in
+    layout coords, `origin.x = 0`) to the line's leading content edge. For
+    LTR that's `indent_start_px`; for RTL it's `indent_end_px` because
+    "leading" is the right side. The trailing edge is mirrored. */
+    let (leading_off, trailing_off) = if rtl {
+        (cfg.indent_end_px, cfg.indent_start_px)
+    } else {
+        (cfg.indent_start_px, cfg.indent_end_px)
+    };
 
     /* Position each line within the paragraph. `origin.y` stacks by the
     accumulated height of preceding lines; each line's height is its own max
     ascent + max descent over its runs (Backlog #5 — dynamic line height), so
     a line carrying a larger span grows to fit instead of clipping. `origin.x`
-    carries the alignment offset so the renderer stays a pure accumulator. */
+    carries the alignment offset + the leading-edge indent so the renderer
+    stays a pure accumulator. */
     let mut lines: Vec<LineBox> = Vec::with_capacity(composed.len());
     let mut y = 0.0_f32;
-    for (mut line, _) in composed {
+    for (i, (mut line, _)) in composed.into_iter().enumerate() {
         let (ascent, descent) = line_extents(&line, cfg.fonts, cfg.line_height);
+        /* First-line indent / hanging: hanging shifts the first line *back*
+        toward the leading edge; firstLine shifts it *forward* into the body.
+        Both already in layout px. Subsequent lines hug `leading_off`. */
+        let first_line_extra = if i == 0 {
+            cfg.first_line_indent_px - cfg.hanging_indent_px
+        } else {
+            0.0
+        };
+        let inner_origin = alignment_origin_x(
+            line.width,
+            (content_width - first_line_extra).max(0.0),
+            line.alignment,
+            cfg.base_direction,
+        );
         line.origin = Point {
-            x: alignment_origin_x(
-                line.width,
-                cfg.max_width,
-                line.alignment,
-                cfg.base_direction,
-            ),
+            x: leading_off + first_line_extra + inner_origin,
             y,
         };
         line.baseline = ascent;
         line.height = ascent + descent;
         y += line.height;
         lines.push(line);
+        /* `trailing_off` participates only by shrinking `content_width`. */
+        let _ = trailing_off;
     }
 
     let height = y;
@@ -86,6 +126,30 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         lines,
         direction: cfg.base_direction,
     }
+}
+
+/// Adapter that lets the indent-aware path call the existing `compose_lines`
+/// (which read `cfg.max_width`) with the shrunken content width. Phase 1
+/// call sites passed `indent_start_px == indent_end_px == 0`, so the shrunk
+/// width equals `max_width` and behaviour is preserved byte-for-byte.
+fn compose_lines_with_width<'a>(
+    cfg: &ParagraphConfig<'a>,
+    content_width: f32,
+) -> Vec<(LineBox, bool)> {
+    let scoped = ParagraphConfig {
+        text: cfg.text,
+        fonts: cfg.fonts,
+        spans: cfg.spans,
+        base_direction: cfg.base_direction,
+        max_width: content_width,
+        line_height: cfg.line_height,
+        alignment: cfg.alignment,
+        indent_start_px: 0.0,
+        indent_end_px: 0.0,
+        first_line_indent_px: 0.0,
+        hanging_indent_px: 0.0,
+    };
+    compose_lines(&scoped)
 }
 
 /// Maximum ascent and descent across a line's runs, from each run's font
