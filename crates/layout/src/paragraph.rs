@@ -296,34 +296,59 @@ fn compose_lines_with_width<'a>(
     compose_lines(&scoped)
 }
 
-/// Maximum ascent and descent across a line's runs, from each run's font
-/// metrics at its pixel size (Backlog #5). A line carrying a larger font size
-/// or a taller script grows to fit the tallest run. A line with no resolvable
-/// run metrics falls back to the configured line height as pure ascent.
-fn line_extents(line: &LineBox, fonts: &FontStack, fallback: f32) -> (f32, f32) {
-    let mut ascent = 0.0_f32;
-    let mut descent = 0.0_f32;
+/// Compute one line's `(ascent, descent)` — the line box's height split at
+/// the baseline. The configured `line_height` is the author's target
+/// (the `<w:spacing w:line>`-equivalent at the engine boundary, matching
+/// Word's `lineRule="auto"`): the line box matches it, with the baseline
+/// placed so font ascender / descender fit inside.
+///
+/// Naskh fonts (Amiri, Noto Naskh) ship intrinsic ascent + descent of
+/// 2-3× the em size to leave room for tashkeel + verse marks. Before this
+/// fix the layer used the raw font metrics directly — a 24 pt Amiri
+/// paragraph rendered at ~70 CSS px per line instead of the configured
+/// 36 pt, blowing the page out vertically.
+///
+/// Policy (mirrors Word's default Auto rule):
+/// - The line box is `line_height` tall; baseline at `0.82 ×
+///   line_height` from the top (ascender takes 82%, descender 18% —
+///   typical for Latin / Naskh mix).
+/// - If `line_height` is somehow zero (callers pass a positive value, but
+///   defensive), fall back to font metrics.
+/// - Phase 7 inline images can still grow the line above `line_height`
+///   when an image's height exceeds the box — clipping a glyph is fine,
+///   clipping an image's content is not.
+fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32) -> (f32, f32) {
+    let mut font_ascent = 0.0_f32;
+    let mut font_descent = 0.0_f32;
+    let mut inline_image_h = 0.0_f32;
     for run in &line.runs {
         if let Some(face) = fonts.face(&run.font) {
             let m = face.metrics(run.attrs.px_size);
-            ascent = ascent.max(m.ascent);
-            descent = descent.max(m.descent.abs());
+            font_ascent = font_ascent.max(m.ascent);
+            font_descent = font_descent.max(m.descent.abs());
         }
-        /* Phase 7 — inline objects (images) push the ascent so the line
-        grows to host the image without clipping. The bottom of the
-        object sits on the baseline; the image extends `height_px`
-        above it. */
+        /* Phase 7 — inline images can grow the line beyond `line_height`. */
         for g in &run.glyphs {
             if g.inline_image_rel_id.is_some() {
-                ascent = ascent.max(g.inline_object_height);
+                inline_image_h = inline_image_h.max(g.inline_object_height);
             }
         }
     }
-    if ascent + descent <= 0.0 {
-        (fallback, 0.0)
-    } else {
-        (ascent, descent)
+
+    /* Defensive fallback: callers pass `cfg.line_height * scale` which is
+    always > 0 in production, but if it slipped to 0, use font metrics. */
+    if line_height <= 0.0 {
+        if font_ascent + font_descent <= 0.0 {
+            return (0.0, 0.0);
+        }
+        return (font_ascent.max(inline_image_h), font_descent);
     }
+
+    /* Inline image grows the line above `line_height` if needed. */
+    let total = line_height.max(inline_image_h + line_height * 0.18);
+    let ascent = (total * 0.82).max(inline_image_h);
+    let descent = total - ascent;
+    (ascent, descent)
 }
 
 /// Greedy line breaking. Returns each line paired with whether it ended at a
