@@ -21,9 +21,16 @@
 //! paginator itself only knows about overflow.
 
 use crate::boxes::{
-    HeaderFooterBox, LayoutBlock, LineBox, PageBox, ParagraphBox, Point, Size, TableBox,
+    FootnoteEntry, HeaderFooterBox, LayoutBlock, LineBox, PageBox, ParagraphBox, Point, Size,
+    TableBox,
 };
 use crate::page::Margins;
+use std::collections::HashMap;
+
+/// Phase 8a — vertical gap above the footnote separator rule, in layout
+/// pt at scale=1. The renderer multiplies by `scale` if it needs device
+/// pixels.
+pub const FOOTNOTE_SEPARATOR_HEIGHT_PT: f32 = 12.0;
 
 /// Concrete geometry for one paginated page. Mirrors `engine::PageGeometry`
 /// without taking a dependency on the engine crate.
@@ -61,6 +68,17 @@ pub struct Paginator {
     cur_y: f32,
     /// Finished pages.
     pages: Vec<PageBox>,
+    /// Phase 8a — pre-laid-out footnote bodies keyed by `w:id`. The
+    /// engine builds these once per document with the same paragraph
+    /// layout pipeline the body uses; the paginator only does lookups.
+    footnote_bodies: HashMap<u32, ParagraphBox>,
+    /// Phase 8a — footnote ids already accumulated on the current page
+    /// (in emission order; deduped). Drained on `flush_page`.
+    cur_footnote_ids: Vec<u32>,
+    /// Phase 8a — total height already consumed by the current page's
+    /// footnote band, including the separator gap. Subtracted from
+    /// the content budget so the body never overruns the band.
+    cur_footnote_height: f32,
 }
 
 impl Paginator {
@@ -76,7 +94,19 @@ impl Paginator {
             cur_blocks: Vec::new(),
             cur_y: 0.0,
             pages: Vec::new(),
+            footnote_bodies: HashMap::new(),
+            cur_footnote_ids: Vec::new(),
+            cur_footnote_height: 0.0,
         }
+    }
+
+    /// Phase 8a — install the per-document footnote body table. The
+    /// paginator looks each `<w:footnoteReference w:id="N"/>` up here
+    /// when it scans a freshly-pushed paragraph and grows the footnote
+    /// band before deciding whether the paragraph still fits.
+    pub fn with_footnote_bodies(mut self, bodies: HashMap<u32, ParagraphBox>) -> Self {
+        self.footnote_bodies = bodies;
+        self
     }
 
     /// Y cursor within the current page's content area (parent-relative).
@@ -123,12 +153,31 @@ impl Paginator {
     /// rewritten to land at the current cursor; if it overflows, the block
     /// is split (paragraphs at line boundaries, tables at row boundaries)
     /// and the tail re-pushed onto the next page.
+    ///
+    /// Phase 8a — every block is scanned for `<w:footnoteReference>`
+    /// anchors. Each new footnote brings its laid-out body into the
+    /// page's bottom band; the band's accumulated height is subtracted
+    /// from the body budget so the page never overflows. If the block
+    /// plus its new footnote draw exceeds the budget, the new
+    /// footnote(s) get rolled back, the page closes, and the block is
+    /// re-tried on a fresh page (where its footnotes start a new band).
     pub fn push_block(&mut self, mut block: LayoutBlock, before: f32, after: f32) {
         /* Apply the paragraph's `<w:spacing w:before>` first — the engine
         layer already had this concept; we keep it here so the paginator
         owns every Y-coordinate. */
         self.cur_y += before;
-        let remaining = self.geometry.content_height() - self.cur_y;
+
+        /* Phase 8a — gather every NEW footnote referenced by this block
+        (already-on-page refs don't grow the band) and provisionally
+        commit their heights to the budget. We undo the commit if the
+        block ends up forced onto a new page. */
+        let new_refs: Vec<u32> = collect_footnote_refs(&block)
+            .into_iter()
+            .filter(|id| !self.cur_footnote_ids.contains(id))
+            .collect();
+        let (added_height, added_separator) = self.try_consume_footnotes(&new_refs);
+
+        let remaining = self.geometry.content_height() - self.cur_y - self.cur_footnote_height;
         let block_height = block.size().height;
 
         if block_height <= remaining || self.cur_blocks.is_empty() {
@@ -145,12 +194,60 @@ impl Paginator {
             return;
         }
 
-        /* Overflow. Split where possible; the remainder flows onto the
-        next page. Pure block-level (a table on a non-empty page that
-        doesn't fit) is the easy case: flush, retry. */
+        /* Overflow. Roll back the provisional footnote commit before
+        retrying: the refs belong to the block, the block is going to
+        the next page, and they should land in that page's band. */
+        self.rollback_footnotes(&new_refs, added_height, added_separator);
+
+        /* Pure block-level (a table on a non-empty page that doesn't
+        fit) is the easy case: flush, retry. Paragraphs split at line
+        boundaries. */
         match block {
             LayoutBlock::Paragraph(p) => self.push_paragraph_split(p, after),
             LayoutBlock::Table(t) => self.push_table_split(t, after),
+        }
+    }
+
+    /// Provisional footnote commit. Returns `(extra_height_added,
+    /// added_separator)` so [`Self::rollback_footnotes`] can undo it on
+    /// an overflow path.
+    fn try_consume_footnotes(&mut self, new_refs: &[u32]) -> (f32, bool) {
+        if new_refs.is_empty() {
+            return (0.0, false);
+        }
+        let mut extra = 0.0_f32;
+        let added_separator = self.cur_footnote_ids.is_empty();
+        if added_separator {
+            extra += FOOTNOTE_SEPARATOR_HEIGHT_PT;
+        }
+        for id in new_refs {
+            if let Some(body) = self.footnote_bodies.get(id) {
+                extra += body.size.height;
+            }
+            self.cur_footnote_ids.push(*id);
+        }
+        self.cur_footnote_height += extra;
+        (extra, added_separator)
+    }
+
+    fn rollback_footnotes(&mut self, new_refs: &[u32], extra: f32, added_separator: bool) {
+        if new_refs.is_empty() {
+            return;
+        }
+        /* Remove from the tail — the provisional push appended them in
+        order, so the unwind pops the same ids. Defensive `retain`
+        guards against duplicates the caller might pass. */
+        for id in new_refs.iter().rev() {
+            if let Some(pos) = self.cur_footnote_ids.iter().rposition(|x| x == id) {
+                self.cur_footnote_ids.remove(pos);
+            }
+        }
+        self.cur_footnote_height -= extra;
+        if added_separator && self.cur_footnote_ids.is_empty() {
+            /* `extra` already includes the separator; nothing else to do. */
+        }
+        if self.cur_footnote_height < 0.0 {
+            self.cur_footnote_height = 0.0;
         }
     }
 
@@ -249,6 +346,28 @@ impl Paginator {
     fn flush_page(&mut self) {
         let blocks = std::mem::take(&mut self.cur_blocks);
         self.cur_y = 0.0;
+        /* Phase 8a — materialize the page's footnote band. The reserved
+        height was already subtracted from the body budget during
+        `push_block`, so the band fits without overflow. Entries are in
+        emission order (the order their refs first appeared in body
+        content), each shifted to its own Y inside the band. */
+        let mut footnotes: Vec<FootnoteEntry> = Vec::with_capacity(self.cur_footnote_ids.len());
+        let mut band_y = 0.0_f32;
+        for (idx, id) in self.cur_footnote_ids.iter().enumerate() {
+            if let Some(body) = self.footnote_bodies.get(id).cloned() {
+                let mut p = body;
+                p.origin = Point { x: 0.0, y: band_y };
+                band_y += p.size.height;
+                footnotes.push(FootnoteEntry {
+                    id: *id,
+                    marker: (idx + 1).to_string(),
+                    paragraph: p,
+                });
+            }
+        }
+        self.cur_footnote_ids.clear();
+        self.cur_footnote_height = 0.0;
+
         /* Even an empty page is emitted on an explicit `force_page_break`
         / `start_new_section` — the renderer paints the blank sheet so a
         section break is visible. */
@@ -261,6 +380,7 @@ impl Paginator {
             blocks,
             header: self.header.clone(),
             footer: self.footer.clone(),
+            footnotes,
         });
     }
 
@@ -272,6 +392,51 @@ impl Paginator {
             self.flush_page();
         }
         self.pages
+    }
+}
+
+/// Phase 8a — scan a laid-out block for footnote reference anchors.
+/// Returns the display number of every footnote the block touches, in
+/// document order, with duplicates preserved (the paginator dedupes).
+///
+/// The glyph stores the marker text (the 1-based display number); the
+/// engine adapter keys its `with_footnote_bodies` map by the *same*
+/// numbers — it does the OOXML `w:id` ↔ display_number rebinding
+/// before handing the table to the paginator, so the layout layer
+/// never sees the raw `w:id`.
+pub fn collect_footnote_refs(block: &LayoutBlock) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    match block {
+        LayoutBlock::Paragraph(p) => collect_in_paragraph(p, &mut out),
+        LayoutBlock::Table(t) => collect_in_table(t, &mut out),
+    }
+    out
+}
+
+fn collect_in_paragraph(p: &ParagraphBox, out: &mut Vec<u32>) {
+    for line in &p.lines {
+        for run in &line.runs {
+            for g in &run.glyphs {
+                if let Some(marker) = g.inline_footnote_marker.as_deref()
+                    && let Ok(id) = marker.parse::<u32>()
+                {
+                    out.push(id);
+                }
+            }
+        }
+    }
+}
+
+fn collect_in_table(t: &TableBox, out: &mut Vec<u32>) {
+    for row in &t.rows {
+        for cell in &row.cells {
+            for inner in &cell.content {
+                match inner {
+                    LayoutBlock::Paragraph(p) => collect_in_paragraph(p, out),
+                    LayoutBlock::Table(nested) => collect_in_table(nested, out),
+                }
+            }
+        }
     }
 }
 

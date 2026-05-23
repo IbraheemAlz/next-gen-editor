@@ -134,6 +134,21 @@ pub fn parse_document_xml(
     let mut para_inline_objects: Vec<engine::InlineObject> = Vec::new();
     let mut para_hyperlinks: Vec<engine::Hyperlink> = Vec::new();
 
+    /* Phase 8a — footnote refs auto-number 1, 2, 3 ... in document order
+    across every `<w:footnoteReference>` the body uses. */
+    let mut footnote_display_counter: u32 = 0;
+
+    /* Phase 8a — comment ranges. `<w:commentRangeStart w:id="N"/>` opens
+    a range; `<w:commentRangeEnd w:id="N"/>` closes it. Each may live in
+    a different paragraph, so we capture the `(block_idx_at_open,
+    open_paragraph_byte_offset)` snapshot and consume it on the matching
+    end. `open_ranges` maps comment id → (start_block_idx, start_offset).
+    `out_comment_ranges` is the document-wide table the parser hands the
+    engine. */
+    let mut open_comment_ranges: std::collections::HashMap<u32, (u32, u32)> =
+        std::collections::HashMap::new();
+    let mut out_comment_ranges: Vec<engine::CommentRange> = Vec::new();
+
     /* Table state. `in_tbl` is a depth counter so nested tables (inside
     cells) don't trigger early `Block::Table` emission — only the
     outermost `</w:tbl>` flushes. `tbl_start_byte` captures the
@@ -342,6 +357,57 @@ pub fn parse_document_xml(
                     }
                     b"a:blip" if in_drawing => {
                         cur_drawing_rel_id = attr_val(&e, b"r:embed");
+                    }
+                    b"w:footnoteReference" => {
+                        /* Phase 8a — inject U+FFFC at the run's current
+                        byte offset and queue a FootnoteRef inline
+                        object. Numbering counts up across the body in
+                        document order, independent of the OOXML `w:id`
+                        the file uses internally. */
+                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok()) {
+                            footnote_display_counter += 1;
+                            let at = (para_text.len() + run_text.len()) as u32;
+                            run_text.push('\u{FFFC}');
+                            para_inline_objects.push(engine::InlineObject {
+                                at,
+                                kind: engine::InlineKind::FootnoteRef {
+                                    id,
+                                    display_number: footnote_display_counter,
+                                },
+                            });
+                        }
+                    }
+                    b"w:commentRangeStart" => {
+                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok()) {
+                            let block_idx = out_blocks.len() as u32;
+                            let off = (para_text.len() + run_text.len()) as u32;
+                            open_comment_ranges.insert(id, (block_idx, off));
+                        }
+                    }
+                    b"w:commentRangeEnd" => {
+                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok())
+                            && let Some((start_block, start_off)) = open_comment_ranges.remove(&id)
+                        {
+                            let end_block = out_blocks.len() as u32;
+                            let end_off = (para_text.len() + run_text.len()) as u32;
+                            out_comment_ranges.push(engine::CommentRange {
+                                id,
+                                start: engine::LogicalPos {
+                                    path: engine::BlockPath::top(start_block),
+                                    offset: start_off,
+                                },
+                                end: engine::LogicalPos {
+                                    path: engine::BlockPath::top(end_block),
+                                    offset: end_off,
+                                },
+                            });
+                        }
+                    }
+                    b"w:commentReference" => {
+                        /* The reference marker itself is invisible in the
+                        canvas (the sidebar UI shows the comment); the
+                        passthrough writer round-trips the markup byte-
+                        identical. Nothing to record here. */
                     }
                     n if in_sect_pr => cur_sect.apply(n, &e),
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
@@ -582,8 +648,7 @@ pub fn parse_document_xml(
         });
     }
 
-    Ok(DocumentTree::from_blocks_with_sections(
-        out_blocks,
-        out_sections,
-    ))
+    let mut tree = DocumentTree::from_blocks_with_sections(out_blocks, out_sections);
+    tree.comment_ranges = out_comment_ranges;
+    Ok(tree)
 }

@@ -69,6 +69,39 @@ pub struct DocumentTree {
     /// the document references. Inline images look up by the `rel_id`
     /// their [`InlineKind::Image`] carries.
     pub media: std::collections::HashMap<String, ImageBlob>,
+    /// Phase 8a — parsed `word/footnotes.xml` entries keyed by the OOXML
+    /// `w:id`. The value is the footnote body's plain text per paragraph;
+    /// the paginator looks an `InlineKind::FootnoteRef.id` up here when
+    /// it lays out the page's footnote band.
+    pub footnotes: std::collections::HashMap<u32, Vec<String>>,
+    /// Phase 8a — parsed `word/comments.xml` entries keyed by `w:id`.
+    /// Plain text + author / date metadata for the sidebar UI.
+    pub comment_defs: std::collections::HashMap<u32, CommentDef>,
+    /// Phase 8a — comment range overlays. Each entry is the byte-range
+    /// span of one `<w:commentRangeStart>` / `<w:commentRangeEnd>` pair
+    /// expressed in `LogicalPos` so a comment can span across paragraph
+    /// (and table-cell) boundaries.
+    pub comment_ranges: Vec<CommentRange>,
+}
+
+/// Phase 8a — author + date + body for one entry of `word/comments.xml`.
+/// Body is currently the joined plain text of every `<w:p>` inside the
+/// comment (rich formatting + reply threading deferred to Phase 8c).
+#[derive(Debug, Clone, Default)]
+pub struct CommentDef {
+    pub author: String,
+    pub date: String,
+    pub paragraphs: Vec<String>,
+}
+
+/// Phase 8a — one `<w:commentRangeStart>` / `<w:commentRangeEnd>` overlay
+/// on a logical position range. `id` matches a key in
+/// [`DocumentTree::comment_defs`].
+#[derive(Debug, Clone)]
+pub struct CommentRange {
+    pub id: u32,
+    pub start: LogicalPos,
+    pub end: LogicalPos,
 }
 
 /// Page geometry for a [`Section`]. Dimensions are layout pixels at 1 pt/unit
@@ -292,7 +325,7 @@ pub fn emu_to_pt(emu: i64) -> f32 {
 }
 
 /// Kind of inline object anchored in a paragraph's text. Phase 7 ships
-/// inline images only; future variants extend this enum (charts, math, ...).
+/// inline images; Phase 8a adds footnote references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineKind {
     /// `<w:drawing><wp:inline><a:graphic><pic:pic>` — a DrawingML picture.
@@ -304,6 +337,12 @@ pub enum InlineKind {
         width_emu: i64,
         height_emu: i64,
     },
+    /// `<w:footnoteReference w:id="N"/>` — Phase 8a. `id` is the OOXML
+    /// footnote id; `display_number` is the 1-based ordinal the renderer
+    /// paints as the superscript marker (assigned at parse time in
+    /// document order, skipping the sentinel `id=0` / `id=-1`
+    /// separator / continuation entries `word/footnotes.xml` ships with).
+    FootnoteRef { id: u32, display_number: u32 },
 }
 
 /// A non-text inline node anchored at a single byte offset in a paragraph.
@@ -932,6 +971,9 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
+            footnotes: std::collections::HashMap::new(),
+            comment_defs: std::collections::HashMap::new(),
+            comment_ranges: Vec::new(),
         }
     }
 
@@ -955,6 +997,9 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
+            footnotes: std::collections::HashMap::new(),
+            comment_defs: std::collections::HashMap::new(),
+            comment_ranges: Vec::new(),
         }
     }
 
@@ -980,6 +1025,9 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
+            footnotes: std::collections::HashMap::new(),
+            comment_defs: std::collections::HashMap::new(),
+            comment_ranges: Vec::new(),
         }
     }
 
@@ -996,6 +1044,9 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
+            footnotes: std::collections::HashMap::new(),
+            comment_defs: std::collections::HashMap::new(),
+            comment_ranges: Vec::new(),
         }
     }
 
@@ -1012,6 +1063,9 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
+            footnotes: std::collections::HashMap::new(),
+            comment_defs: std::collections::HashMap::new(),
+            comment_ranges: Vec::new(),
         }
     }
 
@@ -1045,6 +1099,9 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
+            footnotes: std::collections::HashMap::new(),
+            comment_defs: std::collections::HashMap::new(),
+            comment_ranges: Vec::new(),
         }
     }
 
@@ -1214,6 +1271,9 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
+                footnotes: self.footnotes.clone(),
+                comment_defs: self.comment_defs.clone(),
+                comment_ranges: self.comment_ranges.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -1250,6 +1310,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 
@@ -1294,6 +1357,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 
@@ -1315,6 +1381,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 
@@ -1351,6 +1420,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 
@@ -1374,6 +1446,9 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
+                footnotes: self.footnotes.clone(),
+                comment_defs: self.comment_defs.clone(),
+                comment_ranges: self.comment_ranges.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -1424,6 +1499,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 
@@ -1440,6 +1518,9 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
+                footnotes: self.footnotes.clone(),
+                comment_defs: self.comment_defs.clone(),
+                comment_ranges: self.comment_ranges.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -1454,6 +1535,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 
@@ -1587,6 +1671,9 @@ impl DocumentTree {
                     headers: self.headers.clone(),
                     footers: self.footers.clone(),
                     media: self.media.clone(),
+                    footnotes: self.footnotes.clone(),
+                    comment_defs: self.comment_defs.clone(),
+                    comment_ranges: self.comment_ranges.clone(),
                 },
                 caret,
             );
@@ -1619,6 +1706,9 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
+                footnotes: self.footnotes.clone(),
+                comment_defs: self.comment_defs.clone(),
+                comment_ranges: self.comment_ranges.clone(),
             },
             caret,
         )
@@ -1740,6 +1830,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 
@@ -1759,6 +1852,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 
@@ -1961,6 +2057,9 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
         }
     }
 }
@@ -3426,6 +3525,9 @@ mod tests {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
+            footnotes: std::collections::HashMap::new(),
+            comment_defs: std::collections::HashMap::new(),
+            comment_ranges: Vec::new(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

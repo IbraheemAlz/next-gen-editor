@@ -4,8 +4,10 @@
 //! `settings`, `theme`, `header`, `footer`, `footnotes`, `endnotes`,
 //! `comments`. See `OOXML_ROADMAP.md` §1.1 for the full target layout.
 
+pub mod comments;
 pub mod document;
 pub mod footer;
+pub mod footnotes;
 pub mod header;
 pub mod numbering;
 pub mod rels;

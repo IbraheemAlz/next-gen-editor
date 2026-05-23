@@ -326,7 +326,50 @@ inline images and hyperlinks`).
 
 ---
 
-## 8. Cross-phase reminders
+## 8. Phase 8a — Footnotes & comments
+
+Items deferred during the Phase 8a cut (`feat(engine): implement
+Phase 8a footnotes, paginator integration, and comments parser`).
+
+- [ ] **True superscript footnote markers.** Phase 8a paints each inline
+      footnote ref as a small colored rectangle (placeholder) at the
+      reserved width. The footnote body in the bottom band carries the
+      number prefix so readers still see the number. Real shaped
+      superscript digits ship with Phase 8b. *Depends on:* a
+      `DisplayCmd::DrawText` primitive that shapes a short string at a
+      smaller font size on demand.
+- [ ] **Footnote-body splitting across pages.** A footnote whose body
+      is taller than the remaining content budget currently forces the
+      referencing line onto the next page (the simple "defer" path).
+      Word splits the body itself, continuing on the next page with the
+      `id=-1` continuation separator. *Depends on:* a body-paragraph
+      splitter inside the paginator's footnote band.
+- [ ] **Rich body formatting + multi-paragraph footnotes.** Footnote
+      bodies render as a single concatenated paragraph in plain text;
+      `<w:rPr>` formatting + multi-paragraph layout are flattened.
+      Likewise for comment bodies — the sidebar surfaces joined plain
+      text only. *Depends on:* threading the cascade resolver through
+      `parts::footnotes` / `parts::comments`.
+- [ ] **Click-to-locate comment ranges in the canvas.** The sidebar
+      lists comments + their `(block, offset)` spans, but the canvas
+      does not highlight the range on hover or scroll the body into
+      view on click. *Depends on:* a TS overlay layer keyed off
+      `comments_snapshot` + `document_geometry`.
+- [ ] **Comment threading (`<w:commentEx>`).** OOXML carries `done`
+      state and reply parent ids in `commentsExtended.xml` — not yet
+      parsed. *Depends on:* a `parts::comments_extended` reader +
+      `CommentDef.parent_id` / `done` fields.
+- [ ] **Engine-side footnote / comment mutations.** No
+      `Command::InsertFootnote`, `DeleteFootnote`, `AddComment`,
+      `ResolveComment`. The writer rides the passthrough for
+      `footnotes.xml` and `comments.xml` so unedited entries round-
+      trip byte-identical; engine-edited ones cannot round-trip yet.
+      *Depends on:* writer integration for the two XML parts + new
+      bridge commands.
+
+---
+
+## 9. Cross-phase reminders
 
 Items deferred from earlier phases that interact with Phase 5+
 follow-ups.

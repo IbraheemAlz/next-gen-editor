@@ -10,8 +10,10 @@
 
 use crate::error::DocxError;
 use crate::numbering_resolver::resolve_markers_blocks;
+use crate::parts::comments::parse_comments_xml;
 use crate::parts::document::parse_document_xml;
 use crate::parts::footer::parse_footer_xml;
+use crate::parts::footnotes::parse_footnotes_xml;
 use crate::parts::header::parse_header_xml;
 use crate::parts::numbering::{NumberingDefinitions, parse_numbering_xml};
 use crate::parts::rels::{parse_rels_xml, resolve_target};
@@ -26,6 +28,8 @@ pub const DOC_XML: &str = "word/document.xml";
 pub const STYLES_XML: &str = "word/styles.xml";
 pub const NUMBERING_XML: &str = "word/numbering.xml";
 pub const RELS_XML: &str = "word/_rels/document.xml.rels";
+pub const FOOTNOTES_XML: &str = "word/footnotes.xml";
+pub const COMMENTS_XML: &str = "word/comments.xml";
 
 /// All raw archive entries except `word/document.xml`. Carried through the
 /// round-trip so the writer can re-emit them verbatim.
@@ -192,6 +196,26 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     document = DocumentTree::from_blocks_with_sections(blocks, sections)
         .with_header_footer_parts(headers, footers);
     document.media = media;
+
+    // Phase 8a — parse footnotes.xml + comments.xml if present, attach
+    // to the document. Both XML parts still ride other_entries verbatim
+    // so the passthrough writer round-trips them byte-identical.
+    if let Some(bytes) = other_entries
+        .iter()
+        .find(|(n, _)| n == FOOTNOTES_XML)
+        .map(|(_, b)| b.as_slice())
+        && let Ok(table) = parse_footnotes_xml(bytes)
+    {
+        document.footnotes = table.footnotes;
+    }
+    if let Some(bytes) = other_entries
+        .iter()
+        .find(|(n, _)| n == COMMENTS_XML)
+        .map(|(_, b)| b.as_slice())
+        && let Ok(defs) = parse_comments_xml(bytes)
+    {
+        document.comment_defs = defs.comments;
+    }
 
     Ok(DocxArchive {
         other_entries,

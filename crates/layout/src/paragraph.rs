@@ -32,9 +32,17 @@ pub struct InlineObjectInfo {
     /// Width / height in layout pixels (already scaled).
     pub width_px: f32,
     pub height_px: f32,
-    /// Archive relationship id of the image to paint. Propagated to
-    /// `PositionedGlyph::inline_image_rel_id`.
-    pub rel_id: String,
+    /// What sits at this anchor.
+    pub kind: InlineObjectInfoKind,
+}
+
+/// Phase 8a — discriminator for `InlineObjectInfo`. Image anchors carry a
+/// rel id; footnote refs carry the marker text the renderer paints as a
+/// superscript.
+#[derive(Debug, Clone)]
+pub enum InlineObjectInfoKind {
+    Image { rel_id: String },
+    FootnoteMarker { text: String },
 }
 
 pub struct ParagraphConfig<'a> {
@@ -217,6 +225,7 @@ fn build_marker(
             y_offset: g.y_offset,
             synthetic: false,
             inline_image_rel_id: None,
+            inline_footnote_marker: None,
             inline_object_height: 0.0,
         })
         .collect();
@@ -509,6 +518,15 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                         .inline_objects
                         .iter()
                         .find(|info| info.at == abs_cluster);
+                    let (image_rel, footnote_marker) = match info.map(|i| &i.kind) {
+                        Some(crate::paragraph::InlineObjectInfoKind::Image { rel_id }) => {
+                            (Some(rel_id.clone()), None)
+                        }
+                        Some(crate::paragraph::InlineObjectInfoKind::FootnoteMarker { text }) => {
+                            (None, Some(text.clone()))
+                        }
+                        None => (None, None),
+                    };
                     PositionedGlyph {
                         id: g.glyph_id as u16,
                         cluster: g.cluster,
@@ -517,7 +535,8 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                         x_offset: g.x_offset,
                         y_offset: g.y_offset,
                         synthetic: false,
-                        inline_image_rel_id: info.map(|i| i.rel_id.clone()),
+                        inline_image_rel_id: image_rel,
+                        inline_footnote_marker: footnote_marker,
                         inline_object_height: info.map_or(0.0, |i| i.height_px),
                     }
                 })
@@ -833,6 +852,7 @@ fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &Fon
         y_offset: 0.0,
         synthetic: true,
         inline_image_rel_id: None,
+        inline_footnote_marker: None,
         inline_object_height: 0.0,
     };
     for _ in 0..n {

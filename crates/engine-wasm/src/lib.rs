@@ -257,6 +257,45 @@ impl Engine {
     pub fn register_image(&mut self, rel_id: String, bitmap: web_sys::ImageBitmap) {
         self.image_cache.insert(rel_id, bitmap);
     }
+
+    /// Phase 8a — flat snapshot of every parsed `<w:comment>` plus the
+    /// document-side `<w:commentRangeStart>` / `<w:commentRangeEnd>`
+    /// span. The TS shell renders these in a sidebar; no canvas
+    /// drawing of comment overlays in this MVP.
+    pub fn comments_snapshot(&self) -> Result<JsValue, JsValue> {
+        let doc = self.undo.current();
+        let comments: Vec<CommentOut> = doc
+            .comment_ranges
+            .iter()
+            .map(|r| {
+                let def = doc.comment_defs.get(&r.id).cloned().unwrap_or_default();
+                CommentOut {
+                    id: r.id,
+                    author: def.author,
+                    date: def.date,
+                    text: def.paragraphs.join("\n"),
+                    start_block: r.start.path.last_block_index().unwrap_or(0),
+                    start_offset: r.start.offset,
+                    end_block: r.end.path.last_block_index().unwrap_or(0),
+                    end_offset: r.end.offset,
+                }
+            })
+            .collect();
+        serde_wasm_bindgen::to_value(&comments)
+            .map_err(|e| JsValue::from_str(&format!("encode comments: {e}")))
+    }
+}
+
+#[derive(::serde::Serialize)]
+struct CommentOut {
+    id: u32,
+    author: String,
+    date: String,
+    text: String,
+    start_block: u32,
+    start_offset: u32,
+    end_block: u32,
+    end_offset: u32,
 }
 
 /// Serialization surface for [`Engine::media_entries`]. Mirrors
@@ -714,23 +753,39 @@ fn apply_hyperlink_overlay(
 /// and the renderer's image-paint command.
 fn build_inline_object_infos(
     para: &engine::Paragraph,
+    cfg: &RenderConfig,
     scale: f32,
 ) -> Vec<layout::paragraph::InlineObjectInfo> {
     para.inline_objects
         .iter()
-        .map(|obj| {
-            let (rel_id, w_emu, h_emu) = match &obj.kind {
-                engine::InlineKind::Image {
-                    rel_id,
-                    width_emu,
-                    height_emu,
-                } => (rel_id.clone(), *width_emu, *height_emu),
-            };
-            layout::paragraph::InlineObjectInfo {
-                at: obj.at,
-                width_px: engine::emu_to_pt(w_emu) * scale,
-                height_px: engine::emu_to_pt(h_emu) * scale,
+        .map(|obj| match &obj.kind {
+            engine::InlineKind::Image {
                 rel_id,
+                width_emu,
+                height_emu,
+            } => layout::paragraph::InlineObjectInfo {
+                at: obj.at,
+                width_px: engine::emu_to_pt(*width_emu) * scale,
+                height_px: engine::emu_to_pt(*height_emu) * scale,
+                kind: layout::paragraph::InlineObjectInfoKind::Image {
+                    rel_id: rel_id.clone(),
+                },
+            },
+            engine::InlineKind::FootnoteRef { display_number, .. } => {
+                /* Phase 8a — footnote markers reserve a small fixed
+                width sized to the body font: ~0.45 em per digit at
+                the body size. The renderer paints the number as a
+                superscript at the glyph's pen position. */
+                let label = display_number.to_string();
+                let em = cfg.px_size * scale;
+                let width = em * 0.45 * (label.len() as f32).max(1.0);
+                let height = em * 0.7;
+                layout::paragraph::InlineObjectInfo {
+                    at: obj.at,
+                    width_px: width,
+                    height_px: height,
+                    kind: layout::paragraph::InlineObjectInfoKind::FootnoteMarker { text: label },
+                }
             }
         })
         .collect()
@@ -903,6 +958,97 @@ fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32
 /// device px, which is the unit layout / render operate in.
 fn twips_to_layout_px(twips: i32, scale: f32) -> f32 {
     (twips as f32) / 15.0 * scale
+}
+
+/// Phase 8a — walk every body paragraph in document order, mirror the
+/// `InlineKind::FootnoteRef` id → display_number mapping the parser
+/// assigned, then lay out each referenced footnote's body paragraph(s)
+/// into a single combined `ParagraphBox`. The paginator keys its
+/// `with_footnote_bodies` lookup by display_number — the same number
+/// that lives on every footnote-marker glyph — so layout never sees
+/// the OOXML `w:id`.
+fn build_footnote_bodies(
+    doc: &DocumentTree,
+    font_stack: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+) -> std::collections::HashMap<u32, ParagraphBox> {
+    let mut by_display: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for block in doc.blocks.iter() {
+        walk_block_for_footnote_refs(block, &mut by_display);
+    }
+    let mut out: std::collections::HashMap<u32, ParagraphBox> = std::collections::HashMap::new();
+    /* Footnote body width — content width of the default A4 section;
+    section-specific page widths are a follow-up (the table is built
+    once per document, not once per section, since footnotes flow
+    against the section they reference into). */
+    let body_width = engine::PageGeometry::a4().content_width() * scale;
+    for (display, w_id) in &by_display {
+        let Some(paragraphs) = doc.footnotes.get(w_id) else {
+            continue;
+        };
+        /* Flatten the footnote's per-`<w:p>` plain text into one body
+        paragraph so the band lays out a single block per footnote.
+        Rich body formatting + multi-paragraph footnote bodies ship
+        with the Phase 8c sprint. */
+        let joined: String = paragraphs.join(" ");
+        let combined = format!("{display}. {joined}");
+        let spans = [StyleSpan {
+            start: 0,
+            end: combined.len() as u32,
+            px_size: cfg.px_size * scale * 0.85,
+            color: [0, 0, 0, 255],
+            bold: false,
+            italic: false,
+            underline: false,
+            strike: false,
+            bg_color: None,
+            font_family: None,
+        }];
+        let p = layout_paragraph(ParagraphConfig {
+            text: &combined,
+            fonts: font_stack,
+            spans: &spans,
+            base_direction: first_strong_direction(&combined).unwrap_or(cfg.base_direction),
+            max_width: body_width,
+            line_height: cfg.line_height * scale * 0.85,
+            alignment: cfg.alignment,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: cfg.px_size * scale * 0.85,
+            inline_objects: &[],
+        });
+        out.insert(*display, p);
+    }
+    out
+}
+
+/// Phase 8a — recursive walker that fills `by_display[display_number] = w_id`.
+fn walk_block_for_footnote_refs(
+    block: &engine::Block,
+    by_display: &mut std::collections::HashMap<u32, u32>,
+) {
+    match block {
+        engine::Block::Paragraph(p) => {
+            for obj in &p.inline_objects {
+                if let engine::InlineKind::FootnoteRef { id, display_number } = &obj.kind {
+                    by_display.insert(*display_number, *id);
+                }
+            }
+        }
+        engine::Block::Table(t) => {
+            for row in &t.rows {
+                for cell in &row.cells {
+                    for b in &cell.blocks {
+                        walk_block_for_footnote_refs(b, by_display);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Phase 6b — lay out one section's header (or footer) plain-text
@@ -2469,6 +2615,12 @@ impl Engine {
         split paragraphs (head + tail) share the same id and resolve
         to the same source string. */
         let mut next_para_id: u32 = 0;
+        /* Phase 8a — pre-resolve the footnote-body table the paginator
+        uses to grow the bottom band. The paginator keys by *display
+        number* (the marker text it sees on glyphs); we discover the
+        OOXML w:id → display_number mapping by scanning every body
+        paragraph's `InlineKind::FootnoteRef`. */
+        let footnote_bodies = build_footnote_bodies(&doc, &font_stack, &cfg, scale);
         /* Each top-level block is covered by at most one effective section. The
         paginator runs once across the whole document; section boundaries
         trigger a hard page break + geometry swap. */
@@ -2514,7 +2666,10 @@ impl Engine {
                     scale,
                 )
             });
-            paginator = Some(Paginator::new(geom, header_box, footer_box));
+            paginator = Some(
+                Paginator::new(geom, header_box, footer_box)
+                    .with_footnote_bodies(footnote_bodies.clone()),
+            );
             page_paths.clear();
             page_paths.push(Vec::new());
 
@@ -2589,7 +2744,7 @@ impl Engine {
                                 );
                                 let (ind_s, ind_e, ind_fl, ind_h) =
                                     props_to_layout_indents(&para.props, scale);
-                                let inline_infos = build_inline_object_infos(para, scale);
+                                let inline_infos = build_inline_object_infos(para, &cfg, scale);
                                 let para_cfg = ParagraphConfig {
                                     text: &para.text,
                                     fonts: &font_stack,
@@ -2649,6 +2804,7 @@ impl Engine {
                 blocks: Vec::new(),
                 header: None,
                 footer: None,
+                footnotes: Vec::new(),
             });
             emitted_paths.push(Vec::new());
         }
@@ -2675,6 +2831,7 @@ impl Engine {
             blocks: Vec::new(),
             header: None,
             footer: None,
+            footnotes: Vec::new(),
         });
         let p0 = paths.drain(..).next().unwrap_or_default();
         Ok((page, fonts, p0))
@@ -4042,6 +4199,7 @@ mod tests {
             y_offset: 0.0,
             synthetic,
             inline_image_rel_id: None,
+            inline_footnote_marker: None,
             inline_object_height: 0.0,
         };
         let run = layout::VisualRun {

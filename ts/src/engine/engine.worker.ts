@@ -37,8 +37,18 @@ type ClientRecoverMsg = {
     lastSeq: number;
 };
 type ClientCommandMsg = { id: number; cmd: Command };
+/* Phase 8a — side-channel snapshot request. The reply carries the array
+   the engine's `comments_snapshot()` wasm method returns; the TS shell
+   feeds it into the comments sidebar signal. */
+type GetCommentsMsg = { id: number; type: 'GET_COMMENTS' };
 
-type Msg = InitMsg | CommandMsg | ClientInitMsg | ClientRecoverMsg | ClientCommandMsg;
+type Msg =
+    | InitMsg
+    | CommandMsg
+    | ClientInitMsg
+    | ClientRecoverMsg
+    | ClientCommandMsg
+    | GetCommentsMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -561,6 +571,23 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
     /* Phase 2 §7: a bare command request — `{ id, cmd }` — has no `type`. */
     if (!('type' in msg)) {
         void enqueue(() => handleClientCommand(msg));
+        return;
+    }
+
+    /* Phase 8a — `GET_COMMENTS`: side-channel call into the engine's
+       `comments_snapshot()` wasm method. Not a `Command` (the snapshot
+       is read-only document metadata, not an event-log mutation). */
+    if (msg.type === 'GET_COMMENTS') {
+        if (!engine) {
+            self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
+            return;
+        }
+        try {
+            const snapshot = engine.comments_snapshot();
+            self.postMessage({ id: msg.id, ok: true, comments: snapshot });
+        } catch (e: unknown) {
+            replyError(msg.id, e);
+        }
         return;
     }
 

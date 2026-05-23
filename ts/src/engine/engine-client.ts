@@ -22,7 +22,22 @@ type WorkerReply = {
     crossOriginIsolated?: boolean;
     /** Active renderer the worker picked at INIT — `vello` or `canvas2d`. */
     renderer?: string;
+    /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
+    comments?: CommentSnapshot[];
 };
+
+/** Phase 8a — read-only snapshot row for the comments sidebar. */
+export interface CommentSnapshot {
+    id: number;
+    author: string;
+    date: string;
+    text: string;
+    start_block: number;
+    start_offset: number;
+    end_block: number;
+    end_offset: number;
+}
+
 type Resolver = (v: WorkerReply) => void;
 
 export class EngineClient {
@@ -115,6 +130,18 @@ export class EngineClient {
         return this.dispatch({ type: 'OPEN_DOCUMENT', bytes, format, name }, [
             bytes.buffer as ArrayBuffer,
         ]);
+    }
+
+    /**
+     * Phase 8a — read-only snapshot of every `<w:comment>` + the
+     * matching `<w:commentRangeStart>`/`<w:commentRangeEnd>` span. The
+     * shell renders these in a sidebar; no canvas overlay (per the
+     * Phase 8a MVP cut). Pure metadata read — no event-log mutation.
+     */
+    async commentsSnapshot(): Promise<CommentSnapshot[]> {
+        const r = await this.send({ type: 'GET_COMMENTS' });
+        if (!r.ok) throw new Error(r.error);
+        return (r.comments ?? []) as CommentSnapshot[];
     }
 
     subscribe(fn: (e: Event) => void): () => void {

@@ -759,6 +759,7 @@ mod tests {
             blocks: vec![LayoutBlock::Paragraph(para)],
             header: None,
             footer: None,
+            footnotes: Vec::new(),
         }
     }
 
@@ -868,6 +869,7 @@ mod tests {
             blocks: vec![LayoutBlock::Table(table)],
             header: None,
             footer: None,
+            footnotes: Vec::new(),
         };
         let mut out = Vec::new();
         export_pdf(
@@ -900,6 +902,7 @@ mod tests {
             blocks: vec![],
             header: None,
             footer: None,
+            footnotes: Vec::new(),
         };
         let mut out = Vec::new();
         export_pdf(

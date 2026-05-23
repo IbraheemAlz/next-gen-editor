@@ -152,6 +152,35 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
             paint_block(block, content_x, content_y, &mut cmds);
         }
 
+        /* Phase 8a — footnote band. Sits above the bottom margin, just
+        below the last body line; separated from the body by a thin
+        horizontal rule that visually distinguishes footnotes from
+        regular text. Heights were already reserved by the paginator,
+        so the entries always fit. */
+        if !page.footnotes.is_empty() {
+            let mut band_height = 0.0_f32;
+            for entry in &page.footnotes {
+                band_height += entry.paragraph.size.height;
+            }
+            let band_bottom = top + page.size.height - page.margins.bottom;
+            let band_top = band_bottom - band_height;
+            /* Separator rule — 30% of the content width, 0.75 pt tall. */
+            let rule_w = (page.size.width - page.margins.left - page.margins.right) * 0.3;
+            let rule_y = band_top - 6.0;
+            cmds.push(DisplayCmd::FillRect {
+                rect: Rect::new(
+                    content_x as f64,
+                    rule_y as f64,
+                    (content_x + rule_w) as f64,
+                    (rule_y + 0.75) as f64,
+                ),
+                paint: Paint::solid(Color::from_rgba8(0x55, 0x55, 0x55, 0xff)),
+            });
+            for entry in &page.footnotes {
+                paint_paragraph(&entry.paragraph, content_x, band_top, &mut cmds);
+            }
+        }
+
         if let Some(hf) = &page.footer {
             let band_top = top + (page.size.height - page.margins.bottom * 0.75);
             for para in &hf.paragraphs {
@@ -337,6 +366,12 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                 from text glyphs so the renderer routes them through
                 `DisplayCmd::DrawImage` instead of `DrawGlyphRun`. */
                 let mut images: Vec<(f64, f64, f64, f64, String)> = Vec::new();
+                /* Phase 8a — footnote markers paint as a small colored
+                rectangle (the OOXML default superscript-number glyph
+                isn't shaped — Phase 8b adds true superscript text).
+                The rectangle is drawn at the marker's reserved width,
+                rising from the baseline. */
+                let mut footnote_markers: Vec<(f64, f64, f64, f64)> = Vec::new();
                 for glyph in &run.glyphs {
                     if let Some(rel) = glyph.inline_image_rel_id.as_deref() {
                         /* Image sits flush with the baseline (its bottom
@@ -347,6 +382,15 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                         let y0 = y1 - (glyph.inline_object_height as f64);
                         let x1 = x0 + (glyph.x_advance as f64);
                         images.push((x0, y0, x1, y1, rel.to_string()));
+                        pen += glyph.x_advance;
+                        continue;
+                    }
+                    if glyph.inline_footnote_marker.is_some() {
+                        let x0 = (line_x as f64) + (pen as f64);
+                        let x1 = x0 + (glyph.x_advance as f64);
+                        let y1 = baseline - (glyph.inline_object_height as f64) * 0.2;
+                        let y0 = y1 - (glyph.inline_object_height as f64) * 0.8;
+                        footnote_markers.push((x0, y0, x1, y1));
                         pen += glyph.x_advance;
                         continue;
                     }
@@ -365,6 +409,12 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                     cmds.push(DisplayCmd::DrawImage {
                         rect: Rect::new(x0, y0, x1, y1),
                         rel_id,
+                    });
+                }
+                for (x0, y0, x1, y1) in footnote_markers {
+                    cmds.push(DisplayCmd::FillRect {
+                        rect: Rect::new(x0, y0, x1, y1),
+                        paint: Paint::solid(Color::from_rgba8(0x05, 0x63, 0xC1, 0xFF)),
                     });
                 }
 

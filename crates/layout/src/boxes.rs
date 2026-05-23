@@ -97,6 +97,11 @@ pub struct PositionedGlyph {
     /// this string at the glyph's pen position with `x_advance` as the
     /// physical width. The text glyph itself is **not** drawn.
     pub inline_image_rel_id: Option<String>,
+    /// Phase 8a — when set, this glyph anchors a footnote reference; the
+    /// renderer paints the marker text (e.g. `"1"`, `"2"`) as a
+    /// superscript at the glyph's pen position with `x_advance` as the
+    /// reserved width.
+    pub inline_footnote_marker: Option<String>,
     /// Phase 7 — physical height of the anchored inline object in layout
     /// pixels. Folded into the line's ascent so the line grows to host
     /// the image without clipping.
@@ -273,6 +278,22 @@ pub struct PageBox {
     pub header: Option<HeaderFooterBox>,
     /// Mirror of `header`, painted in the bottom margin band.
     pub footer: Option<HeaderFooterBox>,
+    /// Phase 8a — footnote band. Each entry is the laid-out body of one
+    /// `<w:footnote>` whose `<w:footnoteReference>` lands somewhere in
+    /// this page's body content. Painted above the bottom margin in
+    /// emission order, separated from the body by a thin horizontal
+    /// rule. Origins are relative to the band's top-left.
+    pub footnotes: Vec<FootnoteEntry>,
+}
+
+/// Phase 8a — one laid-out footnote inside a [`PageBox::footnotes`] band.
+/// The marker text (e.g. `"1"`) is painted at the entry's leading edge so
+/// the reader can tie body text to footnote.
+#[derive(Debug, Clone)]
+pub struct FootnoteEntry {
+    pub id: u32,
+    pub marker: String,
+    pub paragraph: ParagraphBox,
 }
 
 /// A laid-out header / footer band — paragraph plain text positioned within
