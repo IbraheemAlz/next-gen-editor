@@ -48,6 +48,11 @@ cross-references between items keep resolving.
 - **Sprint 11 (2026-05-22)** — Inline IME composition preview (item 8): the
   active composition is spliced into its paragraph's layout as a transient
   underlined preview and repainted on every `UpdateComposition`.
+- **Sprint 12 (2026-05-23)** — Core navigation & selection (item 14, complete):
+  arrow-key caret motion with ideal-x preservation, Shift + Arrow extend,
+  Ctrl / Cmd + A select-all, and triple-click paragraph selection. A render
+  follow-up also taught the Vello path the same faux bold / italic synthesis
+  the Canvas2D backend already had from Sprint 6 (commit `55059c2`).
 
 ## 1. Rich text formatting
 
@@ -342,3 +347,30 @@ culling**: laying out only the visible page and deferring the rest. That is a
 larger architectural change than caching — `build_page`, hit-testing and the
 `PageBox` contract all assume a whole-document layout — so `tools/perf/run.mjs`
 keeps the open-doc metric out of its `--strict` gate until then.
+
+## 14. Core navigation & selection — the "missing basics"
+
+**✅ Shipped (Phase 5 sprint 12).** Pre-`beta.2` the editor had no arrow-key
+caret motion, no `Ctrl/Cmd+A`, and no triple-click paragraph selection —
+everything had to be driven through the pointer or the Phase-4 RPC. Sprint 12
+closed all three:
+
+- **`Command::MoveCaret { direction, extend }`** routes the four arrow keys.
+  Left / Right step one Unicode char in logical order (paragraph-local, hopping
+  the boundary at the ends); Up / Down walk to the adjacent `LineGeom` and snap
+  to the slot nearest the stored ideal-x. With `extend: true` the anchor stays
+  put so Shift + Arrow extends the selection.
+- **Ideal-x preservation** lives on `SelectionState` — a `Option<f32>` device-
+  pixel column that is `None` everywhere except mid-vertical-walk. Every
+  horizontal move, click, edit, paste, or selection-set builds a fresh
+  `SelectionState` with `ideal_x: None`, so the reset is automatic; only
+  `do_move_caret(Up | Down)` carries the value forward. Vertical motion
+  through short lines therefore keeps its column rather than drifting.
+- **`Command::SelectAll`** — previously a `phase3_stub` — anchors at byte 0
+  of paragraph 0 and runs the caret to the last paragraph's byte length.
+  `Ctrl/Cmd+A` in the hidden textarea dispatches it (`preventDefault` stops
+  the textarea acting on its own empty content).
+- **`Command::SelectParagraphAt { at }`** hit-tests then selects `[0..len)`
+  of the paragraph under the click. `pointer.ts` fires it from a `click`
+  listener when `e.detail === 3`, bumping the same `gesture` counter as
+  `dblclick` so the third pointerdown's in-flight `placeCaret` is dropped.
