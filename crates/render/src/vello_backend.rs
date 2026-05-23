@@ -12,6 +12,16 @@ use peniko::{Color, Fill, FontData};
 use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, Glyph, RenderParams, Renderer, Scene};
 
+/// Shear factor for faux italic — mirrors `render::synth::SHEAR` (Sprint 6),
+/// applied via Vello's `glyph_transform` so each glyph shape leans right.
+const FAUX_ITALIC_SHEAR: f64 = 0.22;
+
+/// Faux-bold x offset as a fraction of `px_size`. A small second draw on top
+/// of the glyphs approximates the alpha-mask dilation that the Canvas2D path
+/// does via `render::synth::embolden` (Sprint 6) — Vello has no real bold face
+/// to switch to.
+const FAUX_BOLD_DX_FRAC: f32 = 0.04;
+
 /// Encode a slice of `DisplayCmd`s into a `vello::Scene`.
 ///
 /// `resolve_font` maps a `FontId` to a `peniko::FontData` (the post-rename
@@ -38,10 +48,20 @@ pub fn render_vello(
                 let Some(font) = resolve_font(&run.font) else {
                     continue;
                 };
+                /* Vello has no real Bold / Italic face wired here, so faux
+                synthesis matches what the Canvas2D backend does via
+                `render::synth` (Sprint 6): a per-glyph skew for italic + a
+                second offset pass for bold. */
+                let glyph_xform = if run.faux_italic {
+                    Some(Affine::skew(FAUX_ITALIC_SHEAR, 0.0))
+                } else {
+                    None
+                };
                 scene
                     .draw_glyphs(&font)
                     .font_size(run.px_size)
                     .transform(transform)
+                    .glyph_transform(glyph_xform)
                     .brush(&run.paint.brush)
                     .draw(
                         Fill::NonZero,
@@ -51,6 +71,23 @@ pub fn render_vello(
                             y: g.y as f32,
                         }),
                     );
+                if run.faux_bold {
+                    let dx = run.px_size * FAUX_BOLD_DX_FRAC;
+                    scene
+                        .draw_glyphs(&font)
+                        .font_size(run.px_size)
+                        .transform(transform)
+                        .glyph_transform(glyph_xform)
+                        .brush(&run.paint.brush)
+                        .draw(
+                            Fill::NonZero,
+                            run.glyphs.iter().map(|g| Glyph {
+                                id: u32::from(g.glyph_id),
+                                x: g.x as f32 + dx,
+                                y: g.y as f32,
+                            }),
+                        );
+                }
             }
             DisplayCmd::PushTransform(affine) => {
                 transform_stack.push(transform);
