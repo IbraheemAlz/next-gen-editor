@@ -64,6 +64,11 @@ pub struct DocumentTree {
     pub headers: std::collections::HashMap<String, Vec<String>>,
     /// Mirror of `headers` for `<w:footerReference>`.
     pub footers: std::collections::HashMap<String, Vec<String>>,
+    /// Phase 7 — image blobs keyed by their relationship id (`r:id`). The
+    /// archive reader fills this from `word/media/*` for every image rel
+    /// the document references. Inline images look up by the `rel_id`
+    /// their [`InlineKind::Image`] carries.
+    pub media: std::collections::HashMap<String, ImageBlob>,
 }
 
 /// Page geometry for a [`Section`]. Dimensions are layout pixels at 1 pt/unit
@@ -275,6 +280,67 @@ pub struct StyleRun {
     pub style: SpanStyle,
 }
 
+/// Phase 7 — one EMU is **1/914400 of an inch**. 914400 EMU = 1 in = 72 pt;
+/// dividing by 12700 converts straight to PostScript points, which is the
+/// layout unit at scale=1. The paginator then multiplies by `scale` for the
+/// device-pixel canvas.
+pub const EMU_PER_PT: i64 = 12700;
+
+/// Convert EMUs to layout points (the engine's 1 pt/unit space).
+pub fn emu_to_pt(emu: i64) -> f32 {
+    (emu as f32) / (EMU_PER_PT as f32)
+}
+
+/// Kind of inline object anchored in a paragraph's text. Phase 7 ships
+/// inline images only; future variants extend this enum (charts, math, ...).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineKind {
+    /// `<w:drawing><wp:inline><a:graphic><pic:pic>` — a DrawingML picture.
+    /// `rel_id` is the OOXML relationship id from the `<a:blip r:embed=...>`
+    /// pointing to the `word/media/*` archive entry. `width_emu` /
+    /// `height_emu` come from `<wp:extent cx="..." cy="..."/>`.
+    Image {
+        rel_id: String,
+        width_emu: i64,
+        height_emu: i64,
+    },
+}
+
+/// A non-text inline node anchored at a single byte offset in a paragraph.
+/// The paragraph text carries one U+FFFC (OBJECT REPLACEMENT CHARACTER) at
+/// `at`; layout looks the object up here when it sees the sentinel and
+/// reserves the right physical size in the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineObject {
+    pub at: u32,
+    pub kind: InlineKind,
+}
+
+/// A hyperlink overlay on a contiguous byte range of a paragraph. Display
+/// styling (blue + underline if no explicit `<w:rPr>`) is applied at layout
+/// time; clicks are out of scope for Phase 7 (the model is read-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hyperlink {
+    pub start: u32,
+    pub end: u32,
+    /// External URL (`Target` from the `r:id`'s rel entry). Internal
+    /// document anchors (`<w:hyperlink w:anchor>`) are not modelled in
+    /// this initial cut.
+    pub target: String,
+}
+
+/// Phase 7 — a media blob stashed for the renderer to decode.
+///
+/// `content_type` is the MIME type the OOXML rels claimed (`image/png`,
+/// `image/jpeg`, ...). The bytes are the raw archive entry contents — no
+/// re-encoding, so format round-trips byte-identical through the writer
+/// (writer-side media emission is a follow-up sprint).
+#[derive(Debug, Clone)]
+pub struct ImageBlob {
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
 /// Paragraph text alignment (Backlog #9). `Start` / `End` are
 /// writing-direction-relative — they resolve against the base direction at
 /// layout time; `Center` and `Justify` are absolute. Mirrors
@@ -417,6 +483,13 @@ pub struct Paragraph {
     /// `None` for paragraphs the engine synthesised (`from_text`, splits,
     /// pastes); `Some` for any paragraph parsed from a real `.docx`.
     pub source_xml: Option<Vec<u8>>,
+    /// Phase 7 — non-text inline objects anchored in the paragraph's text.
+    /// Each one corresponds to a U+FFFC OBJECT REPLACEMENT CHARACTER in
+    /// `text` at `inline_objects[i].at`. Sorted by `at`.
+    pub inline_objects: Vec<InlineObject>,
+    /// Phase 7 — hyperlink overlays on the paragraph's text. Multiple
+    /// hyperlinks may exist; they do not overlap.
+    pub hyperlinks: Vec<Hyperlink>,
 }
 
 impl Paragraph {
@@ -479,6 +552,8 @@ impl Paragraph {
             resolved_marker: self.resolved_marker.clone(),
             dirty: true,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         }
     }
 
@@ -563,6 +638,8 @@ impl Paragraph {
             resolved_marker: self.resolved_marker.clone(),
             dirty: true,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         }
     }
 
@@ -597,6 +674,8 @@ impl Paragraph {
                 resolved_marker: self.resolved_marker.clone(),
                 dirty: true,
                 source_xml: None,
+                inline_objects: Vec::new(),
+                hyperlinks: Vec::new(),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -606,6 +685,8 @@ impl Paragraph {
                 resolved_marker: self.resolved_marker.clone(),
                 dirty: true,
                 source_xml: None,
+                inline_objects: Vec::new(),
+                hyperlinks: Vec::new(),
             },
         )
     }
@@ -633,6 +714,8 @@ impl Paragraph {
             resolved_marker: self.resolved_marker.clone(),
             dirty: true,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         }
     }
 
@@ -848,6 +931,7 @@ impl DocumentTree {
             sections: Vec::new(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
+            media: std::collections::HashMap::new(),
         }
     }
 
@@ -862,12 +946,15 @@ impl DocumentTree {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         }));
         Self {
             blocks,
             sections: Vec::new(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
+            media: std::collections::HashMap::new(),
         }
     }
 
@@ -883,6 +970,8 @@ impl DocumentTree {
                 resolved_marker: None,
                 dirty: false,
                 source_xml: None,
+                inline_objects: Vec::new(),
+                hyperlinks: Vec::new(),
             }));
         }
         Self {
@@ -890,6 +979,7 @@ impl DocumentTree {
             sections: Vec::new(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
+            media: std::collections::HashMap::new(),
         }
     }
 
@@ -905,6 +995,7 @@ impl DocumentTree {
             sections: Vec::new(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
+            media: std::collections::HashMap::new(),
         }
     }
 
@@ -920,6 +1011,7 @@ impl DocumentTree {
             sections: Vec::new(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
+            media: std::collections::HashMap::new(),
         }
     }
 
@@ -952,6 +1044,7 @@ impl DocumentTree {
             sections,
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
+            media: std::collections::HashMap::new(),
         }
     }
 
@@ -1112,12 +1205,15 @@ impl DocumentTree {
                 resolved_marker: None,
                 dirty: true,
                 source_xml: None,
+                inline_objects: Vec::new(),
+                hyperlinks: Vec::new(),
             }));
             return Self {
                 blocks,
                 sections: self.sections.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
+                media: self.media.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -1153,6 +1249,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 
@@ -1196,6 +1293,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 
@@ -1216,6 +1314,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 
@@ -1251,6 +1350,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 
@@ -1273,6 +1373,7 @@ impl DocumentTree {
                 sections: self.sections.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
+                media: self.media.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -1322,6 +1423,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 
@@ -1337,6 +1439,7 @@ impl DocumentTree {
                 sections: self.sections.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
+                media: self.media.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -1350,6 +1453,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 
@@ -1482,6 +1586,7 @@ impl DocumentTree {
                     sections: self.sections.clone(),
                     headers: self.headers.clone(),
                     footers: self.footers.clone(),
+                    media: self.media.clone(),
                 },
                 caret,
             );
@@ -1513,6 +1618,7 @@ impl DocumentTree {
                 sections: self.sections.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
+                media: self.media.clone(),
             },
             caret,
         )
@@ -1633,6 +1739,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 
@@ -1651,6 +1758,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 
@@ -1852,6 +1960,7 @@ impl DocumentTree {
             sections: self.sections.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
+            media: self.media.clone(),
         }
     }
 }
@@ -2488,6 +2597,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -2507,6 +2618,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -2523,6 +2636,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -2617,6 +2732,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -3044,6 +3161,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -3080,6 +3199,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -3115,6 +3236,8 @@ mod tests {
                 resolved_marker: None,
                 dirty: false,
                 source_xml: None,
+                inline_objects: Vec::new(),
+                hyperlinks: Vec::new(),
             },
             Paragraph {
                 text: "two".into(),
@@ -3128,6 +3251,8 @@ mod tests {
                 resolved_marker: None,
                 dirty: false,
                 source_xml: None,
+                inline_objects: Vec::new(),
+                hyperlinks: Vec::new(),
             },
         ];
         let (out, caret) = doc.insert_rich(
@@ -3300,6 +3425,7 @@ mod tests {
             sections: Vec::new(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
+            media: std::collections::HashMap::new(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

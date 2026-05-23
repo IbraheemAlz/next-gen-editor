@@ -556,6 +556,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -587,6 +589,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -636,6 +640,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -672,6 +678,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]));
         let p = xml.find("<w:pPr>").unwrap();

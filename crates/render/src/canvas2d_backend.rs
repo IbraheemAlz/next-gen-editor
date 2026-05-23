@@ -84,6 +84,7 @@ pub fn render_canvas2d(
     list: &DisplayList,
     atlas: &mut GlyphAtlas,
     resolve_font: impl Fn(&str) -> Option<Arc<LoadedFont>>,
+    resolve_image: impl Fn(&str) -> Option<web_sys::ImageBitmap>,
     clip: Rect,
 ) -> Result<(), JsValue> {
     ctx.save();
@@ -125,6 +126,28 @@ pub fn render_canvas2d(
                     if let Some(raster) = atlas.get_or_rasterize(&key, &font, run.px_size) {
                         paint_alpha_glyph(ctx, raster, g.x, g.y, rgb, run.bg_color)?;
                     }
+                }
+            }
+            DisplayCmd::DrawImage { rect, rel_id } => {
+                /* Phase 7 — inline image. If the worker has already
+                decoded the bytes into an `ImageBitmap`, draw it at
+                `rect` (Canvas2D's `drawImage` respects clip + transform).
+                Cache miss falls back to a gray placeholder rectangle so
+                the layout still shows the image's footprint. */
+                if let Some(bitmap) = resolve_image(rel_id) {
+                    ctx.draw_image_with_image_bitmap_and_dw_and_dh(
+                        &bitmap,
+                        rect.x0,
+                        rect.y0,
+                        rect.width(),
+                        rect.height(),
+                    )?;
+                } else {
+                    ctx.set_fill_style_str("#dddddd");
+                    ctx.fill_rect(rect.x0, rect.y0, rect.width(), rect.height());
+                    ctx.set_stroke_style_str("#999999");
+                    ctx.set_line_width(1.0);
+                    ctx.stroke_rect(rect.x0, rect.y0, rect.width(), rect.height());
                 }
             }
             DisplayCmd::PushClip { rect } => {

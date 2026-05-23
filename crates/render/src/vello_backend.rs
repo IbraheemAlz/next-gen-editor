@@ -89,6 +89,16 @@ pub fn render_vello(
                         );
                 }
             }
+            DisplayCmd::DrawImage { rect, rel_id: _ } => {
+                /* Phase 7 — Vello path paints a placeholder rectangle.
+                Full image decoding through Vello's `Image` resource
+                ships with the dedicated Vello-renderer activation
+                (BACKLOG #4); the placeholder keeps the layout footprint
+                correct on the WebGPU path. */
+                let placeholder =
+                    peniko::Brush::Solid(peniko::Color::from_rgba8(0xdd, 0xdd, 0xdd, 0xff));
+                scene.fill(Fill::NonZero, transform, &placeholder, None, rect);
+            }
             DisplayCmd::PushTransform(affine) => {
                 transform_stack.push(transform);
                 transform *= *affine;

@@ -492,6 +492,13 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
            the event log OFF the critical path. The RPC response is already
            sent, so event-log latency never throttles command throughput. */
         logCommand(msg.cmd);
+        /* Phase 7 — after `OPEN_DOCUMENT`, enumerate the engine's parsed
+           inline-image media blobs, decode each into an `ImageBitmap` via
+           the browser's native pipeline, and register the result back on
+           the engine. The first paint after this picks the bitmaps up. */
+        if (msg.cmd.type === 'OPEN_DOCUMENT') {
+            await decodeAndRegisterMedia();
+        }
         /* §10 / Backlog #10: after a document mutation, broadcast an
            accessibility delta. The message carries no `id`, so EngineClient
            fans it out to subscribers — the mirror DOM reconciler patches only
@@ -502,6 +509,30 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         }
     } catch (e: unknown) {
         replyError(msg.id, e);
+    }
+}
+
+/**
+ * Phase 7 — decode every inline-image media blob the engine parsed into an
+ * `ImageBitmap` and install it back on the engine. Run after `OPEN_DOCUMENT`
+ * succeeds; on decode failure the bitmap is skipped and the renderer falls
+ * back to the placeholder rectangle for that image.
+ */
+async function decodeAndRegisterMedia(): Promise<void> {
+    if (!engine) return;
+    const entries = engine.media_entries() as Array<{
+        rel_id: string;
+        mime: string;
+        bytes: Uint8Array;
+    }>;
+    for (const entry of entries) {
+        try {
+            const blob = new Blob([entry.bytes as BlobPart], { type: entry.mime });
+            const bitmap = await createImageBitmap(blob);
+            engine.register_image(entry.rel_id, bitmap);
+        } catch (e: unknown) {
+            console.warn(`[worker] image decode failed (${entry.rel_id}):`, e);
+        }
     }
 }
 

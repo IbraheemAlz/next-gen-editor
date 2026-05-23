@@ -282,7 +282,51 @@ sections, pagination, and multi-page layout`).
 
 ---
 
-## 7. Cross-phase reminders
+## 7. Phase 7 — Media, hyperlinks, DrawingML
+
+Items deferred during the Phase 7 cut (`feat(engine): implement Phase 7
+inline images and hyperlinks`).
+
+- [ ] **Floating images (`<wp:anchor>`).** Phase 7 parses only inline
+      images (`<wp:inline>`); the `<wp:anchor>` variants — text-wrap,
+      `relativeFrom` anchoring, `behindDoc`, the
+      `<wp:wrapSquare>` / `<wp:wrapTight>` polygons — are read and
+      dropped. *Depends on:* a positioned-block layout layer (the
+      paginator currently flows only inline content).
+- [ ] **Image-bytes writer round-trip.** The reader stashes `word/media/*`
+      via `other_entries`, so the writer emits the bytes verbatim — but
+      the engine has no `InsertImage` / `ReplaceImage` command path that
+      would re-emit edited media. *Depends on:* a new bridge command
+      surface + writer-side `<w:drawing>` emission.
+- [ ] **Vello image decoding.** The Vello backend paints inline images
+      as gray placeholder rectangles. The Canvas2D path decodes via
+      `createImageBitmap` and routes through `drawImage`; Vello needs
+      its own `peniko::Image` resource pipeline (Backlog #4 — Vello
+      activation). *Depends on:* the Vello activation sprint.
+- [ ] **Internal hyperlink anchors (`<w:hyperlink w:anchor>`).** The
+      parser captures only the external URL (`r:id` → rels target).
+      Bookmark-style anchors (jumping to a paragraph inside the same
+      document) drop on parse. *Depends on:* `<w:bookmarkStart>` /
+      `<w:bookmarkEnd>` parsing + a logical-position resolver.
+- [ ] **Inline-image edit operations.** `Command::InsertImage`,
+      `DeleteImage`, and resize-by-handle are not wired. The Phase 7
+      model is read-only on the engine API surface; image bytes ride
+      the passthrough writer unchanged. *Depends on:* engine commands +
+      writer media emission.
+- [ ] **Click-to-open hyperlinks.** Hyperlinks render with style only;
+      the engine does not surface their target through hit-testing, and
+      the TS shell has no pointer handler that opens the URL on click
+      (or Ctrl-click). *Depends on:* a new bridge event surface
+      (e.g. `HyperlinkHit`) emitted from `Command::HitTest`.
+- [ ] **EMU-precision image scaling.** Phase 7 takes `<wp:extent
+      cx="..." cy="..."/>` at face value (no aspect-ratio enforcement,
+      no clamping to page width, no `<a:srcRect>` cropping). Word lets
+      an image exceed the content rect; we currently let it overflow.
+      *Depends on:* a clamp + crop pass in `build_inline_object_infos`.
+
+---
+
+## 8. Cross-phase reminders
 
 Items deferred from earlier phases that interact with Phase 5+
 follow-ups.

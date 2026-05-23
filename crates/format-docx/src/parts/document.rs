@@ -124,6 +124,15 @@ pub fn parse_document_xml(
     let mut out_blocks: Vec<Block> = Vec::new();
     let mut para_text = String::new();
     let mut spans: Vec<StyleRun> = Vec::new();
+    /* Phase 7 — inline images and hyperlinks accumulators (per-paragraph,
+    drained on `</w:p>`). `para_inline_objects` collects each
+    `<w:drawing>` we resolve to a picture; the parser injects a
+    U+FFFC OBJECT REPLACEMENT CHARACTER into `para_text` at the same
+    byte offset so layout sees the placeholder. `para_hyperlinks`
+    collects every `<w:hyperlink>`'s byte range plus the relationship
+    id; the archive reader maps those rIds to URLs in a second pass. */
+    let mut para_inline_objects: Vec<engine::InlineObject> = Vec::new();
+    let mut para_hyperlinks: Vec<engine::Hyperlink> = Vec::new();
 
     /* Table state. `in_tbl` is a depth counter so nested tables (inside
     cells) don't trigger early `Block::Table` emission — only the
@@ -146,6 +155,27 @@ pub fn parse_document_xml(
     let mut list_num_id: Option<u32> = None;
     let mut list_ilvl: Option<u8> = None;
     let mut in_num_pr = false;
+
+    /* Phase 7 — `<w:drawing>` accumulators. A drawing element wraps an
+    inline image (`<wp:inline>`) or a floating image (`<wp:anchor>`,
+    deferred). Inside, `<wp:extent cx=".." cy=".."/>` carries EMU
+    dimensions and `<a:blip r:embed="rId.."/>` carries the image's
+    relationship id. When `</w:drawing>` closes, if we were inside a
+    `<wp:inline>` AND have both an rId and extents, push U+FFFC into
+    the current run text and queue an `InlineObject`. */
+    let mut in_drawing = false;
+    let mut in_wp_inline = false;
+    let mut cur_drawing_rel_id: Option<String> = None;
+    let mut cur_drawing_cx: Option<i64> = None;
+    let mut cur_drawing_cy: Option<i64> = None;
+
+    /* Phase 7 — `<w:hyperlink>` overlays. Word lays paragraph text out
+    paragraph-flat with `<w:hyperlink>` spanning a contiguous slice of
+    `<w:r>` elements that all share the link target. Capture the rId
+    when the element opens; mark the byte range covered when it
+    closes. `target` is the rId at this stage — the archive resolver
+    swaps it to a URL via the rels map in a second pass. */
+    let mut hyperlink_stack: Vec<(String, u32)> = Vec::new();
 
     /* Phase 6 — `<w:sectPr>` accumulators. A sectPr can live in two places:
     inside a paragraph's `<w:pPr>` (ends a section *at* that paragraph,
@@ -236,6 +266,29 @@ pub fn parse_document_xml(
                         in_sect_pr = true;
                         cur_sect = SectPrAccum::default();
                     }
+                    b"w:drawing" => {
+                        in_drawing = true;
+                        in_wp_inline = false;
+                        cur_drawing_rel_id = None;
+                        cur_drawing_cx = None;
+                        cur_drawing_cy = None;
+                    }
+                    b"wp:inline" if in_drawing => {
+                        in_wp_inline = true;
+                    }
+                    b"wp:extent" if in_drawing => {
+                        cur_drawing_cx = attr_val(&e, b"cx").and_then(|v| v.parse().ok());
+                        cur_drawing_cy = attr_val(&e, b"cy").and_then(|v| v.parse().ok());
+                    }
+                    b"a:blip" if in_drawing => {
+                        cur_drawing_rel_id = attr_val(&e, b"r:embed");
+                    }
+                    b"w:hyperlink" => {
+                        if let Some(rid) = attr_val(&e, b"r:id") {
+                            let start = (para_text.len() + run_text.len()) as u32;
+                            hyperlink_stack.push((rid, start));
+                        }
+                    }
                     b"w:t" => in_text_elt = true,
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
@@ -282,6 +335,13 @@ pub fn parse_document_xml(
                     }
                     b"w:ilvl" if in_num_pr => {
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
+                    }
+                    b"wp:extent" if in_drawing => {
+                        cur_drawing_cx = attr_val(&e, b"cx").and_then(|v| v.parse().ok());
+                        cur_drawing_cy = attr_val(&e, b"cy").and_then(|v| v.parse().ok());
+                    }
+                    b"a:blip" if in_drawing => {
+                        cur_drawing_rel_id = attr_val(&e, b"r:embed");
                     }
                     n if in_sect_pr => cur_sect.apply(n, &e),
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
@@ -340,6 +400,47 @@ pub fn parse_document_xml(
                     b"w:rPr" => in_rpr = false,
                     b"w:pPr" => in_ppr = false,
                     b"w:numPr" => in_num_pr = false,
+                    b"wp:inline" => {
+                        in_wp_inline = false;
+                    }
+                    b"w:drawing" => {
+                        if in_drawing
+                            && in_wp_inline
+                            && let Some(rid) = cur_drawing_rel_id.take()
+                            && let (Some(cx), Some(cy)) =
+                                (cur_drawing_cx.take(), cur_drawing_cy.take())
+                        {
+                            /* Inject U+FFFC as the inline object's anchor
+                            character. Position in the eventual `para_text` =
+                            `para_text.len()` (already flushed runs) +
+                            `run_text.len()` (this run's text so far). */
+                            let at = (para_text.len() + run_text.len()) as u32;
+                            run_text.push('\u{FFFC}');
+                            para_inline_objects.push(engine::InlineObject {
+                                at,
+                                kind: engine::InlineKind::Image {
+                                    rel_id: rid,
+                                    width_emu: cx,
+                                    height_emu: cy,
+                                },
+                            });
+                        } else {
+                            /* Anchor / floating or malformed — drop. */
+                            cur_drawing_rel_id = None;
+                            cur_drawing_cx = None;
+                            cur_drawing_cy = None;
+                        }
+                        in_drawing = false;
+                        in_wp_inline = false;
+                    }
+                    b"w:hyperlink" => {
+                        if let Some((target, start)) = hyperlink_stack.pop() {
+                            let end = (para_text.len() + run_text.len()) as u32;
+                            if end > start {
+                                para_hyperlinks.push(engine::Hyperlink { start, end, target });
+                            }
+                        }
+                    }
                     b"w:sectPr" => {
                         /* Inline (inside a paragraph's `<w:pPr>`) → stash for
                         the matching `</w:p>` end. Body-level (the sectPr that
@@ -430,6 +531,8 @@ pub fn parse_document_xml(
                             resolved_marker: None,
                             dirty: false,
                             source_xml,
+                            inline_objects: std::mem::take(&mut para_inline_objects),
+                            hyperlinks: std::mem::take(&mut para_hyperlinks),
                         }));
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this
                         paragraph. Emit a `Section` covering everything since

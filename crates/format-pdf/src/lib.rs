@@ -744,6 +744,7 @@ mod tests {
             hanging_indent_px: 0.0,
             marker_text: None,
             px_size_for_marker: 26.0,
+            inline_objects: &[],
         });
         /* Phase 6 — `source_paragraph_id` is engine-wasm's job in
         production; the test stamps it manually so `/ToUnicode` lookups
@@ -825,6 +826,7 @@ mod tests {
             hanging_indent_px: 0.0,
             marker_text: None,
             px_size_for_marker: 22.0,
+            inline_objects: &[],
         });
         let cell_borders = engine::default_word_borders();
         let cell = layout::TableCellBox {

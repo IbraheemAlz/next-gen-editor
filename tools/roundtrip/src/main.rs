@@ -441,6 +441,8 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         }]),
     };
     vec![

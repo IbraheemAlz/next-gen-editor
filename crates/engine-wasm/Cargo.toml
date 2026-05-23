@@ -24,6 +24,8 @@ wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }
 web-sys = { workspace = true }
 serde-wasm-bindgen = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_bytes = { workspace = true }
 console_error_panic_hook = { workspace = true }
 
 [dev-dependencies]

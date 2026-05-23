@@ -17,7 +17,7 @@ use crate::parts::numbering::{NumberingDefinitions, parse_numbering_xml};
 use crate::parts::rels::{parse_rels_xml, resolve_target};
 use crate::parts::styles::{StyleTable, parse_styles_xml};
 use crate::style_resolver::StyleResolver;
-use engine::DocumentTree;
+use engine::{DocumentTree, ImageBlob};
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
@@ -148,8 +148,109 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     }
     document = document.with_header_footer_parts(headers, footers);
 
+    // Phase 7 — pull image blobs out of word/media/ keyed by the
+    // relationship id every inline image's <a:blip r:embed="..."/>
+    // references. Also rewrite each hyperlink's `target` field from its
+    // rId to the actual URL the rels table holds (the document parser
+    // leaves the rId in place until rels are available).
+    let mut media: std::collections::HashMap<String, ImageBlob> = std::collections::HashMap::new();
+    /* Iterate every relationship; for each image media entry, fetch the
+    blob bytes via the same resolver header/footer used. The
+    relationship `Type` field would be the canonical filter
+    (`.../image`), but the parser is lenient — any rel pointing into
+    `word/media/` is treated as media. */
+    for (rid, target) in &rels {
+        let entry = resolve_target(target);
+        if !entry.starts_with("word/media/") {
+            continue;
+        }
+        if let Some(bytes) = other_entries
+            .iter()
+            .find(|(n, _)| n == &entry)
+            .map(|(_, b)| b.clone())
+        {
+            let content_type = guess_image_mime(&entry).to_string();
+            media.insert(
+                rid.clone(),
+                ImageBlob {
+                    content_type,
+                    data: bytes,
+                },
+            );
+        }
+    }
+    /* Resolve hyperlink targets across every paragraph. */
+    let blocks: Vec<_> = document
+        .blocks
+        .iter()
+        .cloned()
+        .map(|b| resolve_hyperlinks_block(b, &rels))
+        .collect();
+    let sections = std::mem::take(&mut document.sections);
+    let headers = std::mem::take(&mut document.headers);
+    let footers = std::mem::take(&mut document.footers);
+    document = DocumentTree::from_blocks_with_sections(blocks, sections)
+        .with_header_footer_parts(headers, footers);
+    document.media = media;
+
     Ok(DocxArchive {
         other_entries,
         document,
     })
+}
+
+/// Guess a MIME type from a `word/media/*` archive entry name. The OOXML
+/// spec routes media discovery through the rels `Type` attribute; this
+/// helper is the fallback for archives that drop the `Type` (or for
+/// future formats the parser does not catalogue yet). Defaults to
+/// `application/octet-stream` so the renderer's `createImageBitmap` can
+/// still try.
+fn guess_image_mime(entry: &str) -> &'static str {
+    let lower = entry.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match lower.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Walk a block, rewriting every paragraph's hyperlink `target` from the
+/// parser's rId placeholder to the URL the rels table holds. Hyperlinks
+/// whose rId is missing from rels are dropped (defensive — a hyperlink
+/// without a target is not useful).
+fn resolve_hyperlinks_block(
+    block: engine::Block,
+    rels: &std::collections::HashMap<String, String>,
+) -> engine::Block {
+    match block {
+        engine::Block::Paragraph(mut p) => {
+            p.hyperlinks = p
+                .hyperlinks
+                .into_iter()
+                .filter_map(|h| {
+                    rels.get(&h.target).map(|url| engine::Hyperlink {
+                        start: h.start,
+                        end: h.end,
+                        target: url.clone(),
+                    })
+                })
+                .collect();
+            engine::Block::Paragraph(p)
+        }
+        engine::Block::Table(mut t) => {
+            for row in t.rows.iter_mut() {
+                for cell in row.cells.iter_mut() {
+                    cell.blocks = std::mem::take(&mut cell.blocks)
+                        .into_iter()
+                        .map(|b| resolve_hyperlinks_block(b, rels))
+                        .collect();
+                }
+            }
+            engine::Block::Table(t)
+        }
+    }
 }

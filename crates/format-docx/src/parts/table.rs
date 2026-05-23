@@ -225,6 +225,8 @@ fn parse_cell_paragraph(xml: &[u8]) -> engine::Paragraph {
         emits the whole table verbatim on save. */
         dirty: false,
         source_xml: Some(xml.to_vec()),
+        inline_objects: Vec::new(),
+        hyperlinks: Vec::new(),
     }
 }
 

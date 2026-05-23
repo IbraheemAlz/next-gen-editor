@@ -20,11 +20,30 @@ use text_pipeline::{
     segment_by_script, shape_text,
 };
 
+/// Phase 7 — per-paragraph inline object metadata (image dimensions). The
+/// engine populates this from `engine::Paragraph::inline_objects`; layout
+/// looks the relevant entry up by `at == cluster` when shaping yields a
+/// glyph for the U+FFFC OBJECT REPLACEMENT CHARACTER sentinel.
+#[derive(Debug, Clone)]
+pub struct InlineObjectInfo {
+    /// `at` field of the paragraph's `engine::InlineObject`, in
+    /// paragraph-byte coords.
+    pub at: u32,
+    /// Width / height in layout pixels (already scaled).
+    pub width_px: f32,
+    pub height_px: f32,
+    /// Archive relationship id of the image to paint. Propagated to
+    /// `PositionedGlyph::inline_image_rel_id`.
+    pub rel_id: String,
+}
+
 pub struct ParagraphConfig<'a> {
     pub text: &'a str,
     /// Per-script font resolver — Latin and Arabic runs each shape against a
     /// covering face (PHASE_3_RENDER_RTL.md §13.A).
     pub fonts: &'a FontStack,
+    /// Phase 7 — inline-object table. Indexed by sentinel byte (`at`).
+    pub inline_objects: &'a [InlineObjectInfo],
     /// Resolved style spans covering `[0, text.len())` with no gaps. Runs split
     /// at span boundaries and shape at the span's `px_size` (rich text).
     pub spans: &'a [StyleSpan],
@@ -197,6 +216,8 @@ fn build_marker(
             x_offset: g.x_offset,
             y_offset: g.y_offset,
             synthetic: false,
+            inline_image_rel_id: None,
+            inline_object_height: 0.0,
         })
         .collect();
     let width = glyphs.iter().map(|g| g.x_advance).sum::<f32>();
@@ -261,6 +282,7 @@ fn compose_lines_with_width<'a>(
         hanging_indent_px: 0.0,
         marker_text: None,
         px_size_for_marker: cfg.px_size_for_marker,
+        inline_objects: cfg.inline_objects,
     };
     compose_lines(&scoped)
 }
@@ -277,6 +299,15 @@ fn line_extents(line: &LineBox, fonts: &FontStack, fallback: f32) -> (f32, f32) 
             let m = face.metrics(run.attrs.px_size);
             ascent = ascent.max(m.ascent);
             descent = descent.max(m.descent.abs());
+        }
+        /* Phase 7 — inline objects (images) push the ascent so the line
+        grows to host the image without clipping. The bottom of the
+        object sits on the baseline; the image extends `height_px`
+        above it. */
+        for g in &run.glyphs {
+            if g.inline_image_rel_id.is_some() {
+                ascent = ascent.max(g.inline_object_height);
+            }
         }
     }
     if ascent + descent <= 0.0 {
@@ -460,17 +491,35 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
             };
             let sub_text = &brun_text[rel_start..rel_end];
             let shaped = shape_text(face, sub_text, brun.direction, span.px_size);
+            let brun_abs_start = brun_abs + rel_start as u32;
             let glyphs: Vec<PositionedGlyph> = shaped
                 .glyphs
                 .iter()
-                .map(|g| PositionedGlyph {
-                    id: g.glyph_id as u16,
-                    cluster: g.cluster,
-                    x_advance: g.x_advance,
-                    y_advance: g.y_advance,
-                    x_offset: g.x_offset,
-                    y_offset: g.y_offset,
-                    synthetic: false,
+                .map(|g| {
+                    /* Phase 7 — paragraph-absolute byte offset of this
+                    glyph's cluster. The shaper reports cluster relative
+                    to the input string we passed (`sub_text`), so we
+                    re-anchor at the sub-run's paragraph offset. A glyph
+                    sitting on the U+FFFC sentinel of an inline object
+                    has its advance overridden to the object's reserved
+                    width and its `inline_object_id` set so the renderer
+                    paints the bitmap instead of the placeholder glyph. */
+                    let abs_cluster = brun_abs_start + g.cluster;
+                    let info = cfg
+                        .inline_objects
+                        .iter()
+                        .find(|info| info.at == abs_cluster);
+                    PositionedGlyph {
+                        id: g.glyph_id as u16,
+                        cluster: g.cluster,
+                        x_advance: info.map_or(g.x_advance, |i| i.width_px),
+                        y_advance: g.y_advance,
+                        x_offset: g.x_offset,
+                        y_offset: g.y_offset,
+                        synthetic: false,
+                        inline_image_rel_id: info.map(|i| i.rel_id.clone()),
+                        inline_object_height: info.map_or(0.0, |i| i.height_px),
+                    }
                 })
                 .collect();
             runs.push(VisualRun {
@@ -783,8 +832,10 @@ fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &Fon
         x_offset: 0.0,
         y_offset: 0.0,
         synthetic: true,
+        inline_image_rel_id: None,
+        inline_object_height: 0.0,
     };
     for _ in 0..n {
-        run.glyphs.insert(glyph_idx + 1, tatweel_glyph);
+        run.glyphs.insert(glyph_idx + 1, tatweel_glyph.clone());
     }
 }

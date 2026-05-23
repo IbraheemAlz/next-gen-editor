@@ -15,4 +15,4 @@ pub use boxes::{
 };
 pub use page::{A4Page, Margins};
 pub use paginate::{PageGeometry as PaginatePageGeometry, Paginator, split_paragraph_at_line};
-pub use paragraph::{ParagraphConfig, layout_paragraph};
+pub use paragraph::{InlineObjectInfo, ParagraphConfig, layout_paragraph};

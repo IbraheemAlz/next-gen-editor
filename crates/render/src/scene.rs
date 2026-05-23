@@ -68,6 +68,15 @@ pub enum DisplayCmd {
         width: f64,
     },
     DrawGlyphRun(GlyphRun),
+    /// Phase 7 — paint an inline image at `rect`. `rel_id` matches the
+    /// archive relationship id the engine stashed for the image; the
+    /// backend looks the decoded bitmap up via its image-cache
+    /// callback and falls back to a placeholder rectangle on miss
+    /// (image bytes not yet decoded, or the rId resolved nothing).
+    DrawImage {
+        rect: Rect,
+        rel_id: String,
+    },
     PushClip {
         rect: Rect,
     },
@@ -323,7 +332,24 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                 let text_color = Color::from_rgba8(r, g, b, a);
                 let run_x0 = (line_x as f64) + (pen as f64);
                 let mut glyphs: Vec<RunGlyph> = Vec::with_capacity(run.glyphs.len());
+                /* Phase 7 — inline image draws are emitted in line with
+                the run loop so the pen stays in sync. Collected separately
+                from text glyphs so the renderer routes them through
+                `DisplayCmd::DrawImage` instead of `DrawGlyphRun`. */
+                let mut images: Vec<(f64, f64, f64, f64, String)> = Vec::new();
                 for glyph in &run.glyphs {
+                    if let Some(rel) = glyph.inline_image_rel_id.as_deref() {
+                        /* Image sits flush with the baseline (its bottom
+                        edge); the image's `inline_object_height` extends
+                        upward, matching the line's grown ascent. */
+                        let x0 = (line_x as f64) + (pen as f64);
+                        let y1 = baseline;
+                        let y0 = y1 - (glyph.inline_object_height as f64);
+                        let x1 = x0 + (glyph.x_advance as f64);
+                        images.push((x0, y0, x1, y1, rel.to_string()));
+                        pen += glyph.x_advance;
+                        continue;
+                    }
                     /* glyph id 0 is .notdef — advance the pen, draw nothing. */
                     if glyph.id != 0 {
                         glyphs.push(RunGlyph {
@@ -335,6 +361,12 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                     pen += glyph.x_advance;
                 }
                 let run_x1 = (line_x as f64) + (pen as f64);
+                for (x0, y0, x1, y1, rel_id) in images {
+                    cmds.push(DisplayCmd::DrawImage {
+                        rect: Rect::new(x0, y0, x1, y1),
+                        rel_id,
+                    });
+                }
 
                 /* Background highlight — emitted before the glyphs so it sits
                 behind them, spanning the run's advance and the line's full

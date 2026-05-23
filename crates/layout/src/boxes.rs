@@ -75,7 +75,11 @@ pub struct StyleSpan {
 /// One shaped glyph, positioned by advance/offset relative to the pen. There is
 /// no stored absolute x: it is the run pen plus the cumulative `x_advance` of
 /// the prior glyphs in the run.
-#[derive(Debug, Clone, Copy)]
+///
+/// Phase 7 dropped `Copy`: inline-image glyphs carry the image's relationship
+/// id as a `String`, which is not `Copy`. Callers that previously moved the
+/// glyph by value now clone; the storage layout is unchanged.
+#[derive(Debug, Clone)]
 pub struct PositionedGlyph {
     pub id: u16,
     /// Byte offset into the owning [`VisualRun::source_range`].
@@ -88,6 +92,15 @@ pub struct PositionedGlyph {
     /// like any glyph, but skipped by caret / hit-test slot emission so the
     /// byte<->glyph map is not corrupted (Backlog #2).
     pub synthetic: bool,
+    /// Phase 7 — when set, this glyph anchors an inline image; the
+    /// renderer paints the image whose archive relationship id matches
+    /// this string at the glyph's pen position with `x_advance` as the
+    /// physical width. The text glyph itself is **not** drawn.
+    pub inline_image_rel_id: Option<String>,
+    /// Phase 7 — physical height of the anchored inline object in layout
+    /// pixels. Folded into the line's ascent so the line grows to host
+    /// the image without clipping.
+    pub inline_object_height: f32,
 }
 
 /// A maximal run of glyphs sharing one font, direction, and style — the unit

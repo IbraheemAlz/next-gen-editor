@@ -164,6 +164,12 @@ pub struct Engine {
     /// delta — that one is a full `Replace`, so a fresh engine after crash
     /// recovery hands the mirror a clean rebuild.
     a11y_cache: Option<Vec<A11yNode>>,
+    /// Phase 7 — decoded inline-image cache keyed by archive relationship
+    /// id. The TS shell decodes every `word/media/*` blob into an
+    /// `ImageBitmap` after the document loads and installs the result
+    /// here via `Command::RegisterImage`. The Canvas2D backend looks each
+    /// painted inline image up here; a miss falls back to a placeholder.
+    image_cache: HashMap<String, web_sys::ImageBitmap>,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -197,6 +203,7 @@ fn assemble_engine(
         pending_format: None,
         layout_cache: new_layout_cache(),
         a11y_cache: None,
+        image_cache: HashMap::new(),
     }
 }
 
@@ -222,6 +229,45 @@ impl Engine {
         serde_wasm_bindgen::to_value(&evt)
             .map_err(|e| JsValue::from_str(&format!("encode event: {e}")))
     }
+
+    /// Phase 7 — list every inline-image media blob the document carries,
+    /// keyed by archive relationship id (`r:id`). The TS shell consumes
+    /// this list once after `OpenDocx`, decodes each blob into an
+    /// `ImageBitmap` via the browser, and installs the result via
+    /// [`Engine::register_image`]. Returns an array of
+    /// `{ rel_id, mime, bytes }` objects.
+    pub fn media_entries(&self) -> Result<JsValue, JsValue> {
+        let doc = self.undo.current();
+        let entries: Vec<MediaEntryOut> = doc
+            .media
+            .iter()
+            .map(|(rid, blob)| MediaEntryOut {
+                rel_id: rid.clone(),
+                mime: blob.content_type.clone(),
+                bytes: blob.data.clone(),
+            })
+            .collect();
+        serde_wasm_bindgen::to_value(&entries)
+            .map_err(|e| JsValue::from_str(&format!("encode media entries: {e}")))
+    }
+
+    /// Phase 7 — install a decoded inline-image bitmap. Idempotent; later
+    /// registrations overwrite earlier ones (lets the worker re-decode on
+    /// DPR change without leaking).
+    pub fn register_image(&mut self, rel_id: String, bitmap: web_sys::ImageBitmap) {
+        self.image_cache.insert(rel_id, bitmap);
+    }
+}
+
+/// Serialization surface for [`Engine::media_entries`]. Mirrors
+/// `bridge::ImageBlob`'s on-wire shape but keyed by `rel_id` so the TS
+/// shell can route decoded bitmaps back via [`Engine::register_image`].
+#[derive(::serde::Serialize)]
+struct MediaEntryOut {
+    rel_id: String,
+    mime: String,
+    #[serde(with = "serde_bytes")]
+    bytes: Vec<u8>,
 }
 
 /// Vello (WebGPU) activation — wasm-only, since WebGPU surface creation is.
@@ -606,6 +652,90 @@ fn parse_font_family(id: &str) -> Option<EngineFontFamily> {
     }
 }
 
+/// Phase 7 — Word's default hyperlink character style colour, mirroring the
+/// stock "Hyperlink" character style. Used as the overlay tint when a
+/// hyperlink range's underlying run carries the default (black) colour.
+const HYPERLINK_BLUE: [u8; 4] = [0x05, 0x63, 0xC1, 0xFF];
+
+/// Phase 7 — overlay each hyperlink range with `underline = true` and the
+/// hyperlink blue when no explicit colour was set. The base span list is
+/// split at every hyperlink boundary so the overlay applies to sub-spans
+/// only — non-hyperlinked spans keep their original style.
+fn apply_hyperlink_overlay(
+    spans: Vec<StyleSpan>,
+    hyperlinks: &[engine::Hyperlink],
+    default_color: [u8; 4],
+) -> Vec<StyleSpan> {
+    if hyperlinks.is_empty() {
+        return spans;
+    }
+    let mut out: Vec<StyleSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let mut cuts: Vec<u32> = vec![span.start, span.end];
+        for h in hyperlinks {
+            if h.end > span.start && h.start < span.end {
+                cuts.push(h.start.max(span.start));
+                cuts.push(h.end.min(span.end));
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let (s, e) = (w[0], w[1]);
+            if s >= e {
+                continue;
+            }
+            let mut sub = StyleSpan {
+                start: s,
+                end: e,
+                ..span.clone()
+            };
+            let linked = hyperlinks.iter().any(|h| h.start <= s && h.end >= e);
+            if linked {
+                sub.underline = true;
+                /* Only overlay the hyperlink blue when the underlying run
+                carries the plain default colour — explicit `<w:rPr>`
+                colour wins (matches Word's behaviour where a hand-tinted
+                hyperlink keeps its custom colour). */
+                if sub.color == default_color {
+                    sub.color = HYPERLINK_BLUE;
+                }
+            }
+            out.push(sub);
+        }
+    }
+    out
+}
+
+/// Phase 7 — build the layout-side inline object table for one paragraph.
+/// EMU dimensions become layout pixels at the current scale: 914400 EMU is
+/// one inch, one inch is 72 pt, so `px = emu * scale / 12700`. The
+/// resulting `width_px` / `height_px` flow through to the line's ascent
+/// and the renderer's image-paint command.
+fn build_inline_object_infos(
+    para: &engine::Paragraph,
+    scale: f32,
+) -> Vec<layout::paragraph::InlineObjectInfo> {
+    para.inline_objects
+        .iter()
+        .map(|obj| {
+            let (rel_id, w_emu, h_emu) = match &obj.kind {
+                engine::InlineKind::Image {
+                    rel_id,
+                    width_emu,
+                    height_emu,
+                } => (rel_id.clone(), *width_emu, *height_emu),
+            };
+            layout::paragraph::InlineObjectInfo {
+                at: obj.at,
+                width_px: engine::emu_to_pt(w_emu) * scale,
+                height_px: engine::emu_to_pt(h_emu) * scale,
+                rel_id,
+            }
+        })
+        .collect()
+}
+
 fn build_style_spans(
     para: &engine::Paragraph,
     default_size: f32,
@@ -820,6 +950,7 @@ fn build_header_footer_box(
             hanging_indent_px: 0.0,
             marker_text: None,
             px_size_for_marker: cfg.px_size * scale,
+            inline_objects: &[],
         });
         p.origin = Point { x: 0.0, y };
         y += p.size.height;
@@ -1082,6 +1213,7 @@ fn layout_cell_blocks(
                     hanging_indent_px: ind_h,
                     marker_text: p.resolved_marker.clone(),
                     px_size_for_marker: cfg.px_size * scale,
+                    inline_objects: &[],
                 };
                 LayoutBlock::Paragraph(layout_paragraph(pcfg))
             }
@@ -2415,12 +2547,16 @@ impl Engine {
                             text.push_str(&para.text[..off]);
                             text.push_str(&c.text);
                             text.push_str(&para.text[off..]);
-                            let spans = composition_layout_spans(
-                                para,
-                                off as u32,
-                                c.text.len() as u32,
-                                cfg.px_size,
-                                scale,
+                            let spans = apply_hyperlink_overlay(
+                                composition_layout_spans(
+                                    para,
+                                    off as u32,
+                                    c.text.len() as u32,
+                                    cfg.px_size,
+                                    scale,
+                                ),
+                                &para.hyperlinks,
+                                [0, 0, 0, 255],
                             );
                             let (ind_s, ind_e, ind_fl, ind_h) =
                                 props_to_layout_indents(&para.props, scale);
@@ -2439,16 +2575,21 @@ impl Engine {
                                 hanging_indent_px: ind_h,
                                 marker_text: para.resolved_marker.clone(),
                                 px_size_for_marker: cfg.px_size * scale,
+                                inline_objects: &[],
                             })
                         } else {
                             let key = paragraph_layout_key(para, &cfg, scale);
                             if let Some(cached) = cache.get(&key) {
                                 cached.clone()
                             } else {
-                                let spans =
-                                    build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
+                                let spans = apply_hyperlink_overlay(
+                                    build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale),
+                                    &para.hyperlinks,
+                                    [0, 0, 0, 255],
+                                );
                                 let (ind_s, ind_e, ind_fl, ind_h) =
                                     props_to_layout_indents(&para.props, scale);
+                                let inline_infos = build_inline_object_infos(para, scale);
                                 let para_cfg = ParagraphConfig {
                                     text: &para.text,
                                     fonts: &font_stack,
@@ -2467,6 +2608,7 @@ impl Engine {
                                     hanging_indent_px: ind_h,
                                     marker_text: para.resolved_marker.clone(),
                                     px_size_for_marker: cfg.px_size * scale,
+                                    inline_objects: &inline_infos,
                                 };
                                 let laid = layout_paragraph(para_cfg);
                                 cache.put(key, laid.clone());
@@ -2633,11 +2775,13 @@ impl Engine {
         }
         let clip_rect =
             clip.unwrap_or_else(|| Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h)));
+        let image_cache = &self.image_cache;
         if let Err(e) = render_canvas2d(
             &ctx,
             &scene,
             &mut self.atlas,
             |id| self.fonts.get(id).cloned(),
+            |rel| image_cache.get(rel).cloned(),
             clip_rect,
         ) {
             return Err(Box::new(Event::Error {
@@ -3736,6 +3880,7 @@ mod tests {
             pending_format: None,
             layout_cache: new_layout_cache(),
             a11y_cache: None,
+            image_cache: HashMap::new(),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -3896,6 +4041,8 @@ mod tests {
             x_offset: 0.0,
             y_offset: 0.0,
             synthetic,
+            inline_image_rel_id: None,
+            inline_object_height: 0.0,
         };
         let run = layout::VisualRun {
             glyphs: vec![
@@ -3949,6 +4096,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -4082,6 +4231,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, 3, 3, 16.0, 1.0);
@@ -4106,6 +4257,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         let spans = composition_layout_spans(&p, 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);

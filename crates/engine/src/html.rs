@@ -390,6 +390,8 @@ impl ParaBuilder {
             /* HTML paste creates fresh paragraphs; never inherits source. */
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         })
     }
 }
@@ -491,6 +493,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -505,6 +509,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -527,6 +533,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         };
         assert_eq!(
             to_html(&[p]),
@@ -552,6 +560,8 @@ mod tests {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);
