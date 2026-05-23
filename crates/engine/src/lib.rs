@@ -368,6 +368,31 @@ pub struct Hyperlink {
     pub target: String,
 }
 
+/// Phase 8b — kind of tracked-change revision.
+///
+/// - `Insert` — `<w:ins>` wraps text that a reviewer added.
+/// - `Delete` — `<w:del>` wraps text that the original document carried
+///   but a reviewer marked for removal. The deleted text rides in the
+///   paragraph's `text` field alongside live content; the renderer
+///   applies markup styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionKind {
+    Insert,
+    Delete,
+}
+
+/// Phase 8b — one `<w:ins>` / `<w:del>` overlay on a paragraph's byte
+/// range. `author` + `date` carry the OOXML `w:author` / `w:date`
+/// attributes so the TS shell can surface them on hover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revision {
+    pub start: u32,
+    pub end: u32,
+    pub kind: RevisionKind,
+    pub author: String,
+    pub date: String,
+}
+
 /// Phase 7 — a media blob stashed for the renderer to decode.
 ///
 /// `content_type` is the MIME type the OOXML rels claimed (`image/png`,
@@ -529,6 +554,12 @@ pub struct Paragraph {
     /// Phase 7 — hyperlink overlays on the paragraph's text. Multiple
     /// hyperlinks may exist; they do not overlap.
     pub hyperlinks: Vec<Hyperlink>,
+    /// Phase 8b — tracked-change overlays. Each `<w:ins>` / `<w:del>`
+    /// in the source paragraph produces one entry. The paragraph's
+    /// `text` retains deleted text alongside live content so the
+    /// renderer can show markup; the passthrough writer round-trips
+    /// the wrappers byte-identical from `source_xml`.
+    pub revisions: Vec<Revision>,
 }
 
 impl Paragraph {
@@ -593,6 +624,7 @@ impl Paragraph {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         }
     }
 
@@ -679,6 +711,7 @@ impl Paragraph {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         }
     }
 
@@ -715,6 +748,7 @@ impl Paragraph {
                 source_xml: None,
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
+                revisions: Vec::new(),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -726,6 +760,7 @@ impl Paragraph {
                 source_xml: None,
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
+                revisions: Vec::new(),
             },
         )
     }
@@ -755,6 +790,7 @@ impl Paragraph {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         }
     }
 
@@ -990,6 +1026,7 @@ impl DocumentTree {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         }));
         Self {
             blocks,
@@ -1017,6 +1054,7 @@ impl DocumentTree {
                 source_xml: None,
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
+                revisions: Vec::new(),
             }));
         }
         Self {
@@ -1264,6 +1302,7 @@ impl DocumentTree {
                 source_xml: None,
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
+                revisions: Vec::new(),
             }));
             return Self {
                 blocks,
@@ -2698,6 +2737,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -2719,6 +2759,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -2737,6 +2778,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -2833,6 +2875,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -3262,6 +3305,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -3300,6 +3344,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -3337,6 +3382,7 @@ mod tests {
                 source_xml: None,
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
+                revisions: Vec::new(),
             },
             Paragraph {
                 text: "two".into(),
@@ -3352,6 +3398,7 @@ mod tests {
                 source_xml: None,
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
+                revisions: Vec::new(),
             },
         ];
         let (out, caret) = doc.insert_rich(

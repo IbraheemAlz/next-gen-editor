@@ -369,7 +369,58 @@ Phase 8a footnotes, paginator integration, and comments parser`).
 
 ---
 
-## 9. Cross-phase reminders
+## 9. Phase 8b — Tracked changes (revisions)
+
+Items deferred during the Phase 8b cut (`feat(engine): implement Phase
+8b tracked changes and revision rendering`).
+
+- [ ] **Per-author multi-colour palette.** Phase 8b paints every
+      insertion green and every deletion red, regardless of author.
+      Word rotates a palette per reviewer (`<w:rsid>` linkage). The
+      `Revision::author` string is already carried; a colour resolver
+      keyed on it ships with 8c.
+- [ ] **Engine-side accept / reject.** `Command::AcceptRevision` and
+      `Command::RejectRevision` are not wired. The model retains
+      deleted text via `Paragraph::revisions`; accept = strip the
+      revision range + delete the bytes for `Delete`, drop the
+      overlay for `Insert`. Reject = drop the bytes for `Insert`,
+      drop the overlay for `Delete`. *Depends on:* new bridge
+      commands + writer-side `<w:ins>` / `<w:del>` emission.
+- [ ] **`Show Markup` toggle.** Markup is always on in this cut; the
+      "Final" / "Original" viewing modes that hide either the inserts
+      or the deletes are not exposed. *Depends on:* a render-time
+      config bit threaded through `RenderConfig` + the overlay
+      function gating on it.
+- [ ] **Moved-text revisions (`<w:moveFrom>` / `<w:moveTo>`).** The
+      parser handles `<w:ins>` / `<w:del>` only; tracked moves fall
+      through and surface as a delete+insert pair. *Depends on:*
+      additional `RevisionKind` variants + writer support.
+- [ ] **Run-property revisions (`<w:rPrChange>`).** Inline formatting
+      changes (bold added, color changed) are not modelled. The base
+      run's current style wins; the historical "before" style is
+      dropped on parse. *Depends on:* a `before_style: SpanStyle`
+      field on `Revision` for `RprChange` variants.
+- [ ] **Paragraph-property revisions (`<w:pPrChange>`).** Tracked
+      changes to paragraph alignment / indent / spacing are dropped
+      on parse. *Depends on:* paragraph-level revision overlays.
+- [ ] **Canvas hover tooltips.** Engine exposes
+      `revisions_snapshot()` and the TS shell can fetch it via
+      `EngineClient.revisionsSnapshot()`, but no DOM overlay yet
+      ties tooltip popups to revision ranges in canvas geometry.
+      *Depends on:* a TS overlay component + `document_geometry`
+      hover binding.
+- [ ] **Writer-side `<w:ins>` / `<w:del>` emission.** Unedited
+      revision-bearing paragraphs round-trip via the source-XML
+      passthrough (`Paragraph.source_xml` carries the wrappers). An
+      engine edit on a revision-bearing paragraph (currently any
+      `InsertText` etc.) drops `source_xml` and the writer emits a
+      passthrough-less serialization that strips the revision
+      wrappers. *Depends on:* a `<w:ins>` / `<w:del>` re-emission
+      pass in `writer.rs`.
+
+---
+
+## 10. Cross-phase reminders
 
 Items deferred from earlier phases that interact with Phase 5+
 follow-ups.

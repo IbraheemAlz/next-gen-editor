@@ -392,6 +392,7 @@ impl ParaBuilder {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         })
     }
 }
@@ -495,6 +496,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -511,6 +513,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -535,6 +538,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         assert_eq!(
             to_html(&[p]),
@@ -562,6 +566,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);

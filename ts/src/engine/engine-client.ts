@@ -24,6 +24,8 @@ type WorkerReply = {
     renderer?: string;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
+    /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
+    revisions?: RevisionSnapshot[];
 };
 
 /** Phase 8a — read-only snapshot row for the comments sidebar. */
@@ -36,6 +38,16 @@ export interface CommentSnapshot {
     start_offset: number;
     end_block: number;
     end_offset: number;
+}
+
+/** Phase 8b — read-only snapshot row for revision tooltips. */
+export interface RevisionSnapshot {
+    block: number;
+    start: number;
+    end: number;
+    kind: 'insert' | 'delete';
+    author: string;
+    date: string;
 }
 
 type Resolver = (v: WorkerReply) => void;
@@ -142,6 +154,18 @@ export class EngineClient {
         const r = await this.send({ type: 'GET_COMMENTS' });
         if (!r.ok) throw new Error(r.error);
         return (r.comments ?? []) as CommentSnapshot[];
+    }
+
+    /**
+     * Phase 8b — read-only snapshot of every tracked-change revision.
+     * The shell ties the rows to canvas geometry via `document_geometry`
+     * so a hover over deleted (strike-through) or inserted (underlined)
+     * text surfaces the author + date.
+     */
+    async revisionsSnapshot(): Promise<RevisionSnapshot[]> {
+        const r = await this.send({ type: 'GET_REVISIONS' });
+        if (!r.ok) throw new Error(r.error);
+        return (r.revisions ?? []) as RevisionSnapshot[];
     }
 
     subscribe(fn: (e: Event) => void): () => void {

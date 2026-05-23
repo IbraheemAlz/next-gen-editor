@@ -41,6 +41,8 @@ type ClientCommandMsg = { id: number; cmd: Command };
    the engine's `comments_snapshot()` wasm method returns; the TS shell
    feeds it into the comments sidebar signal. */
 type GetCommentsMsg = { id: number; type: 'GET_COMMENTS' };
+/* Phase 8b — same shape for `revisions_snapshot()`. */
+type GetRevisionsMsg = { id: number; type: 'GET_REVISIONS' };
 
 type Msg =
     | InitMsg
@@ -48,7 +50,8 @@ type Msg =
     | ClientInitMsg
     | ClientRecoverMsg
     | ClientCommandMsg
-    | GetCommentsMsg;
+    | GetCommentsMsg
+    | GetRevisionsMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -585,6 +588,21 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
         try {
             const snapshot = engine.comments_snapshot();
             self.postMessage({ id: msg.id, ok: true, comments: snapshot });
+        } catch (e: unknown) {
+            replyError(msg.id, e);
+        }
+        return;
+    }
+
+    /* Phase 8b — revisions side-channel mirror of `GET_COMMENTS`. */
+    if (msg.type === 'GET_REVISIONS') {
+        if (!engine) {
+            self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
+            return;
+        }
+        try {
+            const snapshot = engine.revisions_snapshot();
+            self.postMessage({ id: msg.id, ok: true, revisions: snapshot });
         } catch (e: unknown) {
             replyError(msg.id, e);
         }

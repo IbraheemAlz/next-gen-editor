@@ -133,6 +133,20 @@ pub fn parse_document_xml(
     id; the archive reader maps those rIds to URLs in a second pass. */
     let mut para_inline_objects: Vec<engine::InlineObject> = Vec::new();
     let mut para_hyperlinks: Vec<engine::Hyperlink> = Vec::new();
+    let mut para_revisions: Vec<engine::Revision> = Vec::new();
+
+    /* Phase 8b — tracked-change wrapper state. A `<w:ins>` or `<w:del>`
+    can wrap several `<w:r>` elements; we capture the wrapper's
+    author / date attrs on open and emit a `Revision` on close
+    covering the byte range produced inside. Stack-shaped so a
+    nested ins/del (rare but legal — an insertion inside a deletion)
+    still resolves correctly. */
+    let mut revision_stack: Vec<(engine::RevisionKind, String, String, u32)> = Vec::new();
+    /* Phase 8b — `<w:delText>` is the OOXML synonym for `<w:t>` inside a
+    `<w:del>` wrapper. The parser collapses both into `run_text` so
+    deleted text rides alongside live content; the `Revision` overlay
+    flags the byte range for the strikethrough renderer. */
+    let mut in_del_text_elt = false;
 
     /* Phase 8a — footnote refs auto-number 1, 2, 3 ... in document order
     across every `<w:footnoteReference>` the body uses. */
@@ -305,6 +319,18 @@ pub fn parse_document_xml(
                         }
                     }
                     b"w:t" => in_text_elt = true,
+                    b"w:delText" => in_del_text_elt = true,
+                    b"w:ins" | b"w:del" => {
+                        let kind = if name.as_ref() == b"w:ins" {
+                            engine::RevisionKind::Insert
+                        } else {
+                            engine::RevisionKind::Delete
+                        };
+                        let author = attr_val(&e, b"w:author").unwrap_or_default();
+                        let date = attr_val(&e, b"w:date").unwrap_or_default();
+                        let start = (para_text.len() + run_text.len()) as u32;
+                        revision_stack.push((kind, author, date, start));
+                    }
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
                     }
@@ -418,7 +444,7 @@ pub fn parse_document_xml(
                     _ => {}
                 }
             }
-            Event::Text(t) if in_text_elt && in_tbl == 0 => {
+            Event::Text(t) if (in_text_elt || in_del_text_elt) && in_tbl == 0 => {
                 run_text.push_str(&t.unescape()?);
             }
             Event::End(e) => {
@@ -463,6 +489,21 @@ pub fn parse_document_xml(
                 }
                 match name.as_ref() {
                     b"w:t" => in_text_elt = false,
+                    b"w:delText" => in_del_text_elt = false,
+                    b"w:ins" | b"w:del" => {
+                        if let Some((kind, author, date, start)) = revision_stack.pop() {
+                            let end = (para_text.len() + run_text.len()) as u32;
+                            if end > start {
+                                para_revisions.push(engine::Revision {
+                                    start,
+                                    end,
+                                    kind,
+                                    author,
+                                    date,
+                                });
+                            }
+                        }
+                    }
                     b"w:rPr" => in_rpr = false,
                     b"w:pPr" => in_ppr = false,
                     b"w:numPr" => in_num_pr = false,
@@ -599,6 +640,7 @@ pub fn parse_document_xml(
                             source_xml,
                             inline_objects: std::mem::take(&mut para_inline_objects),
                             hyperlinks: std::mem::take(&mut para_hyperlinks),
+                            revisions: std::mem::take(&mut para_revisions),
                         }));
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this
                         paragraph. Emit a `Section` covering everything since

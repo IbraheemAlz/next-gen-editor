@@ -258,6 +258,35 @@ impl Engine {
         self.image_cache.insert(rel_id, bitmap);
     }
 
+    /// Phase 8b — flat snapshot of every tracked-change revision the
+    /// document carries. Each row pairs a `(block, start_offset,
+    /// end_offset)` byte range with the revision's kind (`Insert` /
+    /// `Delete`), author, and date. The TS shell uses this to render
+    /// hover tooltips over revision-marked text in the canvas.
+    pub fn revisions_snapshot(&self) -> Result<JsValue, JsValue> {
+        let doc = self.undo.current();
+        let mut rows: Vec<RevisionOut> = Vec::new();
+        for (block_idx, block) in doc.blocks.iter().enumerate() {
+            if let engine::Block::Paragraph(p) = block {
+                for r in &p.revisions {
+                    rows.push(RevisionOut {
+                        block: block_idx as u32,
+                        start: r.start,
+                        end: r.end,
+                        kind: match r.kind {
+                            engine::RevisionKind::Insert => "insert",
+                            engine::RevisionKind::Delete => "delete",
+                        },
+                        author: r.author.clone(),
+                        date: r.date.clone(),
+                    });
+                }
+            }
+        }
+        serde_wasm_bindgen::to_value(&rows)
+            .map_err(|e| JsValue::from_str(&format!("encode revisions: {e}")))
+    }
+
     /// Phase 8a — flat snapshot of every parsed `<w:comment>` plus the
     /// document-side `<w:commentRangeStart>` / `<w:commentRangeEnd>`
     /// span. The TS shell renders these in a sidebar; no canvas
@@ -284,6 +313,16 @@ impl Engine {
         serde_wasm_bindgen::to_value(&comments)
             .map_err(|e| JsValue::from_str(&format!("encode comments: {e}")))
     }
+}
+
+#[derive(::serde::Serialize)]
+struct RevisionOut {
+    block: u32,
+    start: u32,
+    end: u32,
+    kind: &'static str,
+    author: String,
+    date: String,
 }
 
 #[derive(::serde::Serialize)]
@@ -696,6 +735,76 @@ fn parse_font_family(id: &str) -> Option<EngineFontFamily> {
 /// hyperlink range's underlying run carries the default (black) colour.
 const HYPERLINK_BLUE: [u8; 4] = [0x05, 0x63, 0xC1, 0xFF];
 
+/// Phase 8b — markup palette for "Show Markup" mode (default ON).
+/// Reviewer-1 colour scheme; per-author multi-colour rotation ships
+/// with a later cut.
+const REVISION_INSERT_COLOR: [u8; 4] = [0x00, 0x80, 0x00, 0xFF];
+const REVISION_DELETE_COLOR: [u8; 4] = [0xCC, 0x00, 0x00, 0xFF];
+
+/// Phase 8b — overlay each revision range so insertions render with
+/// `underline = true` + the insert colour and deletions render with
+/// `strike = true` + the delete colour. The base span list is split at
+/// every revision boundary; sub-spans covered by a revision get the
+/// markup styling. An explicit `<w:rPr>` colour wins over the markup
+/// tint (matches Word's "Show Markup" semantics where a hand-tinted
+/// run keeps its custom colour and just gains the strike / underline
+/// overlay). Nested revisions (insertion inside a deletion) stack
+/// additively for underline / strike — the inner revision's colour
+/// wins last.
+fn apply_revision_overlay(
+    spans: Vec<StyleSpan>,
+    revisions: &[engine::Revision],
+    default_color: [u8; 4],
+) -> Vec<StyleSpan> {
+    if revisions.is_empty() {
+        return spans;
+    }
+    let mut out: Vec<StyleSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let mut cuts: Vec<u32> = vec![span.start, span.end];
+        for r in revisions {
+            if r.end > span.start && r.start < span.end {
+                cuts.push(r.start.max(span.start));
+                cuts.push(r.end.min(span.end));
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let (s, e) = (w[0], w[1]);
+            if s >= e {
+                continue;
+            }
+            let mut sub = StyleSpan {
+                start: s,
+                end: e,
+                ..span.clone()
+            };
+            for r in revisions {
+                if r.start > s || r.end < e {
+                    continue;
+                }
+                match r.kind {
+                    engine::RevisionKind::Insert => {
+                        sub.underline = true;
+                        if sub.color == default_color {
+                            sub.color = REVISION_INSERT_COLOR;
+                        }
+                    }
+                    engine::RevisionKind::Delete => {
+                        sub.strike = true;
+                        if sub.color == default_color {
+                            sub.color = REVISION_DELETE_COLOR;
+                        }
+                    }
+                }
+            }
+            out.push(sub);
+        }
+    }
+    out
+}
+
 /// Phase 7 — overlay each hyperlink range with `underline = true` and the
 /// hyperlink blue when no explicit colour was set. The base span list is
 /// split at every hyperlink boundary so the overlay applies to sub-spans
@@ -943,6 +1052,20 @@ fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32
             3u8.hash(&mut h);
             twips.hash(&mut h);
         }
+    }
+    /* Phase 7 — hyperlinks change span overlay; Phase 8b — revisions
+    do too. Both mix into the layout-cache key so an `<w:ins>` edit
+    that changes only the overlay (not the text) still re-shapes. */
+    (para.hyperlinks.len() as u64).hash(&mut h);
+    for hl in &para.hyperlinks {
+        hl.start.hash(&mut h);
+        hl.end.hash(&mut h);
+    }
+    (para.revisions.len() as u64).hash(&mut h);
+    for r in &para.revisions {
+        r.start.hash(&mut h);
+        r.end.hash(&mut h);
+        matches!(r.kind, engine::RevisionKind::Insert).hash(&mut h);
     }
     cfg.font_id.hash(&mut h);
     matches!(cfg.base_direction, ShapingDirection::Rtl).hash(&mut h);
@@ -2702,15 +2825,19 @@ impl Engine {
                             text.push_str(&para.text[..off]);
                             text.push_str(&c.text);
                             text.push_str(&para.text[off..]);
-                            let spans = apply_hyperlink_overlay(
-                                composition_layout_spans(
-                                    para,
-                                    off as u32,
-                                    c.text.len() as u32,
-                                    cfg.px_size,
-                                    scale,
+                            let spans = apply_revision_overlay(
+                                apply_hyperlink_overlay(
+                                    composition_layout_spans(
+                                        para,
+                                        off as u32,
+                                        c.text.len() as u32,
+                                        cfg.px_size,
+                                        scale,
+                                    ),
+                                    &para.hyperlinks,
+                                    [0, 0, 0, 255],
                                 ),
-                                &para.hyperlinks,
+                                &para.revisions,
                                 [0, 0, 0, 255],
                             );
                             let (ind_s, ind_e, ind_fl, ind_h) =
@@ -2737,9 +2864,13 @@ impl Engine {
                             if let Some(cached) = cache.get(&key) {
                                 cached.clone()
                             } else {
-                                let spans = apply_hyperlink_overlay(
-                                    build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale),
-                                    &para.hyperlinks,
+                                let spans = apply_revision_overlay(
+                                    apply_hyperlink_overlay(
+                                        build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale),
+                                        &para.hyperlinks,
+                                        [0, 0, 0, 255],
+                                    ),
+                                    &para.revisions,
                                     [0, 0, 0, 255],
                                 );
                                 let (ind_s, ind_e, ind_fl, ind_h) =
@@ -4256,6 +4387,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -4391,6 +4523,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, 3, 3, 16.0, 1.0);
@@ -4417,6 +4550,7 @@ mod tests {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         };
         let spans = composition_layout_spans(&p, 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);

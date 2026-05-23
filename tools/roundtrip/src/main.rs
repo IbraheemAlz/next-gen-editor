@@ -443,6 +443,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             source_xml: None,
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
+            revisions: Vec::new(),
         }]),
     };
     vec![
