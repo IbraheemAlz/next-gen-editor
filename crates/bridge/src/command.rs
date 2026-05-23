@@ -212,6 +212,17 @@ pub enum Command {
         at: Point,
     },
 
+    /// Phase 6c — hit-test for the multi-canvas DOM architecture. `at` is
+    /// in the clicked page's LOCAL device-pixel coords (origin at page
+    /// top-left). The engine adds the page's accumulated top offset in
+    /// document space, so the TS shell routes pointer events from N
+    /// independent `<canvas>` elements without any offset math of its
+    /// own. Replies with `Event::HitResult` like `HitTest`.
+    HitTestInPage {
+        page: u32,
+        at: Point,
+    },
+
     /// Select the word under a canvas pixel (double-click). The engine
     /// updates the selection and replies with `Event::SelectionChanged`.
     SelectWordAt {

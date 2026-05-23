@@ -43,6 +43,11 @@ type ClientCommandMsg = { id: number; cmd: Command };
 type GetCommentsMsg = { id: number; type: 'GET_COMMENTS' };
 /* Phase 8b — same shape for `revisions_snapshot()`. */
 type GetRevisionsMsg = { id: number; type: 'GET_REVISIONS' };
+/* Phase 6c — multi-canvas: hand the worker an OffscreenCanvas for page
+   `idx`. The worker dispatches into `engine.set_page_canvas`, which
+   registers the surface so subsequent paints fill that page's
+   <canvas> in the DOM. */
+type RegisterPageCanvasMsg = { id: number; type: 'REGISTER_PAGE_CANVAS'; idx: number; canvas: OffscreenCanvas };
 
 type Msg =
     | InitMsg
@@ -51,7 +56,8 @@ type Msg =
     | ClientRecoverMsg
     | ClientCommandMsg
     | GetCommentsMsg
-    | GetRevisionsMsg;
+    | GetRevisionsMsg
+    | RegisterPageCanvasMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -621,6 +627,28 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
         try {
             const snapshot = engine.comments_snapshot();
             self.postMessage({ id: msg.id, ok: true, comments: snapshot });
+        } catch (e: unknown) {
+            replyError(msg.id, e);
+        }
+        return;
+    }
+
+    /* Phase 6c — multi-canvas registration. Engine's `set_page_canvas`
+       transfers the OffscreenCanvas to a per-page slot; the next paint
+       fills it. */
+    if (msg.type === 'REGISTER_PAGE_CANVAS') {
+        if (!engine) {
+            self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
+            return;
+        }
+        try {
+            engine.set_page_canvas(msg.idx, msg.canvas);
+            self.postMessage({ id: msg.id, ok: true });
+            void dispatch({
+                type: 'REQUEST_PAINT',
+                viewport: { x: 0, y: 0, w: 0, h: 0 },
+                dirty: undefined,
+            }).then((evt) => self.postMessage({ evt }));
         } catch (e: unknown) {
             replyError(msg.id, e);
         }

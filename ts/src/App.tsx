@@ -6,6 +6,7 @@
  * App holds only UI signals. */
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { EditorCanvas } from './components/EditorCanvas';
+import { ExtraPageCanvas } from './components/ExtraPageCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
 import { SelectionOverlay } from './components/SelectionOverlay';
 import { HiddenInput } from './components/HiddenInput';
@@ -166,20 +167,34 @@ export function App() {
             <Toolbar client={client} store={store} />
             <div class="editor-body">
                 <div class="editor-viewport">
-                    <div class="editor-page">
-                        <For each={[canvasGen()]}>
-                            {(generation) => (
-                                <EditorCanvas
-                                    client={client}
-                                    store={store}
-                                    generation={generation}
-                                    onReady={onReady}
-                                />
-                            )}
+                    {/* Phase 6c multi-canvas DOM — one `.editor-page` per
+                        paginated page. Page 0 hosts the boot canvas (the
+                        engine's INIT surface + selection / caret overlays
+                        anchor here). Pages 1+ are independent
+                        `ExtraPageCanvas` elements that transfer a fresh
+                        OffscreenCanvas to the worker via
+                        `engine.set_page_canvas`. DevTools sees each
+                        page as its own DOM node — no more single 30 k-px
+                        canvas hitting Safari's 4 k limit. */}
+                    <div class="editor-pages">
+                        <div class="editor-page" data-page-index="0">
+                            <For each={[canvasGen()]}>
+                                {(generation) => (
+                                    <EditorCanvas
+                                        client={client}
+                                        store={store}
+                                        generation={generation}
+                                        onReady={onReady}
+                                    />
+                                )}
+                            </For>
+                            <SelectionOverlay store={store} />
+                            <CaretOverlay store={store} />
+                            <HiddenInput client={client} store={store} />
+                        </div>
+                        <For each={Array.from({ length: Math.max(0, store.pageCount() - 1) }, (_, i) => i + 1)}>
+                            {(idx) => <ExtraPageCanvas client={client} pageIdx={idx} />}
                         </For>
-                        <SelectionOverlay store={store} />
-                        <CaretOverlay store={store} />
-                        <HiddenInput client={client} store={store} />
                     </div>
                 </div>
                 <TablePanel client={client} store={store} />

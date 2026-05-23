@@ -51,24 +51,35 @@
    `min-height` to the paginator-reported `document_height / dpr` once the
    first paint lands, so a multi-page document grows the container and the
    viewport scrollbar exposes every page. */
+/* Phase 6c — vertical stack of per-page canvases. Each `.editor-page`
+   is one paginated page; `.editor-pages` is the flow column that
+   stacks them with desk-grey gaps between. The gap matches the
+   engine's `PAGE_GAP_PT = 48 pt` at the active `dpr × 4/3 = scale`,
+   so the engine's internal page-top accumulator (used for
+   `HIT_TEST_IN_PAGE` offset math) aligns with the visible CSS
+   inter-page gap. `48 pt / 72 × 96 = 64 CSS px`. */
+.editor-pages {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 64px;
+}
+
 .editor-page {
     position: relative;
     flex: none;
     /* A4 at 96 DPI: 595 pt × (96/72) = 794 px; 842 pt × (96/72) = 1123 px.
-       Engine outputs 1 layout pt = 1 device px at `scale=1`; the TS shell
-       lifts that to CSS-pixel size by multiplying the engine `scale` by
-       `4/3` (see `App.tsx::SCREEN_DPI_SCALE`). Matching the CSS box to
-       the print page's true screen footprint keeps pointer hit-tests
-       round-trip-correct: `pointer.x_css × dpr = engine.device_px`. */
+       Each page is its own DOM element (Phase 6c) so DevTools sees
+       distinct nodes — clicking one in the inspector highlights only
+       that page, never the full document. Multi-page documents grow
+       by mounting more `<canvas>` elements, not by stretching one
+       canvas past the browser's hardware-accelerated size limits
+       (Safari 4096 px, Chrome ~32 k). */
     width: 794px;
-    min-height: 1123px;
-    /* The canvas paints the page cards (white fill + shadow) onto its
-       OWN gray-desk surface, so the wrapping `.editor-page` element no
-       longer needs a white background or a CSS shadow — that would
-       layer over the canvas's print-layout look and leak past the page
-       gaps. Stays `relative` so the caret + selection overlays still
-       anchor against this box. */
-    background: transparent;
+    height: 1123px;
+    background: #ffffff;
+    /* Drop shadow follows the page like a real sheet on a desk. */
+    box-shadow: 0 1px 3px rgba(60, 64, 67, 0.15), 0 4px 16px rgba(60, 64, 67, 0.18);
 }
 
 /* The engine canvas. Fills the A4 page; the backing store is sized to

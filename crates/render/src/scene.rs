@@ -127,6 +127,15 @@ pub fn build_page_scene(page: &PageBox) -> DisplayList {
     build_document_scene(std::slice::from_ref(page), 0.0)
 }
 
+/// Phase 6c multi-canvas refactor — emit one page's scene with its
+/// origin at `(0, 0)` in the target canvas. Used by the per-page
+/// canvas architecture: each `<canvas>` element gets exactly one page
+/// painted into it, so `page_top` accumulation is unnecessary and
+/// hit-testing routes through `page_index + local_coords`.
+pub fn build_single_page_scene(page: &PageBox) -> DisplayList {
+    build_document_scene(std::slice::from_ref(page), 0.0)
+}
+
 /// Vertical gap between consecutive pages, in layout points at `scale = 1`.
 /// `48 pt` × `4/3 screen-DPI scale` ≈ 64 CSS px between pages — wide
 /// enough that desk-grey clearly separates one A4 sheet from the next

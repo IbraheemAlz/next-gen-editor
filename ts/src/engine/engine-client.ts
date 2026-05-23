@@ -145,6 +145,20 @@ export class EngineClient {
     }
 
     /**
+     * Phase 6c — multi-canvas DOM architecture. Register a fresh
+     * `OffscreenCanvas` for page `idx`. The TS shell mounts one
+     * `<canvas>` per paginated page; this hands its surface to the
+     * worker so the engine paints each page into its own DOM
+     * element. The next paint fills the registered surface.
+     */
+    async registerPageCanvas(idx: number, canvas: OffscreenCanvas): Promise<void> {
+        const r = await this.send({ type: 'REGISTER_PAGE_CANVAS', idx, canvas }, [
+            canvas as unknown as Transferable,
+        ]);
+        if (!r.ok) throw new Error(r.error);
+    }
+
+    /**
      * Phase 8a — read-only snapshot of every `<w:comment>` + the
      * matching `<w:commentRangeStart>`/`<w:commentRangeEnd>` span. The
      * shell renders these in a sidebar; no canvas overlay (per the

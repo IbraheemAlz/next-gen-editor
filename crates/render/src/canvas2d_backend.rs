@@ -87,12 +87,14 @@ pub fn render_canvas2d(
     resolve_image: impl Fn(&str) -> Option<web_sys::ImageBitmap>,
     clip: Rect,
 ) -> Result<(), JsValue> {
-    /* UI polish — clear the canvas to the "desk" gray Google Docs / Word
-    print-layout use. The page-card command then paints white sheets over
-    this; inter-page gaps and the outer margin show through naturally. */
+    /* Phase 6c multi-canvas — each canvas is exactly one page card.
+    The CSS `.editor-page` element draws the white background + drop
+    shadow; the canvas just paints page content over a transparent
+    surface. Clearing to a colour here would mask the CSS bg's
+    rounded corners / shadow ring; clearing to transparent keeps
+    them visible. */
     let canvas = ctx.canvas();
-    ctx.set_fill_style_str("#e8eaed");
-    ctx.fill_rect(
+    ctx.clear_rect(
         0.0,
         0.0,
         f64::from(canvas.width()),
@@ -141,39 +143,17 @@ pub fn render_canvas2d(
                 }
             }
             DisplayCmd::DrawPageCard { rect } => {
-                /* UI polish — Google Docs / Word print-layout sheet:
-                a white rectangle with a soft drop shadow wrapping all
-                four sides so each card reads as a distinct A4 sheet
-                floating on the gray desk. `save` / `restore` brackets
-                so the shadow state does NOT leak into the subsequent
-                text + glyph draws (Canvas2D's `shadow*` properties
-                apply to every fill/stroke until reset, which would
-                halo every glyph).
-
-                Two-pass shadow stack: a strong, tight blur (offset_y=0)
-                gives the sharp edge ring; a wider, lower-opacity blur
-                with offset_y=12 carries the "weight" of the page down
-                into the desk. Both shadow draws emit a single white
-                fill_rect each, so we pay just 2 extra fills per card.
-                Shadow units are device px — the canvas backing scales
-                with `scale = dpr * 4/3`, so the values below get the
-                same screen-DPI lift as everything else. */
-                ctx.save();
-                /* Pass 1 — tight edge ring on all four sides. */
-                ctx.set_shadow_color("rgba(60, 64, 67, 0.20)");
-                ctx.set_shadow_blur(8.0);
-                ctx.set_shadow_offset_x(0.0);
-                ctx.set_shadow_offset_y(0.0);
+                /* Phase 6c multi-canvas — the page card's white fill +
+                drop shadow are now drawn by the wrapping
+                `.editor-page` CSS element (each page is its own DOM
+                node). The canvas paints content over a transparent
+                surface; we still emit a white fill here as a safety
+                net in case the CSS bg ever fails to apply. No
+                shadow — Canvas2D's `shadow*` would blur outside the
+                canvas bounds (which are sized exactly to the page)
+                and clip invisibly. */
                 ctx.set_fill_style_str("#ffffff");
                 ctx.fill_rect(rect.x0, rect.y0, rect.width(), rect.height());
-                /* Pass 2 — wider, softer "ambient" shadow falling down
-                into the desk; layered on top of the existing white
-                fill so the underside of the card has extra weight. */
-                ctx.set_shadow_color("rgba(60, 64, 67, 0.18)");
-                ctx.set_shadow_blur(32.0);
-                ctx.set_shadow_offset_y(12.0);
-                ctx.fill_rect(rect.x0, rect.y0, rect.width(), rect.height());
-                ctx.restore();
             }
             DisplayCmd::DrawImage { rect, rel_id } => {
                 /* Phase 7 — inline image. If the worker has already

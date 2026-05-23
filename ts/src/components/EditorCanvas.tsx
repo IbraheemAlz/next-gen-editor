@@ -63,30 +63,22 @@ export function EditorCanvas(props: EditorCanvasProps) {
         resizeObserver.observe(canvas);
 
         /* §7 — pointer → engine hit-testing. Pointer events still fire on a
-           canvas whose drawing surface has been transferred to the worker. */
-        detachPointer = attachPointer(canvas, props.client);
+           canvas whose drawing surface has been transferred to the worker.
+           Phase 6c — page 0; clicks dispatch `HIT_TEST_IN_PAGE { page: 0 }`. */
+        detachPointer = attachPointer(canvas, props.client, 0);
     });
 
-    /* Phase 6b — mirror the engine's paginated `document_height` into the
-       containing `.editor-page` element's `min-height`. The canvas itself
-       is `height: 100%` and fills the page, so growing the page grows the
-       canvas; the `editor-viewport` (the page's scrollable parent) then
-       exposes the rest through its scrollbar. Engine height is device px
-       at the current DPR; CSS divides by `devicePixelRatio`. The
-       OffscreenCanvas backing store is resized worker-side on the same
-       paint. */
+    /* Phase 6c — multi-canvas DOM: each `.editor-page` element keeps its
+       fixed A4 dimensions (CSS `width: 794px; min-height: 1123px`),
+       and the canvas inside fills it. No more growing `min-height`
+       per paginated page — multi-page documents grow by mounting
+       more `<canvas>` elements (see `ExtraPageCanvas`), not by
+       stretching one. The `documentHeight` signal is now informational
+       only (telemetry, scroll bookkeeping). */
     createEffect(() => {
-        const c = canvasRef;
-        if (!c) return;
-        const page = c.parentElement;
-        if (!page) return;
-        const dpr = window.devicePixelRatio || 1;
-        const h = props.store.documentHeight();
-        if (h > 0) {
-            const cssH = Math.ceil(h / dpr);
-            page.style.minHeight = `${cssH}px`;
-            c.style.height = `${cssH}px`;
-        }
+        /* read-only subscription so the canvas mounts react to layout
+           reconfigurations triggered by section changes. No-op body. */
+        void props.store.documentHeight();
     });
 
     onCleanup(() => {

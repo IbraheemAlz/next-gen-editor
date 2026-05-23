@@ -139,6 +139,15 @@ struct RunGeom {
 
 #[wasm_bindgen]
 pub struct Engine {
+    /// Phase 6c multi-canvas refactor — one entry per page (`None` for
+    /// pages whose TS-side canvas has not been transferred yet). Index
+    /// `0` is the boot canvas; later indexes are filled by
+    /// `set_page_canvas` as the TS shell mounts more `<canvas>`
+    /// elements for additional pages.
+    page_ctxs: Vec<Option<OffscreenCanvasRenderingContext2d>>,
+    /// Legacy accessor — `page_ctxs[0]` for backwards compatibility
+    /// with code paths that still expect the single-canvas world.
+    /// Internal mirror only; never set independently.
     ctx: Option<OffscreenCanvasRenderingContext2d>,
     fonts: HashMap<String, Arc<LoadedFont>>,
     undo: UndoStack,
@@ -198,7 +207,9 @@ fn assemble_engine(
     ctx: Option<OffscreenCanvasRenderingContext2d>,
     vello: Option<VelloRenderer>,
 ) -> Engine {
+    let page_ctxs = vec![ctx.clone()];
     Engine {
+        page_ctxs,
         ctx,
         fonts: HashMap::new(),
         undo: UndoStack::new(DocumentTree::new(), 100),
@@ -265,6 +276,33 @@ impl Engine {
     /// DPR change without leaking).
     pub fn register_image(&mut self, rel_id: String, bitmap: web_sys::ImageBitmap) {
         self.image_cache.insert(rel_id, bitmap);
+    }
+
+    /// Phase 6c — multi-canvas DOM refactor. Register an `OffscreenCanvas`
+    /// for page `idx`. The TS shell calls this whenever it mounts a new
+    /// `<canvas>` for a paginated page, transferring the surface to the
+    /// worker so each page draws into its own DOM element. The
+    /// previous single-canvas architecture grew one giant canvas as the
+    /// document grew, hitting Safari's 4096 px and Chrome's 32 k height
+    /// limits on long documents.
+    pub fn set_page_canvas(
+        &mut self,
+        idx: u32,
+        canvas: web_sys::OffscreenCanvas,
+    ) -> Result<(), JsValue> {
+        let ctx_obj = canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("OffscreenCanvas 2d context unavailable"))?;
+        let ctx: OffscreenCanvasRenderingContext2d = ctx_obj.dyn_into()?;
+        let target = idx as usize;
+        while self.page_ctxs.len() <= target {
+            self.page_ctxs.push(None);
+        }
+        self.page_ctxs[target] = Some(ctx);
+        if target == 0 {
+            self.ctx = self.page_ctxs[0].clone();
+        }
+        Ok(())
     }
 
     /// Last `render_document` output dimensions, exposed so the worker
@@ -2387,6 +2425,7 @@ impl Engine {
 
             // Phase 4 — PHASE_4_HEADLESS_UI.md §7. Additive pointer commands.
             Command::HitTest { at } => self.do_hit_test(at),
+            Command::HitTestInPage { page, at } => self.do_hit_test_in_page(page, at),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
             Command::SelectParagraphAt { at } => self.do_select_paragraph_at(at),
             Command::DeleteAtCaret { forward, by_word } => {
@@ -3063,57 +3102,47 @@ impl Engine {
             return Ok(stats);
         }
 
-        /* Canvas2D path — clipped to the dirty region (D3.8). */
-        let total_h: f32 = if pages.is_empty() {
-            0.0
-        } else {
-            pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap
-        };
-        let widest: f32 = pages.iter().map(|p| p.size.width).fold(0.0_f32, f32::max);
-        let ctx = match &self.ctx {
-            Some(c) => c.clone(),
-            None => {
+        /* Canvas2D path — Phase 6c multi-canvas architecture. Each page
+        gets its own `<canvas>` element (registered by the TS shell via
+        `set_page_canvas`); we paint each page into ITS canvas at local
+        origin `(0, 0)`. No more single-canvas-grows-unbounded — a
+        50-page document is 50 canvases of `~1190 × 1684` device px,
+        each well inside Safari's 4096 / Chrome's 32 k size limits.
+        Pages whose canvas hasn't been registered yet (TS shell racing
+        the engine's page count) silently skip; the next paint after
+        registration picks them up. */
+        let _ = clip;
+        let image_cache = &self.image_cache;
+        for (idx, page) in pages.iter().enumerate() {
+            let Some(ctx_opt) = self.page_ctxs.get(idx) else {
+                continue;
+            };
+            let Some(ctx) = ctx_opt.clone() else {
+                continue;
+            };
+            let page_scene = render::scene::build_single_page_scene(page);
+            let canvas = ctx.canvas();
+            let want_w = page.size.width.max(1.0).ceil() as u32;
+            let want_h = page.size.height.max(1.0).ceil() as u32;
+            if canvas.width() != want_w {
+                canvas.set_width(want_w);
+            }
+            if canvas.height() != want_h {
+                canvas.set_height(want_h);
+            }
+            let clip_rect = Rect::new(0.0, 0.0, f64::from(want_w), f64::from(want_h));
+            if let Err(e) = render_canvas2d(
+                &ctx,
+                &page_scene,
+                &mut self.atlas,
+                |id| self.fonts.get(id).cloned(),
+                |rel| image_cache.get(rel).cloned(),
+                clip_rect,
+            ) {
                 return Err(Box::new(Event::Error {
-                    message: "no canvas".into(),
+                    message: format!("paint page {idx}: {e:?}"),
                 }));
             }
-        };
-        /* Phase 6b — resize the `OffscreenCanvas` backing store so every
-        paginated page lives in the visible draw area. The main thread
-        sets a matching CSS height so the browser scrollbar exposes them.
-        Resizing the canvas clears its 2D context to transparent — so on
-        any resize this paint must cover the FULL canvas, otherwise the
-        caller's stale dirty-region clip culls every glyph outside it
-        and the page goes blank. */
-        let canvas = ctx.canvas();
-        let want_w = widest.max(1.0).ceil() as u32;
-        let want_h = total_h.max(1.0).ceil() as u32;
-        let did_resize = canvas.width() != want_w || canvas.height() != want_h;
-        if canvas.width() != want_w {
-            canvas.set_width(want_w);
-        }
-        if canvas.height() != want_h {
-            canvas.set_height(want_h);
-        }
-        let clip_rect = if did_resize {
-            /* Resize invalidated everything — ignore the caller's dirty
-            region and repaint the whole canvas. */
-            Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h))
-        } else {
-            clip.unwrap_or_else(|| Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h)))
-        };
-        let image_cache = &self.image_cache;
-        if let Err(e) = render_canvas2d(
-            &ctx,
-            &scene,
-            &mut self.atlas,
-            |id| self.fonts.get(id).cloned(),
-            |rel| image_cache.get(rel).cloned(),
-            clip_rect,
-        ) {
-            return Err(Box::new(Event::Error {
-                message: format!("paint: {e:?}"),
-            }));
         }
 
         self.last_paint_dims = (stats.document_height, stats.page_count);
@@ -3236,11 +3265,44 @@ impl Engine {
     }
 
     /// `Command::HitTest` — pixel → logical position. A pure query; the
-    /// selection is not mutated.
+    /// selection is not mutated. Coords are in absolute document-device
+    /// pixels (the legacy single-canvas convention). For the Phase 6c
+    /// multi-canvas DOM architecture, the TS shell uses the page-aware
+    /// path below.
     fn do_hit_test(&self, at: BridgePoint) -> Event {
         match self.document_geometry() {
             Ok(geom) => Event::HitResult {
                 pos: hit_test_geom(&geom, at.x, at.y),
+            },
+            Err(e) => *e,
+        }
+    }
+
+    /// Phase 6c — `Command::HitTestInPage` — pixel → logical position with
+    /// the click expressed in the clicked page's LOCAL device-pixel
+    /// coordinates (origin at the page's top-left). The engine adds the
+    /// page's accumulated top offset in document space and calls the
+    /// same geometry walker. Lets the multi-canvas TS shell route
+    /// pointer events from N independent `<canvas>` elements without
+    /// any TS-side offset math.
+    fn do_hit_test_in_page(&self, page_idx: u32, at: BridgePoint) -> Event {
+        let scale = self.scale();
+        let gap = render::scene::PAGE_GAP_PT * scale;
+        let (pages, _, _) = match self.build_pages(scale, false) {
+            Ok(v) => v,
+            Err(e) => return *e,
+        };
+        let mut page_top: f32 = 0.0;
+        for (i, page) in pages.iter().enumerate() {
+            if i as u32 == page_idx {
+                break;
+            }
+            page_top += page.size.height + gap;
+        }
+        let global_y = at.y + page_top;
+        match self.document_geometry() {
+            Ok(geom) => Event::HitResult {
+                pos: hit_test_geom(&geom, at.x, global_y),
             },
             Err(e) => *e,
         }
@@ -4196,6 +4258,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn ping_pong_round_trip() {
         let mut engine = Engine {
+            page_ctxs: Vec::new(),
             ctx: None,
             fonts: HashMap::new(),
             undo: UndoStack::new(DocumentTree::new(), 8),
