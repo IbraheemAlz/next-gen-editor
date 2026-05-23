@@ -28,9 +28,22 @@ impl RendererBackend {
 /// Detect the best available backend from inside a Web Worker.
 ///
 /// Worker-safe by construction — uses `js_sys::global()` rather than
-/// `web_sys::window()` (which is `None` in a Worker). Returns
-/// [`RendererBackend::Vello`] only when a GPU device is successfully
-/// acquired; otherwise [`RendererBackend::Canvas2d`].
+/// `web_sys::window()` (which is `None` in a Worker).
+///
+/// **CLAUDE.md invariant**: "Canvas2D remains the active renderer." The
+/// Vello/WebGPU path is plumbed end-to-end and the `wgpu` + `vello` stack
+/// is reachable so the linker retains them (true WASM size stays
+/// observable). The path is intentionally **not** selected for the
+/// interactive editor yet — Vello's `render_document` does not call
+/// `OffscreenCanvas::set_width`/`set_height` to resize the backing store
+/// for multi-page documents, paints inline images as placeholders only,
+/// and skips the dirty-region clip optimisation. Selecting it here gives
+/// a 300×150-defaulted canvas with squashed unreadable text the moment
+/// content exceeds one page (the real-world Phase 6 multi-page bug). The
+/// Vello activation work is tracked as Backlog #4 / `BACKLOG.md` § Vello
+/// renderer; until that closes, Canvas2D is the right pick. The wgpu
+/// device probe is kept (commented inline) for documentation but no
+/// longer drives the return value.
 pub async fn detect_backend() -> RendererBackend {
     /* Confirm we are in a Worker scope — never touch `web_sys::window()`. */
     if js_sys::global()
@@ -39,15 +52,19 @@ pub async fn detect_backend() -> RendererBackend {
     {
         return RendererBackend::Canvas2d;
     }
-    if request_gpu_device().await {
-        RendererBackend::Vello
-    } else {
-        RendererBackend::Canvas2d
-    }
+    /* Until Backlog #4 lands, Canvas2D is the contract:
+       `let _have_gpu = request_gpu_device().await;` (probe kept reachable
+       in the rendered binary by `Engine::with_vello` + the harness path —
+       this function no longer gates on it). */
+    RendererBackend::Canvas2d
 }
 
 /// Try to acquire a WebGPU adapter + device via `wgpu`. `wgpu`'s WebGPU
 /// backend reads `navigator.gpu` from the current (worker) global scope.
+///
+/// Kept reachable for Backlog #4 (Vello activation); `detect_backend`
+/// no longer calls it.
+#[allow(dead_code)]
 async fn request_gpu_device() -> bool {
     let instance = wgpu::Instance::default();
     let adapter = match instance
