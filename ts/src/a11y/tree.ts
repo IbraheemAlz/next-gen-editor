@@ -1,16 +1,22 @@
-/* Phase 4 §10 / Backlog #10 — accessibility mirror reconciler.
+/* Phase 4 §10 / Backlog #10 / Phase 5 PR 3b — accessibility mirror reconciler.
  *
  * Applies the engine's incremental `A11yPatch` stream to the visually-hidden
  * mirror DOM. Before deltas, every keystroke rebuilt the whole `<p>` list, so
  * the browser recomputed the accessibility tree for the entire document. Now a
- * keystroke patches exactly one `<p>`, and the browser only re-derives a11y
+ * keystroke patches exactly one node, and the browser only re-derives a11y
  * for that node.
+ *
+ * Phase 5 PR 3b: nodes are now `A11yNode` (`Paragraph | Table`), not flat
+ * paragraphs. Tables render as `<table role="table">` with `<tr role="row">`
+ * and `<td role="gridcell" aria-rowspan aria-colspan>`. Continue-rows of a
+ * vMerge span are not emitted — the Restart cell carries the resolved
+ * `aria-rowspan`.
  *
  * The reconciler owns `root`'s children outright — Solid renders `root` as a
  * bare `ref` host and never touches what is inside it. Patches are positional:
  * the engine's prefix/suffix diff emits Updates first, then either Inserts
  * (ascending index) or Removes, so applying them in array order is correct. */
-import type { A11yParagraph, A11yPatch, A11yRun } from '../engine/types';
+import type { A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRun } from '../engine/types';
 
 /** Inline CSS for a run, so a screen reader can announce its formatting. */
 function runStyle(r: A11yRun): string {
@@ -22,12 +28,9 @@ function runStyle(r: A11yRun): string {
 }
 
 /** Build the `<p>` element for one accessibility paragraph. */
-function buildParagraph(p: A11yParagraph, index: number): HTMLParagraphElement {
+function buildParagraph(p: A11yParagraph): HTMLParagraphElement {
     const el = document.createElement('p');
     el.dir = p.direction === 'Rtl' ? 'rtl' : 'ltr';
-    /* Positional, not a stable id — a debugging aid for the DevTools a11y
-       inspector; the reconciler itself addresses paragraphs by child index. */
-    el.dataset.pid = String(index);
     for (const run of p.runs) {
         const span = document.createElement('span');
         const style = runStyle(run);
@@ -36,6 +39,54 @@ function buildParagraph(p: A11yParagraph, index: number): HTMLParagraphElement {
         el.appendChild(span);
     }
     return el;
+}
+
+/** Build a `<td role="gridcell">` for one cell, recursing on nested nodes. */
+function buildCell(cell: A11yCell): HTMLTableCellElement {
+    const td = document.createElement('td');
+    td.setAttribute('role', 'gridcell');
+    if (cell.row_span > 1) td.setAttribute('aria-rowspan', String(cell.row_span));
+    if (cell.col_span > 1) td.setAttribute('aria-colspan', String(cell.col_span));
+    td.dataset.row = String(cell.row);
+    td.dataset.col = String(cell.col);
+    for (const child of cell.nodes) td.appendChild(buildNode(child));
+    return td;
+}
+
+/** Build the `<table role="table">` element for one accessibility table. */
+function buildTable(node: Extract<A11yNode, { kind: 'TABLE' }>): HTMLTableElement {
+    const el = document.createElement('table');
+    el.setAttribute('role', 'table');
+    el.dataset.blockIndex = String(node.block_index);
+    const tbody = document.createElement('tbody');
+    for (const row of node.rows) {
+        const tr = document.createElement('tr');
+        tr.setAttribute('role', 'row');
+        for (const cell of row.cells) tr.appendChild(buildCell(cell));
+        tbody.appendChild(tr);
+    }
+    el.appendChild(tbody);
+    return el;
+}
+
+/** Dispatch on `A11yNode.kind` — single entry point for builders + recursion. */
+function buildNode(node: A11yNode): HTMLElement {
+    if (node.kind === 'TABLE') return buildTable(node);
+    return buildParagraph(node);
+}
+
+/** Refresh top-level positional indices after a structural shift. */
+function reindex(root: HTMLElement): void {
+    for (let i = 0; i < root.children.length; i++) {
+        const child = root.children[i];
+        if (child instanceof HTMLElement) child.dataset.pid = String(i);
+    }
+}
+
+/** Stamp `data-pid` on `node` for the DevTools inspector. */
+function stampPid(node: HTMLElement, index: number): HTMLElement {
+    node.dataset.pid = String(index);
+    return node;
 }
 
 export interface A11yReconciler {
@@ -47,35 +98,26 @@ export interface A11yReconciler {
  * Create a reconciler bound to `root` — the `.a11y-mirror` container.
  */
 export function createA11yReconciler(root: HTMLElement): A11yReconciler {
-    /* `data-pid` is positional; refresh it after a structural shift so the
-       inspector keeps reading true indices. */
-    const reindex = (): void => {
-        for (let i = 0; i < root.children.length; i++) {
-            const child = root.children[i];
-            if (child instanceof HTMLElement) child.dataset.pid = String(i);
-        }
-    };
-
     const apply = (patches: A11yPatch[]): void => {
         let shifted = false;
         for (const patch of patches) {
             switch (patch.type) {
                 case 'REPLACE': {
                     root.replaceChildren(
-                        ...patch.tree.paragraphs.map((p, i) => buildParagraph(p, i)),
+                        ...patch.tree.nodes.map((n, i) => stampPid(buildNode(n), i)),
                     );
                     break;
                 }
                 case 'UPDATE': {
                     const target = root.children[patch.index];
                     if (target) {
-                        target.replaceWith(buildParagraph(patch.paragraph, patch.index));
+                        target.replaceWith(stampPid(buildNode(patch.node), patch.index));
                     }
                     break;
                 }
                 case 'INSERT': {
                     const before = root.children[patch.index] ?? null;
-                    root.insertBefore(buildParagraph(patch.paragraph, patch.index), before);
+                    root.insertBefore(stampPid(buildNode(patch.node), patch.index), before);
                     shifted = true;
                     break;
                 }
@@ -86,7 +128,7 @@ export function createA11yReconciler(root: HTMLElement): A11yReconciler {
                 }
             }
         }
-        if (shifted) reindex();
+        if (shifted) reindex(root);
     };
 
     return { apply };

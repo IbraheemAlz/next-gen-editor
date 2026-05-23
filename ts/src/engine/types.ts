@@ -5,11 +5,19 @@
  * standalone). Re-exporting them here keeps the deep `../../../crates/...`
  * relative path in one place — UI code imports from `../engine/types`. */
 export type {
+    A11yCell,
+    A11yNode,
     A11yParagraph,
     A11yPatch,
+    A11yRow,
     A11yRun,
+    A11yTable,
     A11yTree,
     Alignment,
+    BlockPath,
+    BridgeBorderStroke,
+    BridgeBorderStyle,
+    BridgeCellBorders,
     ClientCapabilities,
     Color,
     Command,
@@ -25,6 +33,7 @@ export type {
     LogicalRange,
     MoveDirection,
     ParagraphId,
+    PathStep,
     PdfConformance,
     Point,
     Rect,

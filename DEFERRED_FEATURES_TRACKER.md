@@ -20,20 +20,35 @@ DOM components plus the bridge wire shapes that the UI needs.
 
 ### TS shell — table UI
 
-- [ ] **"Insert Table" toolbar button.** Spawns a rows×cols picker
+- [x] **"Insert Table" toolbar button.** Spawns a rows×cols picker
       grid, fires `Command::InsertTable { at, rows, cols }` at the
       current caret block. *Depends on:* nothing — the bridge command
-      ships in PR 3.
+      ships in PR 3. *Landed:* PR 3b — 8×8 hover picker; `at` is
+      `BlockPath::top(caret.para + 1)` so the table lands right
+      after the caret's paragraph (paragraph-flat addressing — the
+      common case until the `BlockPath` migration).
 - [ ] **Cell context menu.** Right-click inside a cell exposes Insert
       Row Above / Below, Insert Column Left / Right, Delete Row,
       Delete Column, Merge Cells, Split Cell, Cell Shading, Cell
       Borders. *Depends on:* hit-test recognising "click landed in
       cell `(r, c)` of table at `BlockPath::top(N)`" — see §4.
-- [ ] **Table-properties side panel.** Width, alignment, indent,
-      table-wide borders. *Depends on:* a `Command::SetTableProperties`
-      bridge wrapper (not yet defined; trivial additive).
+      *PR 3b lands the side-panel surface (next bullet) — the
+      right-click context menu still needs the BlockPath caret.*
+- [x] **Table-properties side panel.** Width, alignment, indent,
+      table-wide borders. *Landed in PR 3b* as `TablePanel.tsx`:
+      lists every table from the a11y stream, exposes insert/delete
+      row & column, merge / split, cell shading and per-edge
+      borders. `Command::SetTableProperties` (table-wide width /
+      alignment / indent) is still pending — additive when needed.
 
 ### Cell-rectangular selection + cell navigation
+
+> *PR 3b dependency check (2026-05-23):* every bullet in this
+> subsection requires `LogicalPos` to address a cell — currently it
+> is paragraph-flat and skips tables, so a caret physically cannot
+> sit inside a cell. Pulled forward to **§2 (Phase 5 PR 4 —
+> `BlockPath` migration)**; cell selection + Tab navigation land
+> after PR 4.
 
 - [ ] **`SelectionKind::TableCells` end-to-end.** Bridge schema
       change to widen `Selection` with a `kind` field +
@@ -54,12 +69,16 @@ DOM components plus the bridge wire shapes that the UI needs.
 
 ### A11y — fine-grained patches
 
-- [ ] **Full nested `<table><tr><td>` tree in `A11yTree`.**
+- [x] **Full nested `<table><tr><td>` tree in `A11yTree`.**
       `A11yNode { Paragraph, Table }` enum widening per RFC §4.3.
       Tables emit `role="table"` with `<tr role="row">` and
       `<td role="gridcell">`; `aria-rowspan` / `aria-colspan` from
-      `vMerge` / `gridSpan`. *Currently:* PR 3 emits a single
-      placeholder `<p>[table]</p>` per table. *Depends on:* nothing.
+      `vMerge` / `gridSpan`. *Landed in PR 3b* — `A11yTree.nodes`
+      replaces the flat `paragraphs` list, the reconciler in
+      `ts/src/a11y/tree.ts` builds `<table>` / `<tr>` / `<td>` from
+      `A11yTable` / `A11yRow` / `A11yCell`; Continue cells are
+      suppressed and the Restart cell carries the resolved
+      `aria-rowspan`.
 - [ ] **`AccessibilityTreeDelta` fine-grained patches.** New variants
       `UpdateCell`, `InsertNode`, `DeleteNode` per RFC §4.3. PR 3
       keeps whole-tree replacement. *Depends on:* the bullet above.
@@ -70,10 +89,15 @@ DOM components plus the bridge wire shapes that the UI needs.
 
 ### Bridge wire shapes blocking commands
 
-- [ ] **`BridgeCellBorders` + `BridgeBorderStroke` mirror enums.**
+- [x] **`BridgeCellBorders` + `BridgeBorderStroke` mirror enums.**
       Activates the `Command::SetCellBorders` wire path. Engine
       method `set_cell_borders` already ships in PR 3.
-      *Depends on:* nothing — additive `tsify-next` enums.
+      *Landed in PR 3b* — bridge ships `BridgeCellBorders`,
+      `BridgeBorderStroke`, `BridgeBorderStyle`; engine-wasm wires
+      `Command::SetCellBorders { table_path, row, col, borders }`
+      onto `set_cell_borders`. `inside_h` / `inside_v` are not on
+      the wire (table-level only — table-wide borders land with
+      the `SetTableProperties` wrapper above).
 - [ ] **`Command::SetTableProperties` wrapper.** Wire-shape for
       table-wide width / alignment / indent / borders (today only
       cell-level shading + borders are exposed). *Depends on:*

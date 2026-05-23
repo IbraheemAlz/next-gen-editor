@@ -212,9 +212,21 @@ pub struct EngineStats {
 /// A full accessibility snapshot of the document — the structure mirrored into
 /// the screen-reader DOM (PHASE_4_HEADLESS_UI.md §10). Carried by the
 /// `A11yPatch::Replace` reset patch.
+///
+/// Phase 5 PR 3b: widened from a flat `paragraphs` list to a node list so a
+/// table can appear inline with paragraphs. Cells nest further `nodes` —
+/// recursive in shape; PR 3b only emits paragraphs inside cells.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 pub struct A11yTree {
-    pub paragraphs: Vec<A11yParagraph>,
+    pub nodes: Vec<A11yNode>,
+}
+
+/// A top-level (or nested) accessibility node — a paragraph or a table.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum A11yNode {
+    Paragraph(A11yParagraph),
+    Table(A11yTable),
 }
 
 /// One paragraph in the accessibility tree — a `<p>` in the mirror DOM.
@@ -237,9 +249,40 @@ pub struct A11yRun {
     pub underline: bool,
 }
 
+/// Table node — mirrored as `<table role="table">` in the DOM. PR 3b
+/// keeps the block-level position (top-level index) as the addressing
+/// scheme; nested-table support lands with the `BlockPath` migration.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct A11yTable {
+    /// Top-level block index of this table — pinned to its position in
+    /// the document `Vec<Block>` so the TS shell can target it by
+    /// `BlockPath::top(block_index)` for table mutations.
+    pub block_index: u32,
+    pub rows: Vec<A11yRow>,
+}
+
+/// Row in a table — `<tr role="row">`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct A11yRow {
+    pub cells: Vec<A11yCell>,
+}
+
+/// Cell in a row — `<td role="gridcell">`. `row_span` / `col_span` are
+/// resolved at build time from `vMerge` / `gridSpan` so the DOM can stamp
+/// `aria-rowspan` / `aria-colspan` directly. PR 3b emits paragraphs
+/// only; the recursive `nodes` slot allows nested tables (Phase 5b).
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct A11yCell {
+    pub row: u32,
+    pub col: u32,
+    pub row_span: u32,
+    pub col_span: u32,
+    pub nodes: Vec<A11yNode>,
+}
+
 /// One incremental patch to the mirrored accessibility tree (Backlog #10).
 ///
-/// Patches in a delta apply in order against the current paragraph list:
+/// Patches in a delta apply in order against the current node list:
 /// every `Update` first, then either the `Insert`s (ascending index) or the
 /// `Remove`s — a prefix/suffix diff only ever grows or shrinks one contiguous
 /// region, so a single delta never mixes inserts and removes.
@@ -250,17 +293,11 @@ pub enum A11yPatch {
     /// engine instance (boot or post-recovery), where there is no prior tree
     /// to diff against.
     Replace { tree: A11yTree },
-    /// Replace the paragraph at `index` in place — its text or style changed
-    /// (the common case: a keystroke lands in one paragraph).
-    Update {
-        index: u32,
-        paragraph: A11yParagraph,
-    },
-    /// Insert a new paragraph at `index`, shifting later paragraphs down.
-    Insert {
-        index: u32,
-        paragraph: A11yParagraph,
-    },
-    /// Remove the paragraph at `index`, shifting later paragraphs up.
+    /// Replace the node at `index` in place — its content or structure
+    /// changed (the common case: a keystroke lands in one paragraph).
+    Update { index: u32, node: A11yNode },
+    /// Insert a new node at `index`, shifting later nodes down.
+    Insert { index: u32, node: A11yNode },
+    /// Remove the node at `index`, shifting later nodes up.
     Remove { index: u32 },
 }

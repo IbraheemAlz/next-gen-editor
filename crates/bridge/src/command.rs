@@ -322,6 +322,48 @@ pub enum Command {
         col: u32,
         color: Option<Color>,
     },
+    /// Phase 5 PR 3b — set the per-edge border strokes of one cell. Any
+    /// unset edge clears that edge; the cell-level enum has no
+    /// `inside_h` / `inside_v` (those apply only at table level).
+    SetCellBorders {
+        table_path: BlockPath,
+        row: u32,
+        col: u32,
+        borders: BridgeCellBorders,
+    },
+}
+
+/// Wire shape for `engine::CellBorders` — per-edge strokes for one
+/// cell. Phase 5 PR 3b: cell-level only; the `inside_*` edges apply
+/// only at table level and have no wire path yet.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+pub struct BridgeCellBorders {
+    pub top: Option<BridgeBorderStroke>,
+    pub left: Option<BridgeBorderStroke>,
+    pub bottom: Option<BridgeBorderStroke>,
+    pub right: Option<BridgeBorderStroke>,
+}
+
+/// Wire shape for `engine::BorderStroke` — one edge. `size_eighth_pt`
+/// is `<w:sz>` (eighths of a point, OOXML unit). `color: None` →
+/// inherit from style.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+pub struct BridgeBorderStroke {
+    pub style: BridgeBorderStyle,
+    pub size_eighth_pt: u16,
+    pub color: Option<Color>,
+}
+
+/// Wire shape for `engine::BorderStyle`. PR 3b ships the common
+/// subset; round-tripped exotic styles stay engine-side.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default)]
+pub enum BridgeBorderStyle {
+    #[default]
+    Single,
+    Double,
+    Dotted,
+    Dashed,
+    None,
 }
 
 /// Browser/runtime capabilities advertised to the engine at `Init`.

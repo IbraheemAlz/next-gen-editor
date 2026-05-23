@@ -5,8 +5,9 @@
 //! repaint when a layout config was cached by a prior `RenderPage`.
 
 use bridge::{
-    A11yParagraph, A11yPatch, A11yRun, A11yTree, Alignment as BridgeAlignment, Color, Command,
-    Direction, EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
+    A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRow, A11yRun, A11yTable, A11yTree,
+    Alignment as BridgeAlignment, Color, Command, Direction, EngineStats, Event,
+    FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
     LogicalRange as BridgeLogicalRange, MoveDirection, PdfConformance, Point as BridgePoint,
     Rect as BridgeRect, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
@@ -139,7 +140,7 @@ pub struct Engine {
     /// keystroke emits only the changed paragraph. `None` until the first
     /// delta — that one is a full `Replace`, so a fresh engine after crash
     /// recovery hands the mirror a clean rebuild.
-    a11y_cache: Option<Vec<A11yParagraph>>,
+    a11y_cache: Option<Vec<A11yNode>>,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -1048,25 +1049,103 @@ fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
     runs
 }
 
-/// Diff two accessibility paragraph lists into the minimal patch set (Backlog
+/// Build the accessibility node for one top-level block.
+/// Paragraphs map to `A11yNode::Paragraph`; tables walk rows and cells,
+/// resolving `<w:gridSpan>` → `col_span` and counting consecutive
+/// `VMergeRole::Continue` rows below a `Restart` cell → `row_span`.
+fn build_a11y_block(block: &engine::Block, block_index: u32, direction: Direction) -> A11yNode {
+    match block {
+        engine::Block::Paragraph(p) => A11yNode::Paragraph(A11yParagraph {
+            direction,
+            runs: a11y_runs(p),
+        }),
+        engine::Block::Table(t) => A11yNode::Table(build_a11y_table(t, block_index, direction)),
+    }
+}
+
+fn build_a11y_table(t: &engine::Table, block_index: u32, direction: Direction) -> A11yTable {
+    /* Pre-compute vMerge row spans: for every (r, c) that is a Restart,
+    count the run of Continue rows directly below at the same column.
+    Continue cells are skipped from the DOM — the Restart cell carries
+    the span. */
+    let n_rows = t.rows.len();
+    let row_span_for = |r: usize, c: usize| -> u32 {
+        let mut span = 1u32;
+        let mut k = r + 1;
+        while k < n_rows
+            && t.rows[k]
+                .cells
+                .get(c)
+                .map(|cell| cell.props.v_merge == engine::VMergeRole::Continue)
+                .unwrap_or(false)
+        {
+            span += 1;
+            k += 1;
+        }
+        span
+    };
+
+    let mut rows: Vec<A11yRow> = Vec::with_capacity(t.rows.len());
+    for (r, row) in t.rows.iter().enumerate() {
+        let mut out_cells: Vec<A11yCell> = Vec::with_capacity(row.cells.len());
+        for (c, cell) in row.cells.iter().enumerate() {
+            /* Continue rows are visually owned by the Restart above —
+            skip from the a11y tree so screen readers don't read them
+            twice. */
+            if cell.props.v_merge == engine::VMergeRole::Continue {
+                continue;
+            }
+            let col_span = cell.props.grid_span.max(1) as u32;
+            let row_span = if cell.props.v_merge == engine::VMergeRole::Restart {
+                row_span_for(r, c)
+            } else {
+                1
+            };
+            /* PR 3b: cell paragraphs become paragraphs; nested tables
+            stay flat (recursive descent is PR 4). */
+            let nodes: Vec<A11yNode> = cell
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    engine::Block::Paragraph(p) => Some(A11yNode::Paragraph(A11yParagraph {
+                        direction,
+                        runs: a11y_runs(p),
+                    })),
+                    engine::Block::Table(_) => None,
+                })
+                .collect();
+            out_cells.push(A11yCell {
+                row: r as u32,
+                col: c as u32,
+                row_span,
+                col_span,
+                nodes,
+            });
+        }
+        rows.push(A11yRow { cells: out_cells });
+    }
+    A11yTable { block_index, rows }
+}
+
+/// Diff two accessibility node lists into the minimal patch set (Backlog
 /// #10).
 ///
-/// A prefix/suffix trim: paragraphs equal at the front and back are skipped,
+/// A prefix/suffix trim: nodes equal at the front and back are skipped,
 /// leaving one changed region. Overlapping positions in that region become
 /// `Update`s; then the longer side contributes `Insert`s or `Remove`s — never
 /// both, since trimming leaves a single region that only grows or shrinks.
 /// Typing in paragraph K trims to `{K}` → one `Update`; pressing Enter in K
 /// yields `Update(K)` + `Insert(K+1)`.
-fn diff_a11y(prev: &[A11yParagraph], next: &[A11yParagraph]) -> Vec<A11yPatch> {
+fn diff_a11y(prev: &[A11yNode], next: &[A11yNode]) -> Vec<A11yPatch> {
     let max_common = prev.len().min(next.len());
 
-    /* Common prefix: paragraphs identical from the front. */
+    /* Common prefix: nodes identical from the front. */
     let mut pre = 0;
     while pre < max_common && prev[pre] == next[pre] {
         pre += 1;
     }
 
-    /* Common suffix: paragraphs identical from the back, not overrunning the
+    /* Common suffix: nodes identical from the back, not overrunning the
     prefix already matched on either side. */
     let mut suf = 0;
     while suf < max_common - pre && prev[prev.len() - 1 - suf] == next[next.len() - 1 - suf] {
@@ -1078,26 +1157,26 @@ fn diff_a11y(prev: &[A11yParagraph], next: &[A11yParagraph]) -> Vec<A11yPatch> {
     let overlap = old_mid.len().min(new_mid.len());
 
     let mut patches: Vec<A11yPatch> = Vec::new();
-    /* Overlapping positions: replace where the paragraph actually differs. */
+    /* Overlapping positions: replace where the node actually differs. */
     for (j, (old, new)) in old_mid.iter().zip(new_mid.iter()).enumerate() {
         if old != new {
             patches.push(A11yPatch::Update {
                 index: (pre + j) as u32,
-                paragraph: new.clone(),
+                node: new.clone(),
             });
         }
     }
     /* The longer side: grow with `Insert`s or shrink with `Remove`s. */
     if new_mid.len() > overlap {
-        for (j, para) in new_mid.iter().enumerate().skip(overlap) {
+        for (j, node) in new_mid.iter().enumerate().skip(overlap) {
             patches.push(A11yPatch::Insert {
                 index: (pre + j) as u32,
-                paragraph: para.clone(),
+                node: node.clone(),
             });
         }
     } else {
-        /* Each removal shrinks the list, so the next stale paragraph slides
-        into the same index — remove there repeatedly. */
+        /* Each removal shrinks the list, so the next stale node slides into
+        the same index — remove there repeatedly. */
         for _ in overlap..old_mid.len() {
             patches.push(A11yPatch::Remove {
                 index: (pre + overlap) as u32,
@@ -1308,6 +1387,12 @@ impl Engine {
                 col,
                 color,
             } => self.do_set_cell_shading(table_path, row, col, color),
+            Command::SetCellBorders {
+                table_path,
+                row,
+                col,
+                borders,
+            } => self.do_set_cell_borders(table_path, row, col, borders),
         }
     }
 
@@ -2511,9 +2596,13 @@ impl Engine {
         }
     }
 
-    /// Build the accessibility paragraph list for the current document — every
-    /// paragraph, split into style runs (PHASE_4_HEADLESS_UI.md §10).
-    fn build_a11y_paragraphs(&self) -> Vec<A11yParagraph> {
+    /// Build the accessibility node list for the current document — one node
+    /// per top-level block (PHASE_4_HEADLESS_UI.md §10). Paragraphs emit
+    /// `A11yNode::Paragraph`; tables emit `A11yNode::Table` with resolved
+    /// `rowSpan` / `colSpan` per cell so the DOM can stamp ARIA spans
+    /// directly. Phase 5 PR 3b: nested tables inside cells stay flat — the
+    /// recursive `nodes` slot is empty for nested tables until PR 4.
+    fn build_a11y_nodes(&self) -> Vec<A11yNode> {
         let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
@@ -2522,11 +2611,8 @@ impl Engine {
             .current()
             .blocks
             .iter()
-            .filter_map(engine::Block::as_paragraph)
-            .map(|para| A11yParagraph {
-                direction,
-                runs: a11y_runs(para),
-            })
+            .enumerate()
+            .map(|(block_index, b)| build_a11y_block(b, block_index as u32, direction))
             .collect()
     }
 
@@ -2536,11 +2622,11 @@ impl Engine {
     /// Every later call diffs against the cached tree, so a keystroke that
     /// touches one paragraph emits exactly one `Update`.
     fn build_a11y_delta(&mut self) -> Vec<A11yPatch> {
-        let next = self.build_a11y_paragraphs();
+        let next = self.build_a11y_nodes();
         let patches = match &self.a11y_cache {
             None => vec![A11yPatch::Replace {
                 tree: A11yTree {
-                    paragraphs: next.clone(),
+                    nodes: next.clone(),
                 },
             }],
             Some(prev) => diff_a11y(prev, &next),
@@ -2766,6 +2852,21 @@ impl Engine {
                 .set_cell_shading(bridge_to_engine_path(path), row, col, rgba);
         self.push_table_edit(new_doc)
     }
+    fn do_set_cell_borders(
+        &mut self,
+        path: bridge::BlockPath,
+        row: u32,
+        col: u32,
+        borders: bridge::BridgeCellBorders,
+    ) -> Event {
+        let new_doc = self.undo.current().set_cell_borders(
+            bridge_to_engine_path(path),
+            row,
+            col,
+            bridge_to_engine_borders(borders),
+        );
+        self.push_table_edit(new_doc)
+    }
 
     /// Common tail for every table command — push undo, invalidate +
     /// repaint, fire a SelectionChanged event so the UI re-fetches
@@ -2777,6 +2878,35 @@ impl Engine {
             return *e;
         }
         self.selection_changed()
+    }
+}
+
+/// Bridge `BridgeCellBorders` → engine `CellBorders` (cell-level only;
+/// `inside_h` / `inside_v` are not exposed on the wire — they apply
+/// only at table level).
+fn bridge_to_engine_borders(b: bridge::BridgeCellBorders) -> engine::CellBorders {
+    engine::CellBorders {
+        top: b.top.map(bridge_to_engine_stroke),
+        left: b.left.map(bridge_to_engine_stroke),
+        bottom: b.bottom.map(bridge_to_engine_stroke),
+        right: b.right.map(bridge_to_engine_stroke),
+        inside_h: None,
+        inside_v: None,
+    }
+}
+
+fn bridge_to_engine_stroke(s: bridge::BridgeBorderStroke) -> engine::BorderStroke {
+    let style = match s.style {
+        bridge::BridgeBorderStyle::Single => engine::BorderStyle::Single,
+        bridge::BridgeBorderStyle::Double => engine::BorderStyle::Double,
+        bridge::BridgeBorderStyle::Dotted => engine::BorderStyle::Dotted,
+        bridge::BridgeBorderStyle::Dashed => engine::BorderStyle::Dashed,
+        bridge::BridgeBorderStyle::None => engine::BorderStyle::None,
+    };
+    engine::BorderStroke {
+        style,
+        size_eighth_pt: s.size_eighth_pt,
+        color: s.color.map(|c| [c.r, c.g, c.b, c.a]),
     }
 }
 
@@ -3028,9 +3158,10 @@ mod tests {
         );
     }
 
-    /// Build a single-run accessibility paragraph for the `diff_a11y` tests.
-    fn a11y_para(text: &str) -> A11yParagraph {
-        A11yParagraph {
+    /// Build a single-run accessibility paragraph node for the `diff_a11y`
+    /// tests.
+    fn a11y_para(text: &str) -> A11yNode {
+        A11yNode::Paragraph(A11yParagraph {
             direction: Direction::Ltr,
             runs: vec![A11yRun {
                 text: text.to_string(),
@@ -3038,7 +3169,7 @@ mod tests {
                 italic: false,
                 underline: false,
             }],
-        }
+        })
     }
 
     #[test]
@@ -3056,7 +3187,7 @@ mod tests {
             diff_a11y(&prev, &next),
             vec![A11yPatch::Update {
                 index: 1,
-                paragraph: a11y_para("bX"),
+                node: a11y_para("bX"),
             }],
         );
     }
@@ -3077,11 +3208,11 @@ mod tests {
             vec![
                 A11yPatch::Update {
                     index: 1,
-                    paragraph: a11y_para("b"),
+                    node: a11y_para("b"),
                 },
                 A11yPatch::Insert {
                     index: 2,
-                    paragraph: a11y_para("c"),
+                    node: a11y_para("c"),
                 },
             ],
         );
@@ -3102,7 +3233,7 @@ mod tests {
             vec![
                 A11yPatch::Update {
                     index: 1,
-                    paragraph: a11y_para("bc"),
+                    node: a11y_para("bc"),
                 },
                 A11yPatch::Remove { index: 2 },
             ],
@@ -3117,7 +3248,7 @@ mod tests {
             diff_a11y(&prev, &next),
             vec![A11yPatch::Insert {
                 index: 1,
-                paragraph: a11y_para("b"),
+                node: a11y_para("b"),
             }],
         );
     }

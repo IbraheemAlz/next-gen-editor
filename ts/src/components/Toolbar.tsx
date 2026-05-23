@@ -12,10 +12,15 @@
  * FontFamilyPicker (Backlog #1, #9). The B/I/U/S buttons also drive sticky
  * formatting (Backlog #11): clicking one with a collapsed caret arms a pending
  * style the engine applies to the next typed run. */
-import { createSignal, For } from 'solid-js';
+import { createSignal, For, Show } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
-import type { Alignment, Color, TextAttrsPatch } from '../engine/types';
+import type { Alignment, BlockPath, Color, TextAttrsPatch } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
+
+/* Insert-table picker geometry — Word's classic 8×8 grid. The user
+   hovers to pick rows×cols and clicks to commit. */
+const PICKER_MAX_ROWS = 8;
+const PICKER_MAX_COLS = 8;
 
 const FONT_SIZES = [12, 14, 16, 18, 20, 24, 32, 48, 64];
 const DEFAULT_COLOR: Color = { r: 0, g: 0, b: 0, a: 255 };
@@ -133,6 +138,33 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
         { cls: 'al-right', label: 'Align right', value: rightAlign() },
         { cls: 'al-justify', label: 'Justify', value: 'Justify' },
     ];
+
+    /* Phase 5 PR 3b — Insert Table popover + rows×cols picker.
+       `pickerOpen` toggles visibility; `hoverR/hoverC` (1-indexed)
+       drive the lit cells. Inserts the table at the block index
+       immediately after the caret's paragraph — `LogicalPos.para` is
+       paragraph-flat, so this lands cleanly when the document holds
+       no tables (the common case at PR 3b). With existing tables,
+       the position skips them; nested-table aware addressing arrives
+       with the `BlockPath` migration. */
+    const [pickerOpen, setPickerOpen] = createSignal(false);
+    const [hoverR, setHoverR] = createSignal(0);
+    const [hoverC, setHoverC] = createSignal(0);
+    const insertTable = (rows: number, cols: number): void => {
+        const para = props.store.caretLogical()?.para ?? 0;
+        const at: BlockPath = { steps: [{ kind: 'BLOCK', idx: para + 1 }] };
+        void props.client.dispatch({ type: 'INSERT_TABLE', at, rows, cols });
+        setPickerOpen(false);
+        setHoverR(0);
+        setHoverC(0);
+    };
+    const pickerCells = (): { r: number; c: number }[] => {
+        const cells: { r: number; c: number }[] = [];
+        for (let r = 1; r <= PICKER_MAX_ROWS; r++) {
+            for (let c = 1; c <= PICKER_MAX_COLS; c++) cells.push({ r, c });
+        }
+        return cells;
+    };
 
     /* `exporting` disables the button for the duration of the round-trip so a
        second click cannot start a concurrent export. */
@@ -256,6 +288,50 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
                     </button>
                 )}
             </For>
+            <span class="tb-sep" />
+            <div class="tb-table-wrap">
+                <button
+                    class="tb-btn"
+                    aria-label="Insert table"
+                    aria-haspopup="true"
+                    aria-expanded={pickerOpen()}
+                    onClick={() => setPickerOpen(!pickerOpen())}
+                >
+                    Table
+                </button>
+                <Show when={pickerOpen()}>
+                    <div class="tb-table-pop" role="dialog" aria-label="Insert table picker">
+                        <div
+                            class="tb-table-grid"
+                            onMouseLeave={() => {
+                                setHoverR(0);
+                                setHoverC(0);
+                            }}
+                        >
+                            <For each={pickerCells()}>
+                                {(cell) => (
+                                    <div
+                                        class="tb-table-cell"
+                                        classList={{
+                                            on: cell.r <= hoverR() && cell.c <= hoverC(),
+                                        }}
+                                        onMouseEnter={() => {
+                                            setHoverR(cell.r);
+                                            setHoverC(cell.c);
+                                        }}
+                                        onClick={() => insertTable(cell.r, cell.c)}
+                                    />
+                                )}
+                            </For>
+                        </div>
+                        <div class="tb-table-label">
+                            {hoverR() && hoverC()
+                                ? `${hoverR()} × ${hoverC()}`
+                                : 'Hover to pick size'}
+                        </div>
+                    </div>
+                </Show>
+            </div>
             <span class="tb-spacer" />
             <button
                 class="tb-btn tb-export"

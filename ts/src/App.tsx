@@ -10,6 +10,7 @@ import { CaretOverlay } from './components/CaretOverlay';
 import { SelectionOverlay } from './components/SelectionOverlay';
 import { HiddenInput } from './components/HiddenInput';
 import { Toolbar } from './components/Toolbar';
+import { TablePanel } from './components/TablePanel';
 import { AccessibilityTree } from './components/AccessibilityTree';
 import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
@@ -147,21 +148,24 @@ export function App() {
     return (
         <div class="editor-shell">
             <Toolbar client={client} store={store} />
-            <div class="editor-viewport">
-                <div class="editor-page">
-                    <For each={[canvasGen()]}>
-                        {(generation) => (
-                            <EditorCanvas
-                                client={client}
-                                generation={generation}
-                                onReady={onReady}
-                            />
-                        )}
-                    </For>
-                    <SelectionOverlay store={store} />
-                    <CaretOverlay store={store} />
-                    <HiddenInput client={client} store={store} />
+            <div class="editor-body">
+                <div class="editor-viewport">
+                    <div class="editor-page">
+                        <For each={[canvasGen()]}>
+                            {(generation) => (
+                                <EditorCanvas
+                                    client={client}
+                                    generation={generation}
+                                    onReady={onReady}
+                                />
+                            )}
+                        </For>
+                        <SelectionOverlay store={store} />
+                        <CaretOverlay store={store} />
+                        <HiddenInput client={client} store={store} />
+                    </div>
                 </div>
+                <TablePanel client={client} store={store} />
             </div>
             <AccessibilityTree client={client} />
             <Announcements store={store} />

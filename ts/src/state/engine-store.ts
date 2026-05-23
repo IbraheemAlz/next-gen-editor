@@ -8,6 +8,8 @@
 import { createSignal } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type {
+    A11yNode,
+    A11yTable,
     Alignment,
     Direction,
     Event,
@@ -60,7 +62,20 @@ export function createEngineStore(client: EngineClient) {
     const [paragraphAlignment, setParagraphAlignment] = createSignal<Alignment>('Start');
     const [baseDirection, setBaseDirection] = createSignal<Direction>('Ltr');
     const [announcement, setAnnouncement] = createSignal('');
+    /* Mirror of every table in the document — extracted from the a11y
+       delta stream so the Table panel can list/target tables by
+       BlockPath::top(block_index). The current paragraph-flat
+       LogicalPos can't address a cell, so PR 3b targets tables by
+       block index rather than by caret position. */
+    const [tables, setTables] = createSignal<A11yTable[]>([]);
+    let nodes: A11yNode[] = [];
     let announced = false;
+
+    const recomputeTables = (): void => {
+        const out: A11yTable[] = [];
+        for (const n of nodes) if (n.kind === 'TABLE') out.push(n);
+        setTables(out);
+    };
 
     client.subscribe((ev: Event) => {
         if (ev.type === 'SELECTION_CHANGED') {
@@ -76,14 +91,27 @@ export function createEngineStore(client: EngineClient) {
             setParagraphAlignment(ev.paragraph_alignment);
             setBaseDirection(ev.direction);
         } else if (ev.type === 'ACCESSIBILITY_TREE_DELTA') {
+            /* Mirror the patch stream into the local `nodes` array so the
+               Table panel sees the same view the reconciler renders. */
+            for (const patch of ev.patches) {
+                if (patch.type === 'REPLACE') {
+                    nodes = [...patch.tree.nodes];
+                } else if (patch.type === 'UPDATE') {
+                    nodes[patch.index] = patch.node;
+                } else if (patch.type === 'INSERT') {
+                    nodes.splice(patch.index, 0, patch.node);
+                } else if (patch.type === 'REMOVE') {
+                    nodes.splice(patch.index, 1);
+                }
+            }
+            recomputeTables();
             /* The first delta from a fresh engine is a single REPLACE; use its
-               paragraph count for the one-time "document loaded" announcement.
-               The reconciler in AccessibilityTree consumes the patches. */
+               node count for the one-time "document loaded" announcement. */
             if (!announced) {
                 announced = true;
                 const first = ev.patches[0];
-                const n = first && first.type === 'REPLACE' ? first.tree.paragraphs.length : 0;
-                setAnnouncement(`Document loaded — ${n} paragraph${n === 1 ? '' : 's'}.`);
+                const n = first && first.type === 'REPLACE' ? first.tree.nodes.length : 0;
+                setAnnouncement(`Document loaded — ${n} block${n === 1 ? '' : 's'}.`);
             }
         }
     });
@@ -97,6 +125,7 @@ export function createEngineStore(client: EngineClient) {
         paragraphAlignment,
         baseDirection,
         announcement,
+        tables,
     };
 }
 
