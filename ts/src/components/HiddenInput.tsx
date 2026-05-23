@@ -7,7 +7,7 @@
  * commands; the textarea itself never accumulates text. */
 import { createEffect, onCleanup, onMount } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
-import type { Command, LogicalPos } from '../engine/types';
+import type { Command, LogicalPos, MoveDirection } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
 import { copy, cut, paste } from '../input/clipboard';
 
@@ -92,11 +92,37 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
 
     const onKeyDown = (e: KeyboardEvent): void => {
         if (e.isComposing) return;
+
+        /* Arrow keys: caret motion, Shift-extend (Backlog #14). preventDefault
+           stops the textarea from scrolling its own (empty) viewport. */
+        const arrow: MoveDirection | undefined =
+            e.key === 'ArrowUp'
+                ? 'Up'
+                : e.key === 'ArrowDown'
+                  ? 'Down'
+                  : e.key === 'ArrowLeft'
+                    ? 'Left'
+                    : e.key === 'ArrowRight'
+                      ? 'Right'
+                      : undefined;
+        if (arrow) {
+            e.preventDefault();
+            void props.client.dispatch({
+                type: 'MOVE_CARET',
+                direction: arrow,
+                extend: e.shiftKey,
+            });
+            return;
+        }
+
         const mod = e.ctrlKey || e.metaKey;
         if (!mod) return;
         /* Match e.code (physical key) — e.key is layout-dependent, so an
            Arabic layout reports a non-Latin key at the Z position. */
-        if (e.code === 'KeyZ' && !e.shiftKey) {
+        if (e.code === 'KeyA' && !e.shiftKey) {
+            e.preventDefault();
+            void props.client.dispatch({ type: 'SELECT_ALL' });
+        } else if (e.code === 'KeyZ' && !e.shiftKey) {
             e.preventDefault();
             void props.client.dispatch({ type: 'UNDO' });
         } else if (e.code === 'KeyY' || (e.code === 'KeyZ' && e.shiftKey)) {

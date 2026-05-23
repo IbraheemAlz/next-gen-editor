@@ -7,8 +7,8 @@
 use bridge::{
     A11yParagraph, A11yPatch, A11yRun, A11yTree, Alignment as BridgeAlignment, Color, Command,
     Direction, EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
-    LogicalRange as BridgeLogicalRange, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
-    TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
+    LogicalRange as BridgeLogicalRange, MoveDirection, PdfConformance, Point as BridgePoint,
+    Rect as BridgeRect, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{
     Alignment as EngineAlignment, DocumentTree, FontFamily as EngineFontFamily,
@@ -58,10 +58,16 @@ const CARET_WIDTH: f32 = 2.0;
 
 /// The current selection: a fixed `anchor` and a moving `caret` end. The
 /// selected range is the two ends ordered into document order.
+///
+/// `ideal_x` is the device-pixel X column the caret returns to on vertical
+/// `MoveCaret` motion (Backlog #14). `Some` only while a Up/Down walk is in
+/// progress — every horizontal move, click, selection-set, or edit drops it
+/// by constructing a new `SelectionState` with `ideal_x: None`.
 #[derive(Clone, Copy)]
 struct SelectionState {
     anchor: BridgeLogicalPos,
     caret: BridgeLogicalPos,
+    ideal_x: Option<f32>,
 }
 
 /// An in-progress IME composition (PHASE_4_HEADLESS_UI.md §6). Tracked
@@ -634,6 +640,74 @@ fn slot_x_for_byte(line: &LineGeom, byte: u32) -> f32 {
     nearest_slot_x(&line.slots, byte, line.start_x)
 }
 
+/// Caret slot whose `x` is closest to `target_x` (Backlog #14, ideal-x snap).
+/// `None` only when the line carries no slots — an empty paragraph.
+fn nearest_slot_by_x(slots: &[CaretSlot], target_x: f32) -> Option<&CaretSlot> {
+    slots.iter().min_by(|a, b| {
+        (a.x - target_x)
+            .abs()
+            .partial_cmp(&(b.x - target_x).abs())
+            .unwrap_or(core::cmp::Ordering::Equal)
+    })
+}
+
+/// Step one Unicode char left in logical order (Backlog #14). At the start of
+/// a paragraph the caret jumps to the end of the previous; at byte 0 of the
+/// document it pins there.
+fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    let para_idx = pos.para as usize;
+    let off = pos.offset as usize;
+    if let Some(para) = doc.paragraphs.get(para_idx) {
+        if off > 0 {
+            let text = &para.text;
+            let mut o = off - 1;
+            while o > 0 && !text.is_char_boundary(o) {
+                o -= 1;
+            }
+            return BridgeLogicalPos {
+                para: pos.para,
+                offset: o as u32,
+            };
+        }
+        if para_idx > 0 {
+            if let Some(prev) = doc.paragraphs.get(para_idx - 1) {
+                return BridgeLogicalPos {
+                    para: (para_idx - 1) as u32,
+                    offset: prev.text.len() as u32,
+                };
+            }
+        }
+    }
+    pos
+}
+
+/// Step one Unicode char right in logical order. At a paragraph's end the
+/// caret jumps to the start of the next; at the document end it pins.
+fn step_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    let para_idx = pos.para as usize;
+    let off = pos.offset as usize;
+    if let Some(para) = doc.paragraphs.get(para_idx) {
+        let text = &para.text;
+        if off < text.len() {
+            let mut o = off + 1;
+            while o < text.len() && !text.is_char_boundary(o) {
+                o += 1;
+            }
+            return BridgeLogicalPos {
+                para: pos.para,
+                offset: o as u32,
+            };
+        }
+        if para_idx + 1 < doc.paragraphs.len() {
+            return BridgeLogicalPos {
+                para: (para_idx + 1) as u32,
+                offset: 0,
+            };
+        }
+    }
+    pos
+}
+
 /// Caret rectangle for `pos`, `caret_w` device px wide. Falls back to
 /// `fallback` when the document has no geometry yet (empty document).
 fn caret_rect_geom(
@@ -911,6 +985,7 @@ impl Engine {
                     self.selection = Some(SelectionState {
                         anchor: BridgeLogicalPos { para: 0, offset: 0 },
                         caret: BridgeLogicalPos { para: 0, offset: 0 },
+                        ideal_x: None,
                     });
                     self.layout_cache.get_mut().clear();
                     self.dirty.invalidate(full_page_rect(self.scale()));
@@ -953,7 +1028,8 @@ impl Engine {
             Command::InsertImage { .. } => phase3_stub("InsertImage"),
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
-            Command::SelectAll => phase3_stub("SelectAll"),
+            Command::SelectAll => self.do_select_all(),
+            Command::MoveCaret { direction, extend } => self.do_move_caret(direction, extend),
             Command::BeginComposition { at } => self.do_begin_composition(at),
             Command::UpdateComposition { text, target_range } => {
                 self.do_update_composition(text, target_range)
@@ -968,6 +1044,7 @@ impl Engine {
             // Phase 4 — PHASE_4_HEADLESS_UI.md §7. Additive pointer commands.
             Command::HitTest { at } => self.do_hit_test(at),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
+            Command::SelectParagraphAt { at } => self.do_select_paragraph_at(at),
             Command::DeleteAtCaret { forward, by_word } => {
                 self.do_delete_at_caret(forward, by_word)
             }
@@ -1583,7 +1660,11 @@ impl Engine {
         };
         /* A caret move discards any armed sticky style (Backlog #11). */
         self.pending_format = None;
-        self.selection = Some(SelectionState { anchor, caret });
+        self.selection = Some(SelectionState {
+            anchor,
+            caret,
+            ideal_x: None,
+        });
         self.selection_changed()
     }
 
@@ -1591,7 +1672,11 @@ impl Engine {
     fn do_extend_selection(&mut self, to: BridgeLogicalPos) -> Event {
         let anchor = self.selection.map_or(to, |s| s.anchor);
         self.pending_format = None;
-        self.selection = Some(SelectionState { anchor, caret: to });
+        self.selection = Some(SelectionState {
+            anchor,
+            caret: to,
+            ideal_x: None,
+        });
         self.selection_changed()
     }
 
@@ -1619,6 +1704,120 @@ impl Engine {
                 para: hit.para,
                 offset: hi,
             },
+            ideal_x: None,
+        });
+        self.selection_changed()
+    }
+
+    /// `Command::SelectParagraphAt` — hit-test then select the whole
+    /// paragraph (triple-click).
+    fn do_select_paragraph_at(&mut self, at: BridgePoint) -> Event {
+        let geom = match self.document_geometry() {
+            Ok(g) => g,
+            Err(e) => return *e,
+        };
+        let hit = hit_test_geom(&geom, at.x, at.y);
+        let len = self
+            .undo
+            .current()
+            .paragraphs
+            .get(hit.para as usize)
+            .map_or(0, |p| p.text.len() as u32);
+        self.pending_format = None;
+        self.selection = Some(SelectionState {
+            anchor: BridgeLogicalPos {
+                para: hit.para,
+                offset: 0,
+            },
+            caret: BridgeLogicalPos {
+                para: hit.para,
+                offset: len,
+            },
+            ideal_x: None,
+        });
+        self.selection_changed()
+    }
+
+    /// `Command::SelectAll` — anchor at the document start, caret at the very
+    /// last paragraph's byte length. Empty document collapses to (0, 0).
+    fn do_select_all(&mut self) -> Event {
+        let doc = self.undo.current();
+        let last_para = doc.paragraphs.len().saturating_sub(1);
+        let last_len = doc
+            .paragraphs
+            .get(last_para)
+            .map_or(0, |p| p.text.len() as u32);
+        self.pending_format = None;
+        self.selection = Some(SelectionState {
+            anchor: BridgeLogicalPos { para: 0, offset: 0 },
+            caret: BridgeLogicalPos {
+                para: last_para as u32,
+                offset: last_len,
+            },
+            ideal_x: None,
+        });
+        self.selection_changed()
+    }
+
+    /// `Command::MoveCaret` (Backlog #14). Left/Right step one Unicode char in
+    /// logical order and reset the ideal-x; Up/Down walk to the adjacent line
+    /// and snap to the slot nearest the stored ideal-x. `extend: true` keeps
+    /// the anchor put so the gesture extends the selection (Shift + Arrow).
+    fn do_move_caret(&mut self, direction: MoveDirection, extend: bool) -> Event {
+        let sel = self.selection.unwrap_or(SelectionState {
+            anchor: BridgeLogicalPos { para: 0, offset: 0 },
+            caret: BridgeLogicalPos { para: 0, offset: 0 },
+            ideal_x: None,
+        });
+        let doc = self.undo.current().clone();
+        let (new_caret, new_ideal) = match direction {
+            MoveDirection::Left => (step_left(&doc, sel.caret), None),
+            MoveDirection::Right => (step_right(&doc, sel.caret), None),
+            MoveDirection::Up | MoveDirection::Down => {
+                let geom = match self.document_geometry() {
+                    Ok(g) => g,
+                    Err(e) => return *e,
+                };
+                /* Re-use the carried column if a vertical walk is in progress;
+                otherwise lock in the caret's current x. */
+                let ideal = sel.ideal_x.unwrap_or_else(|| {
+                    geom.iter()
+                        .find(|l| {
+                            l.para == sel.caret.para
+                                && sel.caret.offset >= l.start_byte
+                                && sel.caret.offset <= l.end_byte
+                        })
+                        .or_else(|| geom.first())
+                        .map_or(0.0, |line| slot_x_for_byte(line, sel.caret.offset))
+                });
+                let cur_idx = geom.iter().position(|l| {
+                    l.para == sel.caret.para
+                        && sel.caret.offset >= l.start_byte
+                        && sel.caret.offset <= l.end_byte
+                });
+                let target = match (cur_idx, direction) {
+                    (Some(i), MoveDirection::Up) if i > 0 => geom.get(i - 1),
+                    (Some(i), MoveDirection::Down) => geom.get(i + 1),
+                    _ => None,
+                };
+                let new_caret = match target {
+                    Some(line) => nearest_slot_by_x(&line.slots, ideal)
+                        .map(|s| BridgeLogicalPos {
+                            para: line.para,
+                            offset: s.byte,
+                        })
+                        .unwrap_or(sel.caret),
+                    None => sel.caret,
+                };
+                (new_caret, Some(ideal))
+            }
+        };
+        let new_caret = clamp_pos(&doc, new_caret);
+        self.pending_format = None;
+        self.selection = Some(SelectionState {
+            anchor: if extend { sel.anchor } else { new_caret },
+            caret: new_caret,
+            ideal_x: new_ideal,
         });
         self.selection_changed()
     }
@@ -1753,6 +1952,7 @@ impl Engine {
         self.selection = Some(SelectionState {
             anchor: caret,
             caret,
+            ideal_x: None,
         });
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -1767,6 +1967,7 @@ impl Engine {
         let sel = self.selection.unwrap_or(SelectionState {
             anchor: at,
             caret: at,
+            ideal_x: None,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
         let base = if start == end {
@@ -1993,6 +2194,7 @@ impl Engine {
                 self.selection = Some(SelectionState {
                     anchor: clamp_pos(doc, sel.anchor),
                     caret: clamp_pos(doc, sel.caret),
+                    ideal_x: None,
                 });
                 self.selection_changed()
             }
@@ -2092,6 +2294,7 @@ impl Engine {
         let sel = self.selection.unwrap_or(SelectionState {
             anchor: at,
             caret: at,
+            ideal_x: None,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
         let base = if start == end {
@@ -2126,6 +2329,7 @@ impl Engine {
         let sel = self.selection.unwrap_or(SelectionState {
             anchor: at,
             caret: at,
+            ideal_x: None,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
         let base = if start == end {

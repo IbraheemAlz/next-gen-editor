@@ -23,6 +23,7 @@ export type {
     ImageFit,
     LogicalPos,
     LogicalRange,
+    MoveDirection,
     ParagraphId,
     PdfConformance,
     Point,

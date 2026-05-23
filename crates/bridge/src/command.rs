@@ -160,6 +160,14 @@ pub enum Command {
         modifier: SelectionModifier,
     },
     SelectAll,
+    /// Move the caret one step (Backlog #14). With `extend: true` the anchor
+    /// stays put — the gesture extends the selection. The engine tracks an
+    /// ideal-x on `SelectionState` so vertical motion through short lines
+    /// keeps its column; horizontal motion resets it.
+    MoveCaret {
+        direction: MoveDirection,
+        extend: bool,
+    },
 
     /* IME */
     BeginComposition {
@@ -207,6 +215,12 @@ pub enum Command {
     /// Select the word under a canvas pixel (double-click). The engine
     /// updates the selection and replies with `Event::SelectionChanged`.
     SelectWordAt {
+        at: Point,
+    },
+
+    /// Select the whole paragraph under a canvas pixel (triple-click).
+    /// Selection runs from byte 0 to the paragraph's length.
+    SelectParagraphAt {
         at: Point,
     },
 
@@ -325,4 +339,16 @@ pub enum SelectionModifier {
     Shift,
     Alt,
     ShiftAlt,
+}
+
+/// Cardinal direction for `Command::MoveCaret` (Backlog #14 — core nav).
+/// `Left`/`Right` step one Unicode char in logical order (paragraph-local,
+/// hopping across paragraph boundaries at the ends). `Up`/`Down` walk to the
+/// adjacent line and snap to the slot nearest the caret's stored ideal-x.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveDirection {
+    Up,
+    Down,
+    Left,
+    Right,
 }

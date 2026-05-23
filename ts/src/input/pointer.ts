@@ -72,15 +72,28 @@ export function attachPointer(canvas: HTMLCanvasElement, client: EngineClient): 
         void client.dispatch({ type: 'SELECT_WORD_AT', at: toCanvas(e) });
     };
 
+    /* Triple-click — select the whole paragraph (Backlog #14). The DOM has no
+       native event for this; the third click in a chain carries detail === 3.
+       Bump `gesture` so the third pointerdown's hit-test is dropped, same as
+       dblclick does for the second. */
+    const onClick = (e: MouseEvent): void => {
+        if (e.detail === 3) {
+            gesture += 1;
+            void client.dispatch({ type: 'SELECT_PARAGRAPH_AT', at: toCanvas(e) });
+        }
+    };
+
     canvas.addEventListener('pointerdown', onPointerDown);
     canvas.addEventListener('pointermove', onPointerMove);
     canvas.addEventListener('pointerup', onPointerUp);
     canvas.addEventListener('dblclick', onDblClick);
+    canvas.addEventListener('click', onClick);
 
     return () => {
         canvas.removeEventListener('pointerdown', onPointerDown);
         canvas.removeEventListener('pointermove', onPointerMove);
         canvas.removeEventListener('pointerup', onPointerUp);
         canvas.removeEventListener('dblclick', onDblClick);
+        canvas.removeEventListener('click', onClick);
     };
 }
