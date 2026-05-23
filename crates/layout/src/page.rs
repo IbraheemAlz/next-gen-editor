@@ -27,11 +27,15 @@ pub struct A4Page {
 }
 
 impl A4Page {
-    /// ISO 216 A4 at 1 pt/unit (595 × 842 pt). Margins default to 72 pt (1 in).
+    /// ISO 216 A4 at 1 pt/unit. Dimensions are the exact OOXML twips:
+    /// `11906 / 20 = 595.3` pt wide × `16838 / 20 = 841.9` pt tall —
+    /// what Word stamps on a fresh document. Margins default to 72 pt
+    /// (1 inch / 1440 twips), matching Word's stock template. Aspect
+    /// ratio = 1 : √2 = 1 : 1.4143 (ISO 216).
     pub const fn a4() -> Self {
         Self {
-            width: 595.0,
-            height: 842.0,
+            width: 595.3,
+            height: 841.9,
             margin: Margins::uniform(72.0),
         }
     }

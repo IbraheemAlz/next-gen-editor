@@ -107,6 +107,16 @@ pub struct CommentRange {
 /// Page geometry for a [`Section`]. Dimensions are layout pixels at 1 pt/unit
 /// (matching `layout::A4Page`). The reader converts twips → pt (× 1/20) and
 /// the renderer / paginator consume these values directly.
+///
+/// **OOXML reference values.** A page size landed verbatim from a Word
+/// `<w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>` is ISO 216 A4
+/// (210 × 297 mm). The canonical twips → pt math:
+///
+/// - `11906 twips / 20 = 595.3 pt`  ← page width
+/// - `16838 twips / 20 = 841.9 pt`  ← page height
+/// - `1440 twips / 20 = 72.0 pt`    ← Word default 1-inch margins
+///
+/// Aspect ratio 841.9 / 595.3 = 1.4143, matching ISO 216's `1 : √2`.
 #[derive(Debug, Clone, Copy)]
 pub struct PageGeometry {
     pub width: f32,
@@ -124,17 +134,42 @@ pub struct PageGeometry {
 }
 
 impl PageGeometry {
-    /// ISO 216 A4 with 1-inch (72 pt) margins — the legacy `A4Page::a4()`.
+    /// ISO 216 A4 with 1-inch (72 pt) margins.
+    ///
+    /// Dimensions land exactly on the OOXML canonical twips:
+    /// `<w:pgSz w:w="11906" w:h="16838"/>` and
+    /// `<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"
+    /// w:header="720" w:footer="720"/>` — what `Word.exe` itself stamps
+    /// on a freshly-created `Document1.docx`. Header / footer offsets
+    /// default to 0.5 inch (720 twips / 36 pt), Word's stock value.
     pub const fn a4() -> Self {
+        Self::from_twips(11906, 16838, 1440, 1440, 1440, 1440, 720, 720)
+    }
+
+    /// Build a `PageGeometry` from OOXML twips directly. 1 twip = 1/20 pt.
+    /// Used by the `<w:pgSz>` / `<w:pgMar>` parser to preserve exact
+    /// integer round-trip; in-code default constructors call this with
+    /// canonical Word values so the model never drifts off-spec by
+    /// floating-point rounding.
+    pub const fn from_twips(
+        w_twips: i32,
+        h_twips: i32,
+        top_twips: i32,
+        right_twips: i32,
+        bottom_twips: i32,
+        left_twips: i32,
+        header_twips: i32,
+        footer_twips: i32,
+    ) -> Self {
         Self {
-            width: 595.0,
-            height: 842.0,
-            margin_top: 72.0,
-            margin_right: 72.0,
-            margin_bottom: 72.0,
-            margin_left: 72.0,
-            header_offset: 36.0,
-            footer_offset: 36.0,
+            width: (w_twips as f32) / 20.0,
+            height: (h_twips as f32) / 20.0,
+            margin_top: (top_twips as f32) / 20.0,
+            margin_right: (right_twips as f32) / 20.0,
+            margin_bottom: (bottom_twips as f32) / 20.0,
+            margin_left: (left_twips as f32) / 20.0,
+            header_offset: (header_twips as f32) / 20.0,
+            footer_offset: (footer_twips as f32) / 20.0,
         }
     }
 

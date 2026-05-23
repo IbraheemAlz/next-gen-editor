@@ -17,37 +17,48 @@
 
 /* The "desk" — a scrollable grey surround that centres the A4 page.
    `min-height: 0` lets it shrink inside the flex column; `overflow: auto`
-   scrolls when the page is taller than the viewport. */
+   scrolls when the page is taller than the viewport.
+   `align-items: flex-start` is load-bearing: without it the flex container's
+   default `stretch` enlarges `.editor-page` to fill the cross-axis height,
+   visually breaking the A4 portrait aspect ratio (the page appears as tall
+   as the viewport). Anchoring at the top lets the page take its own height
+   and the viewport scrollbar exposes overflow.
+   `justify-content: center` centres the page horizontally inside the desk. */
 .editor-viewport {
     flex: 1 1 auto;
     min-width: 0;
     min-height: 0;
     overflow: auto;
     display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 24px 0;
     background: #f0f0f0;
 }
 
-/* The A4 page — fixed 595 px wide (engine `A4Page::a4()`, 1:1 with the
-   canvas backing store). Height is driven by the paginator at runtime: the
-   `Painted` event reports `document_height`, the store mirrors it, and
-   `EditorCanvas` writes it into the canvas's CSS `height` inline so a
-   multi-page document grows the container and the viewport scrollbar
-   exposes every paginated page (Phase 6b). 842 px is the floor for the
-   first paint. `margin: 0 auto` centres horizontally only — vertical
-   centring would conflict with the scroll position when the document
-   exceeds the viewport. */
+/* The A4 page — width + height land at the engine's `PageGeometry::a4()`
+   in layout points (595.3 × 841.9, the OOXML 11906 × 16838 twips / 20).
+   CSS treats those as `px` 1:1 with the canvas backing store the worker
+   resizes to in `render_document`: `OffscreenCanvas.width = 595 × dpr`,
+   so the CSS box and the device-pixel grid share the same logical units
+   and the page renders at the correct 1 : √2 aspect ratio.
+   `min-height` is the floor; `EditorCanvas` overrides the inline
+   `min-height` to the paginator-reported `document_height / dpr` once the
+   first paint lands, so a multi-page document grows the container and the
+   viewport scrollbar exposes every page. */
 .editor-page {
     position: relative;
     flex: none;
     width: 595px;
     min-height: 842px;
-    margin: 0 auto;
     background: #fff;
     box-shadow: 0 1px 6px rgb(0 0 0 / 0.25);
 }
 
 /* The engine canvas. Fills the A4 page; the backing store is sized to
-   devicePixelRatio in EditorCanvas before transferControlToOffscreen(). */
+   devicePixelRatio in EditorCanvas before transferControlToOffscreen()
+   and again worker-side by `render_document` on every paint. `display:
+   block` defeats the inline baseline-gap below the canvas. */
 .editor-canvas {
     display: block;
     width: 100%;
