@@ -437,10 +437,14 @@ pub enum SelectionModifier {
 /// `Left`/`Right` step one Unicode char in logical order (paragraph-local,
 /// hopping across paragraph boundaries at the ends). `Up`/`Down` walk to the
 /// adjacent line and snap to the slot nearest the caret's stored ideal-x.
+/// `NextCell` / `PrevCell` are the Phase 5 PR 4 cell-traversal motions
+/// — Tab / Shift+Tab inside a table. Outside a table they no-op.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveDirection {
     Up,
     Down,
     Left,
     Right,
+    NextCell,
+    PrevCell,
 }

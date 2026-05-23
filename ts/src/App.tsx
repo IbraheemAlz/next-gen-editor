@@ -18,6 +18,7 @@ import { createEngineStore } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
 import { attachDragDrop } from './input/dnd';
 import type { Command, Event } from './engine/types';
+import { topPos } from './engine/types';
 import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
 import LIBERATION_URL from '../fonts/LiberationSans-Regular.ttf?url';
 import NOTO_URL from '../fonts/NotoNaskhArabic-Regular.ttf?url';
@@ -61,8 +62,8 @@ async function setupEngine(client: EngineClient): Promise<void> {
        position to insert at before the first pointer click. */
     await client.dispatch({
         type: 'SET_SELECTION',
-        range: { start: { para: 0, offset: 0 }, end: { para: 0, offset: 0 } },
-        caret: { para: 0, offset: 0 },
+        range: { start: topPos(0, 0), end: topPos(0, 0) },
+        caret: topPos(0, 0),
     });
 }
 

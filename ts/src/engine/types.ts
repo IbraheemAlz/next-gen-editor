@@ -38,9 +38,21 @@ export type {
     Point,
     Rect,
     Script,
+    SelectionKind,
     SelectionModifier,
     TextAttrs,
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import type { BlockPath, LogicalPos } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+
+/** Path to the Nth top-level block — `BlockPath::top(n)` mirror. */
+export function topBlockPath(idx: number): BlockPath {
+    return { steps: [{ kind: 'BLOCK', idx }] };
+}
+
+/** Caret at offset `n` of the Nth top-level paragraph. */
+export function topPos(para: number, offset: number): LogicalPos {
+    return { path: topBlockPath(para), offset };
+}

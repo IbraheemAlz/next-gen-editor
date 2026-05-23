@@ -3,16 +3,19 @@
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
-/// Caret/anchor position in the document model: paragraph index + offset.
+/// Caret/anchor position in the document model: a `BlockPath` that
+/// terminates at a `Block::Paragraph` plus a byte offset inside that
+/// paragraph's UTF-8 text.
 ///
-/// **Phase 5 PR 3 transitional.** Paragraph-flat addressing (skipping
-/// tables) — Phase 5 PR 4 widens this to carry a `BlockPath` so the
-/// caret can sit inside a table cell. PR 3 keeps the flat shape so the
-/// existing TS shell doesn't have to migrate every position site at
-/// once; new table commands use `BlockPath` directly.
-#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+/// **Phase 5 PR 4.** Migrated from the paragraph-flat `{ para, offset }`
+/// shape so the caret can sit inside a table cell. Cross-paragraph
+/// ranges whose endpoints share a parent container behave the same as
+/// the paragraph-flat path; cross-container ranges (cell ↔ body) fall
+/// back to in-container clamping at PR 4 — full cross-container
+/// linear semantics land with Phase 5c.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 pub struct LogicalPos {
-    pub para: u32,
+    pub path: BlockPath,
     pub offset: u32,
 }
 
@@ -40,13 +43,94 @@ impl BlockPath {
             steps: vec![PathStep::Block { idx }],
         }
     }
+
+    /// Empty path — the document root container. `[]` matches no
+    /// block; useful as a sentinel.
+    pub fn root() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    /// Parent container path — every step but the last.
+    pub fn parent(&self) -> Self {
+        let mut steps = self.steps.clone();
+        steps.pop();
+        Self { steps }
+    }
+
+    /// The final step's block index when this path terminates at a
+    /// `Block`-step. `None` for empty paths or paths whose last step
+    /// is a `Cell`.
+    pub fn last_block_index(&self) -> Option<u32> {
+        match self.steps.last()? {
+            PathStep::Block { idx } => Some(*idx),
+            PathStep::Cell { .. } => None,
+        }
+    }
+
+    /// Compare two paths in document order (depth-first walk). Earlier
+    /// blocks sort before later; a parent sorts before its first
+    /// child. Used to put selection endpoints in canonical order.
+    pub fn cmp_doc_order(&self, other: &Self) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+        let n = self.steps.len().min(other.steps.len());
+        for i in 0..n {
+            let ord = match (&self.steps[i], &other.steps[i]) {
+                (PathStep::Block { idx: a }, PathStep::Block { idx: b }) => a.cmp(b),
+                (PathStep::Cell { row: r1, col: c1 }, PathStep::Cell { row: r2, col: c2 }) => {
+                    r1.cmp(r2).then_with(|| c1.cmp(c2))
+                }
+                /* Shape mismatch between two well-formed paths is
+                unreachable (a Cell step always follows a Block step
+                that descends into a table). Fall through to comparing
+                by index when it happens. */
+                (PathStep::Block { idx: a }, PathStep::Cell { row: b, .. }) => a.cmp(b),
+                (PathStep::Cell { row: a, .. }, PathStep::Block { idx: b }) => a.cmp(b),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        self.steps.len().cmp(&other.steps.len())
+    }
+
+    /// `true` when this path is a prefix of `descendant` (or equal).
+    pub fn is_ancestor_of(&self, descendant: &Self) -> bool {
+        if self.steps.len() > descendant.steps.len() {
+            return false;
+        }
+        self.steps
+            .iter()
+            .zip(descendant.steps.iter())
+            .all(|(a, b)| a == b)
+    }
 }
 
 /// Half-open span between two logical positions.
-#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 pub struct LogicalRange {
     pub start: LogicalPos,
     pub end: LogicalPos,
+}
+
+/// What flavour of selection is currently active (RFC §4.4).
+///
+/// `Linear` is the classic text-span selection — the caret highlights
+/// a contiguous byte range. `TableCells` is the cell-rectangular
+/// selection a user drags inside a table: every cell in the rectangle
+/// `(from_row, from_col) ..= (to_row, to_col)` is highlighted as a
+/// whole.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SelectionKind {
+    #[default]
+    Linear,
+    TableCells {
+        table_path: BlockPath,
+        from_row: u32,
+        from_col: u32,
+        to_row: u32,
+        to_col: u32,
+    },
 }
 
 /// Axis-aligned rectangle in CSS pixels.

@@ -16,8 +16,10 @@ import type {
     LogicalPos,
     LogicalRange,
     Rect,
+    SelectionKind,
     TextAttrs,
 } from '../engine/types';
+import { topPos } from '../engine/types';
 
 /** The current selection: its logical range plus rendered rectangles. */
 export interface SelectionView {
@@ -32,8 +34,8 @@ export interface UndoState {
 }
 
 const EMPTY_RANGE: LogicalRange = {
-    start: { para: 0, offset: 0 },
-    end: { para: 0, offset: 0 },
+    start: topPos(0, 0),
+    end: topPos(0, 0),
 };
 
 /** Device-pixel rect → CSS-pixel rect. */
@@ -68,6 +70,9 @@ export function createEngineStore(client: EngineClient) {
        LogicalPos can't address a cell, so PR 3b targets tables by
        block index rather than by caret position. */
     const [tables, setTables] = createSignal<A11yTable[]>([]);
+    /* PR 4 — selection flavour. Linear by default; `TableCells` when the
+       drag stayed inside a single table and covered multiple cells. */
+    const [selectionKind, setSelectionKind] = createSignal<SelectionKind>({ kind: 'LINEAR' });
     let nodes: A11yNode[] = [];
     let announced = false;
 
@@ -90,6 +95,7 @@ export function createEngineStore(client: EngineClient) {
             setUndoState({ canUndo: ev.can_undo, canRedo: ev.can_redo });
             setParagraphAlignment(ev.paragraph_alignment);
             setBaseDirection(ev.direction);
+            setSelectionKind(ev.selection_kind);
         } else if (ev.type === 'ACCESSIBILITY_TREE_DELTA') {
             /* Mirror the patch stream into the local `nodes` array so the
                Table panel sees the same view the reconciler renders. */
@@ -126,6 +132,7 @@ export function createEngineStore(client: EngineClient) {
         baseDirection,
         announcement,
         tables,
+        selectionKind,
     };
 }
 

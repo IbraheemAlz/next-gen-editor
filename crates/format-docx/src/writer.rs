@@ -800,9 +800,13 @@ mod tests {
         let bytes = build_style_cascade_docx();
         let archive = read_docx(&bytes).expect("read");
         /* Mutate the paragraph — engine flips dirty=true, drops source_xml. */
-        let edited = archive
-            .document
-            .insert_text(engine::LogicalPos { para: 0, offset: 5 }, " EDITED");
+        let edited = archive.document.insert_text(
+            engine::LogicalPos {
+                path: engine::BlockPath::top(0),
+                offset: 5,
+            },
+            " EDITED",
+        );
         let p = &edited.nth_paragraph(0).unwrap();
         assert!(p.dirty, "edit must flip dirty=true");
         assert!(p.source_xml.is_none(), "edit must drop source_xml");

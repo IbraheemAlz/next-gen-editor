@@ -3,6 +3,7 @@
  * Drop a .docx file anywhere on the editor to replace the open document. The
  * engine parses it via the existing `LoadDocx` command (format-docx). */
 import type { EngineClient } from '../engine/engine-client';
+import { topPos } from '../engine/types';
 
 async function loadDroppedDocx(client: EngineClient, file: File): Promise<void> {
     const bytes = new Uint8Array(await file.arrayBuffer());
@@ -17,8 +18,8 @@ async function loadDroppedDocx(client: EngineClient, file: File): Promise<void> 
        emits SelectionChanged so the overlays refresh. */
     await client.dispatch({
         type: 'SET_SELECTION',
-        range: { start: { para: 0, offset: 0 }, end: { para: 0, offset: 0 } },
-        caret: { para: 0, offset: 0 },
+        range: { start: topPos(0, 0), end: topPos(0, 0) },
+        caret: topPos(0, 0),
     });
 }
 

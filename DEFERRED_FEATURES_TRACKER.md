@@ -43,29 +43,30 @@ DOM components plus the bridge wire shapes that the UI needs.
 
 ### Cell-rectangular selection + cell navigation
 
-> *PR 3b dependency check (2026-05-23):* every bullet in this
-> subsection requires `LogicalPos` to address a cell — currently it
-> is paragraph-flat and skips tables, so a caret physically cannot
-> sit inside a cell. Pulled forward to **§2 (Phase 5 PR 4 —
-> `BlockPath` migration)**; cell selection + Tab navigation land
-> after PR 4.
-
-- [ ] **`SelectionKind::TableCells` end-to-end.** Bridge schema
+- [x] **`SelectionKind::TableCells` end-to-end.** Bridge schema
       change to widen `Selection` with a `kind` field +
-      `{ table_path, from: (row, col), to: (row, col) }` payload.
-      Engine state already has `Selection.kind` headroom. *Depends on:*
-      §4 nested-`BridgeLogicalPos` migration so the anchor / caret
-      positions can sit inside a cell.
-- [ ] **`SelectionOverlay` cell-rect highlights.** DOM overlay paints
-      a solid-fill rect per selected cell instead of per-line text
-      spans. *Depends on:* the bullet above.
-- [ ] **`Tab` / `Shift+Tab` cell navigation.** Caret in a cell + Tab
+      `{ table_path, from_row, from_col, to_row, to_col }` payload.
+      *Landed in PR 4* — `bridge::SelectionKind` enum + the new
+      `Event::SelectionChanged.selection_kind` field;
+      `derive_selection_kind` in engine-wasm classifies same-table
+      drag selections.
+- [x] **`SelectionOverlay` cell-rect highlights.** *Landed in PR 4*
+      — `table_cell_rects` in engine-wasm emits one rect per spanned
+      cell as the selection's `rects` payload when the selection
+      kind is `TableCells`. The DOM overlay paints them with the
+      same `selection-rect` CSS as text spans.
+- [x] **`Tab` / `Shift+Tab` cell navigation.** Caret in a cell + Tab
       → next cell in row-major order; Shift+Tab → previous;
-      `Ctrl+Tab` inserts a literal `\t`. *Depends on:* the bullet
-      above (caret must address a specific cell).
+      Tab on the last cell appends a new row (Word default).
+      *Landed in PR 4* — new `MoveDirection::NextCell` /
+      `PrevCell`, wired through `HiddenInput`'s keydown handler.
+      `Ctrl+Tab` still falls through to the textarea's literal tab.
 - [ ] **Drag-out-of-cell selection.** Anchor inside a cell, caret
       drags outside the table → fall back to `Linear` selection that
-      covers every cell between, matching Word.
+      covers every cell between, matching Word. *Today:*
+      `derive_selection_kind` returns `Linear` for cross-container
+      endpoints — selection rects stop at the cell boundary; full
+      "everything between" semantics ship with Phase 5c.
 
 ### A11y — fine-grained patches
 
@@ -107,25 +108,25 @@ DOM components plus the bridge wire shapes that the UI needs.
 
 ## 2. Phase 5 PR 4 — `BlockPath` migration of `BridgeLogicalPos`
 
-PR 3 left `BridgeLogicalPos.para: u32` paragraph-flat as a
-transitional shape. PR 4 widens it so the caret can sit inside a
-cell.
-
-- [ ] **Widen `BridgeLogicalPos` from `{ para, offset }` to
-      `{ path: BlockPath, offset }`.** Engine-side `LogicalPos`
-      mirrors. Every TS position consumer (caret, hit-test,
-      selection, keyboard motion) updates in lock-step.
-      *Depends on:* nothing engine-side; touches every TS shell
-      component that constructs a position.
-- [ ] **Hit-test recursion into cells.** `document_geometry`
-      flattens cell paragraphs into `CaretSlot`s stamped with the
-      full `BlockPath`. Today hit-tests treat tables as
-      non-interactive regions.
-- [ ] **Migrate `nth_paragraph` / `paragraph_count` /
-      `paragraph_text` callers.** These are the last remnants of
-      paragraph-flat addressing on the engine side; once
-      `BlockPath` is the canonical position type they collapse to
-      `BlockPath::root_paragraph(n)` adapters.
+- [x] **Widen `BridgeLogicalPos` from `{ para, offset }` to
+      `{ path: BlockPath, offset }`.** *Landed in PR 4* — both
+      bridge and engine `LogicalPos` carry `BlockPath`. Every TS
+      site (App seed, dnd, store, Toolbar, harness) builds paths
+      via the `topPos(para, offset)` helper.
+- [x] **Hit-test recursion into cells.** *Landed in PR 4* —
+      `document_geometry` walks `LayoutBlock::Table` boxes,
+      descending into every cell and emitting `LineGeom`s stamped
+      with `[Block(t), Cell{r,c}, Block(p)]` paths. Clicks inside
+      cells now resolve to cell-paragraph positions; clicks on
+      borders/gutter snap to the nearest line via the same
+      `nearest_line` walk that already handled inter-paragraph
+      gaps.
+- [x] **Migrate `nth_paragraph` / `paragraph_count` /
+      `paragraph_text` callers.** *Landed in PR 4* — every
+      interactive engine-wasm path resolves via the new
+      `paragraph_at_path` / `path_to_last_top_paragraph` helpers;
+      `nth_paragraph` / `paragraph_count` / `paragraph_text` stay
+      as compatibility shims for the test corpus.
 
 ---
 

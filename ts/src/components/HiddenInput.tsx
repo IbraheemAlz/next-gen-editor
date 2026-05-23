@@ -115,6 +115,19 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
             return;
         }
 
+        /* Tab / Shift+Tab — cell-to-cell navigation inside a table. The
+           engine no-ops when the caret is not inside a table; Ctrl+Tab
+           still inserts a literal tab via the textarea's default. */
+        if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey) {
+            e.preventDefault();
+            void props.client.dispatch({
+                type: 'MOVE_CARET',
+                direction: e.shiftKey ? 'PrevCell' : 'NextCell',
+                extend: false,
+            });
+            return;
+        }
+
         const mod = e.ctrlKey || e.metaKey;
         if (!mod) return;
         /* Match e.code (physical key) — e.key is layout-dependent, so an

@@ -6,14 +6,16 @@
 
 use bridge::{
     A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRow, A11yRun, A11yTable, A11yTree,
-    Alignment as BridgeAlignment, Color, Command, Direction, EngineStats, Event,
-    FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
-    LogicalRange as BridgeLogicalRange, MoveDirection, PdfConformance, Point as BridgePoint,
-    Rect as BridgeRect, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
+    Alignment as BridgeAlignment, BlockPath as BridgeBlockPath, Color, Command, Direction,
+    EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
+    LogicalRange as BridgeLogicalRange, MoveDirection, PathStep as BridgePathStep, PdfConformance,
+    Point as BridgePoint, Rect as BridgeRect, SelectionKind, TextAttrs, TextAttrsPatch,
+    UnderlineStyle, VerticalScript,
 };
 use engine::{
-    Alignment as EngineAlignment, DocumentTree, FontFamily as EngineFontFamily,
-    LogicalPos as EnginePos, SpanStyle, UndoStack,
+    Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
+    FontFamily as EngineFontFamily, LogicalPos as EnginePos, PathStep as EnginePathStep, SpanStyle,
+    UndoStack,
 };
 use format_docx::writer::build_minimal_docx;
 use kurbo::Rect;
@@ -64,16 +66,22 @@ const CARET_WIDTH: f32 = 2.0;
 /// `MoveCaret` motion (Backlog #14). `Some` only while a Up/Down walk is in
 /// progress — every horizontal move, click, selection-set, or edit drops it
 /// by constructing a new `SelectionState` with `ideal_x: None`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SelectionState {
     anchor: BridgeLogicalPos,
     caret: BridgeLogicalPos,
     ideal_x: Option<f32>,
+    /// Phase 5 PR 4 — selection flavour. `Linear` is the default
+    /// text-span selection; `TableCells` covers cell-rectangular drags
+    /// inside a table. Set by the engine when both endpoints share a
+    /// table ancestor with different cell positions.
+    kind: SelectionKind,
 }
 
 /// An in-progress IME composition (PHASE_4_HEADLESS_UI.md §6). Tracked
 /// between `BeginComposition` and `EndComposition`; the latest `text` is
 /// committed on a committing end. No on-canvas preview — see BACKLOG.md.
+#[derive(Clone)]
 struct CompositionState {
     at: BridgeLogicalPos,
     text: String,
@@ -90,8 +98,10 @@ struct CaretSlot {
 /// One laid-out line flattened for pointer hit-testing and caret/selection
 /// geometry. All coordinates are absolute page points (= canvas device px).
 struct LineGeom {
-    /// Document paragraph index (not the box-tree index — empties are skipped).
-    para: u32,
+    /// `BlockPath` of the paragraph this line belongs to. PR 4: cells
+    /// flatten into their own paths, so a cell-paragraph's line carries
+    /// the full descent path (e.g. `[Block(2), Cell{r,c}, Block(0)]`).
+    path: BridgeBlockPath,
     start_x: f32,
     y_top: f32,
     height: f32,
@@ -234,8 +244,220 @@ const POC_BASELINE_Y: f64 = 200.0;
 
 fn to_engine_pos(p: BridgeLogicalPos) -> EnginePos {
     EnginePos {
-        para: p.para,
+        path: bridge_to_engine_path(p.path),
         offset: p.offset,
+    }
+}
+
+fn to_bridge_pos(p: EnginePos) -> BridgeLogicalPos {
+    BridgeLogicalPos {
+        path: engine_to_bridge_path(p.path),
+        offset: p.offset,
+    }
+}
+
+/// Engine `BlockPath` → bridge `BlockPath` (mirror enums, parallel
+/// shape — see `bridge_to_engine_path` in the table-command path).
+fn engine_to_bridge_path(p: EngineBlockPath) -> BridgeBlockPath {
+    BridgeBlockPath {
+        steps: p
+            .steps
+            .into_iter()
+            .map(|s| match s {
+                EnginePathStep::Block(idx) => BridgePathStep::Block { idx },
+                EnginePathStep::Cell { row, col } => BridgePathStep::Cell { row, col },
+            })
+            .collect(),
+    }
+}
+
+/// Wire-shape constructor for the document-empty fallback used by
+/// crash recovery and the empty-document caret seed.
+fn bpos_top(para: u32, offset: u32) -> BridgeLogicalPos {
+    BridgeLogicalPos {
+        path: BridgeBlockPath::top(para),
+        offset,
+    }
+}
+
+/// Find the cell `(row, col)` of `path` inside `table_path`. `None`
+/// when `path` does not descend into a cell of that exact table.
+fn cell_of(path: &BridgeBlockPath, table_path: &BridgeBlockPath) -> Option<(u32, u32)> {
+    if !table_path.is_ancestor_of(path) || path.steps.len() <= table_path.steps.len() {
+        return None;
+    }
+    match path.steps.get(table_path.steps.len())? {
+        BridgePathStep::Cell { row, col } => Some((*row, *col)),
+        _ => None,
+    }
+}
+
+/// Walk back from a paragraph path through `Block` / `Cell` step
+/// pairs and return the path of the innermost containing table. `None`
+/// when the position is not inside any table.
+fn enclosing_table_path(path: &BridgeBlockPath) -> Option<BridgeBlockPath> {
+    /* The path shape inside a table is `... Block(N) Cell{r,c} ...`.
+    Strip the trailing `Cell{r,c} Block(N)` pair (and anything inside
+    a nested cell) to find the table path. */
+    let mut steps = path.steps.clone();
+    while !steps.is_empty() {
+        let n = steps.len();
+        if n >= 2
+            && matches!(steps[n - 1], BridgePathStep::Block { .. })
+            && matches!(steps[n - 2], BridgePathStep::Cell { .. })
+        {
+            steps.truncate(n - 2);
+            return Some(BridgeBlockPath { steps });
+        }
+        steps.pop();
+    }
+    None
+}
+
+/// Tab / Shift+Tab cell navigation. Inside a table the caret jumps
+/// to the next (or previous) cell in row-major order, landing on the
+/// first paragraph at offset 0; at the table's last cell, Tab inserts
+/// a fresh row and lands at its first cell (Word default). Outside a
+/// table the caret stays put.
+fn cell_tab_step(
+    undo: &mut UndoStack,
+    caret: &BridgeLogicalPos,
+    forward: bool,
+) -> BridgeLogicalPos {
+    let Some(table_path) = enclosing_table_path(&caret.path) else {
+        return caret.clone();
+    };
+    let Some((r, c)) = cell_of(&caret.path, &table_path) else {
+        return caret.clone();
+    };
+    let engine_table = bridge_to_engine_path(table_path.clone());
+    let Some(table) = undo.current().table_at_path(&engine_table) else {
+        return caret.clone();
+    };
+    let n_rows = table.rows.len() as u32;
+    let n_cols = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0) as u32;
+    if n_rows == 0 || n_cols == 0 {
+        return caret.clone();
+    }
+    let (next_r, next_c) = if forward {
+        if c + 1 < n_cols {
+            (r, c + 1)
+        } else if r + 1 < n_rows {
+            (r + 1, 0)
+        } else {
+            /* Last cell + forward → append a fresh row and land on its
+            first cell (Word default). */
+            let new_doc = undo
+                .current()
+                .insert_row(bridge_to_engine_path(table_path.clone()), n_rows - 1);
+            undo.push(new_doc);
+            (n_rows, 0)
+        }
+    } else if c > 0 {
+        (r, c - 1)
+    } else if r > 0 {
+        let cols_at = undo
+            .current()
+            .table_at_path(&engine_table)
+            .and_then(|t| t.rows.get((r - 1) as usize))
+            .map(|row| row.cells.len() as u32)
+            .unwrap_or(n_cols);
+        (r - 1, cols_at.saturating_sub(1))
+    } else {
+        return caret.clone();
+    };
+    /* Address the first paragraph of the destination cell. */
+    let mut steps = table_path.steps.clone();
+    steps.push(BridgePathStep::Cell {
+        row: next_r,
+        col: next_c,
+    });
+    steps.push(BridgePathStep::Block { idx: 0 });
+    BridgeLogicalPos {
+        path: BridgeBlockPath { steps },
+        offset: 0,
+    }
+}
+
+/// Build cell-rectangular highlight rects for `TableCells` selection
+/// — one rect per spanned cell, the union of every line band that
+/// belongs to a paragraph inside that cell.
+fn table_cell_rects(
+    geom: &[LineGeom],
+    table_path: &BridgeBlockPath,
+    from_row: u32,
+    from_col: u32,
+    to_row: u32,
+    to_col: u32,
+) -> Vec<BridgeRect> {
+    use std::collections::HashMap;
+    let mut by_cell: HashMap<(u32, u32), BridgeRect> = HashMap::new();
+    for line in geom {
+        let Some((r, c)) = cell_of(&line.path, table_path) else {
+            continue;
+        };
+        if r < from_row || r > to_row || c < from_col || c > to_col {
+            continue;
+        }
+        let line_rect = BridgeRect {
+            x: line.start_x,
+            y: line.y_top,
+            w: line
+                .runs
+                .iter()
+                .map(|run_g| {
+                    run_g.slots.iter().map(|s| s.x).fold(line.start_x, f32::max) - line.start_x
+                })
+                .fold(0.0_f32, f32::max),
+            h: line.height,
+        };
+        by_cell
+            .entry((r, c))
+            .and_modify(|r| {
+                let x0 = r.x.min(line_rect.x);
+                let y0 = r.y.min(line_rect.y);
+                let x1 = (r.x + r.w).max(line_rect.x + line_rect.w);
+                let y1 = (r.y + r.h).max(line_rect.y + line_rect.h);
+                *r = BridgeRect {
+                    x: x0,
+                    y: y0,
+                    w: x1 - x0,
+                    h: y1 - y0,
+                };
+            })
+            .or_insert(line_rect);
+    }
+    by_cell.into_values().collect()
+}
+
+/// Derive the selection flavour from the two endpoints. PR 4: both
+/// endpoints share an enclosing table AND descend into different
+/// cells → `TableCells`; otherwise `Linear`.
+fn derive_selection_kind(anchor: &BridgeLogicalPos, caret: &BridgeLogicalPos) -> SelectionKind {
+    let Some(table_a) = enclosing_table_path(&anchor.path) else {
+        return SelectionKind::Linear;
+    };
+    let Some(table_b) = enclosing_table_path(&caret.path) else {
+        return SelectionKind::Linear;
+    };
+    if table_a != table_b {
+        return SelectionKind::Linear;
+    }
+    let Some((ar, ac)) = cell_of(&anchor.path, &table_a) else {
+        return SelectionKind::Linear;
+    };
+    let Some((br, bc)) = cell_of(&caret.path, &table_b) else {
+        return SelectionKind::Linear;
+    };
+    if ar == br && ac == bc {
+        return SelectionKind::Linear;
+    }
+    SelectionKind::TableCells {
+        table_path: table_a,
+        from_row: ar.min(br),
+        from_col: ac.min(bc),
+        to_row: ar.max(br),
+        to_col: ac.max(bc),
     }
 }
 
@@ -817,11 +1039,95 @@ fn nearest_line(geom: &[LineGeom], y: f32) -> Option<&LineGeom> {
         .min_by(|a, b| line_y_dist(a, y).total_cmp(&line_y_dist(b, y)))
 }
 
+/// Flatten one `ParagraphBox` into `LineGeom`s stamped with `path`.
+fn collect_paragraph_line_geom(
+    para_box: &ParagraphBox,
+    parent_origin_x: f32,
+    parent_origin_y: f32,
+    path: &BridgeBlockPath,
+    out: &mut Vec<LineGeom>,
+) {
+    let para_x = parent_origin_x + para_box.origin.x;
+    let para_y = parent_origin_y + para_box.origin.y;
+    for line in &para_box.lines {
+        let line_x = para_x + line.origin.x;
+        let line_y = para_y + line.origin.y;
+        let start_byte = line
+            .runs
+            .iter()
+            .map(|r| r.source_range.start)
+            .min()
+            .unwrap_or(0);
+        let end_byte = line
+            .runs
+            .iter()
+            .map(|r| r.source_range.end)
+            .max()
+            .unwrap_or(0);
+        let runs = build_line_run_geom(line, line_x);
+        let slots: Vec<CaretSlot> = runs.iter().flat_map(|r| r.slots.iter().copied()).collect();
+        out.push(LineGeom {
+            path: path.clone(),
+            start_x: line_x,
+            y_top: line_y,
+            height: line.height,
+            start_byte,
+            end_byte,
+            slots,
+            runs,
+        });
+    }
+}
+
+/// Walk a table's rows/cells and emit `LineGeom`s for every paragraph
+/// inside a cell. Continue cells are skipped — their visual content
+/// is owned by the Restart cell above them.
+fn collect_table_line_geom(
+    table_box: &TableBox,
+    table_block_idx: u32,
+    table_origin_x: f32,
+    table_origin_y: f32,
+    out: &mut Vec<LineGeom>,
+) {
+    for (r, row) in table_box.rows.iter().enumerate() {
+        let row_x = table_origin_x + row.origin.x;
+        let row_y = table_origin_y + row.origin.y;
+        for (c, cell) in row.cells.iter().enumerate() {
+            if cell.v_merge == engine::VMergeRole::Continue {
+                continue;
+            }
+            let cell_x = row_x + cell.origin.x;
+            let cell_y = row_y + cell.origin.y;
+            for (block_idx, content) in cell.content.iter().enumerate() {
+                let LayoutBlock::Paragraph(para_box) = content else {
+                    continue;
+                };
+                let path = BridgeBlockPath {
+                    steps: vec![
+                        BridgePathStep::Block {
+                            idx: table_block_idx,
+                        },
+                        BridgePathStep::Cell {
+                            row: r as u32,
+                            col: c as u32,
+                        },
+                        BridgePathStep::Block {
+                            idx: block_idx as u32,
+                        },
+                    ],
+                };
+                collect_paragraph_line_geom(para_box, cell_x, cell_y, &path, out);
+            }
+        }
+    }
+}
+
 /// Map an absolute pixel to a logical position — nearest line by `y`, then
-/// nearest caret slot by `x`.
+/// nearest caret slot by `x`. The returned `path` is the line's owning
+/// paragraph path, descending into a cell when the hit lands inside one.
 fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
     let Some(line) = nearest_line(geom, y) else {
-        return BridgeLogicalPos { para: 0, offset: 0 };
+        return bpos_top(0, 0);
     };
     let offset = line
         .slots
@@ -829,7 +1135,7 @@ fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
         .min_by(|a, b| (a.x - x).abs().total_cmp(&(b.x - x).abs()))
         .map_or(line.start_byte, |s| s.byte);
     BridgeLogicalPos {
-        para: line.para,
+        path: line.path.clone(),
         offset,
     }
 }
@@ -860,12 +1166,12 @@ fn nearest_slot_by_x(slots: &[CaretSlot], target_x: f32) -> Option<&CaretSlot> {
 }
 
 /// Step one Unicode char left in logical order (Backlog #14). At the start of
-/// a paragraph the caret jumps to the end of the previous; at byte 0 of the
-/// document it pins there.
+/// a paragraph the caret jumps to the end of the previous paragraph in the
+/// containing flat-paragraph walk; at byte 0 of the document it pins.
 fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
-    let para_idx = pos.para as usize;
     let off = pos.offset as usize;
-    if let Some(para) = doc.nth_paragraph((para_idx) as u32) {
+    let engine_path = bridge_to_engine_path(pos.path.clone());
+    if let Some(para) = doc.paragraph_at_path(&engine_path) {
         if off > 0 {
             let text = &para.text;
             let mut o = off - 1;
@@ -873,28 +1179,27 @@ fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
                 o -= 1;
             }
             return BridgeLogicalPos {
-                para: pos.para,
+                path: pos.path,
                 offset: o as u32,
             };
         }
-        if para_idx > 0 {
-            if let Some(prev) = doc.nth_paragraph((para_idx - 1) as u32) {
-                return BridgeLogicalPos {
-                    para: (para_idx - 1) as u32,
-                    offset: prev.text.len() as u32,
-                };
-            }
+        if let Some((prev_path, prev_para)) = doc_paragraph_neighbor(doc, &engine_path, false) {
+            return BridgeLogicalPos {
+                path: engine_to_bridge_path(prev_path),
+                offset: prev_para.text.len() as u32,
+            };
         }
     }
     pos
 }
 
 /// Step one Unicode char right in logical order. At a paragraph's end the
-/// caret jumps to the start of the next; at the document end it pins.
+/// caret jumps to the start of the next paragraph in the flat walk; at the
+/// document end it pins.
 fn step_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
-    let para_idx = pos.para as usize;
     let off = pos.offset as usize;
-    if let Some(para) = doc.nth_paragraph((para_idx) as u32) {
+    let engine_path = bridge_to_engine_path(pos.path.clone());
+    if let Some(para) = doc.paragraph_at_path(&engine_path) {
         let text = &para.text;
         if off < text.len() {
             let mut o = off + 1;
@@ -902,13 +1207,13 @@ fn step_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
                 o += 1;
             }
             return BridgeLogicalPos {
-                para: pos.para,
+                path: pos.path,
                 offset: o as u32,
             };
         }
-        if para_idx + 1 < doc.paragraph_count() as usize {
+        if let Some((next_path, _)) = doc_paragraph_neighbor(doc, &engine_path, true) {
             return BridgeLogicalPos {
-                para: (para_idx + 1) as u32,
+                path: engine_to_bridge_path(next_path),
                 offset: 0,
             };
         }
@@ -916,17 +1221,91 @@ fn step_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     pos
 }
 
+/// Walk the document's paragraphs in linear order (depth-first into
+/// table cells) and return the neighbour of `path`. `forward` selects
+/// the next paragraph; otherwise the previous. `None` when at the
+/// boundary.
+fn doc_paragraph_neighbor(
+    doc: &DocumentTree,
+    path: &EngineBlockPath,
+    forward: bool,
+) -> Option<(EngineBlockPath, engine::Paragraph)> {
+    let paths = doc_paragraph_paths(doc);
+    let pos = paths.iter().position(|p| p == path)?;
+    let target = if forward {
+        pos.checked_add(1)?
+    } else {
+        pos.checked_sub(1)?
+    };
+    let candidate = paths.get(target)?.clone();
+    let para = doc.paragraph_at_path(&candidate)?.clone();
+    Some((candidate, para))
+}
+
+/// Flat list of every paragraph path in document order (top-level
+/// paragraphs + recursive descent into table cells). Cheap for the
+/// PoC and the small-table common case; cache when editing lands.
+fn doc_paragraph_paths(doc: &DocumentTree) -> Vec<EngineBlockPath> {
+    let mut out: Vec<EngineBlockPath> = Vec::new();
+    let mut prefix: Vec<EnginePathStep> = Vec::new();
+    for (i, b) in doc.blocks.iter().enumerate() {
+        prefix.push(EnginePathStep::Block(i as u32));
+        walk_block(b, &mut prefix, &mut out);
+        prefix.pop();
+    }
+    out
+}
+
+fn walk_block(
+    block: &engine::Block,
+    prefix: &mut Vec<EnginePathStep>,
+    out: &mut Vec<EngineBlockPath>,
+) {
+    match block {
+        engine::Block::Paragraph(_) => out.push(EngineBlockPath {
+            steps: prefix.clone(),
+        }),
+        engine::Block::Table(t) => {
+            for (r, row) in t.rows.iter().enumerate() {
+                for (c, cell) in row.cells.iter().enumerate() {
+                    if cell.props.v_merge == engine::VMergeRole::Continue {
+                        continue;
+                    }
+                    prefix.push(EnginePathStep::Cell {
+                        row: r as u32,
+                        col: c as u32,
+                    });
+                    collect_paragraph_paths_vec(&cell.blocks, prefix, out);
+                    prefix.pop();
+                }
+            }
+        }
+    }
+}
+
+fn collect_paragraph_paths_vec(
+    blocks: &[engine::Block],
+    prefix: &mut Vec<EnginePathStep>,
+    out: &mut Vec<EngineBlockPath>,
+) {
+    for (i, b) in blocks.iter().enumerate() {
+        prefix.push(EnginePathStep::Block(i as u32));
+        walk_block(b, prefix, out);
+        prefix.pop();
+    }
+}
+
 /// Caret rectangle for `pos`, `caret_w` device px wide. Falls back to
 /// `fallback` when the document has no geometry yet (empty document).
 fn caret_rect_geom(
     geom: &[LineGeom],
-    pos: BridgeLogicalPos,
+    pos: &BridgeLogicalPos,
     fallback: BridgeRect,
     caret_w: f32,
 ) -> BridgeRect {
     let line = geom
         .iter()
-        .find(|l| l.para == pos.para && pos.offset >= l.start_byte && pos.offset <= l.end_byte)
+        .find(|l| l.path == pos.path && pos.offset >= l.start_byte && pos.offset <= l.end_byte)
         .or_else(|| geom.first());
     match line {
         Some(line) => BridgeRect {
@@ -948,20 +1327,25 @@ fn caret_rect_geom(
 /// single run (no BiDi) still yields exactly one rect, as before.
 fn selection_rects_geom(
     geom: &[LineGeom],
-    start: BridgeLogicalPos,
-    end: BridgeLogicalPos,
+    start: &BridgeLogicalPos,
+    end: &BridgeLogicalPos,
 ) -> Vec<BridgeRect> {
+    use core::cmp::Ordering;
     let mut rects: Vec<BridgeRect> = Vec::new();
     for line in geom {
-        if line.para < start.para || line.para > end.para {
+        /* Skip lines whose paragraph sits before start or after end in
+        document order; equal paths clip to the per-paragraph offsets. */
+        let cmp_start = line.path.cmp_doc_order(&start.path);
+        let cmp_end = line.path.cmp_doc_order(&end.path);
+        if cmp_start == Ordering::Less || cmp_end == Ordering::Greater {
             continue;
         }
-        let lo = if line.para == start.para {
+        let lo = if cmp_start == Ordering::Equal {
             start.offset.max(line.start_byte)
         } else {
             line.start_byte
         };
-        let hi = if line.para == end.para {
+        let hi = if cmp_end == Ordering::Equal {
             end.offset.min(line.end_byte)
         } else {
             line.end_byte
@@ -991,28 +1375,42 @@ fn selection_rects_geom(
     rects
 }
 
-/// Order two positions into document order (paragraph, then offset).
+/// Order two positions into document order (path, then offset).
 fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, BridgeLogicalPos) {
-    if (a.para, a.offset) <= (b.para, b.offset) {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    use core::cmp::Ordering;
+    let ord = a.path.cmp_doc_order(&b.path);
+    let swap = match ord {
+        Ordering::Less => false,
+        Ordering::Greater => true,
+        Ordering::Equal => a.offset > b.offset,
+    };
+    if swap { (b, a) } else { (a, b) }
 }
 
-/// Clamp a position into `doc` — paragraph index and byte offset both in range.
+/// Clamp a position into `doc` — `path` resolved to a real paragraph
+/// (falling back to the document end), `offset` capped at the
+/// paragraph's UTF-8 length.
 fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     if doc.paragraph_count() == 0 {
-        return BridgeLogicalPos { para: 0, offset: 0 };
+        return bpos_top(0, 0);
     }
-    let para = (pos.para as usize).min(doc.paragraph_count() as usize - 1);
-    let offset = pos.offset.min(
-        doc.nth_paragraph(para as u32)
-            .map(|p| p.text.len() as u32)
-            .unwrap_or(0),
-    );
+    let engine_path = bridge_to_engine_path(pos.path.clone());
+    let (resolved_path, para_len) = match doc.paragraph_at_path(&engine_path) {
+        Some(p) => (engine_path, p.text.len() as u32),
+        None => {
+            let fallback = doc
+                .path_to_last_top_paragraph()
+                .unwrap_or(EngineBlockPath::top(0));
+            let len = doc
+                .paragraph_at_path(&fallback)
+                .map(|p| p.text.len() as u32)
+                .unwrap_or(0);
+            (fallback, len)
+        }
+    };
+    let offset = pos.offset.min(para_len);
     BridgeLogicalPos {
-        para: para as u32,
+        path: engine_to_bridge_path(resolved_path),
         offset,
     }
 }
@@ -1273,9 +1671,10 @@ impl Engine {
                     /* The prior selection points into the replaced document —
                     reset the caret to the start of the loaded one. */
                     self.selection = Some(SelectionState {
-                        anchor: BridgeLogicalPos { para: 0, offset: 0 },
-                        caret: BridgeLogicalPos { para: 0, offset: 0 },
+                        anchor: bpos_top(0, 0),
+                        caret: bpos_top(0, 0),
                         ideal_x: None,
+                        kind: SelectionKind::Linear,
                     });
                     self.layout_cache.get_mut().clear();
                     self.dirty.invalidate(full_page_rect(self.scale()));
@@ -1584,8 +1983,8 @@ impl Engine {
             return self.selection_changed();
         }
         let new_doc = self.undo.current().apply_style(
-            to_engine_pos(range.start),
-            to_engine_pos(range.end),
+            to_engine_pos(range.start.clone()),
+            to_engine_pos(range.end.clone()),
             patch,
         );
         self.undo.push(new_doc);
@@ -1672,7 +2071,7 @@ impl Engine {
         &self,
         scale: f32,
         with_composition: bool,
-    ) -> Result<(PageBox, FontStack, Vec<u32>), Box<Event>> {
+    ) -> Result<(PageBox, FontStack, Vec<EngineBlockPath>), Box<Event>> {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
@@ -1695,11 +2094,10 @@ impl Engine {
         PR 2: `LayoutBlock::Paragraph` follows the existing path;
         `LayoutBlock::Table` recursively lays out cells. */
         let mut layout_blocks: Vec<LayoutBlock> = Vec::new();
-        /* Document paragraph-flat index of each emitted `ParagraphBox` —
-        empty paragraphs produce no box, so box index != paragraph-flat
-        index. Tables emit a `LayoutBlock::Table` that is *not* recorded
-        here (PDF / hit-test address paragraphs only at PR 2). */
-        let mut box_doc_index: Vec<u32> = Vec::new();
+        /* `BlockPath` of each emitted layout block, in emission order.
+        Empty paragraphs produce no box so layout index != block index;
+        tables are recorded with their top-level block path. */
+        let mut box_paths: Vec<EngineBlockPath> = Vec::new();
         let mut para_y_offset = 0.0_f32;
         let doc = self.undo.current().clone();
         let mut cache = self.layout_cache.borrow_mut();
@@ -1711,8 +2109,7 @@ impl Engine {
         } else {
             None
         };
-        let mut paragraph_flat_idx: u32 = 0;
-        for block in doc.blocks.iter() {
+        for (block_idx, block) in doc.blocks.iter().enumerate() {
             let para = match block {
                 engine::Block::Paragraph(p) => p,
                 engine::Block::Table(t) => {
@@ -1727,14 +2124,14 @@ impl Engine {
                     };
                     para_y_offset += tb.size.height;
                     layout_blocks.push(LayoutBlock::Table(tb));
+                    box_paths.push(EngineBlockPath::top(block_idx as u32));
                     continue;
                 }
             };
-            let doc_idx = paragraph_flat_idx as usize;
-            paragraph_flat_idx += 1;
+            let para_path = EngineBlockPath::top(block_idx as u32);
             {
                 let comp = composition.filter(|c| {
-                    c.at.para as usize == doc_idx
+                    bridge_to_engine_path(c.at.path.clone()) == para_path
                         && !c.text.is_empty()
                         && (c.at.offset as usize) <= para.text.len()
                         && para.text.is_char_boundary(c.at.offset as usize)
@@ -1833,7 +2230,7 @@ impl Engine {
                 };
                 para_y_offset += para_box.size.height + after_px;
                 layout_blocks.push(LayoutBlock::Paragraph(para_box));
-                box_doc_index.push(doc_idx as u32);
+                box_paths.push(para_path);
             }
         }
         drop(cache);
@@ -1846,12 +2243,12 @@ impl Engine {
             margins: page.margin,
             blocks: layout_blocks,
         };
-        Ok((page_box, font_stack, box_doc_index))
+        Ok((page_box, font_stack, box_paths))
     }
 
     fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
         /* `true` — splice the live IME composition preview into the paint. */
-        let (page_box, _font_stack, _box_doc_index) = self.build_page(self.scale(), true)?;
+        let (page_box, _font_stack, _box_paths) = self.build_page(self.scale(), true)?;
 
         let line_count: u32 = page_box
             .blocks
@@ -1936,7 +2333,7 @@ impl Engine {
     fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
         /* `false` — a PDF export is the committed document, never the
         in-progress IME composition. */
-        let (page_box, font_stack, box_doc_index) = match self.build_page(1.0, false) {
+        let (page_box, font_stack, box_paths) = match self.build_page(1.0, false) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -1944,14 +2341,26 @@ impl Engine {
             PdfConformance::A1b => format_pdf::PdfProfile::A1b,
             PdfConformance::A2u | PdfConformance::X3 => format_pdf::PdfProfile::Plain,
         };
-        /* Per-paragraph source text, aligned with `page_box.paragraphs` — the
-        PDF `/ToUnicode` CMap resolves each glyph's cluster against it so the
-        exported text stays selectable. `box_doc_index` maps box index back to
-        document paragraph index (empty paragraphs emit no box). */
+        /* Per-paragraph source text, aligned with the emitted paragraph
+        boxes — the PDF `/ToUnicode` CMap resolves each glyph's cluster
+        against it so the exported text stays selectable. Tables emit no
+        per-paragraph text (PDF table export is Phase 5b — see
+        BACKLOG.md). */
         let doc = self.undo.current();
-        let para_texts: Vec<&str> = box_doc_index
+        let para_texts: Vec<&str> = page_box
+            .blocks
             .iter()
-            .map(|&di| doc.nth_paragraph(di).map(|p| p.text.as_str()).unwrap_or(""))
+            .enumerate()
+            .filter_map(|(i, lb)| match lb {
+                LayoutBlock::Paragraph(_) => Some(
+                    box_paths
+                        .get(i)
+                        .and_then(|p| doc.paragraph_at_path(p))
+                        .map(|p| p.text.as_str())
+                        .unwrap_or(""),
+                ),
+                _ => None,
+            })
             .collect();
         let mut bytes: Vec<u8> = Vec::new();
         if let Err(e) =
@@ -1983,55 +2392,42 @@ impl Engine {
         }
     }
 
-    /// Flatten the current document into per-line hit-test geometry. Re-lays
-    /// out the document — cheap for the single-page PoC; cache when editing
-    /// lands.
+    /// Flatten the current document into per-line hit-test geometry. PR 4:
+    /// recurses into table cells so a click inside a cell maps to a
+    /// `BlockPath` ending at the cell's paragraph (`[Block(t), Cell{r,c},
+    /// Block(p)]`). Re-lays out the document on every call — cheap for the
+    /// single-page PoC; cache when editing lands.
     fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
         /* `false` — hit-test + caret geometry run on committed document
         offsets, which `self.selection` is also expressed in. */
-        let (page, _fonts, box_doc_index) = self.build_page(self.scale(), false)?;
+        let (page, _fonts, box_paths) = self.build_page(self.scale(), false)?;
         let content_x = page.margins.left;
         let content_y = page.margins.top;
         let mut geom: Vec<LineGeom> = Vec::new();
-        /* Phase 5 PR 2 — `page.blocks` may carry tables; geometry only
-        addresses paragraphs (caret + selection are paragraph-flat). */
-        for (k, para_box) in page
-            .blocks
-            .iter()
-            .filter_map(LayoutBlock::as_paragraph)
-            .enumerate()
-        {
-            let doc_idx = box_doc_index.get(k).copied().unwrap_or(0);
-            let para_x = content_x + para_box.origin.x;
-            let para_y = content_y + para_box.origin.y;
-            for line in &para_box.lines {
-                let line_x = para_x + line.origin.x;
-                let line_y = para_y + line.origin.y;
-                let start_byte = line
-                    .runs
-                    .iter()
-                    .map(|r| r.source_range.start)
-                    .min()
-                    .unwrap_or(0);
-                let end_byte = line
-                    .runs
-                    .iter()
-                    .map(|r| r.source_range.end)
-                    .max()
-                    .unwrap_or(0);
-                let runs = build_line_run_geom(line, line_x);
-                let slots: Vec<CaretSlot> =
-                    runs.iter().flat_map(|r| r.slots.iter().copied()).collect();
-                geom.push(LineGeom {
-                    para: doc_idx,
-                    start_x: line_x,
-                    y_top: line_y,
-                    height: line.height,
-                    start_byte,
-                    end_byte,
-                    slots,
-                    runs,
-                });
+        for (i, layout_block) in page.blocks.iter().enumerate() {
+            let Some(path) = box_paths.get(i) else {
+                continue;
+            };
+            match layout_block {
+                LayoutBlock::Paragraph(para_box) => {
+                    collect_paragraph_line_geom(
+                        para_box,
+                        content_x,
+                        content_y,
+                        &engine_to_bridge_path(path.clone()),
+                        &mut geom,
+                    );
+                }
+                LayoutBlock::Table(table_box) => {
+                    let table_block_idx = path.last_block_index().unwrap_or(0);
+                    collect_table_line_geom(
+                        table_box,
+                        table_block_idx,
+                        content_x + table_box.origin.x,
+                        content_y + table_box.origin.y,
+                        &mut geom,
+                    );
+                }
             }
         }
         Ok(geom)
@@ -2057,22 +2453,29 @@ impl Engine {
         };
         /* A caret move discards any armed sticky style (Backlog #11). */
         self.pending_format = None;
+        let kind = derive_selection_kind(&anchor, &caret);
         self.selection = Some(SelectionState {
             anchor,
             caret,
             ideal_x: None,
+            kind,
         });
         self.selection_changed()
     }
 
     /// `Command::ExtendSelection` — keep the anchor, move the caret to `to`.
     fn do_extend_selection(&mut self, to: BridgeLogicalPos) -> Event {
-        let anchor = self.selection.map_or(to, |s| s.anchor);
+        let anchor = self
+            .selection
+            .as_ref()
+            .map_or_else(|| to.clone(), |s| s.anchor.clone());
         self.pending_format = None;
+        let kind = derive_selection_kind(&anchor, &to);
         self.selection = Some(SelectionState {
             anchor,
             caret: to,
             ideal_x: None,
+            kind,
         });
         self.selection_changed()
     }
@@ -2085,22 +2488,24 @@ impl Engine {
             Err(e) => return *e,
         };
         let hit = hit_test_geom(&geom, at.x, at.y);
+        let engine_path = bridge_to_engine_path(hit.path.clone());
         let (lo, hi) = self
             .undo
             .current()
-            .nth_paragraph((hit.para as usize) as u32)
+            .paragraph_at_path(&engine_path)
             .map_or((hit.offset, hit.offset), |p| p.word_bounds(hit.offset));
         self.pending_format = None;
         self.selection = Some(SelectionState {
             anchor: BridgeLogicalPos {
-                para: hit.para,
+                path: hit.path.clone(),
                 offset: lo,
             },
             caret: BridgeLogicalPos {
-                para: hit.para,
+                path: hit.path,
                 offset: hi,
             },
             ideal_x: None,
+            kind: SelectionKind::Linear,
         });
         self.selection_changed()
     }
@@ -2113,22 +2518,24 @@ impl Engine {
             Err(e) => return *e,
         };
         let hit = hit_test_geom(&geom, at.x, at.y);
+        let engine_path = bridge_to_engine_path(hit.path.clone());
         let len = self
             .undo
             .current()
-            .nth_paragraph((hit.para as usize) as u32)
+            .paragraph_at_path(&engine_path)
             .map_or(0, |p| p.text.len() as u32);
         self.pending_format = None;
         self.selection = Some(SelectionState {
             anchor: BridgeLogicalPos {
-                para: hit.para,
+                path: hit.path.clone(),
                 offset: 0,
             },
             caret: BridgeLogicalPos {
-                para: hit.para,
+                path: hit.path,
                 offset: len,
             },
             ideal_x: None,
+            kind: SelectionKind::Linear,
         });
         self.selection_changed()
     }
@@ -2137,18 +2544,21 @@ impl Engine {
     /// last paragraph's byte length. Empty document collapses to (0, 0).
     fn do_select_all(&mut self) -> Event {
         let doc = self.undo.current();
-        let last_para = (doc.paragraph_count() as usize).saturating_sub(1);
+        let last_path = doc
+            .path_to_last_top_paragraph()
+            .unwrap_or(EngineBlockPath::top(0));
         let last_len = doc
-            .nth_paragraph((last_para) as u32)
+            .paragraph_at_path(&last_path)
             .map_or(0, |p| p.text.len() as u32);
         self.pending_format = None;
         self.selection = Some(SelectionState {
-            anchor: BridgeLogicalPos { para: 0, offset: 0 },
+            anchor: bpos_top(0, 0),
             caret: BridgeLogicalPos {
-                para: last_para as u32,
+                path: engine_to_bridge_path(last_path),
                 offset: last_len,
             },
             ideal_x: None,
+            kind: SelectionKind::Linear,
         });
         self.selection_changed()
     }
@@ -2158,36 +2568,47 @@ impl Engine {
     /// and snap to the slot nearest the stored ideal-x. `extend: true` keeps
     /// the anchor put so the gesture extends the selection (Shift + Arrow).
     fn do_move_caret(&mut self, direction: MoveDirection, extend: bool) -> Event {
-        let sel = self.selection.unwrap_or(SelectionState {
-            anchor: BridgeLogicalPos { para: 0, offset: 0 },
-            caret: BridgeLogicalPos { para: 0, offset: 0 },
+        let sel = self.selection.clone().unwrap_or(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
             ideal_x: None,
+            kind: SelectionKind::Linear,
         });
         let doc = self.undo.current().clone();
         let (new_caret, new_ideal) = match direction {
-            MoveDirection::Left => (step_left(&doc, sel.caret), None),
-            MoveDirection::Right => (step_right(&doc, sel.caret), None),
+            MoveDirection::Left => (step_left(&doc, sel.caret.clone()), None),
+            MoveDirection::Right => (step_right(&doc, sel.caret.clone()), None),
+            MoveDirection::NextCell | MoveDirection::PrevCell => (
+                cell_tab_step(
+                    &mut self.undo,
+                    &sel.caret,
+                    direction == MoveDirection::NextCell,
+                ),
+                None,
+            ),
             MoveDirection::Up | MoveDirection::Down => {
                 let geom = match self.document_geometry() {
                     Ok(g) => g,
                     Err(e) => return *e,
                 };
+                let caret_path = sel.caret.path.clone();
+                let caret_offset = sel.caret.offset;
                 /* Re-use the carried column if a vertical walk is in progress;
                 otherwise lock in the caret's current x. */
                 let ideal = sel.ideal_x.unwrap_or_else(|| {
                     geom.iter()
                         .find(|l| {
-                            l.para == sel.caret.para
-                                && sel.caret.offset >= l.start_byte
-                                && sel.caret.offset <= l.end_byte
+                            l.path == caret_path
+                                && caret_offset >= l.start_byte
+                                && caret_offset <= l.end_byte
                         })
                         .or_else(|| geom.first())
-                        .map_or(0.0, |line| slot_x_for_byte(line, sel.caret.offset))
+                        .map_or(0.0, |line| slot_x_for_byte(line, caret_offset))
                 });
                 let cur_idx = geom.iter().position(|l| {
-                    l.para == sel.caret.para
-                        && sel.caret.offset >= l.start_byte
-                        && sel.caret.offset <= l.end_byte
+                    l.path == caret_path
+                        && caret_offset >= l.start_byte
+                        && caret_offset <= l.end_byte
                 });
                 let target = match (cur_idx, direction) {
                     (Some(i), MoveDirection::Up) if i > 0 => geom.get(i - 1),
@@ -2197,28 +2618,35 @@ impl Engine {
                 let new_caret = match target {
                     Some(line) => nearest_slot_by_x(&line.slots, ideal)
                         .map(|s| BridgeLogicalPos {
-                            para: line.para,
+                            path: line.path.clone(),
                             offset: s.byte,
                         })
-                        .unwrap_or(sel.caret),
-                    None => sel.caret,
+                        .unwrap_or_else(|| sel.caret.clone()),
+                    None => sel.caret.clone(),
                 };
                 (new_caret, Some(ideal))
             }
         };
-        let new_caret = clamp_pos(&doc, new_caret);
+        let new_caret = clamp_pos(self.undo.current(), new_caret);
         self.pending_format = None;
+        let anchor = if extend {
+            sel.anchor.clone()
+        } else {
+            new_caret.clone()
+        };
+        let kind = derive_selection_kind(&anchor, &new_caret);
         self.selection = Some(SelectionState {
-            anchor: if extend { sel.anchor } else { new_caret },
+            anchor,
             caret: new_caret,
             ideal_x: new_ideal,
+            kind,
         });
         self.selection_changed()
     }
 
     /// Assemble a `SelectionChanged` event from the current selection.
     fn selection_changed(&self) -> Event {
-        let Some(sel) = self.selection else {
+        let Some(sel) = self.selection.clone() else {
             return Event::Error {
                 message: "selection_changed: no active selection".into(),
             };
@@ -2227,7 +2655,7 @@ impl Engine {
             Ok(g) => g,
             Err(e) => return *e,
         };
-        let (start, end) = ordered(sel.anchor, sel.caret);
+        let (start, end) = ordered(sel.anchor.clone(), sel.caret.clone());
         let scale = self.scale();
         let page = A4Page::a4().scaled(scale);
         let fallback = BridgeRect {
@@ -2236,36 +2664,54 @@ impl Engine {
             w: CARET_WIDTH * scale,
             h: self.layout_cfg.as_ref().map_or(16.0, |c| c.line_height) * scale,
         };
-        let rects = if start == end {
-            Vec::new()
-        } else {
-            selection_rects_geom(&geom, start, end)
+        let rects = match &sel.kind {
+            SelectionKind::TableCells {
+                table_path,
+                from_row,
+                from_col,
+                to_row,
+                to_col,
+            } => table_cell_rects(&geom, table_path, *from_row, *from_col, *to_row, *to_col),
+            SelectionKind::Linear => {
+                if start == end {
+                    Vec::new()
+                } else {
+                    selection_rects_geom(&geom, &start, &end)
+                }
+            }
         };
         let direction = match self.layout_cfg.as_ref().map(|c| c.base_direction) {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
         };
+        let probe = self.attrs_probe(&start, &end);
         Event::SelectionChanged {
-            range: BridgeLogicalRange { start, end },
-            caret: caret_rect_geom(&geom, sel.caret, fallback, CARET_WIDTH * scale),
+            range: BridgeLogicalRange {
+                start: start.clone(),
+                end: end.clone(),
+            },
+            caret: caret_rect_geom(&geom, &sel.caret, fallback, CARET_WIDTH * scale),
             direction,
             rects,
             /* A collapsed caret reflects any armed pending style; a real
             selection reports the document's own attributes (Backlog #11). */
-            attrs_at_caret: self.attrs_at(self.attrs_probe(start, end), start == end),
-            paragraph_alignment: self.paragraph_alignment_at(sel.caret.para),
+            attrs_at_caret: self.attrs_at(probe, start == end),
+            paragraph_alignment: self.paragraph_alignment_at(&sel.caret.path),
             can_undo: self.undo.can_undo(),
             can_redo: self.undo.can_redo(),
+            selection_kind: sel.kind.clone(),
         }
     }
 
-    /// Effective alignment of paragraph `para` for the toolbar — the
-    /// paragraph's own override, else the document's render-config default.
-    fn paragraph_alignment_at(&self, para: u32) -> BridgeAlignment {
+    /// Effective alignment of the paragraph at `path` for the toolbar
+    /// — the paragraph's own override, else the document's render-
+    /// config default.
+    fn paragraph_alignment_at(&self, path: &BridgeBlockPath) -> BridgeAlignment {
+        let engine_path = bridge_to_engine_path(path.clone());
         let stored = self
             .undo
             .current()
-            .nth_paragraph((para as usize) as u32)
+            .paragraph_at_path(&engine_path)
             .and_then(|p| p.props.alignment)
             .map(layout_align);
         let default = self
@@ -2279,17 +2725,18 @@ impl Engine {
     /// for a range, or the char before a collapsed caret (the style typing
     /// there would extend). `style_at(caret)` alone reads the char *after* the
     /// caret, which is unstyled right after formatting a selection.
-    fn attrs_probe(&self, start: BridgeLogicalPos, end: BridgeLogicalPos) -> BridgeLogicalPos {
+    fn attrs_probe(&self, start: &BridgeLogicalPos, end: &BridgeLogicalPos) -> BridgeLogicalPos {
         if start != end || start.offset == 0 {
-            return start;
+            return start.clone();
         }
+        let engine_path = bridge_to_engine_path(start.path.clone());
         let prev = self
             .undo
             .current()
-            .nth_paragraph((start.para as usize) as u32)
+            .paragraph_at_path(&engine_path)
             .map_or(start.offset, |p| p.prev_offset(start.offset));
         BridgeLogicalPos {
-            para: start.para,
+            path: start.path.clone(),
             offset: prev,
         }
     }
@@ -2300,10 +2747,11 @@ impl Engine {
     /// collapsed caret), any armed sticky style is overlaid so the toolbar
     /// previews what the next keystroke will adopt (Backlog #11).
     fn attrs_at(&self, pos: BridgeLogicalPos, apply_pending: bool) -> TextAttrs {
+        let engine_path = bridge_to_engine_path(pos.path.clone());
         let mut style = self
             .undo
             .current()
-            .nth_paragraph((pos.para as usize) as u32)
+            .paragraph_at_path(&engine_path)
             .map_or(SpanStyle::default(), |p| p.style_at(pos.offset));
         if apply_pending && let Some(pending) = self.pending_format {
             style = style.merged_with(pending);
@@ -2340,10 +2788,12 @@ impl Engine {
     fn commit_edit(&mut self, new_doc: DocumentTree, caret: BridgeLogicalPos) -> Event {
         self.undo.push(new_doc);
         let caret = clamp_pos(self.undo.current(), caret);
+        let anchor = caret.clone();
         self.selection = Some(SelectionState {
-            anchor: caret,
+            anchor,
             caret,
             ideal_x: None,
+            kind: SelectionKind::Linear,
         });
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -2355,10 +2805,11 @@ impl Engine {
     /// Interactive `InsertText` — replace any non-empty selection with `text`,
     /// then place the caret after it.
     fn do_insert_text_interactive(&mut self, at: BridgeLogicalPos, text: String) -> Event {
-        let sel = self.selection.unwrap_or(SelectionState {
-            anchor: at,
+        let sel = self.selection.clone().unwrap_or(SelectionState {
+            anchor: at.clone(),
             caret: at,
             ideal_x: None,
+            kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
         let base = if start == end {
@@ -2366,9 +2817,9 @@ impl Engine {
         } else {
             self.undo
                 .current()
-                .delete_range(to_engine_pos(start), to_engine_pos(end))
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
-        let mut new_doc = base.insert_text(to_engine_pos(start), &text);
+        let mut new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
         let inserted_end = start.offset + text.len() as u32;
         /* Sticky formatting (Backlog #11): overlay any armed pending style
         onto the just-inserted run. It is intentionally NOT cleared here — it
@@ -2376,16 +2827,16 @@ impl Engine {
         the style, and is dropped only when the caret moves. */
         if let Some(pending) = self.pending_format {
             new_doc = new_doc.apply_style(
-                to_engine_pos(start),
+                to_engine_pos(start.clone()),
                 EnginePos {
-                    para: start.para,
+                    path: bridge_to_engine_path(start.path.clone()),
                     offset: inserted_end,
                 },
                 pending,
             );
         }
         let caret = BridgeLogicalPos {
-            para: start.para,
+            path: start.path,
             offset: inserted_end,
         };
         self.commit_edit(new_doc, caret)
@@ -2397,14 +2848,14 @@ impl Engine {
         let new_doc = self
             .undo
             .current()
-            .delete_range(to_engine_pos(start), to_engine_pos(end));
+            .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
         self.commit_edit(new_doc, start)
     }
 
     /// `Command::SplitParagraph` — break the paragraph at the caret (replacing
     /// any non-empty selection first); the caret moves to the new paragraph.
     fn do_split_paragraph(&mut self, at: BridgeLogicalPos) -> Event {
-        let (base, split_at) = match self.selection {
+        let (base, split_at) = match self.selection.clone() {
             Some(s) => {
                 let (start, end) = ordered(s.anchor, s.caret);
                 let doc = if start == end {
@@ -2412,15 +2863,16 @@ impl Engine {
                 } else {
                     self.undo
                         .current()
-                        .delete_range(to_engine_pos(start), to_engine_pos(end))
+                        .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
                 };
                 (doc, start)
             }
             None => (self.undo.current().clone(), at),
         };
-        let new_doc = base.split_paragraph(to_engine_pos(split_at));
+        let new_doc = base.split_paragraph(to_engine_pos(split_at.clone()));
+        let next_path = engine::bump_last_block_index(&bridge_to_engine_path(split_at.path));
         let caret = BridgeLogicalPos {
-            para: split_at.para + 1,
+            path: engine_to_bridge_path(next_path),
             offset: 0,
         };
         self.commit_edit(new_doc, caret)
@@ -2429,17 +2881,17 @@ impl Engine {
     /// `Command::DeleteAtCaret` — delete the selection if non-empty, else one
     /// grapheme (or word) in the `forward` direction from the caret.
     fn do_delete_at_caret(&mut self, forward: bool, by_word: bool) -> Event {
-        let Some(sel) = self.selection else {
+        let Some(sel) = self.selection.clone() else {
             return Event::Error {
                 message: "DeleteAtCaret: no active selection".into(),
             };
         };
-        let (start, end) = ordered(sel.anchor, sel.caret);
+        let (start, end) = ordered(sel.anchor, sel.caret.clone());
         if start != end {
             let new_doc = self
                 .undo
                 .current()
-                .delete_range(to_engine_pos(start), to_engine_pos(end));
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
             return self.commit_edit(new_doc, start);
         }
         let Some((del_start, del_end)) = self.delete_target(sel.caret, forward, by_word) else {
@@ -2449,7 +2901,7 @@ impl Engine {
         let new_doc = self
             .undo
             .current()
-            .delete_range(to_engine_pos(del_start), to_engine_pos(del_end));
+            .delete_range(to_engine_pos(del_start.clone()), to_engine_pos(del_end));
         self.commit_edit(new_doc, del_start)
     }
 
@@ -2463,7 +2915,8 @@ impl Engine {
         by_word: bool,
     ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
         let doc = self.undo.current();
-        let para = doc.nth_paragraph((caret.para as usize) as u32)?;
+        let engine_path = bridge_to_engine_path(caret.path.clone());
+        let para = doc.paragraph_at_path(&engine_path)?;
         let para_len = para.text.len() as u32;
         if forward {
             if caret.offset < para_len {
@@ -2472,18 +2925,16 @@ impl Engine {
                 } else {
                     para.next_offset(caret.offset)
                 };
+                let end = BridgeLogicalPos {
+                    path: caret.path.clone(),
+                    offset: to,
+                };
+                Some((caret, end))
+            } else if let Some((next_path, _)) = doc_paragraph_neighbor(doc, &engine_path, true) {
                 Some((
                     caret,
                     BridgeLogicalPos {
-                        para: caret.para,
-                        offset: to,
-                    },
-                ))
-            } else if (caret.para as usize) + 1 < doc.paragraph_count() as usize {
-                Some((
-                    caret,
-                    BridgeLogicalPos {
-                        para: caret.para + 1,
+                        path: engine_to_bridge_path(next_path),
                         offset: 0,
                     },
                 ))
@@ -2496,21 +2947,18 @@ impl Engine {
             } else {
                 para.prev_offset(caret.offset)
             };
+            let start = BridgeLogicalPos {
+                path: caret.path.clone(),
+                offset: from,
+            };
+            Some((start, caret))
+        } else if let Some((prev_path, prev_para)) =
+            doc_paragraph_neighbor(doc, &engine_path, false)
+        {
             Some((
                 BridgeLogicalPos {
-                    para: caret.para,
-                    offset: from,
-                },
-                caret,
-            ))
-        } else if caret.para > 0 {
-            let prev_len = doc
-                .nth_paragraph((caret.para as usize - 1) as u32)
-                .map_or(0, |p| p.text.len() as u32);
-            Some((
-                BridgeLogicalPos {
-                    para: caret.para - 1,
-                    offset: prev_len,
+                    path: engine_to_bridge_path(prev_path),
+                    offset: prev_para.text.len() as u32,
                 },
                 caret,
             ))
@@ -2522,7 +2970,7 @@ impl Engine {
     /// `Command::BeginComposition` — start tracking an IME composition.
     fn do_begin_composition(&mut self, at: BridgeLogicalPos) -> Event {
         self.composition = Some(CompositionState {
-            at,
+            at: at.clone(),
             text: String::new(),
         });
         Event::CompositionUpdated {
@@ -2539,13 +2987,14 @@ impl Engine {
         target_range: Option<BridgeLogicalRange>,
     ) -> Event {
         let at = match &self.composition {
-            Some(c) => c.at,
+            Some(c) => c.at.clone(),
             None => self
                 .selection
-                .map_or(BridgeLogicalPos { para: 0, offset: 0 }, |s| s.caret),
+                .as_ref()
+                .map_or_else(|| bpos_top(0, 0), |s| s.caret.clone()),
         };
         self.composition = Some(CompositionState {
-            at,
+            at: at.clone(),
             text: text.clone(),
         });
         /* Backlog #8: repaint so the inline composition preview tracks the
@@ -2578,13 +3027,17 @@ impl Engine {
     /// restored document. Falls back to `UndoStateChanged` when no selection
     /// exists (the Phase-1 harness path).
     fn after_history_change(&mut self) -> Event {
-        match self.selection {
+        match self.selection.clone() {
             Some(sel) => {
                 let doc = self.undo.current();
+                let anchor = clamp_pos(doc, sel.anchor);
+                let caret = clamp_pos(doc, sel.caret);
+                let kind = derive_selection_kind(&anchor, &caret);
                 self.selection = Some(SelectionState {
-                    anchor: clamp_pos(doc, sel.anchor),
-                    caret: clamp_pos(doc, sel.caret),
+                    anchor,
+                    caret,
                     ideal_x: None,
+                    kind,
                 });
                 self.selection_changed()
             }
@@ -2645,7 +3098,7 @@ impl Engine {
             html: String::new(),
             docx_fragment: Vec::new(),
         };
-        let Some(sel) = self.selection else {
+        let Some(sel) = self.selection.clone() else {
             return empty;
         };
         let (start, end) = ordered(sel.anchor, sel.caret);
@@ -2653,8 +3106,9 @@ impl Engine {
             return empty;
         }
         let doc = self.undo.current();
-        let (estart, eend) = (to_engine_pos(start), to_engine_pos(end));
-        let plain = doc.text_range(estart, eend);
+        let estart = to_engine_pos(start);
+        let eend = to_engine_pos(end);
+        let plain = doc.text_range(estart.clone(), eend.clone());
         /* The selection's styled paragraphs, clipped to local offsets — fed
         to the HTML serializer and packed into a one-document `.docx`. */
         let slice = doc.slice(estart, eend);
@@ -2676,17 +3130,19 @@ impl Engine {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         let at = self
             .selection
-            .map_or(BridgeLogicalPos { para: 0, offset: 0 }, |s| s.caret);
+            .as_ref()
+            .map_or_else(|| bpos_top(0, 0), |s| s.caret.clone());
         if !normalized.contains('\n') {
             return self.do_insert_text_interactive(at, normalized);
         }
         /* Multi-line: replace any non-empty selection, then insert the text
         with a paragraph break at every newline. The caret lands at the end
         of the final pasted line. */
-        let sel = self.selection.unwrap_or(SelectionState {
-            anchor: at,
+        let sel = self.selection.clone().unwrap_or(SelectionState {
+            anchor: at.clone(),
             caret: at,
             ideal_x: None,
+            kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
         let base = if start == end {
@@ -2694,16 +3150,10 @@ impl Engine {
         } else {
             self.undo
                 .current()
-                .delete_range(to_engine_pos(start), to_engine_pos(end))
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
         let (new_doc, caret) = base.insert_multiline(to_engine_pos(start), &normalized);
-        self.commit_edit(
-            new_doc,
-            BridgeLogicalPos {
-                para: caret.para,
-                offset: caret.offset,
-            },
-        )
+        self.commit_edit(new_doc, to_bridge_pos(caret))
     }
 
     /// `Command::PasteHtml` (Backlog #12) — parse HTML into styled paragraphs
@@ -2717,11 +3167,13 @@ impl Engine {
         }
         let at = self
             .selection
-            .map_or(BridgeLogicalPos { para: 0, offset: 0 }, |s| s.caret);
-        let sel = self.selection.unwrap_or(SelectionState {
-            anchor: at,
+            .as_ref()
+            .map_or_else(|| bpos_top(0, 0), |s| s.caret.clone());
+        let sel = self.selection.clone().unwrap_or(SelectionState {
+            anchor: at.clone(),
             caret: at,
             ideal_x: None,
+            kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
         let base = if start == end {
@@ -2729,16 +3181,10 @@ impl Engine {
         } else {
             self.undo
                 .current()
-                .delete_range(to_engine_pos(start), to_engine_pos(end))
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
         let (new_doc, caret) = base.insert_rich(to_engine_pos(start), &paras);
-        self.commit_edit(
-            new_doc,
-            BridgeLogicalPos {
-                para: caret.para,
-                offset: caret.offset,
-            },
-        )
+        self.commit_edit(new_doc, to_bridge_pos(caret))
     }
 
     /// `Command::SetParagraphAlign` (Backlog #9) — set the alignment of every
@@ -2752,7 +3198,7 @@ impl Engine {
     ) -> Event {
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_alignment(
-            to_engine_pos(start),
+            to_engine_pos(start.clone()),
             to_engine_pos(end),
             engine_align(align),
         );
@@ -2994,7 +3440,7 @@ mod tests {
             ],
         };
         let line = LineGeom {
-            para: 0,
+            path: BridgeBlockPath::top(0),
             start_x: 0.0,
             y_top: 5.0,
             height: 20.0,
@@ -3003,11 +3449,7 @@ mod tests {
             slots: Vec::new(),
             runs: vec![ltr, rtl],
         };
-        let rects = selection_rects_geom(
-            &[line],
-            BridgeLogicalPos { para: 0, offset: 2 },
-            BridgeLogicalPos { para: 0, offset: 6 },
-        );
+        let rects = selection_rects_geom(&[line], &bpos_top(0, 2), &bpos_top(0, 6));
         assert_eq!(rects.len(), 2, "one rect per intersected run");
         let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
         /* LTR clip [2,4): x 20..40. */
@@ -3036,7 +3478,7 @@ mod tests {
             ],
         };
         let line = LineGeom {
-            para: 0,
+            path: BridgeBlockPath::top(0),
             start_x: 0.0,
             y_top: 5.0,
             height: 20.0,
@@ -3045,11 +3487,7 @@ mod tests {
             slots: Vec::new(),
             runs: vec![run],
         };
-        let rects = selection_rects_geom(
-            &[line],
-            BridgeLogicalPos { para: 0, offset: 1 },
-            BridgeLogicalPos { para: 0, offset: 3 },
-        );
+        let rects = selection_rects_geom(&[line], &bpos_top(0, 1), &bpos_top(0, 3));
         assert_eq!(rects.len(), 1);
         let approx = |a: f32, b: f32| (a - b).abs() < 0.01;
         assert!(approx(rects[0].x, 10.0));

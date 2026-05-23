@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{
-    Alignment, Direction, DocFormat, LogicalPos, LogicalRange, Rect, Script, TextAttrs,
+    Alignment, Direction, DocFormat, LogicalPos, LogicalRange, Rect, Script, SelectionKind,
+    TextAttrs,
 };
 
 /// An event emitted by the engine. Serialized internally-tagged
@@ -117,6 +118,11 @@ pub enum Event {
         /// so the toolbar stays reactive without polling (Phase 4 §11).
         can_undo: bool,
         can_redo: bool,
+        /// Phase 5 PR 4 — selection flavour. `Linear` for classic text
+        /// spans, `TableCells` when the caret is inside a table and the
+        /// drag covered multiple cells. UI overlays inspect this to
+        /// switch between text-span and cell-rect highlights.
+        selection_kind: SelectionKind,
     },
 
     /* IME */

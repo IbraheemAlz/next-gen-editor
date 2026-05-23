@@ -142,17 +142,18 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
     /* Phase 5 PR 3b — Insert Table popover + rows×cols picker.
        `pickerOpen` toggles visibility; `hoverR/hoverC` (1-indexed)
        drive the lit cells. Inserts the table at the block index
-       immediately after the caret's paragraph — `LogicalPos.para` is
-       paragraph-flat, so this lands cleanly when the document holds
-       no tables (the common case at PR 3b). With existing tables,
-       the position skips them; nested-table aware addressing arrives
-       with the `BlockPath` migration. */
+       immediately after the caret's top-level paragraph. PR 4:
+       resolves the caret's full `BlockPath` and bumps the leading
+       `Block` step by 1; nested-cell carets land outside the table
+       (the `Cell` prefix is dropped) — Word's default. */
     const [pickerOpen, setPickerOpen] = createSignal(false);
     const [hoverR, setHoverR] = createSignal(0);
     const [hoverC, setHoverC] = createSignal(0);
     const insertTable = (rows: number, cols: number): void => {
-        const para = props.store.caretLogical()?.para ?? 0;
-        const at: BlockPath = { steps: [{ kind: 'BLOCK', idx: para + 1 }] };
+        const caretPath = props.store.caretLogical()?.path;
+        const topStep = caretPath?.steps.find((s) => s.kind === 'BLOCK');
+        const idx = topStep && topStep.kind === 'BLOCK' ? topStep.idx + 1 : 0;
+        const at: BlockPath = { steps: [{ kind: 'BLOCK', idx }] };
         void props.client.dispatch({ type: 'INSERT_TABLE', at, rows, cols });
         setPickerOpen(false);
         setHoverR(0);

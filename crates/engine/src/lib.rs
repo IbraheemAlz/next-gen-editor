@@ -90,6 +90,58 @@ impl BlockPath {
         self.steps.push(step);
         self
     }
+
+    /// Parent container path (every step except the last).
+    pub fn parent(&self) -> Self {
+        let mut steps = self.steps.clone();
+        steps.pop();
+        Self { steps }
+    }
+
+    /// The path's final `Block`-step index, when one terminates the
+    /// path. `None` when the path is empty or its last step is `Cell`.
+    pub fn last_block_index(&self) -> Option<u32> {
+        match self.steps.last()? {
+            PathStep::Block(n) => Some(*n),
+            PathStep::Cell { .. } => None,
+        }
+    }
+
+    /// `true` when this path is a prefix of `descendant` (or equal).
+    pub fn is_ancestor_of(&self, descendant: &Self) -> bool {
+        if self.steps.len() > descendant.steps.len() {
+            return false;
+        }
+        self.steps
+            .iter()
+            .zip(descendant.steps.iter())
+            .all(|(a, b)| a == b)
+    }
+
+    /// Compare two paths in document order (depth-first walk). Used to
+    /// canonicalize selection endpoints before edit/range operations.
+    pub fn cmp_doc_order(&self, other: &Self) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+        let n = self.steps.len().min(other.steps.len());
+        for i in 0..n {
+            let ord = match (&self.steps[i], &other.steps[i]) {
+                (PathStep::Block(a), PathStep::Block(b)) => a.cmp(b),
+                (PathStep::Cell { row: r1, col: c1 }, PathStep::Cell { row: r2, col: c2 }) => {
+                    r1.cmp(r2).then_with(|| c1.cmp(c2))
+                }
+                /* Shape mismatch in well-formed paths is unreachable
+                (a Cell step always follows a Block step that descends
+                into a table). Compare by surface index when it
+                happens — keeps doc-order stable. */
+                (PathStep::Block(a), PathStep::Cell { row: b, .. }) => a.cmp(b),
+                (PathStep::Cell { row: a, .. }, PathStep::Block(b)) => a.cmp(b),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        self.steps.len().cmp(&other.steps.len())
+    }
 }
 
 /// A selectable font family (Backlog #9). `engine-wasm` resolves it to a
@@ -678,16 +730,33 @@ pub struct Table {
 }
 
 /* ===================================================================
-LogicalPos — paragraph-flat addressing (Phase 5 PR 1 shim).
-Phase 5 PR 3 will widen this to `BlockPath`; for now `para` is the
-*paragraph index skipping tables*, matching every Phase 4 caller.
+LogicalPos — BlockPath addressing (Phase 5 PR 4).
+`path` walks the block tree to a `Block::Paragraph`; `offset` is the
+caret's byte offset inside that paragraph's UTF-8 text. Cross-cell
+ranges work as long as the endpoints share a parent container; full
+cross-container linear semantics ship with Phase 5c (the engine
+currently clamps to the deeper endpoint's container).
 ==================================================================== */
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogicalPos {
-    pub para: u32,
+    pub path: BlockPath,
     /// Byte offset within the paragraph (UTF-8).
     pub offset: u32,
+}
+
+impl LogicalPos {
+    pub fn new(path: BlockPath, offset: u32) -> Self {
+        Self { path, offset }
+    }
+
+    /// Path to the Nth top-level paragraph, skipping tables — the
+    /// canonical compat shim for callers that still address the doc
+    /// paragraph-flat (RFC §4: `BlockPath::root_paragraph(n)`).
+    pub fn at_top_paragraph(doc: &DocumentTree, n: u32, offset: u32) -> Option<Self> {
+        let path = doc.path_to_top_paragraph(n)?;
+        Some(Self { path, offset })
+    }
 }
 
 impl DocumentTree {
@@ -750,10 +819,70 @@ impl DocumentTree {
     }
 
     /* ============================================================
+    Phase 5 PR 4 — `BlockPath` walk helpers
+    The paragraph-flat shim (`nth_paragraph` / `paragraph_count` /
+    `paragraph_text`) is kept as a compatibility surface for tests
+    and round-trip callers; the canonical position type is now
+    `LogicalPos { path, offset }`, addressed through the helpers
+    below.
+    ============================================================ */
+
+    /// Resolve a `BlockPath` to its terminal `Block`. The path's first
+    /// step is a top-level `Block(n)`; subsequent `Cell` / `Block`
+    /// pairs descend into table cells.
+    pub fn block_at(&self, path: &BlockPath) -> Option<&Block> {
+        let first = path.steps.first()?;
+        let PathStep::Block(n) = first else {
+            return None;
+        };
+        let block = self.blocks.get(*n as usize)?;
+        block_at_descend(block, &path.steps[1..])
+    }
+
+    /// Resolve a `BlockPath` to its terminal `Paragraph`; `None` when
+    /// the path is empty or terminates at a `Table`.
+    pub fn paragraph_at_path(&self, path: &BlockPath) -> Option<&Paragraph> {
+        self.block_at(path)?.as_paragraph()
+    }
+
+    /// Resolve a `BlockPath` to a borrowed reference to its terminal
+    /// `Table`; `None` when the path does not terminate at one.
+    pub fn table_at_path(&self, path: &BlockPath) -> Option<&Table> {
+        self.block_at(path)?.as_table()
+    }
+
+    /// Path to the Nth top-level paragraph (skipping tables). Compat
+    /// shim for callers that still index paragraph-flat — RFC §4
+    /// `BlockPath::root_paragraph(n)`.
+    pub fn path_to_top_paragraph(&self, n: u32) -> Option<BlockPath> {
+        let mut seen = 0u32;
+        for (i, b) in self.blocks.iter().enumerate() {
+            if matches!(b, Block::Paragraph(_)) {
+                if seen == n {
+                    return Some(BlockPath::top(i as u32));
+                }
+                seen += 1;
+            }
+        }
+        None
+    }
+
+    /// Path to the document's last top-level paragraph (skipping
+    /// tables). `None` for empty / tables-only documents.
+    pub fn path_to_last_top_paragraph(&self) -> Option<BlockPath> {
+        let mut last: Option<u32> = None;
+        for (i, b) in self.blocks.iter().enumerate() {
+            if matches!(b, Block::Paragraph(_)) {
+                last = Some(i as u32);
+            }
+        }
+        last.map(BlockPath::top)
+    }
+
+    /* ============================================================
     Phase 5 PR 1 — paragraph-flat shim
-    Treats `Block::Table` as inert. `LogicalPos.para` is an index
-    into the paragraph-flat view (skipping tables). PR 3 will widen
-    to `BlockPath`.
+    Treats `Block::Table` as inert. Kept as a compatibility helper;
+    every interactive path now uses the `BlockPath` helpers above.
     ============================================================ */
 
     /// Number of `Block::Paragraph`s in the doc, skipping tables.
@@ -784,75 +913,17 @@ impl DocumentTree {
     }
 
     pub fn end_of_document(&self) -> LogicalPos {
-        let count = self.paragraph_count();
-        if count == 0 {
-            return LogicalPos { para: 0, offset: 0 };
-        }
-        let last_para = count - 1;
+        let Some(path) = self.path_to_last_top_paragraph() else {
+            return LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            };
+        };
         let offset = self
-            .nth_paragraph(last_para)
+            .paragraph_at_path(&path)
             .map(|p| p.text.len() as u32)
             .unwrap_or(0);
-        LogicalPos {
-            para: last_para,
-            offset,
-        }
-    }
-
-    /// Mutate the Nth paragraph in place. Returns the new `Vector<Block>`
-    /// or `None` when the index is out of range. Walks blocks once to
-    /// find the target, then clones the paragraph and runs `f`.
-    fn map_paragraph<F>(blocks: &mut Vector<Block>, n: u32, f: F) -> Option<()>
-    where
-        F: FnOnce(&mut Paragraph),
-    {
-        let mut seen = 0u32;
-        for i in 0..blocks.len() {
-            if matches!(blocks[i], Block::Paragraph(_)) {
-                if seen == n {
-                    let mut b = blocks[i].clone();
-                    if let Block::Paragraph(ref mut p) = b {
-                        f(p);
-                    }
-                    blocks.set(i, b);
-                    return Some(());
-                }
-                seen += 1;
-            }
-        }
-        None
-    }
-
-    /// Replace the Nth paragraph with `replacement` (one paragraph).
-    fn replace_paragraph(blocks: &mut Vector<Block>, n: u32, replacement: Paragraph) -> Option<()> {
-        let bi = Self::find_paragraph_block_idx(blocks, n)?;
-        blocks.set(bi, Block::Paragraph(replacement));
-        Some(())
-    }
-
-    /// Insert `paragraph` immediately *after* the Nth paragraph (or at
-    /// the document end when `n + 1 == paragraph_count`).
-    fn insert_paragraph_after(
-        blocks: &mut Vector<Block>,
-        n: u32,
-        paragraph: Paragraph,
-    ) -> Option<()> {
-        let bi = Self::find_paragraph_block_idx(blocks, n)?;
-        blocks.insert(bi + 1, Block::Paragraph(paragraph));
-        Some(())
-    }
-
-    fn find_paragraph_block_idx(blocks: &Vector<Block>, n: u32) -> Option<usize> {
-        let mut seen = 0u32;
-        for i in 0..blocks.len() {
-            if matches!(blocks[i], Block::Paragraph(_)) {
-                if seen == n {
-                    return Some(i);
-                }
-                seen += 1;
-            }
-        }
-        None
+        LogicalPos { path, offset }
     }
 
     /// Insert `text` at `at`. Out-of-range positions are clamped to end of
@@ -876,9 +947,17 @@ impl DocumentTree {
             }));
             return Self { blocks };
         }
-        let para_idx = at.para.min(count - 1);
-        Self::map_paragraph(&mut blocks, para_idx, |para| {
-            let offset = (at.offset as usize).min(para.text.len());
+        let target = if self.paragraph_at_path(&at.path).is_some() {
+            at.path.clone()
+        } else {
+            /* Path no longer addresses a paragraph (clamped after a
+            structural edit). Fall back to the document end. */
+            self.path_to_last_top_paragraph()
+                .unwrap_or(BlockPath::top(0))
+        };
+        let off = at.offset;
+        let mutated = mutate_paragraph_in_top(&mut blocks, &target, |para| {
+            let offset = (off as usize).min(para.text.len());
             para.text.insert_str(offset, text);
             /* Shift styled spans across the insertion point — a span
             containing the point grows, spans wholly after it slide right. */
@@ -892,58 +971,91 @@ impl DocumentTree {
                     s.end += len;
                 }
             }
-            para.dirty = true;
-            para.source_xml = None;
         });
+        if mutated.is_none() {
+            return self.clone();
+        }
         Self { blocks }
     }
 
     /// Apply a style `patch` over the logical range `[start, end)`. Splits and
     /// merges spans on every covered paragraph; unaffected paragraphs are
-    /// structurally shared.
+    /// structurally shared. PR 4: full range support only when `start` and
+    /// `end` share a parent container (`same_parent`); cross-container
+    /// ranges clamp to the `start` endpoint's paragraph.
     pub fn apply_style(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
-        let count = self.paragraph_count();
-        if count == 0 {
+        let (start, end) = order_positions(start, end);
+        if !same_parent(&start.path, &end.path) {
+            return self.apply_style_single(start, end, patch);
+        }
+        let Some(start_idx) = start.path.last_block_index() else {
             return self.clone();
-        }
+        };
+        let Some(end_idx) = end.path.last_block_index() else {
+            return self.clone();
+        };
+        let Some(container) = parent_container_snapshot(self, &start.path) else {
+            return self.clone();
+        };
         let mut blocks = self.blocks.clone();
-        let last_idx = count - 1;
-        let first = start.para.min(last_idx);
-        let last = end.para.min(last_idx);
-        for p in first..=last {
-            let lo = if p == first { start.offset } else { 0 };
-            let para_text_len = self
-                .nth_paragraph(p)
-                .map(|x| x.text.len() as u32)
-                .unwrap_or(0);
-            let hi = if p == last { end.offset } else { para_text_len };
-            let styled = self
-                .nth_paragraph(p)
-                .map(|src| src.apply_style(lo, hi, patch));
-            if let Some(styled) = styled {
-                Self::replace_paragraph(&mut blocks, p, styled);
-            }
+        let parent = start.path.parent();
+        for idx in start_idx..=end_idx {
+            let Some(Block::Paragraph(p)) = container.get(idx as usize) else {
+                continue;
+            };
+            let lo = if idx == start_idx { start.offset } else { 0 };
+            let hi = if idx == end_idx {
+                end.offset
+            } else {
+                p.text.len() as u32
+            };
+            let styled = p.apply_style(lo, hi, patch);
+            let child_path = parent.clone().push(PathStep::Block(idx));
+            replace_block_in_top(&mut blocks, &child_path, Block::Paragraph(styled));
         }
+        Self { blocks }
+    }
+
+    fn apply_style_single(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
+        let Some(p) = self.paragraph_at_path(&start.path) else {
+            return self.clone();
+        };
+        let hi = if start.path == end.path {
+            end.offset
+        } else {
+            p.text.len() as u32
+        };
+        let styled = p.apply_style(start.offset, hi, patch);
+        let mut blocks = self.blocks.clone();
+        replace_block_in_top(&mut blocks, &start.path, Block::Paragraph(styled));
         Self { blocks }
     }
 
     /// Set `align` on every paragraph the logical range `[start, end)` spans
     /// (Backlog #9). Paragraphs outside the range are structurally shared.
-    /// `start`/`end` are expected in document order.
+    /// `start`/`end` are expected in document order. PR 4: same-parent
+    /// ranges spread across siblings; cross-container ranges align only
+    /// `start`'s paragraph.
     pub fn set_alignment(&self, start: LogicalPos, end: LogicalPos, align: Alignment) -> Self {
-        let count = self.paragraph_count();
-        if count == 0 {
-            return self.clone();
-        }
+        let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
-        let last = count - 1;
-        let first = start.para.min(last);
-        let final_para = end.para.min(last);
-        for p in first..=final_para {
-            Self::map_paragraph(&mut blocks, p, |para| {
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+                    para.props.alignment = Some(align);
+                });
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
                 para.props.alignment = Some(align);
-                para.dirty = true;
-                para.source_xml = None;
             });
         }
         Self { blocks }
@@ -951,48 +1063,62 @@ impl DocumentTree {
 
     /// Delete the logical range `[start, end)`. A range spanning paragraphs
     /// merges the partial first and last paragraphs and drops those between.
+    /// PR 4: same-parent cross-paragraph ranges work end-to-end; cross-
+    /// container ranges (cell ↔ body) clamp to the `start` paragraph.
     pub fn delete_range(&self, start: LogicalPos, end: LogicalPos) -> Self {
-        let (start, end) = if (start.para, start.offset) <= (end.para, end.offset) {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        let count = self.paragraph_count();
-        if count == 0 {
+        let (start, end) = order_positions(start, end);
+        if self.paragraph_count() == 0 {
             return self.clone();
         }
-        let mut blocks = self.blocks.clone();
-        let last = count - 1;
-        let sp = start.para.min(last);
-        let ep = end.para.min(last);
-        if sp == ep {
-            Self::map_paragraph(&mut blocks, sp, |para| {
+        if start.path == end.path {
+            let mut blocks = self.blocks.clone();
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
                 *para = para.delete_text(start.offset, end.offset);
             });
-        } else {
-            let head = self
-                .nth_paragraph(sp)
-                .map(|p| p.split_at(start.offset).0)
-                .unwrap_or_default();
-            let tail = self
-                .nth_paragraph(ep)
-                .map(|p| p.split_at(end.offset).1)
-                .unwrap_or_default();
-            let merged = head.concat(&tail);
-            /* Drop every block strictly between sp's paragraph block and
-            ep's paragraph block (inclusive of ep, exclusive of sp), then
-            replace sp with the merged paragraph. Intervening tables are
-            dropped too — matches Word's "delete across paragraphs eats
-            everything between" semantics. */
-            let sp_block =
-                Self::find_paragraph_block_idx(&blocks, sp).expect("sp exists in `count > 0` arm");
-            let ep_block =
-                Self::find_paragraph_block_idx(&blocks, ep).expect("ep exists in `count > 0` arm");
-            for _ in 0..(ep_block - sp_block) {
-                blocks.remove(sp_block + 1);
-            }
-            Self::replace_paragraph(&mut blocks, sp, merged);
+            return Self { blocks };
         }
+        if !same_parent(&start.path, &end.path) {
+            /* Cross-container delete clamps to the start endpoint —
+            full cross-container linear semantics land with Phase 5c. */
+            let end_in_start_container = LogicalPos {
+                path: start.path.clone(),
+                offset: self
+                    .paragraph_at_path(&start.path)
+                    .map(|p| p.text.len() as u32)
+                    .unwrap_or(start.offset),
+            };
+            return self.delete_range(start, end_in_start_container);
+        }
+        let Some(sp_idx) = start.path.last_block_index() else {
+            return self.clone();
+        };
+        let Some(ep_idx) = end.path.last_block_index() else {
+            return self.clone();
+        };
+        let Some(container) = parent_container_snapshot(self, &start.path) else {
+            return self.clone();
+        };
+        let head = container
+            .get(sp_idx as usize)
+            .and_then(|b| b.as_paragraph())
+            .map(|p| p.split_at(start.offset).0)
+            .unwrap_or_default();
+        let tail = container
+            .get(ep_idx as usize)
+            .and_then(|b| b.as_paragraph())
+            .map(|p| p.split_at(end.offset).1)
+            .unwrap_or_default();
+        let merged = head.concat(&tail);
+        let mut blocks = self.blocks.clone();
+        let parent = start.path.parent();
+        /* Drop every block strictly after sp up to and including ep,
+        then replace sp with the merged paragraph. */
+        for idx in ((sp_idx + 1)..=ep_idx).rev() {
+            let child = parent.clone().push(PathStep::Block(idx));
+            delete_block_at_path(&mut blocks, &child);
+        }
+        let sp_path = parent.push(PathStep::Block(sp_idx));
+        replace_block_in_top(&mut blocks, &sp_path, Block::Paragraph(merged));
         Self { blocks }
     }
 
@@ -1005,13 +1131,12 @@ impl DocumentTree {
             blocks.push_back(Block::Paragraph(Paragraph::default()));
             return Self { blocks };
         }
-        let idx = at.para.min(count - 1);
-        let (left, right) = self
-            .nth_paragraph(idx)
-            .map(|p| p.split_at(at.offset))
-            .unwrap_or_default();
-        Self::replace_paragraph(&mut blocks, idx, left);
-        Self::insert_paragraph_after(&mut blocks, idx, right);
+        let Some(p) = self.paragraph_at_path(&at.path) else {
+            return self.clone();
+        };
+        let (left, right) = p.split_at(at.offset);
+        replace_block_in_top(&mut blocks, &at.path, Block::Paragraph(left));
+        insert_block_after_path_in_top(&mut blocks, &at.path, Block::Paragraph(right));
         Self { blocks }
     }
 
@@ -1026,18 +1151,20 @@ impl DocumentTree {
         let mut doc = self.clone();
         let mut cur = at;
         for (i, line) in lines.iter().enumerate() {
-            doc = doc.insert_text(cur, line);
+            doc = doc.insert_text(cur.clone(), line);
             let after = LogicalPos {
-                para: cur.para,
+                path: cur.path.clone(),
                 offset: cur.offset + line.len() as u32,
             };
             if i + 1 < lines.len() {
                 /* A newline follows this line — break the paragraph so the
                 next line lands in a fresh one; the remainder of the original
                 paragraph rides along on the tail. */
-                doc = doc.split_paragraph(after);
+                doc = doc.split_paragraph(after.clone());
+                /* Advance the path to the inserted sibling — its last
+                Block step bumps by 1; other steps unchanged. */
                 cur = LogicalPos {
-                    para: cur.para + 1,
+                    path: bump_last_block_index(&cur.path),
                     offset: 0,
                 };
             } else {
@@ -1050,39 +1177,52 @@ impl DocumentTree {
     /// Extract the logical range `[start, end)` as standalone paragraphs,
     /// style spans clipped and shifted to local offsets. Drives rich
     /// clipboard copy — HTML + `.docx`-fragment generation (Backlog #12).
-    /// **Tables in the spanned range are silently dropped at Phase 5 PR 1**
-    /// — clipboard fragments stay paragraph-only until PR 3 widens the
-    /// engine API to `Block`.
+    /// **Tables in the spanned range are silently dropped** —
+    /// clipboard fragments stay paragraph-only. Cross-container ranges
+    /// clamp to the start endpoint's container until Phase 5c.
     pub fn slice(&self, start: LogicalPos, end: LogicalPos) -> Vec<Paragraph> {
-        let (start, end) = if (start.para, start.offset) <= (end.para, end.offset) {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        let count = self.paragraph_count();
-        if count == 0 {
+        let (start, end) = order_positions(start, end);
+        if self.paragraph_count() == 0 {
             return Vec::new();
         }
-        let last = count - 1;
-        let sp = start.para.min(last);
-        let ep = end.para.min(last);
-        if sp == ep {
-            let Some(p) = self.nth_paragraph(sp) else {
+        if start.path == end.path {
+            let Some(p) = self.paragraph_at_path(&start.path) else {
                 return Vec::new();
             };
             let head = p.split_at(end.offset).0;
             return vec![head.split_at(start.offset).1];
         }
-        let mut out = Vec::with_capacity((ep - sp + 1) as usize);
-        if let Some(p) = self.nth_paragraph(sp) {
+        if !same_parent(&start.path, &end.path) {
+            let Some(p) = self.paragraph_at_path(&start.path) else {
+                return Vec::new();
+            };
+            return vec![p.split_at(start.offset).1];
+        }
+        let Some(sp_idx) = start.path.last_block_index() else {
+            return Vec::new();
+        };
+        let Some(ep_idx) = end.path.last_block_index() else {
+            return Vec::new();
+        };
+        let Some(container) = parent_container_snapshot(self, &start.path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Paragraph> = Vec::with_capacity((ep_idx - sp_idx + 1) as usize);
+        if let Some(p) = container
+            .get(sp_idx as usize)
+            .and_then(|b| b.as_paragraph())
+        {
             out.push(p.split_at(start.offset).1);
         }
-        for p in (sp + 1)..ep {
-            if let Some(para) = self.nth_paragraph(p) {
-                out.push(para.clone());
+        for idx in (sp_idx + 1)..ep_idx {
+            if let Some(p) = container.get(idx as usize).and_then(|b| b.as_paragraph()) {
+                out.push(p.clone());
             }
         }
-        if let Some(p) = self.nth_paragraph(ep) {
+        if let Some(p) = container
+            .get(ep_idx as usize)
+            .and_then(|b| b.as_paragraph())
+        {
             out.push(p.split_at(end.offset).0);
         }
         out
@@ -1093,79 +1233,113 @@ impl DocumentTree {
     /// selection first. Drives HTML paste (Backlog #12).
     pub fn insert_rich(&self, at: LogicalPos, paras: &[Paragraph]) -> (Self, LogicalPos) {
         if paras.is_empty() {
-            return (self.clone(), at);
+            return (self.clone(), at.clone());
         }
         let mut blocks = self.blocks.clone();
-        let count = self.paragraph_count();
-        if count == 0 {
+        if self.paragraph_count() == 0 {
             blocks.push_back(Block::Paragraph(Paragraph::default()));
         }
-        let effective_count = count.max(1);
-        let idx = at.para.min(effective_count - 1);
-        let target = Self::find_paragraph_block_idx(&blocks, idx).expect("effective_count >= 1");
-        let (head, tail) = match &blocks[target] {
-            Block::Paragraph(p) => p.split_at(at.offset),
-            _ => unreachable!("nth_paragraph index points at a paragraph block"),
+        let target_path = if self.paragraph_at_path(&at.path).is_some() {
+            at.path.clone()
+        } else {
+            self.path_to_last_top_paragraph()
+                .unwrap_or(BlockPath::top(0))
         };
+        let Some(target_para) = self
+            .paragraph_at_path(&target_path)
+            .cloned()
+            .or_else(|| Some(Paragraph::default()))
+        else {
+            return (self.clone(), at.clone());
+        };
+        let (head, tail) = target_para.split_at(at.offset);
         if paras.len() == 1 {
             let caret = LogicalPos {
-                para: idx,
+                path: target_path.clone(),
                 offset: (head.text.len() + paras[0].text.len()) as u32,
             };
-            blocks.set(
-                target,
+            replace_block_in_top(
+                &mut blocks,
+                &target_path,
                 Block::Paragraph(head.concat(&paras[0]).concat(&tail)),
             );
             return (Self { blocks }, caret);
         }
         let lastp = &paras[paras.len() - 1];
-        let caret = LogicalPos {
-            para: idx + paras.len() as u32 - 1,
-            offset: lastp.text.len() as u32,
-        };
-        blocks.set(target, Block::Paragraph(head.concat(&paras[0])));
-        for (k, p) in paras[1..paras.len() - 1].iter().enumerate() {
-            blocks.insert(target + 1 + k, Block::Paragraph(p.clone()));
+        replace_block_in_top(
+            &mut blocks,
+            &target_path,
+            Block::Paragraph(head.concat(&paras[0])),
+        );
+        let mut last_path = target_path.clone();
+        for p in &paras[1..paras.len() - 1] {
+            insert_block_after_path_in_top(&mut blocks, &last_path, Block::Paragraph(p.clone()));
+            last_path = bump_last_block_index(&last_path);
         }
-        blocks.insert(
-            target + paras.len() - 1,
+        insert_block_after_path_in_top(
+            &mut blocks,
+            &last_path,
             Block::Paragraph(lastp.concat(&tail)),
         );
+        let final_path = bump_last_block_index(&last_path);
+        let caret = LogicalPos {
+            path: final_path,
+            offset: lastp.text.len() as u32,
+        };
         (Self { blocks }, caret)
     }
 
     /// Extract the text of the logical range `[start, end)`. Paragraphs the
     /// range spans are joined by `\n`. Used for clipboard copy.
     pub fn text_range(&self, start: LogicalPos, end: LogicalPos) -> String {
-        let (start, end) = if (start.para, start.offset) <= (end.para, end.offset) {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        let count = self.paragraph_count();
-        if count == 0 {
+        let (start, end) = order_positions(start, end);
+        if self.paragraph_count() == 0 {
             return String::new();
         }
-        let last = count - 1;
-        let sp = start.para.min(last);
-        let ep = end.para.min(last);
+        if start.path == end.path {
+            let Some(p) = self.paragraph_at_path(&start.path) else {
+                return String::new();
+            };
+            let lo = (start.offset as usize).min(p.text.len());
+            let hi = (end.offset as usize).min(p.text.len());
+            if lo >= hi {
+                return String::new();
+            }
+            return p.text[lo..hi].to_string();
+        }
+        if !same_parent(&start.path, &end.path) {
+            let Some(p) = self.paragraph_at_path(&start.path) else {
+                return String::new();
+            };
+            let lo = (start.offset as usize).min(p.text.len());
+            return p.text[lo..].to_string();
+        }
+        let Some(sp_idx) = start.path.last_block_index() else {
+            return String::new();
+        };
+        let Some(ep_idx) = end.path.last_block_index() else {
+            return String::new();
+        };
+        let Some(container) = parent_container_snapshot(self, &start.path) else {
+            return String::new();
+        };
         let mut out = String::new();
-        for p in sp..=ep {
-            let Some(para) = self.nth_paragraph(p) else {
+        for idx in sp_idx..=ep_idx {
+            let Some(para) = container.get(idx as usize).and_then(|b| b.as_paragraph()) else {
                 continue;
             };
             let len = para.text.len();
-            let lo = if p == sp {
+            let lo = if idx == sp_idx {
                 (start.offset as usize).min(len)
             } else {
                 0
             };
-            let hi = if p == ep {
+            let hi = if idx == ep_idx {
                 (end.offset as usize).min(len)
             } else {
                 len
             };
-            if p > sp {
+            if idx > sp_idx {
                 out.push('\n');
             }
             if lo < hi {
@@ -1430,6 +1604,344 @@ fn top_level_block_index(path: &BlockPath) -> Option<u32> {
     }
 }
 
+/// Continue a `block_at` walk from one `Block` through any remaining
+/// `Cell + Block` step pairs.
+fn block_at_descend<'a>(block: &'a Block, steps: &[PathStep]) -> Option<&'a Block> {
+    if steps.is_empty() {
+        return Some(block);
+    }
+    let Block::Table(t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = steps[0] else {
+        return None;
+    };
+    let cell = t.rows.get(row as usize)?.cells.get(col as usize)?;
+    let PathStep::Block(n) = *steps.get(1)? else {
+        return None;
+    };
+    let next = cell.blocks.get(n as usize)?;
+    block_at_descend(next, &steps[2..])
+}
+
+/// Mutate the paragraph addressed by `path` in `top` (the
+/// `im::Vector` top-level container). `f` runs against the cloned
+/// paragraph in place; the containing block (and any intervening
+/// table) is cloned + spliced back so the structural-sharing
+/// invariant holds. Returns `Some(())` on success.
+fn mutate_paragraph_in_top<F>(top: &mut Vector<Block>, path: &BlockPath, f: F) -> Option<()>
+where
+    F: FnOnce(&mut Paragraph),
+{
+    let first = path.steps.first()?;
+    let PathStep::Block(n) = first else {
+        return None;
+    };
+    let n = *n as usize;
+    let mut block = top.get(n)?.clone();
+    if path.steps.len() == 1 {
+        let Block::Paragraph(ref mut p) = block else {
+            return None;
+        };
+        f(p);
+        p.dirty = true;
+        p.source_xml = None;
+        top.set(n, block);
+        return Some(());
+    }
+    let Block::Table(ref mut t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = path.steps[1] else {
+        return None;
+    };
+    let row_box = t.rows.get_mut(row as usize)?;
+    let cell = row_box.cells.get_mut(col as usize)?;
+    mutate_paragraph_in_vec(&mut cell.blocks, &path.steps[2..], f)?;
+    /* A mutation inside a cell dirties the containing table so the
+    writer regenerates it (PR 3 passthrough invariant). */
+    t.dirty = true;
+    t.source_xml = None;
+    top.set(n, block);
+    Some(())
+}
+
+#[allow(clippy::ptr_arg)]
+fn mutate_paragraph_in_vec<F>(blocks: &mut Vec<Block>, steps: &[PathStep], f: F) -> Option<()>
+where
+    F: FnOnce(&mut Paragraph),
+{
+    let first = steps.first()?;
+    let PathStep::Block(n) = first else {
+        return None;
+    };
+    let n = *n as usize;
+    let block = blocks.get_mut(n)?;
+    if steps.len() == 1 {
+        let Block::Paragraph(p) = block else {
+            return None;
+        };
+        f(p);
+        p.dirty = true;
+        p.source_xml = None;
+        return Some(());
+    }
+    let Block::Table(t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = steps[1] else {
+        return None;
+    };
+    let row_box = t.rows.get_mut(row as usize)?;
+    let cell = row_box.cells.get_mut(col as usize)?;
+    mutate_paragraph_in_vec(&mut cell.blocks, &steps[2..], f)?;
+    t.dirty = true;
+    t.source_xml = None;
+    Some(())
+}
+
+/// Replace the block at `path` with `replacement` in `top`. Used by
+/// `split_paragraph` etc. to splice freshly built paragraphs into the
+/// container structurally.
+fn replace_block_in_top(
+    top: &mut Vector<Block>,
+    path: &BlockPath,
+    replacement: Block,
+) -> Option<()> {
+    let first = path.steps.first()?;
+    let PathStep::Block(n) = first else {
+        return None;
+    };
+    let n = *n as usize;
+    if path.steps.len() == 1 {
+        top.set(n, replacement);
+        return Some(());
+    }
+    let mut block = top.get(n)?.clone();
+    let Block::Table(ref mut t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = path.steps[1] else {
+        return None;
+    };
+    let cell = t.rows.get_mut(row as usize)?.cells.get_mut(col as usize)?;
+    replace_block_in_vec(&mut cell.blocks, &path.steps[2..], replacement)?;
+    t.dirty = true;
+    t.source_xml = None;
+    top.set(n, block);
+    Some(())
+}
+
+#[allow(clippy::ptr_arg)]
+fn replace_block_in_vec(
+    blocks: &mut Vec<Block>,
+    steps: &[PathStep],
+    replacement: Block,
+) -> Option<()> {
+    let first = steps.first()?;
+    let PathStep::Block(n) = first else {
+        return None;
+    };
+    let n = *n as usize;
+    if steps.len() == 1 {
+        if n >= blocks.len() {
+            return None;
+        }
+        blocks[n] = replacement;
+        return Some(());
+    }
+    let block = blocks.get_mut(n)?;
+    let Block::Table(t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = steps[1] else {
+        return None;
+    };
+    let cell = t.rows.get_mut(row as usize)?.cells.get_mut(col as usize)?;
+    replace_block_in_vec(&mut cell.blocks, &steps[2..], replacement)?;
+    t.dirty = true;
+    t.source_xml = None;
+    Some(())
+}
+
+/// Insert `inserted` immediately after `path` in its parent container.
+fn insert_block_after_path_in_top(
+    top: &mut Vector<Block>,
+    path: &BlockPath,
+    inserted: Block,
+) -> Option<()> {
+    let first = path.steps.first()?;
+    let PathStep::Block(n) = first else {
+        return None;
+    };
+    let n = *n as usize;
+    if path.steps.len() == 1 {
+        if n >= top.len() {
+            top.push_back(inserted);
+        } else {
+            top.insert(n + 1, inserted);
+        }
+        return Some(());
+    }
+    let mut block = top.get(n)?.clone();
+    let Block::Table(ref mut t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = path.steps[1] else {
+        return None;
+    };
+    let cell = t.rows.get_mut(row as usize)?.cells.get_mut(col as usize)?;
+    insert_block_after_path_in_vec(&mut cell.blocks, &path.steps[2..], inserted)?;
+    t.dirty = true;
+    t.source_xml = None;
+    top.set(n, block);
+    Some(())
+}
+
+fn insert_block_after_path_in_vec(
+    blocks: &mut Vec<Block>,
+    steps: &[PathStep],
+    inserted: Block,
+) -> Option<()> {
+    let first = steps.first()?;
+    let PathStep::Block(n) = first else {
+        return None;
+    };
+    let n = *n as usize;
+    if steps.len() == 1 {
+        let at = (n + 1).min(blocks.len());
+        blocks.insert(at, inserted);
+        return Some(());
+    }
+    let block = blocks.get_mut(n)?;
+    let Block::Table(t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = steps[1] else {
+        return None;
+    };
+    let cell = t.rows.get_mut(row as usize)?.cells.get_mut(col as usize)?;
+    insert_block_after_path_in_vec(&mut cell.blocks, &steps[2..], inserted)?;
+    t.dirty = true;
+    t.source_xml = None;
+    Some(())
+}
+
+/// Resolve `path`'s parent container into an owned snapshot
+/// (`Vec<Block>` cloned out of the document). Used by range methods
+/// that need to walk the paragraphs between two same-container
+/// endpoints; structural sharing is preserved by mutating through
+/// the dedicated splice helpers above (`replace_block_in_*`,
+/// `insert_block_after_path_in_*`), not by writing this snapshot
+/// back.
+pub fn parent_container_snapshot(doc: &DocumentTree, path: &BlockPath) -> Option<Vec<Block>> {
+    if path.steps.len() == 1 {
+        return Some(doc.blocks.iter().cloned().collect());
+    }
+    if path.steps.len() < 3 {
+        return None;
+    }
+    let n = path.steps.len();
+    let grandparent = BlockPath {
+        steps: path.steps[..n - 2].to_vec(),
+    };
+    let block = doc.block_at(&grandparent)?;
+    let Block::Table(t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = path.steps[n - 2] else {
+        return None;
+    };
+    let cell = t.rows.get(row as usize)?.cells.get(col as usize)?;
+    Some(cell.blocks.clone())
+}
+
+/// Same parent container? Two paragraph paths share a container
+/// when every step but the last is identical.
+pub fn same_parent(a: &BlockPath, b: &BlockPath) -> bool {
+    a.steps.len() == b.steps.len() && a.parent() == b.parent()
+}
+
+/// Path with its last `Block` step's index bumped by 1. Used by
+/// `split_paragraph` etc. to compute the path of the inserted
+/// sibling.
+pub fn bump_last_block_index(path: &BlockPath) -> BlockPath {
+    let mut steps = path.steps.clone();
+    if let Some(PathStep::Block(n)) = steps.last_mut() {
+        *n += 1;
+    }
+    BlockPath { steps }
+}
+
+/// Order two positions in document order. The first returned position
+/// is always `<=` the second when compared by `(path, offset)`.
+pub fn order_positions(a: LogicalPos, b: LogicalPos) -> (LogicalPos, LogicalPos) {
+    use core::cmp::Ordering;
+    let ord = a.path.cmp_doc_order(&b.path);
+    let swap = match ord {
+        Ordering::Less => false,
+        Ordering::Greater => true,
+        Ordering::Equal => a.offset > b.offset,
+    };
+    if swap { (b, a) } else { (a, b) }
+}
+
+/// Delete the block at `path` from its parent container.
+fn delete_block_at_path(top: &mut Vector<Block>, path: &BlockPath) -> Option<()> {
+    let first = path.steps.first()?;
+    let PathStep::Block(n) = first else {
+        return None;
+    };
+    let n = *n as usize;
+    if path.steps.len() == 1 {
+        if n >= top.len() {
+            return None;
+        }
+        top.remove(n);
+        return Some(());
+    }
+    let mut block = top.get(n)?.clone();
+    let Block::Table(ref mut t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = path.steps[1] else {
+        return None;
+    };
+    let cell = t.rows.get_mut(row as usize)?.cells.get_mut(col as usize)?;
+    delete_block_in_vec(&mut cell.blocks, &path.steps[2..])?;
+    t.dirty = true;
+    t.source_xml = None;
+    top.set(n, block);
+    Some(())
+}
+
+fn delete_block_in_vec(blocks: &mut Vec<Block>, steps: &[PathStep]) -> Option<()> {
+    let first = steps.first()?;
+    let PathStep::Block(n) = first else {
+        return None;
+    };
+    let n = *n as usize;
+    if steps.len() == 1 {
+        if n >= blocks.len() {
+            return None;
+        }
+        blocks.remove(n);
+        return Some(());
+    }
+    let block = blocks.get_mut(n)?;
+    let Block::Table(t) = block else {
+        return None;
+    };
+    let PathStep::Cell { row, col } = steps[1] else {
+        return None;
+    };
+    let cell = t.rows.get_mut(row as usize)?.cells.get_mut(col as usize)?;
+    delete_block_in_vec(&mut cell.blocks, &steps[2..])?;
+    t.dirty = true;
+    t.source_xml = None;
+    Some(())
+}
+
 /// Bounded undo/redo snapshot stack. Pushing a new snapshot truncates the
 /// redo branch (standard editor semantics).
 #[derive(Debug, Clone)]
@@ -1511,14 +2023,26 @@ mod tests {
     #[test]
     fn insert_into_empty() {
         let d = DocumentTree::new();
-        let d = d.insert_text(LogicalPos { para: 0, offset: 0 }, "hello");
+        let d = d.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            "hello",
+        );
         assert_eq!(d.paragraph_text(0), Some("hello"));
     }
 
     #[test]
     fn insert_mid_paragraph() {
         let d = DocumentTree::from_text("hello world");
-        let d = d.insert_text(LogicalPos { para: 0, offset: 5 }, ",");
+        let d = d.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
+            ",",
+        );
         assert_eq!(d.paragraph_text(0), Some("hello, world"));
     }
 
@@ -1526,8 +2050,14 @@ mod tests {
     fn apply_style_creates_span() {
         let doc = DocumentTree::from_text("hello world");
         let doc = doc.apply_style(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 5 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
             SpanStyle {
                 font_size: Some(20.0),
                 color: None,
@@ -1564,14 +2094,23 @@ mod tests {
             ..Default::default()
         };
         let doc = doc.apply_style(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 8 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 8,
+            },
             red,
         );
         let doc = doc.apply_style(
-            LogicalPos { para: 0, offset: 4 },
             LogicalPos {
-                para: 0,
+                path: BlockPath::top(0),
+                offset: 4,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
                 offset: 11,
             },
             big,
@@ -1598,15 +2137,27 @@ mod tests {
     fn insert_shifts_spans() {
         let doc = DocumentTree::from_text("abcdef");
         let doc = doc.apply_style(
-            LogicalPos { para: 0, offset: 2 },
-            LogicalPos { para: 0, offset: 4 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 2,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 4,
+            },
             SpanStyle {
                 font_size: None,
                 color: Some([1, 2, 3, 255]),
                 ..Default::default()
             },
         );
-        let doc = doc.insert_text(LogicalPos { para: 0, offset: 0 }, "XX");
+        let doc = doc.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            "XX",
+        );
         let span = doc.nth_paragraph(0).unwrap().spans[0];
         assert_eq!((span.start, span.end), (4, 6));
     }
@@ -1664,9 +2215,12 @@ mod tests {
     fn delete_within_paragraph() {
         let d = DocumentTree::from_text("hello world");
         let d = d.delete_range(
-            LogicalPos { para: 0, offset: 5 },
             LogicalPos {
-                para: 0,
+                path: BlockPath::top(0),
+                offset: 5,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
                 offset: 11,
             },
         );
@@ -1677,8 +2231,14 @@ mod tests {
     fn delete_merges_paragraphs() {
         let d = DocumentTree::from_paragraphs(["abc".to_string(), "def".to_string()]);
         let d = d.delete_range(
-            LogicalPos { para: 0, offset: 3 },
-            LogicalPos { para: 1, offset: 0 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 3,
+            },
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
         );
         assert_eq!(d.paragraph_count(), 1);
         assert_eq!(d.paragraph_text(0), Some("abcdef"));
@@ -1688,8 +2248,14 @@ mod tests {
     fn delete_clips_spans() {
         let doc = DocumentTree::from_text("hello world");
         let doc = doc.apply_style(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 5 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
             SpanStyle {
                 font_size: Some(20.0),
                 color: None,
@@ -1697,8 +2263,14 @@ mod tests {
             },
         );
         let doc = doc.delete_range(
-            LogicalPos { para: 0, offset: 3 },
-            LogicalPos { para: 0, offset: 5 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 3,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
         );
         assert_eq!(doc.paragraph_text(0), Some("hel world"));
         let spans = &doc.nth_paragraph(0).unwrap().spans;
@@ -1709,7 +2281,10 @@ mod tests {
     #[test]
     fn split_paragraph_in_two() {
         let d = DocumentTree::from_text("hello world");
-        let d = d.split_paragraph(LogicalPos { para: 0, offset: 5 });
+        let d = d.split_paragraph(LogicalPos {
+            path: BlockPath::top(0),
+            offset: 5,
+        });
         assert_eq!(d.paragraph_count(), 2);
         assert_eq!(d.paragraph_text(0), Some("hello"));
         assert_eq!(d.paragraph_text(1), Some(" world"));
@@ -1738,23 +2313,41 @@ mod tests {
         let d = DocumentTree::from_paragraphs(["hello world".to_string(), "second".to_string()]);
         assert_eq!(
             d.text_range(
-                LogicalPos { para: 0, offset: 0 },
-                LogicalPos { para: 0, offset: 5 },
+                LogicalPos {
+                    path: BlockPath::top(0),
+                    offset: 0
+                },
+                LogicalPos {
+                    path: BlockPath::top(0),
+                    offset: 5
+                },
             ),
             "hello"
         );
         assert_eq!(
             d.text_range(
-                LogicalPos { para: 0, offset: 6 },
-                LogicalPos { para: 1, offset: 6 },
+                LogicalPos {
+                    path: BlockPath::top(0),
+                    offset: 6
+                },
+                LogicalPos {
+                    path: BlockPath::top(1),
+                    offset: 6
+                },
             ),
             "world\nsecond"
         );
         /* reversed args normalize to document order */
         assert_eq!(
             d.text_range(
-                LogicalPos { para: 0, offset: 5 },
-                LogicalPos { para: 0, offset: 0 },
+                LogicalPos {
+                    path: BlockPath::top(0),
+                    offset: 5
+                },
+                LogicalPos {
+                    path: BlockPath::top(0),
+                    offset: 0
+                },
             ),
             "hello"
         );
@@ -1765,8 +2358,14 @@ mod tests {
         let doc = DocumentTree::from_text("hello world");
         /* Apply bold over [0,5). */
         let doc = doc.apply_style(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 5 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
             SpanStyle {
                 bold: Some(true),
                 ..Default::default()
@@ -1779,8 +2378,14 @@ mod tests {
         );
         /* Overlay italic + underline on the same range — they merge in. */
         let doc = doc.apply_style(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 5 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
             SpanStyle {
                 italic: Some(true),
                 underline: Some(true),
@@ -1803,11 +2408,23 @@ mod tests {
         let initial = DocumentTree::from_text("abc");
         let mut undo = UndoStack::new(initial.clone(), 16);
 
-        let d2 = initial.insert_text(LogicalPos { para: 0, offset: 3 }, "def");
+        let d2 = initial.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 3,
+            },
+            "def",
+        );
         undo.push(d2.clone());
         assert_eq!(undo.current().paragraph_text(0), Some("abcdef"));
 
-        let d3 = d2.insert_text(LogicalPos { para: 0, offset: 6 }, "ghi");
+        let d3 = d2.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 6,
+            },
+            "ghi",
+        );
         undo.push(d3.clone());
         assert_eq!(undo.current().paragraph_text(0), Some("abcdefghi"));
 
@@ -1825,8 +2442,14 @@ mod tests {
     fn set_alignment_marks_spanned_paragraphs() {
         let d = DocumentTree::from_paragraphs(["a".into(), "b".into(), "c".into()]);
         let d = d.set_alignment(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 1, offset: 0 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
             Alignment::Center,
         );
         assert_eq!(
@@ -1845,12 +2468,24 @@ mod tests {
     fn alignment_survives_text_edits() {
         let d = DocumentTree::from_text("hello world");
         let d = d.set_alignment(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 0 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
             Alignment::End,
         );
         /* insertion clones the paragraph in place — alignment rides along */
-        let d = d.insert_text(LogicalPos { para: 0, offset: 0 }, "X");
+        let d = d.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            "X",
+        );
         assert_eq!(d.paragraph_text(0), Some("Xhello world"));
         assert_eq!(
             d.nth_paragraph(0).unwrap().props.alignment,
@@ -1858,8 +2493,14 @@ mod tests {
         );
         /* a style change preserves alignment */
         let d = d.apply_style(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 3 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 3,
+            },
             SpanStyle {
                 bold: Some(true),
                 ..Default::default()
@@ -1871,8 +2512,14 @@ mod tests {
         );
         /* and so does a deletion */
         let d = d.delete_range(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 1 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 1,
+            },
         );
         assert_eq!(
             d.nth_paragraph(0).unwrap().props.alignment,
@@ -1884,11 +2531,20 @@ mod tests {
     fn split_paragraph_inherits_alignment() {
         let d = DocumentTree::from_text("hello world");
         let d = d.set_alignment(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 0 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
             Alignment::Center,
         );
-        let d = d.split_paragraph(LogicalPos { para: 0, offset: 5 });
+        let d = d.split_paragraph(LogicalPos {
+            path: BlockPath::top(0),
+            offset: 5,
+        });
         assert_eq!(d.paragraph_count(), 2);
         /* both halves carry the original paragraph's alignment */
         assert_eq!(
@@ -1905,19 +2561,37 @@ mod tests {
     fn merge_keeps_first_paragraph_alignment() {
         let d = DocumentTree::from_paragraphs(["abc".into(), "def".into()]);
         let d = d.set_alignment(
-            LogicalPos { para: 0, offset: 0 },
-            LogicalPos { para: 0, offset: 0 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
             Alignment::Center,
         );
         let d = d.set_alignment(
-            LogicalPos { para: 1, offset: 0 },
-            LogicalPos { para: 1, offset: 0 },
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
             Alignment::End,
         );
         /* deleting the paragraph break merges the two */
         let d = d.delete_range(
-            LogicalPos { para: 0, offset: 3 },
-            LogicalPos { para: 1, offset: 0 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 3,
+            },
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
         );
         assert_eq!(d.paragraph_count(), 1);
         assert_eq!(d.paragraph_text(0), Some("abcdef"));
@@ -1931,29 +2605,59 @@ mod tests {
     #[test]
     fn insert_multiline_single_line_is_plain_insert() {
         let d = DocumentTree::from_text("abcd");
-        let (d, caret) = d.insert_multiline(LogicalPos { para: 0, offset: 2 }, "XY");
+        let (d, caret) = d.insert_multiline(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 2,
+            },
+            "XY",
+        );
         assert_eq!(d.paragraph_count(), 1);
         assert_eq!(d.paragraph_text(0), Some("abXYcd"));
-        assert_eq!(caret, LogicalPos { para: 0, offset: 4 });
+        assert_eq!(
+            caret,
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 4
+            }
+        );
     }
 
     #[test]
     fn insert_multiline_splits_into_paragraphs() {
         let d = DocumentTree::from_text("abcd");
-        let (d, caret) = d.insert_multiline(LogicalPos { para: 0, offset: 2 }, "L0\nL1\nL2");
+        let (d, caret) = d.insert_multiline(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 2,
+            },
+            "L0\nL1\nL2",
+        );
         assert_eq!(d.paragraph_count(), 3);
         /* the original paragraph splits around the caret; the tail rides the
         last pasted line's paragraph */
         assert_eq!(d.paragraph_text(0), Some("abL0"));
         assert_eq!(d.paragraph_text(1), Some("L1"));
         assert_eq!(d.paragraph_text(2), Some("L2cd"));
-        assert_eq!(caret, LogicalPos { para: 2, offset: 2 });
+        assert_eq!(
+            caret,
+            LogicalPos {
+                path: BlockPath::top(2),
+                offset: 2
+            }
+        );
     }
 
     #[test]
     fn insert_multiline_normalizes_crlf_and_cr() {
         let d = DocumentTree::from_text("");
-        let (d, _) = d.insert_multiline(LogicalPos { para: 0, offset: 0 }, "a\r\nb\rc");
+        let (d, _) = d.insert_multiline(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            "a\r\nb\rc",
+        );
         assert_eq!(d.paragraph_count(), 3);
         assert_eq!(d.paragraph_text(0), Some("a"));
         assert_eq!(d.paragraph_text(1), Some("b"));
@@ -1963,22 +2667,46 @@ mod tests {
     #[test]
     fn insert_multiline_trailing_newline_makes_empty_paragraph() {
         let d = DocumentTree::from_text("xy");
-        let (d, caret) = d.insert_multiline(LogicalPos { para: 0, offset: 2 }, "Z\n");
+        let (d, caret) = d.insert_multiline(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 2,
+            },
+            "Z\n",
+        );
         assert_eq!(d.paragraph_count(), 2);
         assert_eq!(d.paragraph_text(0), Some("xyZ"));
         assert_eq!(d.paragraph_text(1), Some(""));
-        assert_eq!(caret, LogicalPos { para: 1, offset: 0 });
+        assert_eq!(
+            caret,
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0
+            }
+        );
     }
 
     #[test]
     fn insert_multiline_into_second_paragraph() {
         let d = DocumentTree::from_paragraphs(["first".to_string(), "second".to_string()]);
-        let (d, caret) = d.insert_multiline(LogicalPos { para: 1, offset: 3 }, "A\nB");
+        let (d, caret) = d.insert_multiline(
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 3,
+            },
+            "A\nB",
+        );
         assert_eq!(d.paragraph_count(), 3);
         assert_eq!(d.paragraph_text(0), Some("first"));
         assert_eq!(d.paragraph_text(1), Some("secA"));
         assert_eq!(d.paragraph_text(2), Some("Bond"));
-        assert_eq!(caret, LogicalPos { para: 2, offset: 1 });
+        assert_eq!(
+            caret,
+            LogicalPos {
+                path: BlockPath::top(2),
+                offset: 1
+            }
+        );
     }
 
     #[test]
@@ -2004,8 +2732,14 @@ mod tests {
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
         let cut = doc.slice(
-            LogicalPos { para: 0, offset: 3 },
-            LogicalPos { para: 0, offset: 9 },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 3,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 9,
+            },
         );
         assert_eq!(cut.len(), 1);
         assert_eq!(cut[0].text, "lo wor");
@@ -2031,13 +2765,19 @@ mod tests {
             dirty: false,
             source_xml: None,
         }];
-        let (out, caret) = doc.insert_rich(LogicalPos { para: 0, offset: 6 }, &frag);
+        let (out, caret) = doc.insert_rich(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 6,
+            },
+            &frag,
+        );
         assert_eq!(out.paragraph_count(), 1);
         assert_eq!(out.paragraph_text(0), Some("hello BRAVE world"));
         assert_eq!(
             caret,
             LogicalPos {
-                para: 0,
+                path: BlockPath::top(0),
                 offset: 12
             }
         );
@@ -2074,11 +2814,23 @@ mod tests {
                 source_xml: None,
             },
         ];
-        let (out, caret) = doc.insert_rich(LogicalPos { para: 0, offset: 2 }, &frag);
+        let (out, caret) = doc.insert_rich(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 2,
+            },
+            &frag,
+        );
         assert_eq!(out.paragraph_count(), 2);
         assert_eq!(out.paragraph_text(0), Some("ABone"));
         assert_eq!(out.paragraph_text(1), Some("twoCD"));
-        assert_eq!(caret, LogicalPos { para: 1, offset: 3 });
+        assert_eq!(
+            caret,
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 3
+            }
+        );
         assert_eq!(out.nth_paragraph(1).unwrap().style_at(0).bold, Some(true));
         assert_eq!(out.nth_paragraph(1).unwrap().style_at(3).bold, None);
     }
