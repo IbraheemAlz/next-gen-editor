@@ -1451,6 +1451,8 @@ impl Engine {
                     indent_end_px: ind_e,
                     first_line_indent_px: ind_fl,
                     hanging_indent_px: ind_h,
+                    marker_text: para.resolved_marker.clone(),
+                    px_size_for_marker: cfg.px_size * scale,
                 })
             } else {
                 /* Backlog #13 — incremental relayout: reuse the cached box
@@ -1483,6 +1485,11 @@ impl Engine {
                         indent_end_px: ind_e,
                         first_line_indent_px: ind_fl,
                         hanging_indent_px: ind_h,
+                        /* Phase 4 — list marker. `None` for non-list paragraphs;
+                        for list paragraphs, the numbering resolver populated
+                        `resolved_marker` at load time. */
+                        marker_text: para.resolved_marker.clone(),
+                        px_size_for_marker: cfg.px_size * scale,
                     };
                     let laid = layout_paragraph(para_cfg);
                     cache.put(key, laid.clone());
@@ -2633,6 +2640,8 @@ mod tests {
             text: text.to_string(),
             spans: Vec::new(),
             props: engine::ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -2763,6 +2772,8 @@ mod tests {
             text: "abcdef".to_string(),
             spans: Vec::new(),
             props: engine::ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -2785,6 +2796,8 @@ mod tests {
             text: "abc".to_string(),
             spans: Vec::new(),
             props: engine::ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };

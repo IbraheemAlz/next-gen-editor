@@ -119,6 +119,38 @@ pub fn build_page_scene(page: &PageBox) -> DisplayList {
     for para in &page.paragraphs {
         let para_x = content_x + para.origin.x;
         let para_y = content_y + para.origin.y;
+        /* Phase 4 — list marker. Lives in the leading-edge gutter, baseline
+        aligned with the first line. Paint it before the line runs so it
+        sits visually beside the body text — z-order doesn't matter here,
+        but rendering first keeps the loop structure simple. */
+        if let Some(marker) = &para.marker {
+            let m_x = para_x + marker.origin.x;
+            let m_baseline = (para_y + marker.origin.y + marker.baseline) as f64;
+            let mut pen = 0.0_f32;
+            let mut glyphs: Vec<RunGlyph> = Vec::with_capacity(marker.run.glyphs.len());
+            for glyph in &marker.run.glyphs {
+                if glyph.id != 0 {
+                    glyphs.push(RunGlyph {
+                        glyph_id: glyph.id,
+                        x: (m_x as f64) + (pen as f64) + (glyph.x_offset as f64),
+                        y: m_baseline - (glyph.y_offset as f64),
+                    });
+                }
+                pen += glyph.x_advance;
+            }
+            if !glyphs.is_empty() {
+                let [r, g, b, a] = marker.run.attrs.color;
+                cmds.push(DisplayCmd::DrawGlyphRun(GlyphRun {
+                    font: marker.run.font.clone(),
+                    px_size: marker.run.attrs.px_size,
+                    paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+                    glyphs,
+                    faux_bold: marker.run.attrs.faux_bold,
+                    faux_italic: marker.run.attrs.faux_italic,
+                    bg_color: marker.run.attrs.bg_color,
+                }));
+            }
+        }
         for line in &para.lines {
             let line_x = para_x + line.origin.x;
             let baseline = (para_y + line.origin.y + line.baseline) as f64;

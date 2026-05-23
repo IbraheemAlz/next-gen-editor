@@ -165,6 +165,16 @@ impl ParaProperties {
     }
 }
 
+/// `<w:numPr>` reference — a paragraph's binding to a numbering definition.
+/// `num_id` keys into `word/numbering.xml`'s `<w:num>` entries; `ilvl`
+/// (0-indexed) selects the level inside the bound `<w:abstractNum>`. The
+/// resolved marker text lives in [`Paragraph::resolved_marker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListItem {
+    pub num_id: u32,
+    pub ilvl: u8,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Paragraph {
     pub text: String,
@@ -174,6 +184,15 @@ pub struct Paragraph {
     /// Paragraph-level properties (`<w:pPr>`). Default = inherit everything
     /// from the render config / document defaults.
     pub props: ParaProperties,
+    /// Phase 4 list membership. `Some` when the paragraph carries a
+    /// `<w:numPr>` reference; resolved marker is in [`Self::resolved_marker`].
+    pub list_item: Option<ListItem>,
+    /// Phase 4 cached list marker (`"1."`, `"a)"`, `"•"`, `"1.1.2."`).
+    /// Populated by the numbering resolver after `parse_document_xml` returns,
+    /// once the full paragraph sequence is known. `None` for non-list
+    /// paragraphs and for list paragraphs whose `num_id` resolves to no
+    /// definition (defensive — Word tolerates dangling numIds).
+    pub resolved_marker: Option<String>,
     /// Phase 3 passthrough optimisation. `false` on load; flips to `true` the
     /// first time any engine mutation produces a derived paragraph. The writer
     /// emits `source_xml` verbatim when this is `false` and ignores it
@@ -242,6 +261,8 @@ impl Paragraph {
             text: self.text.clone(),
             spans,
             props: self.props.clone(),
+            list_item: self.list_item,
+            resolved_marker: self.resolved_marker.clone(),
             dirty: true,
             source_xml: None,
         }
@@ -324,6 +345,8 @@ impl Paragraph {
             text,
             spans,
             props: self.props.clone(),
+            list_item: self.list_item,
+            resolved_marker: self.resolved_marker.clone(),
             dirty: true,
             source_xml: None,
         }
@@ -356,6 +379,8 @@ impl Paragraph {
                 text: self.text[..at as usize].to_owned(),
                 spans: left,
                 props: self.props.clone(),
+                list_item: self.list_item,
+                resolved_marker: self.resolved_marker.clone(),
                 dirty: true,
                 source_xml: None,
             },
@@ -363,6 +388,8 @@ impl Paragraph {
                 text: self.text[at as usize..].to_owned(),
                 spans: right,
                 props: self.props.clone(),
+                list_item: self.list_item,
+                resolved_marker: self.resolved_marker.clone(),
                 dirty: true,
                 source_xml: None,
             },
@@ -388,6 +415,8 @@ impl Paragraph {
             text,
             spans,
             props: self.props.clone(),
+            list_item: self.list_item,
+            resolved_marker: self.resolved_marker.clone(),
             dirty: true,
             source_xml: None,
         }
@@ -433,6 +462,8 @@ impl DocumentTree {
             text: text.to_owned(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         });
@@ -447,6 +478,8 @@ impl DocumentTree {
                 text: t,
                 spans: Vec::new(),
                 props: ParaProperties::default(),
+                list_item: None,
+                resolved_marker: None,
                 dirty: false,
                 source_xml: None,
             });
@@ -497,6 +530,8 @@ impl DocumentTree {
                 text: text.to_owned(),
                 spans: Vec::new(),
                 props: ParaProperties::default(),
+                list_item: None,
+                resolved_marker: None,
                 dirty: true,
                 source_xml: None,
             });
@@ -935,6 +970,8 @@ mod tests {
             text: "hello world".into(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -952,6 +989,8 @@ mod tests {
             text: "مرحبا بالعالم".into(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -966,6 +1005,8 @@ mod tests {
             text: String::new(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -1034,6 +1075,8 @@ mod tests {
             text: "aمb".into(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -1276,6 +1319,8 @@ mod tests {
                 style: bold,
             }],
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -1304,6 +1349,8 @@ mod tests {
             text: "BRAVE ".into(),
             spans: vec![],
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         }];
@@ -1331,6 +1378,8 @@ mod tests {
                 text: "one".into(),
                 spans: vec![],
                 props: ParaProperties::default(),
+                list_item: None,
+                resolved_marker: None,
                 dirty: false,
                 source_xml: None,
             },
@@ -1342,6 +1391,8 @@ mod tests {
                     style: bold,
                 }],
                 props: ParaProperties::default(),
+                list_item: None,
+                resolved_marker: None,
                 dirty: false,
                 source_xml: None,
             },

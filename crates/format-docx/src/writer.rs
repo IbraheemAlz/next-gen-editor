@@ -343,6 +343,8 @@ mod tests {
                 },
             ],
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -372,6 +374,8 @@ mod tests {
                 style: styled,
             }],
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -416,6 +420,8 @@ mod tests {
             text: "hello world".into(),
             spans: Vec::new(),
             props: props.clone(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -450,6 +456,8 @@ mod tests {
                 page_break_before: true,
                 ..Default::default()
             },
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -609,6 +617,112 @@ mod tests {
             q.spans
                 .iter()
                 .any(|s| s.style.bold == Some(true) && s.style.italic == Some(true))
+        );
+    }
+
+    /* ---- Phase 4: numbering + list markers ------------------------- */
+
+    /// Minimal `.docx` with `word/numbering.xml` defining one bullet
+    /// abstractNum + one two-level decimal/lowerLetter abstractNum, and
+    /// `document.xml` interleaving the two list types. Used by the marker
+    /// resolver + list-passthrough tests.
+    fn build_list_docx() -> Vec<u8> {
+        let numbering_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="*"/></w:lvl></w:abstractNum>
+<w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1.%2)"/></w:lvl></w:abstractNum>
+<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
+</w:numbering>"#;
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">bullet alpha</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">first ordered</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">nested item</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">second ordered</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
+</Types>"#;
+        let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+        let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
+</Relationships>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", dot_rels),
+                ("word/_rels/document.xml.rels", doc_rels),
+                ("word/numbering.xml", numbering_xml),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn list_paragraphs_get_resolved_markers() {
+        let bytes = build_list_docx();
+        let parsed = read_docx(&bytes).expect("read");
+        let paras = &parsed.document.paragraphs;
+        assert_eq!(paras.len(), 4);
+        /* Bullet — literal lvlText. */
+        assert_eq!(paras[0].resolved_marker.as_deref(), Some("*"));
+        assert_eq!(
+            paras[0].list_item,
+            Some(engine::ListItem { num_id: 1, ilvl: 0 })
+        );
+        /* Decimal level 0 — `%1.` ⇒ "1." */
+        assert_eq!(paras[1].resolved_marker.as_deref(), Some("1."));
+        /* Nested level 1 — `%1.%2)` ⇒ "1.a)" */
+        assert_eq!(paras[2].resolved_marker.as_deref(), Some("1.a)"));
+        /* Back to level 0 — counter increments to 2; level-1 counter
+        resets on next nested visit. */
+        assert_eq!(paras[3].resolved_marker.as_deref(), Some("2."));
+    }
+
+    #[test]
+    fn list_passthrough_keeps_num_pr_byte_identical() {
+        let bytes = build_list_docx();
+        let archive = read_docx(&bytes).expect("read");
+        /* All loaded paragraphs must be clean with captured source bytes. */
+        for (i, p) in archive.document.paragraphs.iter().enumerate() {
+            assert!(!p.dirty, "para {i} loaded dirty");
+            let raw = p.source_xml.as_deref().expect("source_xml captured");
+            assert!(std::str::from_utf8(raw).unwrap().contains("<w:numPr>"));
+        }
+        /* Save unedited — every paragraph's source bytes ride through
+        verbatim, so document.xml inside the bytes is byte-stable. */
+        let saved = write_docx(&archive, &archive.document).expect("write");
+        let saved_doc_xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&saved)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        let original_doc_xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert_eq!(
+            saved_doc_xml, original_doc_xml,
+            "passthrough must keep list document.xml byte-identical"
         );
     }
 

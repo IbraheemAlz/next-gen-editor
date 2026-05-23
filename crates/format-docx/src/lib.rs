@@ -17,6 +17,7 @@
 //! [`writer::build_minimal_docx`] keep their pre-refactor paths.
 
 pub mod error;
+pub mod numbering_resolver;
 pub mod opc;
 pub mod parts;
 pub mod reader;

@@ -1,5 +1,22 @@
 {
   "fixtures": {
+    "list_bullet_numbered.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 4,
+      "asserts": {
+        "paragraph_count": 5,
+        "paragraph_texts": [
+          "bullet alpha",
+          "bullet beta",
+          "first ordered item",
+          "first nested item",
+          "second ordered item"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "pPr_bidi_rtl.docx": {
       "generator": "handcrafted",
       "phase_introduced": 2,

@@ -9,7 +9,9 @@
 //! model can never drift, because we re-emit them as raw bytes.
 
 use crate::error::DocxError;
+use crate::numbering_resolver::resolve_markers;
 use crate::parts::document::parse_document_xml;
+use crate::parts::numbering::{NumberingDefinitions, parse_numbering_xml};
 use crate::parts::styles::{StyleTable, parse_styles_xml};
 use crate::style_resolver::StyleResolver;
 use engine::DocumentTree;
@@ -18,6 +20,7 @@ use zip::ZipArchive;
 
 pub const DOC_XML: &str = "word/document.xml";
 pub const STYLES_XML: &str = "word/styles.xml";
+pub const NUMBERING_XML: &str = "word/numbering.xml";
 
 /// All raw archive entries except `word/document.xml`. Carried through the
 /// round-trip so the writer can re-emit them verbatim.
@@ -75,7 +78,28 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         _ => StyleTable::default(),
     };
     let resolver = StyleResolver::new(&style_table);
-    let document = parse_document_xml(&xml, &resolver)?;
+    let mut document = parse_document_xml(&xml, &resolver)?;
+
+    /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
+    numbering resolver. Second pass over the parsed paragraphs fills each
+    list paragraph's `resolved_marker`. */
+    let numbering: NumberingDefinitions = match other_entries
+        .iter()
+        .find(|(n, _)| n == NUMBERING_XML)
+        .map(|(_, b)| parse_numbering_xml(b))
+    {
+        Some(Ok(t)) => t,
+        _ => NumberingDefinitions::default(),
+    };
+    if !numbering.num_instances.is_empty() {
+        /* `im::Vector` clones cheaply; we collect into a Vec to mutate
+        in-place, then rebuild the tree. `resolve_markers` only writes
+        `resolved_marker`, so the structurally-shared `Paragraph` fields
+        cost nothing here. */
+        let mut paras: Vec<_> = document.paragraphs.iter().cloned().collect();
+        resolve_markers(&mut paras, &numbering);
+        document = DocumentTree::from_rich_paragraphs(paras);
+    }
 
     Ok(DocxArchive {
         other_entries,

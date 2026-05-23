@@ -481,6 +481,8 @@ mod tests {
             indent_end_px: 0.0,
             first_line_indent_px: 0.0,
             hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 26.0,
         });
         PageBox {
             size: Size {

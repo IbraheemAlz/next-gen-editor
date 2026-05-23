@@ -419,6 +419,8 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             text: text.to_owned(),
             spans: Vec::new(),
             props,
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         }]),
@@ -479,19 +481,40 @@ struct PrebuiltFixture {
 }
 
 fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
-    vec![PrebuiltFixture {
-        name: "style_cascade.docx",
-        bytes: build_style_cascade_docx(),
-        entry: FixtureEntry {
-            generator: "handcrafted".into(),
-            phase_introduced: 3,
-            asserts: FixtureAsserts {
-                paragraph_count: 1,
-                paragraph_texts: vec!["hello cascade".into()],
+    vec![
+        PrebuiltFixture {
+            name: "style_cascade.docx",
+            bytes: build_style_cascade_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 3,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["hello cascade".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
             },
-            roundtrip: RoundtripBounds::default(),
         },
-    }]
+        PrebuiltFixture {
+            name: "list_bullet_numbered.docx",
+            bytes: build_list_bullet_numbered_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 4,
+                asserts: FixtureAsserts {
+                    paragraph_count: 5,
+                    paragraph_texts: vec![
+                        "bullet alpha".into(),
+                        "bullet beta".into(),
+                        "first ordered item".into(),
+                        "first nested item".into(),
+                        "second ordered item".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+    ]
 }
 
 /// Replicates `crates/format-docx/src/writer.rs`
@@ -537,6 +560,71 @@ fn build_style_cascade_docx() -> Vec<u8> {
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
             ("word/styles.xml", styles_xml),
+            ("word/document.xml", document_xml),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// Phase 4 list fixture: a `word/numbering.xml` defining two abstractNums
+/// (bullet at id 0, two-level decimal-then-lowerLetter at id 1) plus two
+/// `<w:num>` instances. `document.xml` has 2 bullet paragraphs, then 2
+/// numbered paragraphs at level 0 interleaved with 1 nested level-1
+/// paragraph. The fixture exercises:
+///
+/// - bullet marker (literal `lvlText`, no `%N`),
+/// - decimal `%1.` substitution,
+/// - mixed-level `%1.%2.` substitution,
+/// - deeper-level reset after a level-0 paragraph appears.
+fn build_list_bullet_numbered_docx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    let numbering_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:abstractNum w:abstractNumId="0">
+<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="*"/></w:lvl>
+</w:abstractNum>
+<w:abstractNum w:abstractNumId="1">
+<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1.%2)"/></w:lvl>
+</w:abstractNum>
+<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
+</w:numbering>"#;
+    let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">bullet alpha</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">bullet beta</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">first ordered item</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">first nested item</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">second ordered item</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
+</Types>"#;
+    let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
+</Relationships>"#;
+
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, body) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", dot_rels),
+            ("word/_rels/document.xml.rels", doc_rels),
+            ("word/numbering.xml", numbering_xml),
             ("word/document.xml", document_xml),
         ] {
             zip.start_file(name, opts).unwrap();

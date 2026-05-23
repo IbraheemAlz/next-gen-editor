@@ -15,7 +15,7 @@ use crate::error::DocxError;
 use crate::schema::ct_ppr::apply_ppr;
 use crate::schema::ct_rpr::{apply_rpr, attr_val};
 use crate::style_resolver::StyleResolver;
-use engine::{DocumentTree, ParaProperties, Paragraph, SpanStyle, StyleRun};
+use engine::{DocumentTree, ListItem, ParaProperties, Paragraph, SpanStyle, StyleRun};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
@@ -38,6 +38,12 @@ pub fn parse_document_xml(
     let mut p_style_id: Option<String> = None;
     let mut direct_ppr = ParaProperties::default();
     let mut pmark_rpr = SpanStyle::default();
+    /* Phase 4 — `<w:numPr>/<w:numId>` + `<w:ilvl>` accumulators. We don't
+    inherit either field from a paragraph style here; that's a separate
+    cascade source Phase 4 ships without modelling. */
+    let mut list_num_id: Option<u32> = None;
+    let mut list_ilvl: Option<u8> = None;
+    let mut in_num_pr = false;
 
     /* Per-run parser state. */
     let mut in_run = false;
@@ -81,12 +87,19 @@ pub fn parse_document_xml(
                     /* A `<w:pPr>` only counts when it's the paragraph's own
                     properties — not a nested element under a `<w:r>`. */
                     b"w:pPr" if !in_run => in_ppr = true,
+                    b"w:numPr" if in_ppr => in_num_pr = true,
                     b"w:t" => in_text_elt = true,
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
                     }
                     b"w:rStyle" if in_run && in_rpr => {
                         r_style_id = attr_val(&e, b"w:val");
+                    }
+                    b"w:numId" if in_num_pr => {
+                        list_num_id = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
+                    }
+                    b"w:ilvl" if in_num_pr => {
+                        list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
                     n if in_ppr && in_rpr => {
@@ -95,7 +108,9 @@ pub fn parse_document_xml(
                         and lay it under the run baseline below. */
                         apply_rpr(n, &e, &mut pmark_rpr);
                     }
-                    n if in_ppr && !in_rpr => apply_ppr(n, &e, &mut direct_ppr),
+                    n if in_ppr && !in_rpr && !in_num_pr => {
+                        apply_ppr(n, &e, &mut direct_ppr);
+                    }
                     _ => {}
                 }
             }
@@ -108,9 +123,17 @@ pub fn parse_document_xml(
                     b"w:rStyle" if in_run && in_rpr => {
                         r_style_id = attr_val(&e, b"w:val");
                     }
+                    b"w:numId" if in_num_pr => {
+                        list_num_id = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
+                    }
+                    b"w:ilvl" if in_num_pr => {
+                        list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
+                    }
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
                     n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
-                    n if in_ppr && !in_rpr => apply_ppr(n, &e, &mut direct_ppr),
+                    n if in_ppr && !in_rpr && !in_num_pr => {
+                        apply_ppr(n, &e, &mut direct_ppr);
+                    }
                     _ => {}
                 }
             }
@@ -121,6 +144,7 @@ pub fn parse_document_xml(
                 b"w:t" => in_text_elt = false,
                 b"w:rPr" => in_rpr = false,
                 b"w:pPr" => in_ppr = false,
+                b"w:numPr" => in_num_pr = false,
                 b"w:r" => {
                     in_run = false;
                     let start = para_text.len() as u32;
@@ -165,10 +189,25 @@ pub fn parse_document_xml(
                         std::mem::take(&mut direct_ppr),
                         std::mem::take(&mut pmark_rpr),
                     );
+                    /* Compose `ListItem` from the per-paragraph numPr
+                    accumulators; partial refs (numId without ilvl, or
+                    vice versa) default the missing field to 0 — Word
+                    treats absent `<w:ilvl>` as level 0. */
+                    let list_item = match (list_num_id.take(), list_ilvl.take()) {
+                        (Some(num_id), ilvl) => Some(ListItem {
+                            num_id,
+                            ilvl: ilvl.unwrap_or(0),
+                        }),
+                        (None, _) => None,
+                    };
                     paragraphs.push(Paragraph {
                         text: std::mem::take(&mut para_text),
                         spans: std::mem::take(&mut spans),
                         props,
+                        list_item,
+                        /* Resolver fills this in a second pass once the full
+                        doc order is known (see `opc::archive::read_docx`). */
+                        resolved_marker: None,
                         dirty: false,
                         source_xml,
                     });

@@ -124,6 +124,28 @@ pub struct ParagraphBox {
     pub size: Size,
     pub lines: Vec<LineBox>,
     pub direction: ShapingDirection,
+    /// Phase 4 list marker (`"1."`, `"a)"`, `"•"`). `origin` is relative to
+    /// this `ParagraphBox`. Positioned in the leading-edge gutter — left
+    /// of the first line for LTR, right for RTL. `None` for non-list
+    /// paragraphs.
+    pub marker: Option<MarkerBox>,
+}
+
+/// A shaped list marker living in the paragraph's leading-edge gutter.
+/// Holds its own `VisualRun` so the renderer can paint it without
+/// special-casing — it's drawn after the line runs in the same scene
+/// pass — but it does not participate in line layout, BiDi reordering,
+/// or justification.
+#[derive(Debug, Clone)]
+pub struct MarkerBox {
+    /// Relative to the parent [`ParagraphBox`] origin. `origin.y` lands at
+    /// the first line's `origin.y`; `origin.x` is the marker's leading edge.
+    pub origin: Point,
+    pub baseline: f32,
+    pub run: VisualRun,
+    /// Total advance of `run.glyphs` — pre-computed so the renderer doesn't
+    /// have to re-sum.
+    pub width: f32,
 }
 
 /// A laid-out page — the root of the box tree and the renderer's input.

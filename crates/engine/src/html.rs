@@ -385,6 +385,8 @@ impl ParaBuilder {
             text,
             spans,
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             /* HTML paste creates fresh paragraphs; never inherits source. */
             dirty: false,
             source_xml: None,
@@ -485,6 +487,8 @@ mod tests {
             text: "hello".into(),
             spans: vec![],
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -497,6 +501,8 @@ mod tests {
             text: "a < b & c".into(),
             spans: vec![],
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -517,6 +523,8 @@ mod tests {
                 },
             }],
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         };
@@ -540,6 +548,8 @@ mod tests {
                 },
             }],
             props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
             dirty: false,
             source_xml: None,
         }];

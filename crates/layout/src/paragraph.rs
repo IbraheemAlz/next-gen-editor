@@ -10,11 +10,11 @@
 //! opportunities. Acceptable for the PoC; Phase 3 will cache widths.
 
 use crate::boxes::{
-    LineBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TextAttrs, VisualRun,
+    LineBox, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TextAttrs, VisualRun,
 };
 use std::mem::take;
 use text_pipeline::{
-    Alignment, FontStack, JustifyMode, ShapingDirection, analyze_bidi, break_opportunities,
+    Alignment, FontStack, JustifyMode, Script, ShapingDirection, analyze_bidi, break_opportunities,
     justify::is_arabic_codepoint,
     justify_kashida::{JoinRole, KashidaPriority, join_role, kashida_point},
     segment_by_script, shape_text,
@@ -44,6 +44,15 @@ pub struct ParagraphConfig<'a> {
     /// `<w:ind w:hanging>` — distance the first line shifts back from
     /// `indent_start_px` (so subsequent lines hang in).
     pub hanging_indent_px: f32,
+    /// Phase 4 list marker text (`"1."`, `"a)"`, `"•"`). `None` for non-list
+    /// paragraphs. Shaped against the first available font in
+    /// [`Self::fonts`] at [`Self::px_size_for_marker`] and laid out in
+    /// the leading-edge gutter (before the first line for LTR; after for
+    /// RTL).
+    pub marker_text: Option<String>,
+    /// Pixel size for shaping the marker. Matches the body font size by
+    /// default at the engine-wasm boundary.
+    pub px_size_for_marker: f32,
 }
 
 /// Lay out `cfg.text` into a [`ParagraphBox`] with positioned lines.
@@ -117,6 +126,13 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     }
 
     let height = y;
+    /* Phase 4 — list marker (`"1."`, `"a)"`, `"•"`). Shape against the
+    base-direction script's preferred face at `px_size_for_marker`, then
+    park it in the leading-edge gutter aligned to the first line's
+    baseline. Positioned but not justified, not selectable, not part of
+    line layout — purely a side-car run. */
+    let marker = build_marker(&cfg, leading_off, lines.first());
+    let _ = trailing_off;
     ParagraphBox {
         origin: Point::default(),
         size: Size {
@@ -125,7 +141,78 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         },
         lines,
         direction: cfg.base_direction,
+        marker,
     }
+}
+
+fn build_marker(
+    cfg: &ParagraphConfig<'_>,
+    leading_off: f32,
+    first_line: Option<&LineBox>,
+) -> Option<MarkerBox> {
+    let text = cfg.marker_text.as_deref()?;
+    if text.is_empty() {
+        return None;
+    }
+    let first = first_line?;
+    let direction = cfg.base_direction;
+    let script = match direction {
+        ShapingDirection::Rtl => Script::Arabic,
+        ShapingDirection::Ltr => Script::Latin,
+    };
+    let (font_id, face, _synth) = cfg.fonts.resolve(script, None, false, false)?;
+    let shaped = shape_text(face, text, direction, cfg.px_size_for_marker);
+    let glyphs: Vec<PositionedGlyph> = shaped
+        .glyphs
+        .iter()
+        .map(|g| PositionedGlyph {
+            id: g.glyph_id as u16,
+            cluster: g.cluster,
+            x_advance: g.x_advance,
+            y_advance: g.y_advance,
+            x_offset: g.x_offset,
+            y_offset: g.y_offset,
+            synthetic: false,
+        })
+        .collect();
+    let width = glyphs.iter().map(|g| g.x_advance).sum::<f32>();
+    /* Small visual gap between the marker and the body text — the OOXML
+    `<w:suff>` element controls this in Word; Phase 4 ships a fixed
+    em-fraction so the marker doesn't kiss the first glyph. */
+    let gap = cfg.px_size_for_marker * 0.5;
+    let rtl = matches!(direction, ShapingDirection::Rtl);
+    /* LTR: marker sits to the left of the first line's leading edge, with
+    its trailing edge at `leading_off - gap`. RTL: mirror — marker sits to
+    the right, leading edge at `max_width - leading_off + gap`. */
+    let origin_x = if rtl {
+        cfg.max_width - leading_off + gap
+    } else {
+        (leading_off - gap - width).max(0.0)
+    };
+    let origin_y = first.origin.y;
+    Some(MarkerBox {
+        origin: Point {
+            x: origin_x,
+            y: origin_y,
+        },
+        baseline: first.baseline,
+        run: VisualRun {
+            glyphs,
+            font: font_id.clone(),
+            direction,
+            source_range: 0..0,
+            attrs: TextAttrs {
+                px_size: cfg.px_size_for_marker,
+                color: [0, 0, 0, 255],
+                bg_color: None,
+                underline: false,
+                strike: false,
+                faux_bold: false,
+                faux_italic: false,
+            },
+        },
+        width,
+    })
 }
 
 /// Adapter that lets the indent-aware path call the existing `compose_lines`
@@ -148,6 +235,8 @@ fn compose_lines_with_width<'a>(
         indent_end_px: 0.0,
         first_line_indent_px: 0.0,
         hanging_indent_px: 0.0,
+        marker_text: None,
+        px_size_for_marker: cfg.px_size_for_marker,
     };
     compose_lines(&scoped)
 }
