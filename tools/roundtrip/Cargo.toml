@@ -15,3 +15,5 @@ engine = { path = "../../crates/engine" }
 format-docx = { path = "../../crates/format-docx" }
 zip = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"

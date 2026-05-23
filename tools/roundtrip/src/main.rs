@@ -1,34 +1,54 @@
 //! Round-trip harness.
 //!
-//! 1. Build a fixture `.docx` from a known Arabic seed text.
-//! 2. Re-open via `read_docx`, verify the tree matches the seed.
-//! 3. Insert a sentence at end of document via `engine::insert_text`.
-//! 4. Save as a new `.docx` via `write_docx` (preserves sibling entries).
-//! 5. Re-open the saved blob; verify edited text is present.
-//! 6. Diff the saved `.docx` ZIP entries against the fixture:
-//!    - Non-`word/document.xml` entries must be byte-identical (the writer
-//!      preserves them verbatim — 0% structural drift on those bytes).
-//!    - `word/document.xml` is allowed to differ but only in the edited
-//!      region. We assert the diff is bounded.
+//! Three modes:
+//!
+//! - **default** (no args): the classic Phase 1 Arabic-seed exit-gate test.
+//!   Builds a minimal `.docx` from a seed, edits, saves, asserts the writer
+//!   preserved sibling entries verbatim and the `document.xml` drift is
+//!   bounded by `2 × |inserted_text_bytes|`. Kept verbatim — this is what
+//!   the CI gate has run since Phase 1 weeks 19-24.
+//!
+//! - **`--fixtures [dir]`**: walks `crates/format-docx/tests/fixtures/`
+//!   (or the supplied dir), looks up each `.docx` in `_manifest.json`, and:
+//!   1. parses it via `read_docx`,
+//!   2. validates the manifest's `asserts` (paragraph count + texts),
+//!   3. re-emits via `write_docx`,
+//!   4. asserts sibling entries are byte-identical,
+//!   5. asserts `document.xml` drift ≤ `roundtrip.document_xml_drift_bytes`
+//!      (default 0 — Phase 1 fixtures are self-built so the writer is
+//!      byte-stable; Phase 3's passthrough optimisation will preserve
+//!      this bound for Word-generated fixtures too).
+//!
+//! - **`--gen-seed [dir]`**: materialises the Phase 1 seed corpus
+//!   (`simple_text.docx`, `simple_arabic.docx`, `simple_xml_escapes.docx`)
+//!   plus `_manifest.json` into the target dir. Idempotent; commit the
+//!   output. Phase 2+ fixtures arrive from Microsoft Word / LibreOffice
+//!   directly and don't pass through this codepath.
 //!
 //! Exit 0 on PASS, non-zero on FAIL.
 
 use anyhow::{Context, Result, bail};
 use engine::DocumentTree;
 use format_docx::writer::build_minimal_docx;
-use format_docx::{read_docx, write_docx};
+use format_docx::{DocxArchive, read_docx, write_docx};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+const DEFAULT_FIXTURES_DIR: &str = "crates/format-docx/tests/fixtures";
+const MANIFEST_NAME: &str = "_manifest.json";
 
 const SEED_TEXT: &str = "السلام عليكم ورحمة الله وبركاته";
 const INSERT_TEXT: &str = " تم التعديل";
 
-fn run() -> Result<()> {
-    /* 1. Build fixture from seed. */
+/* ============================================================ default ==== */
+
+fn run_default() -> Result<()> {
     let seed_doc = DocumentTree::from_text(SEED_TEXT);
     let fixture_bytes = build_minimal_docx(&seed_doc).context("build fixture")?;
     println!("[roundtrip] fixture .docx: {} bytes", fixture_bytes.len());
 
-    /* 2. Re-open fixture; verify it parses to the original tree. */
     let archive_a = read_docx(&fixture_bytes).context("read fixture")?;
     if archive_a.document.paragraph_count() != 1 {
         bail!(
@@ -45,7 +65,6 @@ fn run() -> Result<()> {
     }
     println!("[roundtrip] step 2 OK — fixture parses back to seed");
 
-    /* 3. Insert at end-of-document. */
     let end = archive_a.document.end_of_document();
     let edited = archive_a.document.insert_text(end, INSERT_TEXT);
     let expected_combined = format!("{SEED_TEXT}{INSERT_TEXT}");
@@ -58,14 +77,12 @@ fn run() -> Result<()> {
     }
     println!("[roundtrip] step 3 OK — in-memory edit reflected");
 
-    /* 4. Save the edited tree (using archive_a's siblings). */
     let edited_bytes = write_docx(&archive_a, &edited).context("write edited")?;
     println!(
         "[roundtrip] saved edited .docx: {} bytes",
         edited_bytes.len()
     );
 
-    /* 5. Re-open the saved blob; verify edited text round-trips. */
     let archive_b = read_docx(&edited_bytes).context("re-read edited")?;
     if archive_b.document.paragraph_text(0) != Some(expected_combined.as_str()) {
         bail!(
@@ -76,7 +93,6 @@ fn run() -> Result<()> {
     }
     println!("[roundtrip] step 5 OK — saved .docx parses back to edited tree");
 
-    /* 6. Diff sibling entries verbatim + bounded diff for document.xml. */
     let mut sibling_drift = 0_usize;
     for (name, bytes) in &archive_a.other_entries {
         let b = archive_b
@@ -104,17 +120,6 @@ fn run() -> Result<()> {
     }
     println!("[roundtrip] step 6a OK — all sibling entries byte-identical");
 
-    /* For word/document.xml: the saved bytes will differ since we serialized
-    fresh, but the only structural change vs. the seed should be the
-    inserted text. Assert the diff size is bounded. */
-    let extract_doc_xml = |bytes: &[u8]| -> Result<Vec<u8>> {
-        use std::io::Read;
-        let mut a = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
-        let mut f = a.by_name("word/document.xml")?;
-        let mut out = Vec::new();
-        f.read_to_end(&mut out)?;
-        Ok(out)
-    };
     let doc_a = extract_doc_xml(&fixture_bytes)?;
     let doc_b = extract_doc_xml(&edited_bytes)?;
     let doc_diff = (doc_b.len() as isize - doc_a.len() as isize).unsigned_abs();
@@ -126,16 +131,10 @@ fn run() -> Result<()> {
         doc_diff,
         insert_len_utf8
     );
-    /* The diff should be approximately `insert_len_utf8` (UTF-8 byte size of
-    the inserted text). Allow up to 2× headroom for any whitespace
-    normalization the writer applies. */
     let bound = insert_len_utf8 * 2;
     if doc_diff > bound {
         bail!(
-            "document.xml diff {} B exceeds bound {} B (insert {} B × 2)",
-            doc_diff,
-            bound,
-            insert_len_utf8
+            "document.xml diff {doc_diff} B exceeds bound {bound} B (insert {insert_len_utf8} B × 2)"
         );
     }
     println!("[roundtrip] step 6b OK — document.xml diff within bound");
@@ -144,9 +143,274 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/* ========================================================== manifest ==== */
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestFile {
+    /// Map from fixture filename (e.g. `"simple_text.docx"`) to its entry.
+    fixtures: BTreeMap<String, FixtureEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FixtureEntry {
+    /// Where this fixture came from: `"build_minimal_docx"` (seed),
+    /// `"word365"`, `"libreoffice"`, or `"handcrafted"`.
+    generator: String,
+    /// Roadmap phase at which the fixture was added.
+    phase_introduced: u8,
+    asserts: FixtureAsserts,
+    #[serde(default)]
+    roundtrip: RoundtripBounds,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FixtureAsserts {
+    paragraph_count: u32,
+    /// Expected `paragraph_text(i)` for each paragraph, in order.
+    paragraph_texts: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RoundtripBounds {
+    /// Max allowed |new − old| byte delta on `word/document.xml` between the
+    /// loaded archive and a fresh `write_docx(&archive, &archive.document)`.
+    /// Phase 1 seeds emit byte-identical bytes ⇒ default `0`. Phase 3's
+    /// passthrough optimisation will keep Word-generated fixtures at `0`
+    /// too; Phase 2 / 4 / 5 fixtures may set a small positive bound.
+    #[serde(default)]
+    document_xml_drift_bytes: usize,
+}
+
+/* ========================================================= --fixtures ==== */
+
+fn run_fixtures(dir: &Path) -> Result<()> {
+    let manifest_path = dir.join(MANIFEST_NAME);
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("read {}", manifest_path.display()))?;
+    let manifest: ManifestFile =
+        serde_json::from_slice(&manifest_bytes).context("parse manifest")?;
+
+    let mut docx_files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("walk {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "docx"))
+        .collect();
+    docx_files.sort();
+
+    if docx_files.is_empty() {
+        bail!("no .docx fixtures in {}", dir.display());
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for path in &docx_files {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_owned();
+        match validate_fixture(path, &manifest) {
+            Ok(()) => println!("[fixtures] PASS {name}"),
+            Err(e) => {
+                println!("[fixtures] FAIL {name}: {e:#}");
+                failures.push(name);
+            }
+        }
+    }
+
+    /* Cross-check: every manifest entry has a matching file. */
+    for name in manifest.fixtures.keys() {
+        let path = dir.join(name);
+        if !path.exists() {
+            println!("[fixtures] FAIL {name}: manifest entry has no matching .docx");
+            failures.push(name.clone());
+        }
+    }
+
+    if failures.is_empty() {
+        println!("\nPASS — {} fixtures, all green", docx_files.len());
+        Ok(())
+    } else {
+        bail!(
+            "{} fixture failure(s): {}",
+            failures.len(),
+            failures.join(", ")
+        )
+    }
+}
+
+fn validate_fixture(path: &Path, manifest: &ManifestFile) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("non-utf8 filename"))?;
+    let entry = manifest
+        .fixtures
+        .get(name)
+        .with_context(|| format!("no manifest entry for `{name}`"))?;
+
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let archive_a = read_docx(&bytes).context("read_docx")?;
+
+    /* 1. Manifest assertions. */
+    let got_count = archive_a.document.paragraph_count();
+    if got_count != entry.asserts.paragraph_count {
+        bail!(
+            "paragraph_count: expected {}, got {got_count}",
+            entry.asserts.paragraph_count
+        );
+    }
+    for (i, expected) in entry.asserts.paragraph_texts.iter().enumerate() {
+        let got = archive_a.document.paragraph_text(i as u32);
+        if got != Some(expected.as_str()) {
+            bail!("paragraph_text({i}): expected `{expected}`, got {got:?}");
+        }
+    }
+
+    /* 2. Re-emit and re-parse. */
+    let edited_bytes = write_docx(&archive_a, &archive_a.document).context("write_docx")?;
+    let archive_b = read_docx(&edited_bytes).context("re-read")?;
+
+    /* 3. Siblings byte-identical. */
+    for (sibling_name, raw_a) in &archive_a.other_entries {
+        let raw_b = archive_b
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == sibling_name)
+            .map(|(_, b)| b)
+            .with_context(|| format!("sibling `{sibling_name}` missing on re-read"))?;
+        if raw_a != raw_b {
+            bail!("sibling `{sibling_name}` drifted on round-trip");
+        }
+    }
+
+    /* 4. document.xml drift bound. */
+    let doc_a = extract_doc_xml(&bytes).context("extract original document.xml")?;
+    let doc_b = extract_doc_xml(&edited_bytes).context("extract re-emitted document.xml")?;
+    let drift = (doc_b.len() as isize - doc_a.len() as isize).unsigned_abs();
+    let bound = entry.roundtrip.document_xml_drift_bytes;
+    if drift > bound {
+        bail!(
+            "document.xml drift {drift} B exceeds bound {bound} B \
+             (original {} B → re-emitted {} B)",
+            doc_a.len(),
+            doc_b.len()
+        );
+    }
+
+    /* 5. Semantic equality across the round-trip. */
+    if !documents_equivalent(&archive_a, &archive_b) {
+        bail!("semantic round-trip mismatch — second parse differs from first");
+    }
+
+    Ok(())
+}
+
+/// Paragraph-by-paragraph equality on text + spans + alignment.
+fn documents_equivalent(a: &DocxArchive, b: &DocxArchive) -> bool {
+    let pa = &a.document.paragraphs;
+    let pb = &b.document.paragraphs;
+    if pa.len() != pb.len() {
+        return false;
+    }
+    for (x, y) in pa.iter().zip(pb.iter()) {
+        if x.text != y.text || x.alignment != y.alignment {
+            return false;
+        }
+        if x.spans.len() != y.spans.len() {
+            return false;
+        }
+        for (sx, sy) in x.spans.iter().zip(y.spans.iter()) {
+            if sx != sy {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/* ========================================================== --gen-seed ==== */
+
+fn run_gen_seed(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let mut manifest = ManifestFile {
+        fixtures: BTreeMap::new(),
+    };
+    for (name, doc) in seed_fixtures() {
+        let bytes = build_minimal_docx(&doc).context("build seed")?;
+        let path = dir.join(name);
+        std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
+
+        let texts: Vec<String> = doc.paragraphs.iter().map(|p| p.text.clone()).collect();
+        manifest.fixtures.insert(
+            name.to_owned(),
+            FixtureEntry {
+                generator: "build_minimal_docx".into(),
+                phase_introduced: 1,
+                asserts: FixtureAsserts {
+                    paragraph_count: texts.len() as u32,
+                    paragraph_texts: texts,
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        );
+        println!("[gen-seed] wrote {} ({} B)", path.display(), bytes.len());
+    }
+    let manifest_path = dir.join(MANIFEST_NAME);
+    let manifest_json = serde_json::to_string_pretty(&manifest).context("serialize manifest")?;
+    std::fs::write(&manifest_path, format!("{manifest_json}\n"))
+        .with_context(|| format!("write {}", manifest_path.display()))?;
+    println!("[gen-seed] wrote {}", manifest_path.display());
+    Ok(())
+}
+
+fn seed_fixtures() -> Vec<(&'static str, DocumentTree)> {
+    vec![
+        ("simple_text.docx", DocumentTree::from_text("hello world")),
+        ("simple_arabic.docx", DocumentTree::from_text("السلام عليكم")),
+        (
+            "simple_xml_escapes.docx",
+            DocumentTree::from_text("<a> & </a>"),
+        ),
+    ]
+}
+
+/* ============================================================= helpers ==== */
+
+fn extract_doc_xml(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut a = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+    let mut f = a.by_name("word/document.xml")?;
+    let mut out = Vec::new();
+    f.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/* ================================================================= main ==== */
+
 fn main() -> ExitCode {
-    match run() {
-        Ok(_) => ExitCode::SUCCESS,
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = match args.first().map(String::as_str) {
+        Some("--fixtures") => {
+            let dir = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_FIXTURES_DIR);
+            run_fixtures(Path::new(dir))
+        }
+        Some("--gen-seed") => {
+            let dir = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_FIXTURES_DIR);
+            run_gen_seed(Path::new(dir))
+        }
+        Some(other) => Err(anyhow::anyhow!(
+            "unknown mode `{other}` (expected --fixtures or --gen-seed, or no args for default)"
+        )),
+        None => run_default(),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("FAIL: {e:#}");
             ExitCode::FAILURE

@@ -3,7 +3,8 @@
 //! original archive's other entries are written back verbatim; only
 //! `word/document.xml` is regenerated.
 
-use crate::reader::{DOC_XML, DocxArchive, DocxError};
+use crate::error::DocxError;
+use crate::opc::archive::{DOC_XML, DocxArchive};
 use engine::{DocumentTree, FontFamily, Paragraph, SpanStyle};
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -194,7 +195,7 @@ const DOC_RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="y
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::read_docx;
+    use crate::opc::archive::read_docx;
     use engine::{Paragraph, StyleRun};
 
     #[test]

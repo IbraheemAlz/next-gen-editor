@@ -1,0 +1,43 @@
+{
+  "fixtures": {
+    "simple_arabic.docx": {
+      "generator": "build_minimal_docx",
+      "phase_introduced": 1,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "السلام عليكم"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "simple_text.docx": {
+      "generator": "build_minimal_docx",
+      "phase_introduced": 1,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "hello world"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "simple_xml_escapes.docx": {
+      "generator": "build_minimal_docx",
+      "phase_introduced": 1,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "<a> & </a>"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    }
+  }
+}
