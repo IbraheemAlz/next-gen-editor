@@ -519,9 +519,42 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         if (mutatesDocument(msg.cmd)) {
             const delta = await dispatch({ type: 'REQUEST_ACCESSIBILITY_DELTA' } as Command);
             self.postMessage({ evt: delta });
+            /* Bug-fix sprint after Phase 8b — every mutating command rendered
+               the document but never emitted `Painted`, so the TS shell's
+               `documentHeight` signal stuck at 0 and a multi-page document
+               got vertically squashed into the original A4 CSS box. Synthesize
+               a `Painted` side-channel here from the engine's cached last-
+               render dimensions so the canvas grows when the paginator
+               emits more pages. */
+            broadcastPaintDims();
         }
     } catch (e: unknown) {
         replyError(msg.id, e);
+    }
+}
+
+/**
+ * Side-channel: post a synthetic `Painted` event built from the engine's
+ * cached `last_paint_dims`. Called after every mutating command so the
+ * TS shell's `documentHeight` signal stays in sync with the paginator's
+ * actual page count.
+ */
+function broadcastPaintDims(): void {
+    if (!engine) return;
+    try {
+        const dims = engine.paint_dims() as { document_height: number; page_count: number };
+        self.postMessage({
+            evt: {
+                type: 'PAINTED',
+                dirty: { x: 0, y: 0, w: 0, h: 0 },
+                version: 0,
+                paint_ms: 0,
+                document_height: dims.document_height,
+                page_count: dims.page_count,
+            },
+        });
+    } catch (e: unknown) {
+        console.warn('[worker] paint_dims broadcast failed', e);
     }
 }
 

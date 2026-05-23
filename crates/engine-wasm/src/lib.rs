@@ -170,6 +170,14 @@ pub struct Engine {
     /// here via `Command::RegisterImage`. The Canvas2D backend looks each
     /// painted inline image up here; a miss falls back to a placeholder.
     image_cache: HashMap<String, web_sys::ImageBitmap>,
+    /// Last `render_document` output dimensions, cached so the worker
+    /// can post a synthetic `Painted` side-channel after every mutating
+    /// command without re-rendering. The TS shell drives the CSS
+    /// `.editor-page` height off this so multi-page documents scroll
+    /// correctly after typing (Phase 6b documented this wire but only
+    /// the `REQUEST_PAINT` path emitted `Painted` — mutating commands
+    /// rendered but stayed silent on the dims).
+    last_paint_dims: (f32, u32),
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -204,6 +212,7 @@ fn assemble_engine(
         layout_cache: new_layout_cache(),
         a11y_cache: None,
         image_cache: HashMap::new(),
+        last_paint_dims: (0.0, 0),
     }
 }
 
@@ -256,6 +265,21 @@ impl Engine {
     /// DPR change without leaking).
     pub fn register_image(&mut self, rel_id: String, bitmap: web_sys::ImageBitmap) {
         self.image_cache.insert(rel_id, bitmap);
+    }
+
+    /// Last `render_document` output dimensions, exposed so the worker
+    /// can side-channel a synthetic `Painted` event after every mutating
+    /// command. Returns `{document_height, page_count}` (device px). The
+    /// TS shell uses `document_height` to size `.editor-page`'s CSS so
+    /// multi-page documents grow + scroll instead of getting squashed
+    /// vertically into a single A4 box.
+    pub fn paint_dims(&self) -> Result<JsValue, JsValue> {
+        let (h, n) = self.last_paint_dims;
+        serde_wasm_bindgen::to_value(&PaintDimsOut {
+            document_height: h,
+            page_count: n,
+        })
+        .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
 
     /// Phase 8b — flat snapshot of every tracked-change revision the
@@ -313,6 +337,12 @@ impl Engine {
         serde_wasm_bindgen::to_value(&comments)
             .map_err(|e| JsValue::from_str(&format!("encode comments: {e}")))
     }
+}
+
+#[derive(::serde::Serialize)]
+struct PaintDimsOut {
+    document_height: f32,
+    page_count: u32,
 }
 
 #[derive(::serde::Serialize)]
@@ -3029,6 +3059,7 @@ impl Engine {
                     message: format!("vello paint: {e}"),
                 })
             })?;
+            self.last_paint_dims = (stats.document_height, stats.page_count);
             return Ok(stats);
         }
 
@@ -3050,19 +3081,27 @@ impl Engine {
         /* Phase 6b — resize the `OffscreenCanvas` backing store so every
         paginated page lives in the visible draw area. The main thread
         sets a matching CSS height so the browser scrollbar exposes them.
-        Resizing clears the context, so the full repaint below is the
-        canonical post-resize paint — no incremental clip restore needed. */
+        Resizing the canvas clears its 2D context to transparent — so on
+        any resize this paint must cover the FULL canvas, otherwise the
+        caller's stale dirty-region clip culls every glyph outside it
+        and the page goes blank. */
         let canvas = ctx.canvas();
         let want_w = widest.max(1.0).ceil() as u32;
         let want_h = total_h.max(1.0).ceil() as u32;
+        let did_resize = canvas.width() != want_w || canvas.height() != want_h;
         if canvas.width() != want_w {
             canvas.set_width(want_w);
         }
         if canvas.height() != want_h {
             canvas.set_height(want_h);
         }
-        let clip_rect =
-            clip.unwrap_or_else(|| Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h)));
+        let clip_rect = if did_resize {
+            /* Resize invalidated everything — ignore the caller's dirty
+            region and repaint the whole canvas. */
+            Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h))
+        } else {
+            clip.unwrap_or_else(|| Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h)))
+        };
         let image_cache = &self.image_cache;
         if let Err(e) = render_canvas2d(
             &ctx,
@@ -3077,6 +3116,7 @@ impl Engine {
             }));
         }
 
+        self.last_paint_dims = (stats.document_height, stats.page_count);
         Ok(stats)
     }
 
@@ -4169,6 +4209,7 @@ mod tests {
             layout_cache: new_layout_cache(),
             a11y_cache: None,
             image_cache: HashMap::new(),
+        last_paint_dims: (0.0, 0),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
