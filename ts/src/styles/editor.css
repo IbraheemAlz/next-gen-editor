@@ -27,16 +27,21 @@
     background: #f0f0f0;
 }
 
-/* The A4 page — fixed 595 × 842 (engine `A4Page::a4()`, 1:1 with the canvas
-   backing store). `margin: auto` centres it on both axes and keeps it
-   scroll-reachable when it overflows. The caret + selection overlays
-   absolutely position themselves against this box. */
+/* The A4 page — fixed 595 px wide (engine `A4Page::a4()`, 1:1 with the
+   canvas backing store). Height is driven by the paginator at runtime: the
+   `Painted` event reports `document_height`, the store mirrors it, and
+   `EditorCanvas` writes it into the canvas's CSS `height` inline so a
+   multi-page document grows the container and the viewport scrollbar
+   exposes every paginated page (Phase 6b). 842 px is the floor for the
+   first paint. `margin: 0 auto` centres horizontally only — vertical
+   centring would conflict with the scroll position when the document
+   exceeds the viewport. */
 .editor-page {
     position: relative;
     flex: none;
     width: 595px;
-    height: 842px;
-    margin: auto;
+    min-height: 842px;
+    margin: 0 auto;
     background: #fff;
     box-shadow: 0 1px 6px rgb(0 0 0 / 0.25);
 }

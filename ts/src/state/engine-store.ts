@@ -73,6 +73,13 @@ export function createEngineStore(client: EngineClient) {
     /* PR 4 — selection flavour. Linear by default; `TableCells` when the
        drag stayed inside a single table and covered multiple cells. */
     const [selectionKind, setSelectionKind] = createSignal<SelectionKind>({ kind: 'LINEAR' });
+    /* Phase 6b — paginated layout reach. `documentHeight` is the engine's
+       total Y span (every page + the inter-page gap) in device px; the
+       canvas mount divides by `devicePixelRatio` to set its CSS height
+       so the browser scrollbar exposes every page. `pageCount` drives
+       the document-info UI strip. */
+    const [documentHeight, setDocumentHeight] = createSignal(0);
+    const [pageCount, setPageCount] = createSignal(1);
     let nodes: A11yNode[] = [];
     let announced = false;
 
@@ -96,6 +103,15 @@ export function createEngineStore(client: EngineClient) {
             setParagraphAlignment(ev.paragraph_alignment);
             setBaseDirection(ev.direction);
             setSelectionKind(ev.selection_kind);
+        } else if (ev.type === 'PAINTED') {
+            /* Phase 6b — paginator reach. The engine emits
+               `document_height` (device px) and `page_count` on every
+               paint; mirror them into signals so `EditorCanvas` resizes
+               itself to fit every page and the scrollbar exposes
+               them. Edits that grow / shrink the page count flow
+               through here. */
+            setDocumentHeight(ev.document_height);
+            setPageCount(ev.page_count);
         } else if (ev.type === 'ACCESSIBILITY_TREE_DELTA') {
             /* Mirror the patch stream into the local `nodes` array so the
                Table panel sees the same view the reconciler renders. */
@@ -133,6 +149,8 @@ export function createEngineStore(client: EngineClient) {
         announcement,
         tables,
         selectionKind,
+        documentHeight,
+        pageCount,
     };
 }
 

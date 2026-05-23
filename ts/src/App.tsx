@@ -156,6 +156,7 @@ export function App() {
                             {(generation) => (
                                 <EditorCanvas
                                     client={client}
+                                    store={store}
                                     generation={generation}
                                     onReady={onReady}
                                 />

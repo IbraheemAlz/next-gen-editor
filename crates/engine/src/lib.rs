@@ -56,6 +56,14 @@ pub struct DocumentTree {
     /// applies a single implicit A4 section over the whole document (the
     /// pre-Phase-6 behaviour).
     pub sections: Vec<Section>,
+    /// Phase 6b — parsed header parts keyed by the OOXML relationship id
+    /// (`r:id` from `<w:headerReference>`). Each value is the flat
+    /// per-paragraph plain text the header reader extracted. The
+    /// paginator looks each `Section`'s `header_ref` up here and renders
+    /// the result in the top margin band.
+    pub headers: std::collections::HashMap<String, Vec<String>>,
+    /// Mirror of `headers` for `<w:footerReference>`.
+    pub footers: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Page geometry for a [`Section`]. Dimensions are layout pixels at 1 pt/unit
@@ -838,6 +846,8 @@ impl DocumentTree {
         Self {
             blocks: Vector::new(),
             sections: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            footers: std::collections::HashMap::new(),
         }
     }
 
@@ -856,6 +866,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            footers: std::collections::HashMap::new(),
         }
     }
 
@@ -876,6 +888,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            footers: std::collections::HashMap::new(),
         }
     }
 
@@ -889,6 +903,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            footers: std::collections::HashMap::new(),
         }
     }
 
@@ -902,6 +918,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            footers: std::collections::HashMap::new(),
         }
     }
 
@@ -929,7 +947,26 @@ impl DocumentTree {
                 Some(s)
             })
             .collect();
-        Self { blocks, sections }
+        Self {
+            blocks,
+            sections,
+            headers: std::collections::HashMap::new(),
+            footers: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Phase 6b — attach the parsed header / footer parts collected from
+    /// `word/header*.xml` / `word/footer*.xml`, keyed by their relationship
+    /// id (`r:id`). Consumed by the paginator when a section's
+    /// `header_ref` / `footer_ref` resolves.
+    pub fn with_header_footer_parts(
+        mut self,
+        headers: std::collections::HashMap<String, Vec<String>>,
+        footers: std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
+        self.headers = headers;
+        self.footers = footers;
+        self
     }
 
     /// Resolved section coverage — returns one effective `Section` per
@@ -1079,6 +1116,8 @@ impl DocumentTree {
             return Self {
                 blocks,
                 sections: self.sections.clone(),
+                headers: self.headers.clone(),
+                footers: self.footers.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -1112,6 +1151,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 
@@ -1153,6 +1194,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 
@@ -1171,6 +1214,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 
@@ -1204,6 +1249,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 
@@ -1224,6 +1271,8 @@ impl DocumentTree {
             return Self {
                 blocks,
                 sections: self.sections.clone(),
+                headers: self.headers.clone(),
+                footers: self.footers.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -1271,6 +1320,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 
@@ -1284,6 +1335,8 @@ impl DocumentTree {
             return Self {
                 blocks,
                 sections: self.sections.clone(),
+                headers: self.headers.clone(),
+                footers: self.footers.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -1295,6 +1348,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 
@@ -1425,6 +1480,8 @@ impl DocumentTree {
                 Self {
                     blocks,
                     sections: self.sections.clone(),
+                    headers: self.headers.clone(),
+                    footers: self.footers.clone(),
                 },
                 caret,
             );
@@ -1454,6 +1511,8 @@ impl DocumentTree {
             Self {
                 blocks,
                 sections: self.sections.clone(),
+                headers: self.headers.clone(),
+                footers: self.footers.clone(),
             },
             caret,
         )
@@ -1572,6 +1631,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 
@@ -1588,6 +1649,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 
@@ -1787,6 +1850,8 @@ impl DocumentTree {
         Self {
             blocks,
             sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
         }
     }
 }
@@ -3233,6 +3298,8 @@ mod tests {
         let d = DocumentTree {
             blocks,
             sections: Vec::new(),
+            headers: std::collections::HashMap::new(),
+            footers: std::collections::HashMap::new(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

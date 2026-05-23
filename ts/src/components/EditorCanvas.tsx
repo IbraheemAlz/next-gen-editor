@@ -3,13 +3,20 @@
  * Owns the single <canvas>, transfers its control to the engine worker once
  * (`transferControlToOffscreen()` is one-shot per element), and forwards
  * viewport resizes. The engine never touches this element again — it draws
- * into the transferred OffscreenCanvas from the worker. */
-import { onCleanup, onMount } from 'solid-js';
+ * into the transferred OffscreenCanvas from the worker.
+ *
+ * Phase 6b — the engine reports a paginated `document_height` on every
+ * `Painted` event. The mount reads it from `store.documentHeight` and
+ * sets the element's CSS height so the browser scrollbar exposes every
+ * page. The OffscreenCanvas backing store is resized worker-side. */
+import { createEffect, onCleanup, onMount } from 'solid-js';
 import { attachPointer } from '../input/pointer';
 import type { EngineClient } from '../engine/engine-client';
+import type { EngineStore } from '../state/engine-store';
 
 export interface EditorCanvasProps {
     client: EngineClient;
+    store: EngineStore;
     /**
      * `0` on first boot; bumped by App on every crash so Solid remounts a
      * fresh <canvas> — a consumed OffscreenCanvas cannot be re-transferred.
@@ -58,6 +65,28 @@ export function EditorCanvas(props: EditorCanvasProps) {
         /* §7 — pointer → engine hit-testing. Pointer events still fire on a
            canvas whose drawing surface has been transferred to the worker. */
         detachPointer = attachPointer(canvas, props.client);
+    });
+
+    /* Phase 6b — mirror the engine's paginated `document_height` into the
+       containing `.editor-page` element's `min-height`. The canvas itself
+       is `height: 100%` and fills the page, so growing the page grows the
+       canvas; the `editor-viewport` (the page's scrollable parent) then
+       exposes the rest through its scrollbar. Engine height is device px
+       at the current DPR; CSS divides by `devicePixelRatio`. The
+       OffscreenCanvas backing store is resized worker-side on the same
+       paint. */
+    createEffect(() => {
+        const c = canvasRef;
+        if (!c) return;
+        const page = c.parentElement;
+        if (!page) return;
+        const dpr = window.devicePixelRatio || 1;
+        const h = props.store.documentHeight();
+        if (h > 0) {
+            const cssH = Math.ceil(h / dpr);
+            page.style.minHeight = `${cssH}px`;
+            c.style.height = `${cssH}px`;
+        }
     });
 
     onCleanup(() => {

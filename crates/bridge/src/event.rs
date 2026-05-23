@@ -100,6 +100,14 @@ pub enum Event {
         dirty: Rect,
         version: u64,
         paint_ms: f32,
+        /// Phase 6b — total document height in layout pixels at the current
+        /// `dpr` scale, including inter-page gaps. The TS shell sizes its
+        /// canvas backing store to this so the browser scrollbar exposes
+        /// every paginated page. `0.0` for harness paths that bypass
+        /// pagination (Phase-1 `?test=` cases).
+        document_height: f32,
+        /// Phase 6b — number of paginated pages the renderer drew.
+        page_count: u32,
     },
 
     /* Selection */

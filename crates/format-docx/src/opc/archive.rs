@@ -11,16 +11,21 @@
 use crate::error::DocxError;
 use crate::numbering_resolver::resolve_markers_blocks;
 use crate::parts::document::parse_document_xml;
+use crate::parts::footer::parse_footer_xml;
+use crate::parts::header::parse_header_xml;
 use crate::parts::numbering::{NumberingDefinitions, parse_numbering_xml};
+use crate::parts::rels::{parse_rels_xml, resolve_target};
 use crate::parts::styles::{StyleTable, parse_styles_xml};
 use crate::style_resolver::StyleResolver;
 use engine::DocumentTree;
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
 pub const DOC_XML: &str = "word/document.xml";
 pub const STYLES_XML: &str = "word/styles.xml";
 pub const NUMBERING_XML: &str = "word/numbering.xml";
+pub const RELS_XML: &str = "word/_rels/document.xml.rels";
 
 /// All raw archive entries except `word/document.xml`. Carried through the
 /// round-trip so the writer can re-emit them verbatim.
@@ -103,6 +108,45 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         let sections = std::mem::take(&mut document.sections);
         document = DocumentTree::from_blocks_with_sections(blocks, sections);
     }
+
+    /* Phase 6b — header / footer wiring. The rels table maps each
+    `r:id` in `<w:headerReference>` / `<w:footerReference>` to the
+    archive entry holding the part. Resolve every ref the document's
+    sections carry and parse the corresponding header / footer XML.
+    Unknown refs (target missing or rels missing) silently fall back
+    to an empty band so a partial archive still renders. */
+    let rels = other_entries
+        .iter()
+        .find(|(n, _)| n == RELS_XML)
+        .and_then(|(_, b)| parse_rels_xml(b).ok())
+        .unwrap_or_default();
+    let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut footers: HashMap<String, Vec<String>> = HashMap::new();
+    let fetch_part = |rid: &str| -> Option<&[u8]> {
+        let target = rels.get(rid)?;
+        let entry = resolve_target(target);
+        other_entries
+            .iter()
+            .find(|(n, _)| n == &entry)
+            .map(|(_, b)| b.as_slice())
+    };
+    for section in &document.sections {
+        if let Some(rid) = section.header_ref.as_deref()
+            && !headers.contains_key(rid)
+            && let Some(bytes) = fetch_part(rid)
+            && let Ok(part) = parse_header_xml(bytes)
+        {
+            headers.insert(rid.to_string(), part.paragraphs);
+        }
+        if let Some(rid) = section.footer_ref.as_deref()
+            && !footers.contains_key(rid)
+            && let Some(bytes) = fetch_part(rid)
+            && let Ok(part) = parse_footer_xml(bytes)
+        {
+            footers.insert(rid.to_string(), part.paragraphs);
+        }
+    }
+    document = document.with_header_footer_parts(headers, footers);
 
     Ok(DocxArchive {
         other_entries,

@@ -232,7 +232,57 @@ and zero mid-row pagination support. Phase 5c closes the gap.
 
 ---
 
-## 6. Cross-phase reminders
+## 6. Phase 6 — Sections, headers, footers, pagination
+
+Items deferred during the Phase 6 cut (`feat(engine): implement Phase 6
+sections, pagination, and multi-page layout`).
+
+- [ ] **Header/footer text content wiring to the engine.** The
+      `parts::header::HeaderPart` / `parts::footer::FooterPart` parsers
+      land, and `Section.header_ref` / `footer_ref` carry the OOXML
+      `r:id`. The engine still needs to resolve those refs against the
+      archive's `word/_rels/document.xml.rels`, find the
+      `word/header*.xml` / `word/footer*.xml` part, and route the
+      parsed paragraphs into `PageBox.header` / `PageBox.footer` so
+      the renderer paints them. Phase 6b fixes this partially — the
+      first laid-out paragraph from each part renders as plain text;
+      multi-paragraph headers + rich formatting + tables inside
+      header/footer parts are not modelled. *Depends on:* the engine
+      needs the archive's `other_entries` plumbed through `OpenDocx`,
+      currently only the parsed `DocumentTree` reaches the engine.
+- [ ] **`<w:sectPr w:type>` controls.** Every section break currently
+      becomes a fresh page (`nextPage` semantics). `continuous`,
+      `evenPage`, `oddPage`, `nextColumn` are parsed-but-ignored by
+      the paginator. *Depends on:* `Section` carrying the type;
+      paginator hook to skip the page break for `continuous`.
+- [ ] **Programmatic Section mutations.** `Section` is read-only on
+      the engine API surface: there is no `Command::SplitSection` /
+      `Command::SetPageGeometry`. The `.docx` writer still emits the
+      original `<w:sectPr/>` from the passthrough — engine-side
+      edits to the section table never round-trip. *Depends on:*
+      writer integration for `<w:sectPr>`; new command surface.
+- [x] **TS canvas auto-resize to total document height.** Phase 6b —
+      `EditorCanvas` consumes the new `Painted.document_height` /
+      `page_count` fields and resizes its backing store + CSS height
+      so the browser scrollbar exposes every page.
+- [ ] **Mid-cell row splitting in tables.** A table cell taller than
+      a full page currently overflows past the page footer. The
+      paginator's `push_table_split` only splits at row boundaries;
+      row-internal cell flowing (the rare "single-row table with
+      hundreds of paragraphs in one cell" case) is deferred.
+      *Depends on:* a cell-flow path through the paginator + per-cell
+      breakable / unbreakable hint.
+- [ ] **Header/footer rich formatting + per-page chrome.** Phase 6b
+      paints header/footer plain text in the margin band. Multi-line
+      headers, tab-aligned page numbers, `<w:fldSimple>` page-number
+      fields, and the `first` / `even` / `default` header variants
+      from `<w:headerReference w:type=...>` are not modelled.
+      *Depends on:* the field calculator (deferred Phase 7+) and
+      header-variant selection from page parity.
+
+---
+
+## 7. Cross-phase reminders
 
 Items deferred from earlier phases that interact with Phase 5+
 follow-ups.

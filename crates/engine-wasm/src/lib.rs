@@ -775,6 +775,59 @@ fn twips_to_layout_px(twips: i32, scale: f32) -> f32 {
     (twips as f32) / 15.0 * scale
 }
 
+/// Phase 6b — lay out one section's header (or footer) plain-text
+/// paragraphs into a [`layout::HeaderFooterBox`]. Each entry in
+/// `paragraphs` becomes a fresh `ParagraphBox` laid out at the section's
+/// content width with the document's default style — header / footer
+/// rich-formatting cascade ships in a follow-up sprint. Returns `None`
+/// when every paragraph is empty (nothing to draw).
+fn build_header_footer_box(
+    paragraphs: &[String],
+    content_width: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+) -> Option<layout::HeaderFooterBox> {
+    if paragraphs.iter().all(|p| p.is_empty()) {
+        return None;
+    }
+    let mut paras: Vec<ParagraphBox> = Vec::with_capacity(paragraphs.len());
+    let mut y = 0.0_f32;
+    for text in paragraphs {
+        let spans = vec![StyleSpan {
+            start: 0,
+            end: text.len() as u32,
+            px_size: cfg.px_size * scale,
+            color: [0, 0, 0, 255],
+            bold: false,
+            italic: false,
+            underline: false,
+            strike: false,
+            bg_color: None,
+            font_family: None,
+        }];
+        let mut p = layout_paragraph(ParagraphConfig {
+            text,
+            fonts,
+            spans: &spans,
+            base_direction: first_strong_direction(text).unwrap_or(cfg.base_direction),
+            max_width: content_width,
+            line_height: cfg.line_height * scale,
+            alignment: cfg.alignment,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: cfg.px_size * scale,
+        });
+        p.origin = Point { x: 0.0, y };
+        y += p.size.height;
+        paras.push(p);
+    }
+    Some(layout::HeaderFooterBox { paragraphs: paras })
+}
+
 /// Phase 6 — walk a freshly laid-out `TableBox` and stamp every nested
 /// `ParagraphBox` with the next-flat source paragraph id. Skips
 /// `VMergeRole::Continue` cells (they reuse the Restart cell's content).
@@ -2308,7 +2361,28 @@ impl Engine {
                 paths_taken.resize_with(consume, Vec::new);
                 emitted_paths.append(&mut paths_taken);
             }
-            paginator = Some(Paginator::new(geom, None, None));
+            /* Phase 6b — resolve header / footer text the parser stashed
+            on `doc.headers` / `doc.footers` (keyed by `r:id`) into laid-
+            out paragraphs the renderer paints into the margin bands. */
+            let header_box = section.header_ref.as_deref().and_then(|rid| {
+                build_header_footer_box(
+                    doc.headers.get(rid)?,
+                    geom.width - geom.margins.left - geom.margins.right,
+                    &font_stack,
+                    &cfg,
+                    scale,
+                )
+            });
+            let footer_box = section.footer_ref.as_deref().and_then(|rid| {
+                build_header_footer_box(
+                    doc.footers.get(rid)?,
+                    geom.width - geom.margins.left - geom.margins.right,
+                    &font_stack,
+                    &cfg,
+                    scale,
+                )
+            });
+            paginator = Some(Paginator::new(geom, header_box, footer_box));
             page_paths.clear();
             page_paths.push(Vec::new());
 
@@ -2495,14 +2569,19 @@ impl Engine {
             .first()
             .map(|p| (p.size.width, p.size.height))
             .unwrap_or((0.0, 0.0));
-        let doc_height: f32 = pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap;
+        let document_height: f32 = if pages.is_empty() {
+            0.0
+        } else {
+            pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap
+        };
         let stats = RenderStats {
             page_width,
             page_height,
             line_count,
             glyph_count,
+            document_height,
+            page_count: pages.len() as u32,
         };
-        let _ = doc_height; // reserved for the post-Phase-6 viewport-height event field
 
         /* Vello path: encode the whole display list and present it over
         WebGPU. Vello runs its own GPU-side glyph cache, so the Canvas2D
@@ -2524,10 +2603,12 @@ impl Engine {
         }
 
         /* Canvas2D path — clipped to the dirty region (D3.8). */
-        let total_h: f32 = pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap;
+        let total_h: f32 = if pages.is_empty() {
+            0.0
+        } else {
+            pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap
+        };
         let widest: f32 = pages.iter().map(|p| p.size.width).fold(0.0_f32, f32::max);
-        let clip_rect =
-            clip.unwrap_or_else(|| Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h)));
         let ctx = match &self.ctx {
             Some(c) => c.clone(),
             None => {
@@ -2536,6 +2617,22 @@ impl Engine {
                 }));
             }
         };
+        /* Phase 6b — resize the `OffscreenCanvas` backing store so every
+        paginated page lives in the visible draw area. The main thread
+        sets a matching CSS height so the browser scrollbar exposes them.
+        Resizing clears the context, so the full repaint below is the
+        canonical post-resize paint — no incremental clip restore needed. */
+        let canvas = ctx.canvas();
+        let want_w = widest.max(1.0).ceil() as u32;
+        let want_h = total_h.max(1.0).ceil() as u32;
+        if canvas.width() != want_w {
+            canvas.set_width(want_w);
+        }
+        if canvas.height() != want_h {
+            canvas.set_height(want_h);
+        }
+        let clip_rect =
+            clip.unwrap_or_else(|| Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h)));
         if let Err(e) = render_canvas2d(
             &ctx,
             &scene,
@@ -2603,13 +2700,16 @@ impl Engine {
             .map(bridge_to_kurbo)
             .or(drained)
             .unwrap_or_else(|| bridge_to_kurbo(viewport));
-        if let Err(e) = self.render_document(Some(region)) {
-            return *e;
-        }
+        let stats = match self.render_document(Some(region)) {
+            Ok(s) => s,
+            Err(e) => return *e,
+        };
         Event::Painted {
             dirty: kurbo_to_bridge(region),
             version: u64::from(self.undo.depth()),
             paint_ms: 0.0,
+            document_height: stats.document_height,
+            page_count: stats.page_count,
         }
     }
 
@@ -3607,6 +3707,11 @@ struct RenderStats {
     page_height: f32,
     line_count: u32,
     glyph_count: u32,
+    /// Phase 6b — paginated total: every page's height summed plus the
+    /// inter-page gap on every join. The TS shell sizes its canvas to
+    /// this so multi-page docs scroll.
+    document_height: f32,
+    page_count: u32,
 }
 
 #[cfg(test)]
