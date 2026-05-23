@@ -52,6 +52,46 @@ pub struct DocumentTree {
     pub blocks: Vector<Block>,
 }
 
+/// Address of a `Block` inside a `DocumentTree`. Walks from the root
+/// `blocks: Vector<Block>` down through table cells. Phase 5 PR 3.
+///
+/// Examples:
+/// - `BlockPath { steps: vec![PathStep::Block(2)] }` — the 3rd top-level
+///   block.
+/// - `BlockPath { steps: vec![PathStep::Block(2), PathStep::Cell{row:1,
+///   col:0}, PathStep::Block(0)] }` — the first paragraph in the
+///   top-left cell of row 1 of the 3rd top-level block (which must be
+///   `Block::Table`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct BlockPath {
+    pub steps: Vec<PathStep>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathStep {
+    /// Index into the current `&[Block]` / `&Vector<Block>`.
+    Block(u32),
+    /// Step from a `Block::Table` into one of its cells.
+    Cell { row: u32, col: u32 },
+}
+
+impl BlockPath {
+    /// Empty path — addresses the root `blocks` container itself.
+    pub fn root() -> Self {
+        Self::default()
+    }
+    /// Path to the Nth top-level block.
+    pub fn top(idx: u32) -> Self {
+        Self {
+            steps: vec![PathStep::Block(idx)],
+        }
+    }
+    pub fn push(mut self, step: PathStep) -> Self {
+        self.steps.push(step);
+        self
+    }
+}
+
 /// A selectable font family (Backlog #9). `engine-wasm` resolves it to a
 /// loaded font face when building layout style spans; the pure document model
 /// just stores the choice.
@@ -739,15 +779,6 @@ impl DocumentTree {
             .nth(n as usize)
     }
 
-    /// Iterator over every `Block::Paragraph`, skipping tables. **Phase 5
-    /// migration shim.** Phase 5 PR 3 removes this — switch every caller
-    /// to `.blocks` + `match Block` once `BlockPath` lands. We do NOT
-    /// `#[deprecated]` it during the migration window because `-D warnings`
-    /// would block compilation of every still-paragraph-flat consumer.
-    pub fn paragraphs(&self) -> impl Iterator<Item = &Paragraph> {
-        self.blocks.iter().filter_map(Block::as_paragraph)
-    }
-
     pub fn paragraph_text(&self, idx: u32) -> Option<&str> {
         self.nth_paragraph(idx).map(|p| p.text.as_str())
     }
@@ -1142,6 +1173,260 @@ impl DocumentTree {
             }
         }
         out
+    }
+
+    /* ============================================================
+    Phase 5 PR 3 — table mutation commands.
+    Every command flips `Table.dirty = true` + drops
+    `source_xml`, so the writer regenerates the table from rows
+    instead of emitting the captured passthrough bytes.
+    ============================================================ */
+
+    /// Insert an empty `rows × cols` table at the *block position* given
+    /// by `at` (top-level path only — nested-cell insertion in 5b). The
+    /// new table sits at top-level block index `at.steps[0]`; the
+    /// existing block at that index slides down by one.
+    pub fn insert_table(&self, at: BlockPath, rows: u32, cols: u32) -> Self {
+        let idx = top_level_block_index(&at).unwrap_or(self.blocks.len() as u32);
+        let cols = cols.max(1) as usize;
+        /* Default column width — Word's "auto" cells map to 2880 twips
+        (2 inches) when no grid is specified. */
+        let grid: Vec<i32> = vec![2880; cols];
+        let mut row_vec: Vec<TableRow> = Vec::with_capacity(rows.max(1) as usize);
+        for _ in 0..rows.max(1) {
+            let mut cells = Vec::with_capacity(cols);
+            for _ in 0..cols {
+                cells.push(TableCell::default());
+            }
+            row_vec.push(TableRow {
+                props: RowProperties::default(),
+                cells,
+            });
+        }
+        let table = Table {
+            grid,
+            props: TableProperties::default(),
+            rows: row_vec,
+            /* Engine-synthesised — no source bytes, fully regenerated on
+            save. */
+            dirty: true,
+            source_xml: None,
+        };
+        let mut blocks = self.blocks.clone();
+        let insert_at = (idx as usize).min(blocks.len());
+        blocks.insert(insert_at, Block::Table(table));
+        Self { blocks }
+    }
+
+    /// Delete the table at `at.steps[0]` (top-level only at PR 3).
+    pub fn delete_table(&self, at: BlockPath) -> Self {
+        let idx = match top_level_block_index(&at) {
+            Some(i) => i as usize,
+            None => return self.clone(),
+        };
+        let mut blocks = self.blocks.clone();
+        if idx < blocks.len() && matches!(blocks[idx], Block::Table(_)) {
+            blocks.remove(idx);
+        }
+        Self { blocks }
+    }
+
+    /// Insert a fresh row at `after_row` (or at the end when
+    /// `after_row >= row_count`). Cell count matches the existing
+    /// rows' cell count.
+    pub fn insert_row(&self, table_path: BlockPath, after_row: u32) -> Self {
+        self.mutate_table(table_path, |t| {
+            let cols = t
+                .rows
+                .first()
+                .map(|r| r.cells.len())
+                .unwrap_or_else(|| t.grid.len().max(1));
+            let new_row = TableRow {
+                props: RowProperties::default(),
+                cells: (0..cols).map(|_| TableCell::default()).collect(),
+            };
+            let insert_at = (after_row as usize + 1).min(t.rows.len());
+            t.rows.insert(insert_at, new_row);
+        })
+    }
+
+    pub fn delete_row(&self, table_path: BlockPath, row: u32) -> Self {
+        self.mutate_table(table_path, |t| {
+            let i = row as usize;
+            if i < t.rows.len() {
+                t.rows.remove(i);
+            }
+        })
+    }
+
+    pub fn insert_column(&self, table_path: BlockPath, after_col: u32) -> Self {
+        self.mutate_table(table_path, |t| {
+            let insert_at = (after_col as usize + 1).min(t.grid.len());
+            t.grid.insert(insert_at, 2880);
+            for row in &mut t.rows {
+                let cell_at = insert_at.min(row.cells.len());
+                row.cells.insert(cell_at, TableCell::default());
+            }
+        })
+    }
+
+    pub fn delete_column(&self, table_path: BlockPath, col: u32) -> Self {
+        self.mutate_table(table_path, |t| {
+            let c = col as usize;
+            if c < t.grid.len() {
+                t.grid.remove(c);
+            }
+            for row in &mut t.rows {
+                if c < row.cells.len() {
+                    row.cells.remove(c);
+                }
+            }
+        })
+    }
+
+    /// Merge the rectangle of cells `(from_row, from_col)..=(to_row,
+    /// to_col)` inside the table at `table_path`. The top-left cell
+    /// becomes the visual owner: its `grid_span` widens to cover the
+    /// column range, every cell directly below in the column range
+    /// becomes `VMergeRole::Continue`. Horizontal partners (same row,
+    /// columns to the right) are *removed* and their widths summed
+    /// into the owner's `grid_span`. PR 3 minimum implementation —
+    /// PR 3b extends for non-rectangular merges.
+    pub fn merge_cells(
+        &self,
+        table_path: BlockPath,
+        from_row: u32,
+        from_col: u32,
+        to_row: u32,
+        to_col: u32,
+    ) -> Self {
+        let (r0, r1) = if from_row <= to_row {
+            (from_row, to_row)
+        } else {
+            (to_row, from_row)
+        };
+        let (c0, c1) = if from_col <= to_col {
+            (from_col, to_col)
+        } else {
+            (to_col, from_col)
+        };
+        self.mutate_table(table_path, |t| {
+            let rcount = t.rows.len() as u32;
+            if r0 >= rcount {
+                return;
+            }
+            let span = (c1 - c0 + 1) as u8;
+            /* Horizontal collapse: top-row cells in the rectangle's
+            column range merge into one cell with `grid_span = span`. */
+            if let Some(top_row) = t.rows.get_mut(r0 as usize) {
+                let drop_count = (c1.min(top_row.cells.len() as u32 - 1) - c0) as usize;
+                if (c0 as usize) < top_row.cells.len() {
+                    top_row.cells[c0 as usize].props.grid_span = span;
+                    top_row.cells[c0 as usize].props.v_merge = if r0 == r1 {
+                        VMergeRole::None
+                    } else {
+                        VMergeRole::Restart
+                    };
+                }
+                for _ in 0..drop_count {
+                    if (c0 as usize + 1) < top_row.cells.len() {
+                        top_row.cells.remove(c0 as usize + 1);
+                    }
+                }
+            }
+            /* Vertical: every cell in the column range on rows r0+1..=r1
+            becomes `Continue`. We don't shift cells; the rendering layer
+            already skips `Continue` cells. */
+            for r in (r0 + 1)..=r1.min(rcount - 1) {
+                let row = &mut t.rows[r as usize];
+                for c in c0..=c1.min(row.cells.len() as u32 - 1) {
+                    if let Some(cell) = row.cells.get_mut(c as usize) {
+                        cell.props.v_merge = VMergeRole::Continue;
+                        cell.props.grid_span = span.max(1);
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn split_cell(&self, table_path: BlockPath, row: u32, col: u32) -> Self {
+        self.mutate_table(table_path, |t| {
+            if let Some(r) = t.rows.get_mut(row as usize)
+                && let Some(cell) = r.cells.get_mut(col as usize)
+            {
+                cell.props.grid_span = 1;
+                cell.props.v_merge = VMergeRole::None;
+            }
+        })
+    }
+
+    pub fn set_cell_shading(
+        &self,
+        table_path: BlockPath,
+        row: u32,
+        col: u32,
+        color: Option<[u8; 4]>,
+    ) -> Self {
+        self.mutate_table(table_path, |t| {
+            if let Some(r) = t.rows.get_mut(row as usize)
+                && let Some(cell) = r.cells.get_mut(col as usize)
+            {
+                cell.props.shading = color;
+            }
+        })
+    }
+
+    pub fn set_cell_borders(
+        &self,
+        table_path: BlockPath,
+        row: u32,
+        col: u32,
+        borders: CellBorders,
+    ) -> Self {
+        self.mutate_table(table_path, |t| {
+            if let Some(r) = t.rows.get_mut(row as usize)
+                && let Some(cell) = r.cells.get_mut(col as usize)
+            {
+                cell.props.borders = Some(borders.clone());
+            }
+        })
+    }
+
+    /// Helper — open `table_path`'s `Block::Table`, run `f`, flip dirty,
+    /// drop source bytes, write back.
+    fn mutate_table<F>(&self, path: BlockPath, f: F) -> Self
+    where
+        F: FnOnce(&mut Table),
+    {
+        let idx = match top_level_block_index(&path) {
+            Some(i) => i as usize,
+            None => return self.clone(),
+        };
+        let mut blocks = self.blocks.clone();
+        if idx >= blocks.len() {
+            return self.clone();
+        }
+        let mut block = blocks[idx].clone();
+        let Some(table) = block.as_table_mut() else {
+            return self.clone();
+        };
+        f(table);
+        /* Phase 5 PR 3 invariant: every table mutation drops the
+        passthrough — the writer must regenerate from rows. */
+        table.dirty = true;
+        table.source_xml = None;
+        blocks.set(idx, block);
+        Self { blocks }
+    }
+}
+
+/// Extract the top-level block index from a `BlockPath` (first step
+/// must be `PathStep::Block(N)`; nested-cell paths return `None`
+/// at PR 3 — full nested-table mutation is PR 3b).
+fn top_level_block_index(path: &BlockPath) -> Option<u32> {
+    match path.steps.first()? {
+        PathStep::Block(n) => Some(*n),
+        PathStep::Cell { .. } => None,
     }
 }
 
@@ -1796,5 +2081,113 @@ mod tests {
         assert_eq!(caret, LogicalPos { para: 1, offset: 3 });
         assert_eq!(out.nth_paragraph(1).unwrap().style_at(0).bold, Some(true));
         assert_eq!(out.nth_paragraph(1).unwrap().style_at(3).bold, None);
+    }
+
+    /* ---- Phase 5 PR 3: table command suite ------------------------- */
+
+    #[test]
+    fn insert_table_synthesises_dirty_block_with_no_source() {
+        let d = DocumentTree::from_text("hello");
+        let d = d.insert_table(BlockPath::top(1), 2, 3);
+        assert_eq!(d.blocks.len(), 2);
+        let t = d.blocks[1].as_table().expect("Block::Table");
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells.len(), 3);
+        assert_eq!(t.grid.len(), 3);
+        assert!(t.dirty, "synthesised tables must regen on save");
+        assert!(t.source_xml.is_none());
+    }
+
+    #[test]
+    fn insert_row_appends_with_matching_column_count() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 1, 2);
+        let d = d.insert_row(BlockPath::top(1), 0);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1].cells.len(), 2);
+    }
+
+    #[test]
+    fn insert_column_widens_grid_and_every_row() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 2, 2);
+        let d = d.insert_column(BlockPath::top(1), 0);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.grid.len(), 3);
+        assert!(t.rows.iter().all(|r| r.cells.len() == 3));
+    }
+
+    #[test]
+    fn delete_row_and_column() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 3, 3);
+        let d = d.delete_row(BlockPath::top(1), 1);
+        let d = d.delete_column(BlockPath::top(1), 0);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.grid.len(), 2);
+        assert!(t.rows.iter().all(|r| r.cells.len() == 2));
+    }
+
+    #[test]
+    fn merge_cells_horizontal_sets_grid_span_and_drops_partners() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 1, 3);
+        let d = d.merge_cells(BlockPath::top(1), 0, 0, 0, 2);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells.len(), 1);
+        assert_eq!(t.rows[0].cells[0].props.grid_span, 3);
+        assert_eq!(t.rows[0].cells[0].props.v_merge, VMergeRole::None);
+    }
+
+    #[test]
+    fn merge_cells_vertical_flips_continue_rows() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 3, 2);
+        let d = d.merge_cells(BlockPath::top(1), 0, 0, 2, 0);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells[0].props.v_merge, VMergeRole::Restart);
+        assert_eq!(t.rows[1].cells[0].props.v_merge, VMergeRole::Continue);
+        assert_eq!(t.rows[2].cells[0].props.v_merge, VMergeRole::Continue);
+    }
+
+    #[test]
+    fn set_cell_shading_and_borders_flip_dirty() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 1, 1);
+        /* The previously-inserted table starts dirty (synthesised); force
+        a "clean" reset to exercise the dirty-flip invariant on a
+        passthrough-eligible table. */
+        let mut blocks = d.blocks.clone();
+        if let Some(t) = blocks[1].as_table_mut() {
+            t.dirty = false;
+            t.source_xml = Some(b"<w:tbl/>".to_vec());
+        }
+        let d = DocumentTree { blocks };
+        let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells[0].props.shading, Some([0xFF, 0, 0, 0xFF]));
+        assert!(t.dirty, "shading edit must flip dirty");
+        assert!(t.source_xml.is_none(), "shading edit must drop source");
+
+        let d = d.set_cell_borders(
+            BlockPath::top(1),
+            0,
+            0,
+            CellBorders {
+                top: Some(BorderStroke {
+                    style: BorderStyle::Single,
+                    size_eighth_pt: 8,
+                    color: Some([0, 0, 0xFF, 0xFF]),
+                }),
+                ..Default::default()
+            },
+        );
+        let t = d.blocks[1].as_table().unwrap();
+        assert!(t.rows[0].cells[0].props.borders.is_some());
+    }
+
+    #[test]
+    fn delete_table_removes_top_level_block() {
+        let d = DocumentTree::from_text("before").insert_table(BlockPath::top(1), 1, 1);
+        assert_eq!(d.blocks.len(), 2);
+        let d = d.delete_table(BlockPath::top(1));
+        assert_eq!(d.blocks.len(), 1);
+        assert!(d.blocks[0].as_paragraph().is_some());
     }
 }

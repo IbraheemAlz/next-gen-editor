@@ -311,8 +311,18 @@ fn validate_fixture(path: &Path, manifest: &ManifestFile) -> Result<()> {
 /// `Block::Table` content — Phase 5 PR 1 treats tables as opaque
 /// passthrough; their bytes are validated by the sibling-entry check.
 fn documents_equivalent(a: &DocxArchive, b: &DocxArchive) -> bool {
-    let pa: Vec<_> = a.document.paragraphs().collect();
-    let pb: Vec<_> = b.document.paragraphs().collect();
+    let pa: Vec<_> = a
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .collect();
+    let pb: Vec<_> = b
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .collect();
     if pa.len() != pb.len() {
         return false;
     }
@@ -344,7 +354,13 @@ fn run_gen_seed(dir: &Path) -> Result<()> {
         let path = dir.join(fx.name);
         std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
 
-        let texts: Vec<String> = fx.doc.paragraphs().map(|p| p.text.clone()).collect();
+        let texts: Vec<String> = fx
+            .doc
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| p.text.clone())
+            .collect();
         manifest.fixtures.insert(
             fx.name.to_owned(),
             FixtureEntry {

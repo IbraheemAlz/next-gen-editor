@@ -6,8 +6,9 @@
 use crate::error::DocxError;
 use crate::opc::archive::{DOC_XML, DocxArchive};
 use engine::{
-    Alignment, Block, DocumentTree, FontFamily, LineHeight, ParaProperties, Paragraph, SpanStyle,
-    Table, TextDirection,
+    Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, FontFamily,
+    LineHeight, ParaProperties, Paragraph, RowHeight, SpanStyle, Table, TableCell, TableRow,
+    TextDirection, VMergeRole,
 };
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -264,10 +265,186 @@ fn emit_table(t: &Table, out: &mut String) {
             Err(_) => { /* fall through to regenerate */ }
         }
     }
-    /* Phase 5 PR 2 — regenerate from `t.rows` when the table is dirty
-    or has no source bytes. Until then, emit an empty `<w:tbl/>`
-    placeholder so downstream Word still sees a valid document. */
-    out.push_str("<w:tbl/>");
+    regenerate_table(t, out);
+}
+
+/// Phase 5 PR 3 — full table regeneration. Emits `<w:tbl>` with
+/// `<w:tblPr>` (when non-default), `<w:tblGrid>`, then each `<w:tr>`
+/// with `<w:trPr>` and `<w:tc>` cells carrying `<w:tcPr>` (gridSpan,
+/// vMerge, tcW, shd, tcBorders, vAlign) and nested block content via
+/// `emit_block` for true recursion.
+fn regenerate_table(t: &Table, out: &mut String) {
+    out.push_str("<w:tbl>");
+    emit_tbl_pr(&t.props, out);
+    /* `<w:tblGrid>` — one `<w:gridCol w:w="…"/>` per template column. */
+    if !t.grid.is_empty() {
+        out.push_str("<w:tblGrid>");
+        for w in &t.grid {
+            out.push_str(&format!("<w:gridCol w:w=\"{w}\"/>"));
+        }
+        out.push_str("</w:tblGrid>");
+    }
+    for row in &t.rows {
+        emit_table_row(row, out);
+    }
+    out.push_str("</w:tbl>");
+}
+
+fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
+    let has_content = props.width.is_some()
+        || props.alignment.is_some()
+        || props.indent_twips != 0
+        || props.borders.is_some()
+        || props.table_style_id.is_some();
+    if !has_content {
+        return;
+    }
+    out.push_str("<w:tblPr>");
+    if let Some(id) = &props.table_style_id {
+        out.push_str(&format!("<w:tblStyle w:val=\"{id}\"/>"));
+    }
+    if let Some(w) = props.width {
+        emit_w_width("w:tblW", w, out);
+    }
+    if props.indent_twips != 0 {
+        out.push_str(&format!(
+            "<w:tblInd w:w=\"{}\" w:type=\"dxa\"/>",
+            props.indent_twips
+        ));
+    }
+    if let Some(a) = props.alignment {
+        out.push_str(&format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
+    }
+    if let Some(b) = &props.borders {
+        emit_cell_borders("w:tblBorders", b, out);
+    }
+    out.push_str("</w:tblPr>");
+}
+
+fn emit_table_row(row: &TableRow, out: &mut String) {
+    out.push_str("<w:tr>");
+    emit_tr_pr(&row.props, out);
+    for cell in &row.cells {
+        emit_table_cell(cell, out);
+    }
+    out.push_str("</w:tr>");
+}
+
+fn emit_tr_pr(props: &engine::RowProperties, out: &mut String) {
+    let has = props.height.is_some() || props.cant_split || props.header;
+    if !has {
+        return;
+    }
+    out.push_str("<w:trPr>");
+    if let Some(h) = props.height {
+        let (twips, rule) = match h {
+            RowHeight::Auto => (0, "auto"),
+            RowHeight::AtLeast { twips } => (twips, "atLeast"),
+            RowHeight::Exact { twips } => (twips, "exact"),
+        };
+        out.push_str(&format!(
+            "<w:trHeight w:val=\"{twips}\" w:hRule=\"{rule}\"/>"
+        ));
+    }
+    if props.cant_split {
+        out.push_str("<w:cantSplit/>");
+    }
+    if props.header {
+        out.push_str("<w:tblHeader/>");
+    }
+    out.push_str("</w:trPr>");
+}
+
+fn emit_table_cell(cell: &TableCell, out: &mut String) {
+    out.push_str("<w:tc>");
+    emit_tc_pr(&cell.props, out);
+    /* A cell must contain at least one paragraph (Word repair dialog
+    fires on empty cells); inject a default `<w:p>` when blocks are
+    empty. */
+    if cell.blocks.is_empty() {
+        out.push_str("<w:p/>");
+    } else {
+        for block in &cell.blocks {
+            emit_block(block, out);
+        }
+    }
+    out.push_str("</w:tc>");
+}
+
+fn emit_tc_pr(props: &engine::CellProperties, out: &mut String) {
+    let has = props.grid_span > 1
+        || !matches!(props.v_merge, VMergeRole::None)
+        || props.width.is_some()
+        || props.borders.is_some()
+        || props.shading.is_some()
+        || !matches!(props.v_align, engine::VerticalAlign::Top);
+    if !has {
+        return;
+    }
+    out.push_str("<w:tcPr>");
+    if let Some(w) = props.width {
+        emit_w_width("w:tcW", w, out);
+    }
+    if props.grid_span > 1 {
+        out.push_str(&format!("<w:gridSpan w:val=\"{}\"/>", props.grid_span));
+    }
+    match props.v_merge {
+        VMergeRole::Restart => out.push_str("<w:vMerge w:val=\"restart\"/>"),
+        VMergeRole::Continue => out.push_str("<w:vMerge/>"),
+        VMergeRole::None => {}
+    }
+    if let Some(b) = &props.borders {
+        emit_cell_borders("w:tcBorders", b, out);
+    }
+    if let Some([r, g, b, _]) = props.shading {
+        out.push_str(&format!(
+            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
+        ));
+    }
+    match props.v_align {
+        engine::VerticalAlign::Center => out.push_str("<w:vAlign w:val=\"center\"/>"),
+        engine::VerticalAlign::Bottom => out.push_str("<w:vAlign w:val=\"bottom\"/>"),
+        engine::VerticalAlign::Top => {}
+    }
+    out.push_str("</w:tcPr>");
+}
+
+fn emit_w_width(elem: &str, w: CellWidth, out: &mut String) {
+    let (val, typ) = match w {
+        CellWidth::Dxa(v) => (v.to_string(), "dxa"),
+        CellWidth::Pct(v) => (v.to_string(), "pct"),
+        CellWidth::Auto => ("0".to_string(), "auto"),
+        CellWidth::Nil => ("0".to_string(), "nil"),
+    };
+    out.push_str(&format!("<{elem} w:w=\"{val}\" w:type=\"{typ}\"/>"));
+}
+
+fn emit_cell_borders(elem: &str, b: &CellBorders, out: &mut String) {
+    out.push_str(&format!("<{elem}>"));
+    emit_border_edge("w:top", &b.top, out);
+    emit_border_edge("w:left", &b.left, out);
+    emit_border_edge("w:bottom", &b.bottom, out);
+    emit_border_edge("w:right", &b.right, out);
+    emit_border_edge("w:insideH", &b.inside_h, out);
+    emit_border_edge("w:insideV", &b.inside_v, out);
+    out.push_str(&format!("</{elem}>"));
+}
+
+fn emit_border_edge(elem: &str, edge: &Option<BorderStroke>, out: &mut String) {
+    let Some(s) = edge else { return };
+    let val = match &s.style {
+        BorderStyle::Single => "single",
+        BorderStyle::Double => "double",
+        BorderStyle::Dotted => "dotted",
+        BorderStyle::Dashed => "dashed",
+        BorderStyle::None => "none",
+        BorderStyle::Other(o) => o.as_str(),
+    };
+    let mut attrs = format!(" w:val=\"{val}\" w:sz=\"{}\"", s.size_eighth_pt);
+    if let Some([r, g, b, _]) = s.color {
+        attrs.push_str(&format!(" w:color=\"{r:02X}{g:02X}{b:02X}\""));
+    }
+    out.push_str(&format!("<{elem}{attrs}/>"));
 }
 
 fn build_document_xml(doc: &DocumentTree) -> String {
@@ -711,7 +888,12 @@ mod tests {
     fn list_paragraphs_get_resolved_markers() {
         let bytes = build_list_docx();
         let parsed = read_docx(&bytes).expect("read");
-        let paras: Vec<_> = parsed.document.paragraphs().collect();
+        let paras: Vec<_> = parsed
+            .document
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .collect();
         assert_eq!(paras.len(), 4);
         /* Bullet — literal lvlText. */
         assert_eq!(paras[0].resolved_marker.as_deref(), Some("*"));
@@ -733,7 +915,13 @@ mod tests {
         let bytes = build_list_docx();
         let archive = read_docx(&bytes).expect("read");
         /* All loaded paragraphs must be clean with captured source bytes. */
-        for (i, p) in archive.document.paragraphs().enumerate() {
+        for (i, p) in archive
+            .document
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .enumerate()
+        {
             assert!(!p.dirty, "para {i} loaded dirty");
             let raw = p.source_xml.as_deref().expect("source_xml captured");
             assert!(std::str::from_utf8(raw).unwrap().contains("<w:numPr>"));
@@ -851,6 +1039,33 @@ mod tests {
         assert_eq!(
             saved_doc_xml, original_doc_xml,
             "opaque table passthrough must keep document.xml byte-identical"
+        );
+    }
+
+    #[test]
+    fn regenerated_table_round_trips_through_reader() {
+        /* Phase 5 PR 3 — synthesise a table via `insert_table`, write,
+        re-read, assert structure. `Table.dirty=true + source_xml=None`
+        forces the regenerate path. */
+        let doc =
+            engine::DocumentTree::from_text("hello").insert_table(engine::BlockPath::top(1), 2, 3);
+        /* Apply a shading edit to exercise the cell-properties emitter. */
+        let doc = doc.set_cell_shading(
+            engine::BlockPath::top(1),
+            0,
+            0,
+            Some([0xFF, 0xEB, 0x78, 0xFF]),
+        );
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("re-read");
+        assert_eq!(parsed.document.blocks.len(), 2);
+        let t = parsed.document.blocks[1].as_table().expect("table");
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells.len(), 3);
+        assert_eq!(t.grid.len(), 3);
+        assert_eq!(
+            t.rows[0].cells[0].props.shading,
+            Some([0xFF, 0xEB, 0x78, 0xFF])
         );
     }
 

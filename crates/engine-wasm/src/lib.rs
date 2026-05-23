@@ -1274,6 +1274,40 @@ impl Engine {
             Command::SetParagraphAlign { range, align } => {
                 self.do_set_paragraph_align(range, align)
             }
+
+            // Phase 5 PR 3 — table mutation commands. `BlockPath` flows
+            // straight through to the engine; every command flips
+            // `Table.dirty = true` so the writer regenerates on save.
+            Command::InsertTable { at, rows, cols } => self.do_insert_table(at, rows, cols),
+            Command::DeleteTable { path } => self.do_delete_table(path),
+            Command::InsertRow {
+                table_path,
+                after_row,
+            } => self.do_insert_row(table_path, after_row),
+            Command::DeleteRow { table_path, row } => self.do_delete_row(table_path, row),
+            Command::InsertColumn {
+                table_path,
+                after_col,
+            } => self.do_insert_column(table_path, after_col),
+            Command::DeleteColumn { table_path, col } => self.do_delete_column(table_path, col),
+            Command::MergeCells {
+                table_path,
+                from_row,
+                from_col,
+                to_row,
+                to_col,
+            } => self.do_merge_cells(table_path, from_row, from_col, to_row, to_col),
+            Command::SplitCell {
+                table_path,
+                row,
+                col,
+            } => self.do_split_cell(table_path, row, col),
+            Command::SetCellShading {
+                table_path,
+                row,
+                col,
+                color,
+            } => self.do_set_cell_shading(table_path, row, col, color),
         }
     }
 
@@ -1511,7 +1545,12 @@ impl Engine {
     /// the glyph cache and frame timings land with the Phase 3 renderer.
     fn request_stats(&self) -> Event {
         let doc = self.undo.current();
-        let document_tree_bytes: usize = doc.paragraphs().map(|p| p.text.len()).sum();
+        let document_tree_bytes: usize = doc
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| p.text.len())
+            .sum();
         Event::Stats(EngineStats {
             wasm_heap_bytes: wasm_heap_bytes(),
             document_tree_bytes: document_tree_bytes as u32,
@@ -2481,7 +2520,9 @@ impl Engine {
         };
         self.undo
             .current()
-            .paragraphs()
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
             .map(|para| A11yParagraph {
                 direction,
                 runs: a11y_runs(para),
@@ -2635,6 +2676,123 @@ impl Engine {
             return *e;
         }
         self.selection_changed()
+    }
+
+    /* ===========================================================
+    Phase 5 PR 3 — table command dispatch.
+    Each method maps the bridge `BlockPath` → engine, runs the
+    mutation, pushes undo, repaints. Selection update is naive
+    at PR 3 (caret stays put; PR 3b implements cell-rectangular
+    selection refresh).
+    =========================================================== */
+
+    fn do_insert_table(&mut self, at: bridge::BlockPath, rows: u32, cols: u32) -> Event {
+        let new_doc = self
+            .undo
+            .current()
+            .insert_table(bridge_to_engine_path(at), rows, cols);
+        self.push_table_edit(new_doc)
+    }
+    fn do_delete_table(&mut self, path: bridge::BlockPath) -> Event {
+        let new_doc = self
+            .undo
+            .current()
+            .delete_table(bridge_to_engine_path(path));
+        self.push_table_edit(new_doc)
+    }
+    fn do_insert_row(&mut self, path: bridge::BlockPath, after_row: u32) -> Event {
+        let new_doc = self
+            .undo
+            .current()
+            .insert_row(bridge_to_engine_path(path), after_row);
+        self.push_table_edit(new_doc)
+    }
+    fn do_delete_row(&mut self, path: bridge::BlockPath, row: u32) -> Event {
+        let new_doc = self
+            .undo
+            .current()
+            .delete_row(bridge_to_engine_path(path), row);
+        self.push_table_edit(new_doc)
+    }
+    fn do_insert_column(&mut self, path: bridge::BlockPath, after_col: u32) -> Event {
+        let new_doc = self
+            .undo
+            .current()
+            .insert_column(bridge_to_engine_path(path), after_col);
+        self.push_table_edit(new_doc)
+    }
+    fn do_delete_column(&mut self, path: bridge::BlockPath, col: u32) -> Event {
+        let new_doc = self
+            .undo
+            .current()
+            .delete_column(bridge_to_engine_path(path), col);
+        self.push_table_edit(new_doc)
+    }
+    fn do_merge_cells(
+        &mut self,
+        path: bridge::BlockPath,
+        from_row: u32,
+        from_col: u32,
+        to_row: u32,
+        to_col: u32,
+    ) -> Event {
+        let new_doc = self.undo.current().merge_cells(
+            bridge_to_engine_path(path),
+            from_row,
+            from_col,
+            to_row,
+            to_col,
+        );
+        self.push_table_edit(new_doc)
+    }
+    fn do_split_cell(&mut self, path: bridge::BlockPath, row: u32, col: u32) -> Event {
+        let new_doc = self
+            .undo
+            .current()
+            .split_cell(bridge_to_engine_path(path), row, col);
+        self.push_table_edit(new_doc)
+    }
+    fn do_set_cell_shading(
+        &mut self,
+        path: bridge::BlockPath,
+        row: u32,
+        col: u32,
+        color: Option<bridge::Color>,
+    ) -> Event {
+        let rgba = color.map(|c| [c.r, c.g, c.b, c.a]);
+        let new_doc =
+            self.undo
+                .current()
+                .set_cell_shading(bridge_to_engine_path(path), row, col, rgba);
+        self.push_table_edit(new_doc)
+    }
+
+    /// Common tail for every table command — push undo, invalidate +
+    /// repaint, fire a SelectionChanged event so the UI re-fetches
+    /// state.
+    fn push_table_edit(&mut self, new_doc: engine::DocumentTree) -> Event {
+        self.undo.push(new_doc);
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+}
+
+/// Bridge `BlockPath` → engine `BlockPath`. Trivial 1:1 mapping; the
+/// two crates carry parallel enums so neither has a build-time
+/// dependency on the other's serde derives.
+fn bridge_to_engine_path(p: bridge::BlockPath) -> engine::BlockPath {
+    engine::BlockPath {
+        steps: p
+            .steps
+            .into_iter()
+            .map(|s| match s {
+                bridge::PathStep::Block { idx } => engine::PathStep::Block(idx),
+                bridge::PathStep::Cell { row, col } => engine::PathStep::Cell { row, col },
+            })
+            .collect(),
     }
 }
 

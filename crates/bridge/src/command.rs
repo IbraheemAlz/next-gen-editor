@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{
-    Alignment, Color, DocFormat, LogicalPos, LogicalRange, Point, Rect, UnderlineStyle,
+    Alignment, BlockPath, Color, DocFormat, LogicalPos, LogicalRange, Point, Rect, UnderlineStyle,
     VerticalScript,
 };
 
@@ -271,6 +271,56 @@ pub enum Command {
     /// them in — the rich counterpart of [`Command::PastePlain`].
     PasteHtml {
         html: String,
+    },
+
+    // ===================================================================
+    // Phase 5 PR 3 — table mutation commands. `at` / `table_path` are
+    // `BlockPath`s; the engine resolves them through `Vector<Block>`
+    // (PR 3 supports top-level blocks only; nested-cell paths land in
+    // Phase 5b). Every command flips `Table.dirty = true` so the writer
+    // regenerates the table on save.
+    // ===================================================================
+    InsertTable {
+        at: BlockPath,
+        rows: u32,
+        cols: u32,
+    },
+    DeleteTable {
+        path: BlockPath,
+    },
+    InsertRow {
+        table_path: BlockPath,
+        after_row: u32,
+    },
+    DeleteRow {
+        table_path: BlockPath,
+        row: u32,
+    },
+    InsertColumn {
+        table_path: BlockPath,
+        after_col: u32,
+    },
+    DeleteColumn {
+        table_path: BlockPath,
+        col: u32,
+    },
+    MergeCells {
+        table_path: BlockPath,
+        from_row: u32,
+        from_col: u32,
+        to_row: u32,
+        to_col: u32,
+    },
+    SplitCell {
+        table_path: BlockPath,
+        row: u32,
+        col: u32,
+    },
+    SetCellShading {
+        table_path: BlockPath,
+        row: u32,
+        col: u32,
+        color: Option<Color>,
     },
 }
 
