@@ -2136,10 +2136,11 @@ impl Engine {
                         && (c.at.offset as usize) <= para.text.len()
                         && para.text.is_char_boundary(c.at.offset as usize)
                 });
-                if para.text.is_empty() && comp.is_none() {
-                    para_y_offset += cfg.line_height * scale;
-                    continue;
-                }
+                /* PR 4 caret-fix: empty paragraphs flow through normal
+                layout so `layout_paragraph` emits its zero-width
+                placeholder line — `document_geometry` then has a
+                LineGeom for the empty paragraph, and the caret no
+                longer jumps to (0,0) after Enter. */
                 let mut para_box = if let Some(c) = comp {
                     /* Composition paragraph: splice the composed text in and lay
                     it out fresh — never cached, since the text differs from the

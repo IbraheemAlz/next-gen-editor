@@ -444,14 +444,34 @@ function mutatesDocument(cmd: Command): boolean {
         case 'INSERT_TEXT':
         case 'DELETE_RANGE':
         case 'DELETE_AT_CARET':
+        case 'REPLACE_RANGE':
         case 'SPLIT_PARAGRAPH':
+        case 'MERGE_PARAGRAPH':
         case 'APPLY_FORMATTING':
+        case 'SET_PARAGRAPH_ALIGN':
+        case 'INSERT_IMAGE':
+        case 'PASTE_PLAIN':
+        case 'PASTE_HTML':
         case 'END_COMPOSITION':
         case 'UNDO':
         case 'REDO':
         case 'RENDER_PAGE':
         case 'LOAD_DOCX':
         case 'OPEN_DOCUMENT':
+        /* Phase 5 PR 3 table mutations. Each one flips a Table's
+           `dirty` bit; the worker must broadcast a fresh a11y delta so
+           the TablePanel's `tables` signal re-renders and the mirror
+           DOM exposes the new structure to screen readers. */
+        case 'INSERT_TABLE':
+        case 'DELETE_TABLE':
+        case 'INSERT_ROW':
+        case 'DELETE_ROW':
+        case 'INSERT_COLUMN':
+        case 'DELETE_COLUMN':
+        case 'MERGE_CELLS':
+        case 'SPLIT_CELL':
+        case 'SET_CELL_SHADING':
+        case 'SET_CELL_BORDERS':
             return true;
         default:
             return false;

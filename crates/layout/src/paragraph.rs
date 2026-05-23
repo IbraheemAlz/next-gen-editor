@@ -126,10 +126,29 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     }
 
     /* An empty paragraph (no text → no lines) still occupies one
-    line's worth of vertical space — Word's caret-on-blank-line
-    behaviour. Without this, an empty paragraph inside a table cell
-    collapses the cell to zero height. */
-    let height = if y <= 0.0 { cfg.line_height } else { y };
+    line's worth of vertical space and carries one zero-width
+    placeholder line so the hit-test geometry can locate it. Without
+    the line the caret cannot find its host paragraph after pressing
+    Enter — `caret_rect_geom` falls back to `geom.first()` and the
+    caret visibly jumps to (0, 0). Without the height the cell
+    containing the placeholder collapses to zero. */
+    if lines.is_empty() {
+        let inner_origin =
+            alignment_origin_x(0.0, content_width, cfg.alignment, cfg.base_direction);
+        lines.push(LineBox {
+            origin: Point {
+                x: leading_off + inner_origin,
+                y: 0.0,
+            },
+            baseline: cfg.line_height,
+            height: cfg.line_height,
+            width: 0.0,
+            runs: Vec::new(),
+            alignment: cfg.alignment,
+        });
+        y = cfg.line_height;
+    }
+    let height = y;
     /* Phase 4 — list marker (`"1."`, `"a)"`, `"•"`). Shape against the
     base-direction script's preferred face at `px_size_for_marker`, then
     park it in the leading-edge gutter aligned to the first line's
@@ -309,22 +328,88 @@ fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
             /* Overflow. Commit whatever fit so far. */
             if last_fit_end > start {
                 lines.push((build_line(cfg, start, last_fit_end), true));
+                start = last_fit_end;
+                seg_from = start;
+                line_width = 0.0;
             } else {
-                /* Single segment doesn't fit — force-break here. */
-                lines.push((build_line(cfg, start, b), true));
-                last_fit_end = b;
+                /* Single segment doesn't fit on a fresh line. Force a
+                character-level break so the word wraps instead of
+                overflowing the page (CSS `overflow-wrap: anywhere`). */
+                let force = char_break_fit(cfg, start, b);
+                lines.push((build_line(cfg, start, force), true));
+                start = force;
+                last_fit_end = force;
+                seg_from = force;
+                line_width = 0.0;
+                /* The unconsumed remainder `[force..b]` rides onto the
+                next outer iteration's segment measurement — when `b'`
+                advances past `b`, the prefix `[force..b']` is
+                re-measured and broken again if needed. */
             }
-            start = last_fit_end;
-            /* Restart the running measurement for the fresh line. */
-            seg_from = start;
-            line_width = 0.0;
         }
     }
 
     if start < cfg.text.len() {
-        lines.push((build_line(cfg, start, cfg.text.len()), false));
+        /* The final tail may itself overflow (e.g. a giant trailing
+        URL) — keep force-breaking until it fits. */
+        while start < cfg.text.len() {
+            let end = cfg.text.len();
+            let w = measure_text(
+                cfg.fonts,
+                &cfg.text[start..end],
+                start as u32,
+                cfg.spans,
+                cfg.base_direction,
+            );
+            if w <= cfg.max_width {
+                lines.push((build_line(cfg, start, end), false));
+                break;
+            }
+            let force = char_break_fit(cfg, start, end);
+            lines.push((build_line(cfg, start, force), true));
+            start = force;
+        }
     }
     lines
+}
+
+/// Largest character-boundary position in `[start..hard_end]` whose
+/// rendered text fits within `cfg.max_width`. When even one character
+/// is too wide, returns the first char boundary past `start` so the
+/// loop always makes progress (a single huge glyph then overflows the
+/// page by itself — better than an infinite loop).
+fn char_break_fit(cfg: &ParagraphConfig<'_>, start: usize, hard_end: usize) -> usize {
+    let mut accept: Option<usize> = None;
+    let mut first_char_end: Option<usize> = None;
+    let mut iter = cfg.text[start..hard_end].char_indices();
+    iter.next();
+    for (offset, _) in iter {
+        let abs = start + offset;
+        if first_char_end.is_none() {
+            first_char_end = Some(abs);
+        }
+        let w = measure_text(
+            cfg.fonts,
+            &cfg.text[start..abs],
+            start as u32,
+            cfg.spans,
+            cfg.base_direction,
+        );
+        if w <= cfg.max_width {
+            accept = Some(abs);
+        } else {
+            break;
+        }
+    }
+    accept.or(first_char_end).unwrap_or_else(|| {
+        /* Single-char segment that overflows — push it whole and
+        let it overshoot rather than emit a zero-width line. */
+        cfg.text[start..]
+            .char_indices()
+            .nth(1)
+            .map(|(o, _)| start + o)
+            .unwrap_or(hard_end)
+    })
 }
 
 /// Shape one logical byte range into a [`LineBox`]. Runs UAX #9 BiDi on the
