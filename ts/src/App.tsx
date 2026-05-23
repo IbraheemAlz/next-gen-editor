@@ -37,6 +37,13 @@ const FONT_URLS: ReadonlyArray<readonly [string, string]> = [
     ['noto-naskh', NOTO_URL],
 ];
 
+/** Print → screen DPI conversion: 1 pt (engine) = 1/72 inch; 1 CSS px = 1/96
+ *  inch; so `screen_dpi_scale = 96 / 72 = 4 / 3 ≈ 1.333`. Multiplied into
+ *  the engine's `device_pixel_ratio` so an A4 page renders at the same
+ *  physical size as Word / Google Docs at 100% zoom. Phase 6c bug-fix
+ *  follow-up — pre-fix the 595 × 842 page rendered tiny at ~75% zoom. */
+const SCREEN_DPI_SCALE = 4 / 3;
+
 /** Load the editor fonts and seed a blank A4 page. Runs on boot + recovery. */
 async function setupEngine(client: EngineClient): Promise<void> {
     /* loadFont hands each buffer to the worker as a Transferable — zero-copy. */
@@ -54,9 +61,17 @@ async function setupEngine(client: EngineClient): Promise<void> {
         px_size: 24,
         line_height: 36,
         align: 'START',
-        /* HiDPI: the engine lays out + paints scaled by this so the page
-           fills the device-pixel canvas backing store crisply. */
-        device_pixel_ratio: window.devicePixelRatio,
+        /* Engine scale = `dpr × screen_dpi_scale`. The engine outputs
+           print-perfect layout points (1 pt = 1/72 in) but CSS pixels are
+           1/96 in — multiplying by `96/72 = 4/3` lifts the print page to
+           its true screen size so an A4 sheet renders at 794 × 1123 CSS
+           px (Google Docs / Word at 100% zoom), not the tiny 595 × 842
+           CSS px the raw points would produce. Pointer hit-testing keeps
+           working because `pointer.ts` converts CSS clicks to device px
+           via the same `dpr`, and the canvas backing store ends up sized
+           at `layout_pt × dpr × 4/3 = CSS px × dpr` — clicks land in the
+           right coordinate space without any extra math. */
+        device_pixel_ratio: window.devicePixelRatio * SCREEN_DPI_SCALE,
     });
     /* Seed a collapsed caret at the document start so the hidden input has a
        position to insert at before the first pointer click. */

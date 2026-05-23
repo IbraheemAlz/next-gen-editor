@@ -54,8 +54,14 @@
 .editor-page {
     position: relative;
     flex: none;
-    width: 595px;
-    min-height: 842px;
+    /* A4 at 96 DPI: 595 pt × (96/72) = 794 px; 842 pt × (96/72) = 1123 px.
+       Engine outputs 1 layout pt = 1 device px at `scale=1`; the TS shell
+       lifts that to CSS-pixel size by multiplying the engine `scale` by
+       `4/3` (see `App.tsx::SCREEN_DPI_SCALE`). Matching the CSS box to
+       the print page's true screen footprint keeps pointer hit-tests
+       round-trip-correct: `pointer.x_css × dpr = engine.device_px`. */
+    width: 794px;
+    min-height: 1123px;
     /* The canvas paints the page cards (white fill + shadow) onto its
        OWN gray-desk surface, so the wrapping `.editor-page` element no
        longer needs a white background or a CSS shadow — that would
