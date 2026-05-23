@@ -77,6 +77,16 @@ pub enum DisplayCmd {
         rect: Rect,
         rel_id: String,
     },
+    /// UI-polish sprint — paint one page "card" (Google Docs / Word
+    /// print-layout look): a white rectangle floating over the gray
+    /// desk background with a soft drop shadow underneath. Backends
+    /// route this through their native shadow primitive
+    /// (`ctx.shadow*` on Canvas2D); the standalone command keeps
+    /// the renderer free of paint-state side effects that a plain
+    /// `FillRect` would leak to subsequent draws.
+    DrawPageCard {
+        rect: Rect,
+    },
     PushClip {
         rect: Rect,
     },
@@ -97,6 +107,13 @@ fn page_color() -> Color {
 }
 fn border_color() -> Color {
     Color::from_rgba8(0xcc, 0xcc, 0xcc, 0xff)
+}
+
+/// Google Docs / Word print-layout "desk" colour the white pages float
+/// over. The backend clears the entire canvas to this before walking
+/// the display list so inter-page gaps show through naturally.
+pub fn desk_background_color() -> Color {
+    Color::from_rgba8(0xe8, 0xea, 0xed, 0xff)
 }
 
 /// Lower a laid-out [`PageBox`] into a [`DisplayList`].
@@ -126,15 +143,19 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         let w = page.size.width as f64;
         let h = page.size.height as f64;
         let t = top as f64;
-        cmds.push(DisplayCmd::FillRect {
+        /* UI polish — one "page card" per `PageBox`: the backend draws
+        the white fill with a soft drop shadow underneath, giving the
+        Google Docs / Word print-layout look (distinct sheets floating
+        on the gray desk). No explicit border — the shadow does the
+        edge separation work. */
+        cmds.push(DisplayCmd::DrawPageCard {
             rect: Rect::new(0.0, t, w, t + h),
-            paint: Paint::solid(page_color()),
         });
-        cmds.push(DisplayCmd::StrokeRect {
-            rect: Rect::new(0.5, t + 0.5, w - 0.5, t + h - 0.5),
-            paint: Paint::solid(border_color()),
-            width: 1.0,
-        });
+        /* Avoid unused-function lints — both helpers are kept available
+        for callers that want the legacy chrome (e.g. PDF preview thumbs
+        that don't want a shadow). */
+        let _ = page_color();
+        let _ = border_color();
 
         let content_x = page.margins.left;
         let content_y = top + page.margins.top;

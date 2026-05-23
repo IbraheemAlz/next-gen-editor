@@ -89,6 +89,16 @@ pub fn render_vello(
                         );
                 }
             }
+            DisplayCmd::DrawPageCard { rect } => {
+                /* UI polish — Vello has no built-in CSS-style shadow
+                primitive; paint the white page only. The full shadow
+                ships with the Vello activation (BACKLOG #4); Canvas2D
+                is the active renderer until then. */
+                let white = peniko::Brush::Solid(peniko::Color::from_rgba8(
+                    0xff, 0xff, 0xff, 0xff,
+                ));
+                scene.fill(Fill::NonZero, transform, &white, None, rect);
+            }
             DisplayCmd::DrawImage { rect, rel_id: _ } => {
                 /* Phase 7 — Vello path paints a placeholder rectangle.
                 Full image decoding through Vello's `Image` resource

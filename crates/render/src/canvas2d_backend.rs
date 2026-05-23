@@ -87,6 +87,18 @@ pub fn render_canvas2d(
     resolve_image: impl Fn(&str) -> Option<web_sys::ImageBitmap>,
     clip: Rect,
 ) -> Result<(), JsValue> {
+    /* UI polish — clear the canvas to the "desk" gray Google Docs / Word
+    print-layout use. The page-card command then paints white sheets over
+    this; inter-page gaps and the outer margin show through naturally. */
+    let canvas = ctx.canvas();
+    ctx.set_fill_style_str("#e8eaed");
+    ctx.fill_rect(
+        0.0,
+        0.0,
+        f64::from(canvas.width()),
+        f64::from(canvas.height()),
+    );
+
     ctx.save();
     ctx.begin_path();
     ctx.rect(clip.x0, clip.y0, clip.width(), clip.height());
@@ -127,6 +139,28 @@ pub fn render_canvas2d(
                         paint_alpha_glyph(ctx, raster, g.x, g.y, rgb, run.bg_color)?;
                     }
                 }
+            }
+            DisplayCmd::DrawPageCard { rect } => {
+                /* UI polish — Google Docs / Word print-layout sheet:
+                a white rectangle with a soft drop shadow. `save` /
+                `restore` brackets so the shadow state does NOT leak
+                into the subsequent text + glyph draws (Canvas2D's
+                `shadow*` properties apply to every fill/stroke until
+                reset, which would tint glyphs with a halo).
+                Shadow blur + offset scale with the device-pixel ratio
+                — Canvas2D shadow units are device px, so on a 2× DPR
+                display the values below are doubled visually. We use
+                the nominal 24/8 because the canvas backing is already
+                sized at `scale × layout px` (Phase 6b), so shadow
+                offsets get the same scaling as everything else. */
+                ctx.save();
+                ctx.set_shadow_color("rgba(60, 64, 67, 0.30)");
+                ctx.set_shadow_blur(24.0);
+                ctx.set_shadow_offset_x(0.0);
+                ctx.set_shadow_offset_y(8.0);
+                ctx.set_fill_style_str("#ffffff");
+                ctx.fill_rect(rect.x0, rect.y0, rect.width(), rect.height());
+                ctx.restore();
             }
             DisplayCmd::DrawImage { rect, rel_id } => {
                 /* Phase 7 — inline image. If the worker has already

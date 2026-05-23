@@ -32,8 +32,13 @@
     display: flex;
     align-items: flex-start;
     justify-content: center;
-    padding: 24px 0;
-    background: #f0f0f0;
+    /* Generous breathing room above + below the first / last page card
+       so the shadow has room to fall without clipping at the viewport
+       edge. Horizontal padding keeps the page off the side rails. */
+    padding: 40px 32px;
+    /* Match the canvas's own "desk" colour from `scene::desk_background_color()`
+       so the CSS shell and the painted canvas are visually continuous. */
+    background: #e8eaed;
 }
 
 /* The A4 page — width + height land at the engine's `PageGeometry::a4()`
@@ -51,8 +56,13 @@
     flex: none;
     width: 595px;
     min-height: 842px;
-    background: #fff;
-    box-shadow: 0 1px 6px rgb(0 0 0 / 0.25);
+    /* The canvas paints the page cards (white fill + shadow) onto its
+       OWN gray-desk surface, so the wrapping `.editor-page` element no
+       longer needs a white background or a CSS shadow — that would
+       layer over the canvas's print-layout look and leak past the page
+       gaps. Stays `relative` so the caret + selection overlays still
+       anchor against this box. */
+    background: transparent;
 }
 
 /* The engine canvas. Fills the A4 page; the backing store is sized to
