@@ -125,7 +125,11 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         let _ = trailing_off;
     }
 
-    let height = y;
+    /* An empty paragraph (no text → no lines) still occupies one
+    line's worth of vertical space — Word's caret-on-blank-line
+    behaviour. Without this, an empty paragraph inside a table cell
+    collapses the cell to zero height. */
+    let height = if y <= 0.0 { cfg.line_height } else { y };
     /* Phase 4 — list marker (`"1."`, `"a)"`, `"•"`). Shape against the
     base-direction script's preferred face at `px_size_for_marker`, then
     park it in the leading-edge gutter aligned to the first line's

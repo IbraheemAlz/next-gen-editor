@@ -1370,7 +1370,7 @@ impl DocumentTree {
         for _ in 0..rows.max(1) {
             let mut cells = Vec::with_capacity(cols);
             for _ in 0..cols {
-                cells.push(TableCell::default());
+                cells.push(default_table_cell());
             }
             row_vec.push(TableRow {
                 props: RowProperties::default(),
@@ -1379,7 +1379,13 @@ impl DocumentTree {
         }
         let table = Table {
             grid,
-            props: TableProperties::default(),
+            /* Word-style default outer borders — 0.5 pt single black on
+            every edge so a freshly inserted table is visible without
+            the user opening the borders panel. */
+            props: TableProperties {
+                borders: Some(default_word_borders()),
+                ..TableProperties::default()
+            },
             rows: row_vec,
             /* Engine-synthesised — no source bytes, fully regenerated on
             save. */
@@ -1417,7 +1423,7 @@ impl DocumentTree {
                 .unwrap_or_else(|| t.grid.len().max(1));
             let new_row = TableRow {
                 props: RowProperties::default(),
-                cells: (0..cols).map(|_| TableCell::default()).collect(),
+                cells: (0..cols).map(|_| default_table_cell()).collect(),
             };
             let insert_at = (after_row as usize + 1).min(t.rows.len());
             t.rows.insert(insert_at, new_row);
@@ -1439,7 +1445,7 @@ impl DocumentTree {
             t.grid.insert(insert_at, 2880);
             for row in &mut t.rows {
                 let cell_at = insert_at.min(row.cells.len());
-                row.cells.insert(cell_at, TableCell::default());
+                row.cells.insert(cell_at, default_table_cell());
             }
         })
     }
@@ -1601,6 +1607,51 @@ fn top_level_block_index(path: &BlockPath) -> Option<u32> {
     match path.steps.first()? {
         PathStep::Block(n) => Some(*n),
         PathStep::Cell { .. } => None,
+    }
+}
+
+/// Default `<w:sz>` for a synthesised cell border — 4 eighths of a
+/// point ≈ 0.5 pt single black line. Word's out-of-the-box border
+/// weight; matches what `<w:tblBorders>` emits on `Normal.dotx`.
+const DEFAULT_BORDER_SIZE_EIGHTH_PT: u16 = 4;
+
+/// Word-style default cell-edge stroke — single 0.5 pt black.
+pub fn default_word_stroke() -> BorderStroke {
+    BorderStroke {
+        style: BorderStyle::Single,
+        size_eighth_pt: DEFAULT_BORDER_SIZE_EIGHTH_PT,
+        color: Some([0, 0, 0, 255]),
+    }
+}
+
+/// All-edges Word default border set. Used for both cell-level and
+/// table-level borders on engine-synthesised tables (`InsertTable` /
+/// `InsertRow` / `InsertColumn`) so freshly inserted tables paint
+/// without the user opening the borders picker first.
+pub fn default_word_borders() -> CellBorders {
+    let s = default_word_stroke();
+    CellBorders {
+        top: Some(s.clone()),
+        left: Some(s.clone()),
+        bottom: Some(s.clone()),
+        right: Some(s.clone()),
+        inside_h: Some(s.clone()),
+        inside_v: Some(s),
+    }
+}
+
+/// Construct a default table cell — one empty paragraph (so layout
+/// has something to measure) + Word-default 0.5 pt single-line
+/// borders on every edge. Without the placeholder paragraph cells
+/// collapse to zero height; without the borders the table is
+/// invisible until the user dresses it up.
+pub fn default_table_cell() -> TableCell {
+    TableCell {
+        props: CellProperties {
+            borders: Some(default_word_borders()),
+            ..CellProperties::default()
+        },
+        blocks: vec![Block::Paragraph(Paragraph::default())],
     }
 }
 
@@ -2848,6 +2899,40 @@ mod tests {
         assert_eq!(t.grid.len(), 3);
         assert!(t.dirty, "synthesised tables must regen on save");
         assert!(t.source_xml.is_none());
+    }
+
+    /// PR 4 visibility fix — a freshly inserted table must paint:
+    /// each cell carries an empty paragraph placeholder so layout has
+    /// something to measure, and Word-default 0.5pt single black
+    /// borders on every cell + the table outer perimeter so the user
+    /// sees the table on the canvas immediately.
+    #[test]
+    fn insert_table_seeds_placeholder_paragraph_and_default_borders() {
+        let d = DocumentTree::new().insert_table(BlockPath::top(0), 3, 3);
+        let t = d.blocks[0].as_table().expect("Block::Table");
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, cell) in row.cells.iter().enumerate() {
+                assert!(
+                    !cell.blocks.is_empty(),
+                    "cell ({r},{c}) needs a placeholder paragraph for layout"
+                );
+                let p = cell.blocks[0]
+                    .as_paragraph()
+                    .expect("cell placeholder is a Paragraph");
+                assert!(p.text.is_empty(), "placeholder is the empty paragraph");
+                let borders = cell
+                    .props
+                    .borders
+                    .as_ref()
+                    .expect("cell needs default Word borders");
+                assert!(borders.top.is_some());
+                assert!(borders.bottom.is_some());
+                assert!(borders.left.is_some());
+                assert!(borders.right.is_some());
+            }
+        }
+        let outer = t.props.borders.as_ref().expect("outer borders");
+        assert!(outer.top.is_some() && outer.bottom.is_some());
     }
 
     #[test]
