@@ -1363,9 +1363,13 @@ impl DocumentTree {
     pub fn insert_table(&self, at: BlockPath, rows: u32, cols: u32) -> Self {
         let idx = top_level_block_index(&at).unwrap_or(self.blocks.len() as u32);
         let cols = cols.max(1) as usize;
-        /* Default column width — Word's "auto" cells map to 2880 twips
-        (2 inches) when no grid is specified. */
-        let grid: Vec<i32> = vec![2880; cols];
+        /* Default column width — evenly divide A4 content width
+        (9020 twips ≈ 6.26 in) so a fresh table fits the page on
+        insert. Phase 5c will switch to `<w:tblLayout w:type="autofit"/>`
+        once auto-fit lands; until then a literal grid that matches
+        the page is the pragmatic default. */
+        let per_col = (DEFAULT_A4_CONTENT_TWIPS / cols as i32).max(720);
+        let grid: Vec<i32> = vec![per_col; cols];
         let mut row_vec: Vec<TableRow> = Vec::with_capacity(rows.max(1) as usize);
         for _ in 0..rows.max(1) {
             let mut cells = Vec::with_capacity(cols);
@@ -1442,7 +1446,15 @@ impl DocumentTree {
     pub fn insert_column(&self, table_path: BlockPath, after_col: u32) -> Self {
         self.mutate_table(table_path, |t| {
             let insert_at = (after_col as usize + 1).min(t.grid.len());
-            t.grid.insert(insert_at, 2880);
+            /* Re-divide the A4 content width across the new column
+            count so an inserted column shrinks the existing ones
+            instead of pushing the table past the right margin. */
+            let new_cols = t.grid.len() + 1;
+            let per_col = (DEFAULT_A4_CONTENT_TWIPS / new_cols.max(1) as i32).max(720);
+            t.grid.insert(insert_at, per_col);
+            for w in t.grid.iter_mut() {
+                *w = per_col;
+            }
             for row in &mut t.rows {
                 let cell_at = insert_at.min(row.cells.len());
                 row.cells.insert(cell_at, default_table_cell());
@@ -1614,6 +1626,12 @@ fn top_level_block_index(path: &BlockPath) -> Option<u32> {
 /// point ≈ 0.5 pt single black line. Word's out-of-the-box border
 /// weight; matches what `<w:tblBorders>` emits on `Normal.dotx`.
 const DEFAULT_BORDER_SIZE_EIGHTH_PT: u16 = 4;
+
+/// A4 content width in twips (595 pt − 2 × 72 pt margins = 451 pt;
+/// 1 pt = 20 twips → 9020 twips). Used to seed a fresh table's grid
+/// so the table fits inside the page margins on insert. Phase 5c
+/// will switch to `<w:tblLayout w:type="autofit"/>`.
+const DEFAULT_A4_CONTENT_TWIPS: i32 = 9020;
 
 /// Word-style default cell-edge stroke — single 0.5 pt black.
 pub fn default_word_stroke() -> BorderStroke {
