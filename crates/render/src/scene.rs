@@ -127,11 +127,13 @@ pub fn build_page_scene(page: &PageBox) -> DisplayList {
     build_document_scene(std::slice::from_ref(page), 0.0)
 }
 
-/// Vertical gap between consecutive pages, in layout pixels at scale=1.
-/// Phase 6 uses a small visible gap so a section break / overflow shows
-/// up in the rendered document; the renderer multiplies by `scale` at the
-/// call site.
-pub const PAGE_GAP_PT: f32 = 12.0;
+/// Vertical gap between consecutive pages, in layout points at `scale = 1`.
+/// `48 pt` × `4/3 screen-DPI scale` ≈ 64 CSS px between pages — wide
+/// enough that desk-grey clearly separates one A4 sheet from the next
+/// and the eye reads them as physically distinct cards. The renderer
+/// multiplies by `scale` at the call site, so the gap grows / shrinks
+/// with the document zoom.
+pub const PAGE_GAP_PT: f32 = 48.0;
 
 /// Phase 6 — lower a paginated document (one or more `PageBox`es) into a
 /// single `DisplayList`. Pages stack vertically with `gap` pt of empty

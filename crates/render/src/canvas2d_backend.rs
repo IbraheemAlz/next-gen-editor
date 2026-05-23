@@ -142,23 +142,36 @@ pub fn render_canvas2d(
             }
             DisplayCmd::DrawPageCard { rect } => {
                 /* UI polish — Google Docs / Word print-layout sheet:
-                a white rectangle with a soft drop shadow. `save` /
-                `restore` brackets so the shadow state does NOT leak
-                into the subsequent text + glyph draws (Canvas2D's
-                `shadow*` properties apply to every fill/stroke until
-                reset, which would tint glyphs with a halo).
-                Shadow blur + offset scale with the device-pixel ratio
-                — Canvas2D shadow units are device px, so on a 2× DPR
-                display the values below are doubled visually. We use
-                the nominal 24/8 because the canvas backing is already
-                sized at `scale × layout px` (Phase 6b), so shadow
-                offsets get the same scaling as everything else. */
+                a white rectangle with a soft drop shadow wrapping all
+                four sides so each card reads as a distinct A4 sheet
+                floating on the gray desk. `save` / `restore` brackets
+                so the shadow state does NOT leak into the subsequent
+                text + glyph draws (Canvas2D's `shadow*` properties
+                apply to every fill/stroke until reset, which would
+                halo every glyph).
+
+                Two-pass shadow stack: a strong, tight blur (offset_y=0)
+                gives the sharp edge ring; a wider, lower-opacity blur
+                with offset_y=12 carries the "weight" of the page down
+                into the desk. Both shadow draws emit a single white
+                fill_rect each, so we pay just 2 extra fills per card.
+                Shadow units are device px — the canvas backing scales
+                with `scale = dpr * 4/3`, so the values below get the
+                same screen-DPI lift as everything else. */
                 ctx.save();
-                ctx.set_shadow_color("rgba(60, 64, 67, 0.30)");
-                ctx.set_shadow_blur(24.0);
+                /* Pass 1 — tight edge ring on all four sides. */
+                ctx.set_shadow_color("rgba(60, 64, 67, 0.20)");
+                ctx.set_shadow_blur(8.0);
                 ctx.set_shadow_offset_x(0.0);
-                ctx.set_shadow_offset_y(8.0);
+                ctx.set_shadow_offset_y(0.0);
                 ctx.set_fill_style_str("#ffffff");
+                ctx.fill_rect(rect.x0, rect.y0, rect.width(), rect.height());
+                /* Pass 2 — wider, softer "ambient" shadow falling down
+                into the desk; layered on top of the existing white
+                fill so the underside of the card has extra weight. */
+                ctx.set_shadow_color("rgba(60, 64, 67, 0.18)");
+                ctx.set_shadow_blur(32.0);
+                ctx.set_shadow_offset_y(12.0);
                 ctx.fill_rect(rect.x0, rect.y0, rect.width(), rect.height());
                 ctx.restore();
             }
