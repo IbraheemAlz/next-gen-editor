@@ -1340,6 +1340,29 @@ fn walk_block(
     }
 }
 
+/// Collect every paragraph's text in document order (top-level
+/// paragraphs first, then each table's rows × cells × cell.blocks,
+/// skipping `VMergeRole::Continue` cells). Order must match
+/// `format_pdf::for_each_paragraph` so the PDF `/ToUnicode` CMap
+/// aligns with the laid-out paragraph stream.
+fn walk_block_texts<'a>(block: &'a engine::Block, out: &mut Vec<&'a str>) {
+    match block {
+        engine::Block::Paragraph(p) => out.push(p.text.as_str()),
+        engine::Block::Table(t) => {
+            for row in &t.rows {
+                for cell in &row.cells {
+                    if cell.props.v_merge == engine::VMergeRole::Continue {
+                        continue;
+                    }
+                    for b in &cell.blocks {
+                        walk_block_texts(b, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn collect_paragraph_paths_vec(
     blocks: &[engine::Block],
     prefix: &mut Vec<EnginePathStep>,
@@ -2391,7 +2414,7 @@ impl Engine {
     fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
         /* `false` — a PDF export is the committed document, never the
         in-progress IME composition. */
-        let (page_box, font_stack, box_paths) = match self.build_page(1.0, false) {
+        let (page_box, font_stack, _box_paths) = match self.build_page(1.0, false) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -2399,27 +2422,17 @@ impl Engine {
             PdfConformance::A1b => format_pdf::PdfProfile::A1b,
             PdfConformance::A2u | PdfConformance::X3 => format_pdf::PdfProfile::Plain,
         };
-        /* Per-paragraph source text, aligned with the emitted paragraph
-        boxes — the PDF `/ToUnicode` CMap resolves each glyph's cluster
-        against it so the exported text stays selectable. Tables emit no
-        per-paragraph text (PDF table export is Phase 5b — see
-        BACKLOG.md). */
+        /* Per-paragraph source text, aligned with `for_each_paragraph`
+        on the layout side — the `/ToUnicode` CMap resolves each
+        glyph's cluster against it so exported text stays selectable.
+        Phase 5b: walk top-level paragraphs *and* recurse into table
+        cells (skipping `VMergeRole::Continue`, matching the PDF
+        emitter's traversal). */
         let doc = self.undo.current();
-        let para_texts: Vec<&str> = page_box
-            .blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, lb)| match lb {
-                LayoutBlock::Paragraph(_) => Some(
-                    box_paths
-                        .get(i)
-                        .and_then(|p| doc.paragraph_at_path(p))
-                        .map(|p| p.text.as_str())
-                        .unwrap_or(""),
-                ),
-                _ => None,
-            })
-            .collect();
+        let mut para_texts: Vec<&str> = Vec::new();
+        for b in doc.blocks.iter() {
+            walk_block_texts(b, &mut para_texts);
+        }
         let mut bytes: Vec<u8> = Vec::new();
         if let Err(e) =
             format_pdf::export_pdf(&page_box, &font_stack, &para_texts, profile, &mut bytes)

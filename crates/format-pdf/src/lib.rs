@@ -37,7 +37,7 @@
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use layout::{LayoutBlock, PageBox, VisualRun};
+use layout::{LayoutBlock, PageBox, ParagraphBox, TableBox, VisualRun};
 use pdf_writer::types::{CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, UnicodeCmap};
 use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
 use std::collections::{BTreeMap, HashMap};
@@ -110,9 +110,7 @@ pub fn export_pdf(
 
     /* Distinct fonts referenced by the page, in first-seen order. */
     let mut used: Vec<&str> = Vec::new();
-    /* Phase 5 PR 2 — tables skip the font collection pass; PDF table
-    export is Phase 5b (RFC §3.2). */
-    for para in page.blocks.iter().filter_map(LayoutBlock::as_paragraph) {
+    for_each_paragraph(&page.blocks, &mut |para| {
         for line in &para.lines {
             for run in &line.runs {
                 if !used.contains(&run.font.as_str()) {
@@ -120,7 +118,7 @@ pub fn export_pdf(
                 }
             }
         }
-    }
+    });
 
     let mut pdf = Pdf::new();
     /* PDF/A-1 is defined against PDF 1.4 — declare it so the header agrees. */
@@ -240,50 +238,258 @@ pub fn export_pdf(
 /// Glyphs are placed by an absolute text matrix rather than relying on the PDF
 /// font's advances — our advances carry justification + Kashida adjustments the
 /// font's own metrics do not.
+///
+/// Three passes per page so the text state machine and the graphics state
+/// machine don't collide:
+///
+/// 1. **Shading.** Cell `<w:shd>` fills as `re` / `f` outside any text block.
+/// 2. **Text.** Single `BT`/`ET` envelope; every paragraph (top-level + cell)
+///    emits its glyphs via an absolute text matrix.
+/// 3. **Borders.** Cell + table-outer strokes as `re` / `S` paths.
+///
+/// The order mirrors `crates/render/src/scene.rs::paint_table` so PDF and
+/// Canvas2D agree on layering: shading sits behind content, borders sit on
+/// top.
 fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
     let page_h = page.size.height;
-    let mut content = Content::new();
-    content.begin_text();
-
     let content_x = page.margins.left;
     let content_y = page.margins.top;
-    /* Phase 5 PR 2 — tables silently skip on the PDF path. PDF table
-    export is deferred to Phase 5b per RFC §3.2; warning surfaced via
-    `note_skipped_block` (callers inspect `PdfExportReport`). */
-    for para in page.blocks.iter().filter_map(LayoutBlock::as_paragraph) {
-        let para_x = content_x + para.origin.x;
-        let para_y = content_y + para.origin.y;
-        for line in &para.lines {
-            let line_x = para_x + line.origin.x;
-            /* Layout-space baseline — distance down from the page top. */
-            let baseline = para_y + line.origin.y + line.baseline;
-            let mut pen = 0.0_f32;
-            for run in &line.runs {
-                let Some((_, fo)) = font_objs.iter().find(|(id, _)| id == &run.font) else {
-                    continue;
-                };
-                let [r, g, b, _] = run.attrs.color;
-                content.set_font(Name(fo.resource.as_bytes()), run.attrs.px_size);
-                content.set_fill_rgb(
-                    f32::from(r) / 255.0,
-                    f32::from(g) / 255.0,
-                    f32::from(b) / 255.0,
-                );
-                for glyph in &run.glyphs {
-                    let gx = line_x + pen + glyph.x_offset;
-                    /* Invert the y axis: PDF origin is bottom-left. */
-                    let gy = page_h - (baseline - glyph.y_offset);
-                    content.set_text_matrix([1.0, 0.0, 0.0, 1.0, gx, gy]);
-                    let id = glyph.id;
-                    content.show(Str(&[(id >> 8) as u8, (id & 0xff) as u8]));
-                    pen += glyph.x_advance;
+    let mut content = Content::new();
+
+    /* Pass 1 — cell shading. */
+    for block in &page.blocks {
+        if let LayoutBlock::Table(t) = block {
+            emit_table_shading(&mut content, page_h, content_x, content_y, t);
+        }
+    }
+
+    /* Pass 2 — every paragraph's glyphs (top-level + cell content),
+    in document order. */
+    content.begin_text();
+    for block in &page.blocks {
+        match block {
+            LayoutBlock::Paragraph(p) => {
+                emit_paragraph_text(&mut content, page_h, content_x, content_y, p, font_objs);
+            }
+            LayoutBlock::Table(t) => {
+                emit_table_text(&mut content, page_h, content_x, content_y, t, font_objs);
+            }
+        }
+    }
+    content.end_text();
+
+    /* Pass 3 — cell + table-outer borders. */
+    for block in &page.blocks {
+        if let LayoutBlock::Table(t) = block {
+            emit_table_borders(&mut content, page_h, content_x, content_y, t);
+        }
+    }
+
+    content.finish().to_vec()
+}
+
+/// Emit text for one `ParagraphBox`. `origin_x` / `origin_y` are the
+/// containing block's origin in absolute layout-px (top-left); the
+/// paragraph's own origin is added on top. PDF y is bottom-up — every
+/// glyph's y inverts via `page_h - layout_y`.
+fn emit_paragraph_text(
+    content: &mut Content,
+    page_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    para: &ParagraphBox,
+    font_objs: &[(String, FontObj)],
+) {
+    let para_x = origin_x + para.origin.x;
+    let para_y = origin_y + para.origin.y;
+    for line in &para.lines {
+        let line_x = para_x + line.origin.x;
+        /* Layout-space baseline — distance down from the page top. */
+        let baseline = para_y + line.origin.y + line.baseline;
+        let mut pen = 0.0_f32;
+        for run in &line.runs {
+            let Some((_, fo)) = font_objs.iter().find(|(id, _)| id == &run.font) else {
+                continue;
+            };
+            let [r, g, b, _] = run.attrs.color;
+            content.set_font(Name(fo.resource.as_bytes()), run.attrs.px_size);
+            content.set_fill_rgb(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+            );
+            for glyph in &run.glyphs {
+                let gx = line_x + pen + glyph.x_offset;
+                /* Invert the y axis: PDF origin is bottom-left. */
+                let gy = page_h - (baseline - glyph.y_offset);
+                content.set_text_matrix([1.0, 0.0, 0.0, 1.0, gx, gy]);
+                let id = glyph.id;
+                content.show(Str(&[(id >> 8) as u8, (id & 0xff) as u8]));
+                pen += glyph.x_advance;
+            }
+        }
+    }
+}
+
+/// Pass 1 — cell `<w:shd>` fills. Continue cells are skipped (the
+/// matching Restart cell visually owns the merged region).
+fn emit_table_shading(
+    content: &mut Content,
+    page_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    t: &TableBox,
+) {
+    let tx = origin_x + t.origin.x;
+    let ty = origin_y + t.origin.y;
+    for row in &t.rows {
+        let row_x = tx + row.origin.x;
+        let row_y = ty + row.origin.y;
+        for cell in &row.cells {
+            if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                continue;
+            }
+            let Some([r, g, b, _]) = cell.shading else {
+                continue;
+            };
+            let cell_x = row_x + cell.origin.x;
+            let cell_y = row_y + cell.origin.y;
+            /* Layout-top-left → PDF-bottom-left: the rect's PDF y is
+            the bottom of the cell band in PDF space, i.e.
+            `page_h - (cell_y + cell.size.height)`. The rect grows
+            upward by `cell.size.height`. */
+            let pdf_y = page_h - (cell_y + cell.size.height);
+            content.set_fill_rgb(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+            );
+            content.rect(cell_x, pdf_y, cell.size.width, cell.size.height);
+            content.fill_nonzero();
+        }
+    }
+}
+
+/// Pass 2 (text) — recurse into every cell's `LayoutBlock` content and
+/// re-enter `emit_paragraph_text` with the cell's absolute origin.
+fn emit_table_text(
+    content: &mut Content,
+    page_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    t: &TableBox,
+    font_objs: &[(String, FontObj)],
+) {
+    let tx = origin_x + t.origin.x;
+    let ty = origin_y + t.origin.y;
+    for row in &t.rows {
+        let row_x = tx + row.origin.x;
+        let row_y = ty + row.origin.y;
+        for cell in &row.cells {
+            if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                continue;
+            }
+            let cell_x = row_x + cell.origin.x;
+            let cell_y = row_y + cell.origin.y;
+            for inner in &cell.content {
+                match inner {
+                    LayoutBlock::Paragraph(p) => {
+                        emit_paragraph_text(content, page_h, cell_x, cell_y, p, font_objs);
+                    }
+                    LayoutBlock::Table(nested) => {
+                        emit_table_text(content, page_h, cell_x, cell_y, nested, font_objs);
+                    }
                 }
             }
         }
     }
+}
 
-    content.end_text();
-    content.finish().to_vec()
+/// Pass 3 — every cell edge + the outer-table perimeter as PDF strokes.
+/// Uses the same "right + bottom win" convention as `paint_table` so the
+/// PDF doesn't double-stroke shared edges.
+fn emit_table_borders(
+    content: &mut Content,
+    page_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    t: &TableBox,
+) {
+    let tx = origin_x + t.origin.x;
+    let ty = origin_y + t.origin.y;
+    for row in &t.rows {
+        let row_x = tx + row.origin.x;
+        let row_y = ty + row.origin.y;
+        for cell in &row.cells {
+            if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                continue;
+            }
+            let cell_x = row_x + cell.origin.x;
+            let cell_y = row_y + cell.origin.y;
+            let cx1 = cell_x + cell.size.width;
+            let cy1 = cell_y + cell.size.height;
+            stroke_border_edge(
+                content,
+                page_h,
+                &cell.borders.top,
+                cell_x,
+                cell_y,
+                cx1,
+                cell_y,
+            );
+            stroke_border_edge(
+                content,
+                page_h,
+                &cell.borders.left,
+                cell_x,
+                cell_y,
+                cell_x,
+                cy1,
+            );
+            stroke_border_edge(content, page_h, &cell.borders.right, cx1, cell_y, cx1, cy1);
+            stroke_border_edge(content, page_h, &cell.borders.bottom, cell_x, cy1, cx1, cy1);
+        }
+    }
+    let tx1 = tx + t.size.width;
+    let ty1 = ty + t.size.height;
+    stroke_border_edge(content, page_h, &t.outer_borders.top, tx, ty, tx1, ty);
+    stroke_border_edge(content, page_h, &t.outer_borders.left, tx, ty, tx, ty1);
+    stroke_border_edge(content, page_h, &t.outer_borders.right, tx1, ty, tx1, ty1);
+    stroke_border_edge(content, page_h, &t.outer_borders.bottom, tx, ty1, tx1, ty1);
+}
+
+/// Stroke one cell-edge segment as a PDF path. `(x0, y0)` and `(x1, y1)`
+/// are the edge's endpoints in *layout* coordinates (y-down); each is
+/// inverted before the `m` / `l` ops emit. `<w:sz>` is eighths of a
+/// point; 1 pt is the PDF user-space unit, so the line width is just
+/// `size_eighth_pt / 8.0`. Clamped to ≥ 0.25 so a stroke stays visible
+/// when a viewer renders at low zoom.
+fn stroke_border_edge(
+    content: &mut Content,
+    page_h: f32,
+    edge: &Option<engine::BorderStroke>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) {
+    let Some(stroke) = edge else { return };
+    if matches!(stroke.style, engine::BorderStyle::None) {
+        return;
+    }
+    let weight = ((stroke.size_eighth_pt as f32) / 8.0).max(0.25);
+    let [r, g, b, _] = stroke.color.unwrap_or([0, 0, 0, 255]);
+    content.set_stroke_rgb(
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+    );
+    content.set_line_width(weight);
+    let py0 = page_h - y0;
+    let py1 = page_h - y1;
+    content.move_to(x0, py0);
+    content.line_to(x1, py1);
+    content.stroke();
 }
 
 /// Embed one face as a `Type0` / `CIDFontType2` font with the TrueType bytes in
@@ -343,6 +549,31 @@ fn deflate(data: &[u8]) -> Vec<u8> {
     enc.finish().expect("zlib finish into a Vec cannot fail")
 }
 
+/// Depth-first walk of every paragraph emitted by a page, in
+/// document order: top-level paragraphs first, then each table's
+/// rows × cells × cell.content (skipping `VMergeRole::Continue`
+/// cells — they share their content with the Restart cell above
+/// them and a second emission would double-count fonts + text). The
+/// order matches `emit_table_text` so callers indexing into a
+/// flattened paragraph list stay aligned.
+fn for_each_paragraph<'a, F: FnMut(&'a ParagraphBox)>(blocks: &'a [LayoutBlock], f: &mut F) {
+    for b in blocks {
+        match b {
+            LayoutBlock::Paragraph(p) => f(p),
+            LayoutBlock::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                            continue;
+                        }
+                        for_each_paragraph(&cell.content, f);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Harvest a glyph-id → Unicode map, per font, from the laid-out page.
 ///
 /// `para_texts[i]` is the source text of `page.paragraphs[i]`. Every glyph
@@ -356,22 +587,17 @@ fn collect_to_unicode(
     para_texts: &[&str],
 ) -> HashMap<String, BTreeMap<u16, Vec<char>>> {
     let mut out: HashMap<String, BTreeMap<u16, Vec<char>>> = HashMap::new();
-    for (pi, para) in page
-        .blocks
-        .iter()
-        .filter_map(LayoutBlock::as_paragraph)
-        .enumerate()
-    {
-        let Some(&text) = para_texts.get(pi) else {
-            continue;
-        };
+    let mut idx = 0usize;
+    for_each_paragraph(&page.blocks, &mut |para| {
+        let text = para_texts.get(idx).copied().unwrap_or("");
+        idx += 1;
         for line in &para.lines {
             for run in &line.runs {
                 let map = out.entry(run.font.clone()).or_default();
                 add_run_mappings(run, text, map);
             }
         }
-    }
+    });
     out
 }
 
@@ -525,6 +751,91 @@ mod tests {
         assert!(
             out.windows(10).any(|w| w == b"/FontFile2"),
             "font not embedded"
+        );
+    }
+
+    /// Phase 5b — a `TableBox` exports cleanly. The previous stub
+    /// silently skipped tables; this asserts the cell paragraph
+    /// contributed a font + the PDF carries the rect-fill + path-
+    /// stroke operators a viewer needs to paint shading + borders.
+    #[test]
+    fn table_exports_with_shading_and_borders() {
+        let stack = liberation_stack();
+        let spans = vec![StyleSpan {
+            start: 0,
+            end: "hi".len() as u32,
+            px_size: 18.0,
+            color: [0, 0, 0, 255],
+            bold: false,
+            italic: false,
+            underline: false,
+            strike: false,
+            bg_color: None,
+            font_family: None,
+        }];
+        let para = layout_paragraph(ParagraphConfig {
+            text: "hi",
+            fonts: &stack,
+            spans: &spans,
+            base_direction: ShapingDirection::Ltr,
+            max_width: 200.0,
+            line_height: 22.0,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 22.0,
+        });
+        let cell_borders = engine::default_word_borders();
+        let cell = layout::TableCellBox {
+            origin: layout::Point { x: 0.0, y: 0.0 },
+            size: layout::Size {
+                width: 200.0,
+                height: 30.0,
+            },
+            grid_span: 1,
+            v_merge: engine::VMergeRole::None,
+            borders: cell_borders.clone(),
+            shading: Some([0xFF, 0xEB, 0x78, 0xFF]),
+            content: vec![LayoutBlock::Paragraph(para)],
+        };
+        let row = layout::TableRowBox {
+            origin: layout::Point { x: 0.0, y: 0.0 },
+            size: layout::Size {
+                width: 200.0,
+                height: 30.0,
+            },
+            cells: vec![cell],
+        };
+        let table = TableBox {
+            origin: layout::Point { x: 0.0, y: 100.0 },
+            size: layout::Size {
+                width: 200.0,
+                height: 30.0,
+            },
+            columns: vec![200.0],
+            rows: vec![row],
+            outer_borders: cell_borders,
+        };
+        let page = PageBox {
+            size: Size {
+                width: 595.0,
+                height: 842.0,
+            },
+            margins: Margins::uniform(72.0),
+            blocks: vec![LayoutBlock::Table(table)],
+        };
+        let mut out = Vec::new();
+        export_pdf(&page, &stack, &["hi"], PdfProfile::Plain, &mut out).expect("export table");
+        assert!(out.starts_with(b"%PDF-"));
+        assert!(out.ends_with(b"%%EOF"));
+        /* The cell's paragraph must reach the font-embedding pass —
+        without the cell-recursion fix this would be 0 fonts. */
+        assert!(
+            out.windows(10).any(|w| w == b"/FontFile2"),
+            "cell paragraph must contribute its font to the embedded set"
         );
     }
 

@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "PDF export — box tree to PDF content streams with full font embedding."
 
 [dependencies]
+engine = { path = "../engine" }
 layout = { path = "../layout" }
 text-pipeline = { path = "../text-pipeline" }
 pdf-writer = { workspace = true }
