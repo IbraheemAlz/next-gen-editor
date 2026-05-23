@@ -150,12 +150,17 @@ DOM components plus the bridge wire shapes that the UI needs.
       paragraph's font. veraPDF binary remains a host-tool
       dependency — `tools/pdf-validate` reports "skipped" when not
       on PATH, same as the Phase 5 release pipeline.
-- [ ] **Page-break handling on PDF.** *Still deferred — engine
-      produces a single `PageBox` today.* The "rows whole-only"
-      rule kicks in only when the layout exceeds one page; the
-      multi-page page builder is a separate backlog item, so PDF
-      pagination tracks it. Single-page tables export cleanly
-      under PR 5b.
+- [ ] **Multi-page PDF pagination + "rows whole-only" page-break.**
+      *Deferred — blocked on Phase 6 (Sections & Paginator).* The
+      engine builds a single `PageBox` today, so the
+      "rows-whole-only" overflow rule has nothing to trigger
+      against. `format-pdf::export_pdf` already accepts a
+      `&[PageBox]` slice and emits one PDF page per entry (Phase 5b
+      groundwork), so the moment Phase 6 lands a real paginator
+      this becomes a one-line wiring change: feed the paginated
+      page sequence in. Until then, single-page tables export
+      cleanly under PR 5b and tall tables clip at the page bottom.
+      *Unblocked by:* Phase 6 — Sections & Paginator.
 
 ---
 
