@@ -7,9 +7,49 @@ use im::Vector;
 
 pub mod html;
 
+/// Top-level document block (Phase 5 PR 1). Tables sit alongside
+/// paragraphs in the body; future block variants (Phase 7 floating
+/// images, Phase 8 footnotes) extend this enum.
+#[derive(Debug, Clone)]
+pub enum Block {
+    Paragraph(Paragraph),
+    Table(Table),
+}
+
+impl Block {
+    pub fn as_paragraph(&self) -> Option<&Paragraph> {
+        match self {
+            Block::Paragraph(p) => Some(p),
+            Block::Table(_) => None,
+        }
+    }
+    pub fn as_paragraph_mut(&mut self) -> Option<&mut Paragraph> {
+        match self {
+            Block::Paragraph(p) => Some(p),
+            Block::Table(_) => None,
+        }
+    }
+    pub fn as_table(&self) -> Option<&Table> {
+        match self {
+            Block::Table(t) => Some(t),
+            Block::Paragraph(_) => None,
+        }
+    }
+    pub fn as_table_mut(&mut self) -> Option<&mut Table> {
+        match self {
+            Block::Table(t) => Some(t),
+            Block::Paragraph(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DocumentTree {
-    pub paragraphs: Vector<Paragraph>,
+    /// Top-level block sequence. Previously a flat `Vector<Paragraph>`;
+    /// Phase 5 PR 1 widened it to `Vector<Block>` so tables can appear at
+    /// any document position. Still `im::Vector` so undo snapshots clone
+    /// in O(1) — table cells use plain `Vec<Block>` instead.
+    pub blocks: Vector<Block>,
 }
 
 /// A selectable font family (Backlog #9). `engine-wasm` resolves it to a
@@ -441,6 +481,168 @@ impl Paragraph {
     }
 }
 
+/* ===================================================================
+Phase 5 PR 1 — Table model
+==================================================================== */
+
+/// Border line style (`<w:val>` on `<w:left>` / `<w:top>` / …).
+/// Phase 5 PR 1 ships the common subset; `Other` preserves the
+/// original token for round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BorderStyle {
+    #[default]
+    Single,
+    Double,
+    Dotted,
+    Dashed,
+    None,
+    Other(String),
+}
+
+/// One border edge stroke. `size_eighth_pt` is `<w:sz>` (eighths of a
+/// point — the OOXML unit); divide by 8 to get points, by 6 to get px
+/// at 96 DPI.
+#[derive(Debug, Clone, Default)]
+pub struct BorderStroke {
+    pub style: BorderStyle,
+    pub size_eighth_pt: u16,
+    pub color: Option<[u8; 4]>,
+}
+
+/// Per-edge border strokes for a `<w:tcBorders>` or `<w:tblBorders>`.
+/// `inside_h` / `inside_v` only apply when carried at the table level
+/// (`<w:tblBorders>`); cell-level borders ignore them.
+#[derive(Debug, Clone, Default)]
+pub struct CellBorders {
+    pub top: Option<BorderStroke>,
+    pub left: Option<BorderStroke>,
+    pub bottom: Option<BorderStroke>,
+    pub right: Option<BorderStroke>,
+    pub inside_h: Option<BorderStroke>,
+    pub inside_v: Option<BorderStroke>,
+}
+
+/// `<w:tblCellMar>` default cell padding.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CellMargins {
+    pub top_twips: i32,
+    pub left_twips: i32,
+    pub bottom_twips: i32,
+    pub right_twips: i32,
+}
+
+/// `<w:tcW>` / `<w:tblW>` width — twips, percent (50-thousandths per
+/// OOXML), auto (content-driven), or nil (no width).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellWidth {
+    Dxa(i32),
+    Pct(u16),
+    Auto,
+    Nil,
+}
+
+/// `<w:vMerge>` — vertical merge role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VMergeRole {
+    /// Independent cell.
+    #[default]
+    None,
+    /// Top of a vertical span; renders its content, spans down through
+    /// every `Continue` cell directly below.
+    Restart,
+    /// Placeholder; content is ignored at render time (the `Restart`
+    /// cell visually owns the merged block).
+    Continue,
+}
+
+/// `<w:vAlign>` — vertical alignment of a cell's blocks within the
+/// cell bounding box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerticalAlign {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
+/// `<w:trHeight>` row height. `hRule` decides whether the value is a
+/// minimum, exact, or auto-fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowHeight {
+    Auto,
+    AtLeast { twips: i32 },
+    Exact { twips: i32 },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RowProperties {
+    pub height: Option<RowHeight>,
+    /// `<w:cantSplit/>` — row cannot break across pages. Phase 5a
+    /// treats this as implicit-on for every row (no mid-row pagination
+    /// yet). Carried verbatim for round-trip.
+    pub cant_split: bool,
+    /// `<w:tblHeader/>` — row repeats at the top of every page after
+    /// a break. Phase 5a captures but does not honour.
+    pub header: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CellProperties {
+    pub grid_span: u8,
+    pub v_merge: VMergeRole,
+    pub width: Option<CellWidth>,
+    pub borders: Option<CellBorders>,
+    pub shading: Option<[u8; 4]>,
+    pub v_align: VerticalAlign,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TableProperties {
+    pub width: Option<CellWidth>,
+    pub alignment: Option<Alignment>,
+    pub indent_twips: i32,
+    pub borders: Option<CellBorders>,
+    pub cell_margins: CellMargins,
+    pub table_style_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TableCell {
+    pub props: CellProperties,
+    /// Nested block sequence. `Vec`, not `im::Vector`: cells average
+    /// 1-2 paragraphs, so persistent-vector overhead is not worth the
+    /// structural-sharing win at that size (RFC §1.4).
+    pub blocks: Vec<Block>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TableRow {
+    pub props: RowProperties,
+    pub cells: Vec<TableCell>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Table {
+    /// `<w:tblGrid>` — column template widths in twips. Length is the
+    /// logical column count; cells with `grid_span > 1` consume
+    /// multiple template columns.
+    pub grid: Vec<i32>,
+    pub props: TableProperties,
+    pub rows: Vec<TableRow>,
+    /// Phase 3 passthrough mirror: `false` on load, `true` after any
+    /// mutation. Writer emits `source_xml` verbatim when clean.
+    pub dirty: bool,
+    /// Raw `<w:tbl>...</w:tbl>` source bytes captured by the reader.
+    /// `None` for engine-synthesised tables.
+    pub source_xml: Option<Vec<u8>>,
+}
+
+/* ===================================================================
+LogicalPos — paragraph-flat addressing (Phase 5 PR 1 shim).
+Phase 5 PR 3 will widen this to `BlockPath`; for now `para` is the
+*paragraph index skipping tables*, matching every Phase 4 caller.
+==================================================================== */
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogicalPos {
     pub para: u32,
@@ -451,14 +653,14 @@ pub struct LogicalPos {
 impl DocumentTree {
     pub fn new() -> Self {
         Self {
-            paragraphs: Vector::new(),
+            blocks: Vector::new(),
         }
     }
 
     /// Build a single-paragraph document from a plain string.
     pub fn from_text(text: &str) -> Self {
-        let mut paragraphs = Vector::new();
-        paragraphs.push_back(Paragraph {
+        let mut blocks = Vector::new();
+        blocks.push_back(Block::Paragraph(Paragraph {
             text: text.to_owned(),
             spans: Vec::new(),
             props: ParaProperties::default(),
@@ -466,15 +668,15 @@ impl DocumentTree {
             resolved_marker: None,
             dirty: false,
             source_xml: None,
-        });
-        Self { paragraphs }
+        }));
+        Self { blocks }
     }
 
     /// Build a document from a list of paragraph plain-text bodies.
     pub fn from_paragraphs<I: IntoIterator<Item = String>>(texts: I) -> Self {
-        let mut paragraphs = Vector::new();
+        let mut blocks = Vector::new();
         for t in texts {
-            paragraphs.push_back(Paragraph {
+            blocks.push_back(Block::Paragraph(Paragraph {
                 text: t,
                 spans: Vec::new(),
                 props: ParaProperties::default(),
@@ -482,39 +684,144 @@ impl DocumentTree {
                 resolved_marker: None,
                 dirty: false,
                 source_xml: None,
-            });
+            }));
         }
-        Self { paragraphs }
+        Self { blocks }
     }
 
     /// Build a document from pre-styled paragraphs — the `.docx` reader (run
     /// properties → spans) and the HTML paste path both produce these.
     pub fn from_rich_paragraphs<I: IntoIterator<Item = Paragraph>>(paras: I) -> Self {
-        let mut paragraphs = Vector::new();
+        let mut blocks = Vector::new();
         for p in paras {
-            paragraphs.push_back(p);
+            blocks.push_back(Block::Paragraph(p));
         }
-        Self { paragraphs }
+        Self { blocks }
     }
 
+    /// Build a document from a pre-mixed block sequence — the `.docx` reader
+    /// (with tables) produces these. Phase 5 PR 1 entry point.
+    pub fn from_blocks<I: IntoIterator<Item = Block>>(blocks_in: I) -> Self {
+        let mut blocks = Vector::new();
+        for b in blocks_in {
+            blocks.push_back(b);
+        }
+        Self { blocks }
+    }
+
+    /* ============================================================
+    Phase 5 PR 1 — paragraph-flat shim
+    Treats `Block::Table` as inert. `LogicalPos.para` is an index
+    into the paragraph-flat view (skipping tables). PR 3 will widen
+    to `BlockPath`.
+    ============================================================ */
+
+    /// Number of `Block::Paragraph`s in the doc, skipping tables.
     pub fn paragraph_count(&self) -> u32 {
-        self.paragraphs.len() as u32
+        self.blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Paragraph(_)))
+            .count() as u32
+    }
+
+    /// Total block count (paragraphs + tables).
+    pub fn block_count(&self) -> u32 {
+        self.blocks.len() as u32
+    }
+
+    /// The Nth `Block::Paragraph`, skipping tables. Phase 5 PR 1 shim
+    /// that keeps Phase 1-4 callers working unchanged. Phase 5 PR 3
+    /// widens callers to `BlockPath`.
+    pub fn nth_paragraph(&self, n: u32) -> Option<&Paragraph> {
+        self.blocks
+            .iter()
+            .filter_map(Block::as_paragraph)
+            .nth(n as usize)
+    }
+
+    /// Iterator over every `Block::Paragraph`, skipping tables. **Phase 5
+    /// migration shim.** Phase 5 PR 3 removes this — switch every caller
+    /// to `.blocks` + `match Block` once `BlockPath` lands. We do NOT
+    /// `#[deprecated]` it during the migration window because `-D warnings`
+    /// would block compilation of every still-paragraph-flat consumer.
+    pub fn paragraphs(&self) -> impl Iterator<Item = &Paragraph> {
+        self.blocks.iter().filter_map(Block::as_paragraph)
     }
 
     pub fn paragraph_text(&self, idx: u32) -> Option<&str> {
-        self.paragraphs.get(idx as usize).map(|p| p.text.as_str())
+        self.nth_paragraph(idx).map(|p| p.text.as_str())
     }
 
     pub fn end_of_document(&self) -> LogicalPos {
-        if self.paragraphs.is_empty() {
+        let count = self.paragraph_count();
+        if count == 0 {
             return LogicalPos { para: 0, offset: 0 };
         }
-        let last = self.paragraphs.len() - 1;
-        let offset = self.paragraphs[last].text.len() as u32;
+        let last_para = count - 1;
+        let offset = self
+            .nth_paragraph(last_para)
+            .map(|p| p.text.len() as u32)
+            .unwrap_or(0);
         LogicalPos {
-            para: last as u32,
+            para: last_para,
             offset,
         }
+    }
+
+    /// Mutate the Nth paragraph in place. Returns the new `Vector<Block>`
+    /// or `None` when the index is out of range. Walks blocks once to
+    /// find the target, then clones the paragraph and runs `f`.
+    fn map_paragraph<F>(blocks: &mut Vector<Block>, n: u32, f: F) -> Option<()>
+    where
+        F: FnOnce(&mut Paragraph),
+    {
+        let mut seen = 0u32;
+        for i in 0..blocks.len() {
+            if matches!(blocks[i], Block::Paragraph(_)) {
+                if seen == n {
+                    let mut b = blocks[i].clone();
+                    if let Block::Paragraph(ref mut p) = b {
+                        f(p);
+                    }
+                    blocks.set(i, b);
+                    return Some(());
+                }
+                seen += 1;
+            }
+        }
+        None
+    }
+
+    /// Replace the Nth paragraph with `replacement` (one paragraph).
+    fn replace_paragraph(blocks: &mut Vector<Block>, n: u32, replacement: Paragraph) -> Option<()> {
+        let bi = Self::find_paragraph_block_idx(blocks, n)?;
+        blocks.set(bi, Block::Paragraph(replacement));
+        Some(())
+    }
+
+    /// Insert `paragraph` immediately *after* the Nth paragraph (or at
+    /// the document end when `n + 1 == paragraph_count`).
+    fn insert_paragraph_after(
+        blocks: &mut Vector<Block>,
+        n: u32,
+        paragraph: Paragraph,
+    ) -> Option<()> {
+        let bi = Self::find_paragraph_block_idx(blocks, n)?;
+        blocks.insert(bi + 1, Block::Paragraph(paragraph));
+        Some(())
+    }
+
+    fn find_paragraph_block_idx(blocks: &Vector<Block>, n: u32) -> Option<usize> {
+        let mut seen = 0u32;
+        for i in 0..blocks.len() {
+            if matches!(blocks[i], Block::Paragraph(_)) {
+                if seen == n {
+                    return Some(i);
+                }
+                seen += 1;
+            }
+        }
+        None
     }
 
     /// Insert `text` at `at`. Out-of-range positions are clamped to end of
@@ -524,9 +831,10 @@ impl DocumentTree {
         if text.is_empty() {
             return self.clone();
         }
-        let mut paragraphs = self.paragraphs.clone();
-        if paragraphs.is_empty() {
-            paragraphs.push_back(Paragraph {
+        let mut blocks = self.blocks.clone();
+        let count = self.paragraph_count();
+        if count == 0 {
+            blocks.push_back(Block::Paragraph(Paragraph {
                 text: text.to_owned(),
                 spans: Vec::new(),
                 props: ParaProperties::default(),
@@ -534,74 +842,80 @@ impl DocumentTree {
                 resolved_marker: None,
                 dirty: true,
                 source_xml: None,
-            });
-            return Self { paragraphs };
+            }));
+            return Self { blocks };
         }
-        let para_idx = (at.para as usize).min(paragraphs.len() - 1);
-        let mut para = paragraphs[para_idx].clone();
-        let offset = (at.offset as usize).min(para.text.len());
-        para.text.insert_str(offset, text);
-        /* Shift styled spans across the insertion point — a span containing
-        the point grows, spans wholly after it slide right. */
-        let off = offset as u32;
-        let len = text.len() as u32;
-        for s in &mut para.spans {
-            if s.start >= off {
-                s.start += len;
+        let para_idx = at.para.min(count - 1);
+        Self::map_paragraph(&mut blocks, para_idx, |para| {
+            let offset = (at.offset as usize).min(para.text.len());
+            para.text.insert_str(offset, text);
+            /* Shift styled spans across the insertion point — a span
+            containing the point grows, spans wholly after it slide right. */
+            let off = offset as u32;
+            let len = text.len() as u32;
+            for s in &mut para.spans {
+                if s.start >= off {
+                    s.start += len;
+                }
+                if s.end > off {
+                    s.end += len;
+                }
             }
-            if s.end > off {
-                s.end += len;
-            }
-        }
-        para.dirty = true;
-        para.source_xml = None;
-        paragraphs.set(para_idx, para);
-        Self { paragraphs }
+            para.dirty = true;
+            para.source_xml = None;
+        });
+        Self { blocks }
     }
 
     /// Apply a style `patch` over the logical range `[start, end)`. Splits and
     /// merges spans on every covered paragraph; unaffected paragraphs are
     /// structurally shared.
     pub fn apply_style(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
-        let mut paragraphs = self.paragraphs.clone();
-        if paragraphs.is_empty() {
+        let count = self.paragraph_count();
+        if count == 0 {
             return self.clone();
         }
-        let last_idx = paragraphs.len() - 1;
-        let first = (start.para as usize).min(last_idx);
-        let last = (end.para as usize).min(last_idx);
+        let mut blocks = self.blocks.clone();
+        let last_idx = count - 1;
+        let first = start.para.min(last_idx);
+        let last = end.para.min(last_idx);
         for p in first..=last {
             let lo = if p == first { start.offset } else { 0 };
-            let hi = if p == last {
-                end.offset
-            } else {
-                paragraphs[p].text.len() as u32
-            };
-            let styled = paragraphs[p].apply_style(lo, hi, patch);
-            paragraphs.set(p, styled);
+            let para_text_len = self
+                .nth_paragraph(p)
+                .map(|x| x.text.len() as u32)
+                .unwrap_or(0);
+            let hi = if p == last { end.offset } else { para_text_len };
+            let styled = self
+                .nth_paragraph(p)
+                .map(|src| src.apply_style(lo, hi, patch));
+            if let Some(styled) = styled {
+                Self::replace_paragraph(&mut blocks, p, styled);
+            }
         }
-        Self { paragraphs }
+        Self { blocks }
     }
 
     /// Set `align` on every paragraph the logical range `[start, end)` spans
     /// (Backlog #9). Paragraphs outside the range are structurally shared.
     /// `start`/`end` are expected in document order.
     pub fn set_alignment(&self, start: LogicalPos, end: LogicalPos, align: Alignment) -> Self {
-        let mut paragraphs = self.paragraphs.clone();
-        if paragraphs.is_empty() {
+        let count = self.paragraph_count();
+        if count == 0 {
             return self.clone();
         }
-        let last = paragraphs.len() - 1;
-        let first = (start.para as usize).min(last);
-        let final_para = (end.para as usize).min(last);
+        let mut blocks = self.blocks.clone();
+        let last = count - 1;
+        let first = start.para.min(last);
+        let final_para = end.para.min(last);
         for p in first..=final_para {
-            let mut para = paragraphs[p].clone();
-            para.props.alignment = Some(align);
-            para.dirty = true;
-            para.source_xml = None;
-            paragraphs.set(p, para);
+            Self::map_paragraph(&mut blocks, p, |para| {
+                para.props.alignment = Some(align);
+                para.dirty = true;
+                para.source_xml = None;
+            });
         }
-        Self { paragraphs }
+        Self { blocks }
     }
 
     /// Delete the logical range `[start, end)`. A range spanning paragraphs
@@ -612,41 +926,62 @@ impl DocumentTree {
         } else {
             (end, start)
         };
-        let mut paragraphs = self.paragraphs.clone();
-        if paragraphs.is_empty() {
+        let count = self.paragraph_count();
+        if count == 0 {
             return self.clone();
         }
-        let last = paragraphs.len() - 1;
-        let sp = (start.para as usize).min(last);
-        let ep = (end.para as usize).min(last);
+        let mut blocks = self.blocks.clone();
+        let last = count - 1;
+        let sp = start.para.min(last);
+        let ep = end.para.min(last);
         if sp == ep {
-            let edited = paragraphs[sp].delete_text(start.offset, end.offset);
-            paragraphs.set(sp, edited);
+            Self::map_paragraph(&mut blocks, sp, |para| {
+                *para = para.delete_text(start.offset, end.offset);
+            });
         } else {
-            let head = paragraphs[sp].split_at(start.offset).0;
-            let tail = paragraphs[ep].split_at(end.offset).1;
+            let head = self
+                .nth_paragraph(sp)
+                .map(|p| p.split_at(start.offset).0)
+                .unwrap_or_default();
+            let tail = self
+                .nth_paragraph(ep)
+                .map(|p| p.split_at(end.offset).1)
+                .unwrap_or_default();
             let merged = head.concat(&tail);
-            for _ in sp..ep {
-                paragraphs.remove(sp + 1);
+            /* Drop every block strictly between sp's paragraph block and
+            ep's paragraph block (inclusive of ep, exclusive of sp), then
+            replace sp with the merged paragraph. Intervening tables are
+            dropped too — matches Word's "delete across paragraphs eats
+            everything between" semantics. */
+            let sp_block =
+                Self::find_paragraph_block_idx(&blocks, sp).expect("sp exists in `count > 0` arm");
+            let ep_block =
+                Self::find_paragraph_block_idx(&blocks, ep).expect("ep exists in `count > 0` arm");
+            for _ in 0..(ep_block - sp_block) {
+                blocks.remove(sp_block + 1);
             }
-            paragraphs.set(sp, merged);
+            Self::replace_paragraph(&mut blocks, sp, merged);
         }
-        Self { paragraphs }
+        Self { blocks }
     }
 
     /// Split the paragraph at `at`, the break falling between the two halves.
     pub fn split_paragraph(&self, at: LogicalPos) -> Self {
-        let mut paragraphs = self.paragraphs.clone();
-        if paragraphs.is_empty() {
-            paragraphs.push_back(Paragraph::default());
-            paragraphs.push_back(Paragraph::default());
-            return Self { paragraphs };
+        let count = self.paragraph_count();
+        let mut blocks = self.blocks.clone();
+        if count == 0 {
+            blocks.push_back(Block::Paragraph(Paragraph::default()));
+            blocks.push_back(Block::Paragraph(Paragraph::default()));
+            return Self { blocks };
         }
-        let idx = (at.para as usize).min(paragraphs.len() - 1);
-        let (left, right) = paragraphs[idx].split_at(at.offset);
-        paragraphs.set(idx, left);
-        paragraphs.insert(idx + 1, right);
-        Self { paragraphs }
+        let idx = at.para.min(count - 1);
+        let (left, right) = self
+            .nth_paragraph(idx)
+            .map(|p| p.split_at(at.offset))
+            .unwrap_or_default();
+        Self::replace_paragraph(&mut blocks, idx, left);
+        Self::insert_paragraph_after(&mut blocks, idx, right);
+        Self { blocks }
     }
 
     /// Insert `text` at `at`, splitting it into separate paragraphs on every
@@ -684,29 +1019,41 @@ impl DocumentTree {
     /// Extract the logical range `[start, end)` as standalone paragraphs,
     /// style spans clipped and shifted to local offsets. Drives rich
     /// clipboard copy — HTML + `.docx`-fragment generation (Backlog #12).
+    /// **Tables in the spanned range are silently dropped at Phase 5 PR 1**
+    /// — clipboard fragments stay paragraph-only until PR 3 widens the
+    /// engine API to `Block`.
     pub fn slice(&self, start: LogicalPos, end: LogicalPos) -> Vec<Paragraph> {
         let (start, end) = if (start.para, start.offset) <= (end.para, end.offset) {
             (start, end)
         } else {
             (end, start)
         };
-        if self.paragraphs.is_empty() {
+        let count = self.paragraph_count();
+        if count == 0 {
             return Vec::new();
         }
-        let last = self.paragraphs.len() - 1;
-        let sp = (start.para as usize).min(last);
-        let ep = (end.para as usize).min(last);
+        let last = count - 1;
+        let sp = start.para.min(last);
+        let ep = end.para.min(last);
         if sp == ep {
-            /* Clip to `end`, then take the tail from `start`. */
-            let head = self.paragraphs[sp].split_at(end.offset).0;
+            let Some(p) = self.nth_paragraph(sp) else {
+                return Vec::new();
+            };
+            let head = p.split_at(end.offset).0;
             return vec![head.split_at(start.offset).1];
         }
-        let mut out = Vec::with_capacity(ep - sp + 1);
-        out.push(self.paragraphs[sp].split_at(start.offset).1);
-        for p in (sp + 1)..ep {
-            out.push(self.paragraphs[p].clone());
+        let mut out = Vec::with_capacity((ep - sp + 1) as usize);
+        if let Some(p) = self.nth_paragraph(sp) {
+            out.push(p.split_at(start.offset).1);
         }
-        out.push(self.paragraphs[ep].split_at(end.offset).0);
+        for p in (sp + 1)..ep {
+            if let Some(para) = self.nth_paragraph(p) {
+                out.push(para.clone());
+            }
+        }
+        if let Some(p) = self.nth_paragraph(ep) {
+            out.push(p.split_at(end.offset).0);
+        }
         out
     }
 
@@ -717,31 +1064,43 @@ impl DocumentTree {
         if paras.is_empty() {
             return (self.clone(), at);
         }
-        let mut paragraphs = self.paragraphs.clone();
-        if paragraphs.is_empty() {
-            paragraphs.push_back(Paragraph::default());
+        let mut blocks = self.blocks.clone();
+        let count = self.paragraph_count();
+        if count == 0 {
+            blocks.push_back(Block::Paragraph(Paragraph::default()));
         }
-        let idx = (at.para as usize).min(paragraphs.len() - 1);
-        let (head, tail) = paragraphs[idx].split_at(at.offset);
+        let effective_count = count.max(1);
+        let idx = at.para.min(effective_count - 1);
+        let target = Self::find_paragraph_block_idx(&blocks, idx).expect("effective_count >= 1");
+        let (head, tail) = match &blocks[target] {
+            Block::Paragraph(p) => p.split_at(at.offset),
+            _ => unreachable!("nth_paragraph index points at a paragraph block"),
+        };
         if paras.len() == 1 {
             let caret = LogicalPos {
-                para: idx as u32,
+                para: idx,
                 offset: (head.text.len() + paras[0].text.len()) as u32,
             };
-            paragraphs.set(idx, head.concat(&paras[0]).concat(&tail));
-            return (Self { paragraphs }, caret);
+            blocks.set(
+                target,
+                Block::Paragraph(head.concat(&paras[0]).concat(&tail)),
+            );
+            return (Self { blocks }, caret);
         }
         let lastp = &paras[paras.len() - 1];
         let caret = LogicalPos {
-            para: (idx + paras.len() - 1) as u32,
+            para: idx + paras.len() as u32 - 1,
             offset: lastp.text.len() as u32,
         };
-        paragraphs.set(idx, head.concat(&paras[0]));
+        blocks.set(target, Block::Paragraph(head.concat(&paras[0])));
         for (k, p) in paras[1..paras.len() - 1].iter().enumerate() {
-            paragraphs.insert(idx + 1 + k, p.clone());
+            blocks.insert(target + 1 + k, Block::Paragraph(p.clone()));
         }
-        paragraphs.insert(idx + paras.len() - 1, lastp.concat(&tail));
-        (Self { paragraphs }, caret)
+        blocks.insert(
+            target + paras.len() - 1,
+            Block::Paragraph(lastp.concat(&tail)),
+        );
+        (Self { blocks }, caret)
     }
 
     /// Extract the text of the logical range `[start, end)`. Paragraphs the
@@ -752,15 +1111,18 @@ impl DocumentTree {
         } else {
             (end, start)
         };
-        if self.paragraphs.is_empty() {
+        let count = self.paragraph_count();
+        if count == 0 {
             return String::new();
         }
-        let last = self.paragraphs.len() - 1;
-        let sp = (start.para as usize).min(last);
-        let ep = (end.para as usize).min(last);
+        let last = count - 1;
+        let sp = start.para.min(last);
+        let ep = end.para.min(last);
         let mut out = String::new();
         for p in sp..=ep {
-            let para = &self.paragraphs[p];
+            let Some(para) = self.nth_paragraph(p) else {
+                continue;
+            };
             let len = para.text.len();
             let lo = if p == sp {
                 (start.offset as usize).min(len)
@@ -887,7 +1249,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let spans = &doc.paragraphs[0].spans;
+        let spans = &doc.nth_paragraph(0).unwrap().spans;
         assert_eq!(spans.len(), 1);
         assert_eq!(
             spans[0],
@@ -929,7 +1291,7 @@ mod tests {
             },
             big,
         );
-        let spans = &doc.paragraphs[0].spans;
+        let spans = &doc.nth_paragraph(0).unwrap().spans;
         /* [0,4) red ; [4,8) red+big ; [8,11) big */
         assert_eq!(spans.len(), 3);
         assert_eq!((spans[0].start, spans[0].end), (0, 4));
@@ -960,7 +1322,7 @@ mod tests {
             },
         );
         let doc = doc.insert_text(LogicalPos { para: 0, offset: 0 }, "XX");
-        let span = doc.paragraphs[0].spans[0];
+        let span = doc.nth_paragraph(0).unwrap().spans[0];
         assert_eq!((span.start, span.end), (4, 6));
     }
 
@@ -1054,7 +1416,7 @@ mod tests {
             LogicalPos { para: 0, offset: 5 },
         );
         assert_eq!(doc.paragraph_text(0), Some("hel world"));
-        let spans = &doc.paragraphs[0].spans;
+        let spans = &doc.nth_paragraph(0).unwrap().spans;
         assert_eq!(spans.len(), 1);
         assert_eq!((spans[0].start, spans[0].end), (0, 3));
     }
@@ -1125,8 +1487,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(doc.paragraphs[0].spans.len(), 1);
-        assert_eq!(doc.paragraphs[0].spans[0].style.bold, Some(true));
+        assert_eq!(doc.nth_paragraph(0).unwrap().spans.len(), 1);
+        assert_eq!(
+            doc.nth_paragraph(0).unwrap().spans[0].style.bold,
+            Some(true)
+        );
         /* Overlay italic + underline on the same range — they merge in. */
         let doc = doc.apply_style(
             LogicalPos { para: 0, offset: 0 },
@@ -1137,12 +1502,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        let style = doc.paragraphs[0].style_at(2);
+        let style = doc.nth_paragraph(0).unwrap().style_at(2);
         assert_eq!(style.bold, Some(true));
         assert_eq!(style.italic, Some(true));
         assert_eq!(style.underline, Some(true));
         /* Outside the styled range — unstyled. */
-        assert_eq!(doc.paragraphs[0].style_at(8), SpanStyle::default());
+        assert_eq!(
+            doc.nth_paragraph(0).unwrap().style_at(8),
+            SpanStyle::default()
+        );
     }
 
     #[test]
@@ -1176,10 +1544,16 @@ mod tests {
             LogicalPos { para: 1, offset: 0 },
             Alignment::Center,
         );
-        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::Center));
-        assert_eq!(d.paragraphs[1].props.alignment, Some(Alignment::Center));
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.alignment,
+            Some(Alignment::Center)
+        );
+        assert_eq!(
+            d.nth_paragraph(1).unwrap().props.alignment,
+            Some(Alignment::Center)
+        );
         /* outside the range — untouched */
-        assert_eq!(d.paragraphs[2].props.alignment, None);
+        assert_eq!(d.nth_paragraph(2).unwrap().props.alignment, None);
     }
 
     #[test]
@@ -1193,7 +1567,10 @@ mod tests {
         /* insertion clones the paragraph in place — alignment rides along */
         let d = d.insert_text(LogicalPos { para: 0, offset: 0 }, "X");
         assert_eq!(d.paragraph_text(0), Some("Xhello world"));
-        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::End));
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.alignment,
+            Some(Alignment::End)
+        );
         /* a style change preserves alignment */
         let d = d.apply_style(
             LogicalPos { para: 0, offset: 0 },
@@ -1203,13 +1580,19 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::End));
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.alignment,
+            Some(Alignment::End)
+        );
         /* and so does a deletion */
         let d = d.delete_range(
             LogicalPos { para: 0, offset: 0 },
             LogicalPos { para: 0, offset: 1 },
         );
-        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::End));
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.alignment,
+            Some(Alignment::End)
+        );
     }
 
     #[test]
@@ -1223,8 +1606,14 @@ mod tests {
         let d = d.split_paragraph(LogicalPos { para: 0, offset: 5 });
         assert_eq!(d.paragraph_count(), 2);
         /* both halves carry the original paragraph's alignment */
-        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::Center));
-        assert_eq!(d.paragraphs[1].props.alignment, Some(Alignment::Center));
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.alignment,
+            Some(Alignment::Center)
+        );
+        assert_eq!(
+            d.nth_paragraph(1).unwrap().props.alignment,
+            Some(Alignment::Center)
+        );
     }
 
     #[test]
@@ -1248,7 +1637,10 @@ mod tests {
         assert_eq!(d.paragraph_count(), 1);
         assert_eq!(d.paragraph_text(0), Some("abcdef"));
         /* the surviving paragraph keeps the first paragraph's alignment */
-        assert_eq!(d.paragraphs[0].props.alignment, Some(Alignment::Center));
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.alignment,
+            Some(Alignment::Center)
+        );
     }
 
     #[test]
@@ -1402,7 +1794,7 @@ mod tests {
         assert_eq!(out.paragraph_text(0), Some("ABone"));
         assert_eq!(out.paragraph_text(1), Some("twoCD"));
         assert_eq!(caret, LogicalPos { para: 1, offset: 3 });
-        assert_eq!(out.paragraphs[1].style_at(0).bold, Some(true));
-        assert_eq!(out.paragraphs[1].style_at(3).bold, None);
+        assert_eq!(out.nth_paragraph(1).unwrap().style_at(0).bold, Some(true));
+        assert_eq!(out.nth_paragraph(1).unwrap().style_at(3).bold, None);
     }
 }

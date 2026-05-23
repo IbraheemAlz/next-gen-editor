@@ -307,10 +307,12 @@ fn validate_fixture(path: &Path, manifest: &ManifestFile) -> Result<()> {
     Ok(())
 }
 
-/// Paragraph-by-paragraph equality on text + spans + alignment.
+/// Paragraph-by-paragraph equality on text + spans + props. Skips
+/// `Block::Table` content — Phase 5 PR 1 treats tables as opaque
+/// passthrough; their bytes are validated by the sibling-entry check.
 fn documents_equivalent(a: &DocxArchive, b: &DocxArchive) -> bool {
-    let pa = &a.document.paragraphs;
-    let pb = &b.document.paragraphs;
+    let pa: Vec<_> = a.document.paragraphs().collect();
+    let pb: Vec<_> = b.document.paragraphs().collect();
     if pa.len() != pb.len() {
         return false;
     }
@@ -342,7 +344,7 @@ fn run_gen_seed(dir: &Path) -> Result<()> {
         let path = dir.join(fx.name);
         std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
 
-        let texts: Vec<String> = fx.doc.paragraphs.iter().map(|p| p.text.clone()).collect();
+        let texts: Vec<String> = fx.doc.paragraphs().map(|p| p.text.clone()).collect();
         manifest.fixtures.insert(
             fx.name.to_owned(),
             FixtureEntry {
@@ -514,6 +516,23 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 roundtrip: RoundtripBounds::default(),
             },
         },
+        PrebuiltFixture {
+            name: "table_2x2_opaque.docx",
+            bytes: build_table_2x2_opaque_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 5,
+                /* Two surrounding paragraphs; the table sits between them.
+                Phase 5 PR 1 parses the table as a single opaque
+                `Block::Table` (no row content yet) so the manifest's
+                paragraph-flat view counts only the bookend paragraphs. */
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec!["before".into(), "after".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
     ]
 }
 
@@ -625,6 +644,50 @@ fn build_list_bullet_numbered_docx() -> Vec<u8> {
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
             ("word/numbering.xml", numbering_xml),
+            ("word/document.xml", document_xml),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// Phase 5 PR 1 table fixture: two paragraphs flanking a single 2×2
+/// `<w:tbl>`. The table is parsed as an opaque `Block::Table` —
+/// rows: vec![], source_xml: Some(raw) — and rides the Phase 3
+/// passthrough on the writer side. Drift bound = 0.
+fn build_table_2x2_opaque_docx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">before</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">B1</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">A2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">B2</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+    let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>"#;
+
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, body) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", dot_rels),
+            ("word/_rels/document.xml.rels", doc_rels),
             ("word/document.xml", document_xml),
         ] {
             zip.start_file(name, opts).unwrap();

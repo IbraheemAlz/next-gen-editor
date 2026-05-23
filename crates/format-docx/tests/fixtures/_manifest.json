@@ -120,6 +120,20 @@
       "roundtrip": {
         "document_xml_drift_bytes": 0
       }
+    },
+    "table_2x2_opaque.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 5,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "before",
+          "after"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
     }
   }
 }

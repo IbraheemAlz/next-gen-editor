@@ -6,8 +6,8 @@
 use crate::error::DocxError;
 use crate::opc::archive::{DOC_XML, DocxArchive};
 use engine::{
-    Alignment, DocumentTree, FontFamily, LineHeight, ParaProperties, Paragraph, SpanStyle,
-    TextDirection,
+    Alignment, Block, DocumentTree, FontFamily, LineHeight, ParaProperties, Paragraph, SpanStyle,
+    Table, TextDirection,
 };
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -238,11 +238,43 @@ fn emit_paragraph(para: &Paragraph, out: &mut String) {
     }
 }
 
+/// Phase 5 PR 1 block dispatcher. `Block::Paragraph` rides the existing
+/// `emit_paragraph` passthrough optimisation; `Block::Table` rides its
+/// own opaque passthrough (`source_xml` if clean, else a stub —
+/// regenerate-from-rows lands in Phase 5 PR 2).
+fn emit_block(block: &Block, out: &mut String) {
+    match block {
+        Block::Paragraph(p) => emit_paragraph(p, out),
+        Block::Table(t) => emit_table(t, out),
+    }
+}
+
+fn emit_table(t: &Table, out: &mut String) {
+    if !t.dirty
+        && let Some(raw) = &t.source_xml
+    {
+        /* Source bytes captured by the Phase 5 PR 1 parser — already
+        valid UTF-8 from `quick_xml`. Same defensive fall-back as
+        `emit_paragraph`. */
+        match std::str::from_utf8(raw) {
+            Ok(s) => {
+                out.push_str(s);
+                return;
+            }
+            Err(_) => { /* fall through to regenerate */ }
+        }
+    }
+    /* Phase 5 PR 2 — regenerate from `t.rows` when the table is dirty
+    or has no source bytes. Until then, emit an empty `<w:tbl/>`
+    placeholder so downstream Word still sees a valid document. */
+    out.push_str("<w:tbl/>");
+}
+
 fn build_document_xml(doc: &DocumentTree) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str(DOC_XML_HEADER);
-    for para in &doc.paragraphs {
-        emit_paragraph(para, &mut out);
+    for block in &doc.blocks {
+        emit_block(block, &mut out);
     }
     out.push_str(DOC_XML_FOOTER);
     out
@@ -351,7 +383,7 @@ mod tests {
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
         let parsed = read_docx(&bytes).expect("read");
-        let p = &parsed.document.paragraphs[0];
+        let p = &parsed.document.nth_paragraph(0).unwrap();
         assert_eq!(p.text, "hello world");
         assert_eq!(p.style_at(0), bold_red);
         assert_eq!(p.style_at(4), bold_red);
@@ -382,7 +414,10 @@ mod tests {
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
         let parsed = read_docx(&bytes).expect("read");
-        assert_eq!(parsed.document.paragraphs[0].style_at(1), styled);
+        assert_eq!(
+            parsed.document.nth_paragraph(0).unwrap().style_at(1),
+            styled
+        );
     }
 
     #[test]
@@ -428,7 +463,7 @@ mod tests {
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
         let parsed = read_docx(&bytes).expect("read");
-        assert_eq!(parsed.document.paragraphs[0].props, props);
+        assert_eq!(parsed.document.nth_paragraph(0).unwrap().props, props);
     }
 
     #[test]
@@ -544,7 +579,7 @@ mod tests {
     fn cascade_resolves_basedon_chain_into_flat_span() {
         let bytes = build_style_cascade_docx();
         let parsed = read_docx(&bytes).expect("read");
-        let p = &parsed.document.paragraphs[0];
+        let p = &parsed.document.nth_paragraph(0).unwrap();
         assert_eq!(p.text, "hello cascade");
         /* Single run, covering the whole text, with the cascaded style:
         bold (from BaseStyle) + italic (from ChildStyle). */
@@ -559,7 +594,7 @@ mod tests {
         let bytes = build_style_cascade_docx();
         let archive = read_docx(&bytes).expect("read");
         /* Loaded paragraph must be clean, with captured source bytes. */
-        let p = &archive.document.paragraphs[0];
+        let p = &archive.document.nth_paragraph(0).unwrap();
         assert!(!p.dirty, "loaded paragraph must not be dirty");
         let raw = p.source_xml.as_deref().expect("source_xml captured");
         let raw_str = std::str::from_utf8(raw).unwrap();
@@ -591,7 +626,7 @@ mod tests {
         let edited = archive
             .document
             .insert_text(engine::LogicalPos { para: 0, offset: 5 }, " EDITED");
-        let p = &edited.paragraphs[0];
+        let p = &edited.nth_paragraph(0).unwrap();
         assert!(p.dirty, "edit must flip dirty=true");
         assert!(p.source_xml.is_none(), "edit must drop source_xml");
 
@@ -611,7 +646,7 @@ mod tests {
         passthrough, so the StyleTable is still populated — the bold+italic
         span survives as direct formatting on the regenerated run. */
         let reparsed = read_docx(&saved).expect("re-read");
-        let q = &reparsed.document.paragraphs[0];
+        let q = &reparsed.document.nth_paragraph(0).unwrap();
         assert_eq!(q.text, "hello EDITED cascade");
         assert!(
             q.spans
@@ -676,7 +711,7 @@ mod tests {
     fn list_paragraphs_get_resolved_markers() {
         let bytes = build_list_docx();
         let parsed = read_docx(&bytes).expect("read");
-        let paras = &parsed.document.paragraphs;
+        let paras: Vec<_> = parsed.document.paragraphs().collect();
         assert_eq!(paras.len(), 4);
         /* Bullet — literal lvlText. */
         assert_eq!(paras[0].resolved_marker.as_deref(), Some("*"));
@@ -698,7 +733,7 @@ mod tests {
         let bytes = build_list_docx();
         let archive = read_docx(&bytes).expect("read");
         /* All loaded paragraphs must be clean with captured source bytes. */
-        for (i, p) in archive.document.paragraphs.iter().enumerate() {
+        for (i, p) in archive.document.paragraphs().enumerate() {
             assert!(!p.dirty, "para {i} loaded dirty");
             let raw = p.source_xml.as_deref().expect("source_xml captured");
             assert!(std::str::from_utf8(raw).unwrap().contains("<w:numPr>"));
@@ -723,6 +758,95 @@ mod tests {
         assert_eq!(
             saved_doc_xml, original_doc_xml,
             "passthrough must keep list document.xml byte-identical"
+        );
+    }
+
+    /* ---- Phase 5 PR 1: opaque table parse + passthrough ----------- */
+
+    fn build_table_docx() -> Vec<u8> {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">before</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">A1</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+        let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", dot_rels),
+                ("word/_rels/document.xml.rels", doc_rels),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn table_parses_as_opaque_block_with_source_bytes() {
+        let bytes = build_table_docx();
+        let parsed = read_docx(&bytes).expect("read");
+        let blocks: Vec<_> = parsed.document.blocks.iter().collect();
+        assert_eq!(blocks.len(), 3, "two paragraphs + one table block");
+        assert!(matches!(blocks[0], engine::Block::Paragraph(_)));
+        match &blocks[1] {
+            engine::Block::Table(t) => {
+                assert!(t.rows.is_empty(), "PR 1 keeps rows opaque");
+                assert!(!t.dirty);
+                let raw = t.source_xml.as_deref().expect("source_xml captured");
+                let raw_str = std::str::from_utf8(raw).unwrap();
+                assert!(raw_str.starts_with("<w:tbl"));
+                assert!(raw_str.ends_with("</w:tbl>"));
+                assert!(raw_str.contains("A1"));
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+        assert!(matches!(blocks[2], engine::Block::Paragraph(_)));
+        /* Paragraph-flat view skips the table. */
+        assert_eq!(parsed.document.paragraph_count(), 2);
+        assert_eq!(parsed.document.paragraph_text(0), Some("before"));
+        assert_eq!(parsed.document.paragraph_text(1), Some("after"));
+    }
+
+    #[test]
+    fn table_passthrough_keeps_doc_xml_byte_identical() {
+        let bytes = build_table_docx();
+        let archive = read_docx(&bytes).expect("read");
+        let saved = write_docx(&archive, &archive.document).expect("write");
+        let original_doc_xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        let saved_doc_xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&saved)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert_eq!(
+            saved_doc_xml, original_doc_xml,
+            "opaque table passthrough must keep document.xml byte-identical"
         );
     }
 

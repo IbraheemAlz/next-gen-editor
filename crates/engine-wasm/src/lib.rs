@@ -696,7 +696,7 @@ fn nearest_slot_by_x(slots: &[CaretSlot], target_x: f32) -> Option<&CaretSlot> {
 fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     let para_idx = pos.para as usize;
     let off = pos.offset as usize;
-    if let Some(para) = doc.paragraphs.get(para_idx) {
+    if let Some(para) = doc.nth_paragraph((para_idx) as u32) {
         if off > 0 {
             let text = &para.text;
             let mut o = off - 1;
@@ -709,7 +709,7 @@ fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
             };
         }
         if para_idx > 0 {
-            if let Some(prev) = doc.paragraphs.get(para_idx - 1) {
+            if let Some(prev) = doc.nth_paragraph((para_idx - 1) as u32) {
                 return BridgeLogicalPos {
                     para: (para_idx - 1) as u32,
                     offset: prev.text.len() as u32,
@@ -725,7 +725,7 @@ fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
 fn step_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     let para_idx = pos.para as usize;
     let off = pos.offset as usize;
-    if let Some(para) = doc.paragraphs.get(para_idx) {
+    if let Some(para) = doc.nth_paragraph((para_idx) as u32) {
         let text = &para.text;
         if off < text.len() {
             let mut o = off + 1;
@@ -737,7 +737,7 @@ fn step_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
                 offset: o as u32,
             };
         }
-        if para_idx + 1 < doc.paragraphs.len() {
+        if para_idx + 1 < doc.paragraph_count() as usize {
             return BridgeLogicalPos {
                 para: (para_idx + 1) as u32,
                 offset: 0,
@@ -833,11 +833,15 @@ fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, Bridg
 
 /// Clamp a position into `doc` — paragraph index and byte offset both in range.
 fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
-    if doc.paragraphs.is_empty() {
+    if doc.paragraph_count() == 0 {
         return BridgeLogicalPos { para: 0, offset: 0 };
     }
-    let para = (pos.para as usize).min(doc.paragraphs.len() - 1);
-    let offset = pos.offset.min(doc.paragraphs[para].text.len() as u32);
+    let para = (pos.para as usize).min(doc.paragraph_count() as usize - 1);
+    let offset = pos.offset.min(
+        doc.nth_paragraph(para as u32)
+            .map(|p| p.text.len() as u32)
+            .unwrap_or(0),
+    );
     BridgeLogicalPos {
         para: para as u32,
         offset,
@@ -1339,7 +1343,7 @@ impl Engine {
     /// the glyph cache and frame timings land with the Phase 3 renderer.
     fn request_stats(&self) -> Event {
         let doc = self.undo.current();
-        let document_tree_bytes: usize = doc.paragraphs.iter().map(|p| p.text.len()).sum();
+        let document_tree_bytes: usize = doc.paragraphs().map(|p| p.text.len()).sum();
         Event::Stats(EngineStats {
             wasm_heap_bytes: wasm_heap_bytes(),
             document_tree_bytes: document_tree_bytes as u32,
@@ -1411,7 +1415,7 @@ impl Engine {
         } else {
             None
         };
-        for (doc_idx, para) in doc.paragraphs.iter().enumerate() {
+        for (doc_idx, para) in doc.paragraphs().enumerate() {
             let comp = composition.filter(|c| {
                 c.at.para as usize == doc_idx
                     && !c.text.is_empty()
@@ -1626,7 +1630,7 @@ impl Engine {
         let doc = self.undo.current();
         let para_texts: Vec<&str> = box_doc_index
             .iter()
-            .map(|&di| doc.paragraphs[di as usize].text.as_str())
+            .map(|&di| doc.nth_paragraph(di).map(|p| p.text.as_str()).unwrap_or(""))
             .collect();
         let mut bytes: Vec<u8> = Vec::new();
         if let Err(e) =
@@ -1756,8 +1760,7 @@ impl Engine {
         let (lo, hi) = self
             .undo
             .current()
-            .paragraphs
-            .get(hit.para as usize)
+            .nth_paragraph((hit.para as usize) as u32)
             .map_or((hit.offset, hit.offset), |p| p.word_bounds(hit.offset));
         self.pending_format = None;
         self.selection = Some(SelectionState {
@@ -1785,8 +1788,7 @@ impl Engine {
         let len = self
             .undo
             .current()
-            .paragraphs
-            .get(hit.para as usize)
+            .nth_paragraph((hit.para as usize) as u32)
             .map_or(0, |p| p.text.len() as u32);
         self.pending_format = None;
         self.selection = Some(SelectionState {
@@ -1807,10 +1809,9 @@ impl Engine {
     /// last paragraph's byte length. Empty document collapses to (0, 0).
     fn do_select_all(&mut self) -> Event {
         let doc = self.undo.current();
-        let last_para = doc.paragraphs.len().saturating_sub(1);
+        let last_para = (doc.paragraph_count() as usize).saturating_sub(1);
         let last_len = doc
-            .paragraphs
-            .get(last_para)
+            .nth_paragraph((last_para) as u32)
             .map_or(0, |p| p.text.len() as u32);
         self.pending_format = None;
         self.selection = Some(SelectionState {
@@ -1936,8 +1937,7 @@ impl Engine {
         let stored = self
             .undo
             .current()
-            .paragraphs
-            .get(para as usize)
+            .nth_paragraph((para as usize) as u32)
             .and_then(|p| p.props.alignment)
             .map(layout_align);
         let default = self
@@ -1958,8 +1958,7 @@ impl Engine {
         let prev = self
             .undo
             .current()
-            .paragraphs
-            .get(start.para as usize)
+            .nth_paragraph((start.para as usize) as u32)
             .map_or(start.offset, |p| p.prev_offset(start.offset));
         BridgeLogicalPos {
             para: start.para,
@@ -1976,8 +1975,7 @@ impl Engine {
         let mut style = self
             .undo
             .current()
-            .paragraphs
-            .get(pos.para as usize)
+            .nth_paragraph((pos.para as usize) as u32)
             .map_or(SpanStyle::default(), |p| p.style_at(pos.offset));
         if apply_pending && let Some(pending) = self.pending_format {
             style = style.merged_with(pending);
@@ -2137,7 +2135,7 @@ impl Engine {
         by_word: bool,
     ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
         let doc = self.undo.current();
-        let para = doc.paragraphs.get(caret.para as usize)?;
+        let para = doc.nth_paragraph((caret.para as usize) as u32)?;
         let para_len = para.text.len() as u32;
         if forward {
             if caret.offset < para_len {
@@ -2153,7 +2151,7 @@ impl Engine {
                         offset: to,
                     },
                 ))
-            } else if (caret.para as usize) + 1 < doc.paragraphs.len() {
+            } else if (caret.para as usize) + 1 < doc.paragraph_count() as usize {
                 Some((
                     caret,
                     BridgeLogicalPos {
@@ -2179,8 +2177,7 @@ impl Engine {
             ))
         } else if caret.para > 0 {
             let prev_len = doc
-                .paragraphs
-                .get(caret.para as usize - 1)
+                .nth_paragraph((caret.para as usize - 1) as u32)
                 .map_or(0, |p| p.text.len() as u32);
             Some((
                 BridgeLogicalPos {
@@ -2280,8 +2277,7 @@ impl Engine {
         };
         self.undo
             .current()
-            .paragraphs
-            .iter()
+            .paragraphs()
             .map(|para| A11yParagraph {
                 direction,
                 runs: a11y_runs(para),

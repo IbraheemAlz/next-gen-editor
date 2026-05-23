@@ -27,12 +27,30 @@
 //! hasn't been seen yet (and has no `start`) format as `0` defensively.
 
 use crate::parts::numbering::{NumFmt, NumberingDefinitions};
-use engine::{ListItem, Paragraph};
+use engine::{Block, ListItem, Paragraph};
 use std::collections::HashMap;
 
 /// Render every list paragraph's marker, writing it into
-/// `Paragraph::resolved_marker`. Non-list paragraphs are skipped.
+/// `Paragraph::resolved_marker`. Non-list paragraphs and `Block::Table`
+/// entries are skipped — Phase 5 PR 1 keeps numbering counters running
+/// across intervening tables (matches Word's "list continues across
+/// non-list blocks of the same numId" semantics).
+pub fn resolve_markers_blocks(blocks: &mut [Block], defs: &NumberingDefinitions) {
+    let mut paragraphs: Vec<&mut Paragraph> = blocks
+        .iter_mut()
+        .filter_map(|b| b.as_paragraph_mut())
+        .collect();
+    resolve_markers_inner(&mut paragraphs, defs);
+}
+
+/// Direct entry point for tests / callers that already have a
+/// `[Paragraph]` slice.
 pub fn resolve_markers(paragraphs: &mut [Paragraph], defs: &NumberingDefinitions) {
+    let mut refs: Vec<&mut Paragraph> = paragraphs.iter_mut().collect();
+    resolve_markers_inner(&mut refs, defs);
+}
+
+fn resolve_markers_inner(paragraphs: &mut [&mut Paragraph], defs: &NumberingDefinitions) {
     let mut counters: HashMap<(u32, u8), i32> = HashMap::new();
     /* Track the highest `ilvl` ever observed per `num_id` so we know which
     deeper levels to drop on a parent-level visit. */

@@ -9,7 +9,7 @@
 //! model can never drift, because we re-emit them as raw bytes.
 
 use crate::error::DocxError;
-use crate::numbering_resolver::resolve_markers;
+use crate::numbering_resolver::resolve_markers_blocks;
 use crate::parts::document::parse_document_xml;
 use crate::parts::numbering::{NumberingDefinitions, parse_numbering_xml};
 use crate::parts::styles::{StyleTable, parse_styles_xml};
@@ -93,12 +93,13 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     };
     if !numbering.num_instances.is_empty() {
         /* `im::Vector` clones cheaply; we collect into a Vec to mutate
-        in-place, then rebuild the tree. `resolve_markers` only writes
-        `resolved_marker`, so the structurally-shared `Paragraph` fields
-        cost nothing here. */
-        let mut paras: Vec<_> = document.paragraphs.iter().cloned().collect();
-        resolve_markers(&mut paras, &numbering);
-        document = DocumentTree::from_rich_paragraphs(paras);
+        in-place, then rebuild the tree. `resolve_markers_blocks` only
+        writes `Paragraph::resolved_marker` and skips `Block::Table`,
+        so structurally-shared fields cost nothing here and tables
+        preserve their identity. */
+        let mut blocks: Vec<_> = document.blocks.iter().cloned().collect();
+        resolve_markers_blocks(&mut blocks, &numbering);
+        document = DocumentTree::from_blocks(blocks);
     }
 
     Ok(DocxArchive {
