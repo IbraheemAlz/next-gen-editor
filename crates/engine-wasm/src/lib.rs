@@ -102,7 +102,20 @@ struct LineGeom {
     /// flatten into their own paths, so a cell-paragraph's line carries
     /// the full descent path (e.g. `[Block(2), Cell{r,c}, Block(0)]`).
     path: BridgeBlockPath,
+    /// Line's logical leading edge in absolute coords — where the
+    /// caret lands when the line has no slots (an empty paragraph).
+    /// RTL-aware: for an empty RTL cell paragraph this sits at the
+    /// cell's right edge.
     start_x: f32,
+    /// Hit-target rectangle's left edge in absolute coords. For body
+    /// paragraphs this is the page content area's left; for cell
+    /// paragraphs it is the containing cell's left edge. Two cells
+    /// in the same row share `y_top` and must disambiguate by `x` —
+    /// this rectangle is how.
+    hit_left: f32,
+    /// Hit-target rectangle's width — page content width for body
+    /// paragraphs, cell content width for cell paragraphs.
+    hit_width: f32,
     y_top: f32,
     height: f32,
     start_byte: u32,
@@ -1033,17 +1046,47 @@ fn line_y_dist(line: &LineGeom, y: f32) -> f32 {
     }
 }
 
-/// The line nearest `y` — the band containing it, else the closest above/below.
-fn nearest_line(geom: &[LineGeom], y: f32) -> Option<&LineGeom> {
-    geom.iter()
-        .min_by(|a, b| line_y_dist(a, y).total_cmp(&line_y_dist(b, y)))
+/// Horizontal distance from `x` to a line's hit-target rectangle;
+/// `0.0` when inside it. Used to disambiguate sibling cells that
+/// share `y_top` — without this the leftmost cell always wins.
+fn line_x_dist(line: &LineGeom, x: f32) -> f32 {
+    let x0 = line.hit_left;
+    let x1 = line.hit_left + line.hit_width;
+    if x < x0 {
+        x0 - x
+    } else if x > x1 {
+        x - x1
+    } else {
+        0.0
+    }
+}
+
+/// The line nearest `(x, y)` — the rectangle containing it, else
+/// the closest by y then x. y dominates because lines stack
+/// vertically; x only matters when multiple lines share the same
+/// y-band (cells in a table row).
+fn nearest_line(geom: &[LineGeom], x: f32, y: f32) -> Option<&LineGeom> {
+    geom.iter().min_by(|a, b| {
+        let ya = line_y_dist(a, y);
+        let yb = line_y_dist(b, y);
+        ya.total_cmp(&yb)
+            .then_with(|| line_x_dist(a, x).total_cmp(&line_x_dist(b, x)))
+    })
 }
 
 /// Flatten one `ParagraphBox` into `LineGeom`s stamped with `path`.
+/// `container_left` / `container_width` define the horizontal
+/// hit-target rectangle each emitted line carries — usually the
+/// containing cell's left edge + content width, or the page content
+/// area for top-level paragraphs. Without this rectangle, multiple
+/// cells in the same row share `y_top` and the first-emitted line
+/// always wins (clicks in column C land in column 0).
 fn collect_paragraph_line_geom(
     para_box: &ParagraphBox,
     parent_origin_x: f32,
     parent_origin_y: f32,
+    container_left: f32,
+    container_width: f32,
     path: &BridgeBlockPath,
     out: &mut Vec<LineGeom>,
 ) {
@@ -1069,6 +1112,8 @@ fn collect_paragraph_line_geom(
         out.push(LineGeom {
             path: path.clone(),
             start_x: line_x,
+            hit_left: container_left,
+            hit_width: container_width,
             y_top: line_y,
             height: line.height,
             start_byte,
@@ -1116,7 +1161,19 @@ fn collect_table_line_geom(
                         },
                     ],
                 };
-                collect_paragraph_line_geom(para_box, cell_x, cell_y, &path, out);
+                collect_paragraph_line_geom(
+                    para_box,
+                    cell_x,
+                    cell_y,
+                    /* Hit-target = the entire cell rectangle, so a
+                    click anywhere in the cell lands on this
+                    paragraph's lines — not the leftmost cell that
+                    happens to share `y_top`. */
+                    cell_x,
+                    cell.size.width,
+                    &path,
+                    out,
+                );
             }
         }
     }
@@ -1126,7 +1183,7 @@ fn collect_table_line_geom(
 /// nearest caret slot by `x`. The returned `path` is the line's owning
 /// paragraph path, descending into a cell when the hit lands inside one.
 fn hit_test_geom(geom: &[LineGeom], x: f32, y: f32) -> BridgeLogicalPos {
-    let Some(line) = nearest_line(geom, y) else {
+    let Some(line) = nearest_line(geom, x, y) else {
         return bpos_top(0, 0);
     };
     let offset = line
@@ -2404,6 +2461,7 @@ impl Engine {
         let (page, _fonts, box_paths) = self.build_page(self.scale(), false)?;
         let content_x = page.margins.left;
         let content_y = page.margins.top;
+        let content_w = page.size.width - page.margins.left - page.margins.right;
         let mut geom: Vec<LineGeom> = Vec::new();
         for (i, layout_block) in page.blocks.iter().enumerate() {
             let Some(path) = box_paths.get(i) else {
@@ -2415,6 +2473,8 @@ impl Engine {
                         para_box,
                         content_x,
                         content_y,
+                        content_x,
+                        content_w,
                         &engine_to_bridge_path(path.clone()),
                         &mut geom,
                     );
@@ -3443,6 +3503,8 @@ mod tests {
         let line = LineGeom {
             path: BridgeBlockPath::top(0),
             start_x: 0.0,
+            hit_left: 0.0,
+            hit_width: 100.0,
             y_top: 5.0,
             height: 20.0,
             start_byte: 0,
@@ -3481,6 +3543,8 @@ mod tests {
         let line = LineGeom {
             path: BridgeBlockPath::top(0),
             start_x: 0.0,
+            hit_left: 0.0,
+            hit_width: 100.0,
             y_top: 5.0,
             height: 20.0,
             start_byte: 0,
@@ -3495,6 +3559,46 @@ mod tests {
         assert!(approx(rects[0].w, 20.0));
         assert!(approx(rects[0].y, 5.0));
         assert!(approx(rects[0].h, 20.0));
+    }
+
+    /// PR 4 / Bug 5 — three cells in the same row share `y_top`.
+    /// `hit_test_geom` must pick the cell whose hit-rectangle
+    /// contains the click's x, not the first-emitted one.
+    #[test]
+    fn hit_test_disambiguates_sibling_cells_by_x() {
+        let cell_line = |cell_idx: u32, hit_left: f32, hit_width: f32| LineGeom {
+            path: BridgeBlockPath {
+                steps: vec![
+                    BridgePathStep::Block { idx: 1 },
+                    BridgePathStep::Cell {
+                        row: 0,
+                        col: cell_idx,
+                    },
+                    BridgePathStep::Block { idx: 0 },
+                ],
+            },
+            start_x: hit_left,
+            hit_left,
+            hit_width,
+            y_top: 100.0,
+            height: 24.0,
+            start_byte: 0,
+            end_byte: 0,
+            slots: Vec::new(),
+            runs: Vec::new(),
+        };
+        let geom = vec![
+            cell_line(0, 0.0, 150.0),
+            cell_line(1, 150.0, 150.0),
+            cell_line(2, 300.0, 150.0),
+        ];
+        /* Click inside cell C3 (x ∈ [300..450]). Must land on cell 2. */
+        let hit = hit_test_geom(&geom, 400.0, 110.0);
+        assert_eq!(hit.path.steps.len(), 3);
+        let BridgePathStep::Cell { col, .. } = hit.path.steps[1] else {
+            panic!("expected Cell step");
+        };
+        assert_eq!(col, 2, "click in C3 must land in column 2, not 0");
     }
 
     /// Backlog #2 — a synthetic glyph (an injected Kashida Tatweel) advances
