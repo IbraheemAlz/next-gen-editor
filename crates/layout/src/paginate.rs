@@ -180,11 +180,17 @@ impl Paginator {
         let remaining = self.geometry.content_height() - self.cur_y - self.cur_footnote_height;
         let block_height = block.size().height;
 
-        if block_height <= remaining || self.cur_blocks.is_empty() {
-            /* Fits — or the current page is empty, in which case oversized
-            content lands on a page of its own (no infinite-loop on a
-            single block taller than a page; the overflow renders cropped
-            for now, deferred to a future incremental-relayout sprint). */
+        /* Paragraphs always run through the line-splitter when they
+        don't fit — even when the current page is empty — so a single
+        oversize paragraph turns into N pages, not one overflowing
+        bag of content. Tables stay atomic on an empty page: the
+        line-splitter doesn't apply, and a table taller than a full
+        page is a rare authoring decision the user took deliberately.
+        `push_paragraph_split` carries its own termination guard for
+        the pathological single-line-bigger-than-page case. */
+        let is_paragraph = matches!(block, LayoutBlock::Paragraph(_));
+        let atomic_overflow_ok = !is_paragraph && self.cur_blocks.is_empty();
+        if block_height <= remaining || atomic_overflow_ok {
             let mut origin = block.origin();
             origin.x = 0.0;
             origin.y = self.cur_y;
@@ -252,29 +258,50 @@ impl Paginator {
     }
 
     fn push_paragraph_split(&mut self, para: ParagraphBox, after: f32) {
-        let remaining = self.geometry.content_height() - self.cur_y;
+        let remaining = self.geometry.content_height() - self.cur_y - self.cur_footnote_height;
         let (head, tail) = split_paragraph_at_line(&para, remaining);
 
-        if let Some(head) = head {
-            let head_size = head.size;
-            let mut head = head;
-            head.origin = Point {
-                x: 0.0,
-                y: self.cur_y,
-            };
-            self.cur_y += head_size.height;
-            self.cur_blocks.push(LayoutBlock::Paragraph(head));
-        }
-
-        /* Flush whichever page state we accumulated and continue on a
-        fresh page. If the tail also overflows the next page (rare —
-        only if a paragraph is taller than a full page) the recursion
-        bottoms out because the page is empty on entry. */
-        if let Some(tail) = tail {
-            self.flush_page();
-            self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
-        } else {
-            self.cur_y += after;
+        match (head, tail) {
+            (None, Some(tail)) if self.cur_blocks.is_empty() => {
+                /* Pathological case — even the first line of the
+                paragraph is taller than a fresh content area. Stuff
+                atomically (single oversize line clips the bottom; a
+                proper line-internal splitter is deferred). Without
+                this guard `push_block` would recurse on the same
+                tail on every fresh page → infinite loop. */
+                let h = tail.size.height;
+                let mut t = tail;
+                t.origin = Point {
+                    x: 0.0,
+                    y: self.cur_y,
+                };
+                self.cur_y += h + after;
+                self.cur_blocks.push(LayoutBlock::Paragraph(t));
+            }
+            (None, Some(tail)) => {
+                /* Not even the first line fits on the *current* page
+                but the page already has content — flush, retry on a
+                fresh page where the same paragraph gets a full budget. */
+                self.flush_page();
+                self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
+            }
+            (Some(head), tail) => {
+                let h = head.size.height;
+                let mut head = head;
+                head.origin = Point {
+                    x: 0.0,
+                    y: self.cur_y,
+                };
+                self.cur_y += h;
+                self.cur_blocks.push(LayoutBlock::Paragraph(head));
+                if let Some(tail) = tail {
+                    self.flush_page();
+                    self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
+                } else {
+                    self.cur_y += after;
+                }
+            }
+            (None, None) => { /* Empty paragraph — nothing to do. */ }
         }
     }
 
@@ -527,4 +554,107 @@ pub fn split_paragraph_at_line(
         source_paragraph_id: para.source_paragraph_id,
     };
     (Some(head), Some(tail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::boxes::ParagraphBox;
+    use crate::page::{A4Page, Margins};
+    use text_pipeline::ShapingDirection;
+
+    fn a4_geometry() -> PageGeometry {
+        let page = A4Page::a4();
+        PageGeometry {
+            width: page.width,
+            height: page.height,
+            margins: page.margin,
+            header_offset: 36.0,
+            footer_offset: 36.0,
+        }
+    }
+
+    /// Build a fake `ParagraphBox` with `n` lines of `line_height` each.
+    /// Runs are empty — the splitter only reads `lines[i].origin.y +
+    /// lines[i].height`, which is all the test cares about.
+    fn fake_paragraph(n: usize, line_height: f32) -> ParagraphBox {
+        let mut lines = Vec::with_capacity(n);
+        for i in 0..n {
+            lines.push(LineBox {
+                origin: Point {
+                    x: 0.0,
+                    y: (i as f32) * line_height,
+                },
+                baseline: line_height * 0.8,
+                height: line_height,
+                width: 200.0,
+                runs: Vec::new(),
+                alignment: text_pipeline::Alignment::Start,
+            });
+        }
+        ParagraphBox {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 200.0,
+                height: (n as f32) * line_height,
+            },
+            lines,
+            direction: ShapingDirection::Ltr,
+            marker: None,
+            source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
+        }
+    }
+
+    #[test]
+    fn paginator_splits_oversize_paragraph_on_empty_page() {
+        /* A4 content height ≈ 842 − 144 = 698 pt. 80 lines of 16 pt =
+        1280 pt — must split into at least 2 pages even though the
+        paragraph is the very first block on the page. */
+        let geom = a4_geometry();
+        let mut pag = Paginator::new(geom, None, None);
+        let para = fake_paragraph(80, 16.0);
+        pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        let pages = pag.finish();
+        assert!(
+            pages.len() >= 2,
+            "expected ≥2 pages from an 80-line paragraph; got {}",
+            pages.len()
+        );
+        for p in &pages {
+            for block in &p.blocks {
+                let h = block.size().height;
+                assert!(
+                    h <= geom.content_height() + 0.01,
+                    "block height {h} exceeds page budget {}",
+                    geom.content_height()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paginator_keeps_short_paragraph_on_one_page() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::new(geom, None, None);
+        let para = fake_paragraph(3, 16.0);
+        pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 1);
+    }
+
+    #[test]
+    fn paginator_pathological_single_line_taller_than_page_does_not_loop() {
+        /* Single line of 9999 pt — taller than any A4 budget. Must not
+        infinite-loop; the page-emptiness guard accepts the overflow
+        atomically. */
+        let geom = a4_geometry();
+        let mut pag = Paginator::new(geom, None, None);
+        let para = fake_paragraph(1, 9999.0);
+        pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 1);
+    }
+
+    /* `Margins` import isn't otherwise read in this test module. */
+    const _M: Margins = Margins::uniform(0.0);
 }

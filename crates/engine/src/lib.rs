@@ -151,6 +151,7 @@ impl PageGeometry {
     /// integer round-trip; in-code default constructors call this with
     /// canonical Word values so the model never drifts off-spec by
     /// floating-point rounding.
+    #[allow(clippy::too_many_arguments)]
     pub const fn from_twips(
         w_twips: i32,
         h_twips: i32,
