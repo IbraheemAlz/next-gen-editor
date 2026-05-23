@@ -1074,8 +1074,16 @@ mod tests {
         );
         let bytes = build_minimal_docx(&doc).expect("build");
         let parsed = read_docx(&bytes).expect("re-read");
-        assert_eq!(parsed.document.blocks.len(), 2);
+        /* 3 blocks: leading "hello" paragraph, the synthesised table,
+        and the trailing empty paragraph `insert_table` now appends to
+        give the caret an escape destination + match the OOXML mandate
+        of a `<w:p>` after every `<w:tbl>` boundary. */
+        assert_eq!(parsed.document.blocks.len(), 3);
         let t = parsed.document.blocks[1].as_table().expect("table");
+        assert!(
+            matches!(parsed.document.blocks[2], engine::Block::Paragraph(ref p) if p.text.is_empty()),
+            "trailing escape paragraph"
+        );
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0].cells.len(), 3);
         assert_eq!(t.grid.len(), 3);

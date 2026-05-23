@@ -2042,6 +2042,42 @@ fn selection_rects_geom(
     end: &BridgeLogicalPos,
 ) -> Vec<BridgeRect> {
     use core::cmp::Ordering;
+    /* Cross-container selection (Backlog table-trap bug). A linear
+    drag from a body paragraph BEFORE a table to a body paragraph
+    AFTER it should shade the entire table — not just the
+    text-spans inside each cell, which would otherwise look like
+    fragmented strips with white gutters between cells (broken).
+    Detect tables whose top-level block index sits strictly
+    between `start.path` and `end.path`, and whose `end.path` is
+    NOT a descendant of the table (otherwise the selection ends
+    INSIDE the table — partial-cell highlight, not whole-table).
+    For lines inside a bracketed table, paint a cell-full-width
+    rect (`hit_left .. hit_left + hit_width`) instead of clipping
+    against the line's text-spans. Each line still emits its own
+    rect, so the highlight tracks line wraps + spans pages
+    correctly. */
+    let mut bracketed_tables: std::collections::BTreeSet<u32> = Default::default();
+    {
+        let mut considered: std::collections::BTreeSet<u32> = Default::default();
+        for line in geom {
+            let Some(BridgePathStep::Block { idx: t_idx }) = line.path.steps.first() else {
+                continue;
+            };
+            if !matches!(line.path.steps.get(1), Some(BridgePathStep::Cell { .. })) {
+                continue;
+            }
+            if !considered.insert(*t_idx) {
+                continue;
+            }
+            let table_path = BridgeBlockPath::top(*t_idx);
+            let strictly_after_start = table_path.cmp_doc_order(&start.path) == Ordering::Greater;
+            let strictly_before_end = table_path.cmp_doc_order(&end.path) == Ordering::Less
+                && !table_path.is_ancestor_of(&end.path);
+            if strictly_after_start && strictly_before_end {
+                bracketed_tables.insert(*t_idx);
+            }
+        }
+    }
     let mut rects: Vec<BridgeRect> = Vec::new();
     for line in geom {
         /* Skip lines whose paragraph sits before start or after end in
@@ -2049,6 +2085,28 @@ fn selection_rects_geom(
         let cmp_start = line.path.cmp_doc_order(&start.path);
         let cmp_end = line.path.cmp_doc_order(&end.path);
         if cmp_start == Ordering::Less || cmp_end == Ordering::Greater {
+            continue;
+        }
+        /* Bracketed-table cell line → full-cell-width rect (one per line
+        of cell content). Skip the per-run text-span clip path entirely
+        so cell gutters/padding don't leak white between rects. */
+        let in_bracketed = line
+            .path
+            .steps
+            .first()
+            .and_then(|s| match s {
+                BridgePathStep::Block { idx } => Some(*idx),
+                BridgePathStep::Cell { .. } => None,
+            })
+            .is_some_and(|t_idx| bracketed_tables.contains(&t_idx))
+            && matches!(line.path.steps.get(1), Some(BridgePathStep::Cell { .. }));
+        if in_bracketed {
+            rects.push(BridgeRect {
+                x: line.hit_left,
+                y: line.y_top,
+                w: line.hit_width,
+                h: line.height,
+            });
             continue;
         }
         let lo = if cmp_start == Ordering::Equal {
@@ -3544,6 +3602,71 @@ impl Engine {
                             }
                         };
                     }
+                    /* Boundary escape — when the spatial scan returns
+                    nothing AND the caret sits inside a table cell,
+                    explicitly hop out to the body paragraph adjacent
+                    to the table. Without this, pressing Up at the
+                    top row / Down at the bottom row with no body
+                    line on the correct side of the table TRAPS the
+                    caret inside the table (the spatial scan needs a
+                    geom line to land on, and the scan above filters
+                    lines by strict y-side relative to `cur_line` —
+                    if the only candidate is on the wrong y-side, it
+                    is rejected). `insert_table` now appends a
+                    trailing paragraph so Down usually finds it
+                    through the spatial scan; this fallback covers
+                    the residual cases (in particular when geometry
+                    rounding misattributes the trailing line's
+                    y_top, or when the caret is in a top-of-doc
+                    table and the only escape route is below). */
+                    if best.is_none() {
+                        let cur_table_idx = cur_line.path.steps.first().and_then(|s| match s {
+                            BridgePathStep::Block { idx } => Some(*idx),
+                            BridgePathStep::Cell { .. } => None,
+                        });
+                        let in_cell = matches!(
+                            cur_line.path.steps.get(1),
+                            Some(BridgePathStep::Cell { .. })
+                        );
+                        if let (Some(t_idx), true) = (cur_table_idx, in_cell) {
+                            best = geom
+                                .iter()
+                                .filter(|l| {
+                                    /* Body lines (no Cell step) whose top-level
+                                    block index sits on the correct side of the
+                                    current table. */
+                                    let outside_table = !matches!(
+                                        l.path.steps.get(1),
+                                        Some(BridgePathStep::Cell { .. })
+                                    );
+                                    let l_idx = l.path.steps.first().and_then(|s| match s {
+                                        BridgePathStep::Block { idx } => Some(*idx),
+                                        BridgePathStep::Cell { .. } => None,
+                                    });
+                                    outside_table
+                                        && match l_idx {
+                                            Some(i) if going_up => i < t_idx,
+                                            Some(i) => i > t_idx,
+                                            None => false,
+                                        }
+                                })
+                                .min_by(|a, b| {
+                                    /* Going up → the closest body line is
+                                    the one with the GREATEST y_top below
+                                    `cur_line` in document order (i.e.
+                                    last paragraph above the table).
+                                    Going down → the SMALLEST y_top
+                                    above `cur_line` (first paragraph
+                                    below the table). */
+                                    let key = |l: &&LineGeom| {
+                                        if going_up { -l.y_top } else { l.y_top }
+                                    };
+                                    key(a)
+                                        .partial_cmp(&key(b))
+                                        .unwrap_or(core::cmp::Ordering::Equal)
+                                });
+                        }
+                    }
                     best
                 } else {
                     /* Fallback to first line when current isn't found
@@ -3555,12 +3678,25 @@ impl Engine {
                     }
                 };
                 let new_caret = match target {
-                    Some(line) => nearest_slot_by_x(&line.slots, ideal)
-                        .map(|s| BridgeLogicalPos {
+                    Some(line) => {
+                        /* An empty paragraph's placeholder line carries
+                        no slots — fall back to the line's start_byte
+                        (= end_byte = 0) so the caret still LANDS on
+                        that line instead of bouncing back to the
+                        current position. Without this, Down from
+                        the bottom row of a table whose trailing
+                        paragraph is empty resolves the right target
+                        line, then loses the caret because
+                        `nearest_slot_by_x` returns None on a slotless
+                        line. */
+                        let offset = nearest_slot_by_x(&line.slots, ideal)
+                            .map(|s| s.byte)
+                            .unwrap_or(line.start_byte);
+                        BridgeLogicalPos {
                             path: line.path.clone(),
-                            offset: s.byte,
-                        })
-                        .unwrap_or_else(|| sel.caret.clone()),
+                            offset,
+                        }
+                    }
                     None => sel.caret.clone(),
                 };
                 (new_caret, Some(ideal))
@@ -4347,7 +4483,7 @@ mod tests {
             layout_cache: new_layout_cache(),
             a11y_cache: None,
             image_cache: HashMap::new(),
-        last_paint_dims: (0.0, 0),
+            last_paint_dims: (0.0, 0),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine

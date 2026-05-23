@@ -53,9 +53,9 @@ pub async fn detect_backend() -> RendererBackend {
         return RendererBackend::Canvas2d;
     }
     /* Until Backlog #4 lands, Canvas2D is the contract:
-       `let _have_gpu = request_gpu_device().await;` (probe kept reachable
-       in the rendered binary by `Engine::with_vello` + the harness path —
-       this function no longer gates on it). */
+    `let _have_gpu = request_gpu_device().await;` (probe kept reachable
+    in the rendered binary by `Engine::with_vello` + the harness path —
+    this function no longer gates on it). */
     RendererBackend::Canvas2d
 }
 

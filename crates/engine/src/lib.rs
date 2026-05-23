@@ -1899,6 +1899,18 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let insert_at = (idx as usize).min(blocks.len());
         blocks.insert(insert_at, Block::Table(table));
+        /* OOXML mandates a `<w:p>` after every `<w:tbl>` boundary
+        (the body's last child must be a paragraph). Beyond spec
+        compliance, the trailing paragraph is the caret's escape
+        hatch — without one, pressing Down at the bottom row has
+        nowhere to go and traps the caret inside the table. Splice
+        one in unless the next block is already a Paragraph. */
+        let needs_trailing = blocks
+            .get(insert_at + 1)
+            .is_none_or(|b| !matches!(b, Block::Paragraph(_)));
+        if needs_trailing {
+            blocks.insert(insert_at + 1, Block::Paragraph(Paragraph::default()));
+        }
         Self {
             blocks,
             sections: self.sections.clone(),
@@ -3464,13 +3476,21 @@ mod tests {
     fn insert_table_synthesises_dirty_block_with_no_source() {
         let d = DocumentTree::from_text("hello");
         let d = d.insert_table(BlockPath::top(1), 2, 3);
-        assert_eq!(d.blocks.len(), 2);
+        /* 3 blocks: "hello" + table + auto-appended trailing empty
+        paragraph (the OOXML-mandated escape paragraph). */
+        assert_eq!(d.blocks.len(), 3);
         let t = d.blocks[1].as_table().expect("Block::Table");
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0].cells.len(), 3);
         assert_eq!(t.grid.len(), 3);
         assert!(t.dirty, "synthesised tables must regen on save");
         assert!(t.source_xml.is_none());
+        assert!(
+            d.blocks[2]
+                .as_paragraph()
+                .is_some_and(|p| p.text.is_empty()),
+            "trailing escape paragraph"
+        );
     }
 
     /// PR 4 visibility fix — a freshly inserted table must paint:
@@ -3638,9 +3658,18 @@ mod tests {
     #[test]
     fn delete_table_removes_top_level_block() {
         let d = DocumentTree::from_text("before").insert_table(BlockPath::top(1), 1, 1);
-        assert_eq!(d.blocks.len(), 2);
+        /* 3 blocks: "before" + table + auto-trailing empty paragraph
+        (the OOXML-mandated escape paragraph `insert_table` appends). */
+        assert_eq!(d.blocks.len(), 3);
         let d = d.delete_table(BlockPath::top(1));
-        assert_eq!(d.blocks.len(), 1);
+        /* 2 blocks remain: "before" + the trailing empty paragraph
+        (delete_table removes only the Table block at idx 1). */
+        assert_eq!(d.blocks.len(), 2);
         assert!(d.blocks[0].as_paragraph().is_some());
+        assert!(
+            d.blocks[1]
+                .as_paragraph()
+                .is_some_and(|p| p.text.is_empty())
+        );
     }
 }
