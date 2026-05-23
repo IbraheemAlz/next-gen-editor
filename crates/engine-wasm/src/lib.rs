@@ -2633,6 +2633,8 @@ mod tests {
             text: text.to_string(),
             spans: Vec::new(),
             props: engine::ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -2761,6 +2763,8 @@ mod tests {
             text: "abcdef".to_string(),
             spans: Vec::new(),
             props: engine::ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, 3, 3, 16.0, 1.0);
@@ -2781,6 +2785,8 @@ mod tests {
             text: "abc".to_string(),
             spans: Vec::new(),
             props: engine::ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         let spans = composition_layout_spans(&p, 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);

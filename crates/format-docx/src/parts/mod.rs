@@ -5,3 +5,4 @@
 //! `comments`. See `OOXML_ROADMAP.md` §1.1 for the full target layout.
 
 pub mod document;
+pub mod styles;

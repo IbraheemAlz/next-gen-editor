@@ -385,6 +385,9 @@ impl ParaBuilder {
             text,
             spans,
             props: ParaProperties::default(),
+            /* HTML paste creates fresh paragraphs; never inherits source. */
+            dirty: false,
+            source_xml: None,
         })
     }
 }
@@ -482,6 +485,8 @@ mod tests {
             text: "hello".into(),
             spans: vec![],
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -492,6 +497,8 @@ mod tests {
             text: "a < b & c".into(),
             spans: vec![],
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -510,6 +517,8 @@ mod tests {
                 },
             }],
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         assert_eq!(
             to_html(&[p]),
@@ -531,6 +540,8 @@ mod tests {
                 },
             }],
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);

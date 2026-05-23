@@ -210,11 +210,39 @@ fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("</w:p>");
 }
 
+/// Phase 3 passthrough optimisation. A paragraph that was loaded from a
+/// `.docx` (so `source_xml` is `Some`) and has not been mutated by the
+/// engine (`dirty == false`) is re-emitted **verbatim** from its captured
+/// source bytes. Every other paragraph regenerates via
+/// `serialize_paragraph` — the lossy-vs-stylesheet but engine-state-
+/// preserving fallback path.
+///
+/// This is what keeps stylesheet-heavy real-world `.docx` files
+/// byte-stable on round-trip: paragraphs the user didn't touch carry
+/// their original `<w:pStyle>` / `<w:rsidR>` / `<w:proofErr>` markup
+/// unmodified.
+fn emit_paragraph(para: &Paragraph, out: &mut String) {
+    if !para.dirty
+        && let Some(raw) = &para.source_xml
+    {
+        /* Source bytes are valid UTF-8 — they came out of a well-formed
+        XML document that the reader already round-tripped through
+        `quick_xml`'s decoder. Defensively fall back on regenerate if the
+        bytes aren't UTF-8. */
+        match std::str::from_utf8(raw) {
+            Ok(s) => out.push_str(s),
+            Err(_) => serialize_paragraph(para, out),
+        }
+    } else {
+        serialize_paragraph(para, out);
+    }
+}
+
 fn build_document_xml(doc: &DocumentTree) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str(DOC_XML_HEADER);
     for para in &doc.paragraphs {
-        serialize_paragraph(para, &mut out);
+        emit_paragraph(para, &mut out);
     }
     out.push_str(DOC_XML_FOOTER);
     out
@@ -315,6 +343,8 @@ mod tests {
                 },
             ],
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -342,6 +372,8 @@ mod tests {
                 style: styled,
             }],
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -384,6 +416,8 @@ mod tests {
             text: "hello world".into(),
             spans: Vec::new(),
             props: props.clone(),
+            dirty: false,
+            source_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -416,6 +450,8 @@ mod tests {
                 page_break_before: true,
                 ..Default::default()
             },
+            dirty: false,
+            source_xml: None,
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]));
         let p = xml.find("<w:pPr>").unwrap();
@@ -444,6 +480,136 @@ mod tests {
         let parsed = read_docx(&bytes).expect("read");
         assert_eq!(parsed.document.paragraph_count(), 1);
         assert_eq!(parsed.document.paragraph_text(0), Some("hello world"));
+    }
+
+    /* ---- Phase 3: cascade + passthrough ------------------------------ */
+
+    /// A minimal `.docx` whose `word/styles.xml` defines `BaseStyle` (bold)
+    /// and `ChildStyle` (italic, basedOn BaseStyle), with `document.xml`
+    /// referencing `ChildStyle`. Used by the cascade + passthrough tests.
+    fn build_style_cascade_docx() -> Vec<u8> {
+        let styles_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:styleId="BaseStyle"><w:name w:val="Base"/><w:rPr><w:b/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="ChildStyle"><w:name w:val="Child"/><w:basedOn w:val="BaseStyle"/><w:rPr><w:i/></w:rPr></w:style>
+</w:styles>"#;
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="ChildStyle"/></w:pPr><w:r><w:t xml:space="preserve">hello cascade</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>"#;
+        let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+        let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", dot_rels),
+                ("word/_rels/document.xml.rels", doc_rels),
+                ("word/styles.xml", styles_xml),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn cascade_resolves_basedon_chain_into_flat_span() {
+        let bytes = build_style_cascade_docx();
+        let parsed = read_docx(&bytes).expect("read");
+        let p = &parsed.document.paragraphs[0];
+        assert_eq!(p.text, "hello cascade");
+        /* Single run, covering the whole text, with the cascaded style:
+        bold (from BaseStyle) + italic (from ChildStyle). */
+        assert_eq!(p.spans.len(), 1, "expected one resolved run span");
+        assert_eq!((p.spans[0].start, p.spans[0].end), (0, 13));
+        assert_eq!(p.spans[0].style.bold, Some(true), "BaseStyle bold");
+        assert_eq!(p.spans[0].style.italic, Some(true), "ChildStyle italic");
+    }
+
+    #[test]
+    fn passthrough_keeps_unedited_paragraph_byte_identical() {
+        let bytes = build_style_cascade_docx();
+        let archive = read_docx(&bytes).expect("read");
+        /* Loaded paragraph must be clean, with captured source bytes. */
+        let p = &archive.document.paragraphs[0];
+        assert!(!p.dirty, "loaded paragraph must not be dirty");
+        let raw = p.source_xml.as_deref().expect("source_xml captured");
+        let raw_str = std::str::from_utf8(raw).unwrap();
+        assert!(raw_str.starts_with("<w:p>"));
+        assert!(raw_str.ends_with("</w:p>"));
+        assert!(raw_str.contains("<w:pStyle w:val=\"ChildStyle\"/>"));
+
+        /* Save unedited → document.xml must be byte-identical inside the
+        <w:p>...</w:p> region. */
+        let saved = write_docx(&archive, &archive.document).expect("write");
+        let saved_doc_xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&saved)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(
+            saved_doc_xml.contains(raw_str),
+            "passthrough must re-emit raw <w:p> bytes verbatim"
+        );
+    }
+
+    #[test]
+    fn edit_falls_back_to_serialized_model() {
+        let bytes = build_style_cascade_docx();
+        let archive = read_docx(&bytes).expect("read");
+        /* Mutate the paragraph — engine flips dirty=true, drops source_xml. */
+        let edited = archive
+            .document
+            .insert_text(engine::LogicalPos { para: 0, offset: 5 }, " EDITED");
+        let p = &edited.paragraphs[0];
+        assert!(p.dirty, "edit must flip dirty=true");
+        assert!(p.source_xml.is_none(), "edit must drop source_xml");
+
+        /* Save → document.xml regenerates (no pStyle ref, but the cascaded
+        style spans are emitted as direct rPr). */
+        let saved = write_docx(&archive, &edited).expect("write");
+        let saved_doc_xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&saved)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(saved_doc_xml.contains("hello EDITED cascade"));
+        /* Re-read: cascade is gone (regenerated doc.xml carries direct
+        rPr instead of `<w:pStyle>`); but styles.xml still rides
+        passthrough, so the StyleTable is still populated — the bold+italic
+        span survives as direct formatting on the regenerated run. */
+        let reparsed = read_docx(&saved).expect("re-read");
+        let q = &reparsed.document.paragraphs[0];
+        assert_eq!(q.text, "hello EDITED cascade");
+        assert!(
+            q.spans
+                .iter()
+                .any(|s| s.style.bold == Some(true) && s.style.italic == Some(true))
+        );
     }
 
     #[test]

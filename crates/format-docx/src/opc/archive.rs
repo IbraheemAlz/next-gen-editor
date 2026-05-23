@@ -10,11 +10,14 @@
 
 use crate::error::DocxError;
 use crate::parts::document::parse_document_xml;
+use crate::parts::styles::{StyleTable, parse_styles_xml};
+use crate::style_resolver::StyleResolver;
 use engine::DocumentTree;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
 pub const DOC_XML: &str = "word/document.xml";
+pub const STYLES_XML: &str = "word/styles.xml";
 
 /// All raw archive entries except `word/document.xml`. Carried through the
 /// round-trip so the writer can re-emit them verbatim.
@@ -59,7 +62,20 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     }
 
     let xml = document_xml.ok_or_else(|| DocxError::MissingEntry(DOC_XML.into()))?;
-    let document = parse_document_xml(&xml)?;
+
+    /* Phase 3 — `word/styles.xml` rides the pass-through but feeds the
+    cascade resolver. Absent or malformed → empty table (all paragraphs
+    just see direct formatting; behaviour matches pre-Phase-3). */
+    let style_table: StyleTable = match other_entries
+        .iter()
+        .find(|(n, _)| n == STYLES_XML)
+        .map(|(_, b)| parse_styles_xml(b))
+    {
+        Some(Ok(t)) => t,
+        _ => StyleTable::default(),
+    };
+    let resolver = StyleResolver::new(&style_table);
+    let document = parse_document_xml(&xml, &resolver)?;
 
     Ok(DocxArchive {
         other_entries,

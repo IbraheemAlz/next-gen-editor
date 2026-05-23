@@ -131,6 +131,40 @@ pub struct ParaProperties {
     pub page_break_before: bool,
 }
 
+impl ParaProperties {
+    /// Overlay `patch` onto `self` using OOXML cascade semantics: a child
+    /// style with a *set* (non-default) field overrides the parent. Used by
+    /// the Phase 3 `format_docx::style_resolver` to fold a basedOn chain
+    /// root → leaf and then drop direct `<w:pPr>` on top.
+    ///
+    /// **Known limitation.** Engine fields are flat (`Indent`, `Spacing` are
+    /// non-`Option` structs), so we cannot distinguish "child specified 0"
+    /// from "child inherited". A child whose `<w:ind w:start="0"/>` is
+    /// intentional will lose to a parent's non-zero start. Real-world
+    /// stylesheets virtually never set 0 explicitly, so the trade-off is
+    /// acceptable for Phase 3; Phase 4+ may widen to `Option`.
+    pub fn merged_with(self, patch: ParaProperties) -> ParaProperties {
+        ParaProperties {
+            alignment: patch.alignment.or(self.alignment),
+            indent: if patch.indent == Indent::default() {
+                self.indent
+            } else {
+                patch.indent
+            },
+            spacing: if patch.spacing == Spacing::default() {
+                self.spacing
+            } else {
+                patch.spacing
+            },
+            direction: patch.direction.or(self.direction),
+            line_height: patch.line_height.or(self.line_height),
+            keep_next: patch.keep_next || self.keep_next,
+            keep_lines: patch.keep_lines || self.keep_lines,
+            page_break_before: patch.page_break_before || self.page_break_before,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Paragraph {
     pub text: String,
@@ -140,6 +174,16 @@ pub struct Paragraph {
     /// Paragraph-level properties (`<w:pPr>`). Default = inherit everything
     /// from the render config / document defaults.
     pub props: ParaProperties,
+    /// Phase 3 passthrough optimisation. `false` on load; flips to `true` the
+    /// first time any engine mutation produces a derived paragraph. The writer
+    /// emits `source_xml` verbatim when this is `false` and ignores it
+    /// otherwise — so unmutated stylesheet-driven paragraphs round-trip
+    /// byte-identical.
+    pub dirty: bool,
+    /// Raw `<w:p>...</w:p>` source bytes captured by the reader (Phase 3).
+    /// `None` for paragraphs the engine synthesised (`from_text`, splits,
+    /// pastes); `Some` for any paragraph parsed from a real `.docx`.
+    pub source_xml: Option<Vec<u8>>,
 }
 
 impl Paragraph {
@@ -198,6 +242,8 @@ impl Paragraph {
             text: self.text.clone(),
             spans,
             props: self.props.clone(),
+            dirty: true,
+            source_xml: None,
         }
     }
 
@@ -278,6 +324,8 @@ impl Paragraph {
             text,
             spans,
             props: self.props.clone(),
+            dirty: true,
+            source_xml: None,
         }
     }
 
@@ -308,11 +356,15 @@ impl Paragraph {
                 text: self.text[..at as usize].to_owned(),
                 spans: left,
                 props: self.props.clone(),
+                dirty: true,
+                source_xml: None,
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
                 spans: right,
                 props: self.props.clone(),
+                dirty: true,
+                source_xml: None,
             },
         )
     }
@@ -336,6 +388,8 @@ impl Paragraph {
             text,
             spans,
             props: self.props.clone(),
+            dirty: true,
+            source_xml: None,
         }
     }
 
@@ -379,6 +433,8 @@ impl DocumentTree {
             text: text.to_owned(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         });
         Self { paragraphs }
     }
@@ -391,6 +447,8 @@ impl DocumentTree {
                 text: t,
                 spans: Vec::new(),
                 props: ParaProperties::default(),
+                dirty: false,
+                source_xml: None,
             });
         }
         Self { paragraphs }
@@ -439,6 +497,8 @@ impl DocumentTree {
                 text: text.to_owned(),
                 spans: Vec::new(),
                 props: ParaProperties::default(),
+                dirty: true,
+                source_xml: None,
             });
             return Self { paragraphs };
         }
@@ -458,6 +518,8 @@ impl DocumentTree {
                 s.end += len;
             }
         }
+        para.dirty = true;
+        para.source_xml = None;
         paragraphs.set(para_idx, para);
         Self { paragraphs }
     }
@@ -500,6 +562,8 @@ impl DocumentTree {
         for p in first..=final_para {
             let mut para = paragraphs[p].clone();
             para.props.alignment = Some(align);
+            para.dirty = true;
+            para.source_xml = None;
             paragraphs.set(p, para);
         }
         Self { paragraphs }
@@ -871,6 +935,8 @@ mod tests {
             text: "hello world".into(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -886,6 +952,8 @@ mod tests {
             text: "مرحبا بالعالم".into(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -898,6 +966,8 @@ mod tests {
             text: String::new(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -964,6 +1034,8 @@ mod tests {
             text: "aمb".into(),
             spans: Vec::new(),
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -1204,6 +1276,8 @@ mod tests {
                 style: bold,
             }],
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -1230,6 +1304,8 @@ mod tests {
             text: "BRAVE ".into(),
             spans: vec![],
             props: ParaProperties::default(),
+            dirty: false,
+            source_xml: None,
         }];
         let (out, caret) = doc.insert_rich(LogicalPos { para: 0, offset: 6 }, &frag);
         assert_eq!(out.paragraph_count(), 1);
@@ -1255,6 +1331,8 @@ mod tests {
                 text: "one".into(),
                 spans: vec![],
                 props: ParaProperties::default(),
+                dirty: false,
+                source_xml: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -1264,6 +1342,8 @@ mod tests {
                     style: bold,
                 }],
                 props: ParaProperties::default(),
+                dirty: false,
+                source_xml: None,
             },
         ];
         let (out, caret) = doc.insert_rich(LogicalPos { para: 0, offset: 2 }, &frag);

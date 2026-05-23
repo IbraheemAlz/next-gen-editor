@@ -357,6 +357,14 @@ fn run_gen_seed(dir: &Path) -> Result<()> {
         );
         println!("[gen-seed] wrote {} ({} B)", path.display(), bytes.len());
     }
+    /* Phase 3 fixtures don't fit `build_minimal_docx` (they need a custom
+    `word/styles.xml`); each carries its own raw-byte builder. */
+    for fx in prebuilt_fixtures() {
+        let path = dir.join(fx.name);
+        std::fs::write(&path, &fx.bytes).with_context(|| format!("write {}", path.display()))?;
+        manifest.fixtures.insert(fx.name.to_owned(), fx.entry);
+        println!("[gen-seed] wrote {} ({} B)", path.display(), fx.bytes.len());
+    }
     let manifest_path = dir.join(MANIFEST_NAME);
     let manifest_json = serde_json::to_string_pretty(&manifest).context("serialize manifest")?;
     std::fs::write(&manifest_path, format!("{manifest_json}\n"))
@@ -411,6 +419,8 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             text: text.to_owned(),
             spans: Vec::new(),
             props,
+            dirty: false,
+            source_xml: None,
         }]),
     };
     vec![
@@ -455,6 +465,86 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             "السلام عليكم ورحمة الله وبركاته",
         ),
     ]
+}
+
+/* --- Phase 3: pre-built fixtures.
+These ship as raw `.docx` bytes (not an engine `DocumentTree` we can
+serialise via `build_minimal_docx`) because they need a custom
+`word/styles.xml`. */
+
+struct PrebuiltFixture {
+    name: &'static str,
+    bytes: Vec<u8>,
+    entry: FixtureEntry,
+}
+
+fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
+    vec![PrebuiltFixture {
+        name: "style_cascade.docx",
+        bytes: build_style_cascade_docx(),
+        entry: FixtureEntry {
+            generator: "handcrafted".into(),
+            phase_introduced: 3,
+            asserts: FixtureAsserts {
+                paragraph_count: 1,
+                paragraph_texts: vec!["hello cascade".into()],
+            },
+            roundtrip: RoundtripBounds::default(),
+        },
+    }]
+}
+
+/// Replicates `crates/format-docx/src/writer.rs`
+/// `tests::build_style_cascade_docx`. Kept here so the gen-seed binary
+/// doesn't depend on test-only symbols. BaseStyle (bold) → ChildStyle
+/// (italic, basedOn BaseStyle); the single `<w:p>` references ChildStyle
+/// and must round-trip with the cascade resolved to bold + italic.
+fn build_style_cascade_docx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    let styles_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:styleId="BaseStyle"><w:name w:val="Base"/><w:rPr><w:b/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="ChildStyle"><w:name w:val="Child"/><w:basedOn w:val="BaseStyle"/><w:rPr><w:i/></w:rPr></w:style>
+</w:styles>"#;
+    let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="ChildStyle"/></w:pPr><w:r><w:t xml:space="preserve">hello cascade</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>"#;
+    let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, body) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", dot_rels),
+            ("word/_rels/document.xml.rels", doc_rels),
+            ("word/styles.xml", styles_xml),
+            ("word/document.xml", document_xml),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
 }
 
 /* ============================================================= helpers ==== */

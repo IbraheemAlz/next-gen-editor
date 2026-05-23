@@ -90,6 +90,19 @@
       "roundtrip": {
         "document_xml_drift_bytes": 0
       }
+    },
+    "style_cascade.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 3,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "hello cascade"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
     }
   }
 }
