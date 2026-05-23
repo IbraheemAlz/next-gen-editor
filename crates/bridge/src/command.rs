@@ -458,4 +458,13 @@ pub enum MoveDirection {
     Right,
     NextCell,
     PrevCell,
+    /// Ctrl/Cmd + ArrowLeft — jump caret to the start of the previous
+    /// word in logical byte order. Whitespace-bounded; crosses paragraph
+    /// boundaries by jumping to the end of the previous paragraph.
+    WordLeft,
+    /// Ctrl/Cmd + ArrowRight — jump caret to the start of the next word
+    /// (the byte index just after the run of whitespace that follows the
+    /// current word). Crosses paragraph boundaries by jumping to the
+    /// start of the next paragraph.
+    WordRight,
 }

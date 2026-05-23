@@ -1881,6 +1881,111 @@ fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     pos
 }
 
+/// Jump one word backward in logical order — Ctrl/Cmd + ArrowLeft. The
+/// scan is whitespace-bounded: skip any whitespace immediately to the
+/// left of the caret, then walk through the run of non-whitespace
+/// characters to its start. At the paragraph start the caret jumps to
+/// the END of the previous paragraph in the flat walk; at the document
+/// start it pins.
+///
+/// Mapping is **logical**, matching the existing `step_left` /
+/// `step_right` convention — ArrowLeft moves toward smaller byte offsets
+/// regardless of paragraph direction. Word's actual RTL behaviour
+/// (visual-Left = logical-Forward for RTL paragraphs) is a separate
+/// concern that would touch every arrow, not just word jump.
+fn step_word_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    let engine_path = bridge_to_engine_path(pos.path.clone());
+    let Some(para) = doc.paragraph_at_path(&engine_path) else {
+        return pos;
+    };
+    let text = &para.text;
+    let mut off = (pos.offset as usize).min(text.len());
+    /* Already at paragraph start — hop to the end of the previous
+    paragraph in the flat document walk. */
+    if off == 0 {
+        if let Some((prev_path, prev_para)) = doc_paragraph_neighbor(doc, &engine_path, false) {
+            return BridgeLogicalPos {
+                path: engine_to_bridge_path(prev_path),
+                offset: prev_para.text.len() as u32,
+            };
+        }
+        return pos;
+    }
+    /* Skip whitespace immediately left of the caret. */
+    while off > 0 {
+        let Some(c) = text[..off].chars().next_back() else {
+            break;
+        };
+        if !c.is_whitespace() {
+            break;
+        }
+        off -= c.len_utf8();
+    }
+    /* Walk back through the non-whitespace run to its start. */
+    while off > 0 {
+        let Some(c) = text[..off].chars().next_back() else {
+            break;
+        };
+        if c.is_whitespace() {
+            break;
+        }
+        off -= c.len_utf8();
+    }
+    BridgeLogicalPos {
+        path: pos.path,
+        offset: off as u32,
+    }
+}
+
+/// Jump one word forward in logical order — Ctrl/Cmd + ArrowRight. The
+/// scan walks through the current word's non-whitespace run, then skips
+/// the run of whitespace that follows, landing on the first character of
+/// the NEXT word (Word's convention — not the end of the current word).
+/// At paragraph end the caret jumps to the start of the next paragraph
+/// in the flat walk; at the document end it pins.
+fn step_word_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    let engine_path = bridge_to_engine_path(pos.path.clone());
+    let Some(para) = doc.paragraph_at_path(&engine_path) else {
+        return pos;
+    };
+    let text = &para.text;
+    let mut off = (pos.offset as usize).min(text.len());
+    /* Already at paragraph end — hop to the start of the next paragraph. */
+    if off >= text.len() {
+        if let Some((next_path, _)) = doc_paragraph_neighbor(doc, &engine_path, true) {
+            return BridgeLogicalPos {
+                path: engine_to_bridge_path(next_path),
+                offset: 0,
+            };
+        }
+        return pos;
+    }
+    /* Walk through the current word's non-whitespace run. */
+    while off < text.len() {
+        let Some(c) = text[off..].chars().next() else {
+            break;
+        };
+        if c.is_whitespace() {
+            break;
+        }
+        off += c.len_utf8();
+    }
+    /* Skip the whitespace run to land on the next word's first char. */
+    while off < text.len() {
+        let Some(c) = text[off..].chars().next() else {
+            break;
+        };
+        if !c.is_whitespace() {
+            break;
+        }
+        off += c.len_utf8();
+    }
+    BridgeLogicalPos {
+        path: pos.path,
+        offset: off as u32,
+    }
+}
+
 /// Step one Unicode char right in logical order. At a paragraph's end the
 /// caret jumps to the start of the next paragraph in the flat walk; at the
 /// document end it pins.
@@ -3518,6 +3623,8 @@ impl Engine {
         let (new_caret, new_ideal) = match direction {
             MoveDirection::Left => (step_left(&doc, sel.caret.clone()), None),
             MoveDirection::Right => (step_right(&doc, sel.caret.clone()), None),
+            MoveDirection::WordLeft => (step_word_left(&doc, sel.caret.clone()), None),
+            MoveDirection::WordRight => (step_word_right(&doc, sel.caret.clone()), None),
             MoveDirection::NextCell | MoveDirection::PrevCell => (
                 cell_tab_step(
                     &mut self.undo,
@@ -4872,5 +4979,108 @@ mod tests {
         assert_eq!((spans[0].start, spans[0].end), (0, 3));
         assert_eq!((spans[1].start, spans[1].end), (3, 5));
         assert!(spans[1].underline);
+    }
+
+    /// Helper: build a single-paragraph document for the word-jump tests.
+    fn one_para_doc(text: &str) -> DocumentTree {
+        DocumentTree::from_text(text)
+    }
+
+    /// Ctrl+ArrowLeft mid-word jumps to the start of the current word.
+    #[test]
+    fn word_left_jumps_to_word_start() {
+        let doc = one_para_doc("hello world rust");
+        /* Caret in the middle of "world" (offset 9 — between r and l). */
+        let out = step_word_left(&doc, bpos_top(0, 9));
+        assert_eq!(out.offset, 6, "land on 'w' of 'world'");
+    }
+
+    /// Ctrl+ArrowLeft at the start of a word jumps to the start of the
+    /// PREVIOUS word, skipping the whitespace between them.
+    #[test]
+    fn word_left_at_word_start_jumps_to_previous_word() {
+        let doc = one_para_doc("hello world rust");
+        let out = step_word_left(&doc, bpos_top(0, 6));
+        assert_eq!(out.offset, 0, "land on 'h' of 'hello'");
+    }
+
+    /// Ctrl+ArrowLeft inside whitespace skips back through the whitespace
+    /// and through the preceding word to its start.
+    #[test]
+    fn word_left_from_whitespace_jumps_past_previous_word() {
+        let doc = one_para_doc("hello world");
+        let out = step_word_left(&doc, bpos_top(0, 5));
+        assert_eq!(out.offset, 0);
+    }
+
+    /// Ctrl+ArrowRight from inside a word lands on the first char of the
+    /// next word — Word's convention, not the end of the current word.
+    #[test]
+    fn word_right_jumps_to_next_word_start() {
+        let doc = one_para_doc("hello world rust");
+        let out = step_word_right(&doc, bpos_top(0, 2));
+        assert_eq!(out.offset, 6, "land on 'w' of 'world'");
+    }
+
+    /// Ctrl+ArrowRight at the end of the last word pins at paragraph
+    /// end when no next paragraph exists.
+    #[test]
+    fn word_right_pins_at_document_end() {
+        let doc = one_para_doc("hello world");
+        let len = "hello world".len() as u32;
+        let out = step_word_right(&doc, bpos_top(0, len));
+        assert_eq!(out.offset, len);
+    }
+
+    /// Word-jump scanner is char-aware — multi-byte UTF-8 (Arabic) is
+    /// segmented by ASCII whitespace and never lands inside a char.
+    #[test]
+    fn word_left_arabic_finds_word_start() {
+        let doc = one_para_doc("hello مرحبا بالعالم");
+        let len = doc
+            .paragraph_at_path(&engine::BlockPath::top(0))
+            .unwrap()
+            .text
+            .len() as u32;
+        /* From the very end, one ArrowLeft jumps to the start of the
+        last Arabic word ("بالعالم") — the byte offset of its first
+        char. */
+        let out = step_word_left(&doc, bpos_top(0, len));
+        let expected_word = "بالعالم";
+        let expected_offset = "hello مرحبا ".len() as u32;
+        assert_eq!(out.offset, expected_offset);
+        assert_eq!(
+            &doc.paragraph_at_path(&engine::BlockPath::top(0))
+                .unwrap()
+                .text[out.offset as usize..],
+            expected_word
+        );
+    }
+
+    /// Word-jump across the paragraph boundary — Ctrl+ArrowRight at the
+    /// end of a paragraph hops to offset 0 of the next paragraph.
+    #[test]
+    fn word_right_crosses_paragraph_boundary() {
+        let doc = DocumentTree::from_text("firstsecond").split_paragraph(engine::LogicalPos::new(
+            engine::BlockPath::top(0),
+            "first".len() as u32,
+        ));
+        let first_len = "first".len() as u32;
+        let out = step_word_right(&doc, bpos_top(0, first_len));
+        assert_eq!(out.path.steps[0], bridge::PathStep::Block { idx: 1 });
+        assert_eq!(out.offset, 0);
+    }
+
+    /// Ctrl+ArrowLeft at offset 0 of a non-first paragraph hops to the
+    /// END of the previous paragraph.
+    #[test]
+    fn word_left_crosses_paragraph_boundary() {
+        let doc = DocumentTree::from_text("firstsecond").split_paragraph(engine::LogicalPos::new(
+            engine::BlockPath::top(0),
+            "first".len() as u32,
+        ));
+        let out = step_word_left(&doc, bpos_top(1, 0));
+        assert_eq!(out.path.steps[0], bridge::PathStep::Block { idx: 0 });
+        assert_eq!(out.offset, "first".len() as u32);
     }
 }

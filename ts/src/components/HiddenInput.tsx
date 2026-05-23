@@ -93,17 +93,26 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     const onKeyDown = (e: KeyboardEvent): void => {
         if (e.isComposing) return;
 
-        /* Arrow keys: caret motion, Shift-extend (Backlog #14). preventDefault
-           stops the textarea from scrolling its own (empty) viewport. */
+        /* Arrow keys: caret motion. Shift extends the selection
+           (anchor stays put); Ctrl/Cmd promotes ArrowLeft/Right to
+           word-jump (`WordLeft`/`WordRight`). Up/Down ignore the
+           Ctrl/Cmd modifier — no paragraph-jump shortcut at this
+           tier. preventDefault stops the textarea from scrolling
+           its own (empty) viewport. */
+        const wordJump = (e.ctrlKey || e.metaKey) && !e.altKey;
         const arrow: MoveDirection | undefined =
             e.key === 'ArrowUp'
                 ? 'Up'
                 : e.key === 'ArrowDown'
                   ? 'Down'
                   : e.key === 'ArrowLeft'
-                    ? 'Left'
+                    ? wordJump
+                        ? 'WordLeft'
+                        : 'Left'
                     : e.key === 'ArrowRight'
-                      ? 'Right'
+                      ? wordJump
+                          ? 'WordRight'
+                          : 'Right'
                       : undefined;
         if (arrow) {
             e.preventDefault();
