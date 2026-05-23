@@ -22,12 +22,12 @@ use kurbo::Rect;
 use layout::{
     A4Page, LayoutBlock, LineBox, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan,
     TableBox, TableCellBox, TableRowBox, layout_paragraph,
+    paginate::{PageGeometry as PaginatorGeometry, Paginator},
 };
 use lru::LruCache;
 use render::atlas::GlyphAtlas;
 use render::canvas2d_backend::render_canvas2d;
 use render::dirty::DirtyTracker;
-use render::scene::build_page_scene;
 use render::vello_backend::VelloRenderer;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -773,6 +773,97 @@ fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32
 /// device px, which is the unit layout / render operate in.
 fn twips_to_layout_px(twips: i32, scale: f32) -> f32 {
     (twips as f32) / 15.0 * scale
+}
+
+/// Phase 6 — walk a freshly laid-out `TableBox` and stamp every nested
+/// `ParagraphBox` with the next-flat source paragraph id. Skips
+/// `VMergeRole::Continue` cells (they reuse the Restart cell's content).
+/// The traversal order must match `walk_block_texts` so the same id maps
+/// to the same source text in `para_texts`.
+fn assign_source_ids_table(table: &mut TableBox, next_id: &mut u32) {
+    for row in table.rows.iter_mut() {
+        for cell in row.cells.iter_mut() {
+            if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                continue;
+            }
+            assign_source_ids_blocks(&mut cell.content, next_id);
+        }
+    }
+}
+
+fn assign_source_ids_blocks(blocks: &mut [LayoutBlock], next_id: &mut u32) {
+    for b in blocks.iter_mut() {
+        match b {
+            LayoutBlock::Paragraph(p) => {
+                p.source_paragraph_id = *next_id;
+                *next_id += 1;
+            }
+            LayoutBlock::Table(t) => assign_source_ids_table(t, next_id),
+        }
+    }
+}
+
+/// Phase 6 — scale an `engine::PageGeometry` into the paginator's geometry
+/// type. `engine::PageGeometry` carries pt values directly (the OOXML twips
+/// → pt conversion happened at parse time); the paginator operates in
+/// layout pixels, so every coordinate multiplies by `scale`.
+fn scaled_paginator_geometry(geom: engine::PageGeometry, scale: f32) -> PaginatorGeometry {
+    PaginatorGeometry {
+        width: geom.width * scale,
+        height: geom.height * scale,
+        margins: layout::Margins {
+            top: geom.margin_top * scale,
+            right: geom.margin_right * scale,
+            bottom: geom.margin_bottom * scale,
+            left: geom.margin_left * scale,
+        },
+        header_offset: geom.header_offset * scale,
+        footer_offset: geom.footer_offset * scale,
+    }
+}
+
+/// Phase 6 — sync `page_paths` with the paginator's emitted-page count
+/// before recording the just-pushed block's engine path. A `push_block`
+/// call can:
+/// - leave the page count unchanged (block fit on the current page) → push
+///   one path entry on the current page;
+/// - bump it by one or more (overflow; the head landed on the page that
+///   was finalised, the tail on the next) → push the path on each new
+///   page the block lands on.
+///
+/// The bookkeeping intentionally keeps `page_paths` parallel to the
+/// pages the paginator has accumulated *so far*: page_paths[i] holds the
+/// paths for `paginator.pages[i]`, page_paths.last() is the in-progress page.
+fn attach_block_paths(
+    paginator: &Paginator,
+    prev_emitted: usize,
+    page_paths: &mut Vec<Vec<EngineBlockPath>>,
+    path: &EngineBlockPath,
+) {
+    let new_pages = paginator.page_count_emitted() - prev_emitted;
+    /* The block contributed to the previously in-progress page and to
+    every newly emitted page. */
+    if let Some(cur) = page_paths.last_mut() {
+        cur.push(path.clone());
+    }
+    for _ in 0..new_pages {
+        /* The page that just finalised already has its path entry from
+        the line above. The next page is the new in-progress page; it
+        gets a path entry only if the block spilled onto it (handled by
+        the next iteration). For multi-page overflow the same path is
+        pushed onto each page. */
+        page_paths.push(Vec::new());
+        if let Some(cur) = page_paths.last_mut() {
+            cur.push(path.clone());
+        }
+    }
+    /* If `new_pages > 0` the final entry was for the new in-progress
+    page. But the block may have actually ended on the previously
+    finalised page (no tail). The conservative pass above always assigns
+    one path per page from finalised+1 onwards; that overcounts when a
+    block exactly fills a page with no tail. The hit-test consumers only
+    use paths to map *flow position → engine block*, so a duplicate path
+    entry is harmless. */
 }
 
 /// Pull the four Phase-2 indent fields off `para.props`, convert to layout
@@ -2143,20 +2234,28 @@ impl Engine {
         self.layout_cfg.as_ref().map_or(1.0, |c| c.scale)
     }
 
-    /// Lay out the current document into a `PageBox` plus the `FontStack` used
-    /// to shape it. Shared by the Canvas2D repaint and PDF export. Every
-    /// dimension is multiplied by `scale` — `dpr` for the HiDPI canvas, `1.0`
-    /// for PDF (PDF user space is logical points).
-    fn build_page(
+    /// Lay out the current document into one or more `PageBox`es plus the
+    /// `FontStack` used to shape it. Shared by the Canvas2D repaint and PDF
+    /// export. Every dimension is multiplied by `scale` — `dpr` for the
+    /// HiDPI canvas, `1.0` for PDF (PDF user space is logical points).
+    ///
+    /// Phase 6 — the engine flows blocks through a [`Paginator`], emitting
+    /// a fresh `PageBox` whenever content overflows or the document moves
+    /// into a section with different page geometry. The returned
+    /// `Vec<EngineBlockPath>` is per-page, parallel to the `PageBox`
+    /// vector: `paths[i][j]` is the engine block path of `pages[i].blocks[j]`.
+    /// Paragraph splits emit the same engine path on both pages.
+    #[allow(clippy::type_complexity)]
+    fn build_pages(
         &self,
         scale: f32,
         with_composition: bool,
-    ) -> Result<(PageBox, FontStack, Vec<EngineBlockPath>), Box<Event>> {
+    ) -> Result<(Vec<PageBox>, FontStack, Vec<Vec<EngineBlockPath>>), Box<Event>> {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
                 return Err(Box::new(Event::Error {
-                    message: "build_page: no layout config cached".into(),
+                    message: "build_pages: no layout config cached".into(),
                 }));
             }
         };
@@ -2165,194 +2264,245 @@ impl Engine {
                 message: format!("font `{}` not loaded", cfg.font_id),
             }));
         }
-        let page = A4Page::a4().scaled(scale);
 
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
-
-        /* Lay out each block, stacking them down the content area. Phase 5
-        PR 2: `LayoutBlock::Paragraph` follows the existing path;
-        `LayoutBlock::Table` recursively lays out cells. */
-        let mut layout_blocks: Vec<LayoutBlock> = Vec::new();
-        /* `BlockPath` of each emitted layout block, in emission order.
-        Empty paragraphs produce no box so layout index != block index;
-        tables are recorded with their top-level block path. */
-        let mut box_paths: Vec<EngineBlockPath> = Vec::new();
-        let mut para_y_offset = 0.0_f32;
         let doc = self.undo.current().clone();
         let mut cache = self.layout_cache.borrow_mut();
-        /* The IME composition, if any — spliced into its paragraph's layout
-        as a transient underlined preview (Backlog #8). It never reaches the
-        document model, the layout cache, PDF, or hit-test geometry. */
         let composition = if with_composition {
             self.composition.as_ref()
         } else {
             None
         };
-        for (block_idx, block) in doc.blocks.iter().enumerate() {
-            let para = match block {
-                engine::Block::Paragraph(p) => p,
-                engine::Block::Table(t) => {
-                    /* Phase 5 PR 2 — lay out the table block. Skip the
-                    incremental-relayout cache (tables always re-layout;
-                    Phase 5c will add a cache key). */
-                    let mut tb =
-                        layout_table_box(t, page.content_width(), &font_stack, &cfg, scale);
-                    tb.origin = Point {
-                        x: 0.0,
-                        y: para_y_offset,
-                    };
-                    para_y_offset += tb.size.height;
-                    layout_blocks.push(LayoutBlock::Table(tb));
-                    box_paths.push(EngineBlockPath::top(block_idx as u32));
+
+        let sections = doc.effective_sections();
+        /* Phase 6 — every laid-out paragraph carries a flat
+        `source_paragraph_id` indexing into the per-document paragraph
+        text table the PDF `/ToUnicode` builder consumes. The id is the
+        walk-order index of the source paragraph in `walk_block_texts`,
+        so PDF receives `&[&str]` of those texts and looks up by id —
+        split paragraphs (head + tail) share the same id and resolve
+        to the same source string. */
+        let mut next_para_id: u32 = 0;
+        /* Each top-level block is covered by at most one effective section. The
+        paginator runs once across the whole document; section boundaries
+        trigger a hard page break + geometry swap. */
+        let mut paginator: Option<Paginator> = None;
+        let mut page_paths: Vec<Vec<EngineBlockPath>> = Vec::new();
+        /* Track the page index at the start of the current paginator's
+        accumulated `cur_blocks` so we know where to attach paths emitted
+        by `push_block` (paginator may emit prior pages first). */
+        let mut emitted_pages: Vec<PageBox> = Vec::new();
+        let mut emitted_paths: Vec<Vec<EngineBlockPath>> = Vec::new();
+
+        for section in &sections {
+            let geom = scaled_paginator_geometry(section.geometry, scale);
+            /* Flush the prior paginator (if any) before swapping geometry. */
+            if let Some(p) = paginator.take() {
+                let mut pages = p.finish();
+                /* `paginator` was started fresh — `page_paths` carries the
+                same number of entries. Move them en bloc. */
+                let consume = pages.len();
+                emitted_pages.append(&mut pages);
+                let mut paths_taken: Vec<Vec<EngineBlockPath>> = std::mem::take(&mut page_paths);
+                paths_taken.resize_with(consume, Vec::new);
+                emitted_paths.append(&mut paths_taken);
+            }
+            paginator = Some(Paginator::new(geom, None, None));
+            page_paths.clear();
+            page_paths.push(Vec::new());
+
+            for block_idx in section.start_block..section.end_block {
+                let Some(block) = doc.blocks.get(block_idx as usize) else {
                     continue;
-                }
-            };
-            let para_path = EngineBlockPath::top(block_idx as u32);
-            {
-                let comp = composition.filter(|c| {
-                    bridge_to_engine_path(c.at.path.clone()) == para_path
-                        && !c.text.is_empty()
-                        && (c.at.offset as usize) <= para.text.len()
-                        && para.text.is_char_boundary(c.at.offset as usize)
-                });
-                /* PR 4 caret-fix: empty paragraphs flow through normal
-                layout so `layout_paragraph` emits its zero-width
-                placeholder line — `document_geometry` then has a
-                LineGeom for the empty paragraph, and the caret no
-                longer jumps to (0,0) after Enter. */
-                let mut para_box = if let Some(c) = comp {
-                    /* Composition paragraph: splice the composed text in and lay
-                    it out fresh — never cached, since the text differs from the
-                    committed `para.text`. */
-                    let off = c.at.offset as usize;
-                    let mut text = String::with_capacity(para.text.len() + c.text.len());
-                    text.push_str(&para.text[..off]);
-                    text.push_str(&c.text);
-                    text.push_str(&para.text[off..]);
-                    let spans = composition_layout_spans(
-                        para,
-                        off as u32,
-                        c.text.len() as u32,
-                        cfg.px_size,
-                        scale,
-                    );
-                    let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&para.props, scale);
-                    layout_paragraph(ParagraphConfig {
-                        text: &text,
-                        fonts: &font_stack,
-                        spans: &spans,
-                        base_direction: first_strong_direction(&text).unwrap_or(cfg.base_direction),
-                        max_width: page.content_width(),
-                        line_height: cfg.line_height * scale,
-                        alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
-                        indent_start_px: ind_s,
-                        indent_end_px: ind_e,
-                        first_line_indent_px: ind_fl,
-                        hanging_indent_px: ind_h,
-                        marker_text: para.resolved_marker.clone(),
-                        px_size_for_marker: cfg.px_size * scale,
-                    })
-                } else {
-                    /* Backlog #13 — incremental relayout: reuse the cached box
-                    when this paragraph's content + config hash is unchanged,
-                    skipping BiDi and shaping. An edit changes only the edited
-                    paragraph's hash, so every other paragraph is a cheap clone. */
-                    let key = paragraph_layout_key(para, &cfg, scale);
-                    if let Some(cached) = cache.get(&key) {
-                        cached.clone()
-                    } else {
-                        let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
-                        let (ind_s, ind_e, ind_fl, ind_h) =
-                            props_to_layout_indents(&para.props, scale);
-                        let para_cfg = ParagraphConfig {
-                            text: &para.text,
-                            fonts: &font_stack,
-                            spans: &spans,
-                            /* Per-paragraph base direction from its first strong
-                            character; the document direction is the fallback
-                            (Backlog #6). */
-                            base_direction: first_strong_direction(&para.text)
-                                .unwrap_or(cfg.base_direction),
-                            max_width: page.content_width(),
-                            line_height: cfg.line_height * scale,
-                            /* A paragraph's own alignment overrides the document
-                            default (Backlog #9). */
-                            alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
-                            /* Phase 2 — <w:ind>. Zero by default; non-zero shrinks
-                            content width + offsets the first line. */
-                            indent_start_px: ind_s,
-                            indent_end_px: ind_e,
-                            first_line_indent_px: ind_fl,
-                            hanging_indent_px: ind_h,
-                            /* Phase 4 — list marker. `None` for non-list paragraphs;
-                            for list paragraphs, the numbering resolver populated
-                            `resolved_marker` at load time. */
-                            marker_text: para.resolved_marker.clone(),
-                            px_size_for_marker: cfg.px_size * scale,
-                        };
-                        let laid = layout_paragraph(para_cfg);
-                        cache.put(key, laid.clone());
-                        laid
+                };
+                let pag = paginator.as_mut().expect("paginator created");
+                let para_path = EngineBlockPath::top(block_idx);
+
+                match block {
+                    engine::Block::Table(t) => {
+                        let mut tb =
+                            layout_table_box(t, pag.content_width(), &font_stack, &cfg, scale);
+                        assign_source_ids_table(&mut tb, &mut next_para_id);
+                        let prev_pages_in_pag = pag.page_count_emitted();
+                        pag.push_block(LayoutBlock::Table(tb), 0.0, 0.0);
+                        attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
                     }
-                };
-                /* Cached and fresh boxes carry identical local line geometry —
-                only the global Y shift differs (the vertical-shift step). */
-                /* Phase 2 — <w:spacing w:before|after> adds vertical padding
-                around the paragraph. Before-spacing shifts this paragraph's
-                origin down; after-spacing pushes the *next* paragraph further
-                down. Twips → layout px through `twips_to_layout_px`. */
-                let before_px = twips_to_layout_px(para.props.spacing.before_twips, scale);
-                let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
-                para_y_offset += before_px;
-                para_box.origin = Point {
-                    x: 0.0,
-                    y: para_y_offset,
-                };
-                para_y_offset += para_box.size.height + after_px;
-                layout_blocks.push(LayoutBlock::Paragraph(para_box));
-                box_paths.push(para_path);
+                    engine::Block::Paragraph(para) => {
+                        let comp = composition.filter(|c| {
+                            bridge_to_engine_path(c.at.path.clone()) == para_path
+                                && !c.text.is_empty()
+                                && (c.at.offset as usize) <= para.text.len()
+                                && para.text.is_char_boundary(c.at.offset as usize)
+                        });
+                        let para_box = if let Some(c) = comp {
+                            let off = c.at.offset as usize;
+                            let mut text = String::with_capacity(para.text.len() + c.text.len());
+                            text.push_str(&para.text[..off]);
+                            text.push_str(&c.text);
+                            text.push_str(&para.text[off..]);
+                            let spans = composition_layout_spans(
+                                para,
+                                off as u32,
+                                c.text.len() as u32,
+                                cfg.px_size,
+                                scale,
+                            );
+                            let (ind_s, ind_e, ind_fl, ind_h) =
+                                props_to_layout_indents(&para.props, scale);
+                            layout_paragraph(ParagraphConfig {
+                                text: &text,
+                                fonts: &font_stack,
+                                spans: &spans,
+                                base_direction: first_strong_direction(&text)
+                                    .unwrap_or(cfg.base_direction),
+                                max_width: pag.content_width(),
+                                line_height: cfg.line_height * scale,
+                                alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+                                indent_start_px: ind_s,
+                                indent_end_px: ind_e,
+                                first_line_indent_px: ind_fl,
+                                hanging_indent_px: ind_h,
+                                marker_text: para.resolved_marker.clone(),
+                                px_size_for_marker: cfg.px_size * scale,
+                            })
+                        } else {
+                            let key = paragraph_layout_key(para, &cfg, scale);
+                            if let Some(cached) = cache.get(&key) {
+                                cached.clone()
+                            } else {
+                                let spans =
+                                    build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
+                                let (ind_s, ind_e, ind_fl, ind_h) =
+                                    props_to_layout_indents(&para.props, scale);
+                                let para_cfg = ParagraphConfig {
+                                    text: &para.text,
+                                    fonts: &font_stack,
+                                    spans: &spans,
+                                    base_direction: first_strong_direction(&para.text)
+                                        .unwrap_or(cfg.base_direction),
+                                    max_width: pag.content_width(),
+                                    line_height: cfg.line_height * scale,
+                                    alignment: para
+                                        .props
+                                        .alignment
+                                        .map_or(cfg.alignment, layout_align),
+                                    indent_start_px: ind_s,
+                                    indent_end_px: ind_e,
+                                    first_line_indent_px: ind_fl,
+                                    hanging_indent_px: ind_h,
+                                    marker_text: para.resolved_marker.clone(),
+                                    px_size_for_marker: cfg.px_size * scale,
+                                };
+                                let laid = layout_paragraph(para_cfg);
+                                cache.put(key, laid.clone());
+                                laid
+                            }
+                        };
+                        let before_px = twips_to_layout_px(para.props.spacing.before_twips, scale);
+                        let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
+                        let mut para_box = para_box;
+                        para_box.source_paragraph_id = next_para_id;
+                        next_para_id += 1;
+                        let prev_pages_in_pag = pag.page_count_emitted();
+                        pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
+                        attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
+                    }
+                }
             }
         }
         drop(cache);
 
-        let page_box = PageBox {
+        if let Some(p) = paginator.take() {
+            let mut pages = p.finish();
+            let consume = pages.len();
+            emitted_pages.append(&mut pages);
+            let mut paths_taken: Vec<Vec<EngineBlockPath>> = std::mem::take(&mut page_paths);
+            paths_taken.resize_with(consume, Vec::new);
+            emitted_paths.append(&mut paths_taken);
+        }
+        /* Always at least one page so downstream consumers can index `[0]`. */
+        if emitted_pages.is_empty() {
+            let default_geom = scaled_paginator_geometry(engine::PageGeometry::a4(), scale);
+            emitted_pages.push(PageBox {
+                size: Size {
+                    width: default_geom.width,
+                    height: default_geom.height,
+                },
+                margins: default_geom.margins,
+                blocks: Vec::new(),
+                header: None,
+                footer: None,
+            });
+            emitted_paths.push(Vec::new());
+        }
+        Ok((emitted_pages, font_stack, emitted_paths))
+    }
+
+    /// Backwards-compatible single-page wrapper for callers still on the
+    /// pre-Phase-6 single-page contract. Returns the *first* paginated
+    /// page; the multi-page paint / hit-test / PDF paths consume
+    /// [`build_pages`] directly.
+    #[allow(dead_code)]
+    fn build_page(
+        &self,
+        scale: f32,
+        with_composition: bool,
+    ) -> Result<(PageBox, FontStack, Vec<EngineBlockPath>), Box<Event>> {
+        let (mut pages, fonts, mut paths) = self.build_pages(scale, with_composition)?;
+        let page = pages.drain(..).next().unwrap_or_else(|| PageBox {
             size: Size {
-                width: page.width,
-                height: page.height,
+                width: 0.0,
+                height: 0.0,
             },
-            margins: page.margin,
-            blocks: layout_blocks,
-        };
-        Ok((page_box, font_stack, box_paths))
+            margins: A4Page::a4().margin,
+            blocks: Vec::new(),
+            header: None,
+            footer: None,
+        });
+        let p0 = paths.drain(..).next().unwrap_or_default();
+        Ok((page, fonts, p0))
     }
 
     fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
         /* `true` — splice the live IME composition preview into the paint. */
-        let (page_box, _font_stack, _box_paths) = self.build_page(self.scale(), true)?;
+        let (pages, _font_stack, _box_paths) = self.build_pages(self.scale(), true)?;
 
-        let line_count: u32 = page_box
-            .blocks
-            .iter()
-            .filter_map(LayoutBlock::as_paragraph)
-            .map(|p| p.lines.len() as u32)
-            .sum();
-        let glyph_count: u32 = page_box
-            .blocks
-            .iter()
-            .filter_map(LayoutBlock::as_paragraph)
-            .flat_map(|p| &p.lines)
-            .flat_map(|l| &l.runs)
-            .map(|r| r.glyphs.len() as u32)
-            .sum();
+        let mut line_count: u32 = 0;
+        let mut glyph_count: u32 = 0;
+        for page in &pages {
+            for p in page.blocks.iter().filter_map(LayoutBlock::as_paragraph) {
+                line_count += p.lines.len() as u32;
+                for line in &p.lines {
+                    for run in &line.runs {
+                        glyph_count += run.glyphs.len() as u32;
+                    }
+                }
+            }
+        }
 
-        let scene = build_page_scene(&page_box);
+        /* Phase 6 — paginated scene: stack every `PageBox` with a small
+        inter-page gap so a section / overflow break is visible. */
+        let scale = self.scale();
+        let gap = render::scene::PAGE_GAP_PT * scale;
+        let scene = render::scene::build_document_scene(&pages, gap);
+        /* Stats report the first page's dimensions for back-compat; the
+        `page_count` / total document height live alongside `paint_ms` in
+        the `Painted` event so the TS shell can resize the canvas to fit
+        every page (the multi-page scrolled viewport is wired in the
+        post-Phase-6 sprint). */
+        let (page_width, page_height) = pages
+            .first()
+            .map(|p| (p.size.width, p.size.height))
+            .unwrap_or((0.0, 0.0));
+        let doc_height: f32 = pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap;
         let stats = RenderStats {
-            page_width: page_box.size.width,
-            page_height: page_box.size.height,
+            page_width,
+            page_height,
             line_count,
             glyph_count,
         };
+        let _ = doc_height; // reserved for the post-Phase-6 viewport-height event field
 
         /* Vello path: encode the whole display list and present it over
         WebGPU. Vello runs its own GPU-side glyph cache, so the Canvas2D
@@ -2374,14 +2524,10 @@ impl Engine {
         }
 
         /* Canvas2D path — clipped to the dirty region (D3.8). */
-        let clip_rect = clip.unwrap_or_else(|| {
-            Rect::new(
-                0.0,
-                0.0,
-                f64::from(page_box.size.width),
-                f64::from(page_box.size.height),
-            )
-        });
+        let total_h: f32 = pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap;
+        let widest: f32 = pages.iter().map(|p| p.size.width).fold(0.0_f32, f32::max);
+        let clip_rect =
+            clip.unwrap_or_else(|| Rect::new(0.0, 0.0, f64::from(widest), f64::from(total_h)));
         let ctx = match &self.ctx {
             Some(c) => c.clone(),
             None => {
@@ -2414,7 +2560,7 @@ impl Engine {
     fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
         /* `false` — a PDF export is the committed document, never the
         in-progress IME composition. */
-        let (page_box, font_stack, _box_paths) = match self.build_page(1.0, false) {
+        let (pages, font_stack, _box_paths) = match self.build_pages(1.0, false) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -2422,12 +2568,12 @@ impl Engine {
             PdfConformance::A1b => format_pdf::PdfProfile::A1b,
             PdfConformance::A2u | PdfConformance::X3 => format_pdf::PdfProfile::Plain,
         };
-        /* Per-paragraph source text, aligned with `for_each_paragraph`
-        on the layout side — the `/ToUnicode` CMap resolves each
-        glyph's cluster against it so exported text stays selectable.
-        Phase 5b: walk top-level paragraphs *and* recurse into table
-        cells (skipping `VMergeRole::Continue`, matching the PDF
-        emitter's traversal). */
+        /* Phase 6 — `para_texts` is a flat per-document table indexed by
+        `ParagraphBox::source_paragraph_id`. The walk order matches the
+        engine layer that stamped those ids (`walk_block_texts` over
+        `doc.blocks`, skipping `VMergeRole::Continue`). Paragraphs split
+        across pages share an id, so both halves resolve to the same
+        source text. */
         let doc = self.undo.current();
         let mut para_texts: Vec<&str> = Vec::new();
         for b in doc.blocks.iter() {
@@ -2435,13 +2581,17 @@ impl Engine {
         }
         let mut bytes: Vec<u8> = Vec::new();
         if let Err(e) =
-            format_pdf::export_pdf(&page_box, &font_stack, &para_texts, profile, &mut bytes)
+            format_pdf::export_pdf(&pages, &font_stack, &para_texts, profile, &mut bytes)
         {
             return Event::Error {
                 message: format!("ExportPdf: {e}"),
             };
         }
-        Event::PdfExported { bytes, pages: 1 }
+        let pages_count = pages.len() as u32;
+        Event::PdfExported {
+            bytes,
+            pages: pages_count,
+        }
     }
 
     /// D3.8: repaint the document clipped to the dirty region. The command's
@@ -2471,38 +2621,44 @@ impl Engine {
     fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
         /* `false` — hit-test + caret geometry run on committed document
         offsets, which `self.selection` is also expressed in. */
-        let (page, _fonts, box_paths) = self.build_page(self.scale(), false)?;
-        let content_x = page.margins.left;
-        let content_y = page.margins.top;
-        let content_w = page.size.width - page.margins.left - page.margins.right;
+        let (pages, _fonts, page_paths) = self.build_pages(self.scale(), false)?;
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
         let mut geom: Vec<LineGeom> = Vec::new();
-        for (i, layout_block) in page.blocks.iter().enumerate() {
-            let Some(path) = box_paths.get(i) else {
-                continue;
-            };
-            match layout_block {
-                LayoutBlock::Paragraph(para_box) => {
-                    collect_paragraph_line_geom(
-                        para_box,
-                        content_x,
-                        content_y,
-                        content_x,
-                        content_w,
-                        &engine_to_bridge_path(path.clone()),
-                        &mut geom,
-                    );
-                }
-                LayoutBlock::Table(table_box) => {
-                    let table_block_idx = path.last_block_index().unwrap_or(0);
-                    collect_table_line_geom(
-                        table_box,
-                        table_block_idx,
-                        content_x + table_box.origin.x,
-                        content_y + table_box.origin.y,
-                        &mut geom,
-                    );
+        let mut page_top: f32 = 0.0;
+        for (pi, page) in pages.iter().enumerate() {
+            let content_x = page.margins.left;
+            let content_y = page_top + page.margins.top;
+            let content_w = page.size.width - page.margins.left - page.margins.right;
+            let paths = page_paths.get(pi).map(|v| v.as_slice()).unwrap_or(&[]);
+            for (i, layout_block) in page.blocks.iter().enumerate() {
+                let Some(path) = paths.get(i) else {
+                    continue;
+                };
+                match layout_block {
+                    LayoutBlock::Paragraph(para_box) => {
+                        collect_paragraph_line_geom(
+                            para_box,
+                            content_x,
+                            content_y,
+                            content_x,
+                            content_w,
+                            &engine_to_bridge_path(path.clone()),
+                            &mut geom,
+                        );
+                    }
+                    LayoutBlock::Table(table_box) => {
+                        let table_block_idx = path.last_block_index().unwrap_or(0);
+                        collect_table_line_geom(
+                            table_box,
+                            table_block_idx,
+                            content_x + table_box.origin.x,
+                            content_y + table_box.origin.y,
+                            &mut geom,
+                        );
+                    }
                 }
             }
+            page_top += page.size.height + gap;
         }
         Ok(geom)
     }

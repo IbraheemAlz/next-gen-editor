@@ -96,10 +96,12 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         in-place, then rebuild the tree. `resolve_markers_blocks` only
         writes `Paragraph::resolved_marker` and skips `Block::Table`,
         so structurally-shared fields cost nothing here and tables
-        preserve their identity. */
+        preserve their identity. Phase 6 — preserve the section table
+        the document parser collected from `<w:sectPr>`. */
         let mut blocks: Vec<_> = document.blocks.iter().cloned().collect();
         resolve_markers_blocks(&mut blocks, &numbering);
-        document = DocumentTree::from_blocks(blocks);
+        let sections = std::mem::take(&mut document.sections);
+        document = DocumentTree::from_blocks_with_sections(blocks, sections);
     }
 
     Ok(DocxArchive {

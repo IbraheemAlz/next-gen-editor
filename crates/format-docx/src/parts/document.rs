@@ -17,10 +17,94 @@ use crate::schema::ct_ppr::apply_ppr;
 use crate::schema::ct_rpr::{apply_rpr, attr_val};
 use crate::style_resolver::StyleResolver;
 use engine::{
-    Block, DocumentTree, ListItem, ParaProperties, Paragraph, SpanStyle, StyleRun, Table,
+    Block, DocumentTree, ListItem, PageGeometry, ParaProperties, Paragraph, Section, SpanStyle,
+    StyleRun, Table,
 };
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
+
+/// Twips (1/20 pt) → layout pt. OOXML page geometry is encoded in twips.
+fn twips_to_pt(s: &str) -> Option<f32> {
+    s.trim().parse::<f32>().ok().map(|v| v / 20.0)
+}
+
+/// Accumulator for one `<w:sectPr>` while the parser is inside it. Folded into
+/// a [`PageGeometry`] + header/footer refs when `</w:sectPr>` closes.
+#[derive(Debug, Clone, Default)]
+struct SectPrAccum {
+    width: Option<f32>,
+    height: Option<f32>,
+    margin_top: Option<f32>,
+    margin_right: Option<f32>,
+    margin_bottom: Option<f32>,
+    margin_left: Option<f32>,
+    header_offset: Option<f32>,
+    footer_offset: Option<f32>,
+    header_ref: Option<String>,
+    footer_ref: Option<String>,
+}
+
+impl SectPrAccum {
+    /// Apply one `<w:sectPr>` child element. Both `Empty(...)` and the
+    /// `Start(...)` of `<w:headerReference>...</w:headerReference>`-style tags
+    /// route here — every child the parser cares about is leaf-shaped.
+    fn apply(&mut self, name: &[u8], e: &BytesStart) {
+        match name {
+            b"w:pgSz" => {
+                if let Some(v) = attr_val(e, b"w:w").as_deref().and_then(twips_to_pt) {
+                    self.width = Some(v);
+                }
+                if let Some(v) = attr_val(e, b"w:h").as_deref().and_then(twips_to_pt) {
+                    self.height = Some(v);
+                }
+            }
+            b"w:pgMar" => {
+                if let Some(v) = attr_val(e, b"w:top").as_deref().and_then(twips_to_pt) {
+                    self.margin_top = Some(v);
+                }
+                if let Some(v) = attr_val(e, b"w:right").as_deref().and_then(twips_to_pt) {
+                    self.margin_right = Some(v);
+                }
+                if let Some(v) = attr_val(e, b"w:bottom").as_deref().and_then(twips_to_pt) {
+                    self.margin_bottom = Some(v);
+                }
+                if let Some(v) = attr_val(e, b"w:left").as_deref().and_then(twips_to_pt) {
+                    self.margin_left = Some(v);
+                }
+                if let Some(v) = attr_val(e, b"w:header").as_deref().and_then(twips_to_pt) {
+                    self.header_offset = Some(v);
+                }
+                if let Some(v) = attr_val(e, b"w:footer").as_deref().and_then(twips_to_pt) {
+                    self.footer_offset = Some(v);
+                }
+            }
+            b"w:headerReference" => {
+                self.header_ref = attr_val(e, b"r:id");
+            }
+            b"w:footerReference" => {
+                self.footer_ref = attr_val(e, b"r:id");
+            }
+            _ => {}
+        }
+    }
+
+    /// Bake into the engine-facing `PageGeometry`. Missing fields fall back
+    /// to the A4 defaults so a `<w:sectPr/>` with only a header reference
+    /// still produces a usable section.
+    fn into_geometry(self) -> PageGeometry {
+        let d = PageGeometry::a4();
+        PageGeometry {
+            width: self.width.unwrap_or(d.width),
+            height: self.height.unwrap_or(d.height),
+            margin_top: self.margin_top.unwrap_or(d.margin_top),
+            margin_right: self.margin_right.unwrap_or(d.margin_right),
+            margin_bottom: self.margin_bottom.unwrap_or(d.margin_bottom),
+            margin_left: self.margin_left.unwrap_or(d.margin_left),
+            header_offset: self.header_offset.unwrap_or(d.header_offset),
+            footer_offset: self.footer_offset.unwrap_or(d.footer_offset),
+        }
+    }
+}
 
 /// Parse `word/document.xml` into paragraphs.
 ///
@@ -62,6 +146,25 @@ pub fn parse_document_xml(
     let mut list_num_id: Option<u32> = None;
     let mut list_ilvl: Option<u8> = None;
     let mut in_num_pr = false;
+
+    /* Phase 6 — `<w:sectPr>` accumulators. A sectPr can live in two places:
+    inside a paragraph's `<w:pPr>` (ends a section *at* that paragraph,
+    inclusive — every paragraph since the previous sectPr belongs to it) or
+    directly in `<w:body>` after the final paragraph (the body-level sectPr
+    covers everything left). Both flow through the same accumulator.
+
+    - `in_sect_pr` — depth flag (a sectPr is leaf-shaped at this level).
+    - `cur_sect` — the accumulator being filled.
+    - `pending_paragraph_sect` — set when `</w:sectPr>` closes inside a
+      `<w:pPr>`; consumed on the matching `</w:p>` to emit a `Section`
+      `[sect_start..=this_paragraph_idx]`.
+    - `out_sections` — the section table the parser hands to the engine.
+    - `sect_start_block` — first top-level block of the next section. */
+    let mut in_sect_pr = false;
+    let mut cur_sect = SectPrAccum::default();
+    let mut pending_paragraph_sect: Option<SectPrAccum> = None;
+    let mut out_sections: Vec<Section> = Vec::new();
+    let mut sect_start_block: u32 = 0;
 
     /* Per-run parser state. */
     let mut in_run = false;
@@ -127,6 +230,12 @@ pub fn parse_document_xml(
                     properties — not a nested element under a `<w:r>`. */
                     b"w:pPr" if !in_run => in_ppr = true,
                     b"w:numPr" if in_ppr => in_num_pr = true,
+                    b"w:sectPr" => {
+                        /* Phase 6 — open a fresh accumulator. Inline (inside
+                        a `<w:pPr>`) and body-level both route here. */
+                        in_sect_pr = true;
+                        cur_sect = SectPrAccum::default();
+                    }
                     b"w:t" => in_text_elt = true,
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
@@ -140,6 +249,7 @@ pub fn parse_document_xml(
                     b"w:ilvl" if in_num_pr => {
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
+                    n if in_sect_pr => cur_sect.apply(n, &e),
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
                     n if in_ppr && in_rpr => {
                         /* Paragraph-mark `<w:pPr>/<w:rPr>` — applies to the
@@ -173,6 +283,7 @@ pub fn parse_document_xml(
                     b"w:ilvl" if in_num_pr => {
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
+                    n if in_sect_pr => cur_sect.apply(n, &e),
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
                     n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
                     n if in_ppr && !in_rpr && !in_num_pr => {
@@ -229,6 +340,30 @@ pub fn parse_document_xml(
                     b"w:rPr" => in_rpr = false,
                     b"w:pPr" => in_ppr = false,
                     b"w:numPr" => in_num_pr = false,
+                    b"w:sectPr" => {
+                        /* Inline (inside a paragraph's `<w:pPr>`) → stash for
+                        the matching `</w:p>` end. Body-level (the sectPr that
+                        lives directly under `<w:body>`, after every
+                        paragraph) → finalize a section covering everything
+                        from `sect_start_block` to the current block count. */
+                        in_sect_pr = false;
+                        let taken = std::mem::take(&mut cur_sect);
+                        if in_ppr {
+                            pending_paragraph_sect = Some(taken);
+                        } else {
+                            let end = out_blocks.len() as u32;
+                            if end > sect_start_block {
+                                out_sections.push(Section {
+                                    geometry: taken.clone().into_geometry(),
+                                    start_block: sect_start_block,
+                                    end_block: end,
+                                    header_ref: taken.header_ref,
+                                    footer_ref: taken.footer_ref,
+                                });
+                                sect_start_block = end;
+                            }
+                        }
+                    }
                     b"w:r" => {
                         in_run = false;
                         let start = para_text.len() as u32;
@@ -296,6 +431,25 @@ pub fn parse_document_xml(
                             dirty: false,
                             source_xml,
                         }));
+                        /* Phase 6 — inline `<w:sectPr>` ends the section at this
+                        paragraph. Emit a `Section` covering everything since
+                        the last break; the next paragraph starts a fresh
+                        section. */
+                        if let Some(sect) = pending_paragraph_sect.take() {
+                            let end = out_blocks.len() as u32;
+                            if end > sect_start_block {
+                                let header_ref = sect.header_ref.clone();
+                                let footer_ref = sect.footer_ref.clone();
+                                out_sections.push(Section {
+                                    geometry: sect.into_geometry(),
+                                    start_block: sect_start_block,
+                                    end_block: end,
+                                    header_ref,
+                                    footer_ref,
+                                });
+                                sect_start_block = end;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -307,5 +461,26 @@ pub fn parse_document_xml(
         buf.clear();
     }
 
-    Ok(DocumentTree::from_blocks(out_blocks))
+    /* Phase 6 — close out any unsectioned trailing blocks. A document with
+    no `<w:sectPr>` at all (rare — the spec requires at least one, but the
+    reader is lenient) lands here with `sect_start_block == 0` and the
+    block count as the upper bound, producing one implicit section. A
+    document whose final body-level sectPr already covered every block
+    leaves `sect_start_block == out_blocks.len()`, so this branch is a
+    no-op. */
+    let total = out_blocks.len() as u32;
+    if total > sect_start_block {
+        out_sections.push(Section {
+            geometry: PageGeometry::a4(),
+            start_block: sect_start_block,
+            end_block: total,
+            header_ref: None,
+            footer_ref: None,
+        });
+    }
+
+    Ok(DocumentTree::from_blocks_with_sections(
+        out_blocks,
+        out_sections,
+    ))
 }

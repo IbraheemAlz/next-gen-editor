@@ -50,6 +50,80 @@ pub struct DocumentTree {
     /// any document position. Still `im::Vector` so undo snapshots clone
     /// in O(1) — table cells use plain `Vec<Block>` instead.
     pub blocks: Vector<Block>,
+    /// Phase 6 — `<w:sectPr>`. One `Section` per OOXML section, in document
+    /// order. Each owns a half-open `[start, end)` block range and the page
+    /// geometry the paginator uses for that range. Empty `Vec` ⇒ the engine
+    /// applies a single implicit A4 section over the whole document (the
+    /// pre-Phase-6 behaviour).
+    pub sections: Vec<Section>,
+}
+
+/// Page geometry for a [`Section`]. Dimensions are layout pixels at 1 pt/unit
+/// (matching `layout::A4Page`). The reader converts twips → pt (× 1/20) and
+/// the renderer / paginator consume these values directly.
+#[derive(Debug, Clone, Copy)]
+pub struct PageGeometry {
+    pub width: f32,
+    pub height: f32,
+    pub margin_top: f32,
+    pub margin_right: f32,
+    pub margin_bottom: f32,
+    pub margin_left: f32,
+    /// Distance from the top edge of the page to the top edge of the header
+    /// content area. Optional in OOXML; defaults to half the top margin.
+    pub header_offset: f32,
+    /// Distance from the bottom edge of the page to the bottom edge of the
+    /// footer content area.
+    pub footer_offset: f32,
+}
+
+impl PageGeometry {
+    /// ISO 216 A4 with 1-inch (72 pt) margins — the legacy `A4Page::a4()`.
+    pub const fn a4() -> Self {
+        Self {
+            width: 595.0,
+            height: 842.0,
+            margin_top: 72.0,
+            margin_right: 72.0,
+            margin_bottom: 72.0,
+            margin_left: 72.0,
+            header_offset: 36.0,
+            footer_offset: 36.0,
+        }
+    }
+
+    pub fn content_width(&self) -> f32 {
+        self.width - self.margin_left - self.margin_right
+    }
+
+    pub fn content_height(&self) -> f32 {
+        self.height - self.margin_top - self.margin_bottom
+    }
+}
+
+impl Default for PageGeometry {
+    fn default() -> Self {
+        Self::a4()
+    }
+}
+
+/// One OOXML `<w:sectPr>` worth of state. A section spans a contiguous
+/// half-open block range `[start, end)`; the page geometry is applied to
+/// every page the paginator emits while flowing those blocks. `header_ref`
+/// / `footer_ref` carry the relationship ids the reader captured — the
+/// header / footer XML parts live in the archive's `other_entries` for the
+/// passthrough writer.
+#[derive(Debug, Clone, Default)]
+pub struct Section {
+    pub geometry: PageGeometry,
+    /// First top-level block (inclusive) covered by this section.
+    pub start_block: u32,
+    /// One past the last top-level block (exclusive).
+    pub end_block: u32,
+    /// `r:id` of the `word/header*.xml` part referenced by `<w:headerReference>`.
+    pub header_ref: Option<String>,
+    /// `r:id` of the `word/footer*.xml` part referenced by `<w:footerReference>`.
+    pub footer_ref: Option<String>,
 }
 
 /// Address of a `Block` inside a `DocumentTree`. Walks from the root
@@ -763,6 +837,7 @@ impl DocumentTree {
     pub fn new() -> Self {
         Self {
             blocks: Vector::new(),
+            sections: Vec::new(),
         }
     }
 
@@ -778,7 +853,10 @@ impl DocumentTree {
             dirty: false,
             source_xml: None,
         }));
-        Self { blocks }
+        Self {
+            blocks,
+            sections: Vec::new(),
+        }
     }
 
     /// Build a document from a list of paragraph plain-text bodies.
@@ -795,7 +873,10 @@ impl DocumentTree {
                 source_xml: None,
             }));
         }
-        Self { blocks }
+        Self {
+            blocks,
+            sections: Vec::new(),
+        }
     }
 
     /// Build a document from pre-styled paragraphs — the `.docx` reader (run
@@ -805,7 +886,10 @@ impl DocumentTree {
         for p in paras {
             blocks.push_back(Block::Paragraph(p));
         }
-        Self { blocks }
+        Self {
+            blocks,
+            sections: Vec::new(),
+        }
     }
 
     /// Build a document from a pre-mixed block sequence — the `.docx` reader
@@ -815,7 +899,54 @@ impl DocumentTree {
         for b in blocks_in {
             blocks.push_back(b);
         }
-        Self { blocks }
+        Self {
+            blocks,
+            sections: Vec::new(),
+        }
+    }
+
+    /// Phase 6 — build a document from a pre-mixed block sequence plus the
+    /// section table the `.docx` reader collected from `<w:sectPr>` elements.
+    /// Trims sections that fall outside the block range so the paginator
+    /// never indexes off the end.
+    pub fn from_blocks_with_sections<I: IntoIterator<Item = Block>>(
+        blocks_in: I,
+        sections_in: Vec<Section>,
+    ) -> Self {
+        let mut blocks = Vector::new();
+        for b in blocks_in {
+            blocks.push_back(b);
+        }
+        let len = blocks.len() as u32;
+        let sections: Vec<Section> = sections_in
+            .into_iter()
+            .filter_map(|mut s| {
+                s.start_block = s.start_block.min(len);
+                s.end_block = s.end_block.min(len);
+                if s.end_block <= s.start_block {
+                    return None;
+                }
+                Some(s)
+            })
+            .collect();
+        Self { blocks, sections }
+    }
+
+    /// Resolved section coverage — returns one effective `Section` per
+    /// top-level block. When `self.sections` is empty (the pre-Phase-6
+    /// case) the helper synthesises a single implicit A4 section over the
+    /// whole document.
+    pub fn effective_sections(&self) -> Vec<Section> {
+        if self.sections.is_empty() {
+            return vec![Section {
+                geometry: PageGeometry::a4(),
+                start_block: 0,
+                end_block: self.blocks.len() as u32,
+                header_ref: None,
+                footer_ref: None,
+            }];
+        }
+        self.sections.clone()
     }
 
     /* ============================================================
@@ -945,7 +1076,10 @@ impl DocumentTree {
                 dirty: true,
                 source_xml: None,
             }));
-            return Self { blocks };
+            return Self {
+                blocks,
+                sections: self.sections.clone(),
+            };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
             at.path.clone()
@@ -975,7 +1109,10 @@ impl DocumentTree {
         if mutated.is_none() {
             return self.clone();
         }
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 
     /// Apply a style `patch` over the logical range `[start, end)`. Splits and
@@ -1013,7 +1150,10 @@ impl DocumentTree {
             let child_path = parent.clone().push(PathStep::Block(idx));
             replace_block_in_top(&mut blocks, &child_path, Block::Paragraph(styled));
         }
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 
     fn apply_style_single(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
@@ -1028,7 +1168,10 @@ impl DocumentTree {
         let styled = p.apply_style(start.offset, hi, patch);
         let mut blocks = self.blocks.clone();
         replace_block_in_top(&mut blocks, &start.path, Block::Paragraph(styled));
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 
     /// Set `align` on every paragraph the logical range `[start, end)` spans
@@ -1058,7 +1201,10 @@ impl DocumentTree {
                 para.props.alignment = Some(align);
             });
         }
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 
     /// Delete the logical range `[start, end)`. A range spanning paragraphs
@@ -1075,7 +1221,10 @@ impl DocumentTree {
             let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
                 *para = para.delete_text(start.offset, end.offset);
             });
-            return Self { blocks };
+            return Self {
+                blocks,
+                sections: self.sections.clone(),
+            };
         }
         if !same_parent(&start.path, &end.path) {
             /* Cross-container delete clamps to the start endpoint —
@@ -1119,7 +1268,10 @@ impl DocumentTree {
         }
         let sp_path = parent.push(PathStep::Block(sp_idx));
         replace_block_in_top(&mut blocks, &sp_path, Block::Paragraph(merged));
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 
     /// Split the paragraph at `at`, the break falling between the two halves.
@@ -1129,7 +1281,10 @@ impl DocumentTree {
         if count == 0 {
             blocks.push_back(Block::Paragraph(Paragraph::default()));
             blocks.push_back(Block::Paragraph(Paragraph::default()));
-            return Self { blocks };
+            return Self {
+                blocks,
+                sections: self.sections.clone(),
+            };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
             return self.clone();
@@ -1137,7 +1292,10 @@ impl DocumentTree {
         let (left, right) = p.split_at(at.offset);
         replace_block_in_top(&mut blocks, &at.path, Block::Paragraph(left));
         insert_block_after_path_in_top(&mut blocks, &at.path, Block::Paragraph(right));
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 
     /// Insert `text` at `at`, splitting it into separate paragraphs on every
@@ -1263,7 +1421,13 @@ impl DocumentTree {
                 &target_path,
                 Block::Paragraph(head.concat(&paras[0]).concat(&tail)),
             );
-            return (Self { blocks }, caret);
+            return (
+                Self {
+                    blocks,
+                    sections: self.sections.clone(),
+                },
+                caret,
+            );
         }
         let lastp = &paras[paras.len() - 1];
         replace_block_in_top(
@@ -1286,7 +1450,13 @@ impl DocumentTree {
             path: final_path,
             offset: lastp.text.len() as u32,
         };
-        (Self { blocks }, caret)
+        (
+            Self {
+                blocks,
+                sections: self.sections.clone(),
+            },
+            caret,
+        )
     }
 
     /// Extract the text of the logical range `[start, end)`. Paragraphs the
@@ -1399,7 +1569,10 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let insert_at = (idx as usize).min(blocks.len());
         blocks.insert(insert_at, Block::Table(table));
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 
     /// Delete the table at `at.steps[0]` (top-level only at PR 3).
@@ -1412,7 +1585,10 @@ impl DocumentTree {
         if idx < blocks.len() && matches!(blocks[idx], Block::Table(_)) {
             blocks.remove(idx);
         }
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 
     /// Insert a fresh row at `after_row` (or at the end when
@@ -1608,7 +1784,10 @@ impl DocumentTree {
         table.dirty = true;
         table.source_xml = None;
         blocks.set(idx, block);
-        Self { blocks }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+        }
     }
 }
 
@@ -3051,7 +3230,10 @@ mod tests {
             t.dirty = false;
             t.source_xml = Some(b"<w:tbl/>".to_vec());
         }
-        let d = DocumentTree { blocks };
+        let d = DocumentTree {
+            blocks,
+            sections: Vec::new(),
+        };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();
         assert_eq!(t.rows[0].cells[0].props.shading, Some([0xFF, 0, 0, 0xFF]));

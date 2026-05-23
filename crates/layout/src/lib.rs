@@ -6,11 +6,13 @@
 
 pub mod boxes;
 pub mod page;
+pub mod paginate;
 pub mod paragraph;
 
 pub use boxes::{
-    FontId, LayoutBlock, LineBox, MarkerBox, PageBox, ParagraphBox, Point, PositionedGlyph, Size,
-    StyleSpan, TableBox, TableCellBox, TableRowBox, TextAttrs, VisualRun,
+    FontId, HeaderFooterBox, LayoutBlock, LineBox, MarkerBox, PageBox, ParagraphBox, Point,
+    PositionedGlyph, Size, StyleSpan, TableBox, TableCellBox, TableRowBox, TextAttrs, VisualRun,
 };
 pub use page::{A4Page, Margins};
+pub use paginate::{PageGeometry as PaginatePageGeometry, Paginator, split_paragraph_at_line};
 pub use paragraph::{ParagraphConfig, layout_paragraph};

@@ -5,6 +5,9 @@
 //! `comments`. See `OOXML_ROADMAP.md` §1.1 for the full target layout.
 
 pub mod document;
+pub mod footer;
+pub mod header;
 pub mod numbering;
+pub mod settings;
 pub mod styles;
 pub mod table;

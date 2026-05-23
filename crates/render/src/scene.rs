@@ -98,28 +98,60 @@ fn border_color() -> Color {
 /// accumulated origin reaches absolute glyph positions; font size and colour
 /// come from each run's `attrs` (no `PaintConfig` side channel).
 pub fn build_page_scene(page: &PageBox) -> DisplayList {
+    build_document_scene(std::slice::from_ref(page), 0.0)
+}
+
+/// Vertical gap between consecutive pages, in layout pixels at scale=1.
+/// Phase 6 uses a small visible gap so a section break / overflow shows
+/// up in the rendered document; the renderer multiplies by `scale` at the
+/// call site.
+pub const PAGE_GAP_PT: f32 = 12.0;
+
+/// Phase 6 — lower a paginated document (one or more `PageBox`es) into a
+/// single `DisplayList`. Pages stack vertically with `gap` pt of empty
+/// space between them; absolute Y inside a page = `page_top + content_y`.
+pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
     let mut cmds: Vec<DisplayCmd> = Vec::new();
+    let mut top = 0.0_f32;
+    for page in pages {
+        let w = page.size.width as f64;
+        let h = page.size.height as f64;
+        let t = top as f64;
+        cmds.push(DisplayCmd::FillRect {
+            rect: Rect::new(0.0, t, w, t + h),
+            paint: Paint::solid(page_color()),
+        });
+        cmds.push(DisplayCmd::StrokeRect {
+            rect: Rect::new(0.5, t + 0.5, w - 0.5, t + h - 0.5),
+            paint: Paint::solid(border_color()),
+            width: 1.0,
+        });
 
-    let w = page.size.width as f64;
-    let h = page.size.height as f64;
-    cmds.push(DisplayCmd::FillRect {
-        rect: Rect::new(0.0, 0.0, w, h),
-        paint: Paint::solid(page_color()),
-    });
-    cmds.push(DisplayCmd::StrokeRect {
-        rect: Rect::new(0.5, 0.5, w - 0.5, h - 0.5),
-        paint: Paint::solid(border_color()),
-        width: 1.0,
-    });
+        let content_x = page.margins.left;
+        let content_y = top + page.margins.top;
 
-    /* Page content origin — paragraph and line origins are relative to it. */
-    let content_x = page.margins.left;
-    let content_y = page.margins.top;
+        /* Phase 6 — header band painted before body so a wide header doesn't
+        sit on top of body text. Origin sits inside the top margin. */
+        if let Some(hf) = &page.header {
+            let band_top = top + (page.margins.top * 0.25);
+            for para in &hf.paragraphs {
+                paint_paragraph(para, content_x, band_top, &mut cmds);
+            }
+        }
 
-    for block in &page.blocks {
-        paint_block(block, content_x, content_y, &mut cmds);
+        for block in &page.blocks {
+            paint_block(block, content_x, content_y, &mut cmds);
+        }
+
+        if let Some(hf) = &page.footer {
+            let band_top = top + (page.size.height - page.margins.bottom * 0.75);
+            for para in &hf.paragraphs {
+                paint_paragraph(para, content_x, band_top, &mut cmds);
+            }
+        }
+
+        top += page.size.height + gap;
     }
-
     DisplayList { cmds }
 }
 

@@ -129,6 +129,19 @@ pub struct ParagraphBox {
     /// of the first line for LTR, right for RTL. `None` for non-list
     /// paragraphs.
     pub marker: Option<MarkerBox>,
+    /// Phase 6 — flat index into the per-document source-paragraph text
+    /// table the PDF `/ToUnicode` builder consumes. Engine-wasm fills it at
+    /// layout time; the paginator preserves it through paragraph splits
+    /// (head and tail share the same id, both lookup the same full source
+    /// text — glyph clusters are byte offsets into that full text).
+    /// `u32::MAX` ⇒ unset (the layout-only synthetic paragraphs the
+    /// composition preview produces, plus older callers).
+    pub source_paragraph_id: u32,
+}
+
+impl ParagraphBox {
+    /// Sentinel for a paragraph not associated with a source-doc text.
+    pub const NO_SOURCE_ID: u32 = u32::MAX;
 }
 
 /// A shaped list marker living in the paragraph's leading-edge gutter.
@@ -231,10 +244,32 @@ pub struct TableCellBox {
     pub content: Vec<LayoutBlock>,
 }
 
-/// A laid-out page — the root of the box tree and the renderer's input.
+/// A laid-out page — one element of the box tree the renderer consumes.
+/// Phase 6 turned the engine output into `Vec<PageBox>`: the paginator emits
+/// one `PageBox` per flow page; sections that change geometry produce a
+/// fresh `PageBox` with the new `size` / `margins`.
 #[derive(Debug, Clone)]
 pub struct PageBox {
     pub size: Size,
     pub margins: Margins,
     pub blocks: Vec<LayoutBlock>,
+    /// Phase 6 — paragraph plain text for the section's `<w:headerReference>`,
+    /// painted in the top margin band on every page of the section. `None`
+    /// for sections with no header reference, or when the header part is
+    /// missing from the archive.
+    pub header: Option<HeaderFooterBox>,
+    /// Mirror of `header`, painted in the bottom margin band.
+    pub footer: Option<HeaderFooterBox>,
+}
+
+/// A laid-out header / footer band — paragraph plain text positioned within
+/// the page's top or bottom margin. The Phase 6 cut is deliberately small:
+/// rich formatting in header / footer paragraphs ships with the Phase 7
+/// sprint that promotes them through the same shape / BiDi pipeline the
+/// body uses.
+#[derive(Debug, Clone)]
+pub struct HeaderFooterBox {
+    /// Each laid-out paragraph in the band. Origins are relative to the
+    /// band's top-left.
+    pub paragraphs: Vec<ParagraphBox>,
 }

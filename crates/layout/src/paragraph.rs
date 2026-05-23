@@ -165,6 +165,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         lines,
         direction: cfg.base_direction,
         marker,
+        source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
     }
 }
 

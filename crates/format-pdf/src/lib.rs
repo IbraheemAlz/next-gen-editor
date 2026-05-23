@@ -90,38 +90,41 @@ struct FontObj {
     resource: String,
 }
 
-/// Export `page` to a single-page PDF, appending the bytes to `out`.
+/// Export `pages` to a PDF, appending the bytes to `out`.
 ///
-/// `fonts` must contain every face referenced by the page's runs; each is
-/// embedded in full. `para_texts[i]` is the source text of `page.paragraphs[i]`
-/// — the `/ToUnicode` CMap resolves each glyph's cluster against it; a short or
-/// empty slice just yields a sparser CMap. `profile` selects plain output or
-/// PDF/A-1b conformance.
+/// Phase 6 — every `PageBox` in `pages` becomes one PDF page; each has its
+/// own MediaBox sized from `page.size`, and a dedicated content stream.
+/// `fonts` must contain every face referenced by any page's runs (full
+/// embedding). `para_texts[i]` is the source text of the paragraph whose
+/// `source_paragraph_id == i`; PDF resolves each laid-out paragraph's
+/// glyph clusters against that table, so a paragraph split across pages
+/// (head + tail) gets the same `/ToUnicode` mapping on both halves
+/// (their `source_paragraph_id` is identical). `profile` selects plain
+/// output or PDF/A-1b conformance.
 pub fn export_pdf(
-    page: &PageBox,
+    pages: &[PageBox],
     fonts: &FontStack,
     para_texts: &[&str],
     profile: PdfProfile,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let page_w = page.size.width;
-    let page_h = page.size.height;
     let pdfa = profile == PdfProfile::A1b;
 
-    /* Distinct fonts referenced by the page, in first-seen order. */
+    /* Distinct fonts referenced by every page, in first-seen order. */
     let mut used: Vec<&str> = Vec::new();
-    for_each_paragraph(&page.blocks, &mut |para| {
-        for line in &para.lines {
-            for run in &line.runs {
-                if !used.contains(&run.font.as_str()) {
-                    used.push(run.font.as_str());
+    for page in pages {
+        for_each_paragraph(&page.blocks, &mut |para| {
+            for line in &para.lines {
+                for run in &line.runs {
+                    if !used.contains(&run.font.as_str()) {
+                        used.push(run.font.as_str());
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     let mut pdf = Pdf::new();
-    /* PDF/A-1 is defined against PDF 1.4 — declare it so the header agrees. */
     if pdfa {
         pdf.set_version(1, 4);
     }
@@ -134,8 +137,8 @@ pub fn export_pdf(
     };
     let catalog_id = alloc();
     let pages_id = alloc();
-    let page_id = alloc();
-    let content_id = alloc();
+    /* One page object + one content stream per `PageBox`. */
+    let page_refs: Vec<(Ref, Ref)> = pages.iter().map(|_| (alloc(), alloc())).collect();
     let font_objs: Vec<(String, FontObj)> = used
         .iter()
         .enumerate()
@@ -153,26 +156,30 @@ pub fn export_pdf(
             )
         })
         .collect();
-    /* PDF/A-1b adds two indirect objects — the ICC profile and the XMP packet.
-    Allocated last so a plain export leaves the id space byte-identical. */
     let icc_id = if pdfa { Some(alloc()) } else { None };
     let metadata_id = if pdfa { Some(alloc()) } else { None };
 
-    /* Content stream — must be a live binding while its `Stream` writer runs. */
-    let content = build_content(page, &font_objs);
+    /* Build every page's content stream first — the digest in PDF/A `/ID`
+    is keyed on the concatenated uncompressed content so split exports
+    stay stable. */
+    let contents: Vec<Vec<u8>> = pages
+        .iter()
+        .map(|page| build_content(page, &font_objs))
+        .collect();
     if pdfa {
-        /* PDF/A requires a trailer `/ID`. Derive it from the content so the
-        same document exports to the same identifier every time. */
-        let id = document_id(&content);
+        let mut hash_in: Vec<u8> = Vec::new();
+        for c in &contents {
+            hash_in.extend_from_slice(c);
+        }
+        let id = document_id(&hash_in);
         pdf.set_file_id((id.to_vec(), id.to_vec()));
     }
-    /* Compress the drawing commands; `document_id` above stays keyed on the
-    uncompressed bytes so the PDF/A `/ID` is a stable, meaningful digest. */
-    let content_z = deflate(&content);
-    pdf.stream(content_id, &content_z)
-        .filter(Filter::FlateDecode);
+    for ((_, content_id), content) in page_refs.iter().zip(contents.iter()) {
+        let content_z = deflate(content);
+        pdf.stream(*content_id, &content_z)
+            .filter(Filter::FlateDecode);
+    }
 
-    /* Catalog — plus, for PDF/A-1b, the `/Metadata` and `/OutputIntents`. */
     {
         let mut catalog = pdf.catalog(catalog_id);
         catalog.pages(pages_id);
@@ -190,16 +197,22 @@ pub fn export_pdf(
         }
     }
 
-    let media = Rect::new(0.0, 0.0, page_w, page_h);
+    /* `/Pages` references every page object; `/MediaBox` here is the
+    document default — individual pages override per-`PageBox` size. */
+    let default_size = pages
+        .first()
+        .map(|p| Rect::new(0.0, 0.0, p.size.width, p.size.height))
+        .unwrap_or(Rect::new(0.0, 0.0, 595.0, 842.0));
     pdf.pages(pages_id)
-        .kids([page_id])
-        .count(1)
-        .media_box(media);
-    {
-        let mut p = pdf.page(page_id);
+        .kids(page_refs.iter().map(|(p, _)| *p))
+        .count(page_refs.len() as i32)
+        .media_box(default_size);
+    for ((page_id, content_id), page) in page_refs.iter().zip(pages.iter()) {
+        let media = Rect::new(0.0, 0.0, page.size.width, page.size.height);
+        let mut p = pdf.page(*page_id);
         p.parent(pages_id);
         p.media_box(media);
-        p.contents(content_id);
+        p.contents(*content_id);
         let mut resources = p.resources();
         let mut font_dict = resources.fonts();
         for (_, fo) in &font_objs {
@@ -207,8 +220,10 @@ pub fn export_pdf(
         }
     }
 
-    /* glyph-id → Unicode per font, harvested from the box-tree clusters. */
-    let to_unicode = collect_to_unicode(page, para_texts);
+    /* glyph-id → Unicode per font, harvested across every page. Split
+    paragraphs contribute clusters from both halves into the same source
+    text — the union is what the CMap actually wants. */
+    let to_unicode = collect_to_unicode_pages(pages, para_texts);
     for (id, fo) in &font_objs {
         let face = fonts
             .face(id)
@@ -219,7 +234,6 @@ pub fn export_pdf(
             .filter(Filter::FlateDecode);
     }
 
-    /* PDF/A-1b output intent objects: the embedded sRGB profile + XMP packet. */
     if pdfa {
         pdf.icc_profile(icc_id.expect("icc id allocated for A1b"), SRGB_ICC)
             .n(3);
@@ -582,22 +596,33 @@ fn for_each_paragraph<'a, F: FnMut(&'a ParagraphBox)>(blocks: &'a [LayoutBlock],
 /// decodes to the characters of its segment. A ligature glyph therefore maps to
 /// *all* the characters it consumed — the property that lets shaped Arabic copy
 /// back as real text.
-fn collect_to_unicode(
-    page: &PageBox,
+/// Phase 6 — `collect_to_unicode` over every page in a paginated document.
+/// Paragraphs look up their source text by `ParagraphBox::source_paragraph_id`
+/// — split paragraphs share an id, so their two laid-out halves contribute
+/// to the same per-font CMap entries without conflict.
+fn collect_to_unicode_pages(
+    pages: &[PageBox],
     para_texts: &[&str],
 ) -> HashMap<String, BTreeMap<u16, Vec<char>>> {
     let mut out: HashMap<String, BTreeMap<u16, Vec<char>>> = HashMap::new();
-    let mut idx = 0usize;
-    for_each_paragraph(&page.blocks, &mut |para| {
-        let text = para_texts.get(idx).copied().unwrap_or("");
-        idx += 1;
-        for line in &para.lines {
-            for run in &line.runs {
-                let map = out.entry(run.font.clone()).or_default();
-                add_run_mappings(run, text, map);
+    for page in pages {
+        for_each_paragraph(&page.blocks, &mut |para| {
+            let text = if para.source_paragraph_id == layout::ParagraphBox::NO_SOURCE_ID {
+                ""
+            } else {
+                para_texts
+                    .get(para.source_paragraph_id as usize)
+                    .copied()
+                    .unwrap_or("")
+            };
+            for line in &para.lines {
+                for run in &line.runs {
+                    let map = out.entry(run.font.clone()).or_default();
+                    add_run_mappings(run, text, map);
+                }
             }
-        }
-    });
+        });
+    }
     out
 }
 
@@ -705,7 +730,7 @@ mod tests {
             bg_color: None,
             font_family: None,
         }];
-        let para = layout_paragraph(ParagraphConfig {
+        let mut para = layout_paragraph(ParagraphConfig {
             text: "Hello world",
             fonts: stack,
             spans: &spans,
@@ -720,6 +745,10 @@ mod tests {
             marker_text: None,
             px_size_for_marker: 26.0,
         });
+        /* Phase 6 — `source_paragraph_id` is engine-wasm's job in
+        production; the test stamps it manually so `/ToUnicode` lookups
+        against the supplied `para_texts` resolve. */
+        para.source_paragraph_id = 0;
         PageBox {
             size: Size {
                 width: 595.0,
@@ -727,6 +756,8 @@ mod tests {
             },
             margins: Margins::uniform(72.0),
             blocks: vec![LayoutBlock::Paragraph(para)],
+            header: None,
+            footer: None,
         }
     }
 
@@ -744,7 +775,14 @@ mod tests {
         let page = hello_page(&stack);
 
         let mut out = Vec::new();
-        export_pdf(&page, &stack, &["Hello world"], PdfProfile::Plain, &mut out).expect("export");
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::Plain,
+            &mut out,
+        )
+        .expect("export");
 
         assert!(out.starts_with(b"%PDF-"), "missing PDF header");
         assert!(out.ends_with(b"%%EOF"), "missing EOF marker");
@@ -826,9 +864,18 @@ mod tests {
             },
             margins: Margins::uniform(72.0),
             blocks: vec![LayoutBlock::Table(table)],
+            header: None,
+            footer: None,
         };
         let mut out = Vec::new();
-        export_pdf(&page, &stack, &["hi"], PdfProfile::Plain, &mut out).expect("export table");
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["hi"],
+            PdfProfile::Plain,
+            &mut out,
+        )
+        .expect("export table");
         assert!(out.starts_with(b"%PDF-"));
         assert!(out.ends_with(b"%%EOF"));
         /* The cell's paragraph must reach the font-embedding pass —
@@ -849,9 +896,18 @@ mod tests {
             },
             margins: Margins::uniform(72.0),
             blocks: vec![],
+            header: None,
+            footer: None,
         };
         let mut out = Vec::new();
-        export_pdf(&page, &stack, &[], PdfProfile::Plain, &mut out).expect("export empty page");
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &[],
+            PdfProfile::Plain,
+            &mut out,
+        )
+        .expect("export empty page");
         assert!(out.starts_with(b"%PDF-"), "missing PDF header");
         assert!(out.ends_with(b"%%EOF"), "missing EOF marker");
     }
@@ -862,7 +918,14 @@ mod tests {
         let page = hello_page(&stack);
 
         let mut out = Vec::new();
-        export_pdf(&page, &stack, &["Hello world"], PdfProfile::A1b, &mut out).expect("export A1b");
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::A1b,
+            &mut out,
+        )
+        .expect("export A1b");
 
         let has = |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
         assert!(out.starts_with(b"%PDF-1.4"), "PDF/A-1 must declare PDF 1.4");
@@ -884,8 +947,22 @@ mod tests {
         let page = hello_page(&stack);
         let mut a = Vec::new();
         let mut b = Vec::new();
-        export_pdf(&page, &stack, &["Hello world"], PdfProfile::A1b, &mut a).expect("export a");
-        export_pdf(&page, &stack, &["Hello world"], PdfProfile::A1b, &mut b).expect("export b");
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::A1b,
+            &mut a,
+        )
+        .expect("export a");
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::A1b,
+            &mut b,
+        )
+        .expect("export b");
         assert_eq!(a, b, "A1b export must be byte-stable for identical input");
     }
 
@@ -907,7 +984,14 @@ mod tests {
         let stack = liberation_stack();
         let page = hello_page(&stack);
         let mut out = Vec::new();
-        export_pdf(&page, &stack, &["Hello world"], PdfProfile::Plain, &mut out).expect("export");
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::Plain,
+            &mut out,
+        )
+        .expect("export");
 
         let has = |n: &[u8]| out.windows(n.len()).any(|w| w == n);
         assert!(has(b"/FlateDecode"), "streams must declare FlateDecode");
@@ -923,7 +1007,7 @@ mod tests {
     fn to_unicode_map_covers_source_chars() {
         let stack = liberation_stack();
         let page = hello_page(&stack);
-        let map = collect_to_unicode(&page, &["Hello world"]);
+        let map = collect_to_unicode_pages(std::slice::from_ref(&page), &["Hello world"]);
         let liberation = map.get("liberation").expect("liberation font mapped");
         let covered: HashSet<char> = liberation.values().flatten().copied().collect();
         for ch in "Helo wrd".chars() {
