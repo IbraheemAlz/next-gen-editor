@@ -1627,11 +1627,14 @@ fn top_level_block_index(path: &BlockPath) -> Option<u32> {
 /// weight; matches what `<w:tblBorders>` emits on `Normal.dotx`.
 const DEFAULT_BORDER_SIZE_EIGHTH_PT: u16 = 4;
 
-/// A4 content width in twips (595 pt − 2 × 72 pt margins = 451 pt;
-/// 1 pt = 20 twips → 9020 twips). Used to seed a fresh table's grid
-/// so the table fits inside the page margins on insert. Phase 5c
-/// will switch to `<w:tblLayout w:type="autofit"/>`.
-const DEFAULT_A4_CONTENT_TWIPS: i32 = 9020;
+/// A4 content width in twips, sized to match the engine's layout-px
+/// universe (1 layout px ≡ 1 CSS px ≡ 15 twips at 96 DPI — the same
+/// conversion factor `twips_to_layout_px` uses). The page is 595 ×
+/// 842 layout-px with 72 layout-px margins, leaving 451 layout-px of
+/// content → 451 × 15 = 6765 twips. Used to seed a fresh table's
+/// grid so the table fits inside the page margins on insert. Phase
+/// 5c will switch to `<w:tblLayout w:type="autofit"/>`.
+const DEFAULT_A4_CONTENT_TWIPS: i32 = 6765;
 
 /// Word-style default cell-edge stroke — single 0.5 pt black.
 pub fn default_word_stroke() -> BorderStroke {
@@ -2951,6 +2954,41 @@ mod tests {
         }
         let outer = t.props.borders.as_ref().expect("outer borders");
         assert!(outer.top.is_some() && outer.bottom.is_some());
+    }
+
+    /// PR 4 follow-up — Bug 4. A fresh table's grid must fit the A4
+    /// content area: total grid twips ≤ DEFAULT_A4_CONTENT_TWIPS so
+    /// the layout pass produces a table width ≤ page content width.
+    /// 451 layout-px content × 15 twips/layout-px = 6765 twips.
+    #[test]
+    fn insert_table_grid_fits_a4_content_width() {
+        for cols in 1u32..=8u32 {
+            let d = DocumentTree::new().insert_table(BlockPath::top(0), 1, cols);
+            let t = d.blocks[0].as_table().unwrap();
+            assert_eq!(t.grid.len(), cols as usize);
+            let total: i32 = t.grid.iter().sum();
+            assert!(
+                total <= DEFAULT_A4_CONTENT_TWIPS,
+                "{cols}-col grid totals {total} twips, exceeds A4 content {DEFAULT_A4_CONTENT_TWIPS}"
+            );
+            assert!(
+                total >= DEFAULT_A4_CONTENT_TWIPS - cols as i32,
+                "{cols}-col grid totals {total} twips, leaves >1 twip/col slack"
+            );
+        }
+    }
+
+    /// Inserting a column re-divides the grid so total stays under
+    /// the A4 content area instead of pushing the table past the
+    /// right margin.
+    #[test]
+    fn insert_column_redivides_grid_within_content_width() {
+        let d = DocumentTree::new().insert_table(BlockPath::top(0), 1, 3);
+        let d = d.insert_column(BlockPath::top(0), 0);
+        let t = d.blocks[0].as_table().unwrap();
+        assert_eq!(t.grid.len(), 4);
+        let total: i32 = t.grid.iter().sum();
+        assert!(total <= DEFAULT_A4_CONTENT_TWIPS);
     }
 
     #[test]
