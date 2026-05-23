@@ -8,7 +8,7 @@ import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { EditorCanvas } from './components/EditorCanvas';
 import { ExtraPageCanvas } from './components/ExtraPageCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
-import { SelectionOverlay } from './components/SelectionOverlay';
+import { PageSelectionOverlay } from './components/PageSelectionOverlay';
 import { HiddenInput } from './components/HiddenInput';
 import { Toolbar } from './components/Toolbar';
 import { TablePanel } from './components/TablePanel';
@@ -188,12 +188,14 @@ export function App() {
                                     />
                                 )}
                             </For>
-                            <SelectionOverlay store={store} />
-                            <CaretOverlay store={store} />
+                            <PageSelectionOverlay store={store} pageIdx={0} />
+                            <CaretOverlay store={store} pageIdx={0} />
                             <HiddenInput client={client} store={store} />
                         </div>
                         <For each={Array.from({ length: Math.max(0, store.pageCount() - 1) }, (_, i) => i + 1)}>
-                            {(idx) => <ExtraPageCanvas client={client} pageIdx={idx} />}
+                            {(idx) => (
+                                <ExtraPageCanvas client={client} store={store} pageIdx={idx} />
+                            )}
                         </For>
                     </div>
                 </div>

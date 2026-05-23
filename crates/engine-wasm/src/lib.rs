@@ -1835,6 +1835,24 @@ fn nearest_slot_by_x(slots: &[CaretSlot], target_x: f32) -> Option<&CaretSlot> {
     })
 }
 
+/// Phase 6c — perpendicular x-distance from `target_x` to a line's
+/// horizontal span. Zero when `target_x` falls inside `[start_x,
+/// start_x + width]`; otherwise the gap to the nearest edge. Used to
+/// pick the "right" cell when an Up / Down walk lands on a row with
+/// multiple cells (the cell that contains `ideal_x` wins; if none
+/// does, the nearest one).
+fn x_distance_to_line(line: &LineGeom, target_x: f32) -> f32 {
+    let left = line.hit_left;
+    let right = line.hit_left + line.hit_width;
+    if target_x < left {
+        left - target_x
+    } else if target_x > right {
+        target_x - right
+    } else {
+        0.0
+    }
+}
+
 /// Step one Unicode char left in logical order (Backlog #14). At the start of
 /// a paragraph the caret jumps to the end of the previous paragraph in the
 /// containing flat-paragraph walk; at byte 0 of the document it pins.
@@ -3469,15 +3487,72 @@ impl Engine {
                         .or_else(|| geom.first())
                         .map_or(0.0, |line| slot_x_for_byte(line, caret_offset))
                 });
-                let cur_idx = geom.iter().position(|l| {
+                /* Phase 6c — spatial vertical walk. Locate the caret's
+                line in `geom`, then look for the geometrically next
+                line above (Up) / below (Down) by Y position — NOT by
+                `geom` index order. Tables interleave cells in
+                document order that don't match the visual order:
+                cell(0,1) is to the *right* of cell(0,0) on the same
+                row, so a doc-order walk Up from cell(1,0) jumps to
+                cell(0,1) (the previous block) instead of cell(0,0).
+                Among lines at the target Y, prefer the one whose
+                horizontal span contains `ideal_x` (handles same-row
+                cells with different widths). */
+                let cur = geom.iter().find(|l| {
                     l.path == caret_path
                         && caret_offset >= l.start_byte
                         && caret_offset <= l.end_byte
                 });
-                let target = match (cur_idx, direction) {
-                    (Some(i), MoveDirection::Up) if i > 0 => geom.get(i - 1),
-                    (Some(i), MoveDirection::Down) => geom.get(i + 1),
-                    _ => None,
+                let target: Option<&LineGeom> = if let Some(cur_line) = cur {
+                    let going_up = direction == MoveDirection::Up;
+                    /* Find best candidate at the next y-level. */
+                    let mut best: Option<&LineGeom> = None;
+                    for line in &geom {
+                        if std::ptr::eq(line, cur_line) {
+                            continue;
+                        }
+                        let on_other_side = if going_up {
+                            line.y_top + 0.5 < cur_line.y_top
+                        } else {
+                            line.y_top > cur_line.y_top + 0.5
+                        };
+                        if !on_other_side {
+                            continue;
+                        }
+                        best = match best {
+                            None => Some(line),
+                            Some(b) => {
+                                /* Prefer the candidate CLOSER in Y to the
+                                current line; tie-break by X-overlap with
+                                `ideal` (cells at same row Y but different
+                                X spans). */
+                                let cur_dy = (line.y_top - cur_line.y_top).abs();
+                                let b_dy = (b.y_top - cur_line.y_top).abs();
+                                if cur_dy < b_dy - 0.5 {
+                                    Some(line)
+                                } else if (cur_dy - b_dy).abs() < 0.5 {
+                                    let line_x_dist = x_distance_to_line(line, ideal);
+                                    let b_x_dist = x_distance_to_line(b, ideal);
+                                    if line_x_dist < b_x_dist {
+                                        Some(line)
+                                    } else {
+                                        Some(b)
+                                    }
+                                } else {
+                                    Some(b)
+                                }
+                            }
+                        };
+                    }
+                    best
+                } else {
+                    /* Fallback to first line when current isn't found
+                    (defensive — caret should always sit on a geom line). */
+                    if direction == MoveDirection::Down {
+                        geom.first()
+                    } else {
+                        geom.last()
+                    }
                 };
                 let new_caret = match target {
                     Some(line) => nearest_slot_by_x(&line.slots, ideal)

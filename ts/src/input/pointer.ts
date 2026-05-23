@@ -8,16 +8,27 @@
 import type { EngineClient } from '../engine/engine-client';
 import type { Point } from '../engine/types';
 
+/* Phase 6c — multi-canvas drag math constants. The pointer handler
+   converts canvas-local pointer coords to document-absolute engine
+   device-px so a drag that leaves the originally-clicked canvas (the
+   `setPointerCapture` target) still resolves to the right glyph on
+   whichever page the cursor visits. The conversion adds this canvas's
+   page-top offset in engine device px, computed from the engine's
+   constants below. */
+const PAGE_H_PT = 841.9; // A4 height in layout pt (engine `PageGeometry::a4()`).
+const PAGE_GAP_PT = 48; // Engine `render::scene::PAGE_GAP_PT`.
+const SCREEN_DPI_SCALE = 4 / 3; // 96 / 72 — `App.tsx::SCREEN_DPI_SCALE`.
+
 /**
  * Wire pointer listeners on `canvas` for one page in the multi-canvas DOM
  * architecture (Phase 6c). Returns a teardown that removes them. Pointer
  * events still fire on a `<canvas>` whose drawing surface has been
  * transferred to the worker, so this is safe to attach post-transfer.
  *
- * `pageIdx` identifies which page-card canvas this is. Clicks dispatch
- * `HIT_TEST_IN_PAGE` with that index + the canvas-local device-pixel
- * point — the engine adds the page's accumulated top offset, no
- * TS-side offset math.
+ * `pageIdx` is the canvas's page index — used to convert
+ * canvas-local pointer coords to document-absolute engine device-px,
+ * so `setPointerCapture` drags that cross page boundaries still
+ * resolve to the right glyph on whichever page the cursor visits.
  */
 export function attachPointer(
     canvas: HTMLCanvasElement,
@@ -32,16 +43,27 @@ export function attachPointer(
        time it resolves is dropped. */
     let gesture = 0;
 
-    /* Client coords → canvas device pixels. The engine paints the page 1:1
-       into the device-pixel backing store, so device px are page points. */
-    const toCanvas = (e: PointerEvent | MouseEvent): Point => {
+    /* Client coords → DOCUMENT-ABSOLUTE engine device pixels. Adding
+       this canvas's page-top offset means a `setPointerCapture` drag
+       that wanders onto a neighbouring canvas (or even past the last
+       page) still resolves the correct glyph — `e.clientY - r.top`
+       legitimately exceeds the canvas height when the cursor is below
+       this canvas, and that's exactly the engine-space Y of the line
+       below. Multiplied by `dpr` to lift into engine device px;
+       `pageIdx × (page_h + gap) × scale` shifts to absolute. */
+    const toGlobal = (e: PointerEvent | MouseEvent): Point => {
         const r = canvas.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
-        return { x: (e.clientX - r.left) * dpr, y: (e.clientY - r.top) * dpr };
+        const scale = dpr * SCREEN_DPI_SCALE;
+        const pageOffsetY = pageIdx * (PAGE_H_PT + PAGE_GAP_PT) * scale;
+        return {
+            x: (e.clientX - r.left) * dpr,
+            y: (e.clientY - r.top) * dpr + pageOffsetY,
+        };
     };
 
     const placeCaret = async (at: Point, g: number): Promise<void> => {
-        const hit = await client.dispatch({ type: 'HIT_TEST_IN_PAGE', page: pageIdx, at });
+        const hit = await client.dispatch({ type: 'HIT_TEST', at });
         if (g !== gesture || hit.type !== 'HIT_RESULT') return;
         await client.dispatch({
             type: 'SET_SELECTION',
@@ -51,7 +73,7 @@ export function attachPointer(
     };
 
     const extendTo = async (at: Point, g: number): Promise<void> => {
-        const hit = await client.dispatch({ type: 'HIT_TEST_IN_PAGE', page: pageIdx, at });
+        const hit = await client.dispatch({ type: 'HIT_TEST', at });
         if (g !== gesture || hit.type !== 'HIT_RESULT') return;
         await client.dispatch({ type: 'EXTEND_SELECTION', to: hit.pos, modifier: 'None' });
     };
@@ -60,12 +82,12 @@ export function attachPointer(
         canvas.setPointerCapture(e.pointerId);
         dragging = true;
         gesture += 1;
-        void placeCaret(toCanvas(e), gesture);
+        void placeCaret(toGlobal(e), gesture);
     };
 
     const onPointerMove = (e: PointerEvent): void => {
         if (!dragging) return;
-        void extendTo(toCanvas(e), gesture);
+        void extendTo(toGlobal(e), gesture);
     };
 
     const onPointerUp = (e: PointerEvent): void => {
@@ -79,7 +101,7 @@ export function attachPointer(
         /* Bump past the two single-clicks' in-flight hit-tests so their
            SET_SELECTIONs are dropped and the word selection survives. */
         gesture += 1;
-        void client.dispatch({ type: 'SELECT_WORD_AT', at: toCanvas(e) });
+        void client.dispatch({ type: 'SELECT_WORD_AT', at: toGlobal(e) });
     };
 
     /* Triple-click — select the whole paragraph (Backlog #14). The DOM has no
@@ -89,7 +111,7 @@ export function attachPointer(
     const onClick = (e: MouseEvent): void => {
         if (e.detail === 3) {
             gesture += 1;
-            void client.dispatch({ type: 'SELECT_PARAGRAPH_AT', at: toCanvas(e) });
+            void client.dispatch({ type: 'SELECT_PARAGRAPH_AT', at: toGlobal(e) });
         }
     };
 

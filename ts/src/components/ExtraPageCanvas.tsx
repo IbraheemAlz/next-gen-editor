@@ -13,10 +13,14 @@
  * page, never the full document. */
 import { onCleanup, onMount } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
+import type { EngineStore } from '../state/engine-store';
 import { attachPointer } from '../input/pointer';
+import { PageSelectionOverlay } from './PageSelectionOverlay';
+import { CaretOverlay } from './CaretOverlay';
 
 export interface ExtraPageCanvasProps {
     client: EngineClient;
+    store: EngineStore;
     pageIdx: number;
 }
 
@@ -43,6 +47,8 @@ export function ExtraPageCanvas(props: ExtraPageCanvasProps) {
     return (
         <div class="editor-page" data-page-index={props.pageIdx}>
             <canvas ref={canvasRef} class="editor-canvas" />
+            <PageSelectionOverlay store={props.store} pageIdx={props.pageIdx} />
+            <CaretOverlay store={props.store} pageIdx={props.pageIdx} />
         </div>
     );
 }
