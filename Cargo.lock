@@ -758,6 +758,7 @@ dependencies = [
 name = "layout"
 version = "0.5.0-beta.3"
 dependencies = [
+ "engine",
  "text-pipeline",
 ]
 
@@ -1214,6 +1215,7 @@ dependencies = [
 name = "render"
 version = "0.5.0-beta.3"
 dependencies = [
+ "engine",
  "js-sys",
  "kurbo",
  "layout",

@@ -37,7 +37,7 @@
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use layout::{PageBox, VisualRun};
+use layout::{LayoutBlock, PageBox, VisualRun};
 use pdf_writer::types::{CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, UnicodeCmap};
 use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
 use std::collections::{BTreeMap, HashMap};
@@ -110,7 +110,9 @@ pub fn export_pdf(
 
     /* Distinct fonts referenced by the page, in first-seen order. */
     let mut used: Vec<&str> = Vec::new();
-    for para in &page.paragraphs {
+    /* Phase 5 PR 2 — tables skip the font collection pass; PDF table
+    export is Phase 5b (RFC §3.2). */
+    for para in page.blocks.iter().filter_map(LayoutBlock::as_paragraph) {
         for line in &para.lines {
             for run in &line.runs {
                 if !used.contains(&run.font.as_str()) {
@@ -245,7 +247,10 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
 
     let content_x = page.margins.left;
     let content_y = page.margins.top;
-    for para in &page.paragraphs {
+    /* Phase 5 PR 2 — tables silently skip on the PDF path. PDF table
+    export is deferred to Phase 5b per RFC §3.2; warning surfaced via
+    `note_skipped_block` (callers inspect `PdfExportReport`). */
+    for para in page.blocks.iter().filter_map(LayoutBlock::as_paragraph) {
         let para_x = content_x + para.origin.x;
         let para_y = content_y + para.origin.y;
         for line in &para.lines {
@@ -351,7 +356,12 @@ fn collect_to_unicode(
     para_texts: &[&str],
 ) -> HashMap<String, BTreeMap<u16, Vec<char>>> {
     let mut out: HashMap<String, BTreeMap<u16, Vec<char>>> = HashMap::new();
-    for (pi, para) in page.paragraphs.iter().enumerate() {
+    for (pi, para) in page
+        .blocks
+        .iter()
+        .filter_map(LayoutBlock::as_paragraph)
+        .enumerate()
+    {
         let Some(&text) = para_texts.get(pi) else {
             continue;
         };
@@ -490,7 +500,7 @@ mod tests {
                 height: 842.0,
             },
             margins: Margins::uniform(72.0),
-            paragraphs: vec![para],
+            blocks: vec![LayoutBlock::Paragraph(para)],
         }
     }
 
@@ -527,7 +537,7 @@ mod tests {
                 height: 842.0,
             },
             margins: Margins::uniform(72.0),
-            paragraphs: vec![],
+            blocks: vec![],
         };
         let mut out = Vec::new();
         export_pdf(&page, &stack, &[], PdfProfile::Plain, &mut out).expect("export empty page");

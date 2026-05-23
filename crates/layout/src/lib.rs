@@ -9,8 +9,8 @@ pub mod page;
 pub mod paragraph;
 
 pub use boxes::{
-    FontId, LineBox, PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TextAttrs,
-    VisualRun,
+    FontId, LayoutBlock, LineBox, MarkerBox, PageBox, ParagraphBox, Point, PositionedGlyph, Size,
+    StyleSpan, TableBox, TableCellBox, TableRowBox, TextAttrs, VisualRun,
 };
 pub use page::{A4Page, Margins};
 pub use paragraph::{ParagraphConfig, layout_paragraph};

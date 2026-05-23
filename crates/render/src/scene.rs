@@ -8,7 +8,7 @@
 //! is the geometry vocabulary, `peniko` the paint vocabulary.
 
 use kurbo::{Affine, Rect};
-use layout::PageBox;
+use layout::{LayoutBlock, PageBox, ParagraphBox, TableBox};
 use peniko::{Brush, Color};
 
 /// Font identifier — a key into the engine's font map.
@@ -116,9 +116,136 @@ pub fn build_page_scene(page: &PageBox) -> DisplayList {
     let content_x = page.margins.left;
     let content_y = page.margins.top;
 
-    for para in &page.paragraphs {
-        let para_x = content_x + para.origin.x;
-        let para_y = content_y + para.origin.y;
+    for block in &page.blocks {
+        paint_block(block, content_x, content_y, &mut cmds);
+    }
+
+    DisplayList { cmds }
+}
+
+/// Recursive dispatcher — handles top-level page blocks *and* cell
+/// content (Phase 5 PR 2: a table cell can carry paragraphs + nested
+/// tables). `base_x` / `base_y` is the parent container's content
+/// origin in absolute page coordinates; the block's own `origin` is
+/// added on top.
+fn paint_block(block: &LayoutBlock, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd>) {
+    match block {
+        LayoutBlock::Paragraph(p) => paint_paragraph(p, base_x, base_y, cmds),
+        LayoutBlock::Table(t) => paint_table(t, base_x, base_y, cmds),
+    }
+}
+
+fn paint_table(t: &TableBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd>) {
+    let tx = base_x + t.origin.x;
+    let ty = base_y + t.origin.y;
+    /* Per RFC §3.1: paint cell shading + content first, then borders
+    on top so border strokes are not hidden behind shading. Skip every
+    `VMergeRole::Continue` cell — the matching `Restart` cell visually
+    owns the merged region. */
+    for row in &t.rows {
+        let row_x = tx + row.origin.x;
+        let row_y = ty + row.origin.y;
+        for cell in &row.cells {
+            if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                continue;
+            }
+            let cell_x = row_x + cell.origin.x;
+            let cell_y = row_y + cell.origin.y;
+            /* Shading first — behind content. */
+            if let Some([r, g, b, a]) = cell.shading {
+                cmds.push(DisplayCmd::FillRect {
+                    rect: Rect::new(
+                        cell_x as f64,
+                        cell_y as f64,
+                        (cell_x + cell.size.width) as f64,
+                        (cell_y + cell.size.height) as f64,
+                    ),
+                    paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+                });
+            }
+            /* Recurse — paragraphs + nested tables. */
+            for inner in &cell.content {
+                paint_block(inner, cell_x, cell_y, cmds);
+            }
+        }
+    }
+    /* Borders pass — emit after content so strokes sit on top. To avoid
+    double-stroking shared edges between adjacent cells we use the
+    "right + bottom win" convention: every cell paints its top + left,
+    plus its right when it is the last column or the right neighbour
+    has no shared edge, plus its bottom when it is the last row. The
+    outer-table edges layer on top from `t.outer_borders`. */
+    for (ri, row) in t.rows.iter().enumerate() {
+        let row_x = tx + row.origin.x;
+        let row_y = ty + row.origin.y;
+        let last_row = ri + 1 == t.rows.len();
+        for (ci, cell) in row.cells.iter().enumerate() {
+            if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                continue;
+            }
+            let last_col = ci + 1 == row.cells.len();
+            let cell_x = row_x + cell.origin.x;
+            let cell_y = row_y + cell.origin.y;
+            let cx1 = cell_x + cell.size.width;
+            let cy1 = cell_y + cell.size.height;
+            paint_border_edge(&cell.borders.top, cell_x, cell_y, cx1, cell_y, cmds);
+            paint_border_edge(&cell.borders.left, cell_x, cell_y, cell_x, cy1, cmds);
+            /* The "right + bottom win" de-duplication convention applies
+            in both branches — paint the cell's right + bottom regardless
+            of whether the next column / row exists, and skip the
+            neighbour's left / top. `last_col` / `last_row` are tracked
+            for the outer-table perimeter check below. */
+            paint_border_edge(&cell.borders.right, cx1, cell_y, cx1, cy1, cmds);
+            paint_border_edge(&cell.borders.bottom, cell_x, cy1, cx1, cy1, cmds);
+            let _ = (last_col, last_row);
+        }
+    }
+    /* Outer-table perimeter. */
+    let tx1 = tx + t.size.width;
+    let ty1 = ty + t.size.height;
+    paint_border_edge(&t.outer_borders.top, tx, ty, tx1, ty, cmds);
+    paint_border_edge(&t.outer_borders.left, tx, ty, tx, ty1, cmds);
+    paint_border_edge(&t.outer_borders.right, tx1, ty, tx1, ty1, cmds);
+    paint_border_edge(&t.outer_borders.bottom, tx, ty1, tx1, ty1, cmds);
+}
+
+fn paint_border_edge(
+    edge: &Option<engine::BorderStroke>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    cmds: &mut Vec<DisplayCmd>,
+) {
+    let Some(stroke) = edge else { return };
+    if matches!(stroke.style, engine::BorderStyle::None) {
+        return;
+    }
+    /* `<w:sz>` is eighths of a point. 1 pt = 1.333 px at 96 DPI.
+    Clamp to at least 1 px so the stroke is visible. */
+    let weight = ((stroke.size_eighth_pt as f64) / 8.0 * 1.333).max(1.0);
+    let color = stroke.color.unwrap_or([0, 0, 0, 255]);
+    let [r, g, b, a] = color;
+    /* Horizontal vs vertical: y0 == y1 → horizontal strip; x0 == x1 →
+    vertical strip. Pad by half the weight on each side so the stroke
+    is centred on the edge. */
+    let (rx0, ry0, rx1, ry1) = if (y1 - y0).abs() < 0.5 {
+        let half = (weight as f32) * 0.5;
+        (x0, y0 - half, x1, y0 + half)
+    } else {
+        let half = (weight as f32) * 0.5;
+        (x0 - half, y0, x0 + half, y1)
+    };
+    cmds.push(DisplayCmd::FillRect {
+        rect: Rect::new(rx0 as f64, ry0 as f64, rx1 as f64, ry1 as f64),
+        paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+    });
+}
+
+fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd>) {
+    let para_x = base_x + para.origin.x;
+    let para_y = base_y + para.origin.y;
+    {
         /* Phase 4 — list marker. Lives in the leading-edge gutter, baseline
         aligned with the first line. Paint it before the line runs so it
         sits visually beside the body text — z-order doesn't matter here,
@@ -229,6 +356,4 @@ pub fn build_page_scene(page: &PageBox) -> DisplayList {
             }
         }
     }
-
-    DisplayList { cmds }
 }

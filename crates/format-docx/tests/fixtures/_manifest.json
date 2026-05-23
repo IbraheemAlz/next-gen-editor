@@ -134,6 +134,71 @@
       "roundtrip": {
         "document_xml_drift_bytes": 0
       }
+    },
+    "table_borders_double.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 5,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "intro"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "table_grid_span.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 5,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "intro"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "table_in_rtl_doc.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 5,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "مقدمة"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "table_shaded_header.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 5,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "intro"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "table_vmerge.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 5,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "intro"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
     }
   }
 }

@@ -148,10 +148,93 @@ pub struct MarkerBox {
     pub width: f32,
 }
 
+/// Top-level page child — Phase 5 PR 2. The page-build pipeline emits one
+/// `LayoutBlock` per `engine::Block`. Tables, like paragraphs, carry their
+/// own `origin` relative to the page content area.
+#[derive(Debug, Clone)]
+pub enum LayoutBlock {
+    Paragraph(ParagraphBox),
+    Table(TableBox),
+}
+
+impl LayoutBlock {
+    pub fn origin(&self) -> Point {
+        match self {
+            LayoutBlock::Paragraph(p) => p.origin,
+            LayoutBlock::Table(t) => t.origin,
+        }
+    }
+    pub fn set_origin(&mut self, o: Point) {
+        match self {
+            LayoutBlock::Paragraph(p) => p.origin = o,
+            LayoutBlock::Table(t) => t.origin = o,
+        }
+    }
+    pub fn size(&self) -> Size {
+        match self {
+            LayoutBlock::Paragraph(p) => p.size,
+            LayoutBlock::Table(t) => t.size,
+        }
+    }
+    pub fn as_paragraph(&self) -> Option<&ParagraphBox> {
+        match self {
+            LayoutBlock::Paragraph(p) => Some(p),
+            _ => None,
+        }
+    }
+    pub fn as_table(&self) -> Option<&TableBox> {
+        match self {
+            LayoutBlock::Table(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// A laid-out table block (Phase 5 PR 2). `origin` is relative to the
+/// parent `PageBox` content area (or, for a nested table, to its
+/// containing `TableCellBox` origin).
+#[derive(Debug, Clone)]
+pub struct TableBox {
+    pub origin: Point,
+    pub size: Size,
+    /// Column widths in device px. Length matches the logical column count
+    /// from `engine::Table::grid`; cells with `grid_span > 1` consume
+    /// multiple entries.
+    pub columns: Vec<f32>,
+    pub rows: Vec<TableRowBox>,
+    /// Outer table border strokes — painted by the renderer over the
+    /// entire table rectangle. `None` per-edge ⇒ no stroke (Word's default
+    /// table has no borders unless `<w:tblBorders>` says so).
+    pub outer_borders: engine::CellBorders,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableRowBox {
+    /// Relative to parent [`TableBox`] origin.
+    pub origin: Point,
+    pub size: Size,
+    pub cells: Vec<TableCellBox>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableCellBox {
+    /// Relative to parent [`TableRowBox`] origin.
+    pub origin: Point,
+    pub size: Size,
+    pub grid_span: u8,
+    pub v_merge: engine::VMergeRole,
+    pub borders: engine::CellBorders,
+    pub shading: Option<[u8; 4]>,
+    /// Recursive content — paragraphs and nested tables. Phase 5 PR 2
+    /// recursion bound: practical 8 levels (matches Word). Deeper
+    /// nesting silently truncates with a placeholder.
+    pub content: Vec<LayoutBlock>,
+}
+
 /// A laid-out page — the root of the box tree and the renderer's input.
 #[derive(Debug, Clone)]
 pub struct PageBox {
     pub size: Size,
     pub margins: Margins,
-    pub paragraphs: Vec<ParagraphBox>,
+    pub blocks: Vec<LayoutBlock>,
 }

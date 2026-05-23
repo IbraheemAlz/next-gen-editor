@@ -800,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn table_parses_as_opaque_block_with_source_bytes() {
+    fn table_block_carries_parsed_rows_and_source_bytes() {
         let bytes = build_table_docx();
         let parsed = read_docx(&bytes).expect("read");
         let blocks: Vec<_> = parsed.document.blocks.iter().collect();
@@ -808,7 +808,11 @@ mod tests {
         assert!(matches!(blocks[0], engine::Block::Paragraph(_)));
         match &blocks[1] {
             engine::Block::Table(t) => {
-                assert!(t.rows.is_empty(), "PR 1 keeps rows opaque");
+                /* Phase 5 PR 2 — rows are now parsed; PR 1's "opaque
+                rows" invariant is gone. Source bytes still rides the
+                passthrough writer. */
+                assert_eq!(t.rows.len(), 1, "1 row in the build_table_docx fixture");
+                assert_eq!(t.rows[0].cells.len(), 1);
                 assert!(!t.dirty);
                 let raw = t.source_xml.as_deref().expect("source_xml captured");
                 let raw_str = std::str::from_utf8(raw).unwrap();

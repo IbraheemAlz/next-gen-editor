@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Display list + Vello (WebGPU) + Canvas2D fallback backends."
 
 [dependencies]
+engine = { path = "../engine" }
 text-pipeline = { path = "../text-pipeline" }
 layout = { path = "../layout" }
 kurbo = { workspace = true }

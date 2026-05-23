@@ -7,3 +7,4 @@
 pub mod document;
 pub mod numbering;
 pub mod styles;
+pub mod table;

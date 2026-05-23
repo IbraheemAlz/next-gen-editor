@@ -17,8 +17,8 @@ use engine::{
 use format_docx::writer::build_minimal_docx;
 use kurbo::Rect;
 use layout::{
-    A4Page, LineBox, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan,
-    layout_paragraph,
+    A4Page, LayoutBlock, LineBox, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan,
+    TableBox, TableCellBox, TableRowBox, layout_paragraph,
 };
 use lru::LruCache;
 use render::atlas::GlyphAtlas;
@@ -548,6 +548,174 @@ fn props_to_layout_indents(props: &engine::ParaProperties, scale: f32) -> (f32, 
         twips_to_layout_px(props.indent.first_line_twips, scale),
         twips_to_layout_px(props.indent.hanging_twips, scale),
     )
+}
+
+/* ===================================================================
+Phase 5 PR 2 — table layout
+==================================================================== */
+
+/// Lay out an `engine::Table` into a `layout::TableBox`. Column widths
+/// come straight from `<w:tblGrid>` (literal twips → px); cells with
+/// `grid_span > 1` consume the sum of their N spanned columns. Each
+/// cell's content recursively lays out via [`layout_block_for_layout`]
+/// so nested tables work. Row height = max cell measured height,
+/// skipping `VMergeRole::Continue` cells (their content is owned by
+/// the matching `Restart` cell — Phase 5c will accumulate Restart
+/// cell heights across the merged span; PR 2 simply renders the
+/// Restart cell at the row's natural height).
+fn layout_table_box(
+    table: &engine::Table,
+    available_width_px: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+) -> TableBox {
+    /* Column widths in device px. If `<w:tblGrid>` is missing, fall back
+    to equal-divide across the available width — defensive for malformed
+    documents. */
+    let columns: Vec<f32> = if table.grid.is_empty() {
+        Vec::new()
+    } else {
+        table
+            .grid
+            .iter()
+            .map(|&t| twips_to_layout_px(t, scale))
+            .collect()
+    };
+
+    let mut rows_out: Vec<TableRowBox> = Vec::with_capacity(table.rows.len());
+    let mut y = 0.0_f32;
+    let mut table_width = columns.iter().sum::<f32>();
+    if table_width <= 0.0 {
+        table_width = available_width_px;
+    }
+    for row in &table.rows {
+        let mut cells_out: Vec<TableCellBox> = Vec::with_capacity(row.cells.len());
+        let mut x = 0.0_f32;
+        let mut row_height = 0.0_f32;
+        let mut col_cursor: usize = 0;
+        for cell in &row.cells {
+            let span = cell.props.grid_span.max(1) as usize;
+            let cell_width: f32 = if columns.is_empty() {
+                /* No grid info — give every cell an equal share. */
+                table_width / row.cells.len().max(1) as f32
+            } else {
+                /* Sum N spanned columns starting at `col_cursor`. */
+                let lo = col_cursor.min(columns.len());
+                let hi = (col_cursor + span).min(columns.len());
+                columns[lo..hi].iter().sum::<f32>().max(1.0)
+            };
+            /* Recursively lay out cell content. Phase 5 PR 2 ships a fixed
+            cell-internal padding of 4 px on every side — the OOXML
+            `<w:tcMar>` / table-level `<w:tblCellMar>` model is a
+            Phase 5b refinement. */
+            let inner_pad = 4.0_f32;
+            let content_width = (cell_width - inner_pad * 2.0).max(0.0);
+            let inner_blocks = layout_cell_blocks(&cell.blocks, content_width, fonts, cfg, scale);
+            let content_height: f32 = inner_blocks.iter().map(|b| b.size().height).sum();
+            /* `VMergeRole::Continue` cells contribute zero — the matching
+            `Restart` cell visually owns the merged region. */
+            let measured = if matches!(cell.props.v_merge, engine::VMergeRole::Continue) {
+                0.0
+            } else {
+                content_height + inner_pad * 2.0
+            };
+            row_height = row_height.max(measured);
+            cells_out.push(TableCellBox {
+                origin: Point { x, y: 0.0 },
+                size: Size {
+                    width: cell_width,
+                    /* Filled below once the row height is final. */
+                    height: 0.0,
+                },
+                grid_span: cell.props.grid_span.max(1),
+                v_merge: cell.props.v_merge,
+                borders: cell.props.borders.clone().unwrap_or_default(),
+                shading: cell.props.shading,
+                content: inner_blocks,
+            });
+            x += cell_width;
+            col_cursor += span;
+        }
+        /* Apply row min-height from `<w:trHeight>` if present. */
+        if let Some(rh) = row.props.height {
+            match rh {
+                engine::RowHeight::AtLeast { twips } | engine::RowHeight::Exact { twips } => {
+                    row_height = row_height.max(twips_to_layout_px(twips, scale));
+                }
+                engine::RowHeight::Auto => {}
+            }
+        }
+        /* Stamp final row height onto every cell. */
+        for c in &mut cells_out {
+            c.size.height = row_height;
+        }
+        let row_width = cells_out.iter().map(|c| c.size.width).sum::<f32>();
+        rows_out.push(TableRowBox {
+            origin: Point { x: 0.0, y },
+            size: Size {
+                width: row_width.max(table_width),
+                height: row_height,
+            },
+            cells: cells_out,
+        });
+        y += row_height;
+    }
+
+    TableBox {
+        origin: Point::default(),
+        size: Size {
+            width: table_width,
+            height: y,
+        },
+        columns,
+        rows: rows_out,
+        outer_borders: table.props.borders.clone().unwrap_or_default(),
+    }
+}
+
+fn layout_cell_blocks(
+    blocks: &[engine::Block],
+    content_width_px: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+) -> Vec<LayoutBlock> {
+    let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
+    let mut y = 0.0_f32;
+    for b in blocks {
+        let mut lb = match b {
+            engine::Block::Paragraph(p) => {
+                let spans = build_style_spans(p, cfg.px_size, [0, 0, 0, 255], scale);
+                let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&p.props, scale);
+                let pcfg = ParagraphConfig {
+                    text: &p.text,
+                    fonts,
+                    spans: &spans,
+                    base_direction: first_strong_direction(&p.text).unwrap_or(cfg.base_direction),
+                    max_width: content_width_px.max(1.0),
+                    line_height: cfg.line_height * scale,
+                    alignment: p.props.alignment.map_or(cfg.alignment, layout_align),
+                    indent_start_px: ind_s,
+                    indent_end_px: ind_e,
+                    first_line_indent_px: ind_fl,
+                    hanging_indent_px: ind_h,
+                    marker_text: p.resolved_marker.clone(),
+                    px_size_for_marker: cfg.px_size * scale,
+                };
+                LayoutBlock::Paragraph(layout_paragraph(pcfg))
+            }
+            engine::Block::Table(t) => {
+                LayoutBlock::Table(layout_table_box(t, content_width_px, fonts, cfg, scale))
+            }
+        };
+        let mut o = lb.origin();
+        o.y = y;
+        lb.set_origin(o);
+        y += lb.size().height;
+        out.push(lb);
+    }
+    out
 }
 
 /// Discriminant for an optional paragraph alignment (the enum has no `Hash`).
@@ -1399,10 +1567,14 @@ impl Engine {
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
 
-        /* Lay out each paragraph, stacking them down the content area. */
-        let mut paragraphs: Vec<ParagraphBox> = Vec::new();
-        /* Document paragraph index of each emitted `ParagraphBox` — empty
-        paragraphs produce no box, so box index != document index. */
+        /* Lay out each block, stacking them down the content area. Phase 5
+        PR 2: `LayoutBlock::Paragraph` follows the existing path;
+        `LayoutBlock::Table` recursively lays out cells. */
+        let mut layout_blocks: Vec<LayoutBlock> = Vec::new();
+        /* Document paragraph-flat index of each emitted `ParagraphBox` —
+        empty paragraphs produce no box, so box index != paragraph-flat
+        index. Tables emit a `LayoutBlock::Table` that is *not* recorded
+        here (PDF / hit-test address paragraphs only at PR 2). */
         let mut box_doc_index: Vec<u32> = Vec::new();
         let mut para_y_offset = 0.0_f32;
         let doc = self.undo.current().clone();
@@ -1415,107 +1587,130 @@ impl Engine {
         } else {
             None
         };
-        for (doc_idx, para) in doc.paragraphs().enumerate() {
-            let comp = composition.filter(|c| {
-                c.at.para as usize == doc_idx
-                    && !c.text.is_empty()
-                    && (c.at.offset as usize) <= para.text.len()
-                    && para.text.is_char_boundary(c.at.offset as usize)
-            });
-            if para.text.is_empty() && comp.is_none() {
-                para_y_offset += cfg.line_height * scale;
-                continue;
-            }
-            let mut para_box = if let Some(c) = comp {
-                /* Composition paragraph: splice the composed text in and lay
-                it out fresh — never cached, since the text differs from the
-                committed `para.text`. */
-                let off = c.at.offset as usize;
-                let mut text = String::with_capacity(para.text.len() + c.text.len());
-                text.push_str(&para.text[..off]);
-                text.push_str(&c.text);
-                text.push_str(&para.text[off..]);
-                let spans = composition_layout_spans(
-                    para,
-                    off as u32,
-                    c.text.len() as u32,
-                    cfg.px_size,
-                    scale,
-                );
-                let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&para.props, scale);
-                layout_paragraph(ParagraphConfig {
-                    text: &text,
-                    fonts: &font_stack,
-                    spans: &spans,
-                    base_direction: first_strong_direction(&text).unwrap_or(cfg.base_direction),
-                    max_width: page.content_width(),
-                    line_height: cfg.line_height * scale,
-                    alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
-                    indent_start_px: ind_s,
-                    indent_end_px: ind_e,
-                    first_line_indent_px: ind_fl,
-                    hanging_indent_px: ind_h,
-                    marker_text: para.resolved_marker.clone(),
-                    px_size_for_marker: cfg.px_size * scale,
-                })
-            } else {
-                /* Backlog #13 — incremental relayout: reuse the cached box
-                when this paragraph's content + config hash is unchanged,
-                skipping BiDi and shaping. An edit changes only the edited
-                paragraph's hash, so every other paragraph is a cheap clone. */
-                let key = paragraph_layout_key(para, &cfg, scale);
-                if let Some(cached) = cache.get(&key) {
-                    cached.clone()
-                } else {
-                    let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
+        let mut paragraph_flat_idx: u32 = 0;
+        for block in doc.blocks.iter() {
+            let para = match block {
+                engine::Block::Paragraph(p) => p,
+                engine::Block::Table(t) => {
+                    /* Phase 5 PR 2 — lay out the table block. Skip the
+                    incremental-relayout cache (tables always re-layout;
+                    Phase 5c will add a cache key). */
+                    let mut tb =
+                        layout_table_box(t, page.content_width(), &font_stack, &cfg, scale);
+                    tb.origin = Point {
+                        x: 0.0,
+                        y: para_y_offset,
+                    };
+                    para_y_offset += tb.size.height;
+                    layout_blocks.push(LayoutBlock::Table(tb));
+                    continue;
+                }
+            };
+            let doc_idx = paragraph_flat_idx as usize;
+            paragraph_flat_idx += 1;
+            {
+                let comp = composition.filter(|c| {
+                    c.at.para as usize == doc_idx
+                        && !c.text.is_empty()
+                        && (c.at.offset as usize) <= para.text.len()
+                        && para.text.is_char_boundary(c.at.offset as usize)
+                });
+                if para.text.is_empty() && comp.is_none() {
+                    para_y_offset += cfg.line_height * scale;
+                    continue;
+                }
+                let mut para_box = if let Some(c) = comp {
+                    /* Composition paragraph: splice the composed text in and lay
+                    it out fresh — never cached, since the text differs from the
+                    committed `para.text`. */
+                    let off = c.at.offset as usize;
+                    let mut text = String::with_capacity(para.text.len() + c.text.len());
+                    text.push_str(&para.text[..off]);
+                    text.push_str(&c.text);
+                    text.push_str(&para.text[off..]);
+                    let spans = composition_layout_spans(
+                        para,
+                        off as u32,
+                        c.text.len() as u32,
+                        cfg.px_size,
+                        scale,
+                    );
                     let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&para.props, scale);
-                    let para_cfg = ParagraphConfig {
-                        text: &para.text,
+                    layout_paragraph(ParagraphConfig {
+                        text: &text,
                         fonts: &font_stack,
                         spans: &spans,
-                        /* Per-paragraph base direction from its first strong
-                        character; the document direction is the fallback
-                        (Backlog #6). */
-                        base_direction: first_strong_direction(&para.text)
-                            .unwrap_or(cfg.base_direction),
+                        base_direction: first_strong_direction(&text).unwrap_or(cfg.base_direction),
                         max_width: page.content_width(),
                         line_height: cfg.line_height * scale,
-                        /* A paragraph's own alignment overrides the document
-                        default (Backlog #9). */
                         alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
-                        /* Phase 2 — <w:ind>. Zero by default; non-zero shrinks
-                        content width + offsets the first line. */
                         indent_start_px: ind_s,
                         indent_end_px: ind_e,
                         first_line_indent_px: ind_fl,
                         hanging_indent_px: ind_h,
-                        /* Phase 4 — list marker. `None` for non-list paragraphs;
-                        for list paragraphs, the numbering resolver populated
-                        `resolved_marker` at load time. */
                         marker_text: para.resolved_marker.clone(),
                         px_size_for_marker: cfg.px_size * scale,
-                    };
-                    let laid = layout_paragraph(para_cfg);
-                    cache.put(key, laid.clone());
-                    laid
-                }
-            };
-            /* Cached and fresh boxes carry identical local line geometry —
-            only the global Y shift differs (the vertical-shift step). */
-            /* Phase 2 — <w:spacing w:before|after> adds vertical padding
-            around the paragraph. Before-spacing shifts this paragraph's
-            origin down; after-spacing pushes the *next* paragraph further
-            down. Twips → layout px through `twips_to_layout_px`. */
-            let before_px = twips_to_layout_px(para.props.spacing.before_twips, scale);
-            let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
-            para_y_offset += before_px;
-            para_box.origin = Point {
-                x: 0.0,
-                y: para_y_offset,
-            };
-            para_y_offset += para_box.size.height + after_px;
-            paragraphs.push(para_box);
-            box_doc_index.push(doc_idx as u32);
+                    })
+                } else {
+                    /* Backlog #13 — incremental relayout: reuse the cached box
+                    when this paragraph's content + config hash is unchanged,
+                    skipping BiDi and shaping. An edit changes only the edited
+                    paragraph's hash, so every other paragraph is a cheap clone. */
+                    let key = paragraph_layout_key(para, &cfg, scale);
+                    if let Some(cached) = cache.get(&key) {
+                        cached.clone()
+                    } else {
+                        let spans = build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale);
+                        let (ind_s, ind_e, ind_fl, ind_h) =
+                            props_to_layout_indents(&para.props, scale);
+                        let para_cfg = ParagraphConfig {
+                            text: &para.text,
+                            fonts: &font_stack,
+                            spans: &spans,
+                            /* Per-paragraph base direction from its first strong
+                            character; the document direction is the fallback
+                            (Backlog #6). */
+                            base_direction: first_strong_direction(&para.text)
+                                .unwrap_or(cfg.base_direction),
+                            max_width: page.content_width(),
+                            line_height: cfg.line_height * scale,
+                            /* A paragraph's own alignment overrides the document
+                            default (Backlog #9). */
+                            alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+                            /* Phase 2 — <w:ind>. Zero by default; non-zero shrinks
+                            content width + offsets the first line. */
+                            indent_start_px: ind_s,
+                            indent_end_px: ind_e,
+                            first_line_indent_px: ind_fl,
+                            hanging_indent_px: ind_h,
+                            /* Phase 4 — list marker. `None` for non-list paragraphs;
+                            for list paragraphs, the numbering resolver populated
+                            `resolved_marker` at load time. */
+                            marker_text: para.resolved_marker.clone(),
+                            px_size_for_marker: cfg.px_size * scale,
+                        };
+                        let laid = layout_paragraph(para_cfg);
+                        cache.put(key, laid.clone());
+                        laid
+                    }
+                };
+                /* Cached and fresh boxes carry identical local line geometry —
+                only the global Y shift differs (the vertical-shift step). */
+                /* Phase 2 — <w:spacing w:before|after> adds vertical padding
+                around the paragraph. Before-spacing shifts this paragraph's
+                origin down; after-spacing pushes the *next* paragraph further
+                down. Twips → layout px through `twips_to_layout_px`. */
+                let before_px = twips_to_layout_px(para.props.spacing.before_twips, scale);
+                let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
+                para_y_offset += before_px;
+                para_box.origin = Point {
+                    x: 0.0,
+                    y: para_y_offset,
+                };
+                para_y_offset += para_box.size.height + after_px;
+                layout_blocks.push(LayoutBlock::Paragraph(para_box));
+                box_doc_index.push(doc_idx as u32);
+            }
         }
         drop(cache);
 
@@ -1525,7 +1720,7 @@ impl Engine {
                 height: page.height,
             },
             margins: page.margin,
-            paragraphs,
+            blocks: layout_blocks,
         };
         Ok((page_box, font_stack, box_doc_index))
     }
@@ -1535,13 +1730,15 @@ impl Engine {
         let (page_box, _font_stack, _box_doc_index) = self.build_page(self.scale(), true)?;
 
         let line_count: u32 = page_box
-            .paragraphs
+            .blocks
             .iter()
+            .filter_map(LayoutBlock::as_paragraph)
             .map(|p| p.lines.len() as u32)
             .sum();
         let glyph_count: u32 = page_box
-            .paragraphs
+            .blocks
             .iter()
+            .filter_map(LayoutBlock::as_paragraph)
             .flat_map(|p| &p.lines)
             .flat_map(|l| &l.runs)
             .map(|r| r.glyphs.len() as u32)
@@ -1672,7 +1869,14 @@ impl Engine {
         let content_x = page.margins.left;
         let content_y = page.margins.top;
         let mut geom: Vec<LineGeom> = Vec::new();
-        for (k, para_box) in page.paragraphs.iter().enumerate() {
+        /* Phase 5 PR 2 — `page.blocks` may carry tables; geometry only
+        addresses paragraphs (caret + selection are paragraph-flat). */
+        for (k, para_box) in page
+            .blocks
+            .iter()
+            .filter_map(LayoutBlock::as_paragraph)
+            .enumerate()
+        {
             let doc_idx = box_doc_index.get(k).copied().unwrap_or(0);
             let para_x = content_x + para_box.origin.x;
             let para_y = content_y + para_box.origin.y;

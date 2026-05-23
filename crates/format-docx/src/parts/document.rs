@@ -12,6 +12,7 @@
 //!   optimisation; zero document.xml drift on untouched paragraphs).
 
 use crate::error::DocxError;
+use crate::parts::table::parse_table_bytes;
 use crate::schema::ct_ppr::apply_ppr;
 use crate::schema::ct_rpr::{apply_rpr, attr_val};
 use crate::style_resolver::StyleResolver;
@@ -197,10 +198,18 @@ pub fn parse_document_xml(
                                 .take()
                                 .filter(|&s| s < tbl_end_byte && tbl_end_byte <= xml.len())
                                 .map(|s| xml[s..tbl_end_byte].to_vec());
+                            /* Phase 5 PR 2 — full row/cell parse via
+                            `parts::table::parse_table_bytes`. Source bytes
+                            still ride the passthrough so the writer is
+                            byte-stable for unedited tables. */
+                            let (grid, props, rows) = source_xml
+                                .as_deref()
+                                .map(|b| parse_table_bytes(b).unwrap_or_default())
+                                .unwrap_or_default();
                             out_blocks.push(Block::Table(Table {
-                                grid: Vec::new(),
-                                props: Default::default(),
-                                rows: Vec::new(),
+                                grid,
+                                props,
+                                rows,
                                 dirty: false,
                                 source_xml,
                             }));

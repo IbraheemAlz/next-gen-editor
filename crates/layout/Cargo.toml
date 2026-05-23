@@ -7,4 +7,5 @@ rust-version.workspace = true
 description = "Paragraph + table + page box layout engine."
 
 [dependencies]
+engine = { path = "../engine" }
 text-pipeline = { path = "../text-pipeline" }

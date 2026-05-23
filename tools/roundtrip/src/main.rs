@@ -523,12 +523,79 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 generator: "handcrafted".into(),
                 phase_introduced: 5,
                 /* Two surrounding paragraphs; the table sits between them.
-                Phase 5 PR 1 parses the table as a single opaque
-                `Block::Table` (no row content yet) so the manifest's
-                paragraph-flat view counts only the bookend paragraphs. */
+                Phase 5 PR 2 now fully parses rows + cells; the source
+                bytes still ride the passthrough writer so drift = 0. */
                 asserts: FixtureAsserts {
                     paragraph_count: 2,
                     paragraph_texts: vec!["before".into(), "after".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        /* Phase 5 PR 2 — full row/cell/tcPr feature coverage. Every
+        fixture round-trips via Phase 3 passthrough (drift = 0): the
+        captured `<w:tbl>` source bytes are emitted verbatim. */
+        PrebuiltFixture {
+            name: "table_grid_span.docx",
+            bytes: build_table_grid_span_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 5,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["intro".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        PrebuiltFixture {
+            name: "table_vmerge.docx",
+            bytes: build_table_vmerge_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 5,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["intro".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        PrebuiltFixture {
+            name: "table_borders_double.docx",
+            bytes: build_table_borders_double_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 5,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["intro".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        PrebuiltFixture {
+            name: "table_shaded_header.docx",
+            bytes: build_table_shaded_header_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 5,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["intro".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        PrebuiltFixture {
+            name: "table_in_rtl_doc.docx",
+            bytes: build_table_in_rtl_doc_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 5,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["مقدمة".into()],
                 },
                 roundtrip: RoundtripBounds::default(),
             },
@@ -696,6 +763,76 @@ fn build_table_2x2_opaque_docx() -> Vec<u8> {
         zip.finish().unwrap();
     }
     buf
+}
+
+/// Build a minimal Phase 5 PR 2 table fixture. `inner_tbl_xml` is the
+/// `<w:tbl>` element (without any wrapping) plus optional surrounding
+/// content. `body_intro_text` is the leading paragraph; the whole body
+/// becomes `<w:p>intro</w:p>` + inner_tbl_xml + `<w:sectPr/>`. Drift
+/// bound = 0 — every fixture rides the passthrough.
+fn build_table_fixture(body_intro_text: &str, inner_tbl_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">{body_intro_text}</w:t></w:r></w:p>{inner_tbl_xml}<w:sectPr/></w:body></w:document>"#,
+    );
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+    let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>"#;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, body) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", dot_rels),
+            ("word/_rels/document.xml.rels", doc_rels),
+            ("word/document.xml", document_xml.as_str()),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+fn build_table_grid_span_docx() -> Vec<u8> {
+    let tbl = r#"<w:tbl><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:gridSpan w:val="3"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">spans all 3</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">b</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">c</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+    build_table_fixture("intro", tbl)
+}
+
+fn build_table_vmerge_docx() -> Vec<u8> {
+    let tbl = r#"<w:tbl><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">spans down</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">r1c2</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">r2c2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+    build_table_fixture("intro", tbl)
+}
+
+fn build_table_borders_double_docx() -> Vec<u8> {
+    let tbl = r#"<w:tbl><w:tblPr><w:tblBorders><w:top w:val="double" w:sz="8" w:color="000000"/><w:left w:val="double" w:sz="8" w:color="000000"/><w:bottom w:val="double" w:sz="8" w:color="000000"/><w:right w:val="double" w:sz="8" w:color="000000"/></w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcBorders><w:top w:val="double" w:sz="8" w:color="000000"/><w:bottom w:val="double" w:sz="8" w:color="000000"/></w:tcBorders></w:tcPr><w:p><w:r><w:t xml:space="preserve">bordered cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+    build_table_fixture("intro", tbl)
+}
+
+fn build_table_shaded_header_docx() -> Vec<u8> {
+    let tbl = r#"<w:tbl><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="FFEB78"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">Header A</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="FFEB78"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">Header B</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">a1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">b1</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+    build_table_fixture("intro", tbl)
+}
+
+fn build_table_in_rtl_doc_docx() -> Vec<u8> {
+    let tbl = r#"<w:tbl><w:tblPr><w:bidiVisual/></w:tblPr><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t xml:space="preserve">يمين</w:t></w:r></w:p></w:tc><w:tc><w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t xml:space="preserve">يسار</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+    build_table_fixture("مقدمة", tbl)
 }
 
 /* ============================================================= helpers ==== */
