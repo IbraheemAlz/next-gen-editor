@@ -30,6 +30,7 @@ pub const NUMBERING_XML: &str = "word/numbering.xml";
 pub const RELS_XML: &str = "word/_rels/document.xml.rels";
 pub const FOOTNOTES_XML: &str = "word/footnotes.xml";
 pub const COMMENTS_XML: &str = "word/comments.xml";
+pub const SETTINGS_XML: &str = "word/settings.xml";
 
 /// All raw archive entries except `word/document.xml`. Carried through the
 /// round-trip so the writer can re-emit them verbatim.
@@ -134,20 +135,41 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
             .find(|(n, _)| n == &entry)
             .map(|(_, b)| b.as_slice())
     };
+    /* Phase 2 audit — sections now carry a per-role
+    `HeaderFooterRefs` instead of a single `Option<String>`; resolve
+    every populated slot so the `default` / `first` / `even` parts
+    all land in the headers/footers maps. The map is keyed by `r:id`
+    so a single header part shared across roles only parses once. */
     for section in &document.sections {
-        if let Some(rid) = section.header_ref.as_deref()
-            && !headers.contains_key(rid)
-            && let Some(bytes) = fetch_part(rid)
-            && let Ok(part) = parse_header_xml(bytes)
+        for rid in [
+            section.header_refs.default.as_deref(),
+            section.header_refs.first.as_deref(),
+            section.header_refs.even.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            headers.insert(rid.to_string(), part.paragraphs);
+            if !headers.contains_key(rid)
+                && let Some(bytes) = fetch_part(rid)
+                && let Ok(part) = parse_header_xml(bytes)
+            {
+                headers.insert(rid.to_string(), part.paragraphs);
+            }
         }
-        if let Some(rid) = section.footer_ref.as_deref()
-            && !footers.contains_key(rid)
-            && let Some(bytes) = fetch_part(rid)
-            && let Ok(part) = parse_footer_xml(bytes)
+        for rid in [
+            section.footer_refs.default.as_deref(),
+            section.footer_refs.first.as_deref(),
+            section.footer_refs.even.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            footers.insert(rid.to_string(), part.paragraphs);
+            if !footers.contains_key(rid)
+                && let Some(bytes) = fetch_part(rid)
+                && let Ok(part) = parse_footer_xml(bytes)
+            {
+                footers.insert(rid.to_string(), part.paragraphs);
+            }
         }
     }
     document = document.with_header_footer_parts(headers, footers);
@@ -215,6 +237,18 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         && let Ok(defs) = parse_comments_xml(bytes)
     {
         document.comment_defs = defs.comments;
+    }
+
+    /* Phase 2 audit — `word/settings.xml` rides `other_entries`
+    verbatim for round-trip; the typed read just lifts the
+    `even_and_odd_headers` toggle the paginator needs. */
+    if let Some(bytes) = other_entries
+        .iter()
+        .find(|(n, _)| n == SETTINGS_XML)
+        .map(|(_, b)| b.as_slice())
+        && let Ok(settings) = crate::parts::settings::parse_settings_xml(bytes)
+    {
+        document.settings.even_and_odd_headers = settings.even_and_odd_headers;
     }
 
     Ok(DocxArchive {

@@ -27,6 +27,43 @@ use crate::boxes::{
 use crate::page::Margins;
 use std::collections::HashMap;
 
+/// Per-role header / footer bands the paginator picks from for each
+/// page (Phase 2 audit — C.1 / C.2 / C.3). `default` always covers
+/// every page where no more-specific variant applies. `first` is used
+/// for the first page of the section when [`Paginator::title_pg`] is
+/// `true`; `even` is used for even-numbered pages when
+/// [`Paginator::even_and_odd_headers`] is `true`. Missing variants
+/// fall back through `default` per OOXML §17.10.3, then to "no band"
+/// when even `default` is unset.
+#[derive(Debug, Clone, Default)]
+pub struct HeaderBands {
+    pub default: Option<HeaderFooterBox>,
+    pub first: Option<HeaderFooterBox>,
+    pub even: Option<HeaderFooterBox>,
+}
+
+/// Which header/footer slot the paginator should attach to a given page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderRole {
+    Default,
+    First,
+    Even,
+}
+
+impl HeaderBands {
+    /// Resolve `role` against the available slots. Falls back to
+    /// `Default` when the requested slot is unset; returns `None`
+    /// when even `Default` is missing.
+    pub fn resolve(&self, role: HeaderRole) -> Option<&HeaderFooterBox> {
+        let primary = match role {
+            HeaderRole::Default => self.default.as_ref(),
+            HeaderRole::First => self.first.as_ref(),
+            HeaderRole::Even => self.even.as_ref(),
+        };
+        primary.or(self.default.as_ref())
+    }
+}
+
 /// Phase 8a — vertical gap above the footnote separator rule, in layout
 /// pt at scale=1. The renderer multiplies by `scale` if it needs device
 /// pixels.
@@ -57,10 +94,17 @@ impl PageGeometry {
 /// [`Paginator::finish`].
 pub struct Paginator {
     geometry: PageGeometry,
-    /// Optional header / footer to attach to every page emitted with this
-    /// geometry. Cloned onto each `PageBox`.
-    header: Option<HeaderFooterBox>,
-    footer: Option<HeaderFooterBox>,
+    /// Per-role header bands the paginator picks from for each page.
+    headers: HeaderBands,
+    footers: HeaderBands,
+    /// `<w:titlePg/>` — first page of current section uses `First` slot.
+    title_pg: bool,
+    /// `<w:evenAndOddHeaders/>` — even-numbered pages use `Even` slot.
+    even_and_odd_headers: bool,
+    /// Set on `new` and after every `start_new_section`; cleared after
+    /// the next page flushes. Drives the `First` slot selection when
+    /// `title_pg` is on.
+    section_first_page_pending: bool,
     /// Accumulating page state.
     cur_blocks: Vec<LayoutBlock>,
     /// Cursor inside the current page's content area, in content-relative
@@ -84,19 +128,70 @@ pub struct Paginator {
 impl Paginator {
     pub fn new(
         geometry: PageGeometry,
-        header: Option<HeaderFooterBox>,
-        footer: Option<HeaderFooterBox>,
+        headers: HeaderBands,
+        footers: HeaderBands,
+        title_pg: bool,
+        even_and_odd_headers: bool,
     ) -> Self {
         Self {
             geometry,
-            header,
-            footer,
+            headers,
+            footers,
+            title_pg,
+            even_and_odd_headers,
+            section_first_page_pending: true,
             cur_blocks: Vec::new(),
             cur_y: 0.0,
             pages: Vec::new(),
             footnote_bodies: HashMap::new(),
             cur_footnote_ids: Vec::new(),
             cur_footnote_height: 0.0,
+        }
+    }
+
+    /// Single-slot convenience constructor — wraps the legacy
+    /// `Option<HeaderFooterBox>` pair in default-only bands. Useful for
+    /// callers that haven't yet plumbed the per-role section model.
+    pub fn with_default_bands(
+        geometry: PageGeometry,
+        header: Option<HeaderFooterBox>,
+        footer: Option<HeaderFooterBox>,
+    ) -> Self {
+        Self::new(
+            geometry,
+            HeaderBands {
+                default: header,
+                ..Default::default()
+            },
+            HeaderBands {
+                default: footer,
+                ..Default::default()
+            },
+            false,
+            false,
+        )
+    }
+
+    /// Pick which header/footer role applies to the page that is about
+    /// to flush. Precedence (highest first):
+    /// 1. Section first page AND `title_pg` → `First`.
+    /// 2. `even_and_odd_headers` AND 1-based page number is even →
+    ///    `Even`.
+    /// 3. Otherwise → `Default`.
+    ///
+    /// The paginator counts pages document-wide (`self.pages.len() + 1`
+    /// is the in-progress page number), matching Word's behaviour: a
+    /// `<w:type="even"/>` header lines up with absolute page parity, not
+    /// section-relative parity. The `First` check is section-scoped via
+    /// `section_first_page_pending`.
+    fn page_role(&self) -> HeaderRole {
+        let page_no = self.pages.len() + 1;
+        if self.section_first_page_pending && self.title_pg {
+            HeaderRole::First
+        } else if self.even_and_odd_headers && page_no % 2 == 0 {
+            HeaderRole::Even
+        } else {
+            HeaderRole::Default
         }
     }
 
@@ -134,13 +229,26 @@ impl Paginator {
     pub fn start_new_section(
         &mut self,
         new_geom: PageGeometry,
-        new_header: Option<HeaderFooterBox>,
-        new_footer: Option<HeaderFooterBox>,
+        new_headers: HeaderBands,
+        new_footers: HeaderBands,
+        title_pg: bool,
     ) {
         self.flush_page();
         self.geometry = new_geom;
-        self.header = new_header;
-        self.footer = new_footer;
+        self.headers = new_headers;
+        self.footers = new_footers;
+        self.title_pg = title_pg;
+        /* New section ⇒ next page emitted is its first page; reset
+        the flag so `page_role` picks `First` (if `title_pg`) before
+        the next flush clears it. */
+        self.section_first_page_pending = true;
+    }
+
+    /// Update the document-wide `even_and_odd_headers` toggle mid-flow.
+    /// Lives outside `start_new_section` because the setting is a
+    /// `word/settings.xml` flag, not a per-section property.
+    pub fn set_even_and_odd_headers(&mut self, on: bool) {
+        self.even_and_odd_headers = on;
     }
 
     /// Close the in-progress page (without changing geometry) — used when a
@@ -395,6 +503,14 @@ impl Paginator {
         self.cur_footnote_ids.clear();
         self.cur_footnote_height = 0.0;
 
+        /* Pick the role *before* pushing the page — `page_role` reads
+        `pages.len()` to derive the 1-based page number, and the
+        increment happens at `push`. Clone the resolved band slot;
+        every other slot stays on the paginator for the next page. */
+        let role = self.page_role();
+        let header = self.headers.resolve(role).cloned();
+        let footer = self.footers.resolve(role).cloned();
+
         /* Even an empty page is emitted on an explicit `force_page_break`
         / `start_new_section` — the renderer paints the blank sheet so a
         section break is visible. */
@@ -405,10 +521,15 @@ impl Paginator {
             },
             margins: self.geometry.margins,
             blocks,
-            header: self.header.clone(),
-            footer: self.footer.clone(),
+            header,
+            footer,
             footnotes,
         });
+
+        /* Clear the section-first-page flag once a page has flushed for
+        the section. Subsequent pages in the same section pick
+        `Default` or `Even`. */
+        self.section_first_page_pending = false;
     }
 
     /// Finalize — drain the in-progress page and return every page emitted.
@@ -611,7 +732,7 @@ mod tests {
         1280 pt — must split into at least 2 pages even though the
         paragraph is the very first block on the page. */
         let geom = a4_geometry();
-        let mut pag = Paginator::new(geom, None, None);
+        let mut pag = Paginator::with_default_bands(geom, None, None);
         let para = fake_paragraph(80, 16.0);
         pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
         let pages = pag.finish();
@@ -635,7 +756,7 @@ mod tests {
     #[test]
     fn paginator_keeps_short_paragraph_on_one_page() {
         let geom = a4_geometry();
-        let mut pag = Paginator::new(geom, None, None);
+        let mut pag = Paginator::with_default_bands(geom, None, None);
         let para = fake_paragraph(3, 16.0);
         pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
         let pages = pag.finish();
@@ -648,7 +769,7 @@ mod tests {
         infinite-loop; the page-emptiness guard accepts the overflow
         atomically. */
         let geom = a4_geometry();
-        let mut pag = Paginator::new(geom, None, None);
+        let mut pag = Paginator::with_default_bands(geom, None, None);
         let para = fake_paragraph(1, 9999.0);
         pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
         let pages = pag.finish();
@@ -657,4 +778,147 @@ mod tests {
 
     /* `Margins` import isn't otherwise read in this test module. */
     const _M: Margins = Margins::uniform(0.0);
+
+    /// Build a one-line `HeaderFooterBox` carrying `tag` as the only
+    /// run's source range — lets a test fingerprint which band landed
+    /// on a page by reading back `tag` from the emitted `PageBox`.
+    fn fake_band(tag: u32) -> HeaderFooterBox {
+        HeaderFooterBox {
+            paragraphs: vec![ParagraphBox {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 16.0,
+                },
+                lines: Vec::new(),
+                direction: ShapingDirection::Ltr,
+                marker: None,
+                source_paragraph_id: tag,
+            }],
+        }
+    }
+
+    /// Extract the `source_paragraph_id` of a page's header `ParagraphBox`,
+    /// or `u32::MAX` when no header was attached. Lets the per-role
+    /// selection tests assert which band the paginator picked.
+    fn header_tag(p: &PageBox) -> u32 {
+        p.header
+            .as_ref()
+            .and_then(|h| h.paragraphs.first())
+            .map_or(u32::MAX, |para| para.source_paragraph_id)
+    }
+
+    #[test]
+    fn title_pg_routes_first_page_to_first_header() {
+        /* Section with all three header slots populated + `title_pg`
+        on. The first page must read the `First` band; every page
+        after that falls back to `Default` (no even/odd parity). */
+        let geom = a4_geometry();
+        let headers = HeaderBands {
+            default: Some(fake_band(1)),
+            first: Some(fake_band(2)),
+            even: Some(fake_band(3)),
+        };
+        let mut pag = Paginator::new(geom, headers, HeaderBands::default(), true, false);
+        for _ in 0..3 {
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+            pag.force_page_break();
+        }
+        let pages = pag.finish();
+        assert!(pages.len() >= 3, "expected ≥3 pages, got {}", pages.len());
+        assert_eq!(header_tag(&pages[0]), 2, "page 1 must use First header");
+        assert_eq!(header_tag(&pages[1]), 1, "page 2 must use Default header");
+        assert_eq!(header_tag(&pages[2]), 1, "page 3 must use Default header");
+    }
+
+    #[test]
+    fn even_and_odd_routes_even_pages_to_even_header() {
+        /* `even_and_odd_headers` on, `title_pg` off. Page 1 → Default,
+        page 2 → Even, page 3 → Default, page 4 → Even. */
+        let geom = a4_geometry();
+        let headers = HeaderBands {
+            default: Some(fake_band(10)),
+            first: None,
+            even: Some(fake_band(20)),
+        };
+        let mut pag = Paginator::new(geom, headers, HeaderBands::default(), false, true);
+        for _ in 0..4 {
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+            pag.force_page_break();
+        }
+        let pages = pag.finish();
+        assert!(pages.len() >= 4);
+        assert_eq!(header_tag(&pages[0]), 10);
+        assert_eq!(header_tag(&pages[1]), 20);
+        assert_eq!(header_tag(&pages[2]), 10);
+        assert_eq!(header_tag(&pages[3]), 20);
+    }
+
+    #[test]
+    fn missing_first_falls_back_to_default() {
+        /* `title_pg` requests `First`, but only `Default` is set —
+        OOXML §17.10.3 fallback: every page reads Default. */
+        let geom = a4_geometry();
+        let headers = HeaderBands {
+            default: Some(fake_band(7)),
+            first: None,
+            even: None,
+        };
+        let mut pag = Paginator::new(geom, headers, HeaderBands::default(), true, false);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.force_page_break();
+        let pages = pag.finish();
+        assert_eq!(
+            header_tag(&pages[0]),
+            7,
+            "missing First slot must fall back to Default"
+        );
+    }
+
+    #[test]
+    fn missing_default_leaves_blank_band() {
+        /* No header slots populated. Every page has `header: None`. */
+        let geom = a4_geometry();
+        let mut pag = Paginator::new(
+            geom,
+            HeaderBands::default(),
+            HeaderBands::default(),
+            true,
+            true,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.force_page_break();
+        let pages = pag.finish();
+        assert_eq!(
+            header_tag(&pages[0]),
+            u32::MAX,
+            "absent default + absent variant must produce no band"
+        );
+    }
+
+    #[test]
+    fn even_only_archive_falls_back_when_default_missing() {
+        /* Document supplies only an `Even` header but no `Default`.
+        OOXML resolves any unset variant via Default → None; for an
+        Even-only doc that means every page renders with no band
+        because the Default fallback walks to nothing. */
+        let geom = a4_geometry();
+        let headers = HeaderBands {
+            default: None,
+            first: None,
+            even: Some(fake_band(99)),
+        };
+        let mut pag = Paginator::new(geom, headers, HeaderBands::default(), false, true);
+        for _ in 0..2 {
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+            pag.force_page_break();
+        }
+        let pages = pag.finish();
+        /* Page 2 picks `Even` directly (variant populated). Page 1 asks
+        for `Default` → falls back to Even? No — fallback is variant
+        → Default, NOT the other way around. Default → None means
+        page 1 carries no band. */
+        assert_eq!(header_tag(&pages[0]), u32::MAX);
+        assert_eq!(header_tag(&pages[1]), 99);
+    }
 }

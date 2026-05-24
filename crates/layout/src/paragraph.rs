@@ -259,7 +259,7 @@ fn build_marker(
                 px_size: cfg.px_size_for_marker,
                 color: [0, 0, 0, 255],
                 bg_color: None,
-                underline: false,
+                underline: engine::UnderlineStyle::None,
                 strike: false,
                 faux_bold: false,
                 faux_italic: false,

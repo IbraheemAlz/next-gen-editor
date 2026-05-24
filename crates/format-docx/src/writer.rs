@@ -8,7 +8,7 @@ use crate::opc::archive::{DOC_XML, DocxArchive};
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, FontFamily,
     InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, Revision, RevisionKind,
-    RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection, VMergeRole,
+    RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection, UnderlineStyle, VMergeRole,
 };
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -127,8 +127,19 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
         out.push_str(&format!("<w:sz w:val=\"{half_pts}\"/>"));
         out.push_str(&format!("<w:szCs w:val=\"{half_pts}\"/>"));
     }
-    if style.underline == Some(true) {
-        out.push_str("<w:u w:val=\"single\"/>");
+    /* `<w:u w:val="…"/>` — emit only when the variant is visible. The
+    explicit `none` round-trips when the engine carries it (overrides an
+    inherited underline); a sticky `Some(None)` is rare but legal. */
+    if let Some(u) = style.underline {
+        let v = match u {
+            UnderlineStyle::None => "none",
+            UnderlineStyle::Single => "single",
+            UnderlineStyle::Double => "double",
+            UnderlineStyle::Dotted => "dotted",
+            UnderlineStyle::Dashed => "dash",
+            UnderlineStyle::Wavy => "wave",
+        };
+        out.push_str(&format!("<w:u w:val=\"{v}\"/>"));
     }
     if let Some([r, g, b, _]) = style.bg_color {
         out.push_str(&format!(
@@ -911,7 +922,7 @@ mod tests {
             ..Default::default()
         };
         let ul = SpanStyle {
-            underline: Some(true),
+            underline: Some(UnderlineStyle::Single),
             ..Default::default()
         };
         let para = Paragraph {
@@ -1159,6 +1170,162 @@ mod tests {
         assert_eq!(p.revisions[0].id, Some(42));
         assert_eq!(p.revisions[0].kind, RevisionKind::Insert);
         assert_eq!(p.revisions[0].author, "A");
+    }
+
+    #[test]
+    fn section_captures_header_footer_roles_and_title_pg() {
+        /* `<w:sectPr>` carries three `<w:headerReference>` (default /
+        first / even), one `<w:footerReference>` (default), and
+        `<w:titlePg/>`. The reader must split the headers across the
+        per-role `HeaderFooterRefs` slots and capture `title_pg`. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:body>
+<w:p><w:r><w:t xml:space="preserve">body</w:t></w:r></w:p>
+<w:sectPr>
+<w:headerReference w:type="default" r:id="rIdH1"/>
+<w:headerReference w:type="first" r:id="rIdH2"/>
+<w:headerReference w:type="even" r:id="rIdH3"/>
+<w:footerReference w:type="default" r:id="rIdF1"/>
+<w:titlePg/>
+</w:sectPr>
+</w:body>
+</w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        let sections = &parsed.document.sections;
+        assert_eq!(sections.len(), 1, "expected one section");
+        let s = &sections[0];
+        assert_eq!(s.header_refs.default.as_deref(), Some("rIdH1"));
+        assert_eq!(s.header_refs.first.as_deref(), Some("rIdH2"));
+        assert_eq!(s.header_refs.even.as_deref(), Some("rIdH3"));
+        assert_eq!(s.footer_refs.default.as_deref(), Some("rIdF1"));
+        assert!(s.footer_refs.first.is_none());
+        assert!(s.footer_refs.even.is_none());
+        assert!(s.title_pg, "<w:titlePg/> toggle must capture as on");
+    }
+
+    #[test]
+    fn settings_captures_even_and_odd_headers() {
+        /* `<w:evenAndOddHeaders/>` in settings.xml must lift into
+        `DocumentSettings.even_and_odd_headers`. */
+        let settings_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:evenAndOddHeaders/>
+</w:settings>"#;
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">x</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/document.xml", document_xml),
+                ("word/settings.xml", settings_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        assert!(
+            parsed.document.settings.even_and_odd_headers,
+            "even/odd toggle must lift from settings.xml"
+        );
+    }
+
+    #[test]
+    fn round_trip_underline_variants() {
+        /* Each underline variant must regenerate to its OOXML `w:val`
+        token and parse back to the same enum on the way home.
+        Variants stay fully qualified — a glob import would shadow
+        `Option::None` and break the literal `None` fields below. */
+        use engine::UnderlineStyle;
+        let cases = [
+            (UnderlineStyle::Single, "single"),
+            (UnderlineStyle::Double, "double"),
+            (UnderlineStyle::Dotted, "dotted"),
+            (UnderlineStyle::Dashed, "dash"),
+            (UnderlineStyle::Wavy, "wave"),
+        ];
+        for (variant, token) in cases {
+            let style = SpanStyle {
+                underline: Some(variant),
+                ..Default::default()
+            };
+            let para = Paragraph {
+                text: "u".into(),
+                spans: vec![StyleRun {
+                    start: 0,
+                    end: 1,
+                    style,
+                }],
+                props: ParaProperties::default(),
+                list_item: None,
+                resolved_marker: None,
+                dirty: false,
+                source_xml: None,
+                inline_objects: Vec::new(),
+                hyperlinks: Vec::new(),
+                revisions: Vec::new(),
+            };
+            let doc = DocumentTree::from_rich_paragraphs([para]);
+            let bytes = build_minimal_docx(&doc).expect("build");
+            let saved_doc_xml = {
+                let mut z = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+                let mut f = z.by_name("word/document.xml").unwrap();
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+                s
+            };
+            assert!(
+                saved_doc_xml.contains(&format!("<w:u w:val=\"{token}\"/>")),
+                "{variant:?} must emit `w:val=\"{token}\"`; got {saved_doc_xml}"
+            );
+            let parsed = read_docx(&bytes).expect("read");
+            assert_eq!(
+                parsed
+                    .document
+                    .nth_paragraph(0)
+                    .unwrap()
+                    .style_at(0)
+                    .underline,
+                Some(variant)
+            );
+        }
     }
 
     #[test]

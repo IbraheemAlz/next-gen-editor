@@ -82,6 +82,9 @@ pub struct DocumentTree {
     /// expressed in `LogicalPos` so a comment can span across paragraph
     /// (and table-cell) boundaries.
     pub comment_ranges: Vec<CommentRange>,
+    /// Phase 2 audit — typed `word/settings.xml` flags. Currently only
+    /// `even_and_odd_headers`; grows as more settings get modelled.
+    pub settings: DocumentSettings,
 }
 
 /// Phase 8a — author + date + body for one entry of `word/comments.xml`.
@@ -189,12 +192,65 @@ impl Default for PageGeometry {
     }
 }
 
+/// `<w:headerReference>` / `<w:footerReference>` discriminator — the
+/// `w:type` attribute. `Default` is what every page uses unless a more
+/// specific variant is requested and selected by the paginator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum HeaderFooterRole {
+    #[default]
+    Default,
+    /// `w:type="first"` — only used when `Section.title_pg` is `true`.
+    First,
+    /// `w:type="even"` — only used when
+    /// `DocumentSettings.even_and_odd_headers` is `true` and the page
+    /// number is even.
+    Even,
+}
+
+/// Per-role header / footer references. The reader fills the slots based
+/// on each `<w:headerReference w:type="…" r:id="…"/>` in a section;
+/// missing roles stay `None` and fall back to `Default` at paint time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderFooterRefs {
+    pub default: Option<String>,
+    pub first: Option<String>,
+    pub even: Option<String>,
+}
+
+impl HeaderFooterRefs {
+    pub fn is_empty(&self) -> bool {
+        self.default.is_none() && self.first.is_none() && self.even.is_none()
+    }
+
+    /// Set the slot for `role`; replaces any existing value.
+    pub fn set(&mut self, role: HeaderFooterRole, rid: String) {
+        match role {
+            HeaderFooterRole::Default => self.default = Some(rid),
+            HeaderFooterRole::First => self.first = Some(rid),
+            HeaderFooterRole::Even => self.even = Some(rid),
+        }
+    }
+
+    /// Look up the rId for `role`, falling back to `Default` if the
+    /// requested role is unset (OOXML §17.10.3 — the default header
+    /// stands in for any unset variant). Returns `None` when even the
+    /// default is missing.
+    pub fn resolve(&self, role: HeaderFooterRole) -> Option<&str> {
+        let primary = match role {
+            HeaderFooterRole::Default => self.default.as_deref(),
+            HeaderFooterRole::First => self.first.as_deref(),
+            HeaderFooterRole::Even => self.even.as_deref(),
+        };
+        primary.or(self.default.as_deref())
+    }
+}
+
 /// One OOXML `<w:sectPr>` worth of state. A section spans a contiguous
 /// half-open block range `[start, end)`; the page geometry is applied to
-/// every page the paginator emits while flowing those blocks. `header_ref`
-/// / `footer_ref` carry the relationship ids the reader captured — the
-/// header / footer XML parts live in the archive's `other_entries` for the
-/// passthrough writer.
+/// every page the paginator emits while flowing those blocks. The
+/// reference structs carry the relationship ids the reader captured —
+/// the header / footer XML parts live in the archive's `other_entries`
+/// for the passthrough writer.
 #[derive(Debug, Clone, Default)]
 pub struct Section {
     pub geometry: PageGeometry,
@@ -202,10 +258,23 @@ pub struct Section {
     pub start_block: u32,
     /// One past the last top-level block (exclusive).
     pub end_block: u32,
-    /// `r:id` of the `word/header*.xml` part referenced by `<w:headerReference>`.
-    pub header_ref: Option<String>,
-    /// `r:id` of the `word/footer*.xml` part referenced by `<w:footerReference>`.
-    pub footer_ref: Option<String>,
+    /// `<w:headerReference>` table, keyed by `w:type`.
+    pub header_refs: HeaderFooterRefs,
+    /// `<w:footerReference>` table, keyed by `w:type`.
+    pub footer_refs: HeaderFooterRefs,
+    /// `<w:titlePg/>` — when `true`, the first page of this section uses
+    /// the `First` header / footer slot instead of `Default`.
+    pub title_pg: bool,
+}
+
+/// Document-wide flags pulled from `word/settings.xml`. Phase 2 — only
+/// the header/footer parity toggle is modelled; later phases grow the
+/// struct as more setting elements get typed support.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentSettings {
+    /// `<w:evenAndOddHeaders/>` — when `true`, even-numbered pages render
+    /// the `Even` header / footer instead of the `Default` slot.
+    pub even_and_odd_headers: bool,
 }
 
 /// Address of a `Block` inside a `DocumentTree`. Walks from the root
@@ -310,6 +379,30 @@ pub enum FontFamily {
     NotoNaskhArabic,
 }
 
+/// Underline decoration style — OOXML `<w:u w:val="…"/>` variants the
+/// engine carries through layout + render. `Single` matches the legacy
+/// boolean-true behaviour; `None` matches boolean-false. The renderer
+/// approximates `Dotted` / `Dashed` / `Wavy` with patterned fill rects
+/// (Canvas2D backend has no native dash array on the underline path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
+impl UnderlineStyle {
+    /// `true` when the variant should paint any stroke at all. `None`
+    /// is the only variant that suppresses painting.
+    pub fn is_visible(self) -> bool {
+        !matches!(self, UnderlineStyle::None)
+    }
+}
+
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
@@ -319,7 +412,7 @@ pub struct SpanStyle {
     pub color: Option<[u8; 4]>,
     pub bold: Option<bool>,
     pub italic: Option<bool>,
-    pub underline: Option<bool>,
+    pub underline: Option<UnderlineStyle>,
     pub strike: Option<bool>,
     pub bg_color: Option<[u8; 4]>,
     pub font_family: Option<FontFamily>,
@@ -1051,6 +1144,7 @@ impl DocumentTree {
             footnotes: std::collections::HashMap::new(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            settings: DocumentSettings::default(),
         }
     }
 
@@ -1078,6 +1172,7 @@ impl DocumentTree {
             footnotes: std::collections::HashMap::new(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            settings: DocumentSettings::default(),
         }
     }
 
@@ -1107,6 +1202,7 @@ impl DocumentTree {
             footnotes: std::collections::HashMap::new(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            settings: DocumentSettings::default(),
         }
     }
 
@@ -1126,6 +1222,7 @@ impl DocumentTree {
             footnotes: std::collections::HashMap::new(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            settings: DocumentSettings::default(),
         }
     }
 
@@ -1145,6 +1242,7 @@ impl DocumentTree {
             footnotes: std::collections::HashMap::new(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            settings: DocumentSettings::default(),
         }
     }
 
@@ -1181,6 +1279,7 @@ impl DocumentTree {
             footnotes: std::collections::HashMap::new(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            settings: DocumentSettings::default(),
         }
     }
 
@@ -1208,8 +1307,9 @@ impl DocumentTree {
                 geometry: PageGeometry::a4(),
                 start_block: 0,
                 end_block: self.blocks.len() as u32,
-                header_ref: None,
-                footer_ref: None,
+                header_refs: HeaderFooterRefs::default(),
+                footer_refs: HeaderFooterRefs::default(),
+                title_pg: false,
             }];
         }
         self.sections.clone()
@@ -1354,6 +1454,7 @@ impl DocumentTree {
                 footnotes: self.footnotes.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                settings: self.settings.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -1393,6 +1494,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -1440,6 +1542,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -1464,6 +1567,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -1503,6 +1607,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -1550,6 +1655,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -1576,6 +1682,7 @@ impl DocumentTree {
                 footnotes: self.footnotes.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                settings: self.settings.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -1629,6 +1736,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -1648,6 +1756,7 @@ impl DocumentTree {
                 footnotes: self.footnotes.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                settings: self.settings.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -1665,6 +1774,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -1801,6 +1911,7 @@ impl DocumentTree {
                     footnotes: self.footnotes.clone(),
                     comment_defs: self.comment_defs.clone(),
                     comment_ranges: self.comment_ranges.clone(),
+                    settings: self.settings.clone(),
                 },
                 caret,
             );
@@ -1836,6 +1947,7 @@ impl DocumentTree {
                 footnotes: self.footnotes.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                settings: self.settings.clone(),
             },
             caret,
         )
@@ -1999,6 +2111,7 @@ impl DocumentTree {
                 footnotes: self.footnotes.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
+                settings: self.settings.clone(),
             },
             caret,
         )
@@ -2135,6 +2248,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -2157,6 +2271,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -2362,6 +2477,7 @@ impl DocumentTree {
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
         }
     }
 }
@@ -3226,14 +3342,14 @@ mod tests {
             },
             SpanStyle {
                 italic: Some(true),
-                underline: Some(true),
+                underline: Some(UnderlineStyle::Single),
                 ..Default::default()
             },
         );
         let style = doc.nth_paragraph(0).unwrap().style_at(2);
         assert_eq!(style.bold, Some(true));
         assert_eq!(style.italic, Some(true));
-        assert_eq!(style.underline, Some(true));
+        assert_eq!(style.underline, Some(UnderlineStyle::Single));
         /* Outside the styled range — unstyled. */
         assert_eq!(
             doc.nth_paragraph(0).unwrap().style_at(8),
@@ -3872,6 +3988,7 @@ mod tests {
             footnotes: std::collections::HashMap::new(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
+            settings: DocumentSettings::default(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

@@ -17,8 +17,8 @@ use crate::schema::ct_ppr::apply_ppr;
 use crate::schema::ct_rpr::{apply_rpr, attr_val};
 use crate::style_resolver::StyleResolver;
 use engine::{
-    Block, DocumentTree, ListItem, PageGeometry, ParaProperties, Paragraph, Section, SpanStyle,
-    StyleRun, Table,
+    Block, DocumentTree, HeaderFooterRefs, HeaderFooterRole, ListItem, PageGeometry,
+    ParaProperties, Paragraph, Section, SpanStyle, StyleRun, Table,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -40,8 +40,25 @@ struct SectPrAccum {
     margin_left: Option<f32>,
     header_offset: Option<f32>,
     footer_offset: Option<f32>,
-    header_ref: Option<String>,
-    footer_ref: Option<String>,
+    /// Phase 2 audit — `<w:headerReference>` table keyed by `w:type`.
+    /// Replaces the pre-audit single-slot `header_ref: Option<String>`
+    /// which silently overwrote on `first` / `even` references.
+    header_refs: HeaderFooterRefs,
+    footer_refs: HeaderFooterRefs,
+    /// `<w:titlePg/>` toggle.
+    title_pg: bool,
+}
+
+/// Map an OOXML `<w:headerReference w:type="…"/>` token to the engine's
+/// role enum. Unknown / absent values default to `Default` — matches the
+/// spec's behaviour: a `<w:headerReference>` with no `w:type` covers
+/// every page where no more-specific variant is selected.
+fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
+    match v.map(str::trim) {
+        Some("first") => HeaderFooterRole::First,
+        Some("even") => HeaderFooterRole::Even,
+        _ => HeaderFooterRole::Default,
+    }
 }
 
 impl SectPrAccum {
@@ -79,10 +96,25 @@ impl SectPrAccum {
                 }
             }
             b"w:headerReference" => {
-                self.header_ref = attr_val(e, b"r:id");
+                if let Some(rid) = attr_val(e, b"r:id") {
+                    let role = parse_header_footer_role(attr_val(e, b"w:type").as_deref());
+                    self.header_refs.set(role, rid);
+                }
             }
             b"w:footerReference" => {
-                self.footer_ref = attr_val(e, b"r:id");
+                if let Some(rid) = attr_val(e, b"r:id") {
+                    let role = parse_header_footer_role(attr_val(e, b"w:type").as_deref());
+                    self.footer_refs.set(role, rid);
+                }
+            }
+            b"w:titlePg" => {
+                /* Toggle — bare `<w:titlePg/>` is on, explicit `w:val="0"`
+                or `"false"` off. Mirrors the OOXML toggle convention the
+                rest of the schema uses. */
+                self.title_pg = match attr_val(e, b"w:val").as_deref() {
+                    Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "off"),
+                    None => true,
+                };
             }
             _ => {}
         }
@@ -574,12 +606,16 @@ pub fn parse_document_xml(
                         } else {
                             let end = out_blocks.len() as u32;
                             if end > sect_start_block {
+                                let header_refs = taken.header_refs.clone();
+                                let footer_refs = taken.footer_refs.clone();
+                                let title_pg = taken.title_pg;
                                 out_sections.push(Section {
-                                    geometry: taken.clone().into_geometry(),
+                                    geometry: taken.into_geometry(),
                                     start_block: sect_start_block,
                                     end_block: end,
-                                    header_ref: taken.header_ref,
-                                    footer_ref: taken.footer_ref,
+                                    header_refs,
+                                    footer_refs,
+                                    title_pg,
                                 });
                                 sect_start_block = end;
                             }
@@ -662,14 +698,16 @@ pub fn parse_document_xml(
                         if let Some(sect) = pending_paragraph_sect.take() {
                             let end = out_blocks.len() as u32;
                             if end > sect_start_block {
-                                let header_ref = sect.header_ref.clone();
-                                let footer_ref = sect.footer_ref.clone();
+                                let header_refs = sect.header_refs.clone();
+                                let footer_refs = sect.footer_refs.clone();
+                                let title_pg = sect.title_pg;
                                 out_sections.push(Section {
                                     geometry: sect.into_geometry(),
                                     start_block: sect_start_block,
                                     end_block: end,
-                                    header_ref,
-                                    footer_ref,
+                                    header_refs,
+                                    footer_refs,
+                                    title_pg,
                                 });
                                 sect_start_block = end;
                             }
@@ -698,8 +736,9 @@ pub fn parse_document_xml(
             geometry: PageGeometry::a4(),
             start_block: sect_start_block,
             end_block: total,
-            header_ref: None,
-            footer_ref: None,
+            header_refs: HeaderFooterRefs::default(),
+            footer_refs: HeaderFooterRefs::default(),
+            title_pg: false,
         });
     }
 

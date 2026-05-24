@@ -741,6 +741,31 @@ fn kurbo_to_bridge(r: Rect) -> BridgeRect {
     }
 }
 
+/// Bridge `UnderlineStyle` ↔ engine `UnderlineStyle` — same variant
+/// names; mapper just keeps the two enum types from leaking into each
+/// other's crates.
+fn bridge_to_engine_underline(b: UnderlineStyle) -> engine::UnderlineStyle {
+    match b {
+        UnderlineStyle::None => engine::UnderlineStyle::None,
+        UnderlineStyle::Single => engine::UnderlineStyle::Single,
+        UnderlineStyle::Double => engine::UnderlineStyle::Double,
+        UnderlineStyle::Dotted => engine::UnderlineStyle::Dotted,
+        UnderlineStyle::Dashed => engine::UnderlineStyle::Dashed,
+        UnderlineStyle::Wavy => engine::UnderlineStyle::Wavy,
+    }
+}
+
+fn engine_to_bridge_underline(e: engine::UnderlineStyle) -> UnderlineStyle {
+    match e {
+        engine::UnderlineStyle::None => UnderlineStyle::None,
+        engine::UnderlineStyle::Single => UnderlineStyle::Single,
+        engine::UnderlineStyle::Double => UnderlineStyle::Double,
+        engine::UnderlineStyle::Dotted => UnderlineStyle::Dotted,
+        engine::UnderlineStyle::Dashed => UnderlineStyle::Dashed,
+        engine::UnderlineStyle::Wavy => UnderlineStyle::Wavy,
+    }
+}
+
 /// Build a fully-resolved `TextAttrs` for the `FormattingChanged` reply,
 /// filling unset patch fields with defaults.
 fn resolved_attrs(patch: &TextAttrsPatch, default_size: f32) -> TextAttrs {
@@ -877,7 +902,7 @@ fn apply_revision_overlay(
                 }
                 match r.kind {
                     engine::RevisionKind::Insert => {
-                        sub.underline = true;
+                        sub.underline = engine::UnderlineStyle::Single;
                         if sub.color == default_color {
                             sub.color = REVISION_INSERT_COLOR;
                         }
@@ -931,7 +956,7 @@ fn apply_hyperlink_overlay(
             };
             let linked = hyperlinks.iter().any(|h| h.start <= s && h.end >= e);
             if linked {
-                sub.underline = true;
+                sub.underline = engine::UnderlineStyle::Single;
                 /* Only overlay the hyperlink blue when the underlying run
                 carries the plain default colour — explicit `<w:rPr>`
                 colour wins (matches Word's behaviour where a hand-tinted
@@ -1008,7 +1033,7 @@ fn build_style_spans(
         color: default_color,
         bold: false,
         italic: false,
-        underline: false,
+        underline: engine::UnderlineStyle::None,
         strike: false,
         bg_color: None,
         font_family: None,
@@ -1024,7 +1049,7 @@ fn build_style_spans(
             color: run.style.color.unwrap_or(default_color),
             bold: run.style.bold.unwrap_or(false),
             italic: run.style.italic.unwrap_or(false),
-            underline: run.style.underline.unwrap_or(false),
+            underline: run.style.underline.unwrap_or(engine::UnderlineStyle::None),
             strike: run.style.strike.unwrap_or(false),
             bg_color: run.style.bg_color,
             font_family: run
@@ -1088,7 +1113,7 @@ fn composition_layout_spans(
         color: st.color.unwrap_or([0, 0, 0, 255]),
         bold: st.bold.unwrap_or(false),
         italic: st.italic.unwrap_or(false),
-        underline: true,
+        underline: engine::UnderlineStyle::Single,
         strike: st.strike.unwrap_or(false),
         bg_color: st.bg_color,
         font_family: st.font_family.map(font_family_id).map(str::to_string),
@@ -1225,7 +1250,7 @@ fn build_footnote_bodies(
             color: [0, 0, 0, 255],
             bold: false,
             italic: false,
-            underline: false,
+            underline: engine::UnderlineStyle::None,
             strike: false,
             bg_color: None,
             font_family: None,
@@ -1302,7 +1327,7 @@ fn build_header_footer_box(
             color: [0, 0, 0, 255],
             bold: false,
             italic: false,
-            underline: false,
+            underline: engine::UnderlineStyle::None,
             strike: false,
             bg_color: None,
             font_family: None,
@@ -2503,7 +2528,10 @@ fn push_run(runs: &mut Vec<A11yRun>, text: &str, s: u32, e: u32, style: SpanStyl
             text: text[s as usize..e as usize].to_string(),
             bold: style.bold.unwrap_or(false),
             italic: style.italic.unwrap_or(false),
-            underline: style.underline.unwrap_or(false),
+            underline: style
+                .underline
+                .unwrap_or(engine::UnderlineStyle::None)
+                .is_visible(),
         });
     }
 }
@@ -3053,8 +3081,8 @@ impl Engine {
             color: attrs.color.map(|c| [c.r, c.g, c.b, c.a]),
             bold: attrs.bold,
             italic: attrs.italic,
-            /* Underline is a stored on/off flag in the model. */
-            underline: attrs.underline.map(|u| !matches!(u, UnderlineStyle::None)),
+            /* Bridge → engine underline variant mapping (1:1 by name). */
+            underline: attrs.underline.map(bridge_to_engine_underline),
             strike: attrs.strike,
             bg_color: attrs.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
             font_family: attrs.font_family.as_deref().and_then(parse_font_family),
@@ -3234,27 +3262,36 @@ impl Engine {
             /* Phase 6b — resolve header / footer text the parser stashed
             on `doc.headers` / `doc.footers` (keyed by `r:id`) into laid-
             out paragraphs the renderer paints into the margin bands. */
-            let header_box = section.header_ref.as_deref().and_then(|rid| {
-                build_header_footer_box(
-                    doc.headers.get(rid)?,
-                    geom.width - geom.margins.left - geom.margins.right,
-                    &font_stack,
-                    &cfg,
-                    scale,
-                )
-            });
-            let footer_box = section.footer_ref.as_deref().and_then(|rid| {
-                build_header_footer_box(
-                    doc.footers.get(rid)?,
-                    geom.width - geom.margins.left - geom.margins.right,
-                    &font_stack,
-                    &cfg,
-                    scale,
-                )
-            });
+            /* Phase 2 audit — sections now carry a per-role
+            `HeaderFooterRefs` instead of a single `Option<String>`. Lay
+            out every populated slot into a `layout::HeaderBands` so the
+            paginator can pick by page parity / first-page / default. */
+            let content_w = geom.width - geom.margins.left - geom.margins.right;
+            let lay_band = |slot: Option<&String>,
+                            table: &std::collections::HashMap<String, Vec<String>>|
+             -> Option<layout::HeaderFooterBox> {
+                let rid = slot?;
+                build_header_footer_box(table.get(rid)?, content_w, &font_stack, &cfg, scale)
+            };
+            let headers = layout::HeaderBands {
+                default: lay_band(section.header_refs.default.as_ref(), &doc.headers),
+                first: lay_band(section.header_refs.first.as_ref(), &doc.headers),
+                even: lay_band(section.header_refs.even.as_ref(), &doc.headers),
+            };
+            let footers = layout::HeaderBands {
+                default: lay_band(section.footer_refs.default.as_ref(), &doc.footers),
+                first: lay_band(section.footer_refs.first.as_ref(), &doc.footers),
+                even: lay_band(section.footer_refs.even.as_ref(), &doc.footers),
+            };
             paginator = Some(
-                Paginator::new(geom, header_box, footer_box)
-                    .with_footnote_bodies(footnote_bodies.clone()),
+                Paginator::new(
+                    geom,
+                    headers,
+                    footers,
+                    section.title_pg,
+                    doc.settings.even_and_odd_headers,
+                )
+                .with_footnote_bodies(footnote_bodies.clone()),
             );
             page_paths.clear();
             page_paths.push(Vec::new());
@@ -4247,13 +4284,13 @@ impl Engine {
         sample is recorded. */
         let mut bold_seen: Option<bool> = None;
         let mut italic_seen: Option<bool> = None;
-        let mut underline_seen: Option<bool> = None;
+        let mut underline_seen: Option<engine::UnderlineStyle> = None;
         let mut strike_seen: Option<bool> = None;
         let mut mixed = bridge::AttrsMixed::default();
         let mut record = |s: SpanStyle| {
             let b = s.bold.unwrap_or(false);
             let i = s.italic.unwrap_or(false);
-            let u = s.underline.unwrap_or(false);
+            let u = s.underline.unwrap_or(engine::UnderlineStyle::None);
             let st = s.strike.unwrap_or(false);
             match bold_seen {
                 None => bold_seen = Some(b),
@@ -4500,11 +4537,8 @@ impl Engine {
         }
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let [r, g, b, a] = style.color.unwrap_or([0, 0, 0, 255]);
-        let underline = if style.underline.unwrap_or(false) {
-            UnderlineStyle::Single
-        } else {
-            UnderlineStyle::None
-        };
+        let underline =
+            engine_to_bridge_underline(style.underline.unwrap_or(engine::UnderlineStyle::None));
         TextAttrs {
             bold: style.bold.unwrap_or(false),
             italic: style.italic.unwrap_or(false),
@@ -5354,7 +5388,7 @@ mod tests {
             color: [0, 0, 0, 255],
             faux_bold: false,
             faux_italic: false,
-            underline: false,
+            underline: engine::UnderlineStyle::None,
             strike: false,
             bg_color: None,
         };
@@ -5460,7 +5494,7 @@ mod tests {
                 text: text.to_string(),
                 bold: false,
                 italic: false,
-                underline: false,
+                underline: engine::UnderlineStyle::None,
             }],
         })
     }

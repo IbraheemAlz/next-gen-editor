@@ -164,7 +164,10 @@ fn emit_run(text: &str, s: &SpanStyle, out: &mut String) {
     let flags: [(bool, &str); 4] = [
         (s.bold == Some(true), "b"),
         (s.italic == Some(true), "i"),
-        (s.underline == Some(true), "u"),
+        (
+            s.underline.is_some_and(crate::UnderlineStyle::is_visible),
+            "u",
+        ),
         (s.strike == Some(true), "s"),
     ];
     for (on, tag) in flags {
@@ -523,7 +526,7 @@ fn parse_inline_style(css: &str) -> SpanStyle {
             }
             "text-decoration" | "text-decoration-line" => {
                 if v.contains("underline") {
-                    s.underline = Some(true);
+                    s.underline = Some(crate::UnderlineStyle::Single);
                 }
                 if v.contains("line-through") {
                     s.strike = Some(true);
@@ -547,7 +550,7 @@ fn tag_style(name: &str, body: &str) -> Option<SpanStyle> {
     match name {
         "b" | "strong" => s.bold = Some(true),
         "i" | "em" => s.italic = Some(true),
-        "u" | "ins" => s.underline = Some(true),
+        "u" | "ins" => s.underline = Some(crate::UnderlineStyle::Single),
         "s" | "strike" | "del" => s.strike = Some(true),
         "span" | "font" => {
             if let Some(css) = extract_attr(body, "style") {

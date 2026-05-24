@@ -6,7 +6,7 @@
 //! `styles.xml`'s `<w:style>/<w:rPr>` (Phase 3); kept here so the cascade
 //! resolver can reuse them without depending on `parts::document`.
 
-use engine::{FontFamily, SpanStyle};
+use engine::{FontFamily, SpanStyle, UnderlineStyle};
 use quick_xml::events::BytesStart;
 
 /// Value of attribute `key` on a start/empty tag, unescaped.
@@ -75,8 +75,32 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
         b"w:i" => style.italic = Some(toggle_on(e)),
         b"w:strike" => style.strike = Some(toggle_on(e)),
         b"w:u" => {
-            let on = attr_val(e, b"w:val").is_none_or(|v| !v.eq_ignore_ascii_case("none"));
-            style.underline = Some(on);
+            /* `<w:u/>` (no `w:val`) → single. `<w:u w:val="none"/>` → none,
+            preserved so it can override an inherited underline.
+            Everything else maps to the closest variant the engine
+            represents; unknown values collapse to single. The spec
+            catalogues `single`, `words`, `double`, `thick`, `dotted`,
+            `dottedHeavy`, `dash`, `dashedHeavy`, `dashLong`,
+            `dashLongHeavy`, `dotDash`, `dashDotHeavy`, `dotDotDash`,
+            `dashDotDotHeavy`, `wave`, `wavyHeavy`, `wavyDouble` — most
+            collapse to `Dotted` / `Dashed` / `Wavy` for the renderer. */
+            let variant = match attr_val(e, b"w:val").as_deref().map(str::trim) {
+                None | Some("single") | Some("words") | Some("thick") => UnderlineStyle::Single,
+                Some("double") | Some("wavyDouble") => UnderlineStyle::Double,
+                Some("dotted") | Some("dottedHeavy") => UnderlineStyle::Dotted,
+                Some("dash")
+                | Some("dashedHeavy")
+                | Some("dashLong")
+                | Some("dashLongHeavy")
+                | Some("dotDash")
+                | Some("dashDotHeavy")
+                | Some("dotDotDash")
+                | Some("dashDotDotHeavy") => UnderlineStyle::Dashed,
+                Some("wave") | Some("wavyHeavy") => UnderlineStyle::Wavy,
+                Some(v) if v.eq_ignore_ascii_case("none") => UnderlineStyle::None,
+                Some(_) => UnderlineStyle::Single,
+            };
+            style.underline = Some(variant);
         }
         b"w:color" => style.color = attr_val(e, b"w:val").and_then(|v| parse_hex_color(&v)),
         b"w:highlight" => {

@@ -476,15 +476,21 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                 Y positions are px-size-relative approximations (Backlog #1):
                 the underline sits just below the baseline, the strikethrough
                 is centred ~one quarter em above it (≈ x-height / 2). */
-                if (run.attrs.underline || run.attrs.strike) && run_x1 > run_x0 {
+                let underline_visible = run.attrs.underline.is_visible();
+                if (underline_visible || run.attrs.strike) && run_x1 > run_x0 {
                     let px = run.attrs.px_size as f64;
                     let thickness = (px * 0.06).max(1.0);
-                    if run.attrs.underline {
+                    if underline_visible {
                         let top = baseline + px * 0.10;
-                        cmds.push(DisplayCmd::FillRect {
-                            rect: Rect::new(run_x0, top, run_x1, top + thickness),
-                            paint: Paint::solid(text_color),
-                        });
+                        push_underline_pattern(
+                            cmds,
+                            run.attrs.underline,
+                            run_x0,
+                            run_x1,
+                            top,
+                            thickness,
+                            text_color,
+                        );
                     }
                     if run.attrs.strike {
                         let mid = baseline - px * 0.25;
@@ -499,6 +505,84 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                         });
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Emit the underline rectangles for a single `(x0..x1, top)` span,
+/// patterning the strokes to approximate the OOXML variant. Canvas2D
+/// has no native dash array on our `FillRect` path, so dotted / dashed
+/// / wavy are tiled as small fills.
+///
+/// Pattern math (all multiples of `thickness` so the visual weight
+/// scales with the font px size, matching Word's screen rendering):
+/// - `Single`: one rect across the run.
+/// - `Double`: two parallel rects, separated by `2 * thickness`.
+/// - `Dotted`: square dots `thickness × thickness`, pitch `2 * thickness`.
+/// - `Dashed`: dashes `4 * thickness` wide, pitch `8 * thickness`.
+/// - `Wavy`: two-pixel sawtooth — small rects alternating between two Y
+///   bands `2 * thickness` apart. Cheap visual approximation of the
+///   sinusoidal stroke Word draws; round-trips faithfully because the
+///   variant is preserved on the model side.
+fn push_underline_pattern(
+    cmds: &mut Vec<DisplayCmd>,
+    style: engine::UnderlineStyle,
+    x0: f64,
+    x1: f64,
+    top: f64,
+    thickness: f64,
+    paint_color: peniko::Color,
+) {
+    use engine::UnderlineStyle::*;
+    let solid = |cmds: &mut Vec<DisplayCmd>, lo: f64, hi: f64, t: f64| {
+        if hi > lo {
+            cmds.push(DisplayCmd::FillRect {
+                rect: Rect::new(lo, t, hi, t + thickness),
+                paint: Paint::solid(paint_color),
+            });
+        }
+    };
+    match style {
+        None => {}
+        Single => solid(cmds, x0, x1, top),
+        Double => {
+            solid(cmds, x0, x1, top);
+            solid(cmds, x0, x1, top + thickness * 2.0);
+        }
+        Dotted => {
+            let pitch = (thickness * 2.0).max(2.0);
+            let mut x = x0;
+            while x < x1 {
+                let end = (x + thickness).min(x1);
+                solid(cmds, x, end, top);
+                x += pitch;
+            }
+        }
+        Dashed => {
+            let dash = (thickness * 4.0).max(3.0);
+            let gap = dash;
+            let mut x = x0;
+            while x < x1 {
+                let end = (x + dash).min(x1);
+                solid(cmds, x, end, top);
+                x += dash + gap;
+            }
+        }
+        Wavy => {
+            /* Sawtooth: tile pairs of short rects on alternating rows.
+            Period = `4 * thickness`; each half-period is one short rect. */
+            let half = (thickness * 2.0).max(2.0);
+            let top_band = top - thickness;
+            let bottom_band = top + thickness;
+            let mut x = x0;
+            let mut up = true;
+            while x < x1 {
+                let end = (x + half).min(x1);
+                let band_top = if up { top_band } else { bottom_band };
+                solid(cmds, x, end, band_top);
+                up = !up;
+                x += half;
             }
         }
     }

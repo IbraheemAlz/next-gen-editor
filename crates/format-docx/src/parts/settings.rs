@@ -13,6 +13,23 @@ use quick_xml::reader::Reader;
 pub struct SettingsPart {
     /// `<w:defaultTabStop w:val="N"/>` — twips. `None` when absent.
     pub default_tab_stop_twips: Option<u32>,
+    /// `<w:evenAndOddHeaders/>` — Phase 2 audit. Toggle element; when
+    /// `true`, even pages should render the `Even` header / footer
+    /// slot instead of the `Default`. The paginator consumes this
+    /// alongside each section's per-role header table.
+    pub even_and_odd_headers: bool,
+}
+
+/// Decode an OOXML toggle attribute (`w:val` "false" / "0" / "off"
+/// → off; anything else / absent → on). Mirrors the `toggle_on`
+/// helper in `ct_rpr` so behaviour stays consistent without the
+/// schema module dependency.
+fn toggle_attr(attrs: quick_xml::events::attributes::Attributes<'_>) -> bool {
+    attrs
+        .flatten()
+        .find(|a| a.key.as_ref() == b"w:val")
+        .and_then(|a| a.unescape_value().ok())
+        .is_none_or(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "off"))
 }
 
 pub fn parse_settings_xml(xml: &[u8]) -> Result<SettingsPart, DocxError> {
@@ -30,6 +47,9 @@ pub fn parse_settings_xml(xml: &[u8]) -> Result<SettingsPart, DocxError> {
                     .find(|a| a.key.as_ref() == b"w:val")
                     .and_then(|a| a.unescape_value().ok())
                     .and_then(|v| v.parse().ok());
+            }
+            Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w:evenAndOddHeaders" => {
+                out.even_and_odd_headers = toggle_attr(e.attributes());
             }
             Event::Eof => break,
             _ => {}
