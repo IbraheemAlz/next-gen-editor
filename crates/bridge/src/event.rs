@@ -131,6 +131,13 @@ pub enum Event {
         /// drag covered multiple cells. UI overlays inspect this to
         /// switch between text-span and cell-rect highlights.
         selection_kind: SelectionKind,
+        /// Phase 9b — per-flag "mixed across the selection" bitmap. A flag
+        /// is `true` when the underlying spans in `[range.start, range.end)`
+        /// don't all agree (some bold + some not). The toolbar renders an
+        /// **indeterminate** state for those buttons so a user can't
+        /// mis-read the start position's value as the whole selection's.
+        /// Always `false` on a collapsed caret (nothing to disagree over).
+        attrs_mixed: AttrsMixed,
     },
 
     /* IME */
@@ -189,6 +196,23 @@ pub enum Event {
         #[tsify(type = "Uint8Array")]
         docx_fragment: Vec<u8>,
     },
+}
+
+/// Per-flag "this attribute is mixed across the selection" bitmap that
+/// rides on `Event::SelectionChanged`. The toolbar reads it to switch
+/// each button between OFF / ON / INDETERMINATE — without it, a
+/// selection that crosses a bold/non-bold boundary would mis-render
+/// the start position's bold state as the whole selection's.
+///
+/// Each field is `true` iff the underlying spans in the selection
+/// don't unanimously agree on that flag. A collapsed caret reports all
+/// `false` (there's no range to disagree over).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default)]
+pub struct AttrsMixed {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
 }
 
 /// Font vertical metrics, scaled to a requested pixel size.

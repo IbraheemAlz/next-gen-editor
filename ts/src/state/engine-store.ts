@@ -11,6 +11,7 @@ import type {
     A11yNode,
     A11yTable,
     Alignment,
+    AttrsMixed,
     Direction,
     Event,
     LogicalPos,
@@ -55,6 +56,17 @@ export function createEngineStore(client: EngineClient) {
         rects: [],
     });
     const [attrsAtCaret, setAttrsAtCaret] = createSignal<TextAttrs | null>(null);
+    /* Phase 9b — per-flag "mixed across the selection" bitmap. The
+       toolbar reads it to switch each B/I/U/S button between
+       OFF/ON/INDETERMINATE so a selection straddling a styled boundary
+       doesn't mis-render the start position's value as the whole
+       selection's. Default to all-false on no selection. */
+    const [attrsMixed, setAttrsMixed] = createSignal<AttrsMixed>({
+        bold: false,
+        italic: false,
+        underline: false,
+        strike: false,
+    });
     const [undoState, setUndoState] = createSignal<UndoState>({
         canUndo: false,
         canRedo: false,
@@ -99,6 +111,7 @@ export function createEngineStore(client: EngineClient) {
                 rects: ev.rects.map((r) => toCssRect(r, dpr)),
             });
             setAttrsAtCaret(ev.attrs_at_caret);
+            setAttrsMixed(ev.attrs_mixed);
             setUndoState({ canUndo: ev.can_undo, canRedo: ev.can_redo });
             setParagraphAlignment(ev.paragraph_alignment);
             setBaseDirection(ev.direction);
@@ -143,6 +156,7 @@ export function createEngineStore(client: EngineClient) {
         caretLogical,
         selection,
         attrsAtCaret,
+        attrsMixed,
         undoState,
         paragraphAlignment,
         baseDirection,

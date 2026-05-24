@@ -122,10 +122,20 @@ function downloadBlob(bytes: Uint8Array, mime: string, filename: string): void {
 
 export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
     const attrs = () => props.store.attrsAtCaret();
+    const mixed = () => props.store.attrsMixed();
     const bold = () => attrs()?.bold ?? false;
     const italic = () => attrs()?.italic ?? false;
     const underline = () => (attrs()?.underline ?? 'None') !== 'None';
     const strike = () => attrs()?.strike ?? false;
+    /* Mixed-state helpers — toolbar buttons render INDETERMINATE
+       (CSS class `indeterminate`, aria-pressed="mixed") when the
+       selection straddles a styled boundary. A click on a mixed
+       button applies the flag as ON to the whole selection — Word's
+       behaviour: "make this entire run bold". */
+    const boldMixed = () => mixed().bold;
+    const italicMixed = () => mixed().italic;
+    const underlineMixed = () => mixed().underline;
+    const strikeMixed = () => mixed().strike;
     const fontSize = () => attrs()?.font_size ?? 24;
     const color = () => attrs()?.color ?? DEFAULT_COLOR;
     const bgColor = () => attrs()?.bg_color ?? NO_HIGHLIGHT;
@@ -238,37 +248,44 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
             <span class="tb-sep" />
             <button
                 class="tb-btn tb-b"
-                classList={{ active: bold() }}
-                aria-pressed={bold()}
+                classList={{ active: bold() && !boldMixed(), indeterminate: boldMixed() }}
+                aria-pressed={boldMixed() ? 'mixed' : bold()}
                 aria-label="Bold"
-                onClick={() => apply({ bold: !bold() })}
+                onClick={() => apply({ bold: boldMixed() ? true : !bold() })}
             >
                 B
             </button>
             <button
                 class="tb-btn tb-i"
-                classList={{ active: italic() }}
-                aria-pressed={italic()}
+                classList={{ active: italic() && !italicMixed(), indeterminate: italicMixed() }}
+                aria-pressed={italicMixed() ? 'mixed' : italic()}
                 aria-label="Italic"
-                onClick={() => apply({ italic: !italic() })}
+                onClick={() => apply({ italic: italicMixed() ? true : !italic() })}
             >
                 I
             </button>
             <button
                 class="tb-btn tb-u"
-                classList={{ active: underline() }}
-                aria-pressed={underline()}
+                classList={{
+                    active: underline() && !underlineMixed(),
+                    indeterminate: underlineMixed(),
+                }}
+                aria-pressed={underlineMixed() ? 'mixed' : underline()}
                 aria-label="Underline"
-                onClick={() => apply({ underline: underline() ? 'None' : 'Single' })}
+                onClick={() =>
+                    apply({
+                        underline: underlineMixed() ? 'Single' : underline() ? 'None' : 'Single',
+                    })
+                }
             >
                 U
             </button>
             <button
                 class="tb-btn tb-s"
-                classList={{ active: strike() }}
-                aria-pressed={strike()}
+                classList={{ active: strike() && !strikeMixed(), indeterminate: strikeMixed() }}
+                aria-pressed={strikeMixed() ? 'mixed' : strike()}
                 aria-label="Strikethrough"
-                onClick={() => apply({ strike: !strike() })}
+                onClick={() => apply({ strike: strikeMixed() ? true : !strike() })}
             >
                 S
             </button>

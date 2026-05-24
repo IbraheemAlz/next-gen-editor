@@ -38,6 +38,21 @@
     border-color: #4a90d9;
 }
 
+/* Indeterminate state — selection straddles a styled boundary so the
+   flag is non-uniform. Word renders this with a faded outline on the
+   button; we use a diagonal-stripe background to keep the toolbar's
+   tri-state visible without a tooltip. */
+.tb-btn.indeterminate {
+    background: repeating-linear-gradient(
+        45deg,
+        #d3e6ff,
+        #d3e6ff 4px,
+        #eef4fb 4px,
+        #eef4fb 8px
+    );
+    border-color: #4a90d9;
+}
+
 .tb-b {
     font-weight: 700;
 }

@@ -2088,6 +2088,98 @@ fn doc_paragraph_neighbor(
 /// Flat list of every paragraph path in document order (top-level
 /// paragraphs + recursive descent into table cells). Cheap for the
 /// PoC and the small-table common case; cache when editing lands.
+/// Sample every distinct `SpanStyle` covered by `[lo, hi)` in `para` —
+/// the maximal segments coming out of the same per-byte walk
+/// `serialize_paragraph` uses. A default-styled gap between explicit
+/// spans counts as `SpanStyle::default()`; the empty range yields
+/// nothing. Used by `attrs_mixed_over` to detect non-uniform flags
+/// across a selection.
+fn sample_paragraph_styles(
+    para: &engine::Paragraph,
+    lo: u32,
+    hi: u32,
+    record: &mut dyn FnMut(SpanStyle),
+) {
+    if lo >= hi {
+        return;
+    }
+    let text_len = para.text.len() as u32;
+    let lo = lo.min(text_len);
+    let hi = hi.min(text_len);
+    if lo == hi {
+        /* Empty paragraph clipped to nothing — record the default so
+        the toolbar still reports a uniform-default state. */
+        record(SpanStyle::default());
+        return;
+    }
+    let mut cursor = lo;
+    for run in &para.spans {
+        if run.end <= cursor {
+            continue;
+        }
+        if run.start >= hi {
+            break;
+        }
+        let rs = run.start.max(cursor);
+        let re = run.end.min(hi);
+        if rs > cursor {
+            record(SpanStyle::default());
+        }
+        if re > rs {
+            record(run.style);
+        }
+        cursor = re;
+    }
+    if cursor < hi {
+        record(SpanStyle::default());
+    }
+}
+
+/// Paths to every paragraph STRICTLY BETWEEN `start_path` and `end_path`
+/// in the doc-flat walk — i.e., the middle paragraphs of a
+/// cross-paragraph selection, excluding the endpoints themselves.
+/// Returns an empty vec when no such paragraphs exist (adjacent or
+/// same-paragraph selection).
+fn doc_paragraph_paths_between(
+    doc: &DocumentTree,
+    start_path: &EngineBlockPath,
+    end_path: &EngineBlockPath,
+) -> Vec<EngineBlockPath> {
+    let all = doc_paragraph_paths(doc);
+    let Some(si) = all.iter().position(|p| p == start_path) else {
+        return Vec::new();
+    };
+    let Some(ei) = all.iter().position(|p| p == end_path) else {
+        return Vec::new();
+    };
+    if si + 1 >= ei {
+        return Vec::new();
+    }
+    all[si + 1..ei].to_vec()
+}
+
+/// Count of `Block` entries in the cell addressed by `cell_prefix`
+/// (a path with exactly `[Block(t), Cell{r,c}]`). `None` when the
+/// prefix doesn't resolve to a real cell. Used by `do_select_cell_at`
+/// to know which `Block(N)` step terminates the cell's last paragraph.
+fn cell_block_count(doc: &DocumentTree, cell_prefix: &EngineBlockPath) -> Option<usize> {
+    if cell_prefix.steps.len() < 2 {
+        return None;
+    }
+    let EnginePathStep::Block(t_idx) = cell_prefix.steps[0] else {
+        return None;
+    };
+    let EnginePathStep::Cell { row, col } = cell_prefix.steps[1] else {
+        return None;
+    };
+    let block = doc.blocks.get(t_idx as usize)?;
+    let engine::Block::Table(t) = block else {
+        return None;
+    };
+    let cell = t.rows.get(row as usize)?.cells.get(col as usize)?;
+    Some(cell.blocks.len())
+}
+
 fn doc_paragraph_paths(doc: &DocumentTree) -> Vec<EngineBlockPath> {
     let mut out: Vec<EngineBlockPath> = Vec::new();
     let mut prefix: Vec<EnginePathStep> = Vec::new();
@@ -2689,6 +2781,7 @@ impl Engine {
             Command::HitTestInPage { page, at } => self.do_hit_test_in_page(page, at),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
             Command::SelectParagraphAt { at } => self.do_select_paragraph_at(at),
+            Command::SelectCellAt { at } => self.do_select_cell_at(at),
             Command::DeleteAtCaret { forward, by_word } => {
                 self.do_delete_at_caret(forward, by_word)
             }
@@ -3665,6 +3758,63 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// `Command::SelectCellAt` — hit-test, then select every byte of
+    /// the containing cell (quadruple-click inside a table).
+    /// `UX_BEHAVIOR_SPEC §I.3`. The hit's path tells us which cell —
+    /// path steps `[Block(t_idx), Cell{r,c}, Block(0)]` etc.
+    /// Anchor lands at offset 0 of the cell's first paragraph; caret
+    /// lands at `text.len()` of its last paragraph. Outside any cell
+    /// the command falls back to `SelectAll`.
+    fn do_select_cell_at(&mut self, at: BridgePoint) -> Event {
+        let geom = match self.document_geometry() {
+            Ok(g) => g,
+            Err(e) => return *e,
+        };
+        let hit = hit_test_geom(&geom, at.x, at.y);
+        let in_cell = matches!(hit.path.steps.get(1), Some(BridgePathStep::Cell { .. }));
+        if !in_cell {
+            return self.do_select_all();
+        }
+        /* Cell address = first two steps of the hit's path
+        (`Block(t_idx)` + `Cell{r,c}`). Build start / end paths by
+        appending `Block(0)` for the first cell-paragraph and
+        `Block(last_idx)` for the last. */
+        let cell_prefix: Vec<BridgePathStep> = hit.path.steps.iter().take(2).cloned().collect();
+        let doc = self.undo.current();
+        /* Resolve the cell's block list to know how many paragraphs
+        live inside it. */
+        let engine_prefix = bridge_to_engine_path(BridgeBlockPath {
+            steps: cell_prefix.clone(),
+        });
+        let cell_blocks = cell_block_count(doc, &engine_prefix).unwrap_or(1);
+        let last_block_idx = cell_blocks.saturating_sub(1) as u32;
+        let mut start_steps = cell_prefix.clone();
+        start_steps.push(BridgePathStep::Block { idx: 0 });
+        let mut end_steps = cell_prefix;
+        end_steps.push(BridgePathStep::Block {
+            idx: last_block_idx,
+        });
+        let end_path = BridgeBlockPath { steps: end_steps };
+        let end_engine = bridge_to_engine_path(end_path.clone());
+        let end_len = doc
+            .paragraph_at_path(&end_engine)
+            .map_or(0, |p| p.text.len() as u32);
+        self.pending_format = None;
+        self.selection = Some(SelectionState {
+            anchor: BridgeLogicalPos {
+                path: BridgeBlockPath { steps: start_steps },
+                offset: 0,
+            },
+            caret: BridgeLogicalPos {
+                path: end_path,
+                offset: end_len,
+            },
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.selection_changed()
+    }
+
     /// `Command::SelectAll` — anchor at the document start, caret at the very
     /// last paragraph's byte length. Empty document collapses to (0, 0).
     fn do_select_all(&mut self) -> Event {
@@ -4030,7 +4180,90 @@ impl Engine {
             can_undo: self.undo.can_undo(),
             can_redo: self.undo.can_redo(),
             selection_kind: sel.kind.clone(),
+            attrs_mixed: self.attrs_mixed_over(&start, &end),
         }
+    }
+
+    /// Compute the per-flag "mixed across the selection" bitmap. A
+    /// collapsed caret has nothing to disagree over — all `false`. For
+    /// a real range we walk the paragraph(s) the selection spans and
+    /// compare each contributing `SpanStyle`'s flags against the first
+    /// observed value; any disagreement flips the flag to mixed.
+    ///
+    /// Cross-container ranges (paragraph in body + paragraph in cell)
+    /// fall back to scanning each endpoint's paragraph independently —
+    /// good enough until cross-container linear selections land
+    /// (UX_BEHAVIOR_SPEC §IV.6, GH #3).
+    fn attrs_mixed_over(
+        &self,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+    ) -> bridge::AttrsMixed {
+        if start == end {
+            return bridge::AttrsMixed::default();
+        }
+        let doc = self.undo.current();
+        /* Track each flag's first observation; flip to `Some(true)` for
+        mixed when a later sample disagrees. `None` until the first
+        sample is recorded. */
+        let mut bold_seen: Option<bool> = None;
+        let mut italic_seen: Option<bool> = None;
+        let mut underline_seen: Option<bool> = None;
+        let mut strike_seen: Option<bool> = None;
+        let mut mixed = bridge::AttrsMixed::default();
+        let mut record = |s: SpanStyle| {
+            let b = s.bold.unwrap_or(false);
+            let i = s.italic.unwrap_or(false);
+            let u = s.underline.unwrap_or(false);
+            let st = s.strike.unwrap_or(false);
+            match bold_seen {
+                None => bold_seen = Some(b),
+                Some(prev) if prev != b => mixed.bold = true,
+                _ => {}
+            }
+            match italic_seen {
+                None => italic_seen = Some(i),
+                Some(prev) if prev != i => mixed.italic = true,
+                _ => {}
+            }
+            match underline_seen {
+                None => underline_seen = Some(u),
+                Some(prev) if prev != u => mixed.underline = true,
+                _ => {}
+            }
+            match strike_seen {
+                None => strike_seen = Some(st),
+                Some(prev) if prev != st => mixed.strike = true,
+                _ => {}
+            }
+        };
+        /* Same-paragraph range: sample every span-boundary-bracketed
+        sub-range that intersects `[start.offset, end.offset)`. */
+        if start.path == end.path {
+            let engine_path = bridge_to_engine_path(start.path.clone());
+            if let Some(p) = doc.paragraph_at_path(&engine_path) {
+                sample_paragraph_styles(p, start.offset, end.offset, &mut record);
+            }
+            return mixed;
+        }
+        /* Cross-paragraph range: sample the head paragraph from
+        `start.offset` to its end, every full paragraph between, and
+        the tail paragraph from 0 to `end.offset`. Defensively cap at
+        each paragraph's `text.len()`. */
+        let engine_start = bridge_to_engine_path(start.path.clone());
+        let engine_end = bridge_to_engine_path(end.path.clone());
+        if let Some(p) = doc.paragraph_at_path(&engine_start) {
+            sample_paragraph_styles(p, start.offset, p.text.len() as u32, &mut record);
+        }
+        for path in doc_paragraph_paths_between(doc, &engine_start, &engine_end) {
+            if let Some(p) = doc.paragraph_at_path(&path) {
+                sample_paragraph_styles(p, 0, p.text.len() as u32, &mut record);
+            }
+        }
+        if let Some(p) = doc.paragraph_at_path(&engine_end) {
+            sample_paragraph_styles(p, 0, end.offset, &mut record);
+        }
+        mixed
     }
 
     /// Effective alignment of the paragraph at `path` for the toolbar

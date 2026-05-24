@@ -235,6 +235,17 @@ pub enum Command {
         at: Point,
     },
 
+    /// Select the whole cell content under a canvas pixel
+    /// (quadruple-click inside a table). The engine resolves the hit
+    /// position's owning cell; if found, selection runs from offset 0
+    /// of the cell's first paragraph to `text.len()` of its last.
+    /// When the hit lands outside any cell, the command falls back to
+    /// `SelectAll` so quadruple-click in the body still has a useful
+    /// meaning (UX_BEHAVIOR_SPEC §I.3).
+    SelectCellAt {
+        at: Point,
+    },
+
     /// Delete relative to the caret (Backspace / Delete). If the selection
     /// is non-empty it is deleted; otherwise one grapheme — or one word when
     /// `by_word` — is removed in the `forward` direction. The frozen

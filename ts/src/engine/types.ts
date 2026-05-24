@@ -14,6 +14,7 @@ export type {
     A11yTable,
     A11yTree,
     Alignment,
+    AttrsMixed,
     BlockPath,
     BridgeBorderStroke,
     BridgeBorderStyle,

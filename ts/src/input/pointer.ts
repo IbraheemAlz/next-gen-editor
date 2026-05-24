@@ -111,20 +111,21 @@ export function attachPointer(
         void client.dispatch({ type: 'SELECT_WORD_AT', at: toGlobal(e) });
     };
 
-    /* Triple-click — whole paragraph. Quadruple-click — whole document
-       (UX_BEHAVIOR_SPEC §I.3). DOM has no native triple/quadruple events;
-       `e.detail` carries the click count. Bump `gesture` on each so the
-       pending hit-tests from the inner clicks get dropped (mirrors
-       dblclick's defence against the two single-clicks). Cell-scope
-       on quadruple-click inside a table is deferred — no SELECT_CELL_AT
-       command yet; falls through to SELECT_ALL until that lands. */
+    /* Triple-click — whole paragraph. Quadruple-click — whole cell
+       (when inside a table) or whole document (UX_BEHAVIOR_SPEC §I.3).
+       DOM has no native triple/quadruple events; `e.detail` carries
+       the click count. Bump `gesture` on each so the pending
+       hit-tests from the inner clicks get dropped (mirrors dblclick's
+       defence against the two single-clicks). `SELECT_CELL_AT`
+       resolves the click's owning cell engine-side and falls back to
+       `SELECT_ALL` when the hit lands outside any cell. */
     const onClick = (e: MouseEvent): void => {
         if (e.detail === 3) {
             gesture += 1;
             void client.dispatch({ type: 'SELECT_PARAGRAPH_AT', at: toGlobal(e) });
         } else if (e.detail >= 4) {
             gesture += 1;
-            void client.dispatch({ type: 'SELECT_ALL' });
+            void client.dispatch({ type: 'SELECT_CELL_AT', at: toGlobal(e) });
         }
     };
 
