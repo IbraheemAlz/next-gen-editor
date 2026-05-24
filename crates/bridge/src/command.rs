@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{
-    Alignment, BlockPath, Color, DocFormat, LogicalPos, LogicalRange, Point, Rect, UnderlineStyle,
-    VerticalScript,
+    Alignment, BlockPath, Color, Direction, DocFormat, LogicalPos, LogicalRange, Point, Rect,
+    UnderlineStyle, VerticalScript,
 };
 
 /// A command issued to the engine. Serialized internally-tagged
@@ -281,6 +281,18 @@ pub enum Command {
     SetParagraphAlign {
         range: LogicalRange,
         align: Alignment,
+    },
+
+    /// Phase 9c — set the paragraph base direction (`<w:bidi>`) of
+    /// every paragraph the `range` spans. Direction defines logical
+    /// text flow and punctuation placement; alignment is a separate
+    /// concern (visual anchoring). Word ties them implicitly via the
+    /// direction-relative `Start` / `End` alignment tokens — flipping
+    /// direction automatically swaps which visual edge those resolve
+    /// to. A real edit (undo + reflow); selection preserved.
+    SetParagraphDirection {
+        range: LogicalRange,
+        direction: Direction,
     },
 
     // ===================================================================

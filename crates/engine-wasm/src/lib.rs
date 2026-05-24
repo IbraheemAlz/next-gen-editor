@@ -2800,6 +2800,11 @@ impl Engine {
             Command::SetParagraphAlign { range, align } => {
                 self.do_set_paragraph_align(range, align)
             }
+            // Phase 9c — paragraph base direction (`<w:bidi>`), distinct
+            // from alignment (UX_BEHAVIOR_SPEC §III, ISO/IEC 29500).
+            Command::SetParagraphDirection { range, direction } => {
+                self.do_set_paragraph_direction(range, direction)
+            }
 
             // Phase 5 PR 3 — table mutation commands. `BlockPath` flows
             // straight through to the engine; every command flips
@@ -4181,6 +4186,7 @@ impl Engine {
             can_redo: self.undo.can_redo(),
             selection_kind: sel.kind.clone(),
             attrs_mixed: self.attrs_mixed_over(&start, &end),
+            paragraph_direction: self.paragraph_direction_over(&start, &end),
         }
     }
 
@@ -4382,6 +4388,46 @@ impl Engine {
             .as_ref()
             .map(|c| c.base_direction)
             .unwrap_or(ShapingDirection::Ltr)
+    }
+
+    /// Tri-state paragraph direction across the selection: `Some(dir)`
+    /// when every paragraph the range spans agrees on the EFFECTIVE
+    /// direction (resolved via the same precedence
+    /// `paragraph_direction_at` uses), `None` when paragraphs disagree.
+    /// Drives the toolbar's LTR/RTL toggle and the indeterminate
+    /// state when a multi-paragraph selection straddles a direction
+    /// boundary (UX_BEHAVIOR_SPEC §III).
+    fn paragraph_direction_over(
+        &self,
+        start: &BridgeLogicalPos,
+        end: &BridgeLogicalPos,
+    ) -> Option<Direction> {
+        let to_bridge = |d: ShapingDirection| match d {
+            ShapingDirection::Ltr => Direction::Ltr,
+            ShapingDirection::Rtl => Direction::Rtl,
+        };
+        if start.path == end.path {
+            return Some(to_bridge(self.paragraph_direction_at(&start.path)));
+        }
+        /* Multi-paragraph: walk every paragraph in the range and require
+        uniform agreement. Cross-container ranges fall back to the
+        endpoints (matching `attrs_mixed_over`'s behavior). */
+        let head = to_bridge(self.paragraph_direction_at(&start.path));
+        let tail = to_bridge(self.paragraph_direction_at(&end.path));
+        if head != tail {
+            return None;
+        }
+        let doc = self.undo.current();
+        let engine_start = bridge_to_engine_path(start.path.clone());
+        let engine_end = bridge_to_engine_path(end.path.clone());
+        for path in doc_paragraph_paths_between(doc, &engine_start, &engine_end) {
+            let bridge_path = engine_to_bridge_path(path);
+            let d = to_bridge(self.paragraph_direction_at(&bridge_path));
+            if d != head {
+                return None;
+            }
+        }
+        Some(head)
     }
 
     /// The offset whose style the toolbar should reflect: the selection start
@@ -4887,6 +4933,37 @@ impl Engine {
             to_engine_pos(start.clone()),
             to_engine_pos(end),
             engine_align(align),
+        );
+        self.undo.push(new_doc);
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::SetParagraphDirection` — set `props.direction` on every
+    /// paragraph the range spans. Word's `<w:bidi>` semantics: direction
+    /// is logical (text flow + punctuation placement), separate from
+    /// alignment (visual anchoring). Existing `Start` / `End`
+    /// alignments are direction-relative, so toggling direction
+    /// automatically swaps which visual edge they resolve to — no
+    /// alignment rewrite needed for the auto-flip behavior Word
+    /// users expect.
+    fn do_set_paragraph_direction(
+        &mut self,
+        range: BridgeLogicalRange,
+        direction: Direction,
+    ) -> Event {
+        let engine_dir = match direction {
+            Direction::Ltr => engine::TextDirection::Ltr,
+            Direction::Rtl => engine::TextDirection::Rtl,
+        };
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self.undo.current().set_direction(
+            to_engine_pos(start.clone()),
+            to_engine_pos(end),
+            engine_dir,
         );
         self.undo.push(new_doc);
         self.dirty.invalidate(full_page_rect(self.scale()));

@@ -14,7 +14,7 @@
  * style the engine applies to the next typed run. */
 import { createSignal, For, Show } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
-import type { Alignment, BlockPath, Color, TextAttrsPatch } from '../engine/types';
+import type { Alignment, BlockPath, Color, Direction, TextAttrsPatch } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
 
 /* Insert-table picker geometry — Word's classic 8×8 grid. The user
@@ -177,6 +177,25 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
         { cls: 'al-right', label: 'Align right', value: rightAlign() },
         { cls: 'al-justify', label: 'Justify', value: 'Justify' },
     ];
+
+    /* Phase 9c — paragraph base direction (`<w:bidi>`), distinct from
+       alignment. Direction defines logical text flow + punctuation
+       placement; alignment is visual anchoring. The `Start`/`End`
+       alignment tokens auto-flip with direction, so toggling direction
+       while keeping `Start` alignment automatically swaps the
+       paragraph's visual leading edge — Word's "auto-flip alignment"
+       behavior comes for free. */
+    const paragraphDirection = () => props.store.paragraphDirection();
+    const isRtl = (): boolean => paragraphDirection() === 'Rtl';
+    const isLtr = (): boolean => paragraphDirection() === 'Ltr';
+    const directionMixed = (): boolean => paragraphDirection() === null;
+    const setDirection = (d: Direction): void => {
+        void props.client.dispatch({
+            type: 'SET_PARAGRAPH_DIRECTION',
+            range: props.store.selection().range,
+            direction: d,
+        });
+    };
 
     /* Phase 5 PR 3b — Insert Table popover + rows×cols picker.
        `pickerOpen` toggles visibility; `hoverR/hoverC` (1-indexed)
@@ -344,6 +363,33 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
                     </button>
                 )}
             </For>
+            <span class="tb-sep" />
+            <button
+                class="tb-btn tb-dir"
+                classList={{
+                    active: isLtr() && !directionMixed(),
+                    indeterminate: directionMixed(),
+                }}
+                aria-pressed={directionMixed() ? 'mixed' : isLtr()}
+                aria-label="Left-to-right paragraph direction"
+                title="LTR direction"
+                onClick={() => setDirection('Ltr')}
+            >
+                LTR
+            </button>
+            <button
+                class="tb-btn tb-dir"
+                classList={{
+                    active: isRtl() && !directionMixed(),
+                    indeterminate: directionMixed(),
+                }}
+                aria-pressed={directionMixed() ? 'mixed' : isRtl()}
+                aria-label="Right-to-left paragraph direction"
+                title="RTL direction"
+                onClick={() => setDirection('Rtl')}
+            >
+                RTL
+            </button>
             <span class="tb-sep" />
             <div class="tb-table-wrap">
                 <button

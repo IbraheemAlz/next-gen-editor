@@ -1501,6 +1501,53 @@ impl DocumentTree {
         }
     }
 
+    /// Set paragraph base direction (`<w:bidi>`) on every paragraph the
+    /// range spans. Mirrors [`Self::set_alignment`] but writes
+    /// `props.direction` instead. The direction defines logical text
+    /// flow + punctuation placement; alignment is a separate concern
+    /// (visual anchoring). Word ties them with the
+    /// writing-direction-relative `Start` / `End` alignment tokens —
+    /// flipping direction automatically swaps which visual edge those
+    /// resolve to, no alignment rewrite needed.
+    pub fn set_direction(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        direction: TextDirection,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        let mut blocks = self.blocks.clone();
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+                    para.props.direction = Some(direction);
+                });
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
+                para.props.direction = Some(direction);
+            });
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+        }
+    }
+
     /// Delete the logical range `[start, end)`. A range spanning paragraphs
     /// merges the partial first and last paragraphs and drops those between.
     /// PR 4: same-parent cross-paragraph ranges work end-to-end; cross-
@@ -3248,6 +3295,32 @@ mod tests {
         );
         /* outside the range — untouched */
         assert_eq!(d.nth_paragraph(2).unwrap().props.alignment, None);
+    }
+
+    #[test]
+    fn set_direction_marks_spanned_paragraphs() {
+        let d = DocumentTree::from_paragraphs(["a".into(), "b".into(), "c".into()]);
+        let d = d.set_direction(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
+            TextDirection::Rtl,
+        );
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.direction,
+            Some(TextDirection::Rtl)
+        );
+        assert_eq!(
+            d.nth_paragraph(1).unwrap().props.direction,
+            Some(TextDirection::Rtl)
+        );
+        /* outside the range — untouched */
+        assert_eq!(d.nth_paragraph(2).unwrap().props.direction, None);
     }
 
     #[test]

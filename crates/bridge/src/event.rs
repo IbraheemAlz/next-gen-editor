@@ -138,6 +138,14 @@ pub enum Event {
         /// mis-read the start position's value as the whole selection's.
         /// Always `false` on a collapsed caret (nothing to disagree over).
         attrs_mixed: AttrsMixed,
+        /// Phase 9c — paragraph base direction (`<w:bidi>`) reflected as
+        /// a tri-state for the toolbar LTR/RTL buttons. `Some(Ltr)` /
+        /// `Some(Rtl)` when every paragraph in the range agrees on the
+        /// EFFECTIVE direction (explicit `props.direction` if set, else
+        /// first-strong inference, else the layout-config default).
+        /// `None` when paragraphs disagree → toolbar renders both
+        /// direction buttons as INDETERMINATE.
+        paragraph_direction: Option<Direction>,
     },
 
     /* IME */

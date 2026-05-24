@@ -75,6 +75,13 @@ export function createEngineStore(client: EngineClient) {
        direction — together they drive the toolbar's alignment picker. */
     const [paragraphAlignment, setParagraphAlignment] = createSignal<Alignment>('Start');
     const [baseDirection, setBaseDirection] = createSignal<Direction>('Ltr');
+    /* Phase 9c — effective paragraph base direction (`<w:bidi>`),
+       tri-state: `Ltr` / `Rtl` when every paragraph in the range
+       agrees, `null` when they disagree → toolbar's LTR/RTL buttons
+       render INDETERMINATE. Distinct from `baseDirection`, which is
+       the document-level direction for the alignment picker; this
+       reflects the SELECTION's paragraph direction. */
+    const [paragraphDirection, setParagraphDirection] = createSignal<Direction | null>('Ltr');
     const [announcement, setAnnouncement] = createSignal('');
     /* Mirror of every table in the document — extracted from the a11y
        delta stream so the Table panel can list/target tables by
@@ -112,6 +119,7 @@ export function createEngineStore(client: EngineClient) {
             });
             setAttrsAtCaret(ev.attrs_at_caret);
             setAttrsMixed(ev.attrs_mixed);
+            setParagraphDirection(ev.paragraph_direction ?? null);
             setUndoState({ canUndo: ev.can_undo, canRedo: ev.can_redo });
             setParagraphAlignment(ev.paragraph_alignment);
             setBaseDirection(ev.direction);
@@ -160,6 +168,7 @@ export function createEngineStore(client: EngineClient) {
         undoState,
         paragraphAlignment,
         baseDirection,
+        paragraphDirection,
         announcement,
         tables,
         selectionKind,
