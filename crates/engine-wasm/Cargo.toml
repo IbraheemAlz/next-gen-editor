@@ -27,6 +27,7 @@ serde-wasm-bindgen = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_bytes = { workspace = true }
 console_error_panic_hook = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

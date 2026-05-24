@@ -124,6 +124,29 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
             return;
         }
 
+        /* Home / End. Ctrl/Cmd promotes line-bounded motion to document
+           bounds (`DocHome` / `DocEnd`). Shift extends as with arrows. */
+        const docJump = (e.ctrlKey || e.metaKey) && !e.altKey;
+        const lineMotion: MoveDirection | undefined =
+            e.key === 'Home'
+                ? docJump
+                    ? 'DocHome'
+                    : 'LineHome'
+                : e.key === 'End'
+                  ? docJump
+                      ? 'DocEnd'
+                      : 'LineEnd'
+                  : undefined;
+        if (lineMotion) {
+            e.preventDefault();
+            void props.client.dispatch({
+                type: 'MOVE_CARET',
+                direction: lineMotion,
+                extend: e.shiftKey,
+            });
+            return;
+        }
+
         /* Tab / Shift+Tab — cell-to-cell navigation inside a table. The
            engine no-ops when the caret is not inside a table; Ctrl+Tab
            still inserts a literal tab via the textarea's default. */

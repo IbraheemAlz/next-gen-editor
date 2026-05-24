@@ -452,19 +452,39 @@ pub enum SelectionModifier {
 /// — Tab / Shift+Tab inside a table. Outside a table they no-op.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveDirection {
+    /// Visual arrow keys. The engine maps these to logical byte motion
+    /// using the caret's host paragraph base direction (UAX #9, see
+    /// `UX_BEHAVIOR_SPEC.md` §III):
+    /// * **LTR paragraph** — `Left` decrements offset, `Right` increments.
+    /// * **RTL paragraph** — `Left` increments offset, `Right` decrements.
+    ///
+    /// The motion unit is a UAX #29 grapheme cluster, not a Unicode
+    /// scalar — combining marks (Arabic harakat, Devanagari conjuncts,
+    /// emoji ZWJ sequences) traverse as one user-perceived character.
     Up,
     Down,
     Left,
     Right,
     NextCell,
     PrevCell,
-    /// Ctrl/Cmd + ArrowLeft — jump caret to the start of the previous
-    /// word in logical byte order. Whitespace-bounded; crosses paragraph
-    /// boundaries by jumping to the end of the previous paragraph.
+    /// Ctrl/Cmd + ArrowLeft (visual). Jump caret to the start of the
+    /// previous **word-like** UAX #29 segment in the caret's host
+    /// paragraph, after applying the same RTL flip as `Left`. Crosses
+    /// paragraph boundaries by jumping to the end of the previous
+    /// paragraph.
     WordLeft,
-    /// Ctrl/Cmd + ArrowRight — jump caret to the start of the next word
-    /// (the byte index just after the run of whitespace that follows the
-    /// current word). Crosses paragraph boundaries by jumping to the
-    /// start of the next paragraph.
+    /// Ctrl/Cmd + ArrowRight (visual). Jump caret to the start of the
+    /// next word-like UAX #29 segment, after the RTL flip. Crosses
+    /// paragraph boundaries by jumping to offset 0 of the next.
     WordRight,
+    /// `Home` — caret to the start of the current visual line. Snaps to
+    /// the LineGeom whose `start_byte..end_byte` brackets the caret and
+    /// lands on `start_byte`.
+    LineHome,
+    /// `End` — caret to the end of the current visual line.
+    LineEnd,
+    /// `Ctrl/Cmd + Home` — caret to the very first paragraph at offset 0.
+    DocHome,
+    /// `Ctrl/Cmd + End` — caret to the last paragraph at `text.len`.
+    DocEnd,
 }

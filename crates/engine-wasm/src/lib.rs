@@ -1853,22 +1853,31 @@ fn x_distance_to_line(line: &LineGeom, target_x: f32) -> f32 {
     }
 }
 
-/// Step one Unicode char left in logical order (Backlog #14). At the start of
-/// a paragraph the caret jumps to the end of the previous paragraph in the
-/// containing flat-paragraph walk; at byte 0 of the document it pins.
+/// Step one grapheme cluster backward in logical byte order (UAX #29).
+/// `unicode-segmentation::UnicodeSegmentation::grapheme_indices` returns
+/// the byte index of every grapheme break; the caret lands on the LAST
+/// break strictly less than the current offset, so combining marks
+/// (Arabic harakat, Devanagari conjuncts, emoji ZWJ sequences) traverse
+/// as a single user-perceived character (UX_BEHAVIOR_SPEC.md §I.1).
+/// At the start of a paragraph the caret jumps to the end of the
+/// previous paragraph in the doc-flat walk; at byte 0 of the document
+/// it pins.
 fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    use unicode_segmentation::UnicodeSegmentation;
     let off = pos.offset as usize;
     let engine_path = bridge_to_engine_path(pos.path.clone());
     if let Some(para) = doc.paragraph_at_path(&engine_path) {
         if off > 0 {
             let text = &para.text;
-            let mut o = off - 1;
-            while o > 0 && !text.is_char_boundary(o) {
-                o -= 1;
-            }
+            let target = text
+                .grapheme_indices(true)
+                .map(|(i, _)| i)
+                .take_while(|&i| i < off)
+                .last()
+                .unwrap_or(0);
             return BridgeLogicalPos {
                 path: pos.path,
-                offset: o as u32,
+                offset: target as u32,
             };
         }
         if let Some((prev_path, prev_para)) = doc_paragraph_neighbor(doc, &engine_path, false) {
@@ -1881,27 +1890,67 @@ fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     pos
 }
 
-/// Jump one word backward in logical order — Ctrl/Cmd + ArrowLeft. The
-/// scan is whitespace-bounded: skip any whitespace immediately to the
-/// left of the caret, then walk through the run of non-whitespace
-/// characters to its start. At the paragraph start the caret jumps to
-/// the END of the previous paragraph in the flat walk; at the document
-/// start it pins.
+/// Caret position at the start of the visual line containing `caret`
+/// (Home key, UX_BEHAVIOR_SPEC §I.2). Finds the LineGeom whose
+/// `path == caret.path` and `start_byte..end_byte` brackets the caret,
+/// then returns a position at `line.start_byte`. `None` when the
+/// document is empty or `caret` doesn't resolve to any line — caller
+/// keeps the existing caret in that case.
+fn line_home(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalPos> {
+    let geom = engine.document_geometry().ok()?;
+    let line = geom.into_iter().find(|l| {
+        l.path == caret.path && caret.offset >= l.start_byte && caret.offset <= l.end_byte
+    })?;
+    Some(BridgeLogicalPos {
+        path: caret.path.clone(),
+        offset: line.start_byte,
+    })
+}
+
+/// Caret position at the end of the visual line containing `caret`
+/// (End key). See [`line_home`].
+fn line_end(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalPos> {
+    let geom = engine.document_geometry().ok()?;
+    let line = geom.into_iter().find(|l| {
+        l.path == caret.path && caret.offset >= l.start_byte && caret.offset <= l.end_byte
+    })?;
+    Some(BridgeLogicalPos {
+        path: caret.path.clone(),
+        offset: line.end_byte,
+    })
+}
+
+/// UAX #29 word-like segment starts (byte offsets) in `text`. A segment
+/// is "word-like" iff `unicode-segmentation` classifies it via
+/// `unicode_word_indices` — Letters, Numbers, and a small set of
+/// connector chars (`'` inside contractions, `.` / `,` between digits in
+/// `3.14` and `1,000`). Whitespace and stand-alone punctuation are NOT
+/// word-like — they're the gaps the word-jump motions skip.
+fn word_starts(text: &str) -> Vec<usize> {
+    use unicode_segmentation::UnicodeSegmentation;
+    text.unicode_word_indices().map(|(i, _)| i).collect()
+}
+
+/// Jump one UAX #29 word backward in logical byte order — the engine
+/// half of Ctrl/Cmd + ArrowLeft in an LTR paragraph (an RTL paragraph
+/// flips the visual mapping; see `do_move_caret`). Lands on the start
+/// of the previous word-like segment relative to `pos.offset`. At
+/// paragraph start the caret hops to the end of the previous paragraph
+/// in the doc-flat walk (descending into cells); at document start it
+/// pins.
 ///
-/// Mapping is **logical**, matching the existing `step_left` /
-/// `step_right` convention — ArrowLeft moves toward smaller byte offsets
-/// regardless of paragraph direction. Word's actual RTL behaviour
-/// (visual-Left = logical-Forward for RTL paragraphs) is a separate
-/// concern that would touch every arrow, not just word jump.
+/// Word-like classification handles the cases the previous whitespace-
+/// only scanner missed: `"isn't"` is ONE word (apostrophe is a Word
+/// connector under WB6/WB7), `"3.14"` is ONE word (period between
+/// digits is MidNumLet/MidNum under WB11/WB12), and CJK ideographs
+/// segment per-ideograph.
 fn step_word_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     let engine_path = bridge_to_engine_path(pos.path.clone());
     let Some(para) = doc.paragraph_at_path(&engine_path) else {
         return pos;
     };
     let text = &para.text;
-    let mut off = (pos.offset as usize).min(text.len());
-    /* Already at paragraph start — hop to the end of the previous
-    paragraph in the flat document walk. */
+    let off = (pos.offset as usize).min(text.len());
     if off == 0 {
         if let Some((prev_path, prev_para)) = doc_paragraph_neighbor(doc, &engine_path, false) {
             return BridgeLogicalPos {
@@ -1911,46 +1960,35 @@ fn step_word_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos
         }
         return pos;
     }
-    /* Skip whitespace immediately left of the caret. */
-    while off > 0 {
-        let Some(c) = text[..off].chars().next_back() else {
-            break;
-        };
-        if !c.is_whitespace() {
-            break;
-        }
-        off -= c.len_utf8();
-    }
-    /* Walk back through the non-whitespace run to its start. */
-    while off > 0 {
-        let Some(c) = text[..off].chars().next_back() else {
-            break;
-        };
-        if c.is_whitespace() {
-            break;
-        }
-        off -= c.len_utf8();
-    }
+    /* Last word-start strictly before the caret. `unicode_word_indices`
+    is monotonic ascending; the last one < off wins. If the caret sits
+    at offset 0 of the first word, `word_starts` may still emit 0 →
+    falling through to "no candidate" lands the caret at 0 (pinned at
+    paragraph start). */
+    let target = word_starts(text)
+        .into_iter()
+        .take_while(|&i| i < off)
+        .last()
+        .unwrap_or(0);
     BridgeLogicalPos {
         path: pos.path,
-        offset: off as u32,
+        offset: target as u32,
     }
 }
 
-/// Jump one word forward in logical order — Ctrl/Cmd + ArrowRight. The
-/// scan walks through the current word's non-whitespace run, then skips
-/// the run of whitespace that follows, landing on the first character of
-/// the NEXT word (Word's convention — not the end of the current word).
-/// At paragraph end the caret jumps to the start of the next paragraph
-/// in the flat walk; at the document end it pins.
+/// Jump one UAX #29 word forward in logical byte order — the engine
+/// half of Ctrl/Cmd + ArrowRight in an LTR paragraph. Lands on the
+/// **start** of the next word-like segment after `pos.offset` (Word /
+/// Google Docs convention — not the end of the current word). At
+/// paragraph end the caret hops to offset 0 of the next paragraph; at
+/// document end it pins.
 fn step_word_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     let engine_path = bridge_to_engine_path(pos.path.clone());
     let Some(para) = doc.paragraph_at_path(&engine_path) else {
         return pos;
     };
     let text = &para.text;
-    let mut off = (pos.offset as usize).min(text.len());
-    /* Already at paragraph end — hop to the start of the next paragraph. */
+    let off = (pos.offset as usize).min(text.len());
     if off >= text.len() {
         if let Some((next_path, _)) = doc_paragraph_neighbor(doc, &engine_path, true) {
             return BridgeLogicalPos {
@@ -1960,48 +1998,37 @@ fn step_word_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPo
         }
         return pos;
     }
-    /* Walk through the current word's non-whitespace run. */
-    while off < text.len() {
-        let Some(c) = text[off..].chars().next() else {
-            break;
-        };
-        if c.is_whitespace() {
-            break;
-        }
-        off += c.len_utf8();
-    }
-    /* Skip the whitespace run to land on the next word's first char. */
-    while off < text.len() {
-        let Some(c) = text[off..].chars().next() else {
-            break;
-        };
-        if !c.is_whitespace() {
-            break;
-        }
-        off += c.len_utf8();
-    }
+    /* First word-start strictly greater than the caret. If no further
+    word exists (caret in trailing whitespace/punctuation), pin at
+    paragraph end so a follow-up WordRight hops to the next paragraph. */
+    let target = word_starts(text)
+        .into_iter()
+        .find(|&i| i > off)
+        .unwrap_or(text.len());
     BridgeLogicalPos {
         path: pos.path,
-        offset: off as u32,
+        offset: target as u32,
     }
 }
 
-/// Step one Unicode char right in logical order. At a paragraph's end the
-/// caret jumps to the start of the next paragraph in the flat walk; at the
-/// document end it pins.
+/// Step one grapheme cluster forward in logical byte order (UAX #29).
+/// At a paragraph's end the caret jumps to offset 0 of the next
+/// paragraph in the flat walk; at the document end it pins.
 fn step_right(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    use unicode_segmentation::UnicodeSegmentation;
     let off = pos.offset as usize;
     let engine_path = bridge_to_engine_path(pos.path.clone());
     if let Some(para) = doc.paragraph_at_path(&engine_path) {
         let text = &para.text;
         if off < text.len() {
-            let mut o = off + 1;
-            while o < text.len() && !text.is_char_boundary(o) {
-                o += 1;
-            }
+            let target = text
+                .grapheme_indices(true)
+                .map(|(i, _)| i)
+                .find(|&i| i > off)
+                .unwrap_or(text.len());
             return BridgeLogicalPos {
                 path: pos.path,
-                offset: o as u32,
+                offset: target as u32,
             };
         }
         if let Some((next_path, _)) = doc_paragraph_neighbor(doc, &engine_path, true) {
@@ -3620,11 +3647,54 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let doc = self.undo.current().clone();
+        /* UAX #9 visual-arrow mapping (UX_BEHAVIOR_SPEC §III.1). In an
+        RTL paragraph the user's ArrowLeft means "visually leftward",
+        which is LOGICALLY FORWARD because RTL text reorders. The flip
+        applies to plain Left/Right and Ctrl-modified WordLeft/WordRight
+        identically. */
+        let para_dir = self.paragraph_direction_at(&sel.caret.path);
+        let rtl = para_dir == ShapingDirection::Rtl;
         let (new_caret, new_ideal) = match direction {
-            MoveDirection::Left => (step_left(&doc, sel.caret.clone()), None),
-            MoveDirection::Right => (step_right(&doc, sel.caret.clone()), None),
-            MoveDirection::WordLeft => (step_word_left(&doc, sel.caret.clone()), None),
-            MoveDirection::WordRight => (step_word_right(&doc, sel.caret.clone()), None),
+            MoveDirection::Left => {
+                let f = if rtl { step_right } else { step_left };
+                (f(&doc, sel.caret.clone()), None)
+            }
+            MoveDirection::Right => {
+                let f = if rtl { step_left } else { step_right };
+                (f(&doc, sel.caret.clone()), None)
+            }
+            MoveDirection::WordLeft => {
+                let f = if rtl { step_word_right } else { step_word_left };
+                (f(&doc, sel.caret.clone()), None)
+            }
+            MoveDirection::WordRight => {
+                let f = if rtl { step_word_left } else { step_word_right };
+                (f(&doc, sel.caret.clone()), None)
+            }
+            MoveDirection::LineHome => (
+                line_home(self, &sel.caret).unwrap_or(sel.caret.clone()),
+                None,
+            ),
+            MoveDirection::LineEnd => (
+                line_end(self, &sel.caret).unwrap_or(sel.caret.clone()),
+                None,
+            ),
+            MoveDirection::DocHome => (bpos_top(0, 0), None),
+            MoveDirection::DocEnd => {
+                let last_path = doc
+                    .path_to_last_top_paragraph()
+                    .unwrap_or(EngineBlockPath::top(0));
+                let last_len = doc
+                    .paragraph_at_path(&last_path)
+                    .map_or(0, |p| p.text.len() as u32);
+                (
+                    BridgeLogicalPos {
+                        path: engine_to_bridge_path(last_path),
+                        offset: last_len,
+                    },
+                    None,
+                )
+            }
             MoveDirection::NextCell | MoveDirection::PrevCell => (
                 cell_tab_step(
                     &mut self.undo,
@@ -3901,6 +3971,36 @@ impl Engine {
             .as_ref()
             .map_or(Alignment::Start, |c| c.alignment);
         bridge_align(stored.unwrap_or(default))
+    }
+
+    /// Resolved base direction of the paragraph at `path`, used by the
+    /// UAX #9 visual-arrow flip (UX_BEHAVIOR_SPEC §III.1). Falls back in
+    /// the same precedence the layout pass uses:
+    /// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`).
+    /// 2. `first_strong_direction` over the paragraph text — the same
+    ///    inference layout applies when `props.direction` is `None`.
+    /// 3. The engine's `layout_cfg.base_direction` (the document-wide
+    ///    default the TS shell seeds at boot).
+    /// 4. `Ltr` if no `layout_cfg` is set (defensive — engine should
+    ///    always carry a config once `render_document` has run).
+    fn paragraph_direction_at(&self, path: &BridgeBlockPath) -> ShapingDirection {
+        let engine_path = bridge_to_engine_path(path.clone());
+        let para = self.undo.current().paragraph_at_path(&engine_path);
+        if let Some(p) = para {
+            if let Some(dir) = p.props.direction {
+                return match dir {
+                    engine::TextDirection::Ltr => ShapingDirection::Ltr,
+                    engine::TextDirection::Rtl => ShapingDirection::Rtl,
+                };
+            }
+            if let Some(d) = first_strong_direction(&p.text) {
+                return d;
+            }
+        }
+        self.layout_cfg
+            .as_ref()
+            .map(|c| c.base_direction)
+            .unwrap_or(ShapingDirection::Ltr)
     }
 
     /// The offset whose style the toolbar should reflect: the selection start
@@ -5082,5 +5182,160 @@ mod tests {
         let out = step_word_left(&doc, bpos_top(1, 0));
         assert_eq!(out.path.steps[0], bridge::PathStep::Block { idx: 0 });
         assert_eq!(out.offset, "first".len() as u32);
+    }
+
+    /* ---- Roadmap Phase 1: UAX #29 grapheme stepping (§I.1) ------ */
+
+    /// `step_right` walks one grapheme cluster — a base char + its
+    /// combining marks traverse as ONE step, never bisecting a fused
+    /// glyph. Arabic ARABIC LETTER YEH + FATHATAN is `يً` (2 chars, 4
+    /// UTF-8 bytes, 1 grapheme).
+    #[test]
+    fn step_right_skips_combining_marks_as_one_grapheme() {
+        let doc = one_para_doc("aيًb");
+        /* Offsets:
+           0 = 'a'         (1 byte)
+           1 = 'ي'         (2 bytes)
+           3 = ARABIC FATHATAN U+064B (2 bytes, combining mark on ي)
+           5 = 'b'         (1 byte)
+           6 = end
+        */
+        let out = step_right(&doc, bpos_top(0, 1));
+        assert_eq!(out.offset, 5, "ي+ٌ are one grapheme — caret skips past both");
+    }
+
+    /// Symmetric — `step_left` from after 'b' skips both ي and its
+    /// combining mark in one motion.
+    #[test]
+    fn step_left_skips_combining_marks_as_one_grapheme() {
+        let doc = one_para_doc("aيًb");
+        let out = step_left(&doc, bpos_top(0, 5));
+        assert_eq!(out.offset, 1);
+    }
+
+    /* ---- Roadmap Phase 1: UAX #29 word boundaries (§II) ---------- */
+
+    /// `"isn't"` is ONE word — the apostrophe joins under UAX #29 WB6/WB7,
+    /// so WordRight from offset 0 lands past the contraction, on 'd'.
+    #[test]
+    fn word_right_treats_contraction_as_one_word() {
+        let doc = one_para_doc("isn't done");
+        let out = step_word_right(&doc, bpos_top(0, 0));
+        let expected = "isn't ".len() as u32;
+        assert_eq!(out.offset, expected, "land on 'd' of 'done'");
+    }
+
+    /// `"3.14"` is ONE word — period between digits is MidNumLet/MidNum
+    /// under WB11/WB12, so WordRight from offset 0 jumps past `3.14`.
+    #[test]
+    fn word_right_keeps_decimal_number_intact() {
+        let doc = one_para_doc("3.14 pi");
+        let out = step_word_right(&doc, bpos_top(0, 0));
+        assert_eq!(out.offset, "3.14 ".len() as u32, "land on 'p' of 'pi'");
+    }
+
+    /* ---- Roadmap Phase 1: Home / End (§I.2, §III.4) -------------- */
+
+    /// `MoveDirection::DocHome` lands the caret at offset 0 of the
+    /// document's first paragraph. (Native — drives the engine directly,
+    /// no layout config; `DocHome` doesn't depend on geometry.)
+    #[test]
+    fn doc_home_and_end_address_document_boundaries() {
+        let mut e = Engine {
+            page_ctxs: Vec::new(),
+            ctx: None,
+            fonts: HashMap::new(),
+            undo: UndoStack::new(DocumentTree::from_text("hello world"), 8),
+            layout_cfg: None,
+            atlas: GlyphAtlas::new(),
+            vello: None,
+            dirty: DirtyTracker::new(),
+            selection: Some(SelectionState {
+                anchor: bpos_top(0, 5),
+                caret: bpos_top(0, 5),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            composition: None,
+            pending_format: None,
+            layout_cache: new_layout_cache(),
+            a11y_cache: None,
+            image_cache: HashMap::new(),
+            last_paint_dims: (0.0, 0),
+        };
+        e.do_move_caret(MoveDirection::DocHome, false);
+        assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
+        e.do_move_caret(MoveDirection::DocEnd, false);
+        assert_eq!(
+            e.selection.as_ref().unwrap().caret.offset,
+            "hello world".len() as u32
+        );
+    }
+
+    /* ---- Roadmap Phase 1: BiDi visual-arrow flip (§III.1) -------- */
+
+    /// In an RTL paragraph, `MoveDirection::Right` maps to logical
+    /// **backward** (smaller byte offset) — the visual-right caret motion
+    /// the user expects in Arabic text.
+    #[test]
+    fn arrow_right_in_rtl_paragraph_steps_logical_backward() {
+        let mut e = Engine {
+            page_ctxs: Vec::new(),
+            ctx: None,
+            fonts: HashMap::new(),
+            undo: UndoStack::new(DocumentTree::from_text("مرحبا"), 8),
+            layout_cfg: None,
+            atlas: GlyphAtlas::new(),
+            vello: None,
+            dirty: DirtyTracker::new(),
+            selection: Some(SelectionState {
+                /* Mid-word in "مرحبا" — offset 4 sits between two
+                Arabic letters (each 2 bytes). */
+                anchor: bpos_top(0, 4),
+                caret: bpos_top(0, 4),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            composition: None,
+            pending_format: None,
+            layout_cache: new_layout_cache(),
+            a11y_cache: None,
+            image_cache: HashMap::new(),
+            last_paint_dims: (0.0, 0),
+        };
+        e.do_move_caret(MoveDirection::Right, false);
+        /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
+        assert_eq!(e.selection.as_ref().unwrap().caret.offset, 2);
+    }
+
+    /// In an RTL paragraph, `MoveDirection::Left` steps logical
+    /// **forward** (visual-left = logical-forward in RTL text).
+    #[test]
+    fn arrow_left_in_rtl_paragraph_steps_logical_forward() {
+        let mut e = Engine {
+            page_ctxs: Vec::new(),
+            ctx: None,
+            fonts: HashMap::new(),
+            undo: UndoStack::new(DocumentTree::from_text("مرحبا"), 8),
+            layout_cfg: None,
+            atlas: GlyphAtlas::new(),
+            vello: None,
+            dirty: DirtyTracker::new(),
+            selection: Some(SelectionState {
+                anchor: bpos_top(0, 4),
+                caret: bpos_top(0, 4),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            composition: None,
+            pending_format: None,
+            layout_cache: new_layout_cache(),
+            a11y_cache: None,
+            image_cache: HashMap::new(),
+            last_paint_dims: (0.0, 0),
+        };
+        e.do_move_caret(MoveDirection::Left, false);
+        /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
+        assert_eq!(e.selection.as_ref().unwrap().caret.offset, 6);
     }
 }
