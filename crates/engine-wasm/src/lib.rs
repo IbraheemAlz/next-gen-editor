@@ -744,6 +744,41 @@ fn kurbo_to_bridge(r: Rect) -> BridgeRect {
 /// Bridge `UnderlineStyle` ↔ engine `UnderlineStyle` — same variant
 /// names; mapper just keeps the two enum types from leaking into each
 /// other's crates.
+/// Phase 2 audit (gap A.12) — for each `\u{000C}` (FORM FEED) byte in
+/// `text`, find the index of the [`ParagraphBox`] line whose source
+/// range covers that byte. Returns the list deduped + sorted so the
+/// paginator's split walks them in document order.
+///
+/// A line "covers" a byte when any of its `VisualRun`s has a
+/// `source_range` whose `[start, end)` straddles the FORM FEED's byte
+/// position. The U+000C glyph itself shapes to .notdef in most fonts
+/// (zero advance, no visible mark), so the line carrying it ends
+/// naturally at the mandatory break ICU inserted at that position.
+fn compute_page_break_lines(text: &str, para_box: &ParagraphBox) -> Vec<usize> {
+    let ff_positions: Vec<usize> = text
+        .char_indices()
+        .filter_map(|(i, c)| (c == '\u{000C}').then_some(i))
+        .collect();
+    if ff_positions.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<usize> = Vec::new();
+    for (line_idx, line) in para_box.lines.iter().enumerate() {
+        for run in &line.runs {
+            let lo = run.source_range.start as usize;
+            let hi = run.source_range.end as usize;
+            for &pos in &ff_positions {
+                if pos >= lo && pos < hi && !out.contains(&line_idx) {
+                    out.push(line_idx);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn bridge_to_engine_underline(b: UnderlineStyle) -> engine::UnderlineStyle {
     match b {
         UnderlineStyle::None => engine::UnderlineStyle::None,
@@ -3443,6 +3478,17 @@ impl Engine {
                                 evaluated_text: None,
                             })
                             .collect();
+                        /* Phase 2 audit (gap A.12) — scan paragraph text
+                        for U+000C FORM FEED (the reader's mapping of
+                        `<w:br w:type="page"/>`) and stamp the
+                        containing line index onto
+                        `page_break_after_line`. The paginator's
+                        push_paragraph_split consults this list before
+                        the budget-based split so each page-break char
+                        forces a flush regardless of remaining content
+                        height. */
+                        para_box.page_break_after_line =
+                            compute_page_break_lines(&para.text, &para_box);
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);

@@ -194,6 +194,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         marker,
         source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
         fields: Vec::new(),
+        page_break_after_line: Vec::new(),
     }
 }
 

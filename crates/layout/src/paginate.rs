@@ -298,7 +298,18 @@ impl Paginator {
         the pathological single-line-bigger-than-page case. */
         let is_paragraph = matches!(block, LayoutBlock::Paragraph(_));
         let atomic_overflow_ok = !is_paragraph && self.cur_blocks.is_empty();
-        if block_height <= remaining || atomic_overflow_ok {
+        /* Phase 2 audit (gap A.12) — paragraphs carrying a forced
+        page break (`\u{000C}` FORM FEED → `page_break_after_line`
+        populated by the layout pass) must always route through the
+        split path, regardless of remaining budget. Otherwise the
+        fast "fits whole" branch swallows the break and Word's
+        page-break semantics are silently dropped. */
+        let has_forced_break = if let LayoutBlock::Paragraph(p) = &block {
+            !p.page_break_after_line.is_empty()
+        } else {
+            false
+        };
+        if (block_height <= remaining || atomic_overflow_ok) && !has_forced_break {
             let mut origin = block.origin();
             origin.x = 0.0;
             origin.y = self.cur_y;
@@ -307,15 +318,23 @@ impl Paginator {
             self.cur_blocks.push(block);
             return;
         }
-
-        /* Overflow. Roll back the provisional footnote commit before
-        retrying: the refs belong to the block, the block is going to
-        the next page, and they should land in that page's band. */
-        self.rollback_footnotes(&new_refs, added_height, added_separator);
+        /* Rollback footnote provisional commit only for the
+        budget-overflow branch — a forced break still keeps its
+        footnote refs on the current page (the head lands here, the
+        tail starts a new page where its own footnotes accumulate
+        anew). */
+        if !has_forced_break {
+            /* Overflow. Roll back the provisional footnote commit
+            before retrying: the refs belong to the block, the block
+            is going to the next page, and they should land in that
+            page's band. */
+            self.rollback_footnotes(&new_refs, added_height, added_separator);
+        }
 
         /* Pure block-level (a table on a non-empty page that doesn't
         fit) is the easy case: flush, retry. Paragraphs split at line
-        boundaries. */
+        boundaries (`push_paragraph_split` also handles the forced
+        page-break path). */
         match block {
             LayoutBlock::Paragraph(p) => self.push_paragraph_split(p, after),
             LayoutBlock::Table(t) => self.push_table_split(t, after),
@@ -366,6 +385,45 @@ impl Paginator {
     }
 
     fn push_paragraph_split(&mut self, para: ParagraphBox, after: f32) {
+        /* Phase 2 audit (gap A.12) — forced page break path. If the
+        paragraph carries a `\u{000C}` FORM FEED (the reader's
+        mapping of `<w:br w:type="page"/>`), the earliest line index
+        in `page_break_after_line` wins over the budget-based split:
+        head covers `0..=first_break` and flushes the page
+        unconditionally, then the tail re-enters `push_block` on a
+        fresh page where any remaining breaks fire on their own
+        iteration.
+
+        Head's page_break_after_line slot is cleared before the
+        inner push so the budget path doesn't re-trigger this same
+        forced flush. Tail keeps its remaining breaks (already
+        index-shifted by `split_page_breaks`). */
+        if let Some(&first_break) = para.page_break_after_line.first() {
+            let split_after = first_break + 1;
+            let (head_opt, tail_opt) = split_paragraph_at_line_index(&para, split_after);
+            if let Some(mut head) = head_opt {
+                /* Strip the consumed break from head's list so the
+                inner budget push doesn't recurse on it. */
+                head.page_break_after_line.clear();
+                /* Re-route through `push_block` — the budget split
+                still applies inside head (a paragraph longer than
+                a page that also contains a page break needs to
+                page-overflow the head AND then force-flush at the
+                break boundary). `after = 0.0` because the
+                outer-call's `after` belongs to the tail's last
+                line, not the forced break. */
+                self.push_block(LayoutBlock::Paragraph(head), 0.0, 0.0);
+            }
+            /* Force the flush even when head was empty (page break at
+            the very first line — produces a blank "current page"
+            then the tail starts fresh; matches Word's behaviour). */
+            self.flush_page();
+            if let Some(tail) = tail_opt {
+                self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
+            }
+            return;
+        }
+
         let remaining = self.geometry.content_height() - self.cur_y - self.cur_footnote_height;
         let (head, tail) = split_paragraph_at_line(&para, remaining);
 
@@ -748,6 +806,7 @@ pub fn split_paragraph_at_line(
         .map(|l| l.origin.y + l.height)
         .unwrap_or(0.0);
 
+    let (head_pb, tail_pb) = split_page_breaks(&para.page_break_after_line, split_idx);
     let head = ParagraphBox {
         origin: para.origin,
         size: Size {
@@ -767,6 +826,7 @@ pub fn split_paragraph_at_line(
         field that ends up on the tail still gets re-evaluated; the
         paginator decides per-page which copy gets stamped. */
         fields: para.fields.clone(),
+        page_break_after_line: head_pb,
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -779,8 +839,93 @@ pub fn split_paragraph_at_line(
         marker: None,
         source_paragraph_id: para.source_paragraph_id,
         fields: para.fields.clone(),
+        page_break_after_line: tail_pb,
     };
     (Some(head), Some(tail))
+}
+
+/// Phase 2 audit (gap A.12) — paragraph splitter that cuts at an
+/// exact line index instead of a height budget. Mirrors
+/// [`split_paragraph_at_line`] but takes a deterministic `split_idx`
+/// (number of lines that go to the head; lines `[split_idx..]` go to
+/// the tail). The forced-flush path the paginator uses for
+/// `\u{000C}` FORM FEED breaks needs this — budget-based split
+/// won't fire when the paragraph still has remaining content height.
+pub fn split_paragraph_at_line_index(
+    para: &ParagraphBox,
+    split_idx: usize,
+) -> (Option<ParagraphBox>, Option<ParagraphBox>) {
+    if split_idx == 0 {
+        return (None, Some(para.clone()));
+    }
+    if split_idx >= para.lines.len() {
+        return (Some(para.clone()), None);
+    }
+    let head_lines: Vec<LineBox> = para.lines[..split_idx].to_vec();
+    let mut tail_lines: Vec<LineBox> = para.lines[split_idx..].to_vec();
+    let split_y = tail_lines
+        .first()
+        .map(|l| l.origin.y)
+        .unwrap_or(para.size.height);
+    for l in tail_lines.iter_mut() {
+        l.origin.y -= split_y;
+    }
+    let head_height = head_lines
+        .last()
+        .map(|l| l.origin.y + l.height)
+        .unwrap_or(0.0);
+    let tail_height = tail_lines
+        .last()
+        .map(|l| l.origin.y + l.height)
+        .unwrap_or(0.0);
+    let (head_pb, tail_pb) = split_page_breaks(&para.page_break_after_line, split_idx);
+    let head = ParagraphBox {
+        origin: para.origin,
+        size: Size {
+            width: para.size.width,
+            height: head_height,
+        },
+        lines: head_lines,
+        direction: para.direction,
+        marker: para.marker.clone(),
+        source_paragraph_id: para.source_paragraph_id,
+        fields: para.fields.clone(),
+        page_break_after_line: head_pb,
+    };
+    let tail = ParagraphBox {
+        origin: Point { x: 0.0, y: 0.0 },
+        size: Size {
+            width: para.size.width,
+            height: tail_height,
+        },
+        lines: tail_lines,
+        direction: para.direction,
+        marker: None,
+        source_paragraph_id: para.source_paragraph_id,
+        fields: para.fields.clone(),
+        page_break_after_line: tail_pb,
+    };
+    (Some(head), Some(tail))
+}
+
+/// Phase 2 audit (gap A.12) — split a `page_break_after_line` index
+/// list across a paragraph break at line `split_idx`. The split
+/// boundary itself lives in `head` (head retains lines `0..split_idx`,
+/// tail starts at the original `split_idx`).
+///
+/// Indices `< split_idx` stay on `head` verbatim. Indices `>= split_idx`
+/// move to `tail` and shift down by `split_idx` so they index into the
+/// tail's own line array. Index `split_idx - 1` (a page break exactly
+/// at the line that ends the head) stays with head; the paginator
+/// flushes after head emits and tail starts on a fresh page.
+fn split_page_breaks(orig: &[usize], split_idx: usize) -> (Vec<usize>, Vec<usize>) {
+    let head: Vec<usize> = orig.iter().filter(|&&i| i < split_idx).copied().collect();
+    let tail: Vec<usize> = orig
+        .iter()
+        .filter(|&&i| i >= split_idx)
+        .map(|&i| i - split_idx)
+        .collect();
+    (head, tail)
 }
 
 #[cfg(test)]
@@ -830,6 +975,7 @@ mod tests {
             marker: None,
             source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
             fields: Vec::new(),
+            page_break_after_line: Vec::new(),
         }
     }
 
@@ -902,6 +1048,7 @@ mod tests {
                 marker: None,
                 source_paragraph_id: tag,
                 fields: Vec::new(),
+                page_break_after_line: Vec::new(),
             }],
         }
     }
@@ -942,6 +1089,7 @@ mod tests {
                 instruction: instruction.to_string(),
                 evaluated_text: None,
             }],
+            page_break_after_line: Vec::new(),
         }
     }
 
@@ -1072,6 +1220,155 @@ mod tests {
                 .and_then(|f| f.evaluated_text.clone());
             assert_eq!(f.as_deref(), Some("4"), "page {i} footer NUMPAGES");
         }
+    }
+
+    /// Helper — build a paragraph with N lines and a forced page
+    /// break recorded after line index `break_after`.
+    fn fake_paragraph_with_page_break(
+        n: usize,
+        line_height: f32,
+        break_after: usize,
+    ) -> ParagraphBox {
+        let mut p = fake_paragraph(n, line_height);
+        p.page_break_after_line = vec![break_after];
+        p
+    }
+
+    #[test]
+    fn form_feed_forces_page_flush_mid_paragraph() {
+        /* Paragraph: 6 lines, page break after line 2. Even though
+        the whole paragraph fits on a single A4 page (6 × 16 = 96 pt
+        << 698 pt budget), the break forces a flush after line 2 →
+        page 1 carries lines 0..=2 (3 lines), page 2 carries lines
+        3..=5 (3 lines). */
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_page_break(6, 16.0, 2)),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 2, "expected 2 pages from forced break");
+        let head_lines = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                LayoutBlock::Paragraph(p) => Some(p.lines.len()),
+                _ => None,
+            })
+            .next()
+            .unwrap_or(0);
+        let tail_lines = pages[1]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                LayoutBlock::Paragraph(p) => Some(p.lines.len()),
+                _ => None,
+            })
+            .next()
+            .unwrap_or(0);
+        assert_eq!(head_lines, 3, "page 1 head must hold lines 0..=2");
+        assert_eq!(tail_lines, 3, "page 2 tail must hold lines 3..=5");
+    }
+
+    #[test]
+    fn multiple_form_feeds_split_into_three_pages() {
+        /* Two breaks in one paragraph: after line 1 and line 3 →
+        page 1 = lines 0..=1, page 2 = lines 2..=3, page 3 = lines
+        4..=5. Verifies index remap on the recursive split (the
+        second break's index shifts down by `split_idx` for the
+        tail's local indexing). */
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        let mut p = fake_paragraph(6, 16.0);
+        p.page_break_after_line = vec![1, 3];
+        pag.push_block(LayoutBlock::Paragraph(p), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 3, "expected 3 pages from two breaks");
+        let count = |i: usize| -> usize {
+            pages[i]
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    LayoutBlock::Paragraph(p) => Some(p.lines.len()),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or(0)
+        };
+        assert_eq!(count(0), 2);
+        assert_eq!(count(1), 2);
+        assert_eq!(count(2), 2);
+    }
+
+    #[test]
+    fn form_feed_on_last_line_flushes_but_no_dangling_empty_page() {
+        /* Break after the final line: head = whole paragraph, tail
+        is empty so no second page emits. `finish` still produces a
+        page count of 1 (the head page), not 2 (avoiding a dangling
+        empty page after the break). */
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_page_break(4, 16.0, 3)),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        /* Head fills page 1; tail is empty so the forced flush emits
+        page 1 but `finish` does not emit a phantom page 2 because
+        `cur_blocks` stays empty after the flush. */
+        assert_eq!(
+            pages.len(),
+            1,
+            "no dangling empty page after terminal break"
+        );
+        let line_count = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                LayoutBlock::Paragraph(p) => Some(p.lines.len()),
+                _ => None,
+            })
+            .next()
+            .unwrap_or(0);
+        assert_eq!(line_count, 4, "all 4 lines on the single page");
+    }
+
+    #[test]
+    fn form_feed_tail_starts_at_top_no_y_offset_drift() {
+        /* After the forced split, the tail's first line origin must
+        sit at y=0 within its new ParagraphBox. The renderer adds
+        the page-level origin (content_y), so a non-zero residual
+        from the source paragraph would push the tail down the page
+        — exactly the "dangling empty line" bug. Verify by
+        inspecting the first line of the tail page. */
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_page_break(4, 16.0, 1)),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 2);
+        let tail_para = pages[1]
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                LayoutBlock::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("tail paragraph");
+        assert_eq!(
+            tail_para.lines[0].origin.y, 0.0,
+            "tail's first line must start at y=0 (no drift)"
+        );
+        assert_eq!(
+            tail_para.origin.y, 0.0,
+            "tail paragraph origin at content top"
+        );
     }
 
     #[test]

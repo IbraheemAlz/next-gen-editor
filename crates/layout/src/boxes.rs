@@ -180,6 +180,16 @@ pub struct ParagraphBox {
     /// [`engine::Paragraph::fields`]; the paginator mutates
     /// `evaluated_text` on the page-owned copy of the `ParagraphBox`.
     pub fields: Vec<LayoutField>,
+    /// Phase 2 audit (gap A.12) — line indices after which the
+    /// paginator must force `flush_page`. Populated by the layout
+    /// builder for every line containing a `\u{000C}` FORM FEED (the
+    /// reader's representation of `<w:br w:type="page"/>`). The
+    /// paginator's `push_paragraph_split` consults this list before
+    /// the budget-based split so a mid-paragraph page break fires
+    /// regardless of remaining content height. Indices remap on
+    /// paragraph split (head keeps `[i ≤ split_idx]`; tail keeps
+    /// `[i > split_idx]` shifted by `split_idx + 1`).
+    pub page_break_after_line: Vec<usize>,
 }
 
 impl ParagraphBox {
