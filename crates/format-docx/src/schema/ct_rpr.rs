@@ -89,6 +89,18 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
                 .or_else(|| attr_val(e, b"w:cs"))
                 .and_then(|v| family_from_docx(&v));
         }
+        /* `<w:sz w:val="N"/>` and `<w:szCs w:val="N"/>` — N is half-points
+        (Word's native encoding; `w:val="24"` = 12 pt). `w:sz` targets ASCII
+        + high-ANSI runs; `w:szCs` targets complex-script (Arabic, Hebrew,
+        Thai) runs. The engine carries one `font_size` slot, so both fold
+        into it; `w:szCs` wins when both appear because OOXML lists it
+        second in CT_RPr and complex-script docs depend on it. */
+        b"w:sz" | b"w:szCs" => {
+            if let Some(half_pts) = attr_val(e, b"w:val").and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                style.font_size = Some((half_pts as f32) / 2.0);
+            }
+        }
         _ => {}
     }
 }

@@ -7,8 +7,8 @@ use crate::error::DocxError;
 use crate::opc::archive::{DOC_XML, DocxArchive};
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, FontFamily,
-    InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, RowHeight, SpanStyle, Table,
-    TableCell, TableRow, TextDirection, VMergeRole,
+    InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, Revision, RevisionKind,
+    RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection, VMergeRole,
 };
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -119,6 +119,14 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
     if let Some([r, g, b, _]) = style.color {
         out.push_str(&format!("<w:color w:val=\"{r:02X}{g:02X}{b:02X}\"/>"));
     }
+    /* `<w:sz>` / `<w:szCs>` — Word's half-point encoding; round to nearest.
+    Emit both elements so ASCII + complex-script runs (Arabic, Hebrew,
+    Thai) both pick up the size. Word's own writer always pairs them. */
+    if let Some(pt) = style.font_size {
+        let half_pts = (pt * 2.0).round().max(2.0) as u32;
+        out.push_str(&format!("<w:sz w:val=\"{half_pts}\"/>"));
+        out.push_str(&format!("<w:szCs w:val=\"{half_pts}\"/>"));
+    }
     if style.underline == Some(true) {
         out.push_str("<w:u w:val=\"single\"/>");
     }
@@ -134,11 +142,66 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
 /// `xml:space="preserve"` keeps leading/trailing whitespace; matters for
 /// Arabic trailing-shadda etc.
 fn serialize_run(text: &str, style: &SpanStyle, out: &mut String) {
+    serialize_run_kind(text, style, false, out);
+}
+
+/// `serialize_run`, with a `delete_kind` flag that swaps `<w:t>` for
+/// `<w:delText>` when the run sits inside a `<w:del>` wrapper. OOXML
+/// requires the renamed element so the deleted bytes don't display as
+/// live content in readers that strip tracked-change markup.
+fn serialize_run_kind(text: &str, style: &SpanStyle, delete_kind: bool, out: &mut String) {
+    let tag = if delete_kind { "w:delText" } else { "w:t" };
     out.push_str("<w:r>");
     emit_rpr(style, out);
-    out.push_str("<w:t xml:space=\"preserve\">");
+    out.push_str(&format!("<{tag} xml:space=\"preserve\">"));
     push_escaped(text, out);
-    out.push_str("</w:t></w:r>");
+    out.push_str(&format!("</{tag}></w:r>"));
+}
+
+/// Escape `&` `<` `>` `"` for an XML attribute value. Quotes matter here
+/// (unlike character data) because attribute values are quote-delimited.
+fn push_escaped_attr(text: &str, out: &mut String) {
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Emit the opening tag of a `<w:ins>` / `<w:del>` wrapper. `id` defaults
+/// to the writer-assigned fallback when the engine model carries none —
+/// Word requires `w:id` on every wrapper, the value must be unique within
+/// the document, but is otherwise opaque.
+fn emit_revision_open(rev: &Revision, fallback_id: u32, out: &mut String) {
+    let tag = match rev.kind {
+        RevisionKind::Insert => "w:ins",
+        RevisionKind::Delete => "w:del",
+    };
+    let id = rev.id.unwrap_or(fallback_id);
+    out.push_str(&format!("<{tag} w:id=\"{id}\""));
+    if !rev.author.is_empty() {
+        out.push_str(" w:author=\"");
+        push_escaped_attr(&rev.author, out);
+        out.push('"');
+    }
+    if !rev.date.is_empty() {
+        out.push_str(" w:date=\"");
+        push_escaped_attr(&rev.date, out);
+        out.push('"');
+    }
+    out.push('>');
+}
+
+fn emit_revision_close(kind: RevisionKind, out: &mut String) {
+    let tag = match kind {
+        RevisionKind::Insert => "w:ins",
+        RevisionKind::Delete => "w:del",
+    };
+    out.push_str(&format!("</{tag}>"));
 }
 
 /// `<w:jc w:val="…"/>` token for an `Alignment`. Word emits writing-direction-
@@ -234,7 +297,7 @@ fn emit_ppr(props: &ParaProperties, out: &mut String) {
 fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("<w:p>");
     emit_ppr(&para.props, out);
-    if para.spans.is_empty() && para.inline_objects.is_empty() {
+    if para.spans.is_empty() && para.inline_objects.is_empty() && para.revisions.is_empty() {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
         emit_styled_runs_with_objects(para, out);
@@ -242,59 +305,137 @@ fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("</w:p>");
 }
 
-/// Walk the paragraph as maximal (range, style) segments — gaps
-/// between explicit spans get the default style. At every byte offset
-/// that hosts an `InlineObject`, emit a `<w:drawing>` (or other inline)
-/// run in place of the U+FFFC OBJECT REPLACEMENT CHARACTER. The walk
-/// keeps the run-style continuous across the anchor — a styled span
-/// that brackets the image still emits its `<w:rPr>` on the surrounding
-/// text runs.
+/// Walk the paragraph as a single ordered pass weaving three orthogonal
+/// overlays:
+///
+/// 1. **Style spans** — each contiguous byte range carries a `SpanStyle`
+///    that becomes the run's `<w:rPr>`.
+/// 2. **Inline objects** — anchored at a single U+FFFC byte; emit the
+///    object's own run shape (`<w:drawing>`, `<w:footnoteReference>`, …)
+///    in place of the anchor character.
+/// 3. **Revisions** — `<w:ins>` / `<w:del>` wrappers covering byte
+///    ranges that group one-or-more `<w:r>` children. When a run sits
+///    inside a `<w:del>`, its `<w:t>` switches to `<w:delText>`.
+///
+/// **Emission algorithm.** All three overlays contribute *cut points*
+/// into a sorted, deduped position set. The walk advances one segment
+/// `[lo, hi)` at a time. Before emitting a segment we sync the open
+/// revision stack to position `lo`:
+///
+/// - Pop (close) any revision whose `end <= lo`. Stack discipline
+///   guarantees innermost-first close order, so the emitted XML is
+///   well-formed for properly-nested input (reader builds the input
+///   via its own balanced stack, so this invariant holds in practice).
+/// - Push (open) any revision whose `start <= lo && end > lo` that is
+///   not yet on the stack. Multiple revisions opening at the same
+///   position are sorted `(start ASC, end DESC)` so the outermost
+///   opens first — keeps `<w:ins><w:del>…</w:del></w:ins>` nesting
+///   visually consistent with the reader's stack order.
+///
+/// After sync, the segment emits exactly one element: an inline object
+/// (when `lo` is anchor-aligned) or a single `<w:r>` for `text[lo..hi)`
+/// at the style resolved at `lo`. The `in_del` flag — true when *any*
+/// `Delete` revision is currently on the stack — switches the `<w:t>`
+/// element to `<w:delText>`.
+///
+/// At end-of-text every still-open revision flushes its close in
+/// stack-LIFO order.
 fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
     let len = para.text.len();
-    let mut cursor = 0usize;
-    let mut obj_iter = para.inline_objects.iter().peekable();
-    /* Iterate by span (or by full text when no spans), splitting each
-    segment at any inline-object anchors that fall inside it. */
-    let style_segments: Vec<(usize, usize, SpanStyle)> = if para.spans.is_empty() {
-        vec![(0, len, SpanStyle::default())]
-    } else {
-        let mut segs: Vec<(usize, usize, SpanStyle)> = Vec::with_capacity(para.spans.len() * 2 + 1);
-        for span in &para.spans {
-            let (rs, re) = (span.start as usize, span.end as usize);
-            if rs > cursor {
-                segs.push((cursor, rs, SpanStyle::default()));
-            }
-            if re > rs {
-                segs.push((rs, re, span.style));
-            }
-            cursor = re;
-        }
-        if cursor < len {
-            segs.push((cursor, len, SpanStyle::default()));
-        }
-        segs
+
+    /* Cut-point set: paragraph bounds, every span edge, every inline
+    object anchor + its 3-byte trailing edge, every revision boundary.
+    BTreeSet sorts + dedups in one pass. */
+    let mut cuts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    cuts.insert(0);
+    cuts.insert(len);
+    for s in &para.spans {
+        cuts.insert((s.start as usize).min(len));
+        cuts.insert((s.end as usize).min(len));
+    }
+    for o in &para.inline_objects {
+        let at = (o.at as usize).min(len);
+        cuts.insert(at);
+        cuts.insert((at + OBJECT_REPLACE_UTF8.len()).min(len));
+    }
+    for r in &para.revisions {
+        cuts.insert((r.start as usize).min(len));
+        cuts.insert((r.end as usize).min(len));
+    }
+    let cuts: Vec<usize> = cuts.into_iter().collect();
+
+    /* Revisions sorted for stable open-order at any shared start. */
+    let mut sorted_revs: Vec<&Revision> = para.revisions.iter().collect();
+    sorted_revs.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+
+    /* Inline object lookup by anchor byte. */
+    let obj_at: std::collections::HashMap<usize, &InlineObject> = para
+        .inline_objects
+        .iter()
+        .map(|o| (o.at as usize, o))
+        .collect();
+
+    let style_at = |off: usize| -> SpanStyle {
+        para.spans
+            .iter()
+            .find(|s| off >= s.start as usize && off < s.end as usize)
+            .map(|s| s.style)
+            .unwrap_or_default()
     };
-    for (seg_lo, seg_hi, seg_style) in style_segments {
-        let mut start = seg_lo;
-        while let Some(obj) = obj_iter.peek() {
-            let at = obj.at as usize;
-            if at < start {
-                obj_iter.next();
-                continue;
-            }
-            if at >= seg_hi {
+
+    let mut rev_stack: Vec<&Revision> = Vec::new();
+    let mut next_fallback_id: u32 = 1;
+
+    for win in cuts.windows(2) {
+        let (lo, hi) = (win[0], win[1]);
+        if lo >= hi {
+            continue;
+        }
+
+        /* Close any revisions ending at or before `lo`. Stack LIFO order
+        emits inner closes first, preserving well-formed nesting. */
+        while let Some(top) = rev_stack.last() {
+            if (top.end as usize) <= lo {
+                emit_revision_close(top.kind, out);
+                rev_stack.pop();
+            } else {
                 break;
             }
-            if at > start {
-                serialize_run(&para.text[start..at], &seg_style, out);
+        }
+        /* Open any revisions that should be active at `lo` but are not
+        on the stack yet. `sorted_revs` is in outermost-first order. */
+        for r in &sorted_revs {
+            let rs = r.start as usize;
+            let re = r.end as usize;
+            if rs <= lo
+                && re > lo
+                && !rev_stack
+                    .iter()
+                    .any(|x| std::ptr::eq(*x as *const _, *r as *const _))
+            {
+                let fallback = next_fallback_id;
+                next_fallback_id += 1;
+                emit_revision_open(r, fallback, out);
+                rev_stack.push(r);
             }
-            emit_inline_object(obj_iter.next().expect("peeked"), out);
-            /* The OBJECT REPLACEMENT CHARACTER is 3 UTF-8 bytes. */
-            start = (at + OBJECT_REPLACE_UTF8.len()).min(seg_hi);
         }
-        if start < seg_hi {
-            serialize_run(&para.text[start..seg_hi], &seg_style, out);
+
+        let in_del = rev_stack.iter().any(|r| r.kind == RevisionKind::Delete);
+
+        if let Some(obj) = obj_at.get(&lo) {
+            emit_inline_object(obj, out);
+            /* Skip to the byte after the anchor's UTF-8 length — the
+            object consumes the full anchor character. The cut set
+            already placed a boundary at `lo + OBJECT_REPLACE_UTF8.len()`,
+            so the next window picks up from there naturally. */
+        } else {
+            serialize_run_kind(&para.text[lo..hi], &style_at(lo), in_del, out);
         }
+    }
+
+    /* Drain whatever is still open (revisions extending to `len`). */
+    while let Some(top) = rev_stack.pop() {
+        emit_revision_close(top.kind, out);
     }
 }
 
@@ -836,6 +977,221 @@ mod tests {
         assert_eq!(
             parsed.document.nth_paragraph(0).unwrap().style_at(1),
             styled
+        );
+    }
+
+    #[test]
+    fn round_trip_font_size_sz_szcs() {
+        /* Reader must lift `<w:sz>` / `<w:szCs>` into `SpanStyle.font_size`;
+        writer must emit both elements so ASCII + complex-script runs
+        agree on the size. Half-point math: 13.5 pt = w:val="27". */
+        let sized = SpanStyle {
+            font_size: Some(13.5),
+            ..Default::default()
+        };
+        let para = Paragraph {
+            text: "abc".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 3,
+                style: sized,
+            }],
+            props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
+            dirty: false,
+            source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
+            revisions: Vec::new(),
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        /* Inspect the regenerated document.xml directly — both elements
+        must be present at the matching half-point value. */
+        let saved_doc_xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(
+            saved_doc_xml.contains("<w:sz w:val=\"27\"/>"),
+            "ASCII font-size element missing: {saved_doc_xml}"
+        );
+        assert!(
+            saved_doc_xml.contains("<w:szCs w:val=\"27\"/>"),
+            "complex-script font-size element missing: {saved_doc_xml}"
+        );
+        /* Reader round-trip — value must come back as 13.5 pt. */
+        let parsed = read_docx(&bytes).expect("read");
+        assert_eq!(
+            parsed
+                .document
+                .nth_paragraph(0)
+                .unwrap()
+                .style_at(1)
+                .font_size,
+            Some(13.5)
+        );
+    }
+
+    #[test]
+    fn reader_szcs_overrides_sz_when_both_present() {
+        /* OOXML lists `<w:szCs>` after `<w:sz>` in CT_RPr; complex-script
+        docs depend on it winning. `apply_rpr` folds both into the same
+        slot in document order, so the last one written wins. */
+        use crate::schema::ct_rpr::apply_rpr;
+        use quick_xml::events::Event;
+        use quick_xml::reader::Reader;
+        let xml = br#"<w:rPr><w:sz w:val="20"/><w:szCs w:val="28"/></w:rPr>"#;
+        let mut r = Reader::from_reader(&xml[..]);
+        r.config_mut().trim_text(true);
+        let mut style = SpanStyle::default();
+        let mut buf = Vec::new();
+        loop {
+            match r.read_event_into(&mut buf).unwrap() {
+                Event::Empty(e) | Event::Start(e) if e.name().as_ref() != b"w:rPr" => {
+                    apply_rpr(e.name().as_ref(), &e, &mut style);
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        assert_eq!(style.font_size, Some(14.0));
+    }
+
+    #[test]
+    fn revision_writer_wraps_insert_and_delete_with_attrs() {
+        /* Paragraph: "hello bold world". `<w:ins>` covers "hello "
+        (live insertion); `<w:del>` covers "bold " (tracked deletion).
+        The writer must emit both wrappers around the matching `<w:r>`
+        runs, switch the deleted text's element to `<w:delText>`, and
+        propagate the `w:author` / `w:date` / `w:id` attributes. */
+        let para = Paragraph {
+            text: "hello bold world".into(),
+            spans: Vec::new(),
+            props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
+            dirty: true,
+            source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
+            revisions: vec![
+                Revision {
+                    start: 0,
+                    end: 6,
+                    kind: RevisionKind::Insert,
+                    author: "Alice".into(),
+                    date: "2026-01-01T00:00:00Z".into(),
+                    id: Some(7),
+                },
+                Revision {
+                    start: 6,
+                    end: 11,
+                    kind: RevisionKind::Delete,
+                    author: "Bob".into(),
+                    date: "2026-01-02T00:00:00Z".into(),
+                    id: Some(8),
+                },
+            ],
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let xml = build_document_xml(&doc);
+        /* Insertion: `<w:ins>` with attrs wraps a `<w:r>` carrying
+        "hello " inside a `<w:t>` (live text). */
+        assert!(
+            xml.contains(
+                "<w:ins w:id=\"7\" w:author=\"Alice\" w:date=\"2026-01-01T00:00:00Z\">\
+                 <w:r><w:t xml:space=\"preserve\">hello </w:t></w:r>\
+                 </w:ins>"
+            ),
+            "insert wrapper missing or malformed: {xml}"
+        );
+        /* Deletion: `<w:del>` with attrs wraps a `<w:r>` carrying
+        "bold " inside `<w:delText>` (deleted text). */
+        assert!(
+            xml.contains(
+                "<w:del w:id=\"8\" w:author=\"Bob\" w:date=\"2026-01-02T00:00:00Z\">\
+                 <w:r><w:delText xml:space=\"preserve\">bold </w:delText></w:r>\
+                 </w:del>"
+            ),
+            "delete wrapper missing or malformed: {xml}"
+        );
+        /* Trailing "world" lives outside both wrappers as a plain run. */
+        assert!(xml.contains("<w:r><w:t xml:space=\"preserve\">world</w:t></w:r>"));
+    }
+
+    #[test]
+    fn revision_reader_captures_id_attribute() {
+        /* Read a document carrying a `<w:ins w:id="42">` wrapper and
+        verify the engine model preserves the id. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:ins w:id="42" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:t xml:space="preserve">inserted</w:t></w:r></w:ins></w:p><w:sectPr/></w:body></w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.revisions.len(), 1);
+        assert_eq!(p.revisions[0].id, Some(42));
+        assert_eq!(p.revisions[0].kind, RevisionKind::Insert);
+        assert_eq!(p.revisions[0].author, "A");
+    }
+
+    #[test]
+    fn revision_writer_assigns_fallback_id_when_missing() {
+        /* A `Revision` synthesised in-engine has `id == None`; the writer
+        must assign a fresh sequential id so the emitted XML stays
+        well-formed (Word rejects `<w:ins>` without `w:id`). */
+        let para = Paragraph {
+            text: "x".into(),
+            spans: Vec::new(),
+            props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
+            dirty: true,
+            source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
+            revisions: vec![Revision {
+                start: 0,
+                end: 1,
+                kind: RevisionKind::Insert,
+                author: String::new(),
+                date: String::new(),
+                id: None,
+            }],
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let xml = build_document_xml(&doc);
+        /* Fallback ids start at 1; an attribute-less revision still gets
+        the bare `w:id="1"` attribute. */
+        assert!(
+            xml.contains("<w:ins w:id=\"1\">"),
+            "fallback id missing: {xml}"
         );
     }
 

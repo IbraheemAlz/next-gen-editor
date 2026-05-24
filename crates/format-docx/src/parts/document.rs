@@ -141,7 +141,8 @@ pub fn parse_document_xml(
     covering the byte range produced inside. Stack-shaped so a
     nested ins/del (rare but legal — an insertion inside a deletion)
     still resolves correctly. */
-    let mut revision_stack: Vec<(engine::RevisionKind, String, String, u32)> = Vec::new();
+    let mut revision_stack: Vec<(engine::RevisionKind, String, String, Option<u32>, u32)> =
+        Vec::new();
     /* Phase 8b — `<w:delText>` is the OOXML synonym for `<w:t>` inside a
     `<w:del>` wrapper. The parser collapses both into `run_text` so
     deleted text rides alongside live content; the `Revision` overlay
@@ -328,8 +329,9 @@ pub fn parse_document_xml(
                         };
                         let author = attr_val(&e, b"w:author").unwrap_or_default();
                         let date = attr_val(&e, b"w:date").unwrap_or_default();
+                        let id = attr_val(&e, b"w:id").and_then(|v| v.trim().parse().ok());
                         let start = (para_text.len() + run_text.len()) as u32;
-                        revision_stack.push((kind, author, date, start));
+                        revision_stack.push((kind, author, date, id, start));
                     }
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
@@ -491,7 +493,7 @@ pub fn parse_document_xml(
                     b"w:t" => in_text_elt = false,
                     b"w:delText" => in_del_text_elt = false,
                     b"w:ins" | b"w:del" => {
-                        if let Some((kind, author, date, start)) = revision_stack.pop() {
+                        if let Some((kind, author, date, id, start)) = revision_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
                             if end > start {
                                 para_revisions.push(engine::Revision {
@@ -500,6 +502,7 @@ pub fn parse_document_xml(
                                     kind,
                                     author,
                                     date,
+                                    id,
                                 });
                             }
                         }

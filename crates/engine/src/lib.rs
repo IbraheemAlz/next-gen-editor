@@ -419,7 +419,11 @@ pub enum RevisionKind {
 
 /// Phase 8b — one `<w:ins>` / `<w:del>` overlay on a paragraph's byte
 /// range. `author` + `date` carry the OOXML `w:author` / `w:date`
-/// attributes so the TS shell can surface them on hover.
+/// attributes so the TS shell can surface them on hover. `id` carries
+/// the `w:id` attribute Word's accept/reject UI uses to address an
+/// individual change; `None` for revisions the engine synthesised
+/// (writer assigns a fresh sequential id at emission time) or for
+/// source files that omit the attribute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revision {
     pub start: u32,
@@ -427,6 +431,7 @@ pub struct Revision {
     pub kind: RevisionKind,
     pub author: String,
     pub date: String,
+    pub id: Option<u32>,
 }
 
 /// Phase 7 — a media blob stashed for the renderer to decode.
