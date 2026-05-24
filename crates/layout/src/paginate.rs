@@ -1007,6 +1007,74 @@ mod tests {
     }
 
     #[test]
+    fn header_band_page_field_stamps_per_page() {
+        /* Phase 2 audit (gap D.1 follow-up). A single Default header
+        carrying a PAGE field is cloned per page by the paginator
+        (the `headers.resolve(role)` walk on every flush yields a
+        fresh `HeaderFooterBox.clone()`); the per-page field
+        evaluator stamps each clone with that page's own number. */
+        let geom = a4_geometry();
+        let header_bands = HeaderBands {
+            default: Some(HeaderFooterBox {
+                paragraphs: vec![fake_paragraph_with_field("PAGE", 16.0)],
+            }),
+            first: None,
+            even: None,
+        };
+        let mut pag = Paginator::new(geom, header_bands, HeaderBands::default(), false, false);
+        for _ in 0..3 {
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+            pag.force_page_break();
+        }
+        let pages = pag.finish();
+        assert!(pages.len() >= 3);
+        let header_eval = |page: &PageBox| -> Option<String> {
+            let hf = page.header.as_ref()?;
+            let para = hf.paragraphs.first()?;
+            para.fields.first().and_then(|f| f.evaluated_text.clone())
+        };
+        /* Each page's header carries the OWN page number, not a global
+        constant — proves the clone-then-stamp ordering keeps every
+        page's band independent. */
+        assert_eq!(header_eval(&pages[0]).as_deref(), Some("1"));
+        assert_eq!(header_eval(&pages[1]).as_deref(), Some("2"));
+        assert_eq!(header_eval(&pages[2]).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn footer_band_numpages_stamps_after_finish() {
+        /* NUMPAGES in a footer band waits on the second pass run by
+        `finish`. Before `finish`, the field's `evaluated_text` is
+        whatever `flush_page` produced (None — NUMPAGES is not a
+        first-pass instruction); after `finish`, every page's footer
+        reads the total. */
+        let geom = a4_geometry();
+        let footer_bands = HeaderBands {
+            default: Some(HeaderFooterBox {
+                paragraphs: vec![fake_paragraph_with_field("NUMPAGES", 16.0)],
+            }),
+            first: None,
+            even: None,
+        };
+        let mut pag = Paginator::new(geom, HeaderBands::default(), footer_bands, false, false);
+        for _ in 0..4 {
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+            pag.force_page_break();
+        }
+        let pages = pag.finish();
+        assert!(pages.len() >= 4);
+        for (i, page) in pages.iter().enumerate().take(4) {
+            let f = page
+                .footer
+                .as_ref()
+                .and_then(|hf| hf.paragraphs.first())
+                .and_then(|p| p.fields.first())
+                .and_then(|f| f.evaluated_text.clone());
+            assert_eq!(f.as_deref(), Some("4"), "page {i} footer NUMPAGES");
+        }
+    }
+
+    #[test]
     fn paginator_skips_unknown_field_instruction() {
         /* `DATE` is not evaluated; the field's `evaluated_text` stays
         `None` so the renderer paints the cached glyphs untouched. */

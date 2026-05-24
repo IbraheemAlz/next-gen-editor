@@ -1,18 +1,18 @@
-//! `word/footer*.xml` — minimal read-only model (Phase 6).
+//! `word/footer*.xml` — mirror of [`crate::parts::header`].
 //!
-//! Mirror of [`crate::parts::header`]; the footer XML schema is identical to
-//! the header schema and the engine's downstream model is the same plain
-//! paragraph list. Kept as a separate type so callers reading both can
-//! distinguish them without an enum tag.
+//! Phase 2 audit (gap D.1 follow-up). The XML schema is identical to
+//! the header's; the engine model is the same `Vec<Paragraph>`. Kept
+//! as a separate type so callers reading both can distinguish them by
+//! type without an enum tag.
 
 use crate::error::DocxError;
 use crate::parts::header::{HeaderPart, parse_header_xml};
+use crate::style_resolver::StyleResolver;
+use engine::Paragraph;
 
-/// One footer part — a flat list of paragraph plain-text bodies. Phase 6
-/// scope matches [`HeaderPart`].
 #[derive(Debug, Clone, Default)]
 pub struct FooterPart {
-    pub paragraphs: Vec<String>,
+    pub paragraphs: Vec<Paragraph>,
 }
 
 impl From<HeaderPart> for FooterPart {
@@ -24,6 +24,6 @@ impl From<HeaderPart> for FooterPart {
 }
 
 /// Parse a `word/footer*.xml` byte blob.
-pub fn parse_footer_xml(xml: &[u8]) -> Result<FooterPart, DocxError> {
-    parse_header_xml(xml).map(FooterPart::from)
+pub fn parse_footer_xml(xml: &[u8], resolver: &StyleResolver<'_>) -> Result<FooterPart, DocxError> {
+    parse_header_xml(xml, resolver).map(FooterPart::from)
 }

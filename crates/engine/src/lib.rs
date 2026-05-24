@@ -61,9 +61,14 @@ pub struct DocumentTree {
     /// per-paragraph plain text the header reader extracted. The
     /// paginator looks each `Section`'s `header_ref` up here and renders
     /// the result in the top margin band.
-    pub headers: std::collections::HashMap<String, Vec<String>>,
-    /// Mirror of `headers` for `<w:footerReference>`.
-    pub footers: std::collections::HashMap<String, Vec<String>>,
+    pub headers: std::collections::HashMap<String, Vec<Paragraph>>,
+    /// Mirror of `headers` for `<w:footerReference>`. Phase 2 audit
+    /// (gap D.1 follow-up) — was `Vec<String>`; widened to full
+    /// `Paragraph` so headers/footers carry style spans, inline
+    /// objects, hyperlinks, revisions and `Field` overlays. The
+    /// paginator's per-page field evaluator stamps PAGE/NUMPAGES on
+    /// the laid-out copies these paragraphs produce.
+    pub footers: std::collections::HashMap<String, Vec<Paragraph>>,
     /// Phase 7 — image blobs keyed by their relationship id (`r:id`). The
     /// archive reader fills this from `word/media/*` for every image rel
     /// the document references. Inline images look up by the `rel_id`
@@ -1354,8 +1359,8 @@ impl DocumentTree {
     /// `header_ref` / `footer_ref` resolves.
     pub fn with_header_footer_parts(
         mut self,
-        headers: std::collections::HashMap<String, Vec<String>>,
-        footers: std::collections::HashMap<String, Vec<String>>,
+        headers: std::collections::HashMap<String, Vec<Paragraph>>,
+        footers: std::collections::HashMap<String, Vec<Paragraph>>,
     ) -> Self {
         self.headers = headers;
         self.footers = footers;

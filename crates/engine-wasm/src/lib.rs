@@ -1301,53 +1301,70 @@ fn walk_block_for_footnote_refs(
     }
 }
 
-/// Phase 6b — lay out one section's header (or footer) plain-text
-/// paragraphs into a [`layout::HeaderFooterBox`]. Each entry in
-/// `paragraphs` becomes a fresh `ParagraphBox` laid out at the section's
-/// content width with the document's default style — header / footer
-/// rich-formatting cascade ships in a follow-up sprint. Returns `None`
-/// when every paragraph is empty (nothing to draw).
+/// Phase 2 audit (gap D.1 follow-up) — lay out one section's header
+/// (or footer) paragraphs into a [`layout::HeaderFooterBox`]. The
+/// input is the full `engine::Paragraph` model now, not plain text:
+/// style spans, hyperlinks, revisions and `Field` overlays all
+/// propagate into the laid-out `ParagraphBox` so the paginator's
+/// per-page field evaluator can stamp PAGE / NUMPAGES.
+///
+/// Each paragraph runs through the same `build_style_spans` →
+/// `apply_hyperlink_overlay` → `apply_revision_overlay` →
+/// `layout_paragraph` pipeline as a body paragraph. Indents,
+/// alignment, base direction and line-height inherit from the
+/// paragraph's `props` exactly as in the body path. Returns `None`
+/// when every paragraph is empty.
 fn build_header_footer_box(
-    paragraphs: &[String],
+    paragraphs: &[engine::Paragraph],
     content_width: f32,
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
 ) -> Option<layout::HeaderFooterBox> {
-    if paragraphs.iter().all(|p| p.is_empty()) {
+    if paragraphs.iter().all(|p| p.text.is_empty()) {
         return None;
     }
     let mut paras: Vec<ParagraphBox> = Vec::with_capacity(paragraphs.len());
     let mut y = 0.0_f32;
-    for text in paragraphs {
-        let spans = vec![StyleSpan {
-            start: 0,
-            end: text.len() as u32,
-            px_size: cfg.px_size * scale,
-            color: [0, 0, 0, 255],
-            bold: false,
-            italic: false,
-            underline: engine::UnderlineStyle::None,
-            strike: false,
-            bg_color: None,
-            font_family: None,
-        }];
+    for para in paragraphs {
+        let spans = apply_revision_overlay(
+            apply_hyperlink_overlay(
+                build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale),
+                &para.hyperlinks,
+                [0, 0, 0, 255],
+            ),
+            &para.revisions,
+            [0, 0, 0, 255],
+        );
+        let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&para.props, scale);
         let mut p = layout_paragraph(ParagraphConfig {
-            text,
+            text: &para.text,
             fonts,
             spans: &spans,
-            base_direction: first_strong_direction(text).unwrap_or(cfg.base_direction),
+            base_direction: resolve_base_direction(para, cfg),
             max_width: content_width,
             line_height: cfg.line_height * scale,
-            alignment: cfg.alignment,
-            indent_start_px: 0.0,
-            indent_end_px: 0.0,
-            first_line_indent_px: 0.0,
-            hanging_indent_px: 0.0,
-            marker_text: None,
+            alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+            indent_start_px: ind_s,
+            indent_end_px: ind_e,
+            first_line_indent_px: ind_fl,
+            hanging_indent_px: ind_h,
+            marker_text: para.resolved_marker.clone(),
             px_size_for_marker: cfg.px_size * scale,
             inline_objects: &[],
         });
+        /* Phase 2 audit (gap D.1) — propagate field overlays so the
+        paginator can re-evaluate PAGE / NUMPAGES per page. Identical
+        plumbing to the body-paragraph path. */
+        p.fields = para
+            .fields
+            .iter()
+            .map(|f| layout::LayoutField {
+                byte_range: f.start..f.end,
+                instruction: f.instruction.clone(),
+                evaluated_text: None,
+            })
+            .collect();
         p.origin = Point { x: 0.0, y };
         y += p.size.height;
         paras.push(p);
@@ -3268,7 +3285,7 @@ impl Engine {
             paginator can pick by page parity / first-page / default. */
             let content_w = geom.width - geom.margins.left - geom.margins.right;
             let lay_band = |slot: Option<&String>,
-                            table: &std::collections::HashMap<String, Vec<String>>|
+                            table: &std::collections::HashMap<String, Vec<engine::Paragraph>>|
              -> Option<layout::HeaderFooterBox> {
                 let rid = slot?;
                 build_header_footer_box(table.get(rid)?, content_w, &font_stack, &cfg, scale)
@@ -5471,6 +5488,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -5506,7 +5524,7 @@ mod tests {
                 text: text.to_string(),
                 bold: false,
                 italic: false,
-                underline: engine::UnderlineStyle::None,
+                underline: false,
             }],
         })
     }
@@ -5607,16 +5625,20 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, 3, 3, 16.0, 1.0);
         assert_eq!(spans.len(), 3, "split + composition span");
         assert_eq!((spans[0].start, spans[0].end), (0, 3));
-        assert!(!spans[0].underline);
+        assert!(!spans[0].underline.is_visible());
         assert_eq!((spans[1].start, spans[1].end), (3, 6));
-        assert!(spans[1].underline, "composition span must be underlined");
+        assert!(
+            spans[1].underline.is_visible(),
+            "composition span must be underlined"
+        );
         assert_eq!((spans[2].start, spans[2].end), (6, 9));
-        assert!(!spans[2].underline);
+        assert!(!spans[2].underline.is_visible());
     }
 
     /// Composing at the end of a paragraph appends an underlined span past
@@ -5634,12 +5656,13 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let spans = composition_layout_spans(&p, 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
         assert_eq!((spans[0].start, spans[0].end), (0, 3));
         assert_eq!((spans[1].start, spans[1].end), (3, 5));
-        assert!(spans[1].underline);
+        assert!(spans[1].underline.is_visible());
     }
 
     /// Helper: build a single-paragraph document for the word-jump tests.

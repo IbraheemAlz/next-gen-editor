@@ -125,8 +125,8 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         .find(|(n, _)| n == RELS_XML)
         .and_then(|(_, b)| parse_rels_xml(b).ok())
         .unwrap_or_default();
-    let mut headers: HashMap<String, Vec<String>> = HashMap::new();
-    let mut footers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut headers: HashMap<String, Vec<engine::Paragraph>> = HashMap::new();
+    let mut footers: HashMap<String, Vec<engine::Paragraph>> = HashMap::new();
     let fetch_part = |rid: &str| -> Option<&[u8]> {
         let target = rels.get(rid)?;
         let entry = resolve_target(target);
@@ -151,7 +151,7 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         {
             if !headers.contains_key(rid)
                 && let Some(bytes) = fetch_part(rid)
-                && let Ok(part) = parse_header_xml(bytes)
+                && let Ok(part) = parse_header_xml(bytes, &resolver)
             {
                 headers.insert(rid.to_string(), part.paragraphs);
             }
@@ -166,7 +166,7 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         {
             if !footers.contains_key(rid)
                 && let Some(bytes) = fetch_part(rid)
-                && let Ok(part) = parse_footer_xml(bytes)
+                && let Ok(part) = parse_footer_xml(bytes, &resolver)
             {
                 footers.insert(rid.to_string(), part.paragraphs);
             }

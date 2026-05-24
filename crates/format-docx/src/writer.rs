@@ -1345,6 +1345,79 @@ mod tests {
     }
 
     #[test]
+    fn header_part_parses_rich_paragraphs_with_fields() {
+        /* Phase 2 audit (gap D.1 follow-up). A `word/header1.xml` part
+        carrying a PAGE field must parse into the full `Paragraph`
+        model, not the legacy `Vec<String>` text-only shape. Once on
+        `doc.headers`, downstream consumers (engine-wasm + paginator)
+        see the field overlay and can re-evaluate it per page. */
+        let header_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:p>
+<w:r><w:t xml:space="preserve">Page </w:t></w:r>
+<w:r><w:fldChar w:fldCharType="begin"/></w:r>
+<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>
+<w:r><w:fldChar w:fldCharType="separate"/></w:r>
+<w:r><w:t xml:space="preserve">1</w:t></w:r>
+<w:r><w:fldChar w:fldCharType="end"/></w:r>
+</w:p>
+</w:hdr>"#;
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:body>
+<w:p><w:r><w:t xml:space="preserve">body</w:t></w:r></w:p>
+<w:sectPr><w:headerReference w:type="default" r:id="rIdH1"/></w:sectPr>
+</w:body>
+</w:document>"#;
+        let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rIdH1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+</Relationships>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/_rels/document.xml.rels", doc_rels),
+                ("word/document.xml", document_xml),
+                ("word/header1.xml", header_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        let header_paragraphs = parsed
+            .document
+            .headers
+            .get("rIdH1")
+            .expect("rIdH1 header part parsed");
+        assert_eq!(header_paragraphs.len(), 1);
+        let hp = &header_paragraphs[0];
+        /* Header text contains the "Page " prefix + cached "1". */
+        assert_eq!(hp.text, "Page 1");
+        /* The PAGE field overlay survived the reroute through
+        `parse_document_xml` — proves the header reader is now using
+        the same full-fidelity pipeline document.xml does. */
+        assert_eq!(hp.fields.len(), 1);
+        assert_eq!(hp.fields[0].keyword(), "PAGE");
+        assert_eq!(hp.fields[0].start, 5);
+        assert_eq!(hp.fields[0].end, 6);
+    }
+
+    #[test]
     fn complex_field_round_trip_page_number() {
         /* Reader: walk a `PAGE \\* MERGEFORMAT` complex field split
         across the canonical begin / instrText / separate / cached /
