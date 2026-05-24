@@ -1072,15 +1072,17 @@ fn build_style_spans(
         strike: false,
         bg_color: None,
         font_family: None,
+        caps_transform: false,
     };
     for run in &para.spans {
         if run.start > cursor {
             spans.push(gap(cursor, run.start));
         }
-        spans.push(StyleSpan {
+        let base_px = run.style.font_size.unwrap_or(default_size) * scale;
+        let template = StyleSpan {
             start: run.start,
             end: run.end,
-            px_size: run.style.font_size.unwrap_or(default_size) * scale,
+            px_size: base_px,
             color: run.style.color.unwrap_or(default_color),
             bold: run.style.bold.unwrap_or(false),
             italic: run.style.italic.unwrap_or(false),
@@ -1092,13 +1094,105 @@ fn build_style_spans(
                 .font_family
                 .map(font_family_id)
                 .map(str::to_string),
-        });
+            caps_transform: false,
+        };
+        push_caps_spans(&para.text, &run.style, &template, base_px, &mut spans);
         cursor = run.end;
     }
     if cursor < len {
         spans.push(gap(cursor, len));
     }
     spans
+}
+
+/// Audit gap A.H3 — expand a single engine `StyleRun` into one or more
+/// layout `StyleSpan`s with the caps / smallCaps display contract baked in.
+///
+/// * `<w:caps>` (full caps) → one span covering the run, `caps_transform`
+///   on, full px_size.
+/// * `<w:smallCaps>` → walk the **original** source bytes and split at
+///   case boundaries:
+///     * originally-lowercase ASCII / Unicode letters → sub-span shrunk to
+///       ~80 % of the run's nominal px_size, `caps_transform` on (they
+///       upper-case at shape time);
+///     * everything else (originally-uppercase letters, digits, punctuation,
+///       whitespace) → sub-span at full px_size, `caps_transform` on (a
+///       no-op for non-letters and already-upper letters).
+///
+///   Inspecting the source bytes here — *before* any uppercase transform
+///   has been applied — is how the renderer differentiates the two
+///   classes; once the text reaches the shaper everything is upper.
+///
+/// `caps` wins over `small_caps` when both flags are set, matching OOXML
+/// §17.3.2.7 (`<w:caps>` is the more aggressive of the pair).
+fn push_caps_spans(
+    para_text: &str,
+    rstyle: &engine::SpanStyle,
+    template: &StyleSpan,
+    base_px: f32,
+    out: &mut Vec<StyleSpan>,
+) {
+    let caps = rstyle.caps == Some(true);
+    let small = rstyle.small_caps == Some(true);
+    if !caps && !small {
+        out.push(template.clone());
+        return;
+    }
+    if caps {
+        out.push(StyleSpan {
+            caps_transform: true,
+            ..template.clone()
+        });
+        return;
+    }
+    /* smallCaps split. The slice is paragraph-relative; guard against
+    out-of-bounds (defensive — `run.end` is always ≤ paragraph length). */
+    let lo = template.start as usize;
+    let hi = (template.end as usize).min(para_text.len());
+    if lo >= hi {
+        out.push(StyleSpan {
+            caps_transform: true,
+            ..template.clone()
+        });
+        return;
+    }
+    let slice = &para_text[lo..hi];
+    let small_px = (base_px * 0.8).max(1.0);
+    let mut sub_start = lo as u32;
+    let mut sub_is_lower: Option<bool> = None;
+    for (off, ch) in slice.char_indices() {
+        let abs = (lo + off) as u32;
+        let ch_is_lower = ch.is_lowercase();
+        if sub_is_lower.is_none() {
+            sub_is_lower = Some(ch_is_lower);
+            sub_start = abs;
+            continue;
+        }
+        if Some(ch_is_lower) != sub_is_lower {
+            out.push(StyleSpan {
+                start: sub_start,
+                end: abs,
+                px_size: if sub_is_lower == Some(true) {
+                    small_px
+                } else {
+                    base_px
+                },
+                caps_transform: true,
+                ..template.clone()
+            });
+            sub_start = abs;
+            sub_is_lower = Some(ch_is_lower);
+        }
+    }
+    if let Some(was_lower) = sub_is_lower {
+        out.push(StyleSpan {
+            start: sub_start,
+            end: hi as u32,
+            px_size: if was_lower { small_px } else { base_px },
+            caps_transform: true,
+            ..template.clone()
+        });
+    }
 }
 
 /// Style spans for a paragraph with an IME composition spliced in at `off`.
@@ -1152,6 +1246,7 @@ fn composition_layout_spans(
         strike: st.strike.unwrap_or(false),
         bg_color: st.bg_color,
         font_family: st.font_family.map(font_family_id).map(str::to_string),
+        caps_transform: false,
     });
     out.sort_by_key(|s| s.start);
     out
@@ -1289,6 +1384,7 @@ fn build_footnote_bodies(
             strike: false,
             bg_color: None,
             font_family: None,
+            caps_transform: false,
         }];
         let p = layout_paragraph(ParagraphConfig {
             text: &combined,
@@ -1642,6 +1738,35 @@ fn layout_table_box(
         /* Stamp final row height onto every cell. */
         for c in &mut cells_out {
             c.size.height = row_height;
+        }
+        /* Audit gap A.H1 — `<w:vAlign>`. Now that the row height is final,
+        shift each cell's inner content down by `(cell_inner_height -
+        content_height) * factor` so Center / Bottom alignments park
+        content in the right band of the cell. Continue cells own no
+        content; Restart cells with content shorter than the row gain a
+        visible offset; cells whose content already fills the row stay
+        flush against the top padding (clamp negative slack to 0). */
+        for (c, src_cell) in cells_out.iter_mut().zip(row.cells.iter()) {
+            if matches!(src_cell.props.v_merge, engine::VMergeRole::Continue) {
+                continue;
+            }
+            let factor = match src_cell.props.v_align {
+                engine::VerticalAlign::Top => continue,
+                engine::VerticalAlign::Center => 0.5_f32,
+                engine::VerticalAlign::Bottom => 1.0_f32,
+            };
+            let inner_height = (row_height - c.padding_top - c.padding_bottom).max(0.0);
+            let content_h: f32 = c.content.iter().map(|b| b.size().height).sum();
+            let slack = (inner_height - content_h).max(0.0);
+            if slack <= 0.0 {
+                continue;
+            }
+            let shift = slack * factor;
+            for inner in c.content.iter_mut() {
+                let mut o = inner.origin();
+                o.y += shift;
+                inner.set_origin(o);
+            }
         }
         let row_width = cells_out.iter().map(|c| c.size.width).sum::<f32>();
         rows_out.push(TableRowBox {
@@ -3148,6 +3273,12 @@ impl Engine {
             strike: attrs.strike,
             bg_color: attrs.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
             font_family: attrs.font_family.as_deref().and_then(parse_font_family),
+            /* Audit gap A.H3 — caps / smallCaps round-trip on read +
+            write; the interactive `ApplyFormatting` bridge surface does
+            not yet expose toggles (additive extension for a later
+            sprint), so direct edits leave the flags untouched. */
+            caps: None,
+            small_caps: None,
         };
         /* Sticky formatting (Backlog #11): a collapsed caret has no text to
         style. Rather than push a no-op edit, arm the patch as the pending

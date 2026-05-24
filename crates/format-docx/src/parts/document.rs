@@ -513,6 +513,17 @@ pub fn parse_document_xml(
                     b"a:blip" if in_drawing => {
                         cur_drawing_rel_id = attr_val(&e, b"r:embed");
                     }
+                    b"w:tab" if in_run => {
+                        /* Audit gap A.M5 — `<w:tab/>` inside a `<w:r>`.
+                        Stored as the literal U+0009 TAB byte so the
+                        writer can recognise the anchor and emit the
+                        structural element back. Geometric tab-stop
+                        layout (audit A.M3) is deferred to a later
+                        sprint; the shaper substitutes U+0009 → U+0020
+                        at shape time so the user sees a single space
+                        instead of a `.notdef` tofu glyph. */
+                        run_text.push('\u{0009}');
+                    }
                     b"w:br" if in_run => {
                         /* Phase 2 audit (gap A.12) — `<w:br/>` inside a
                         `<w:r>`. Maps to the Unicode mandatory-break

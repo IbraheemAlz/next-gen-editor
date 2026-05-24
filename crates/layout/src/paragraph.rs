@@ -525,7 +525,37 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
             else {
                 continue;
             };
-            let sub_text = &brun_text[rel_start..rel_end];
+            let sub_text_raw = &brun_text[rel_start..rel_end];
+            /* Audit gap A.H3 / A.M5 — two shape-time substitutions both
+            preserve UTF-8 byte length so glyph clusters keep indexing
+            the source paragraph bytes:
+              * `caps_transform` upper-cases the slice. Guarded — German
+                `ß` → "SS" + a few ligatures change byte length and
+                degrade to "no transform" rather than corrupt clusters.
+              * U+0009 TAB → U+0020 SPACE (always safe, both 1-byte
+                UTF-8). The tab anchor survives in `para.text` for the
+                writer; the shaper just needs a glyph that is not
+                `.notdef` so the user sees a visible gap. */
+            let needs_tab_sub = sub_text_raw.contains('\u{0009}');
+            let owned: Option<String> = if span.caps_transform {
+                let upper = sub_text_raw.to_uppercase();
+                if upper.len() == sub_text_raw.len() {
+                    Some(if needs_tab_sub {
+                        upper.replace('\t', " ")
+                    } else {
+                        upper
+                    })
+                } else if needs_tab_sub {
+                    Some(sub_text_raw.replace('\t', " "))
+                } else {
+                    None
+                }
+            } else if needs_tab_sub {
+                Some(sub_text_raw.replace('\t', " "))
+            } else {
+                None
+            };
+            let sub_text = owned.as_deref().unwrap_or(sub_text_raw);
             let shaped = shape_text(face, sub_text, brun.direction, span.px_size);
             let brun_abs_start = brun_abs + rel_start as u32;
             let glyphs: Vec<PositionedGlyph> = shaped
@@ -640,7 +670,32 @@ fn measure_text(
             else {
                 break;
             };
-            let sub = &text[(cursor - abs_start) as usize..(piece_end - abs_start) as usize];
+            let sub_raw = &text[(cursor - abs_start) as usize..(piece_end - abs_start) as usize];
+            /* Audit gap A.H3 / A.M5 — keep the greedy width probe in
+            sync with `build_line`'s shape input so a line that fits at
+            measure time also fits at build time. Mirror both the
+            caps/smallCaps uppercase transform (length-guarded) and the
+            U+0009 → U+0020 tab substitution (always length-safe). */
+            let needs_tab_sub = sub_raw.contains('\u{0009}');
+            let owned: Option<String> = if span.caps_transform {
+                let upper = sub_raw.to_uppercase();
+                if upper.len() == sub_raw.len() {
+                    Some(if needs_tab_sub {
+                        upper.replace('\t', " ")
+                    } else {
+                        upper
+                    })
+                } else if needs_tab_sub {
+                    Some(sub_raw.replace('\t', " "))
+                } else {
+                    None
+                }
+            } else if needs_tab_sub {
+                Some(sub_raw.replace('\t', " "))
+            } else {
+                None
+            };
+            let sub = owned.as_deref().unwrap_or(sub_raw);
             total += shape_text(face, sub, direction, span.px_size).total_advance;
             cursor = piece_end;
         }

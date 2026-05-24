@@ -71,6 +71,12 @@ pub struct StyleSpan {
     /// Resolved font id for an explicit family request; `None` keeps the
     /// per-script default face (Backlog #9).
     pub font_family: Option<String>,
+    /// Audit gap A.H3 — uppercase the source bytes of this span before
+    /// shaping. Set by `build_style_spans` for `<w:caps>` and `<w:smallCaps>`
+    /// spans; the shaper guards against case-changing length deltas
+    /// (e.g. German `ß` → "SS") to keep glyph clusters aligned with the
+    /// paragraph's source bytes.
+    pub caps_transform: bool,
 }
 
 /// One shaped glyph, positioned by advance/offset relative to the pen. There is

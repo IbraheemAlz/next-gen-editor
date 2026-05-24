@@ -74,6 +74,8 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
         b"w:b" => style.bold = Some(toggle_on(e)),
         b"w:i" => style.italic = Some(toggle_on(e)),
         b"w:strike" => style.strike = Some(toggle_on(e)),
+        b"w:caps" => style.caps = Some(toggle_on(e)),
+        b"w:smallCaps" => style.small_caps = Some(toggle_on(e)),
         b"w:u" => {
             /* `<w:u/>` (no `w:val`) → single. `<w:u w:val="none"/>` → none,
             preserved so it can override an inherited underline.

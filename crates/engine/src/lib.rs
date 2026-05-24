@@ -421,6 +421,17 @@ pub struct SpanStyle {
     pub strike: Option<bool>,
     pub bg_color: Option<[u8; 4]>,
     pub font_family: Option<FontFamily>,
+    /// `<w:caps/>` — display every character of the run as its uppercase
+    /// equivalent. Applied as a `to_uppercase` transform at shape time so
+    /// glyph metrics + BiDi + line breaking all see the visible string.
+    /// `caps` wins over `small_caps` when both are set (OOXML §17.3.2.7).
+    pub caps: Option<bool>,
+    /// `<w:smallCaps/>` — display lowercase characters as reduced-height
+    /// uppercase glyphs while leaving originally-uppercase characters at
+    /// full size. The engine's best-effort approximation uppercases the
+    /// originally-lowercase substrings and shrinks their font_size to
+    /// ~80% of the run's nominal size.
+    pub small_caps: Option<bool>,
 }
 
 impl SpanStyle {
@@ -435,6 +446,8 @@ impl SpanStyle {
             strike: patch.strike.or(self.strike),
             bg_color: patch.bg_color.or(self.bg_color),
             font_family: patch.font_family.or(self.font_family),
+            caps: patch.caps.or(self.caps),
+            small_caps: patch.small_caps.or(self.small_caps),
         }
     }
 }

@@ -729,6 +729,7 @@ mod tests {
             strike: false,
             bg_color: None,
             font_family: None,
+            caps_transform: false,
         }];
         let mut para = layout_paragraph(ParagraphConfig {
             text: "Hello world",
@@ -812,6 +813,7 @@ mod tests {
             strike: false,
             bg_color: None,
             font_family: None,
+            caps_transform: false,
         }];
         let para = layout_paragraph(ParagraphConfig {
             text: "hi",

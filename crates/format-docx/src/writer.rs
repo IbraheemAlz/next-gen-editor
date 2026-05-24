@@ -114,6 +114,16 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
     if style.italic == Some(true) {
         out.push_str("<w:i/>");
     }
+    /* CT_RPr ordering — caps/smallCaps sit between `<w:iCs/>` and
+    `<w:strike/>` (OOXML §17.3.2). When both are on, Word's writer
+    emits both; the reader's `apply_rpr` flips both flags and the
+    shape-time transform prefers `caps` (full-height) over `smallCaps`. */
+    if style.caps == Some(true) {
+        out.push_str("<w:caps/>");
+    }
+    if style.small_caps == Some(true) {
+        out.push_str("<w:smallCaps/>");
+    }
     if style.strike == Some(true) {
         out.push_str("<w:strike/>");
     }
@@ -401,6 +411,11 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
     character (which Word would render as a "missing-glyph" box). */
     let mut break_at: std::collections::HashMap<usize, BreakKind> =
         std::collections::HashMap::new();
+    /* Audit gap A.M5 — `<w:tab/>` round-trip. Reader stashes the literal
+    U+0009 byte at every tab anchor; the writer reinjects the structural
+    `<w:r><w:tab/></w:r>` run at the same offset. Tabs sit alongside
+    `<w:br>` in the cut set because the same boundary mechanic applies. */
+    let mut tab_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (idx, ch) in para.text.char_indices() {
         let kind = match ch {
             '\u{2028}' => Some(BreakKind::Line),
@@ -409,6 +424,11 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
         };
         if let Some(k) = kind {
             break_at.insert(idx, k);
+            cuts.insert(idx);
+            cuts.insert(idx + ch.len_utf8());
+        }
+        if ch == '\u{0009}' {
+            tab_at.insert(idx);
             cuts.insert(idx);
             cuts.insert(idx + ch.len_utf8());
         }
@@ -519,6 +539,11 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
             U+2028 / U+000C character — emit the structural element so
             Word doesn't render the bare Unicode char as a tofu box. */
             emit_br_run(kind, out);
+        } else if tab_at.contains(&lo) {
+            /* Audit gap A.M5 — emit the structural `<w:tab/>` element
+            instead of a literal HT byte; the rPr applies to the tab
+            run so an inherited bold/italic style still survives. */
+            emit_tab_run(&style_at(lo), in_del, out);
         } else {
             serialize_run_kind(&para.text[lo..hi], &style_at(lo), in_del, out);
         }
@@ -573,6 +598,18 @@ fn emit_br_run(kind: BreakKind, out: &mut String) {
         BreakKind::Line => out.push_str("<w:r><w:br/></w:r>"),
         BreakKind::Page => out.push_str("<w:r><w:br w:type=\"page\"/></w:r>"),
     }
+}
+
+/// Audit gap A.M5 — `<w:tab/>` round-trip. Emitted as its own `<w:r>`
+/// so the surrounding rPr applies (bold/italic on a tab is legal and
+/// Word emits it that way). `delete_kind` flips the wrapping element
+/// when the tab sits inside a `<w:del>` block — the tab element itself
+/// has no body so it does not switch tag names, only the enclosing
+/// run picks up `<w:delText>` semantics for any neighbouring text.
+fn emit_tab_run(style: &SpanStyle, _delete_kind: bool, out: &mut String) {
+    out.push_str("<w:r>");
+    emit_rpr(style, out);
+    out.push_str("<w:tab/></w:r>");
 }
 
 /// UTF-8 encoding of U+FFFC OBJECT REPLACEMENT CHARACTER (the byte
