@@ -309,10 +309,19 @@ fn emit_ppr(props: &ParaProperties, out: &mut String) {
 fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("<w:p>");
     emit_ppr(&para.props, out);
+    /* `<w:br>` (Phase 2 audit, gap A.12) lives as U+2028 / U+000C in
+    `para.text`; the structural `<w:r><w:br/></w:r>` emission needs
+    the cut-point walk. The fast path stays open for plain
+    paragraphs that carry no overlays AND no break characters. */
+    let has_break = para
+        .text
+        .chars()
+        .any(|c| c == '\u{2028}' || c == '\u{000C}');
     if para.spans.is_empty()
         && para.inline_objects.is_empty()
         && para.revisions.is_empty()
         && para.fields.is_empty()
+        && !has_break
     {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
@@ -381,6 +390,28 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
     for f in &para.fields {
         cuts.insert((f.start as usize).min(len));
         cuts.insert((f.end as usize).min(len));
+    }
+    /* Phase 2 audit (gap A.12) — `<w:br>` round-trip. Reader maps
+    `<w:br/>` to U+2028 LINE SEPARATOR and `<w:br w:type="page"/>` to
+    U+000C FORM FEED in `para.text`. Both characters are mandatory-
+    break per UAX-14, so the layout shaper already line-breaks at
+    them. The writer emits a dedicated `<w:r><w:br/></w:r>` /
+    `<w:r><w:br w:type="page"/></w:r>` run at each occurrence so the
+    re-saved file uses Word's structural form, not the bare Unicode
+    character (which Word would render as a "missing-glyph" box). */
+    let mut break_at: std::collections::HashMap<usize, BreakKind> =
+        std::collections::HashMap::new();
+    for (idx, ch) in para.text.char_indices() {
+        let kind = match ch {
+            '\u{2028}' => Some(BreakKind::Line),
+            '\u{000C}' => Some(BreakKind::Page),
+            _ => None,
+        };
+        if let Some(k) = kind {
+            break_at.insert(idx, k);
+            cuts.insert(idx);
+            cuts.insert(idx + ch.len_utf8());
+        }
     }
     let cuts: Vec<usize> = cuts.into_iter().collect();
 
@@ -483,6 +514,11 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
             object consumes the full anchor character. The cut set
             already placed a boundary at `lo + OBJECT_REPLACE_UTF8.len()`,
             so the next window picks up from there naturally. */
+        } else if let Some(&kind) = break_at.get(&lo) {
+            /* `<w:br/>` / `<w:br w:type="page"/>` runs replace the
+            U+2028 / U+000C character — emit the structural element so
+            Word doesn't render the bare Unicode char as a tofu box. */
+            emit_br_run(kind, out);
         } else {
             serialize_run_kind(&para.text[lo..hi], &style_at(lo), in_del, out);
         }
@@ -521,6 +557,22 @@ fn emit_field_prologue(instruction: &str, delete_kind: bool, out: &mut String) {
 /// Emit the complex-field epilogue — the end fldChar run.
 fn emit_field_epilogue(out: &mut String) {
     out.push_str("<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>");
+}
+
+/// Phase 2 audit (gap A.12) — `<w:br>` variants. Reader maps
+/// `<w:br/>` (default or `w:type="textWrapping"`) to U+2028 LINE
+/// SEPARATOR and `<w:br w:type="page"/>` to U+000C FORM FEED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakKind {
+    Line,
+    Page,
+}
+
+fn emit_br_run(kind: BreakKind, out: &mut String) {
+    match kind {
+        BreakKind::Line => out.push_str("<w:r><w:br/></w:r>"),
+        BreakKind::Page => out.push_str("<w:r><w:br w:type=\"page\"/></w:r>"),
+    }
 }
 
 /// UTF-8 encoding of U+FFFC OBJECT REPLACEMENT CHARACTER (the byte
@@ -664,11 +716,13 @@ fn regenerate_table(t: &Table, out: &mut String) {
 }
 
 fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
+    let has_margins = props.cell_margins != engine::CellMargins::default();
     let has_content = props.width.is_some()
         || props.alignment.is_some()
         || props.indent_twips != 0
         || props.borders.is_some()
-        || props.table_style_id.is_some();
+        || props.table_style_id.is_some()
+        || has_margins;
     if !has_content {
         return;
     }
@@ -690,6 +744,9 @@ fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
     }
     if let Some(b) = &props.borders {
         emit_cell_borders("w:tblBorders", b, out);
+    }
+    if has_margins {
+        emit_cell_margins("w:tblCellMar", &props.cell_margins, out);
     }
     out.push_str("</w:tblPr>");
 }
@@ -750,7 +807,8 @@ fn emit_tc_pr(props: &engine::CellProperties, out: &mut String) {
         || props.width.is_some()
         || props.borders.is_some()
         || props.shading.is_some()
-        || !matches!(props.v_align, engine::VerticalAlign::Top);
+        || !matches!(props.v_align, engine::VerticalAlign::Top)
+        || props.cell_margins.is_some();
     if !has {
         return;
     }
@@ -779,7 +837,33 @@ fn emit_tc_pr(props: &engine::CellProperties, out: &mut String) {
         engine::VerticalAlign::Bottom => out.push_str("<w:vAlign w:val=\"bottom\"/>"),
         engine::VerticalAlign::Top => {}
     }
+    if let Some(m) = &props.cell_margins {
+        emit_cell_margins("w:tcMar", m, out);
+    }
     out.push_str("</w:tcPr>");
+}
+
+/// Phase 2 audit (gap B.1/B.2) — emit `<w:tblCellMar>` or `<w:tcMar>`.
+/// Only edges with a value emit a sub-element; absent edges (the
+/// `Option<i32>` is `None`) round-trip as inheritance markers, matching
+/// how the reader captured them. A `<w:tcMar>` with only `<w:left>` and
+/// `<w:right>` set re-emits the same shape, preserving Word's inherit
+/// semantics for top + bottom.
+fn emit_cell_margins(elem: &str, m: &engine::CellMargins, out: &mut String) {
+    out.push_str(&format!("<{elem}>"));
+    if let Some(v) = m.top_twips {
+        out.push_str(&format!("<w:top w:w=\"{v}\" w:type=\"dxa\"/>"));
+    }
+    if let Some(v) = m.left_twips {
+        out.push_str(&format!("<w:left w:w=\"{v}\" w:type=\"dxa\"/>"));
+    }
+    if let Some(v) = m.bottom_twips {
+        out.push_str(&format!("<w:bottom w:w=\"{v}\" w:type=\"dxa\"/>"));
+    }
+    if let Some(v) = m.right_twips {
+        out.push_str(&format!("<w:right w:w=\"{v}\" w:type=\"dxa\"/>"));
+    }
+    out.push_str(&format!("</{elem}>"));
 }
 
 fn emit_w_width(elem: &str, w: CellWidth, out: &mut String) {
@@ -1341,6 +1425,207 @@ mod tests {
         assert!(
             parsed.document.settings.even_and_odd_headers,
             "even/odd toggle must lift from settings.xml"
+        );
+    }
+
+    #[test]
+    fn round_trip_br_line_and_page_break() {
+        /* Reader maps `<w:br/>` to U+2028 and `<w:br w:type="page"/>`
+        to U+000C; writer regenerates the structural runs around
+        those chars when the paragraph is dirty. Verify both:
+        text bytes survive the round-trip, and the regenerated XML
+        emits a `<w:r><w:br…/></w:r>` rather than a bare `<w:t>` with
+        the Unicode char. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p>
+<w:r><w:t xml:space="preserve">before</w:t></w:r>
+<w:r><w:br/></w:r>
+<w:r><w:t xml:space="preserve">soft</w:t></w:r>
+<w:r><w:br w:type="page"/></w:r>
+<w:r><w:t xml:space="preserve">after</w:t></w:r>
+</w:p>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        /* U+2028 and U+000C land in `para.text` at the break positions. */
+        assert!(
+            p.text.contains('\u{2028}'),
+            "line break char missing: {:?}",
+            p.text
+        );
+        assert!(
+            p.text.contains('\u{000C}'),
+            "page break char missing: {:?}",
+            p.text
+        );
+        let line_pos = p.text.find('\u{2028}').unwrap();
+        let page_pos = p.text.find('\u{000C}').unwrap();
+        assert_eq!(line_pos, "before".len());
+        assert_eq!(
+            page_pos,
+            "before".len() + '\u{2028}'.len_utf8() + "soft".len()
+        );
+
+        /* Force regenerate + reparse — writer emits structural runs. */
+        let mut owned = parsed.document.clone();
+        if let Some(engine::Block::Paragraph(p)) = owned.blocks.iter_mut().next() {
+            p.dirty = true;
+            p.source_xml = None;
+        }
+        let xml = build_document_xml(&owned);
+        assert!(
+            xml.contains("<w:r><w:br/></w:r>"),
+            "line break run missing: {xml}"
+        );
+        assert!(
+            xml.contains("<w:r><w:br w:type=\"page\"/></w:r>"),
+            "page break run missing: {xml}"
+        );
+        /* Reparse — chars come back at the same offsets. */
+        let saved = write_docx(&parsed, &owned).expect("write");
+        let reparsed = read_docx(&saved).expect("re-read");
+        let q = reparsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(q.text, p.text);
+    }
+
+    #[test]
+    fn round_trip_cell_margins_per_cell_and_table_default() {
+        /* `<w:tblCellMar>` on the table provides defaults (200 twips
+        on every edge); `<w:tcMar>` on the second cell overrides only
+        `left` and `right`. Reader fills `TableProperties.cell_margins`
+        + the cell's `Option<CellMargins>`; writer round-trips both. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:tbl>
+<w:tblPr>
+<w:tblCellMar>
+<w:top w:w="200" w:type="dxa"/>
+<w:left w:w="200" w:type="dxa"/>
+<w:bottom w:w="200" w:type="dxa"/>
+<w:right w:w="200" w:type="dxa"/>
+</w:tblCellMar>
+</w:tblPr>
+<w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid>
+<w:tr>
+<w:tc><w:p><w:r><w:t xml:space="preserve">A</w:t></w:r></w:p></w:tc>
+<w:tc>
+<w:tcPr>
+<w:tcMar>
+<w:left w:w="500" w:type="dxa"/>
+<w:right w:w="500" w:type="dxa"/>
+</w:tcMar>
+</w:tcPr>
+<w:p><w:r><w:t xml:space="preserve">B</w:t></w:r></w:p>
+</w:tc>
+</w:tr>
+</w:tbl>
+<w:p><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        let table = parsed
+            .document
+            .blocks
+            .iter()
+            .find_map(|b| b.as_table())
+            .expect("table block");
+        assert_eq!(table.props.cell_margins.top_twips, Some(200));
+        assert_eq!(table.props.cell_margins.left_twips, Some(200));
+        assert_eq!(table.props.cell_margins.bottom_twips, Some(200));
+        assert_eq!(table.props.cell_margins.right_twips, Some(200));
+        let row0 = &table.rows[0];
+        /* Cell 0 — no override; `cell_margins` stays None. */
+        assert!(row0.cells[0].props.cell_margins.is_none());
+        /* Cell 1 — `<w:tcMar>` override on left + right only; top +
+        bottom remain None and inherit the table default at resolve. */
+        let cm = row0.cells[1]
+            .props
+            .cell_margins
+            .as_ref()
+            .expect("cell 1 override");
+        assert_eq!(cm.left_twips, Some(500));
+        assert_eq!(cm.right_twips, Some(500));
+        assert_eq!(cm.top_twips, None);
+        assert_eq!(cm.bottom_twips, None);
+        /* Resolver — top/bottom inherit from the table default, left/
+        right pick the cell override. */
+        let resolved = engine::CellMargins::resolve_edges(Some(cm), &table.props.cell_margins);
+        assert_eq!(resolved.left_twips, 500);
+        assert_eq!(resolved.right_twips, 500);
+        assert_eq!(resolved.top_twips, 200);
+        assert_eq!(resolved.bottom_twips, 200);
+
+        /* Force-regenerate the table and check the writer emits both
+        margin elements. */
+        let mut owned = parsed.document.clone();
+        for b in owned.blocks.iter_mut() {
+            if let engine::Block::Table(t) = b {
+                t.dirty = true;
+                t.source_xml = None;
+            }
+        }
+        let xml = build_document_xml(&owned);
+        assert!(
+            xml.contains("<w:tblCellMar>"),
+            "tblCellMar missing on regenerate: {xml}"
+        );
+        assert!(
+            xml.contains("<w:tcMar>"),
+            "tcMar missing on regenerate: {xml}"
+        );
+        assert!(
+            xml.contains("<w:left w:w=\"500\" w:type=\"dxa\"/>"),
+            "cell override left missing: {xml}"
         );
     }
 

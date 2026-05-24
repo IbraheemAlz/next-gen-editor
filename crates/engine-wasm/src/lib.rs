@@ -1553,12 +1553,18 @@ fn layout_table_box(
                 let hi = (col_cursor + span).min(columns.len());
                 columns[lo..hi].iter().sum::<f32>().max(1.0)
             };
-            /* Recursively lay out cell content. Phase 5 PR 2 ships a fixed
-            cell-internal padding of 4 px on every side — the OOXML
-            `<w:tcMar>` / table-level `<w:tblCellMar>` model is a
-            Phase 5b refinement. */
-            let inner_pad = 4.0_f32;
-            let content_width = (cell_width - inner_pad * 2.0).max(0.0);
+            /* Phase 2 audit (gap B.1/B.2) — per-edge padding resolves
+            cell override (`<w:tcMar>`) → table default
+            (`<w:tblCellMar>`) → Word stock (0/108/0/108 twips). */
+            let eff = engine::CellMargins::resolve_edges(
+                cell.props.cell_margins.as_ref(),
+                &table.props.cell_margins,
+            );
+            let pad_top = twips_to_layout_px(eff.top_twips, scale);
+            let pad_bottom = twips_to_layout_px(eff.bottom_twips, scale);
+            let pad_left = twips_to_layout_px(eff.left_twips, scale);
+            let pad_right = twips_to_layout_px(eff.right_twips, scale);
+            let content_width = (cell_width - pad_left - pad_right).max(0.0);
             let inner_blocks = layout_cell_blocks(&cell.blocks, content_width, fonts, cfg, scale);
             let content_height: f32 = inner_blocks.iter().map(|b| b.size().height).sum();
             /* `VMergeRole::Continue` cells contribute zero — the matching
@@ -1566,7 +1572,7 @@ fn layout_table_box(
             let measured = if matches!(cell.props.v_merge, engine::VMergeRole::Continue) {
                 0.0
             } else {
-                content_height + inner_pad * 2.0
+                content_height + pad_top + pad_bottom
             };
             row_height = row_height.max(measured);
             cells_out.push(TableCellBox {
@@ -1581,6 +1587,10 @@ fn layout_table_box(
                 borders: cell.props.borders.clone().unwrap_or_default(),
                 shading: cell.props.shading,
                 content: inner_blocks,
+                padding_left: pad_left,
+                padding_top: pad_top,
+                padding_right: pad_right,
+                padding_bottom: pad_bottom,
             });
             x += cell_width;
             col_cursor += span;

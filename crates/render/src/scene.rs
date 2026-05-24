@@ -265,9 +265,14 @@ fn paint_table(t: &TableBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd
                     paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
                 });
             }
-            /* Recurse — paragraphs + nested tables. */
+            /* Recurse — paragraphs + nested tables. Phase 2 audit
+            (gap B.1/B.2) — content origin is offset by the cell's
+            resolved `<w:tcMar>` / `<w:tblCellMar>` padding so text
+            doesn't render flush against the border. */
+            let content_x = cell_x + cell.padding_left;
+            let content_y = cell_y + cell.padding_top;
             for inner in &cell.content {
-                paint_block(inner, cell_x, cell_y, cmds);
+                paint_block(inner, content_x, content_y, cmds);
             }
         }
     }

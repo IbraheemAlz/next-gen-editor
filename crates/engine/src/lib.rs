@@ -1056,13 +1056,82 @@ pub struct CellBorders {
     pub inside_v: Option<BorderStroke>,
 }
 
-/// `<w:tblCellMar>` default cell padding.
-#[derive(Debug, Clone, Copy, Default)]
+/// `<w:tblCellMar>` (table default) or `<w:tcMar>` (per-cell override)
+/// cell padding. Per-edge `Option<i32>` because OOXML lets each edge
+/// override independently — a `<w:tcMar>` carrying only `<w:left>` and
+/// `<w:right>` inherits top/bottom from the table default, which itself
+/// can also leave edges unset. The layout solver collapses the
+/// inherit chain via [`CellMargins::resolve_edges`] →
+/// [`ResolvedCellMargins`] (every edge populated with Word stock as
+/// the final fallback).
+///
+/// `default()` is all-`None` — meaning every edge inherits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CellMargins {
+    pub top_twips: Option<i32>,
+    pub left_twips: Option<i32>,
+    pub bottom_twips: Option<i32>,
+    pub right_twips: Option<i32>,
+}
+
+/// Fully-resolved per-edge padding the layout solver consumes. Every
+/// edge is populated; the [`CellMargins::resolve_edges`] resolver
+/// walks cell override → table default → Word stock for each edge
+/// independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCellMargins {
     pub top_twips: i32,
     pub left_twips: i32,
     pub bottom_twips: i32,
     pub right_twips: i32,
+}
+
+impl CellMargins {
+    /// Word's stock cell padding (0 / 108 / 0 / 108 twips). Used by the
+    /// layout solver when neither `<w:tcMar>` nor `<w:tblCellMar>`
+    /// specify an explicit value — matches what `winword.exe` emits on
+    /// a freshly-inserted table.
+    pub const fn word_default() -> ResolvedCellMargins {
+        ResolvedCellMargins {
+            top_twips: 0,
+            left_twips: 108,
+            bottom_twips: 0,
+            right_twips: 108,
+        }
+    }
+
+    /// Per-edge resolver — for each edge, return the cell override if
+    /// set, otherwise the table default, otherwise Word's stock value.
+    /// Crucially, each edge is resolved INDEPENDENTLY: a cell
+    /// `<w:tcMar>` setting only `<w:left>` and `<w:right>` correctly
+    /// inherits top/bottom from the table default (or Word stock if
+    /// the table also leaves them unset).
+    pub fn resolve_edges(cell: Option<&Self>, table: &Self) -> ResolvedCellMargins {
+        let stock = Self::word_default();
+        let pick = |c: Option<i32>, t: Option<i32>, s: i32| -> i32 { c.or(t).unwrap_or(s) };
+        ResolvedCellMargins {
+            top_twips: pick(
+                cell.and_then(|c| c.top_twips),
+                table.top_twips,
+                stock.top_twips,
+            ),
+            left_twips: pick(
+                cell.and_then(|c| c.left_twips),
+                table.left_twips,
+                stock.left_twips,
+            ),
+            bottom_twips: pick(
+                cell.and_then(|c| c.bottom_twips),
+                table.bottom_twips,
+                stock.bottom_twips,
+            ),
+            right_twips: pick(
+                cell.and_then(|c| c.right_twips),
+                table.right_twips,
+                stock.right_twips,
+            ),
+        }
+    }
 }
 
 /// `<w:tcW>` / `<w:tblW>` width — twips, percent (50-thousandths per
@@ -1128,6 +1197,11 @@ pub struct CellProperties {
     pub borders: Option<CellBorders>,
     pub shading: Option<[u8; 4]>,
     pub v_align: VerticalAlign,
+    /// Phase 2 audit (gap B.1) — `<w:tcMar>` per-cell padding override.
+    /// `None` ⇒ inherit from the table's `<w:tblCellMar>`; an explicit
+    /// `Some` value wins per-edge as resolved by
+    /// [`CellMargins::resolve_edges`].
+    pub cell_margins: Option<CellMargins>,
 }
 
 #[derive(Debug, Clone, Default)]

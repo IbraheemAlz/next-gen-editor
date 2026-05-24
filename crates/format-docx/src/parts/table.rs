@@ -15,8 +15,8 @@
 use crate::error::DocxError;
 use crate::schema::ct_rpr::{attr_val, parse_hex_color};
 use engine::{
-    Block, BorderStroke, BorderStyle, CellBorders, CellWidth, RowHeight, Table, TableCell,
-    TableProperties, TableRow, VMergeRole, VerticalAlign,
+    Block, BorderStroke, BorderStyle, CellBorders, CellMargins, CellWidth, RowHeight, Table,
+    TableCell, TableProperties, TableRow, VMergeRole, VerticalAlign,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -256,6 +256,18 @@ fn handle_property_start(
         b"w:tblBorders" => {
             props.borders = Some(CellBorders::default());
         }
+        /* Phase 2 audit (gap B.1) — `<w:tcMar>` opens a per-cell
+        margin override; children are `<w:top>` / `<w:left|start>` /
+        `<w:bottom>` / `<w:right|end>` carrying `w:w` twips. The
+        sentinel `Some(default)` here marks "cell specified an
+        override" so the layout resolver knows to consult per-edge
+        values; absent (`None`) keeps the table-level / Word-default
+        fallback chain. */
+        b"w:tcMar" if cur_cell.is_some() => {
+            if let Some(cell) = cur_cell.as_mut() {
+                cell.props.cell_margins = Some(CellMargins::default());
+            }
+        }
         _ => {
             handle_property_inner(name, e, grid, props, cur_row, cur_cell, parent);
         }
@@ -329,6 +341,46 @@ fn handle_property_inner(
             _ => {}
         }
         /* Border edges under `<w:tcBorders>`. */
+        return;
+    }
+    /* Phase 2 audit (gap B.1) — per-cell `<w:tcMar>` edge values.
+    `<w:w>` carries twips (default `w:type="dxa"`). Each edge is
+    `Option<i32>` so an unset edge correctly inherits from the
+    table default instead of being read as a literal zero. */
+    if let Some(cell) = cur_cell.as_mut()
+        && parent == b"w:tcMar"
+    {
+        let twips: i32 = attr_val(e, b"w:w")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let m = cell
+            .props
+            .cell_margins
+            .get_or_insert_with(CellMargins::default);
+        match name {
+            b"w:top" => m.top_twips = Some(twips),
+            b"w:bottom" => m.bottom_twips = Some(twips),
+            b"w:left" | b"w:start" => m.left_twips = Some(twips),
+            b"w:right" | b"w:end" => m.right_twips = Some(twips),
+            _ => {}
+        }
+        return;
+    }
+    /* Phase 2 audit (gap B.2) — table-default `<w:tblCellMar>` edges.
+    Children are `<w:top>` / `<w:left|start>` / `<w:bottom>` /
+    `<w:right|end>` with `w:w` twips. */
+    if parent == b"w:tblCellMar" {
+        let twips: i32 = attr_val(e, b"w:w")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let m = &mut props.cell_margins;
+        match name {
+            b"w:top" => m.top_twips = Some(twips),
+            b"w:bottom" => m.bottom_twips = Some(twips),
+            b"w:left" | b"w:start" => m.left_twips = Some(twips),
+            b"w:right" | b"w:end" => m.right_twips = Some(twips),
+            _ => {}
+        }
         return;
     }
     /* Cell border edges — parent must be `<w:tcBorders>` and we must

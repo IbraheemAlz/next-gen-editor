@@ -285,6 +285,15 @@ pub struct TableCellBox {
     /// recursion bound: practical 8 levels (matches Word). Deeper
     /// nesting silently truncates with a placeholder.
     pub content: Vec<LayoutBlock>,
+    /// Phase 2 audit (gap B.1/B.2) — effective inner padding in layout
+    /// pixels, already resolved against `<w:tcMar>` / `<w:tblCellMar>`
+    /// / Word stock defaults by the layout solver. The renderer
+    /// offsets content origin by `(left, top)` and the cell's size
+    /// already includes `(left + right, top + bottom)` of padding.
+    pub padding_left: f32,
+    pub padding_top: f32,
+    pub padding_right: f32,
+    pub padding_bottom: f32,
 }
 
 /// A laid-out page — one element of the box tree the renderer consumes.

@@ -513,6 +513,26 @@ pub fn parse_document_xml(
                     b"a:blip" if in_drawing => {
                         cur_drawing_rel_id = attr_val(&e, b"r:embed");
                     }
+                    b"w:br" if in_run => {
+                        /* Phase 2 audit (gap A.12) — `<w:br/>` inside a
+                        `<w:r>`. Maps to the Unicode mandatory-break
+                        character that matches the requested break type:
+                        U+2028 LINE SEPARATOR for line/textWrapping
+                        breaks (UAX-14 BK class — ICU LineSegmenter
+                        produces a hard break opportunity) and U+000C
+                        FORM FEED for page breaks (same UAX-14 BK
+                        class; the paginator inspects the cluster to
+                        force a page flush). Column breaks fall back
+                        to U+2028 — column layout is deferred (audit
+                        C.4) so a column break degrades visually to a
+                        line break. */
+                        let kind = attr_val(&e, b"w:type").unwrap_or_default();
+                        let ch = match kind.trim() {
+                            "page" => '\u{000C}',
+                            _ => '\u{2028}',
+                        };
+                        run_text.push(ch);
+                    }
                     b"w:footnoteReference" => {
                         /* Phase 8a — inject U+FFFC at the run's current
                         byte offset and queue a FootnoteRef inline

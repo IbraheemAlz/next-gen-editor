@@ -841,6 +841,10 @@ mod tests {
             borders: cell_borders.clone(),
             shading: Some([0xFF, 0xEB, 0x78, 0xFF]),
             content: vec![LayoutBlock::Paragraph(para)],
+            padding_left: 0.0,
+            padding_top: 0.0,
+            padding_right: 0.0,
+            padding_bottom: 0.0,
         };
         let row = layout::TableRowBox {
             origin: layout::Point { x: 0.0, y: 0.0 },
