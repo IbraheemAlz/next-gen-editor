@@ -1123,6 +1123,17 @@ fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32
     /* `engine::Alignment` / `text_pipeline::Alignment` carry no `Hash` derive —
     hash a small discriminant instead. */
     engine_align_disc(para.props.alignment).hash(&mut h);
+    /* Phase 9c — paragraph base direction is part of the layout
+    contract now that `resolve_base_direction` prefers the paragraph's
+    explicit override. Without this hash, a paragraph whose
+    `props.direction` flips would re-use stale RTL/LTR shaping from
+    cache. Encoded as `Option<bool>`: `0` for absent, `1`/`2` for
+    Ltr/Rtl. */
+    match para.props.direction {
+        None => 0u8.hash(&mut h),
+        Some(engine::TextDirection::Ltr) => 1u8.hash(&mut h),
+        Some(engine::TextDirection::Rtl) => 2u8.hash(&mut h),
+    }
     /* Phase 2 — indent + line-height override change layout geometry, so the
     cache key must mix them in or stale boxes leak across edits. */
     para.props.indent.start_twips.hash(&mut h);
@@ -1410,6 +1421,30 @@ fn attach_block_paths(
     entry is harmless. */
 }
 
+/// Resolved base direction for a paragraph layout pass — Phase 9c fix
+/// (UX_BEHAVIOR_SPEC §III). UAX #9's first-strong inference is correct
+/// for paragraphs WITHOUT an explicit `<w:bidi>` setting, but when the
+/// user (or the source `.docx`) has explicitly set `props.direction`,
+/// that override MUST win over first-strong — otherwise the BiDi
+/// algorithm shapes neutrals (trailing `!!`, parentheses, digits)
+/// using the implicit character-level RTL of the Arabic glyphs even
+/// when the paragraph was explicitly LTR.
+///
+/// Precedence:
+/// 1. Paragraph's explicit `props.direction` (Word's `<w:bidi>`).
+/// 2. `first_strong_direction(text)` — first-strong inference for
+///    paragraphs with no explicit setting.
+/// 3. `cfg.base_direction` — document-wide default seeded at boot.
+fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingDirection {
+    if let Some(d) = p.props.direction {
+        return match d {
+            engine::TextDirection::Ltr => ShapingDirection::Ltr,
+            engine::TextDirection::Rtl => ShapingDirection::Rtl,
+        };
+    }
+    first_strong_direction(&p.text).unwrap_or(cfg.base_direction)
+}
+
 /// Pull the four Phase-2 indent fields off `para.props`, convert to layout
 /// px. Returned in `(indent_start, indent_end, first_line, hanging)`.
 fn props_to_layout_indents(props: &engine::ParaProperties, scale: f32) -> (f32, f32, f32, f32) {
@@ -1563,7 +1598,7 @@ fn layout_cell_blocks(
                     text: &p.text,
                     fonts,
                     spans: &spans,
-                    base_direction: first_strong_direction(&p.text).unwrap_or(cfg.base_direction),
+                    base_direction: resolve_base_direction(p, cfg),
                     max_width: content_width_px.max(1.0),
                     line_height: cfg.line_height * scale,
                     alignment: p.props.alignment.map_or(cfg.alignment, layout_align),
@@ -3274,8 +3309,7 @@ impl Engine {
                                 text: &text,
                                 fonts: &font_stack,
                                 spans: &spans,
-                                base_direction: first_strong_direction(&text)
-                                    .unwrap_or(cfg.base_direction),
+                                base_direction: resolve_base_direction(para, &cfg),
                                 max_width: pag.content_width(),
                                 line_height: cfg.line_height * scale,
                                 alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
@@ -3308,8 +3342,7 @@ impl Engine {
                                     text: &para.text,
                                     fonts: &font_stack,
                                     spans: &spans,
-                                    base_direction: first_strong_direction(&para.text)
-                                        .unwrap_or(cfg.base_direction),
+                                    base_direction: resolve_base_direction(para, &cfg),
                                     max_width: pag.content_width(),
                                     line_height: cfg.line_height * scale,
                                     alignment: para
