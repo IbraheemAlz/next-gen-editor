@@ -508,7 +508,17 @@ pub fn parse_document_xml(
                     b"w:pPr" => in_ppr = false,
                     b"w:numPr" => in_num_pr = false,
                     b"wp:inline" => {
-                        in_wp_inline = false;
+                        /* Don't clear `in_wp_inline` on the inline close —
+                        it's structurally a child of `<w:drawing>`, so the
+                        outer `</w:drawing>` handler is the one that needs
+                        to see "this drawing wrapped an inline picture"
+                        (vs anchor / floating) when it decides whether to
+                        push the inline object. Clearing here would race
+                        the two close handlers: `</wp:inline>` always
+                        fires before `</w:drawing>`, leaving the outer
+                        check with `in_wp_inline == false` and the image
+                        silently dropped. The drawing-close handler does
+                        the full reset for both flags. */
                     }
                     b"w:drawing" => {
                         if in_drawing

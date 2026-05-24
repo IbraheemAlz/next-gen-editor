@@ -76,13 +76,42 @@ async function exportPdf(client: EngineClient): Promise<void> {
         console.error('[export] unexpected reply to EXPORT_PDF:', evt.type);
         return;
     }
+    downloadBlob(evt.bytes, 'application/pdf', 'document.pdf');
+}
+
+/* Phase 9 — Save as DOCX. Engine packs the current document into a
+   freshly built `.docx` (regenerated `word/document.xml` + media + rels +
+   Content_Types), the TS shell streams the resulting Uint8Array out as a
+   file download. Word opens the file directly — no "unreadable content"
+   recovery prompt — because the writer matches Word's element-order
+   convention (CT_Inline children, run-property children, table-property
+   children all schema-strict). */
+async function exportDocx(client: EngineClient): Promise<void> {
+    const evt = await client.dispatch({ type: 'SAVE_DOCX' });
+    if (evt.type === 'ERROR') {
+        console.error('[export] DOCX export failed:', evt.message);
+        return;
+    }
+    if (evt.type !== 'DOCUMENT_SAVED') {
+        console.error('[export] unexpected reply to SAVE_DOCX:', evt.type);
+        return;
+    }
+    downloadBlob(
+        evt.bytes,
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'document.docx',
+    );
+}
+
+/* Common Blob → anchor → click → revoke dance for engine-side artifacts. */
+function downloadBlob(bytes: Uint8Array, mime: string, filename: string): void {
     /* Copy into a fresh ArrayBuffer-backed view: the worker's Uint8Array is
        typed over `ArrayBufferLike`, which a Blob part will not accept. */
-    const blob = new Blob([new Uint8Array(evt.bytes)], { type: 'application/pdf' });
+    const blob = new Blob([new Uint8Array(bytes)], { type: mime });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'document.pdf';
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -168,12 +197,21 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
     };
 
     /* `exporting` disables the button for the duration of the round-trip so a
-       second click cannot start a concurrent export. */
+       second click cannot start a concurrent export. One signal covers PDF and
+       DOCX — both bounce through the worker, no point letting them race. */
     const [exporting, setExporting] = createSignal(false);
     const doExport = async (): Promise<void> => {
         setExporting(true);
         try {
             await exportPdf(props.client);
+        } finally {
+            setExporting(false);
+        }
+    };
+    const doSaveDocx = async (): Promise<void> => {
+        setExporting(true);
+        try {
+            await exportDocx(props.client);
         } finally {
             setExporting(false);
         }
@@ -334,6 +372,14 @@ export function Toolbar(props: { client: EngineClient; store: EngineStore }) {
                 </Show>
             </div>
             <span class="tb-spacer" />
+            <button
+                class="tb-btn tb-export"
+                onClick={() => void doSaveDocx()}
+                disabled={exporting()}
+                aria-label="Save as DOCX"
+            >
+                {exporting() ? 'Saving…' : 'Save as DOCX'}
+            </button>
             <button
                 class="tb-btn tb-export"
                 onClick={() => void doExport()}

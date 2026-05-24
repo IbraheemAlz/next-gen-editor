@@ -7,8 +7,8 @@ use crate::error::DocxError;
 use crate::opc::archive::{DOC_XML, DocxArchive};
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, FontFamily,
-    LineHeight, ParaProperties, Paragraph, RowHeight, SpanStyle, Table, TableCell, TableRow,
-    TextDirection, VMergeRole,
+    InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, RowHeight, SpanStyle, Table,
+    TableCell, TableRow, TextDirection, VMergeRole,
 };
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -20,7 +20,52 @@ const DOC_XML_HEADER: &str = concat!(
     r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
     "<w:body>",
 );
+/// Header used for documents that carry inline drawings (images). Word
+/// requires DrawingML, WordprocessingDrawing, picture, and relationships
+/// namespaces declared at the document root before any `<w:drawing>`
+/// child element references them. The image-free header stays the
+/// minimal form so plain text round-trips byte-stable.
+const DOC_XML_HEADER_WITH_DRAWING: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    "\n",
+    r#"<w:document "#,
+    r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+    r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+    r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+    r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+    r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+    "<w:body>",
+);
 const DOC_XML_FOOTER: &str = "<w:sectPr/></w:body></w:document>";
+
+/// `true` when any paragraph in the doc (including those inside table
+/// cells) carries an inline image — the writer picks the expanded
+/// namespace header so the emitted `<w:drawing>` resolves.
+fn doc_has_inline_images(doc: &DocumentTree) -> bool {
+    fn any_image_in_blocks(blocks: &[Block]) -> bool {
+        blocks.iter().any(|b| match b {
+            Block::Paragraph(p) => paragraph_has_image(p),
+            Block::Table(t) => t.rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .any(|cell| any_image_in_blocks(&cell.blocks))
+            }),
+        })
+    }
+    fn paragraph_has_image(p: &Paragraph) -> bool {
+        p.inline_objects
+            .iter()
+            .any(|o| matches!(o.kind, InlineKind::Image { .. }))
+    }
+    doc.blocks.iter().any(|b| match b {
+        Block::Paragraph(p) => paragraph_has_image(p),
+        Block::Table(t) => t.rows.iter().any(|row| {
+            row.cells
+                .iter()
+                .any(|cell| any_image_in_blocks(&cell.blocks))
+        }),
+    })
+}
 
 fn family_docx_name(f: FontFamily) -> &'static str {
     match f {
@@ -189,26 +234,129 @@ fn emit_ppr(props: &ParaProperties, out: &mut String) {
 fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("<w:p>");
     emit_ppr(&para.props, out);
-    if para.spans.is_empty() {
+    if para.spans.is_empty() && para.inline_objects.is_empty() {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
-        let len = para.text.len();
-        let mut cursor = 0usize;
-        for run in &para.spans {
-            let (rs, re) = (run.start as usize, run.end as usize);
+        emit_styled_runs_with_objects(para, out);
+    }
+    out.push_str("</w:p>");
+}
+
+/// Walk the paragraph as maximal (range, style) segments — gaps
+/// between explicit spans get the default style. At every byte offset
+/// that hosts an `InlineObject`, emit a `<w:drawing>` (or other inline)
+/// run in place of the U+FFFC OBJECT REPLACEMENT CHARACTER. The walk
+/// keeps the run-style continuous across the anchor — a styled span
+/// that brackets the image still emits its `<w:rPr>` on the surrounding
+/// text runs.
+fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
+    let len = para.text.len();
+    let mut cursor = 0usize;
+    let mut obj_iter = para.inline_objects.iter().peekable();
+    /* Iterate by span (or by full text when no spans), splitting each
+    segment at any inline-object anchors that fall inside it. */
+    let style_segments: Vec<(usize, usize, SpanStyle)> = if para.spans.is_empty() {
+        vec![(0, len, SpanStyle::default())]
+    } else {
+        let mut segs: Vec<(usize, usize, SpanStyle)> = Vec::with_capacity(para.spans.len() * 2 + 1);
+        for span in &para.spans {
+            let (rs, re) = (span.start as usize, span.end as usize);
             if rs > cursor {
-                serialize_run(&para.text[cursor..rs], &SpanStyle::default(), out);
+                segs.push((cursor, rs, SpanStyle::default()));
             }
             if re > rs {
-                serialize_run(&para.text[rs..re], &run.style, out);
+                segs.push((rs, re, span.style));
             }
             cursor = re;
         }
         if cursor < len {
-            serialize_run(&para.text[cursor..len], &SpanStyle::default(), out);
+            segs.push((cursor, len, SpanStyle::default()));
+        }
+        segs
+    };
+    for (seg_lo, seg_hi, seg_style) in style_segments {
+        let mut start = seg_lo;
+        while let Some(obj) = obj_iter.peek() {
+            let at = obj.at as usize;
+            if at < start {
+                obj_iter.next();
+                continue;
+            }
+            if at >= seg_hi {
+                break;
+            }
+            if at > start {
+                serialize_run(&para.text[start..at], &seg_style, out);
+            }
+            emit_inline_object(obj_iter.next().expect("peeked"), out);
+            /* The OBJECT REPLACEMENT CHARACTER is 3 UTF-8 bytes. */
+            start = (at + OBJECT_REPLACE_UTF8.len()).min(seg_hi);
+        }
+        if start < seg_hi {
+            serialize_run(&para.text[start..seg_hi], &seg_style, out);
         }
     }
-    out.push_str("</w:p>");
+}
+
+/// UTF-8 encoding of U+FFFC OBJECT REPLACEMENT CHARACTER (the byte
+/// anchor for `InlineObject` in a paragraph's `text`).
+const OBJECT_REPLACE_UTF8: &str = "\u{FFFC}";
+
+fn emit_inline_object(obj: &InlineObject, out: &mut String) {
+    match &obj.kind {
+        InlineKind::Image {
+            rel_id,
+            width_emu,
+            height_emu,
+        } => emit_image_drawing(rel_id, *width_emu, *height_emu, out),
+        InlineKind::FootnoteRef {
+            id,
+            display_number: _,
+        } => {
+            /* Phase 8a footnote reference — round-trip via the engine's
+            existing `<w:footnoteReference>` emission. */
+            out.push_str(&format!(
+                "<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>\
+                 <w:footnoteReference w:id=\"{id}\"/></w:r>"
+            ));
+        }
+    }
+}
+
+/// Emit the DrawingML inline-picture run for an image. Element order
+/// matches Microsoft Word's own output exactly — the OOXML schema is
+/// CT_Inline-strict: `extent` precedes `effectExtent` precedes `docPr`
+/// precedes `cNvGraphicFramePr` precedes `graphic`. Re-ordering any
+/// pair makes Word reject the file with the "unreadable content"
+/// recovery prompt.
+fn emit_image_drawing(rel_id: &str, width_emu: i64, height_emu: i64, out: &mut String) {
+    let cx = width_emu.max(1);
+    let cy = height_emu.max(1);
+    out.push_str("<w:r><w:drawing>");
+    out.push_str(&format!(
+        "<wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
+         <wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\
+         <wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
+         <wp:docPr id=\"1\" name=\"Picture\"/>\
+         <wp:cNvGraphicFramePr/>\
+         <a:graphic>\
+         <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
+         <pic:pic>\
+         <pic:nvPicPr><pic:cNvPr id=\"0\" name=\"Image\"/><pic:cNvPicPr/></pic:nvPicPr>\
+         <pic:blipFill>\
+         <a:blip r:embed=\"{rel_id}\"/>\
+         <a:stretch><a:fillRect/></a:stretch>\
+         </pic:blipFill>\
+         <pic:spPr>\
+         <a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
+         <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>\
+         </pic:spPr>\
+         </pic:pic>\
+         </a:graphicData>\
+         </a:graphic>\
+         </wp:inline>"
+    ));
+    out.push_str("</w:drawing></w:r>");
 }
 
 /// Phase 3 passthrough optimisation. A paragraph that was loaded from a
@@ -449,7 +597,11 @@ fn emit_border_edge(elem: &str, edge: &Option<BorderStroke>, out: &mut String) {
 
 fn build_document_xml(doc: &DocumentTree) -> String {
     let mut out = String::with_capacity(2048);
-    out.push_str(DOC_XML_HEADER);
+    if doc_has_inline_images(doc) {
+        out.push_str(DOC_XML_HEADER_WITH_DRAWING);
+    } else {
+        out.push_str(DOC_XML_HEADER);
+    }
     for block in &doc.blocks {
         emit_block(block, &mut out);
     }
@@ -484,39 +636,123 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
 }
 
 /// Build a minimal valid `.docx` from a freshly created document — no
-/// existing archive to base on. Used by tests to manufacture fixtures.
+/// existing archive to base on. When the document references media
+/// (`doc.media`), the writer pulls the blobs into `word/media/*` and
+/// generates one `<Relationship>` per blob in `word/_rels/document.xml.rels`
+/// so each inline `<w:drawing>` resolves. `[Content_Types].xml` learns
+/// one `<Default>` per distinct image extension; absent that, Word
+/// rejects the file with a "no content type" parse error.
 pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    let extensions = media_extensions(doc);
+    let content_types = build_content_types(&extensions);
+    let doc_rels = build_doc_rels(doc);
+    let mut other_entries: Vec<(String, Vec<u8>)> = vec![
+        ("[Content_Types].xml".into(), content_types.into_bytes()),
+        ("_rels/.rels".into(), DOT_RELS_XML.as_bytes().to_vec()),
+        ("word/_rels/document.xml.rels".into(), doc_rels.into_bytes()),
+    ];
+    /* One `word/media/<filename>` entry per image blob the engine
+    holds, named after the relationship id so the `<a:blip r:embed>`
+    lookups in `word/document.xml` agree with the rels target. */
+    for (rel_id, blob) in &doc.media {
+        let filename = media_filename(rel_id, &blob.content_type);
+        other_entries.push((format!("word/media/{filename}"), blob.data.clone()));
+    }
     let archive = DocxArchive {
-        other_entries: vec![
-            (
-                "[Content_Types].xml".into(),
-                CONTENT_TYPES_XML.as_bytes().to_vec(),
-            ),
-            ("_rels/.rels".into(), DOT_RELS_XML.as_bytes().to_vec()),
-            (
-                "word/_rels/document.xml.rels".into(),
-                DOC_RELS_XML.as_bytes().to_vec(),
-            ),
-        ],
+        other_entries,
         document: doc.clone(),
     };
     write_docx(&archive, doc)
 }
 
-const CONTENT_TYPES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-<Default Extension="xml" ContentType="application/xml"/>
-<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>"#;
+/// Derive the file extension a `word/media/*` entry uses from its
+/// MIME content type. Falls back to `bin` for unrecognised types so
+/// the archive still validates as ZIP even if Word would later
+/// reject the file.
+fn media_extension(content_type: &str) -> &'static str {
+    match content_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpeg",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        "image/x-emf" | "image/emf" => "emf",
+        "image/x-wmf" | "image/wmf" => "wmf",
+        "image/svg+xml" => "svg",
+        _ => "bin",
+    }
+}
+
+fn media_filename(rel_id: &str, content_type: &str) -> String {
+    format!("{rel_id}.{ext}", ext = media_extension(content_type))
+}
+
+/// Distinct media extensions referenced by `doc.media`. Used to emit
+/// one `<Default Extension="png" ContentType="image/png"/>` per type
+/// in `[Content_Types].xml`.
+fn media_extensions(doc: &DocumentTree) -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+    for blob in doc.media.values() {
+        let ext = media_extension(&blob.content_type);
+        let mime: &'static str = match ext {
+            "png" => "image/png",
+            "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            "tiff" => "image/tiff",
+            "emf" => "image/x-emf",
+            "wmf" => "image/x-wmf",
+            "svg" => "image/svg+xml",
+            _ => "application/octet-stream",
+        };
+        if !out.iter().any(|(e, _)| *e == ext) {
+            out.push((ext, mime));
+        }
+    }
+    out
+}
+
+fn build_content_types(extra_defaults: &[(&'static str, &'static str)]) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n\
+         <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n\
+         <Default Extension=\"xml\" ContentType=\"application/xml\"/>\n",
+    );
+    for (ext, mime) in extra_defaults {
+        out.push_str(&format!(
+            "<Default Extension=\"{ext}\" ContentType=\"{mime}\"/>\n"
+        ));
+    }
+    out.push_str(
+        "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\n\
+         </Types>",
+    );
+    out
+}
+
+fn build_doc_rels(doc: &DocumentTree) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n",
+    );
+    for (rel_id, blob) in &doc.media {
+        let filename = media_filename(rel_id, &blob.content_type);
+        out.push_str(&format!(
+            "<Relationship Id=\"{rel_id}\" \
+             Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" \
+             Target=\"media/{filename}\"/>\n"
+        ));
+    }
+    out.push_str("</Relationships>");
+    out
+}
 
 const DOT_RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>"#;
-
-const DOC_RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 </Relationships>"#;
 
 #[cfg(test)]
@@ -1110,5 +1346,83 @@ mod tests {
         let bytes = build_minimal_docx(&doc).expect("build");
         let parsed = read_docx(&bytes).expect("read");
         assert_eq!(parsed.document.paragraph_text(0), Some("<a> & </a>"));
+    }
+
+    /* ---- Phase 9: image .docx round-trip ----------------------------- */
+
+    /// A paragraph with one inline image survives a save → reload cycle:
+    /// the EMU extents stay exact, the rel-id resolves through the
+    /// regenerated `word/_rels/document.xml.rels`, and the image blob
+    /// lands in `word/media/<rel>.png`.
+    #[test]
+    fn round_trip_inline_image_drawing_and_media() {
+        use engine::{ImageBlob, InlineKind, InlineObject};
+        let mut doc = DocumentTree::from_text("\u{FFFC}");
+        /* Park a fake PNG blob under the relationship id the paragraph's
+        InlineObject references. The bytes don't have to BE a valid PNG
+        for this round-trip — the writer just stashes them in
+        `word/media/rId7.png` and the reader pulls them back. */
+        doc.media.insert(
+            "rId7".into(),
+            ImageBlob {
+                content_type: "image/png".into(),
+                data: vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+            },
+        );
+        /* Replace the synth paragraph with one that anchors the image
+        at offset 0. */
+        let para = Paragraph {
+            text: "\u{FFFC}".into(),
+            spans: Vec::new(),
+            props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
+            dirty: true,
+            source_xml: None,
+            inline_objects: vec![InlineObject {
+                at: 0,
+                kind: InlineKind::Image {
+                    rel_id: "rId7".into(),
+                    width_emu: 1_905_000,
+                    height_emu: 1_524_000,
+                },
+            }],
+            hyperlinks: Vec::new(),
+            revisions: Vec::new(),
+        };
+        let mut blocks = doc.blocks.clone();
+        blocks.set(0, Block::Paragraph(para));
+        let doc = DocumentTree { blocks, ..doc };
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("read");
+        /* Paragraph survives. */
+        let p = parsed.document.nth_paragraph(0).expect("paragraph at 0");
+        assert_eq!(p.text, "\u{FFFC}");
+        assert_eq!(p.inline_objects.len(), 1, "image anchored");
+        let obj = &p.inline_objects[0];
+        match &obj.kind {
+            InlineKind::Image {
+                rel_id,
+                width_emu,
+                height_emu,
+            } => {
+                assert_eq!(rel_id, "rId7");
+                assert_eq!(*width_emu, 1_905_000);
+                assert_eq!(*height_emu, 1_524_000);
+            }
+            other => panic!("expected Image kind, got {other:?}"),
+        }
+        /* Image bytes land at `word/media/rId7.png` and the reader's
+        media cache holds them. */
+        let media = parsed
+            .document
+            .media
+            .get("rId7")
+            .expect("media blob round-trips");
+        assert_eq!(media.content_type, "image/png");
+        assert_eq!(
+            media.data,
+            vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+        );
     }
 }
