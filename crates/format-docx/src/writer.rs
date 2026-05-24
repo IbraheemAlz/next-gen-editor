@@ -6,9 +6,10 @@
 use crate::error::DocxError;
 use crate::opc::archive::{DOC_XML, DocxArchive};
 use engine::{
-    Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, FontFamily,
-    InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, Revision, RevisionKind,
-    RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection, UnderlineStyle, VMergeRole,
+    Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
+    FontFamily, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, Revision,
+    RevisionKind, RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection, UnderlineStyle,
+    VMergeRole,
 };
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -308,7 +309,11 @@ fn emit_ppr(props: &ParaProperties, out: &mut String) {
 fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("<w:p>");
     emit_ppr(&para.props, out);
-    if para.spans.is_empty() && para.inline_objects.is_empty() && para.revisions.is_empty() {
+    if para.spans.is_empty()
+        && para.inline_objects.is_empty()
+        && para.revisions.is_empty()
+        && para.fields.is_empty()
+    {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
         emit_styled_runs_with_objects(para, out);
@@ -373,11 +378,24 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
         cuts.insert((r.start as usize).min(len));
         cuts.insert((r.end as usize).min(len));
     }
+    for f in &para.fields {
+        cuts.insert((f.start as usize).min(len));
+        cuts.insert((f.end as usize).min(len));
+    }
     let cuts: Vec<usize> = cuts.into_iter().collect();
 
     /* Revisions sorted for stable open-order at any shared start. */
     let mut sorted_revs: Vec<&Revision> = para.revisions.iter().collect();
     sorted_revs.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+
+    /* Fields sorted the same way. Nesting model: revisions wrap fields
+    (i.e. `<w:ins><w:r><w:fldChar/></w:r></w:ins>`), so the field
+    open emits *after* the revision open at any shared boundary and
+    the field close emits *before* the revision close. The two stacks
+    are independent — interleaving by open / close order in the walk
+    naturally produces well-formed XML. */
+    let mut sorted_fields: Vec<&Field> = para.fields.iter().collect();
+    sorted_fields.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
 
     /* Inline object lookup by anchor byte. */
     let obj_at: std::collections::HashMap<usize, &InlineObject> = para
@@ -395,6 +413,7 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
     };
 
     let mut rev_stack: Vec<&Revision> = Vec::new();
+    let mut field_stack: Vec<&Field> = Vec::new();
     let mut next_fallback_id: u32 = 1;
 
     for win in cuts.windows(2) {
@@ -403,6 +422,17 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
             continue;
         }
 
+        /* Close any fields ending at or before `lo` first — field
+        wrappers nest *inside* revision wrappers, so the field's `end`
+        fldChar run emits before the surrounding `</w:ins>` close. */
+        while let Some(top) = field_stack.last() {
+            if (top.end as usize) <= lo {
+                emit_field_epilogue(out);
+                field_stack.pop();
+            } else {
+                break;
+            }
+        }
         /* Close any revisions ending at or before `lo`. Stack LIFO order
         emits inner closes first, preserving well-formed nesting. */
         while let Some(top) = rev_stack.last() {
@@ -430,8 +460,22 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
                 rev_stack.push(r);
             }
         }
-
+        /* Open fields *after* revisions so the field prologue lives
+        inside the enclosing `<w:ins>` / `<w:del>` wrapper. */
         let in_del = rev_stack.iter().any(|r| r.kind == RevisionKind::Delete);
+        for f in &sorted_fields {
+            let fs = f.start as usize;
+            let fe = f.end as usize;
+            if fs <= lo
+                && fe > lo
+                && !field_stack
+                    .iter()
+                    .any(|x| std::ptr::eq(*x as *const _, *f as *const _))
+            {
+                emit_field_prologue(&f.instruction, in_del, out);
+                field_stack.push(f);
+            }
+        }
 
         if let Some(obj) = obj_at.get(&lo) {
             emit_inline_object(obj, out);
@@ -444,10 +488,39 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
         }
     }
 
-    /* Drain whatever is still open (revisions extending to `len`). */
+    /* Drain whatever is still open. Field epilogues fire before
+    revision closes (field wrappers nest inside revision wrappers). */
+    while let Some(_top) = field_stack.pop() {
+        emit_field_epilogue(out);
+    }
     while let Some(top) = rev_stack.pop() {
         emit_revision_close(top.kind, out);
     }
+}
+
+/// Emit the complex-field prologue runs — the begin fldChar, the
+/// `<w:instrText>` carrier, and the separate fldChar. `delete_kind`
+/// switches the inner element to `<w:delText>` when the field sits
+/// inside a `<w:del>` wrapper (rare but legal — a reviewer can mark a
+/// field for deletion). Each component lives in its own `<w:r>` because
+/// Word emits it that way and round-tripping a file with the prologue
+/// fused into one run would visibly drift on byte-stable harnesses.
+fn emit_field_prologue(instruction: &str, delete_kind: bool, out: &mut String) {
+    out.push_str("<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>");
+    let tag = if delete_kind {
+        "w:delInstrText"
+    } else {
+        "w:instrText"
+    };
+    out.push_str(&format!("<w:r><{tag} xml:space=\"preserve\">"));
+    push_escaped(instruction, out);
+    out.push_str(&format!("</{tag}></w:r>"));
+    out.push_str("<w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>");
+}
+
+/// Emit the complex-field epilogue — the end fldChar run.
+fn emit_field_epilogue(out: &mut String) {
+    out.push_str("<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>");
 }
 
 /// UTF-8 encoding of U+FFFC OBJECT REPLACEMENT CHARACTER (the byte
@@ -947,6 +1020,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -981,6 +1055,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -1015,6 +1090,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -1109,6 +1185,7 @@ mod tests {
                     id: Some(8),
                 },
             ],
+            fields: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc);
@@ -1268,6 +1345,97 @@ mod tests {
     }
 
     #[test]
+    fn complex_field_round_trip_page_number() {
+        /* Reader: walk a `PAGE \\* MERGEFORMAT` complex field split
+        across the canonical begin / instrText / separate / cached /
+        end run sequence. Must produce one `engine::Field` overlay
+        anchoring the cached text `"7"` (Word's last-rendered value)
+        with the instruction stripped of surrounding whitespace. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p>
+<w:r><w:t xml:space="preserve">Page </w:t></w:r>
+<w:r><w:fldChar w:fldCharType="begin"/></w:r>
+<w:r><w:instrText xml:space="preserve"> PAGE \* MERGEFORMAT </w:instrText></w:r>
+<w:r><w:fldChar w:fldCharType="separate"/></w:r>
+<w:r><w:t xml:space="preserve">7</w:t></w:r>
+<w:r><w:fldChar w:fldCharType="end"/></w:r>
+<w:r><w:t xml:space="preserve"> of doc</w:t></w:r>
+</w:p>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        /* Reader: text contains the live "Page " prefix + cached "7" +
+        " of doc" suffix; a single Field overlay anchors the "7". */
+        assert_eq!(p.text, "Page 7 of doc");
+        assert_eq!(p.fields.len(), 1, "one PAGE field expected");
+        let f = &p.fields[0];
+        assert_eq!(f.start, 5);
+        assert_eq!(f.end, 6);
+        assert_eq!(f.instruction, "PAGE \\* MERGEFORMAT");
+        assert_eq!(f.keyword(), "PAGE");
+
+        /* Force regeneration through the writer and verify the
+        wrappers re-emit as the canonical run sequence. */
+        let mut owned_doc = parsed.document.clone();
+        if let Some(engine::Block::Paragraph(p)) = owned_doc.blocks.iter_mut().next() {
+            p.dirty = true;
+            p.source_xml = None;
+        }
+        let xml = build_document_xml(&owned_doc);
+        assert!(
+            xml.contains("<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>"),
+            "writer must emit begin fldChar: {xml}"
+        );
+        assert!(
+            xml.contains(
+                "<w:r><w:instrText xml:space=\"preserve\">PAGE \\* MERGEFORMAT</w:instrText></w:r>"
+            ),
+            "writer must emit instrText: {xml}"
+        );
+        assert!(
+            xml.contains("<w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>"),
+            "writer must emit separate fldChar: {xml}"
+        );
+        assert!(
+            xml.contains("<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"),
+            "writer must emit end fldChar: {xml}"
+        );
+        /* Re-read after regeneration: field must still parse back. */
+        let saved_bytes = write_docx(&parsed, &owned_doc).expect("write");
+        let reparsed = read_docx(&saved_bytes).expect("re-read");
+        let q = reparsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(q.text, "Page 7 of doc");
+        assert_eq!(q.fields.len(), 1);
+        assert_eq!(q.fields[0].keyword(), "PAGE");
+    }
+
+    #[test]
     fn round_trip_underline_variants() {
         /* Each underline variant must regenerate to its OOXML `w:val`
         token and parse back to the same enum on the way home.
@@ -1301,6 +1469,7 @@ mod tests {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
+                fields: Vec::new(),
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -1351,6 +1520,7 @@ mod tests {
                 date: String::new(),
                 id: None,
             }],
+            fields: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc);
@@ -1404,6 +1574,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -1443,6 +1614,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]));
         let p = xml.find("<w:pPr>").unwrap();
@@ -1912,6 +2084,7 @@ mod tests {
             }],
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));

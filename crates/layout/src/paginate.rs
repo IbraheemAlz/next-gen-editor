@@ -478,6 +478,49 @@ impl Paginator {
         }
     }
 
+    /// Phase 2 audit (gap D.1) — stamp every PAGE field in the
+    /// paragraph's [`ParagraphBox::fields`] with the 1-based page
+    /// number it is about to flush on. NUMPAGES is deferred: its
+    /// value is `pages.len()` at end-of-document, which is unknown
+    /// here; [`Paginator::finish`] walks every emitted page and
+    /// patches them in a second pass.
+    fn evaluate_fields_on_paragraph(para: &mut ParagraphBox, current_page: u32) {
+        for f in para.fields.iter_mut() {
+            /* Keyword extraction lives on `engine::Field` so the
+            layout box doesn't need to reimplement the trim + split
+            + uppercase walk. Re-build a synthetic Field just to
+            call `keyword` — cheap, since instructions are short. */
+            let synthetic = engine::Field {
+                start: f.byte_range.start,
+                end: f.byte_range.end,
+                instruction: f.instruction.clone(),
+            };
+            if synthetic.keyword() == "PAGE" {
+                f.evaluated_text = Some(current_page.to_string());
+            }
+        }
+    }
+
+    /// Recursive sweep that visits every paragraph inside a
+    /// [`LayoutBlock`] (top-level paragraph, table cell paragraphs,
+    /// nested table cell paragraphs, ...) and applies `f`. The
+    /// paginator needs this walk for field evaluation; lives on the
+    /// paginator side because it mutates `ParagraphBox` in place.
+    fn for_each_paragraph_in_block(block: &mut LayoutBlock, f: &mut impl FnMut(&mut ParagraphBox)) {
+        match block {
+            LayoutBlock::Paragraph(p) => f(p),
+            LayoutBlock::Table(t) => {
+                for row in t.rows.iter_mut() {
+                    for cell in row.cells.iter_mut() {
+                        for inner in cell.content.iter_mut() {
+                            Self::for_each_paragraph_in_block(inner, f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn flush_page(&mut self) {
         let blocks = std::mem::take(&mut self.cur_blocks);
         self.cur_y = 0.0;
@@ -508,8 +551,31 @@ impl Paginator {
         increment happens at `push`. Clone the resolved band slot;
         every other slot stays on the paginator for the next page. */
         let role = self.page_role();
-        let header = self.headers.resolve(role).cloned();
-        let footer = self.footers.resolve(role).cloned();
+        let mut header = self.headers.resolve(role).cloned();
+        let mut footer = self.footers.resolve(role).cloned();
+
+        /* Phase 2 audit (gap D.1) — PAGE field evaluation. The page
+        number we're about to emit is `pages.len() + 1` (1-based).
+        Stamp every body block + header + footer paragraph the page
+        owns; `evaluate_fields_on_paragraph` mutates the
+        `evaluated_text` slot the renderer eventually reads. */
+        let current_page = (self.pages.len() + 1) as u32;
+        let mut blocks = blocks;
+        for block in blocks.iter_mut() {
+            Self::for_each_paragraph_in_block(block, &mut |p| {
+                Self::evaluate_fields_on_paragraph(p, current_page);
+            });
+        }
+        if let Some(hf) = header.as_mut() {
+            for p in hf.paragraphs.iter_mut() {
+                Self::evaluate_fields_on_paragraph(p, current_page);
+            }
+        }
+        if let Some(hf) = footer.as_mut() {
+            for p in hf.paragraphs.iter_mut() {
+                Self::evaluate_fields_on_paragraph(p, current_page);
+            }
+        }
 
         /* Even an empty page is emitted on an explicit `force_page_break`
         / `start_new_section` — the renderer paints the blank sheet so a
@@ -538,6 +604,40 @@ impl Paginator {
     pub fn finish(mut self) -> Vec<PageBox> {
         if !self.cur_blocks.is_empty() || self.pages.is_empty() {
             self.flush_page();
+        }
+        /* Phase 2 audit (gap D.1) — NUMPAGES second pass. The first
+        pass (in `flush_page`) only knows `pages.len() + 1`; the total
+        is only fixed once every page has flushed. Walk every emitted
+        page and stamp NUMPAGES on any field that hadn't already been
+        evaluated as PAGE. */
+        let total_pages = self.pages.len() as u32;
+        for page in self.pages.iter_mut() {
+            let mut stamp = |para: &mut ParagraphBox| {
+                for f in para.fields.iter_mut() {
+                    let kw = engine::Field {
+                        start: f.byte_range.start,
+                        end: f.byte_range.end,
+                        instruction: f.instruction.clone(),
+                    }
+                    .keyword();
+                    if kw == "NUMPAGES" {
+                        f.evaluated_text = Some(total_pages.to_string());
+                    }
+                }
+            };
+            for block in page.blocks.iter_mut() {
+                Self::for_each_paragraph_in_block(block, &mut stamp);
+            }
+            if let Some(hf) = page.header.as_mut() {
+                for p in hf.paragraphs.iter_mut() {
+                    stamp(p);
+                }
+            }
+            if let Some(hf) = page.footer.as_mut() {
+                for p in hf.paragraphs.iter_mut() {
+                    stamp(p);
+                }
+            }
         }
         self.pages
     }
@@ -662,6 +762,11 @@ pub fn split_paragraph_at_line(
         /* Both halves share the same source paragraph — clusters in either
         half's glyphs are byte offsets into the full original text. */
         source_paragraph_id: para.source_paragraph_id,
+        /* Field overlays attach to byte ranges in the source paragraph
+        text. The split duplicates them onto both halves so a PAGE
+        field that ends up on the tail still gets re-evaluated; the
+        paginator decides per-page which copy gets stamped. */
+        fields: para.fields.clone(),
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -673,6 +778,7 @@ pub fn split_paragraph_at_line(
         direction: para.direction,
         marker: None,
         source_paragraph_id: para.source_paragraph_id,
+        fields: para.fields.clone(),
     };
     (Some(head), Some(tail))
 }
@@ -680,7 +786,7 @@ pub fn split_paragraph_at_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boxes::ParagraphBox;
+    use crate::boxes::{LayoutField, ParagraphBox};
     use crate::page::{A4Page, Margins};
     use text_pipeline::ShapingDirection;
 
@@ -723,6 +829,7 @@ mod tests {
             direction: ShapingDirection::Ltr,
             marker: None,
             source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
+            fields: Vec::new(),
         }
     }
 
@@ -794,6 +901,7 @@ mod tests {
                 direction: ShapingDirection::Ltr,
                 marker: None,
                 source_paragraph_id: tag,
+                fields: Vec::new(),
             }],
         }
     }
@@ -806,6 +914,111 @@ mod tests {
             .as_ref()
             .and_then(|h| h.paragraphs.first())
             .map_or(u32::MAX, |para| para.source_paragraph_id)
+    }
+
+    /// Build a one-line `ParagraphBox` carrying a single `LayoutField`
+    /// with the given instruction. Used by the field-evaluation tests
+    /// to assert PAGE/NUMPAGES stamping happens on the right page.
+    fn fake_paragraph_with_field(instruction: &str, line_height: f32) -> ParagraphBox {
+        ParagraphBox {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 200.0,
+                height: line_height,
+            },
+            lines: vec![LineBox {
+                origin: Point { x: 0.0, y: 0.0 },
+                baseline: line_height * 0.8,
+                height: line_height,
+                width: 200.0,
+                runs: Vec::new(),
+                alignment: text_pipeline::Alignment::Start,
+            }],
+            direction: ShapingDirection::Ltr,
+            marker: None,
+            source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
+            fields: vec![LayoutField {
+                byte_range: 0..1,
+                instruction: instruction.to_string(),
+                evaluated_text: None,
+            }],
+        }
+    }
+
+    /// Helper — return the `evaluated_text` of the first field on the
+    /// first body paragraph of `page`, or `None` if absent.
+    fn first_field_eval(page: &PageBox) -> Option<String> {
+        let first = page.blocks.first()?;
+        if let LayoutBlock::Paragraph(p) = first {
+            p.fields.first().and_then(|f| f.evaluated_text.clone())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn paginator_evaluates_page_field_per_page() {
+        /* Three body paragraphs each carrying a PAGE field — landing on
+        pages 1, 2, 3 because we force a page break between each.
+        After paginate, each paragraph's field must read its own page
+        number. */
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        for _ in 0..3 {
+            pag.push_block(
+                LayoutBlock::Paragraph(fake_paragraph_with_field("PAGE", 16.0)),
+                0.0,
+                0.0,
+            );
+            pag.force_page_break();
+        }
+        let pages = pag.finish();
+        assert!(pages.len() >= 3, "expected 3 pages, got {}", pages.len());
+        assert_eq!(first_field_eval(&pages[0]).as_deref(), Some("1"));
+        assert_eq!(first_field_eval(&pages[1]).as_deref(), Some("2"));
+        assert_eq!(first_field_eval(&pages[2]).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn paginator_evaluates_numpages_second_pass() {
+        /* NUMPAGES needs to know total pages, which is only fixed
+        after every page has flushed. `finish` runs a second pass
+        and stamps every NUMPAGES field with the total. */
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        for _ in 0..4 {
+            pag.push_block(
+                LayoutBlock::Paragraph(fake_paragraph_with_field("NUMPAGES \\* MERGEFORMAT", 16.0)),
+                0.0,
+                0.0,
+            );
+            pag.force_page_break();
+        }
+        let pages = pag.finish();
+        assert!(pages.len() >= 4);
+        /* Every page reads the same total (4). */
+        for (i, page) in pages.iter().enumerate().take(4) {
+            assert_eq!(
+                first_field_eval(page).as_deref(),
+                Some("4"),
+                "page {i} NUMPAGES must read 4"
+            );
+        }
+    }
+
+    #[test]
+    fn paginator_skips_unknown_field_instruction() {
+        /* `DATE` is not evaluated; the field's `evaluated_text` stays
+        `None` so the renderer paints the cached glyphs untouched. */
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_field("DATE \\@ \"yyyy\"", 16.0)),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert!(first_field_eval(&pages[0]).is_none());
     }
 
     #[test]

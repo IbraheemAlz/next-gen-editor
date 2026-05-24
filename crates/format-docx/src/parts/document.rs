@@ -49,6 +49,70 @@ struct SectPrAccum {
     title_pg: bool,
 }
 
+/// Per-field accumulator on the [`field_stack`] in
+/// [`parse_document_xml`]. One entry per active `<w:fldChar
+/// fldCharType="begin">`. Nested fields stack; `</w:fldChar
+/// fldCharType="end">` pops the innermost.
+#[derive(Debug, Clone, Default)]
+struct FieldBuilder {
+    /// `<w:instrText>` content — concatenated across as many runs as
+    /// the file spreads it over.
+    instruction: String,
+    /// Byte offset of the first cached display character (the moment
+    /// `separate` fires). `None` while still in the begin → separate
+    /// phase. Used as the field overlay's `start` on close.
+    cached_start: Option<u32>,
+}
+
+/// Apply one `<w:fldChar>` event to the field state machine.
+///
+/// `fldCharType="begin"` pushes a fresh [`FieldBuilder`] onto the stack.
+/// `separate` records the cached display text's leading byte offset on
+/// the top entry — that's `para_text.len() + run_text.len()` *at the
+/// time `separate` fires*, mirroring how every other anchor in this
+/// parser maps source-XML position to engine-text position. `end` pops
+/// the top entry and (when the field had both a non-empty instruction
+/// and a non-empty cached range) emits a [`engine::Field`] overlay.
+///
+/// Fields with no `separate` (legal — Word omits it for fields that
+/// evaluate to nothing, e.g. `<w:fldSimple w:instr="BIBLIOGRAPHY"/>`
+/// that hasn't been refreshed) still get parsed: the `cached_start`
+/// stays `None`, and `end` discards the entry without emitting an
+/// overlay because there is no byte range to anchor.
+fn handle_fld_char(
+    e: &BytesStart<'_>,
+    stack: &mut Vec<FieldBuilder>,
+    para_text: &str,
+    run_text: &str,
+    out_fields: &mut Vec<engine::Field>,
+) {
+    let kind = attr_val(e, b"w:fldCharType").unwrap_or_default();
+    match kind.trim() {
+        "begin" => stack.push(FieldBuilder::default()),
+        "separate" => {
+            if let Some(top) = stack.last_mut() {
+                top.cached_start = Some((para_text.len() + run_text.len()) as u32);
+            }
+        }
+        "end" => {
+            if let Some(top) = stack.pop()
+                && let Some(start) = top.cached_start
+            {
+                let end = (para_text.len() + run_text.len()) as u32;
+                let instruction = top.instruction.trim().to_string();
+                if end > start && !instruction.is_empty() {
+                    out_fields.push(engine::Field {
+                        start,
+                        end,
+                        instruction,
+                    });
+                }
+            }
+        }
+        _ => { /* Unknown fldCharType — ignore. */ }
+    }
+}
+
 /// Map an OOXML `<w:headerReference w:type="…"/>` token to the engine's
 /// role enum. Unknown / absent values default to `Default` — matches the
 /// spec's behaviour: a `<w:headerReference>` with no `w:type` covers
@@ -166,6 +230,23 @@ pub fn parse_document_xml(
     let mut para_inline_objects: Vec<engine::InlineObject> = Vec::new();
     let mut para_hyperlinks: Vec<engine::Hyperlink> = Vec::new();
     let mut para_revisions: Vec<engine::Revision> = Vec::new();
+    let mut para_fields: Vec<engine::Field> = Vec::new();
+
+    /* Phase 2 audit (gap D.1) — complex-field state machine. A field
+    is the triplet `<w:fldChar fldCharType="begin">` ...
+    `<w:instrText>…</w:instrText>` ... `<w:fldChar fldCharType="separate">`
+    ... cached `<w:r><w:t>…</w:t></w:r>` runs ... `<w:fldChar
+    fldCharType="end">`. The four moving parts (begin, instrText
+    accumulator, separate marker, end) can each sit in different `<w:r>`
+    elements so the state lives outside the per-run loop. Stack-shaped
+    because OOXML permits nested fields (e.g. an `IF` that evaluates
+    another field as one of its arguments).
+
+    Per stack entry: the leading byte offset where the cached display
+    text begins (set when `separate` arrives) and the accumulating
+    instruction string. `cached_start: None` before `separate`. */
+    let mut field_stack: Vec<FieldBuilder> = Vec::new();
+    let mut in_instr_text = false;
 
     /* Phase 8b — tracked-change wrapper state. A `<w:ins>` or `<w:del>`
     can wrap several `<w:r>` elements; we capture the wrapper's
@@ -353,6 +434,20 @@ pub fn parse_document_xml(
                     }
                     b"w:t" => in_text_elt = true,
                     b"w:delText" => in_del_text_elt = true,
+                    b"w:instrText" => in_instr_text = true,
+                    b"w:fldChar" => {
+                        /* fldChar drives the field state machine. The
+                        attribute value lives on the start tag's `w:fldCharType`
+                        attribute. `Start(...)` and `Empty(...)` both end up
+                        here — match `Empty` below as well for completeness. */
+                        handle_fld_char(
+                            &e,
+                            &mut field_stack,
+                            &para_text,
+                            &run_text,
+                            &mut para_fields,
+                        );
+                    }
                     b"w:ins" | b"w:del" => {
                         let kind = if name.as_ref() == b"w:ins" {
                             engine::RevisionKind::Insert
@@ -469,6 +564,15 @@ pub fn parse_document_xml(
                         passthrough writer round-trips the markup byte-
                         identical. Nothing to record here. */
                     }
+                    b"w:fldChar" => {
+                        handle_fld_char(
+                            &e,
+                            &mut field_stack,
+                            &para_text,
+                            &run_text,
+                            &mut para_fields,
+                        );
+                    }
                     n if in_sect_pr => cur_sect.apply(n, &e),
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
                     n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
@@ -480,6 +584,17 @@ pub fn parse_document_xml(
             }
             Event::Text(t) if (in_text_elt || in_del_text_elt) && in_tbl == 0 => {
                 run_text.push_str(&t.unescape()?);
+            }
+            Event::Text(t) if in_instr_text && in_tbl == 0 => {
+                /* `<w:instrText>` content accumulates onto the innermost
+                open field's instruction buffer. The text may straddle
+                multiple `<w:r><w:instrText>` runs — accumulating across
+                runs is exactly the point of the stack-based state
+                machine, otherwise a `PAGE \* MERGEFORMAT` split across
+                `PAGE` and ` \* MERGEFORMAT` runs would lose its switch. */
+                if let Some(top) = field_stack.last_mut() {
+                    top.instruction.push_str(&t.unescape()?);
+                }
             }
             Event::End(e) => {
                 let name = e.name();
@@ -524,6 +639,7 @@ pub fn parse_document_xml(
                 match name.as_ref() {
                     b"w:t" => in_text_elt = false,
                     b"w:delText" => in_del_text_elt = false,
+                    b"w:instrText" => in_instr_text = false,
                     b"w:ins" | b"w:del" => {
                         if let Some((kind, author, date, id, start)) = revision_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
@@ -690,6 +806,7 @@ pub fn parse_document_xml(
                             inline_objects: std::mem::take(&mut para_inline_objects),
                             hyperlinks: std::mem::take(&mut para_hyperlinks),
                             revisions: std::mem::take(&mut para_revisions),
+                            fields: std::mem::take(&mut para_fields),
                         }));
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this
                         paragraph. Emit a `Section` covering everything since

@@ -1000,6 +1000,7 @@ impl ParaBuilder {
             inline_objects,
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         })
     }
 }
@@ -1110,6 +1111,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -1127,6 +1129,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -1152,6 +1155,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         assert_eq!(
             to_html(&[p]),
@@ -1180,6 +1184,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);
@@ -1329,6 +1334,7 @@ mod tests {
             }],
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let html = to_html(&[p]);
         assert!(html.contains("data-rel-id=\"rId7\""));

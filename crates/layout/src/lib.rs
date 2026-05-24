@@ -10,8 +10,9 @@ pub mod paginate;
 pub mod paragraph;
 
 pub use boxes::{
-    FontId, HeaderFooterBox, LayoutBlock, LineBox, MarkerBox, PageBox, ParagraphBox, Point,
-    PositionedGlyph, Size, StyleSpan, TableBox, TableCellBox, TableRowBox, TextAttrs, VisualRun,
+    FontId, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, MarkerBox, PageBox, ParagraphBox,
+    Point, PositionedGlyph, Size, StyleSpan, TableBox, TableCellBox, TableRowBox, TextAttrs,
+    VisualRun,
 };
 pub use page::{A4Page, Margins};
 pub use paginate::{

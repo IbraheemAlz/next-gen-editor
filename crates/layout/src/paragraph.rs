@@ -193,6 +193,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         direction: cfg.base_direction,
         marker,
         source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
+        fields: Vec::new(),
     }
 }
 

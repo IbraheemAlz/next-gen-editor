@@ -228,6 +228,7 @@ fn parse_cell_paragraph(xml: &[u8]) -> engine::Paragraph {
         inline_objects: Vec::new(),
         hyperlinks: Vec::new(),
         revisions: Vec::new(),
+        fields: Vec::new(),
     }
 }
 

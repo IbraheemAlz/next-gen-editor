@@ -136,6 +136,25 @@ pub struct LineBox {
     pub alignment: Alignment,
 }
 
+/// Phase 2 audit (gap D.1) — complex-field overlay propagated from the
+/// source [`engine::Field`] into the laid-out paragraph. `evaluated_text`
+/// is `None` until the paginator stamps the per-page value (PAGE /
+/// NUMPAGES); other instructions keep `None` and the renderer paints
+/// the cached display text already baked into the paragraph's glyphs.
+#[derive(Debug, Clone)]
+pub struct LayoutField {
+    /// Byte range `[start, end)` in the source paragraph text that
+    /// carries the field's cached display value.
+    pub byte_range: Range<u32>,
+    /// Field code lifted from the source `<w:instrText>` — kept as the
+    /// trimmed source string so re-evaluation rules live in one place
+    /// (`engine::Field::keyword` + `evaluate`).
+    pub instruction: String,
+    /// Per-page evaluated string the paginator stamps before flushing.
+    /// `None` ⇒ renderer paints the original cached glyphs.
+    pub evaluated_text: Option<String>,
+}
+
 /// One laid-out paragraph. `origin` is relative to the [`PageBox`] content area.
 #[derive(Debug, Clone)]
 pub struct ParagraphBox {
@@ -156,6 +175,11 @@ pub struct ParagraphBox {
     /// `u32::MAX` ⇒ unset (the layout-only synthetic paragraphs the
     /// composition preview produces, plus older callers).
     pub source_paragraph_id: u32,
+    /// Phase 2 audit (gap D.1) — complex-field overlays the paginator
+    /// re-evaluates per page. Layout fills this from
+    /// [`engine::Paragraph::fields`]; the paginator mutates
+    /// `evaluated_text` on the page-owned copy of the `ParagraphBox`.
+    pub fields: Vec<LayoutField>,
 }
 
 impl ParagraphBox {

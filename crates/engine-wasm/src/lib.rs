@@ -3404,6 +3404,18 @@ impl Engine {
                         let mut para_box = para_box;
                         para_box.source_paragraph_id = next_para_id;
                         next_para_id += 1;
+                        /* Phase 2 audit (gap D.1) — propagate complex-field
+                        overlays so the paginator can re-evaluate PAGE /
+                        NUMPAGES per page when the paragraph lands. */
+                        para_box.fields = para
+                            .fields
+                            .iter()
+                            .map(|f| layout::LayoutField {
+                                byte_range: f.start..f.end,
+                                instruction: f.instruction.clone(),
+                                evaluated_text: None,
+                            })
+                            .collect();
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);

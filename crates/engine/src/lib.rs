@@ -497,6 +497,57 @@ pub struct Hyperlink {
     pub target: String,
 }
 
+/// Phase 2 audit (gap D.1) — complex field overlay on a paragraph byte
+/// range. The cached display text lives in the paragraph's `text` field
+/// at `[start, end)`; `instruction` is the OOXML field code (`PAGE`,
+/// `NUMPAGES`, `DATE`, `TIME`, etc.) lifted verbatim from the
+/// `<w:instrText>` element(s) between the field's `begin` and
+/// `separate` fldChars.
+///
+/// Evaluation lives at paginate / paint time, not parse time: a `PAGE`
+/// field's actual page number is not knowable until the containing
+/// paragraph has been placed on a page. The reader preserves whatever
+/// cached value the source `.docx` shipped (Word stamps the
+/// last-rendered value as the cached text); the paginator overrides it
+/// with the live value before flushing each page via [`Field::evaluate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    /// Byte offset where the cached display text starts (inclusive).
+    pub start: u32,
+    /// One past the end of the cached display text.
+    pub end: u32,
+    /// Field code — the unparsed `<w:instrText>` content. Trimmed of
+    /// surrounding whitespace; switches like `\* MERGEFORMAT` are
+    /// preserved (the evaluator parses the leading keyword).
+    pub instruction: String,
+}
+
+impl Field {
+    /// Extract the leading keyword from `instruction` — the part Word
+    /// uses to dispatch field types. `"PAGE \* MERGEFORMAT"` → `"PAGE"`;
+    /// `"DATE"` → `"DATE"`. Returns an uppercase owned `String` so
+    /// callers can `match` on it without re-allocating.
+    pub fn keyword(&self) -> String {
+        self.instruction
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase()
+    }
+
+    /// Compute the live display string for this field given the page
+    /// context. Returns `None` for instructions the engine does not
+    /// evaluate (the renderer keeps the cached text in that case).
+    /// `current_page` and `total_pages` are 1-based.
+    pub fn evaluate(&self, current_page: u32, total_pages: u32) -> Option<String> {
+        match self.keyword().as_str() {
+            "PAGE" => Some(current_page.to_string()),
+            "NUMPAGES" => Some(total_pages.to_string()),
+            _ => None,
+        }
+    }
+}
+
 /// Phase 8b — kind of tracked-change revision.
 ///
 /// - `Insert` — `<w:ins>` wraps text that a reviewer added.
@@ -694,6 +745,13 @@ pub struct Paragraph {
     /// renderer can show markup; the passthrough writer round-trips
     /// the wrappers byte-identical from `source_xml`.
     pub revisions: Vec<Revision>,
+    /// Phase 2 audit (gap D.1) — complex-field overlays. Each
+    /// `<w:fldChar fldCharType="begin">`/`separate`/`end` triplet the
+    /// reader sees produces one entry covering the cached display
+    /// text's byte range. The paginator overrides the rendered string
+    /// at flush time for `PAGE` / `NUMPAGES`; other instructions
+    /// (`DATE`, `TIME`, …) render their cached value.
+    pub fields: Vec<Field>,
 }
 
 impl Paragraph {
@@ -759,6 +817,7 @@ impl Paragraph {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         }
     }
 
@@ -846,6 +905,7 @@ impl Paragraph {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         }
     }
 
@@ -883,6 +943,7 @@ impl Paragraph {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
+                fields: Vec::new(),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -895,6 +956,7 @@ impl Paragraph {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
+                fields: Vec::new(),
             },
         )
     }
@@ -925,6 +987,7 @@ impl Paragraph {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         }
     }
 
@@ -1162,6 +1225,7 @@ impl DocumentTree {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         }));
         Self {
             blocks,
@@ -1191,6 +1255,7 @@ impl DocumentTree {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
+                fields: Vec::new(),
             }));
         }
         Self {
@@ -1444,6 +1509,7 @@ impl DocumentTree {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
+                fields: Vec::new(),
             }));
             return Self {
                 blocks,
@@ -3117,6 +3183,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -3139,6 +3206,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -3158,6 +3226,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -3255,6 +3324,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -3711,6 +3781,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -3750,6 +3821,7 @@ mod tests {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -3788,6 +3860,7 @@ mod tests {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
+                fields: Vec::new(),
             },
             Paragraph {
                 text: "two".into(),
@@ -3804,6 +3877,7 @@ mod tests {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
+                fields: Vec::new(),
             },
         ];
         let (out, caret) = doc.insert_rich(

@@ -444,6 +444,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
+            fields: Vec::new(),
         }]),
     };
     vec![
