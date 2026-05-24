@@ -173,6 +173,14 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         } else if (e.code === 'KeyY' || (e.code === 'KeyZ' && e.shiftKey)) {
             e.preventDefault();
             void props.client.dispatch({ type: 'REDO' });
+        } else if (e.code === 'KeyV' && e.shiftKey) {
+            /* Ctrl/Cmd+Shift+V — Paste Special: Unformatted Text.
+               Bypass the HTML path so the engine sees only plain
+               text (UX_BEHAVIOR_SPEC §V.2). The default Ctrl+V is
+               handled by the `onPaste` handler below via the
+               native `paste` ClipboardEvent. */
+            e.preventDefault();
+            void paste(props.client, true);
         }
     };
 

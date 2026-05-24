@@ -43,19 +43,24 @@ export async function cut(client: EngineClient): Promise<void> {
     await client.dispatch({ type: 'DELETE_AT_CARET', forward: false, by_word: false });
 }
 
-/** Paste the system clipboard at the caret — HTML when present, else plain. */
-export async function paste(client: EngineClient): Promise<void> {
+/** Paste the system clipboard at the caret — HTML when present, else plain.
+ *  When `forcePlain` is true (Ctrl/Cmd+Shift+V, UX_BEHAVIOR_SPEC §V.2),
+ *  the HTML path is bypassed entirely so the engine never sees any
+ *  rich markup — Word's "Paste Special → Unformatted Text". */
+export async function paste(client: EngineClient, forcePlain = false): Promise<void> {
     /* The typed `read()` exposes every MIME so a `text/html` payload routes
        to the rich PasteHtml path. It is unavailable or permission-blocked in
        some browsers — fall back to plain-text `readText()`. */
     try {
         const items = await navigator.clipboard.read();
-        for (const item of items) {
-            if (item.types.includes('text/html')) {
-                const html = await (await item.getType('text/html')).text();
-                if (html) {
-                    await client.dispatch({ type: 'PASTE_HTML', html });
-                    return;
+        if (!forcePlain) {
+            for (const item of items) {
+                if (item.types.includes('text/html')) {
+                    const html = await (await item.getType('text/html')).text();
+                    if (html) {
+                        await client.dispatch({ type: 'PASTE_HTML', html });
+                        return;
+                    }
                 }
             }
         }

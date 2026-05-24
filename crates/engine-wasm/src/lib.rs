@@ -4555,12 +4555,19 @@ impl Engine {
         let estart = to_engine_pos(start);
         let eend = to_engine_pos(end);
         let plain = doc.text_range(estart.clone(), eend.clone());
-        /* The selection's styled paragraphs, clipped to local offsets — fed
-        to the HTML serializer and packed into a one-document `.docx`. */
-        let slice = doc.slice(estart, eend);
-        let html = engine::html::to_html(&slice);
+        /* The selection's blocks (paragraphs + any tables it spans),
+        clipped at the endpoints — fed to the rich HTML serializer so
+        the clipboard carries cell shading + borders + image extents
+        for high-fidelity round-trip (UX_BEHAVIOR_SPEC §V). The
+        paragraph-only `slice` still feeds the legacy `.docx`
+        fragment path until `from_rich_paragraphs` learns to accept
+        blocks. */
+        let block_slice = doc.slice_blocks(estart.clone(), eend.clone());
+        let html = engine::html::to_html_blocks(&block_slice);
+        let paragraph_slice = doc.slice(estart, eend);
         let docx_fragment =
-            build_minimal_docx(&DocumentTree::from_rich_paragraphs(slice)).unwrap_or_default();
+            build_minimal_docx(&DocumentTree::from_rich_paragraphs(paragraph_slice))
+                .unwrap_or_default();
         Event::ClipboardPayload {
             plain,
             html,
@@ -4606,8 +4613,8 @@ impl Engine {
     /// and splice them in at the caret, replacing any non-empty selection.
     /// The rich counterpart of `do_paste_plain`.
     fn do_paste_html(&mut self, html: String) -> Event {
-        let paras = engine::html::from_html(&html);
-        if paras.is_empty() {
+        let blocks_in = engine::html::from_html_blocks(&html);
+        if blocks_in.is_empty() {
             /* No parseable content — leave the document untouched. */
             return self.selection_changed();
         }
@@ -4629,7 +4636,7 @@ impl Engine {
                 .current()
                 .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
-        let (new_doc, caret) = base.insert_rich(to_engine_pos(start), &paras);
+        let (new_doc, caret) = base.insert_rich_blocks(to_engine_pos(start), &blocks_in);
         self.commit_edit(new_doc, to_bridge_pos(caret))
     }
 

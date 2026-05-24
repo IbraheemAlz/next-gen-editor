@@ -1789,6 +1789,169 @@ impl DocumentTree {
         )
     }
 
+    /// Like [`Self::slice`] but preserves the top-level block sequence —
+    /// tables that fall between the start and end paragraphs survive
+    /// the slice as `Block::Table` entries, so the rich clipboard can
+    /// round-trip a selection that crosses a table without dropping
+    /// the cell content. The first and last paragraphs are clipped to
+    /// their respective endpoint offsets; tables between them are
+    /// cloned verbatim. Cross-container ranges (cell ↔ body) fall back
+    /// to the start paragraph's tail only — full cross-container
+    /// slicing lands with §IV.6 of UX_BEHAVIOR_SPEC.
+    pub fn slice_blocks(&self, start: LogicalPos, end: LogicalPos) -> Vec<Block> {
+        let (start, end) = order_positions(start, end);
+        if self.paragraph_count() == 0 {
+            return Vec::new();
+        }
+        if start.path == end.path {
+            let Some(p) = self.paragraph_at_path(&start.path) else {
+                return Vec::new();
+            };
+            let head = p.split_at(end.offset).0;
+            return vec![Block::Paragraph(head.split_at(start.offset).1)];
+        }
+        if !same_parent(&start.path, &end.path) {
+            let Some(p) = self.paragraph_at_path(&start.path) else {
+                return Vec::new();
+            };
+            return vec![Block::Paragraph(p.split_at(start.offset).1)];
+        }
+        let Some(sp_idx) = start.path.last_block_index() else {
+            return Vec::new();
+        };
+        let Some(ep_idx) = end.path.last_block_index() else {
+            return Vec::new();
+        };
+        let Some(container) = parent_container_snapshot(self, &start.path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Block> = Vec::with_capacity((ep_idx - sp_idx + 1) as usize);
+        if let Some(p) = container
+            .get(sp_idx as usize)
+            .and_then(|b| b.as_paragraph())
+        {
+            out.push(Block::Paragraph(p.split_at(start.offset).1));
+        }
+        for idx in (sp_idx + 1)..ep_idx {
+            if let Some(b) = container.get(idx as usize) {
+                out.push(b.clone());
+            }
+        }
+        if let Some(p) = container
+            .get(ep_idx as usize)
+            .and_then(|b| b.as_paragraph())
+        {
+            out.push(Block::Paragraph(p.split_at(end.offset).0));
+        }
+        out
+    }
+
+    /// Like [`Self::insert_rich`] but accepts pre-styled blocks — the
+    /// rich clipboard's table-and-paragraph payload. Splits the target
+    /// paragraph at `at`, splices the head + first input block, then
+    /// inserts the middle blocks (tables and paragraphs alike), then
+    /// the last input block + the target's tail. Returns the new tree
+    /// and the caret at the end of the inserted content.
+    pub fn insert_rich_blocks(&self, at: LogicalPos, blocks_in: &[Block]) -> (Self, LogicalPos) {
+        if blocks_in.is_empty() {
+            return (self.clone(), at.clone());
+        }
+        /* When the input is all paragraphs, defer to the existing
+        paragraph-only insert — it merges head+first and last+tail
+        intra-paragraph so consecutive `\n`-joined paragraphs splice
+        with no inter-paragraph break. */
+        if blocks_in.iter().all(|b| matches!(b, Block::Paragraph(_))) {
+            let paras: Vec<Paragraph> = blocks_in
+                .iter()
+                .filter_map(|b| b.as_paragraph().cloned())
+                .collect();
+            return self.insert_rich(at, &paras);
+        }
+        let mut blocks = self.blocks.clone();
+        if self.paragraph_count() == 0 {
+            blocks.push_back(Block::Paragraph(Paragraph::default()));
+        }
+        let target_path = if self.paragraph_at_path(&at.path).is_some() {
+            at.path.clone()
+        } else {
+            self.path_to_last_top_paragraph()
+                .unwrap_or(BlockPath::top(0))
+        };
+        let Some(target_para) = self.paragraph_at_path(&target_path).cloned() else {
+            return (self.clone(), at.clone());
+        };
+        let (head, tail) = target_para.split_at(at.offset);
+        /* Replace the target paragraph with the head + first input
+        block (merged inline if that first block is a paragraph; else
+        head stays its own paragraph and the input block follows). */
+        let (first_replace, first_is_para) = match &blocks_in[0] {
+            Block::Paragraph(p) => (Block::Paragraph(head.concat(p)), true),
+            _ => (Block::Paragraph(head), false),
+        };
+        replace_block_in_top(&mut blocks, &target_path, first_replace);
+        let mut after_path = target_path.clone();
+        if !first_is_para {
+            insert_block_after_path_in_top(&mut blocks, &after_path, blocks_in[0].clone());
+            after_path = bump_last_block_index(&after_path);
+        }
+        /* Middle blocks (everything between the first and last input
+        block) splice in verbatim. */
+        let last_idx = blocks_in.len() - 1;
+        for b in &blocks_in[1..last_idx] {
+            insert_block_after_path_in_top(&mut blocks, &after_path, b.clone());
+            after_path = bump_last_block_index(&after_path);
+        }
+        /* Last input block + the target's tail. When both are
+        paragraphs, merge them inline (the typical Word paste shape).
+        When the last input is a table, the tail becomes its own
+        trailing paragraph below the table. */
+        let (last_block, caret_offset) = match (blocks_in.get(last_idx), last_idx == 0) {
+            (Some(Block::Paragraph(p)), true) => {
+                /* Single-input-paragraph case is handled by the
+                paragraph fast-path above; this branch is unreachable
+                in practice but stays for completeness. */
+                (Block::Paragraph(p.concat(&tail)), p.text.len() as u32)
+            }
+            (Some(Block::Paragraph(p)), false) => {
+                let offset = p.text.len() as u32;
+                (Block::Paragraph(p.concat(&tail)), offset)
+            }
+            (Some(Block::Table(t)), _) => {
+                /* Splice the table, then append the tail as a fresh
+                paragraph BELOW it so the caret has a logical home. */
+                insert_block_after_path_in_top(&mut blocks, &after_path, Block::Table(t.clone()));
+                after_path = bump_last_block_index(&after_path);
+                (Block::Paragraph(tail.clone()), 0)
+            }
+            _ => (Block::Paragraph(tail.clone()), 0),
+        };
+        /* Splice the final block. When the last input block was a
+        table, `last_block` is the synthesised trailing paragraph the
+        match above produced and `after_path` already points to that
+        table; otherwise `after_path` still points to the merged
+        head+first paragraph (or the last middle block) and we
+        append the merged last+tail behind it. */
+        insert_block_after_path_in_top(&mut blocks, &after_path, last_block);
+        after_path = bump_last_block_index(&after_path);
+        let caret = LogicalPos {
+            path: after_path,
+            offset: caret_offset,
+        };
+        (
+            Self {
+                blocks,
+                sections: self.sections.clone(),
+                headers: self.headers.clone(),
+                footers: self.footers.clone(),
+                media: self.media.clone(),
+                footnotes: self.footnotes.clone(),
+                comment_defs: self.comment_defs.clone(),
+                comment_ranges: self.comment_ranges.clone(),
+            },
+            caret,
+        )
+    }
+
     /// Extract the text of the logical range `[start, end)`. Paragraphs the
     /// range spans are joined by `\n`. Used for clipboard copy.
     pub fn text_range(&self, start: LogicalPos, end: LogicalPos) -> String {
