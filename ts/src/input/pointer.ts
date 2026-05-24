@@ -82,6 +82,13 @@ export function attachPointer(
         canvas.setPointerCapture(e.pointerId);
         dragging = true;
         gesture += 1;
+        /* Shift+Click extends the existing selection (anchor stays
+           put, caret jumps to the hit position) instead of resetting
+           it. UX_BEHAVIOR_SPEC §IV.7. */
+        if (e.shiftKey) {
+            void extendTo(toGlobal(e), gesture);
+            return;
+        }
         void placeCaret(toGlobal(e), gesture);
     };
 
@@ -104,14 +111,20 @@ export function attachPointer(
         void client.dispatch({ type: 'SELECT_WORD_AT', at: toGlobal(e) });
     };
 
-    /* Triple-click — select the whole paragraph (Backlog #14). The DOM has no
-       native event for this; the third click in a chain carries detail === 3.
-       Bump `gesture` so the third pointerdown's hit-test is dropped, same as
-       dblclick does for the second. */
+    /* Triple-click — whole paragraph. Quadruple-click — whole document
+       (UX_BEHAVIOR_SPEC §I.3). DOM has no native triple/quadruple events;
+       `e.detail` carries the click count. Bump `gesture` on each so the
+       pending hit-tests from the inner clicks get dropped (mirrors
+       dblclick's defence against the two single-clicks). Cell-scope
+       on quadruple-click inside a table is deferred — no SELECT_CELL_AT
+       command yet; falls through to SELECT_ALL until that lands. */
     const onClick = (e: MouseEvent): void => {
         if (e.detail === 3) {
             gesture += 1;
             void client.dispatch({ type: 'SELECT_PARAGRAPH_AT', at: toGlobal(e) });
+        } else if (e.detail >= 4) {
+            gesture += 1;
+            void client.dispatch({ type: 'SELECT_ALL' });
         }
     };
 

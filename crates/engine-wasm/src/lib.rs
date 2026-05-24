@@ -95,6 +95,17 @@ struct CaretSlot {
     byte: u32,
 }
 
+/// Caret affinity at a BiDi seam — see `SelectionState::affinity`. The
+/// default is `LeadingX` so a fresh selection / pointer-set caret
+/// renders at the smaller-x slot (consistent with the existing
+/// `slot_x_for_byte` choice).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum CaretAffinity {
+    #[default]
+    LeadingX,
+    TrailingX,
+}
+
 /// One laid-out line flattened for pointer hit-testing and caret/selection
 /// geometry. All coordinates are absolute page points (= canvas device px).
 struct LineGeom {
@@ -187,6 +198,17 @@ pub struct Engine {
     /// the `REQUEST_PAINT` path emitted `Painted` — mutating commands
     /// rendered but stayed silent on the dims).
     last_paint_dims: (f32, u32),
+    /// Caret affinity at a BiDi seam (UX_BEHAVIOR_SPEC §III.5). When
+    /// the caret offset lands on a byte with TWO valid visual slots —
+    /// the end of one directional run and the start of the next —
+    /// `caret_rect_geom` consults this flag to pick which side
+    /// renders. The visual-step arrow sets it on each motion
+    /// (`Right` → `TrailingX`, `Left` → `LeadingX`); a non-arrow
+    /// selection change (click, SET_SELECTION, SelectAll, paste,
+    /// type) resets to `LeadingX`. Stored on `Engine` rather than
+    /// `SelectionState` so the 13+ places that mint a `SelectionState`
+    /// struct literal stay untouched.
+    caret_affinity: CaretAffinity,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -224,6 +246,7 @@ fn assemble_engine(
         a11y_cache: None,
         image_cache: HashMap::new(),
         last_paint_dims: (0.0, 0),
+        caret_affinity: CaretAffinity::default(),
     }
 }
 
@@ -2145,6 +2168,7 @@ fn caret_rect_geom(
     pos: &BridgeLogicalPos,
     fallback: BridgeRect,
     caret_w: f32,
+    affinity: CaretAffinity,
 ) -> BridgeRect {
     let line = geom
         .iter()
@@ -2152,13 +2176,42 @@ fn caret_rect_geom(
         .or_else(|| geom.first());
     match line {
         Some(line) => BridgeRect {
-            x: slot_x_for_byte(line, pos.offset),
+            x: slot_x_for_byte_with_affinity(line, pos.offset, affinity),
             y: line.y_top,
             w: caret_w,
             h: line.height,
         },
         None => fallback,
     }
+}
+
+/// Affinity-aware x lookup. At a BiDi seam two slots share the same
+/// byte offset (logical end of one run + logical end of the next
+/// directional run); they sit at DIFFERENT x's. Pick whichever the
+/// caret's affinity asks for: `LeadingX` = smaller x (left side of
+/// the seam), `TrailingX` = greater x (right side).
+///
+/// When only one slot matches the byte, that slot wins regardless of
+/// affinity. When no slot matches, fall back to `line.start_x` like
+/// the existing `slot_x_for_byte`.
+fn slot_x_for_byte_with_affinity(line: &LineGeom, byte: u32, affinity: CaretAffinity) -> f32 {
+    use core::cmp::Ordering;
+    let candidates: Vec<&CaretSlot> = line.slots.iter().filter(|s| s.byte == byte).collect();
+    if candidates.is_empty() {
+        return slot_x_for_byte(line, byte);
+    }
+    if candidates.len() == 1 {
+        return candidates[0].x;
+    }
+    let pick = match affinity {
+        CaretAffinity::LeadingX => candidates
+            .iter()
+            .min_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal)),
+        CaretAffinity::TrailingX => candidates
+            .iter()
+            .max_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal)),
+    };
+    pick.map_or(line.start_x, |s| s.x)
 }
 
 /// Per-`VisualRun` selection rectangles for `[start, end]` — the discontinuous
@@ -3647,28 +3700,46 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let doc = self.undo.current().clone();
-        /* UAX #9 visual-arrow mapping (UX_BEHAVIOR_SPEC §III.1). In an
-        RTL paragraph the user's ArrowLeft means "visually leftward",
-        which is LOGICALLY FORWARD because RTL text reorders. The flip
-        applies to plain Left/Right and Ctrl-modified WordLeft/WordRight
-        identically. */
-        let para_dir = self.paragraph_direction_at(&sel.caret.path);
-        let rtl = para_dir == ShapingDirection::Rtl;
+        /* UAX #9 visual-arrow mapping (UX_BEHAVIOR_SPEC §III.1).
+        Plain Left/Right are SPATIAL — they consult LineGeom slot x's
+        to find the visual neighbour, so a caret inside an Arabic word
+        in an LTR paragraph still moves visually right when the user
+        presses Right (the paragraph-direction flip would step
+        logical-forward, which is visually LEFT inside the RTL run —
+        the very bug §III.1 calls out).
+        Word-jump (WordLeft/WordRight) keeps the paragraph-direction
+        flip — Word's observed Ctrl+Arrow behaviour in mixed text is
+        paragraph-level, not run-level (jumps logical word boundaries
+        regardless of the caret's current run direction). */
+        let para_rtl = self.paragraph_direction_at(&sel.caret.path) == ShapingDirection::Rtl;
+        let mut new_affinity = self.caret_affinity;
         let (new_caret, new_ideal) = match direction {
             MoveDirection::Left => {
-                let f = if rtl { step_right } else { step_left };
-                (f(&doc, sel.caret.clone()), None)
+                let (p, aff) = self.visual_step_arrow(&sel.caret, false);
+                new_affinity = aff;
+                (p, None)
             }
             MoveDirection::Right => {
-                let f = if rtl { step_left } else { step_right };
-                (f(&doc, sel.caret.clone()), None)
+                let (p, aff) = self.visual_step_arrow(&sel.caret, true);
+                new_affinity = aff;
+                (p, None)
             }
             MoveDirection::WordLeft => {
-                let f = if rtl { step_word_right } else { step_word_left };
+                let f = if para_rtl {
+                    step_word_right
+                } else {
+                    step_word_left
+                };
+                new_affinity = CaretAffinity::LeadingX;
                 (f(&doc, sel.caret.clone()), None)
             }
             MoveDirection::WordRight => {
-                let f = if rtl { step_word_left } else { step_word_right };
+                let f = if para_rtl {
+                    step_word_left
+                } else {
+                    step_word_right
+                };
+                new_affinity = CaretAffinity::TrailingX;
                 (f(&doc, sel.caret.clone()), None)
             }
             MoveDirection::LineHome => (
@@ -3887,6 +3958,7 @@ impl Engine {
             new_caret.clone()
         };
         let kind = derive_selection_kind(&anchor, &new_caret);
+        self.caret_affinity = new_affinity;
         self.selection = Some(SelectionState {
             anchor,
             caret: new_caret,
@@ -3942,7 +4014,13 @@ impl Engine {
                 start: start.clone(),
                 end: end.clone(),
             },
-            caret: caret_rect_geom(&geom, &sel.caret, fallback, CARET_WIDTH * scale),
+            caret: caret_rect_geom(
+                &geom,
+                &sel.caret,
+                fallback,
+                CARET_WIDTH * scale,
+                self.caret_affinity,
+            ),
             direction,
             rects,
             /* A collapsed caret reflects any armed pending style; a real
@@ -3971,6 +4049,76 @@ impl Engine {
             .as_ref()
             .map_or(Alignment::Start, |c| c.alignment);
         bridge_align(stored.unwrap_or(default))
+    }
+
+    /// SPATIAL visual-arrow step (UX_BEHAVIOR_SPEC §III.1 run-level
+    /// fix). Find the caret's host LineGeom and return the slot
+    /// immediately to the visual right (`going_right: true`) or left
+    /// of the caret's current x. This is the **only** correct way to
+    /// handle ArrowLeft / ArrowRight in a BiDi-mixed line: a
+    /// paragraph-direction flip moves logically and breaks INSIDE
+    /// directional runs (an LTR paragraph with an inline Arabic word
+    /// — ArrowRight inside the Arabic chunk would step logical-forward,
+    /// which is VISUALLY LEFT in the RTL reorder).
+    ///
+    /// At a line's visual edge (no slot on the requested side), fall
+    /// back to the paragraph-direction–aware logical step which
+    /// handles line and paragraph wrap. The paragraph-direction flip
+    /// stays for word-jump (`WordLeft` / `WordRight`) — Word's
+    /// observed behaviour in mixed text Ctrl+Arrow.
+    fn visual_step_arrow(
+        &self,
+        caret: &BridgeLogicalPos,
+        going_right: bool,
+    ) -> (BridgeLogicalPos, CaretAffinity) {
+        use core::cmp::Ordering;
+        let affinity = if going_right {
+            CaretAffinity::TrailingX
+        } else {
+            CaretAffinity::LeadingX
+        };
+        if let Ok(geom) = self.document_geometry() {
+            let line = geom.iter().find(|l| {
+                l.path == caret.path && caret.offset >= l.start_byte && caret.offset <= l.end_byte
+            });
+            if let Some(line) = line {
+                let current_x = slot_x_for_byte(line, caret.offset);
+                let next = if going_right {
+                    line.slots
+                        .iter()
+                        .filter(|s| s.x > current_x + 0.5)
+                        .min_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal))
+                } else {
+                    line.slots
+                        .iter()
+                        .filter(|s| s.x < current_x - 0.5)
+                        .max_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal))
+                };
+                if let Some(s) = next {
+                    return (
+                        BridgeLogicalPos {
+                            path: caret.path.clone(),
+                            offset: s.byte,
+                        },
+                        affinity,
+                    );
+                }
+            }
+        }
+        /* Visual edge of the line OR geometry unavailable (no
+        layout_cfg yet — happens in unit tests + before the first
+        render). Fall back to the paragraph-direction–aware logical
+        step which handles line + paragraph wrap. Visual-right in an
+        LTR line is logical-forward; in an RTL line it is
+        logical-backward. */
+        let para_rtl = self.paragraph_direction_at(&caret.path) == ShapingDirection::Rtl;
+        let doc = self.undo.current();
+        let stepped = if going_right ^ para_rtl {
+            step_right(doc, caret.clone())
+        } else {
+            step_left(doc, caret.clone())
+        };
+        (stepped, affinity)
     }
 
     /// Resolved base direction of the paragraph at `path`, used by the
@@ -4203,7 +4351,15 @@ impl Engine {
         if forward {
             if caret.offset < para_len {
                 let to = if by_word {
-                    para.word_bounds(caret.offset).1
+                    /* UAX #29 word boundary forward — delete from caret
+                    to the start of the next word-like segment. Matches
+                    Ctrl+Delete in Word / Google Docs. Falls back to
+                    paragraph end when no further word exists. */
+                    word_starts(&para.text)
+                        .into_iter()
+                        .find(|&i| i as u32 > caret.offset)
+                        .map(|i| i as u32)
+                        .unwrap_or(para_len)
                 } else {
                     para.next_offset(caret.offset)
                 };
@@ -4225,7 +4381,15 @@ impl Engine {
             }
         } else if caret.offset > 0 {
             let from = if by_word {
-                para.word_bounds(para.prev_offset(caret.offset)).0
+                /* UAX #29 word boundary backward — delete from the
+                start of the previous word-like segment up to the
+                caret. Matches Ctrl+Backspace in Word / Google Docs. */
+                word_starts(&para.text)
+                    .into_iter()
+                    .take_while(|&i| (i as u32) < caret.offset)
+                    .last()
+                    .map(|i| i as u32)
+                    .unwrap_or(0)
             } else {
                 para.prev_offset(caret.offset)
             };
@@ -4691,6 +4855,7 @@ mod tests {
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: (0.0, 0),
+            caret_affinity: CaretAffinity::default(),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -5262,6 +5427,7 @@ mod tests {
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: (0.0, 0),
+            caret_affinity: CaretAffinity::default(),
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -5302,6 +5468,7 @@ mod tests {
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: (0.0, 0),
+            caret_affinity: CaretAffinity::default(),
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -5333,9 +5500,83 @@ mod tests {
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: (0.0, 0),
+            caret_affinity: CaretAffinity::default(),
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 6);
+    }
+
+    /* ---- Roadmap Phase 2: run-level visual step (§III.1) -------- */
+
+    /// `slot_x_for_byte_with_affinity` resolves a BiDi-seam byte that
+    /// hosts two slots to the side the caret's affinity asks for.
+    #[test]
+    fn affinity_picks_correct_slot_at_bidi_seam() {
+        /* Synthesise a line whose `slots` carry two entries with byte=4
+        at very different x's — the LTR-run trailing edge (x=80) and
+        the RTL-run trailing edge (x=20). */
+        let line = LineGeom {
+            path: BridgeBlockPath::top(0),
+            start_x: 0.0,
+            hit_left: 0.0,
+            hit_width: 100.0,
+            y_top: 0.0,
+            height: 20.0,
+            start_byte: 0,
+            end_byte: 8,
+            slots: vec![
+                CaretSlot { x: 20.0, byte: 4 },
+                CaretSlot { x: 80.0, byte: 4 },
+            ],
+            runs: Vec::new(),
+        };
+        let leading = slot_x_for_byte_with_affinity(&line, 4, CaretAffinity::LeadingX);
+        let trailing = slot_x_for_byte_with_affinity(&line, 4, CaretAffinity::TrailingX);
+        assert_eq!(leading, 20.0);
+        assert_eq!(trailing, 80.0);
+    }
+
+    /* ---- Roadmap Phase 2: UAX #29 deletion (§II.2) -------------- */
+
+    /// `Ctrl+Backspace` deletes back to the start of the previous
+    /// word-like segment per UAX #29, treating `isn't` as one word so
+    /// the apostrophe is not the boundary the delete stops at.
+    #[test]
+    fn delete_word_backward_treats_contraction_as_one_word() {
+        let mut e = Engine {
+            page_ctxs: Vec::new(),
+            ctx: None,
+            fonts: HashMap::new(),
+            undo: UndoStack::new(DocumentTree::from_text("isn't done"), 8),
+            layout_cfg: None,
+            atlas: GlyphAtlas::new(),
+            vello: None,
+            dirty: DirtyTracker::new(),
+            selection: Some(SelectionState {
+                anchor: bpos_top(0, "isn't done".len() as u32),
+                caret: bpos_top(0, "isn't done".len() as u32),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            composition: None,
+            pending_format: None,
+            layout_cache: new_layout_cache(),
+            a11y_cache: None,
+            image_cache: HashMap::new(),
+            last_paint_dims: (0.0, 0),
+            caret_affinity: CaretAffinity::default(),
+        };
+        e.do_delete_at_caret(false, true);
+        /* "done" deleted → "isn't " remains. The whitespace-classifier
+        scanner from before would have stopped at the apostrophe. */
+        assert_eq!(
+            e.undo
+                .current()
+                .paragraph_at_path(&engine::BlockPath::top(0))
+                .unwrap()
+                .text,
+            "isn't "
+        );
     }
 }
