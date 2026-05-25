@@ -4644,6 +4644,12 @@ impl Engine {
         };
         /* A caret move discards any armed sticky style (Backlog #11). */
         self.pending_format = None;
+        /* Audit gap B.M4 — non-arrow selection change resets the BiDi
+        seam affinity to the leading-x default. The arrow-key motions
+        carry their own directional intent; a click, SetSelection,
+        SelectAll, paste, or type starts a fresh visual journey from
+        the leading slot at a seam. */
+        self.caret_affinity = CaretAffinity::default();
         let kind = derive_selection_kind(&anchor, &caret);
         self.selection = Some(SelectionState {
             anchor,
@@ -4661,6 +4667,10 @@ impl Engine {
             .as_ref()
             .map_or_else(|| to.clone(), |s| s.anchor.clone());
         self.pending_format = None;
+        /* Audit gap B.M4 — shift+click is a non-arrow caret motion;
+        reset affinity so the new caret position renders at the
+        leading-x seam slot. */
+        self.caret_affinity = CaretAffinity::default();
         let kind = derive_selection_kind(&anchor, &to);
         self.selection = Some(SelectionState {
             anchor,
@@ -4802,6 +4812,9 @@ impl Engine {
             .paragraph_at_path(&last_path)
             .map_or(0, |p| p.text.len() as u32);
         self.pending_format = None;
+        /* Audit gap B.M4 — SelectAll is a non-arrow motion; reset
+        affinity. */
+        self.caret_affinity = CaretAffinity::default();
         self.selection = Some(SelectionState {
             anchor: bpos_top(0, 0),
             caret: BridgeLogicalPos {
@@ -5454,6 +5467,10 @@ impl Engine {
         self.undo.push(new_doc);
         let caret = clamp_pos(self.undo.current(), caret);
         let anchor = caret.clone();
+        /* Audit gap B.M4 — a content edit (type, paste, delete) is a
+        non-arrow caret motion; reset affinity so the post-edit caret
+        rect at a fresh seam picks the leading slot. */
+        self.caret_affinity = CaretAffinity::default();
         self.selection = Some(SelectionState {
             anchor,
             caret,
