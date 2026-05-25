@@ -434,6 +434,13 @@ fn handle_property_inner(
             b"w:tblStyle" => {
                 props.table_style_id = attr_val(e, b"w:val");
             }
+            /* Audit gap A.M8 — `<w:tblLayout w:type="autofit|fixed"/>`. */
+            b"w:tblLayout" => {
+                props.layout = match attr_val(e, b"w:type").as_deref().map(str::trim) {
+                    Some("fixed") => engine::TableLayout::Fixed,
+                    _ => engine::TableLayout::Autofit,
+                };
+            }
             _ => {}
         }
         return;

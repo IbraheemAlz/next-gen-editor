@@ -310,6 +310,18 @@ pub struct TableRowBox {
     pub origin: Point,
     pub size: Size,
     pub cells: Vec<TableCellBox>,
+    /// Audit gap A.M9 — `<w:trPr><w:tblHeader/>` toggle. When `true`,
+    /// the paginator clones this row at the top of every page the table
+    /// continues onto after a split. Header rows still pay their own
+    /// budget on the original page.
+    pub header: bool,
+    /// Audit gap C.M2 — `<w:trPr><w:cantSplit/>` toggle. When `true`,
+    /// the row never splits across a page boundary; the paginator
+    /// flushes the page and pushes the row whole on the next. When
+    /// `false`, the paginator MAY split the row's cell paragraphs
+    /// mid-row (deferred — current implementation keeps every row
+    /// atomic).
+    pub cant_split: bool,
 }
 
 #[derive(Debug, Clone)]

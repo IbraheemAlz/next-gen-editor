@@ -1809,10 +1809,13 @@ fn layout_table_box(
     cfg: &RenderConfig,
     scale: f32,
 ) -> TableBox {
-    /* Column widths in device px. If `<w:tblGrid>` is missing, fall back
-    to equal-divide across the available width — defensive for malformed
-    documents. */
-    let columns: Vec<f32> = if table.grid.is_empty() {
+    /* Column widths in device px. Decision tree:
+    - `<w:tblLayout w:type="fixed"/>` AND grid present → use grid as-is.
+    - Default (Autofit) AND grid present → start with grid, then run
+      the autofit measure-then-distribute pass to right-size each
+      column to its content (audit gap A.M8).
+    - Grid absent → autofit always, the grid simply has no anchor. */
+    let mut columns: Vec<f32> = if table.grid.is_empty() {
         Vec::new()
     } else {
         table
@@ -1821,6 +1824,16 @@ fn layout_table_box(
             .map(|&t| twips_to_layout_px(t, scale))
             .collect()
     };
+    /* Audit gap A.M8 — autofit. Measure each column's intrinsic
+    natural width (max line width across all cells in that column at
+    a generous probe width), then redistribute `available_width_px`
+    so wide columns get more room and narrow columns aren't forced
+    to wrap their longest unbreakable word. Single-pass: re-uses the
+    cell layout result from the measure pass as the layout (no second
+    layout call for unchanged column widths). */
+    if matches!(table.props.layout, engine::TableLayout::Autofit) {
+        columns = autofit_distribute(table, available_width_px, fonts, cfg, scale, &columns);
+    }
 
     let mut rows_out: Vec<TableRowBox> = Vec::with_capacity(table.rows.len());
     let mut y = 0.0_f32;
@@ -1936,9 +1949,21 @@ fn layout_table_box(
                 height: row_height,
             },
             cells: cells_out,
+            header: row.props.header,
+            cant_split: row.props.cant_split,
         });
         y += row_height;
     }
+
+    /* Audit gap C.M1 — vMerge height accumulation. Walk each Restart
+    cell and grow its `size.height` to span the consecutive Continue
+    cells beneath it in the same column. Done after every row is
+    finalized (so row heights are stable) and before the box leaves
+    `layout_table_box`. Without this, a vertically-merged cell whose
+    Restart row is short renders the Restart cell's content shrunk
+    to that single row's height, and the Continue rows below show
+    blank — the visual bug A.M8 / C.M1 covers. */
+    accumulate_vmerge_heights(&mut rows_out);
 
     TableBox {
         origin: Point::default(),
@@ -1949,6 +1974,186 @@ fn layout_table_box(
         columns,
         rows: rows_out,
         outer_borders: table.props.borders.clone().unwrap_or_default(),
+    }
+}
+
+/// Audit gap A.M8 — autofit two-pass column distribution.
+///
+/// Pass 1 (measure): for every cell, lay out its paragraphs against
+/// the table's available width and read back the per-paragraph maximum
+/// line width (the natural max-content metric). Track per-column the
+/// max over rows. Empty cells contribute a floor of ~30 pt so a
+/// single-cell column doesn't collapse to zero. Grid_span > 1 cells
+/// contribute their natural width split evenly across the spanned
+/// columns.
+///
+/// Pass 2 (distribute): if the sum of column max-content widths
+/// already fits in `available_width_px`, expand columns proportionally
+/// to fill the available band (Word's "Autofit Window" behaviour);
+/// otherwise scale every column down by the same factor so the total
+/// equals available. Either way, columns whose grid hint is set are
+/// allowed to grow but never shrink below their grid value plus a
+/// tiny epsilon — explicit grid widths from `<w:tblGrid>` are still
+/// honoured as a soft minimum.
+///
+/// Cost: O(rows × cols) calls to `layout_cell_blocks` in the measure
+/// pass. Cells re-layout once more at the final widths in the caller,
+/// so the total is 2× a fixed-grid table for autofit. Bounded for
+/// typical tables; infinite-loop risk is zero because the distribute
+/// pass is a one-shot transformation, not an iterative solver.
+fn autofit_distribute(
+    table: &engine::Table,
+    available_width_px: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    grid_hint: &[f32],
+) -> Vec<f32> {
+    /* Number of columns: max(grid, max row's cell-count). The grid
+    might be empty; cells might over-/under-shoot it; take the union. */
+    let max_cols_in_rows = table
+        .rows
+        .iter()
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| c.props.grid_span.max(1) as usize)
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    let n_cols = grid_hint.len().max(max_cols_in_rows);
+    if n_cols == 0 {
+        return Vec::new();
+    }
+    const MIN_COL_WIDTH_PT: f32 = 30.0;
+    let probe_width = (available_width_px / n_cols as f32).max(MIN_COL_WIDTH_PT * scale);
+
+    let mut col_natural: Vec<f32> = vec![MIN_COL_WIDTH_PT * scale; n_cols];
+    for row in &table.rows {
+        let mut col_cursor: usize = 0;
+        for cell in &row.cells {
+            let span = cell.props.grid_span.max(1) as usize;
+            if matches!(cell.props.v_merge, engine::VMergeRole::Continue) {
+                col_cursor += span;
+                continue;
+            }
+            /* Effective padding eats into the natural-width measurement
+            because the eventual layout subtracts it from the column
+            width before passing to the paragraph builder. Apply
+            symmetrically here so the measure matches the actual fit. */
+            let eff = engine::CellMargins::resolve_edges(
+                cell.props.cell_margins.as_ref(),
+                &table.props.cell_margins,
+            );
+            let pad = twips_to_layout_px(eff.left_twips + eff.right_twips, scale);
+            /* Lay out at the probe width — max line width across all
+            paragraphs is the natural fit. */
+            let inner = layout_cell_blocks(&cell.blocks, probe_width, fonts, cfg, scale);
+            let natural_content_w = inner
+                .iter()
+                .map(|b| match b {
+                    LayoutBlock::Paragraph(p) => {
+                        p.lines.iter().map(|l| l.width).fold(0.0_f32, f32::max)
+                    }
+                    LayoutBlock::Table(t) => t.size.width,
+                })
+                .fold(0.0_f32, f32::max);
+            let cell_natural = natural_content_w + pad;
+            let share = cell_natural / span as f32;
+            for i in 0..span {
+                let ci = col_cursor + i;
+                if ci < col_natural.len() && col_natural[ci] < share {
+                    col_natural[ci] = share;
+                }
+            }
+            col_cursor += span;
+        }
+    }
+    /* Honour grid hints as a soft minimum — never shrink below them.
+    Empty grid contributes nothing here. */
+    for (i, &hint) in grid_hint.iter().enumerate() {
+        if i < col_natural.len() && col_natural[i] < hint {
+            col_natural[i] = hint;
+        }
+    }
+    let total: f32 = col_natural.iter().sum();
+    if total <= 0.0 {
+        return vec![available_width_px / n_cols as f32; n_cols];
+    }
+    let scale_factor = available_width_px / total;
+    col_natural.iter().map(|w| w * scale_factor).collect()
+}
+
+/// Audit gap C.M1 — vertical-merge height pass. For every Restart cell
+/// at column index `C`, walk subsequent rows scanning column `C`; while
+/// the cell at `C` is `Continue`, add its row's height to the Restart's
+/// `size.height`. The Restart cell visually owns the merged span; its
+/// inner-content `v_align` shift (computed earlier off the now-final
+/// `size.height`) is re-applied so Bottom-aligned content inside a
+/// 4-row vMerge actually sits at the bottom of all 4 rows.
+fn accumulate_vmerge_heights(rows: &mut [TableRowBox]) {
+    /* Identify (row_idx, col_idx) of every Restart cell and how many
+    Continue rows follow at the same `col_idx`. Build a list first
+    then mutate, so the loop borrows immutably for scanning and
+    mutably for the patch. */
+    let mut extensions: Vec<(usize, usize, f32)> = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        let mut col_cursor: u32 = 0;
+        for cell in &row.cells {
+            let span = cell.grid_span.max(1) as u32;
+            if matches!(cell.v_merge, engine::VMergeRole::Restart) {
+                let mut extra = 0.0_f32;
+                for next_row in rows.iter().skip(r + 1) {
+                    /* Does `next_row` carry a Continue cell at the same
+                    column? Re-walk grid_spans because cells before col_cursor
+                    may consume different widths. */
+                    let mut nc: u32 = 0;
+                    let mut hit_continue = false;
+                    for next_cell in &next_row.cells {
+                        if nc == col_cursor {
+                            if matches!(next_cell.v_merge, engine::VMergeRole::Continue) {
+                                hit_continue = true;
+                            }
+                            break;
+                        }
+                        nc += next_cell.grid_span.max(1) as u32;
+                        if nc > col_cursor {
+                            break;
+                        }
+                    }
+                    if hit_continue {
+                        extra += next_row.size.height;
+                    } else {
+                        break;
+                    }
+                }
+                if extra > 0.0 {
+                    /* Find this cell's index inside its row to record
+                    the patch. `col_cursor` tracks the column; we need
+                    the actual `cells[i]` index. */
+                    let cell_idx = row
+                        .cells
+                        .iter()
+                        .scan(0_u32, |acc, c| {
+                            let start = *acc;
+                            *acc += c.grid_span.max(1) as u32;
+                            Some(start)
+                        })
+                        .position(|s| s == col_cursor)
+                        .unwrap_or(0);
+                    extensions.push((r, cell_idx, extra));
+                }
+            }
+            col_cursor += span;
+        }
+    }
+    for (r, c, extra) in extensions {
+        if let Some(row) = rows.get_mut(r)
+            && let Some(cell) = row.cells.get_mut(c)
+        {
+            cell.size.height += extra;
+        }
     }
 }
 

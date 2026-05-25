@@ -1384,6 +1384,17 @@ pub struct CellProperties {
     pub cell_margins: Option<CellMargins>,
 }
 
+/// Audit gap A.M8 — `<w:tblLayout w:type>`. `Autofit` (Word's
+/// default) measures cell content and distributes column widths to
+/// fit the available band; `Fixed` honours `<w:tblGrid>` verbatim
+/// regardless of content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableLayout {
+    #[default]
+    Autofit,
+    Fixed,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TableProperties {
     pub width: Option<CellWidth>,
@@ -1392,6 +1403,10 @@ pub struct TableProperties {
     pub borders: Option<CellBorders>,
     pub cell_margins: CellMargins,
     pub table_style_id: Option<String>,
+    /// Audit gap A.M8 — `<w:tblLayout w:type="autofit|fixed"/>`.
+    /// Default `Autofit` matches Word's behaviour when the element
+    /// is absent.
+    pub layout: TableLayout,
 }
 
 #[derive(Debug, Clone, Default)]

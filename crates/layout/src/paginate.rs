@@ -22,7 +22,7 @@
 
 use crate::boxes::{
     FootnoteEntry, HeaderFooterBox, LayoutBlock, LineBox, PageBox, ParagraphBox, Point, Size,
-    TableBox,
+    TableBox, TableRowBox,
 };
 use crate::page::Margins;
 use std::collections::HashMap;
@@ -573,7 +573,14 @@ impl Paginator {
         }
 
         /* The page is empty and the table is still taller than a page —
-        emit row-by-row splits. */
+        emit row-by-row splits.
+
+        Audit gap C.M2 — `<w:trPr><w:cantSplit/>` honour. The current
+        implementation already keeps every row atomic (no mid-row
+        paragraph split), so `cant_split=true` is the default
+        behaviour. The flag is threaded through `TableRowBox` for
+        when the mid-cell split lands in a follow-up sprint; the
+        check below mirrors what the future split path will do. */
         let mut head_rows = Vec::new();
         let mut head_height = 0.0_f32;
         let mut tail_rows = Vec::new();
@@ -607,17 +614,44 @@ impl Paginator {
             outer_borders: table.outer_borders.clone(),
         };
         self.cur_y += head_height;
+        /* Audit gap A.M9 — collect header rows from the head BEFORE we
+        move it into `cur_blocks`. Cloning is cheap (handful of cells
+        each carrying paragraph-content `Vec`s); the originals stay in
+        place at the top of the head. The tail prepends fresh clones
+        so the headers repeat. */
+        let header_rows: Vec<TableRowBox> =
+            head.rows.iter().filter(|r| r.header).cloned().collect();
         self.cur_blocks.push(LayoutBlock::Table(head));
 
         if !tail_rows.is_empty() {
+            /* Audit gap A.M9 — prepend cloned headers to every tail
+            page. Re-stamp `origin.y` so the headers sit at the top of
+            the new TableBox and the original tail rows shift down by
+            the headers' total height. */
+            let header_total: f32 = header_rows.iter().map(|r| r.size.height).sum();
+            let mut combined: Vec<TableRowBox> =
+                Vec::with_capacity(header_rows.len() + tail_rows.len());
+            let mut cursor_y = 0.0_f32;
+            for h in &header_rows {
+                let mut hh = h.clone();
+                hh.origin.y = cursor_y;
+                cursor_y += hh.size.height;
+                combined.push(hh);
+            }
+            for r in &tail_rows {
+                let mut rr = r.clone();
+                rr.origin.y = cursor_y;
+                cursor_y += rr.size.height;
+                combined.push(rr);
+            }
             let tail = TableBox {
                 origin: Point { x: 0.0, y: 0.0 },
                 size: Size {
                     width: table.size.width,
-                    height: tail_height,
+                    height: tail_height + header_total,
                 },
                 columns: table.columns,
-                rows: tail_rows,
+                rows: combined,
                 outer_borders: table.outer_borders,
             };
             /* Audit gap A.H2 — snake into the next column before

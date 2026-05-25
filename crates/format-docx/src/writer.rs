@@ -818,12 +818,14 @@ fn regenerate_table(t: &Table, out: &mut String) {
 
 fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
     let has_margins = props.cell_margins != engine::CellMargins::default();
+    let has_layout_override = matches!(props.layout, engine::TableLayout::Fixed);
     let has_content = props.width.is_some()
         || props.alignment.is_some()
         || props.indent_twips != 0
         || props.borders.is_some()
         || props.table_style_id.is_some()
-        || has_margins;
+        || has_margins
+        || has_layout_override;
     if !has_content {
         return;
     }
@@ -842,6 +844,12 @@ fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
     }
     if let Some(a) = props.alignment {
         out.push_str(&format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
+    }
+    /* Audit gap A.M8 — emit `<w:tblLayout>` only for the non-default
+    `Fixed` form so existing Autofit tables stay byte-identical on
+    roundtrip. */
+    if has_layout_override {
+        out.push_str("<w:tblLayout w:type=\"fixed\"/>");
     }
     if let Some(b) = &props.borders {
         emit_cell_borders("w:tblBorders", b, out);

@@ -859,6 +859,8 @@ mod tests {
                 height: 30.0,
             },
             cells: vec![cell],
+            header: false,
+            cant_split: false,
         };
         let table = TableBox {
             origin: layout::Point { x: 0.0, y: 100.0 },
