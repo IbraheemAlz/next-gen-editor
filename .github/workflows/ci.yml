@@ -82,6 +82,12 @@ jobs:
     # GitHub runner's Chrome is not yet proven, so a mismatch must surface
     # without breaking main. Promote to a required check once verified.
     continue-on-error: true
+    # Bound the runtime — historically the harness finishes in ~2 min on
+    # the runner. Any hang in the dev-server boot / memory-profile /
+    # perf harnesses is bounded so a stuck job doesn't burn an hour of
+    # runner time. continue-on-error keeps the overall workflow green
+    # when the cap fires.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
 
@@ -127,11 +133,16 @@ jobs:
             curl -sf http://localhost:5173 >/dev/null 2>&1 && break
             sleep 1
           done
-          node tools/visual-diff/run.mjs --tier A
+          # Per-harness wall-clock caps. Visual-diff: 7 cases × ~3 s each
+          # ≈ 21 s; budget 3 min. Memory-profile: 4 fixtures × ~10 s each;
+          # budget 3 min. Perf: cold-start + 100 keystrokes + open 50p;
+          # budget 3 min. `timeout` exits 124 on the cap — caller treats
+          # it like any other non-zero so continue-on-error catches it.
+          timeout 180 node tools/visual-diff/run.mjs --tier A
           VD=$?
-          node tools/memory-profile/run.mjs --budgets
+          timeout 180 node tools/memory-profile/run.mjs --budgets
           MP=$?
-          node tools/perf/run.mjs --strict
+          timeout 180 node tools/perf/run.mjs --strict
           PF=$?
           kill "$DEV_PID" 2>/dev/null || true
           echo "visual-diff exit=$VD  memory-profile exit=$MP  perf exit=$PF"
