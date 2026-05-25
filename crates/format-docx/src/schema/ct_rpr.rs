@@ -6,7 +6,7 @@
 //! `styles.xml`'s `<w:style>/<w:rPr>` (Phase 3); kept here so the cascade
 //! resolver can reuse them without depending on `parts::document`.
 
-use engine::{FontFamily, SpanStyle, UnderlineStyle};
+use engine::{FontFamily, SpanStyle, UnderlineStyle, VertAlign};
 use quick_xml::events::BytesStart;
 
 /// Value of attribute `key` on a start/empty tag, unescaped.
@@ -76,6 +76,15 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
         b"w:strike" => style.strike = Some(toggle_on(e)),
         b"w:caps" => style.caps = Some(toggle_on(e)),
         b"w:smallCaps" => style.small_caps = Some(toggle_on(e)),
+        b"w:vertAlign" => {
+            /* Audit gap A.M1 — `<w:vertAlign w:val="superscript|subscript|
+            baseline"/>`. Unknown values collapse to `Baseline` (defensive). */
+            style.vert_align = Some(match attr_val(e, b"w:val").as_deref().map(str::trim) {
+                Some("superscript") => VertAlign::Superscript,
+                Some("subscript") => VertAlign::Subscript,
+                _ => VertAlign::Baseline,
+            });
+        }
         b"w:u" => {
             /* `<w:u/>` (no `w:val`) → single. `<w:u w:val="none"/>` → none,
             preserved so it can override an inherited underline.
@@ -110,10 +119,28 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
         }
         b"w:shd" => style.bg_color = attr_val(e, b"w:fill").and_then(|v| parse_hex_color(&v)),
         b"w:rFonts" => {
-            style.font_family = attr_val(e, b"w:ascii")
+            /* Audit gap A.M2 — accept ANY font name, not just the
+            three the engine has loaded. Resolved names hit
+            `font_family`; unresolved names park in `raw_font_family`
+            so the writer round-trips them verbatim (Word reopens with
+            the original face the author chose). Theme attributes
+            (`asciiTheme` / `hAnsiTheme` / `cstheme`) park in
+            `font_theme` — Word's "Update Style" depends on them. */
+            let name = attr_val(e, b"w:ascii")
                 .or_else(|| attr_val(e, b"w:hAnsi"))
-                .or_else(|| attr_val(e, b"w:cs"))
-                .and_then(|v| family_from_docx(&v));
+                .or_else(|| attr_val(e, b"w:cs"));
+            if let Some(n) = name {
+                match family_from_docx(&n) {
+                    Some(fam) => style.font_family = Some(fam),
+                    None => style.raw_font_family = Some(n),
+                }
+            }
+            let theme = attr_val(e, b"w:asciiTheme")
+                .or_else(|| attr_val(e, b"w:hAnsiTheme"))
+                .or_else(|| attr_val(e, b"w:cstheme"));
+            if let Some(t) = theme {
+                style.font_theme = Some(t);
+            }
         }
         /* `<w:sz w:val="N"/>` and `<w:szCs w:val="N"/>` — N is half-points
         (Word's native encoding; `w:val="24"` = 12 pt). `w:sz` targets ASCII

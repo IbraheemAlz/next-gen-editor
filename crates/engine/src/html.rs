@@ -1016,9 +1016,9 @@ pub fn from_html(html: &str) -> Vec<Paragraph> {
 
     /* Resolved style = every stacked frame's style merged bottom-to-top. */
     let resolved = |stack: &[Frame]| -> SpanStyle {
-        stack
-            .iter()
-            .fold(SpanStyle::default(), |acc, f| acc.merged_with(f.style))
+        stack.iter().fold(SpanStyle::default(), |acc, f| {
+            acc.merged_with(f.style.clone())
+        })
     };
 
     while i < bytes.len() {

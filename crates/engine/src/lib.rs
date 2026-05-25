@@ -476,10 +476,29 @@ impl UnderlineStyle {
     }
 }
 
+/// Audit gap A.M1 — `<w:vertAlign>` super/subscript positioning. The
+/// renderer shrinks the run's font and shifts the baseline up
+/// (`Superscript`) or down (`Subscript`); `Baseline` is the implicit
+/// default and a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VertAlign {
+    #[default]
+    Baseline,
+    Superscript,
+    Subscript,
+}
+
+impl VertAlign {
+    /// `true` when the variant alters baseline / font size at paint time.
+    pub fn is_shifted(self) -> bool {
+        !matches!(self, VertAlign::Baseline)
+    }
+}
+
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SpanStyle {
     pub font_size: Option<f32>,
     pub color: Option<[u8; 4]>,
@@ -500,6 +519,23 @@ pub struct SpanStyle {
     /// originally-lowercase substrings and shrinks their font_size to
     /// ~80% of the run's nominal size.
     pub small_caps: Option<bool>,
+    /// Audit gap A.M1 — `<w:vertAlign w:val="superscript|subscript"/>`.
+    /// `None` ⇒ baseline (the no-op default); explicit `Some(Baseline)`
+    /// is preserved so a run-style override can defeat an inherited
+    /// super/subscript from the style cascade.
+    pub vert_align: Option<VertAlign>,
+    /// Audit gap A.M2 — verbatim font family name from `<w:rFonts w:ascii>`
+    /// when the engine cannot resolve it to a loaded face. Round-tripped
+    /// back into the writer so a save preserves the author's
+    /// "Cambria" / "Times New Roman" / etc. even though we render with
+    /// the fallback. `None` when the engine successfully resolves the
+    /// name into [`font_family`].
+    pub raw_font_family: Option<String>,
+    /// Audit gap A.M2 — `<w:rFonts w:asciiTheme="…"/>` (and the
+    /// per-script `hAnsiTheme` / `cstheme`). Round-tripped verbatim. Lost
+    /// theme bindings break Word's "Update Style" — preserve at all
+    /// costs even though our font picker ignores them.
+    pub font_theme: Option<String>,
 }
 
 impl SpanStyle {
@@ -516,12 +552,15 @@ impl SpanStyle {
             font_family: patch.font_family.or(self.font_family),
             caps: patch.caps.or(self.caps),
             small_caps: patch.small_caps.or(self.small_caps),
+            vert_align: patch.vert_align.or(self.vert_align),
+            raw_font_family: patch.raw_font_family.or(self.raw_font_family),
+            font_theme: patch.font_theme.or(self.font_theme),
         }
     }
 }
 
 /// A styled byte range `[start, end)` within a paragraph.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StyleRun {
     pub start: u32,
     pub end: u32,
@@ -733,6 +772,33 @@ pub enum LineHeight {
 
 /// Paragraph-level properties parsed from `<w:pPr>`. Holds every field the
 /// engine needs to round-trip a Word paragraph; layout consumes the
+/// Audit gap A.M3 — one `<w:pPr><w:tabs><w:tab/>` entry. `position`
+/// is layout pt at scale=1 (twip → pt at parse); `kind` controls the
+/// alignment of content at the stop. Phase-5 line builder honours
+/// `Left` precisely; `Center` / `Right` / `Decimal` round-trip
+/// faithfully on the writer but render as `Left` for now (proper
+/// alignment requires a measure-then-place pass deferred to a later
+/// sprint).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TabStop {
+    pub position_pt: f32,
+    pub kind: TabKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabKind {
+    /// Tab cursor jumps to `position_pt`; content lands right of it.
+    /// Word's default and what the line builder honours.
+    #[default]
+    Left,
+    Center,
+    Right,
+    Decimal,
+    /// `<w:clear>` — explicit "no tab at this position", used to defeat
+    /// an inherited tab stop from the style cascade.
+    Clear,
+}
+
 /// alignment / indent / spacing / direction / line-height subset.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ParaProperties {
@@ -744,6 +810,18 @@ pub struct ParaProperties {
     pub keep_next: bool,
     pub keep_lines: bool,
     pub page_break_before: bool,
+    /// Audit gap A.M4 — `<w:pPr><w:pBdr>` border strokes painted around
+    /// the paragraph bounding rectangle. Mirror of the table-cell
+    /// border model (top/left/bottom/right edges plus the unused
+    /// inside_h/inside_v slots `CellBorders` ships with). `None` ⇒ no
+    /// border (the implicit default). Renderer reuses the cell-border
+    /// drawing primitive at paragraph-rect bounds.
+    pub borders: Option<CellBorders>,
+    /// Audit gap A.M3 — `<w:pPr><w:tabs>` custom tab stops in
+    /// document order. Empty list ⇒ fall back to the 0.5-inch default
+    /// grid the line builder uses. Position is layout pt at scale=1
+    /// (1 twip = 1/20 pt; reader converts at parse time).
+    pub tab_stops: Vec<TabStop>,
 }
 
 impl ParaProperties {
@@ -776,6 +854,18 @@ impl ParaProperties {
             keep_next: patch.keep_next || self.keep_next,
             keep_lines: patch.keep_lines || self.keep_lines,
             page_break_before: patch.page_break_before || self.page_break_before,
+            /* Audit gap A.M4 — `<w:pBdr>` overlay: patch's borders win
+            when set; otherwise inherit. */
+            borders: patch.borders.or(self.borders),
+            /* Audit gap A.M3 — `<w:tabs>` overlay: patch's stops
+            REPLACE the parent's (Word's documented behaviour — child
+            `<w:tabs>` is not additive, it shadows the cascade).
+            Empty patch inherits. */
+            tab_stops: if patch.tab_stops.is_empty() {
+                self.tab_stops
+            } else {
+                patch.tab_stops
+            },
         }
     }
 }
@@ -846,7 +936,7 @@ impl Paragraph {
         self.spans
             .iter()
             .find(|s| at >= s.start && at < s.end)
-            .map_or(SpanStyle::default(), |s| s.style)
+            .map_or(SpanStyle::default(), |s| s.style.clone())
     }
 
     /// Return a copy with `patch` overlaid on the byte range `[start, end)`.
@@ -877,7 +967,7 @@ impl Paragraph {
             let (a, b) = (win[0], win[1]);
             let mut style = self.style_at(a);
             if a >= start && b <= end {
-                style = style.merged_with(patch);
+                style = style.merged_with(patch.clone());
             }
             if style == SpanStyle::default() {
                 continue;
@@ -976,7 +1066,7 @@ impl Paragraph {
                 spans.push(StyleRun {
                     start: ns,
                     end: ne,
-                    style: run.style,
+                    style: run.style.clone(),
                 });
             }
         }
@@ -1006,14 +1096,14 @@ impl Paragraph {
                 left.push(StyleRun {
                     start: run.start,
                     end: run.end.min(at),
-                    style: run.style,
+                    style: run.style.clone(),
                 });
             }
             if run.end > at {
                 right.push(StyleRun {
                     start: run.start.max(at) - at,
                     end: run.end - at,
-                    style: run.style,
+                    style: run.style.clone(),
                 });
             }
         }
@@ -1059,7 +1149,7 @@ impl Paragraph {
             spans.push(StyleRun {
                 start: run.start + shift,
                 end: run.end + shift,
-                style: run.style,
+                style: run.style.clone(),
             });
         }
         Paragraph {
@@ -1126,7 +1216,7 @@ pub enum BorderStyle {
 /// One border edge stroke. `size_eighth_pt` is `<w:sz>` (eighths of a
 /// point — the OOXML unit); divide by 8 to get points, by 6 to get px
 /// at 96 DPI.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct BorderStroke {
     pub style: BorderStyle,
     pub size_eighth_pt: u16,
@@ -1136,7 +1226,7 @@ pub struct BorderStroke {
 /// Per-edge border strokes for a `<w:tcBorders>` or `<w:tblBorders>`.
 /// `inside_h` / `inside_v` only apply when carried at the table level
 /// (`<w:tblBorders>`); cell-level borders ignore them.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CellBorders {
     pub top: Option<BorderStroke>,
     pub left: Option<BorderStroke>,
@@ -1765,7 +1855,7 @@ impl DocumentTree {
             } else {
                 p.text.len() as u32
             };
-            let styled = p.apply_style(lo, hi, patch);
+            let styled = p.apply_style(lo, hi, patch.clone());
             let child_path = parent.clone().push(PathStep::Block(idx));
             replace_block_in_top(&mut blocks, &child_path, Block::Paragraph(styled));
         }
@@ -3280,7 +3370,7 @@ mod tests {
                 path: BlockPath::top(0),
                 offset: 8,
             },
-            red,
+            red.clone(),
         );
         let doc = doc.apply_style(
             LogicalPos {
@@ -3291,7 +3381,7 @@ mod tests {
                 path: BlockPath::top(0),
                 offset: 11,
             },
-            big,
+            big.clone(),
         );
         let spans = &doc.nth_paragraph(0).unwrap().spans;
         /* [0,4) red ; [4,8) red+big ; [8,11) big */
@@ -3336,7 +3426,7 @@ mod tests {
             },
             "XX",
         );
-        let span = doc.nth_paragraph(0).unwrap().spans[0];
+        let span = doc.nth_paragraph(0).unwrap().spans[0].clone();
         assert_eq!((span.start, span.end), (4, 6));
     }
 
@@ -3978,7 +4068,7 @@ mod tests {
             spans: vec![StyleRun {
                 start: 6,
                 end: 11,
-                style: bold,
+                style: bold.clone(),
             }],
             props: ParaProperties::default(),
             list_item: None,

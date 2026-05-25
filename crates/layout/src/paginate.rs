@@ -925,6 +925,7 @@ pub fn split_paragraph_at_line(
         paginator decides per-page which copy gets stamped. */
         fields: para.fields.clone(),
         page_break_after_line: head_pb,
+        borders: para.borders.clone(),
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -938,6 +939,7 @@ pub fn split_paragraph_at_line(
         source_paragraph_id: para.source_paragraph_id,
         fields: para.fields.clone(),
         page_break_after_line: tail_pb,
+        borders: para.borders.clone(),
     };
     (Some(head), Some(tail))
 }
@@ -989,6 +991,7 @@ pub fn split_paragraph_at_line_index(
         source_paragraph_id: para.source_paragraph_id,
         fields: para.fields.clone(),
         page_break_after_line: head_pb,
+        borders: para.borders.clone(),
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -1002,6 +1005,7 @@ pub fn split_paragraph_at_line_index(
         source_paragraph_id: para.source_paragraph_id,
         fields: para.fields.clone(),
         page_break_after_line: tail_pb,
+        borders: para.borders.clone(),
     };
     (Some(head), Some(tail))
 }
@@ -1074,6 +1078,7 @@ mod tests {
             source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
             fields: Vec::new(),
             page_break_after_line: Vec::new(),
+            borders: None,
         }
     }
 
@@ -1147,6 +1152,7 @@ mod tests {
                 source_paragraph_id: tag,
                 fields: Vec::new(),
                 page_break_after_line: Vec::new(),
+                borders: None,
             }],
         }
     }
@@ -1188,6 +1194,7 @@ mod tests {
                 evaluated_text: None,
             }],
             page_break_after_line: Vec::new(),
+            borders: None,
         }
     }
 

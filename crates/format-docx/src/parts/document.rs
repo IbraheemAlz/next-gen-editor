@@ -129,6 +129,93 @@ fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
     }
 }
 
+/// Audit gap A.M4 — parse one `<w:pBdr>` per-edge child into the
+/// matching `CellBorders` slot. Reuses the table-border parser via
+/// `parse_border_stroke` on `<w:top w:val w:sz w:color>`. Unknown
+/// edge names are silently ignored — defensive against future spec
+/// extensions.
+fn apply_pbdr_edge(
+    name: &[u8],
+    e: &quick_xml::events::BytesStart,
+    props: &mut engine::ParaProperties,
+) {
+    let stroke = parse_border_stroke(e);
+    if stroke.is_none() {
+        return;
+    }
+    let borders = props
+        .borders
+        .get_or_insert_with(engine::CellBorders::default);
+    match name {
+        b"w:top" => borders.top = stroke,
+        b"w:left" => borders.left = stroke,
+        b"w:bottom" => borders.bottom = stroke,
+        b"w:right" => borders.right = stroke,
+        b"w:between" => {
+            /* `<w:between>` is the "inside-horizontal" border between
+            consecutive same-pBdr paragraphs. The engine has no
+            multi-paragraph border collapse yet — store on `inside_h`
+            for round-trip; renderer ignores it. */
+            borders.inside_h = stroke;
+        }
+        _ => {}
+    }
+}
+
+/// Audit gap A.M3 — parse one `<w:tab w:val w:pos/>` child.
+/// `w:val` defaults to `left`; `w:pos` is twips (signed integer per
+/// spec). Returns `None` for malformed entries (missing pos) so they
+/// don't pollute the stop list with NaNs.
+fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine::TabStop> {
+    use crate::schema::ct_rpr::attr_val;
+    let pos_twips: i32 = attr_val(e, b"w:pos")?.trim().parse().ok()?;
+    let kind = match attr_val(e, b"w:val").as_deref().map(str::trim) {
+        Some("center") => engine::TabKind::Center,
+        Some("right") | Some("end") => engine::TabKind::Right,
+        Some("decimal") => engine::TabKind::Decimal,
+        Some("clear") => engine::TabKind::Clear,
+        _ => engine::TabKind::Left,
+    };
+    Some(engine::TabStop {
+        position_pt: (pos_twips as f32) / 20.0,
+        kind,
+    })
+}
+
+/// Audit gap A.M4 — parse `<w:top|left|bottom|right|between
+/// w:val w:sz w:color w:space/>` into a `BorderStroke`. Mirrors the
+/// table-cell border parser semantics; `w:val="none"` returns `None`
+/// so the edge stays absent in the engine model.
+fn parse_border_stroke(e: &quick_xml::events::BytesStart) -> Option<engine::BorderStroke> {
+    use crate::schema::ct_rpr::{attr_val, parse_hex_color};
+    let val = attr_val(e, b"w:val")?.trim().to_ascii_lowercase();
+    if val == "none" || val == "nil" {
+        return None;
+    }
+    let style = match val.as_str() {
+        "single" => engine::BorderStyle::Single,
+        "double" => engine::BorderStyle::Double,
+        "dotted" => engine::BorderStyle::Dotted,
+        "dashed" => engine::BorderStyle::Dashed,
+        other => engine::BorderStyle::Other(other.to_string()),
+    };
+    let size_eighth_pt: u16 = attr_val(e, b"w:sz")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(4);
+    let color = attr_val(e, b"w:color").and_then(|v| {
+        if v.trim().eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            parse_hex_color(&v)
+        }
+    });
+    Some(engine::BorderStroke {
+        style,
+        size_eighth_pt,
+        color,
+    })
+}
+
 impl SectPrAccum {
     /// Apply one `<w:sectPr>` child element. Both `Empty(...)` and the
     /// `Start(...)` of `<w:headerReference>...</w:headerReference>`-style tags
@@ -319,6 +406,11 @@ pub fn parse_document_xml(
     let mut list_num_id: Option<u32> = None;
     let mut list_ilvl: Option<u8> = None;
     let mut in_num_pr = false;
+    /* Audit gap A.M3 / A.M4 — `<w:pBdr>` / `<w:tabs>` depth tracking.
+    The container elements wrap per-edge / per-stop empty children that
+    fold into `direct_ppr`. */
+    let mut in_pbdr = false;
+    let mut in_tabs = false;
 
     /* Phase 7 — `<w:drawing>` accumulators. A drawing element wraps an
     inline image (`<wp:inline>`) or a floating image (`<wp:anchor>`,
@@ -424,6 +516,16 @@ pub fn parse_document_xml(
                     properties — not a nested element under a `<w:r>`. */
                     b"w:pPr" if !in_run => in_ppr = true,
                     b"w:numPr" if in_ppr => in_num_pr = true,
+                    /* Audit gap A.M4 — `<w:pBdr>` is a container element
+                    holding per-edge `<w:top>` / `<w:left>` / `<w:bottom>`
+                    / `<w:right>` empty children. Toggle the depth
+                    tracker so the per-edge handlers below know to fold
+                    into `direct_ppr.borders` instead of cell borders. */
+                    b"w:pBdr" if in_ppr => in_pbdr = true,
+                    /* Audit gap A.M3 — `<w:tabs>` container of `<w:tab/>`
+                    children. The child handlers parse position + kind
+                    and push onto `direct_ppr.tab_stops`. */
+                    b"w:tabs" if in_ppr => in_tabs = true,
                     b"w:sectPr" => {
                         /* Phase 6 — open a fresh accumulator. Inline (inside
                         a `<w:pPr>`) and body-level both route here. */
@@ -628,7 +730,15 @@ pub fn parse_document_xml(
                     n if in_sect_pr => cur_sect.apply(n, &e),
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
                     n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
-                    n if in_ppr && !in_rpr && !in_num_pr => {
+                    /* Audit gap A.M4 — `<w:pBdr>` per-edge children. */
+                    n if in_ppr && in_pbdr => apply_pbdr_edge(n, &e, &mut direct_ppr),
+                    /* Audit gap A.M3 — `<w:tabs>` per-stop children. */
+                    n if in_ppr && in_tabs && n == b"w:tab" => {
+                        if let Some(stop) = parse_tab_stop(&e) {
+                            direct_ppr.tab_stops.push(stop);
+                        }
+                    }
+                    n if in_ppr && !in_rpr && !in_num_pr && !in_pbdr && !in_tabs => {
                         apply_ppr(n, &e, &mut direct_ppr);
                     }
                     _ => {}
@@ -710,6 +820,8 @@ pub fn parse_document_xml(
                     b"w:rPr" => in_rpr = false,
                     b"w:pPr" => in_ppr = false,
                     b"w:numPr" => in_num_pr = false,
+                    b"w:pBdr" => in_pbdr = false,
+                    b"w:tabs" => in_tabs = false,
                     b"wp:inline" => {
                         /* Don't clear `in_wp_inline` on the inline close —
                         it's structurally a child of `<w:drawing>`, so the
@@ -806,10 +918,13 @@ pub fn parse_document_xml(
                         let (_, baseline) = resolver.resolve_paragraph(
                             p_style_id.as_deref(),
                             direct_ppr.clone(),
-                            pmark_rpr,
+                            pmark_rpr.clone(),
                         );
-                        let style =
-                            resolver.resolve_run(baseline, r_style_id.as_deref(), direct_rpr);
+                        let style = resolver.resolve_run(
+                            baseline,
+                            r_style_id.as_deref(),
+                            direct_rpr.clone(),
+                        );
                         if style != SpanStyle::default() {
                             match spans.last_mut() {
                                 Some(last) if last.end == start && last.style == style => {

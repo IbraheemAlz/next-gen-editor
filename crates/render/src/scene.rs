@@ -352,6 +352,19 @@ fn paint_border_edge(
 fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd>) {
     let para_x = base_x + para.origin.x;
     let para_y = base_y + para.origin.y;
+    /* Audit gap A.M4 — `<w:pBdr>` strokes around the paragraph rect.
+    Painted FIRST so the text glyphs draw on top of the border (matches
+    Word's compositing order); the table-border edge primitive is
+    reused so dotted / dashed / coloured strokes behave consistently
+    with cell borders. */
+    if let Some(b) = para.borders.as_ref() {
+        let px1 = para_x + para.size.width;
+        let py1 = para_y + para.size.height;
+        paint_border_edge(&b.top, para_x, para_y, px1, para_y, cmds);
+        paint_border_edge(&b.left, para_x, para_y, para_x, py1, cmds);
+        paint_border_edge(&b.right, px1, para_y, px1, py1, cmds);
+        paint_border_edge(&b.bottom, para_x, py1, px1, py1, cmds);
+    }
     {
         /* Phase 4 — list marker. Lives in the leading-edge gutter, baseline
         aligned with the first line. Paint it before the line runs so it
@@ -397,6 +410,12 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                 let [r, g, b, a] = run.attrs.color;
                 let text_color = Color::from_rgba8(r, g, b, a);
                 let run_x0 = (line_x as f64) + (pen as f64);
+                /* Audit gap A.M1 — `<w:vertAlign>` baseline shift. The
+                run's glyphs draw at `baseline - shift`: positive shift
+                lifts the glyph (superscript), negative drops it
+                (subscript). Applied per-run, not per-line, because a
+                line typically mixes baseline + shifted runs. */
+                let run_baseline = baseline - (run.attrs.baseline_shift_px as f64);
                 let mut glyphs: Vec<RunGlyph> = Vec::with_capacity(run.glyphs.len());
                 /* Phase 7 — inline image draws are emitted in line with
                 the run loop so the pen stays in sync. Collected separately
@@ -436,7 +455,7 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                         glyphs.push(RunGlyph {
                             glyph_id: glyph.id,
                             x: (line_x as f64) + (pen as f64) + (glyph.x_offset as f64),
-                            y: baseline - (glyph.y_offset as f64),
+                            y: run_baseline - (glyph.y_offset as f64),
                         });
                     }
                     pen += glyph.x_advance;

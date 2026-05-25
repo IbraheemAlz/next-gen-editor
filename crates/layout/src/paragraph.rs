@@ -80,7 +80,21 @@ pub struct ParagraphConfig<'a> {
     /// Pixel size for shaping the marker. Matches the body font size by
     /// default at the engine-wasm boundary.
     pub px_size_for_marker: f32,
+    /// Audit gap A.M3 — `<w:pPr><w:tabs>` custom stops in
+    /// paragraph-content-relative layout px. Empty ⇒ the line builder
+    /// falls back to the default 0.5-inch grid (`DEFAULT_TAB_GRID_PX`).
+    /// `Clear` entries are filtered out by the engine-wasm adapter
+    /// before reaching us — the line builder treats `position_px` as
+    /// the absolute advance target.
+    pub tab_stops_px: &'a [f32],
 }
+
+/// Audit gap A.M3 — default tab grid in layout pt at scale=1. Word's
+/// "default tab stops" knob (`<w:settings><w:defaultTabStop>`) defaults
+/// to 720 twips = 36 pt = ½ inch; the line builder steps in 36-pt
+/// increments whenever no custom stop in the paragraph's tab list
+/// fits.
+pub const DEFAULT_TAB_GRID_PT: f32 = 36.0;
 
 /// Lay out `cfg.text` into a [`ParagraphBox`] with positioned lines.
 ///
@@ -93,6 +107,18 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     — and the leading-edge shift drops onto the line origin. */
     let content_width = (cfg.max_width - cfg.indent_start_px - cfg.indent_end_px).max(0.0);
     let mut composed = compose_lines_with_width(&cfg, content_width);
+
+    /* Audit gap A.M3 — geometric tab stops. Pass runs BEFORE justify so
+    the post-fix advances are baked into `line.width` and justify gets
+    a clean total. Each tab character (U+0009) in a glyph's source
+    cluster has its advance overridden to land the *next* glyph at the
+    next custom stop in `tab_stops_px`, falling back to the default
+    half-inch grid (`DEFAULT_TAB_GRID_PT`). The pen is line-local
+    (origin.x already carries the alignment + indent offset, so the
+    tab math operates against the line's "content-leading" pen at 0). */
+    for (line, _) in composed.iter_mut() {
+        apply_tab_advances(line, cfg.text, cfg.tab_stops_px);
+    }
 
     /* Justify every line except the last and any hard-broken (overflow) line. */
     if cfg.alignment == Alignment::Justify {
@@ -195,6 +221,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
         fields: Vec::new(),
         page_break_after_line: Vec::new(),
+        borders: None,
     }
 }
 
@@ -265,6 +292,7 @@ fn build_marker(
                 strike: false,
                 faux_bold: false,
                 faux_italic: false,
+                baseline_shift_px: 0.0,
             },
         },
         width,
@@ -294,6 +322,7 @@ fn compose_lines_with_width<'a>(
         marker_text: None,
         px_size_for_marker: cfg.px_size_for_marker,
         inline_objects: cfg.inline_objects,
+        tab_stops_px: cfg.tab_stops_px,
     };
     compose_lines(&scoped)
 }
@@ -319,6 +348,63 @@ fn compose_lines_with_width<'a>(
 /// - Phase 7 inline images can still grow the line above `line_height`
 ///   when an image's height exceeds the box — clipping a glyph is fine,
 ///   clipping an image's content is not.
+// Audit gap A.M3 — geometric tab-stop advance.
+//
+// Walks `line.runs` in visual order accumulating the pen position. When
+// a glyph's source cluster points to a U+0009 TAB byte, the advance is
+// rewritten so the following glyph lands at the next tab stop strictly
+// past the current pen. Custom stops in `tab_stops_px` are tried
+// first; if none qualify, the default half-inch
+// (`DEFAULT_TAB_GRID_PT`) grid kicks in. `line.width` is updated to
+// the post-adjustment cumulative pen so downstream justify / alignment
+// math sees the right total.
+//
+// Limitations: tab stops are paragraph-content-relative, but the pen
+// here is line-local. The discrepancy is the line's `origin.x`
+// (alignment + indent offset). For Start-aligned LTR paragraphs the
+// two are equal; other cases drift, accepted as a known trade-off for
+// this sprint. Decimal / Center / Right kinds on the stop itself round-
+// trip on parse + emit but render as Left for now.
+fn apply_tab_advances(line: &mut LineBox, para_text: &str, tab_stops_px: &[f32]) {
+    if !para_text.contains('\u{0009}') {
+        return;
+    }
+    let bytes = para_text.as_bytes();
+    let mut pen = 0.0_f32;
+    for run in line.runs.iter_mut() {
+        for g in run.glyphs.iter_mut() {
+            let cluster_byte = run.source_range.start as usize + g.cluster as usize;
+            let is_tab = bytes.get(cluster_byte).copied() == Some(b'\t');
+            if is_tab {
+                let next = next_tab_stop_after(pen, tab_stops_px);
+                if next > pen {
+                    g.x_advance = next - pen;
+                }
+            }
+            pen += g.x_advance;
+        }
+    }
+    line.width = pen;
+}
+
+/// Audit gap A.M3 — choose the next tab stop strictly past `pen_x`.
+/// Custom stops win when one fits; otherwise the default half-inch
+/// grid (`DEFAULT_TAB_GRID_PT`) ceiling-rounded.
+fn next_tab_stop_after(pen_x: f32, custom: &[f32]) -> f32 {
+    let custom_next = custom
+        .iter()
+        .copied()
+        .filter(|&p| p > pen_x + 0.001)
+        .reduce(f32::min);
+    if let Some(p) = custom_next {
+        return p;
+    }
+    /* Grid fallback. `(pen / grid).floor() + 1` jumps to the next
+    multiple of the grid step regardless of how close pen is. */
+    let grid = DEFAULT_TAB_GRID_PT;
+    ((pen_x / grid).floor() + 1.0) * grid
+}
+
 fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32) -> (f32, f32) {
     let mut font_ascent = 0.0_f32;
     let mut font_descent = 0.0_f32;
@@ -611,6 +697,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     underline: span.underline,
                     strike: span.strike,
                     bg_color: span.bg_color,
+                    baseline_shift_px: span.baseline_shift_px,
                 },
             });
         }

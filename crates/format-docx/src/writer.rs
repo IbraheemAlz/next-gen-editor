@@ -98,15 +98,36 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
         return;
     }
     out.push_str("<w:rPr>");
-    if let Some(f) = style.font_family {
-        let n = family_docx_name(f);
-        out.push_str("<w:rFonts w:ascii=\"");
-        out.push_str(n);
-        out.push_str("\" w:hAnsi=\"");
-        out.push_str(n);
-        out.push_str("\" w:cs=\"");
-        out.push_str(n);
-        out.push_str("\"/>");
+    /* Audit gap A.M2 — `<w:rFonts>` round-trips a known FontFamily,
+    a verbatim raw name, and/or a theme binding. The reader splits
+    the source's `w:ascii` either into `font_family` (recognised) or
+    `raw_font_family` (verbatim string); the theme attrs park in
+    `font_theme`. Emit whichever slots are populated. */
+    let rfonts_name: Option<String> = style
+        .font_family
+        .map(|f| family_docx_name(f).to_string())
+        .or_else(|| style.raw_font_family.clone());
+    if rfonts_name.is_some() || style.font_theme.is_some() {
+        out.push_str("<w:rFonts");
+        if let Some(n) = rfonts_name.as_deref() {
+            out.push_str(" w:ascii=\"");
+            push_escaped_attr(n, out);
+            out.push_str("\" w:hAnsi=\"");
+            push_escaped_attr(n, out);
+            out.push_str("\" w:cs=\"");
+            push_escaped_attr(n, out);
+            out.push('"');
+        }
+        if let Some(t) = style.font_theme.as_deref() {
+            out.push_str(" w:asciiTheme=\"");
+            push_escaped_attr(t, out);
+            out.push_str("\" w:hAnsiTheme=\"");
+            push_escaped_attr(t, out);
+            out.push_str("\" w:cstheme=\"");
+            push_escaped_attr(t, out);
+            out.push('"');
+        }
+        out.push_str("/>");
     }
     if style.bold == Some(true) {
         out.push_str("<w:b/>");
@@ -156,6 +177,19 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
         out.push_str(&format!(
             "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
         ));
+    }
+    /* Audit gap A.M1 — `<w:vertAlign>` after shading per OOXML §17.3.2.42
+    ordering. Skip when the resolved value is the implicit baseline (the
+    spec lets us omit it for noise reduction; explicit `Baseline` only
+    appears when defeating an inherited super/subscript, in which case
+    `<w:vertAlign w:val="baseline"/>` IS emitted). */
+    if let Some(va) = style.vert_align {
+        let v = match va {
+            engine::VertAlign::Baseline => "baseline",
+            engine::VertAlign::Superscript => "superscript",
+            engine::VertAlign::Subscript => "subscript",
+        };
+        out.push_str(&format!("<w:vertAlign w:val=\"{v}\"/>"));
     }
     out.push_str("</w:rPr>");
 }
@@ -254,6 +288,36 @@ fn emit_ppr(props: &ParaProperties, out: &mut String) {
     }
     if props.page_break_before {
         out.push_str("<w:pageBreakBefore/>");
+    }
+    /* Audit gap A.M4 — `<w:pBdr>` paragraph borders. CT_PPr ordering
+    places pBdr between pageBreakBefore and spacing. Each edge with a
+    populated stroke emits as a child; absent edges silently omit. */
+    if let Some(b) = props.borders.as_ref() {
+        out.push_str("<w:pBdr>");
+        emit_border_edge("w:top", &b.top, out);
+        emit_border_edge("w:left", &b.left, out);
+        emit_border_edge("w:bottom", &b.bottom, out);
+        emit_border_edge("w:right", &b.right, out);
+        emit_border_edge("w:between", &b.inside_h, out);
+        out.push_str("</w:pBdr>");
+    }
+    /* Audit gap A.M3 — `<w:tabs>` custom stops, child order preserved.
+    Empty list ⇒ no element. `Clear` kind round-trips so a user-defined
+    clear-of-an-inherited-stop survives a save. */
+    if !props.tab_stops.is_empty() {
+        out.push_str("<w:tabs>");
+        for stop in &props.tab_stops {
+            let val = match stop.kind {
+                engine::TabKind::Left => "left",
+                engine::TabKind::Center => "center",
+                engine::TabKind::Right => "right",
+                engine::TabKind::Decimal => "decimal",
+                engine::TabKind::Clear => "clear",
+            };
+            let pos_twips = (stop.position_pt * 20.0).round() as i32;
+            out.push_str(&format!("<w:tab w:val=\"{val}\" w:pos=\"{pos_twips}\"/>"));
+        }
+        out.push_str("</w:tabs>");
     }
     /* `<w:spacing>` carries both before/after gaps and the line rule. We
     omit the element entirely when none of its attributes are set. */
@@ -459,7 +523,7 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
         para.spans
             .iter()
             .find(|s| off >= s.start as usize && off < s.end as usize)
-            .map(|s| s.style)
+            .map(|s| s.style.clone())
             .unwrap_or_default()
     };
 
@@ -1149,12 +1213,12 @@ mod tests {
                 StyleRun {
                     start: 0,
                     end: 5,
-                    style: bold_red,
+                    style: bold_red.clone(),
                 },
                 StyleRun {
                     start: 6,
                     end: 11,
-                    style: ul,
+                    style: ul.clone(),
                 },
             ],
             props: ParaProperties::default(),
@@ -1190,7 +1254,7 @@ mod tests {
             spans: vec![StyleRun {
                 start: 0,
                 end: 3,
-                style: styled,
+                style: styled.clone(),
             }],
             props: ParaProperties::default(),
             list_item: None,
@@ -2053,6 +2117,8 @@ mod tests {
             keep_next: true,
             keep_lines: false,
             page_break_before: false,
+            borders: None,
+            tab_stops: Vec::new(),
         };
         let para = Paragraph {
             text: "hello world".into(),

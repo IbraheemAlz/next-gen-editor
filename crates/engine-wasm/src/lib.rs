@@ -1180,12 +1180,27 @@ fn build_style_spans(
         bg_color: None,
         font_family: None,
         caps_transform: false,
+        baseline_shift_px: 0.0,
     };
     for run in &para.spans {
         if run.start > cursor {
             spans.push(gap(cursor, run.start));
         }
-        let base_px = run.style.font_size.unwrap_or(default_size) * scale;
+        /* Audit gap A.M1 — `<w:vertAlign>` shrinks the run to ~65 % of
+        its nominal pt size and shifts the baseline. Word's super /
+        subscript both shrink to ~58 %; bump to 65 % so the result
+        stays readable at 12 pt body sizes. Superscript lifts by 33 %
+        of the *base* px (positive in the run's pen-Y space); subscript
+        drops by 15 % (sticks closer to baseline by convention). */
+        let raw_base_px = run.style.font_size.unwrap_or(default_size) * scale;
+        let vert = run.style.vert_align.unwrap_or(engine::VertAlign::Baseline);
+        let (px_factor, shift_factor) = match vert {
+            engine::VertAlign::Baseline => (1.0_f32, 0.0_f32),
+            engine::VertAlign::Superscript => (0.65, 0.33),
+            engine::VertAlign::Subscript => (0.65, -0.15),
+        };
+        let base_px = (raw_base_px * px_factor).max(1.0);
+        let baseline_shift_px = raw_base_px * shift_factor;
         let template = StyleSpan {
             start: run.start,
             end: run.end,
@@ -1202,6 +1217,7 @@ fn build_style_spans(
                 .map(font_family_id)
                 .map(str::to_string),
             caps_transform: false,
+            baseline_shift_px,
         };
         push_caps_spans(&para.text, &run.style, &template, base_px, &mut spans);
         cursor = run.end;
@@ -1354,6 +1370,7 @@ fn composition_layout_spans(
         bg_color: st.bg_color,
         font_family: st.font_family.map(font_family_id).map(str::to_string),
         caps_transform: false,
+        baseline_shift_px: 0.0,
     });
     out.sort_by_key(|s| s.start);
     out
@@ -1441,6 +1458,13 @@ fn paragraph_layout_key(
         r.end.hash(&mut h);
         matches!(r.kind, engine::RevisionKind::Insert).hash(&mut h);
     }
+    /* Audit gap A.M3 — tab stops affect glyph advances at the line
+    builder's post-pass; without them in the key, two paragraphs with
+    identical text but different `<w:tabs>` would collide on cache hits. */
+    (para.props.tab_stops.len() as u64).hash(&mut h);
+    for s in &para.props.tab_stops {
+        s.position_pt.to_bits().hash(&mut h);
+    }
     cfg.font_id.hash(&mut h);
     matches!(cfg.base_direction, ShapingDirection::Rtl).hash(&mut h);
     cfg.px_size.to_bits().hash(&mut h);
@@ -1502,6 +1526,7 @@ fn build_footnote_bodies(
             bg_color: None,
             font_family: None,
             caps_transform: false,
+            baseline_shift_px: 0.0,
         }];
         let p = layout_paragraph(ParagraphConfig {
             text: &combined,
@@ -1518,6 +1543,7 @@ fn build_footnote_bodies(
             marker_text: None,
             px_size_for_marker: cfg.px_size * scale * 0.85,
             inline_objects: &[],
+            tab_stops_px: &[],
         });
         out.insert(*display, p);
     }
@@ -1600,6 +1626,7 @@ fn build_header_footer_box(
             marker_text: para.resolved_marker.clone(),
             px_size_for_marker: cfg.px_size * scale,
             inline_objects: &[],
+            tab_stops_px: &[],
         });
         /* Phase 2 audit (gap D.1) — propagate field overlays so the
         paginator can re-evaluate PAGE / NUMPAGES per page. Identical
@@ -1744,6 +1771,22 @@ fn props_to_layout_indents(props: &engine::ParaProperties, scale: f32) -> (f32, 
         twips_to_layout_px(props.indent.first_line_twips, scale),
         twips_to_layout_px(props.indent.hanging_twips, scale),
     )
+}
+
+/// Audit gap A.M3 — convert `engine::TabStop` positions (pt at scale=1)
+/// into device-px positions the layout pass consumes. `Clear` kinds
+/// drop here (the layout treats absence as "no stop"; clear-of-
+/// inherited only matters for the cascade resolver, not the line
+/// builder). Sorted ascending so `next_tab_stop_after`'s `reduce(min)`
+/// scan is monotonic.
+fn tab_stops_to_layout_px(stops: &[engine::TabStop], scale: f32) -> Vec<f32> {
+    let mut out: Vec<f32> = stops
+        .iter()
+        .filter(|s| !matches!(s.kind, engine::TabKind::Clear))
+        .map(|s| s.position_pt * scale)
+        .collect();
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out
 }
 
 /* ===================================================================
@@ -1923,6 +1966,7 @@ fn layout_cell_blocks(
             engine::Block::Paragraph(p) => {
                 let spans = build_style_spans(p, cfg.px_size, [0, 0, 0, 255], scale);
                 let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&p.props, scale);
+                let tab_stops_px = tab_stops_to_layout_px(&p.props.tab_stops, scale);
                 let pcfg = ParagraphConfig {
                     text: &p.text,
                     fonts,
@@ -1938,6 +1982,7 @@ fn layout_cell_blocks(
                     marker_text: p.resolved_marker.clone(),
                     px_size_for_marker: cfg.px_size * scale,
                     inline_objects: &[],
+                    tab_stops_px: &tab_stops_px,
                 };
                 LayoutBlock::Paragraph(layout_paragraph(pcfg))
             }
@@ -2531,7 +2576,7 @@ fn sample_paragraph_styles(
             record(SpanStyle::default());
         }
         if re > rs {
-            record(run.style);
+            record(run.style.clone());
         }
         cursor = re;
     }
@@ -2894,7 +2939,7 @@ fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
             sr.start,
             SpanStyle::default(),
         );
-        push_run(&mut runs, &para.text, sr.start, sr.end, sr.style);
+        push_run(&mut runs, &para.text, sr.start, sr.end, sr.style.clone());
         cursor = sr.end;
     }
     push_run(&mut runs, &para.text, cursor, len, SpanStyle::default());
@@ -3438,6 +3483,20 @@ impl Engine {
             sprint), so direct edits leave the flags untouched. */
             caps: None,
             small_caps: None,
+            /* Audit gap A.M1 — `<w:vertAlign>` toggles map from the
+            existing `script: Option<VerticalScript>` patch field. The
+            bridge enum's `Normal` variant ⇒ explicit `Baseline`
+            (defeats an inherited super/subscript from the style chain). */
+            vert_align: attrs.script.map(|s| match s {
+                bridge::VerticalScript::Superscript => engine::VertAlign::Superscript,
+                bridge::VerticalScript::Subscript => engine::VertAlign::Subscript,
+                bridge::VerticalScript::Normal => engine::VertAlign::Baseline,
+            }),
+            /* Audit gap A.M2 — interactive toolbar doesn't surface
+            raw-font / theme overrides yet; the open-font path is
+            file-round-trip only. */
+            raw_font_family: None,
+            font_theme: None,
         };
         /* Sticky formatting (Backlog #11): a collapsed caret has no text to
         style. Rather than push a no-op edit, arm the patch as the pending
@@ -3446,7 +3505,11 @@ impl Engine {
         Gated on an active selection so the visual-diff harness (which has no
         selection) keeps its original no-op path. */
         if range.start == range.end && self.selection.is_some() {
-            let armed = self.pending_format.unwrap_or_default().merged_with(patch);
+            let armed = self
+                .pending_format
+                .clone()
+                .unwrap_or_default()
+                .merged_with(patch);
             self.pending_format = Some(armed);
             return self.selection_changed();
         }
@@ -3762,6 +3825,7 @@ impl Engine {
                             );
                             let (ind_s, ind_e, ind_fl, ind_h) =
                                 props_to_layout_indents(&para.props, scale);
+                            let tab_stops_px = tab_stops_to_layout_px(&para.props.tab_stops, scale);
                             layout_paragraph(ParagraphConfig {
                                 text: &text,
                                 fonts: &font_stack,
@@ -3777,6 +3841,7 @@ impl Engine {
                                 marker_text: para.resolved_marker.clone(),
                                 px_size_for_marker: cfg.px_size * scale,
                                 inline_objects: &[],
+                                tab_stops_px: &tab_stops_px,
                             })
                         } else {
                             let key = paragraph_layout_key(para, &cfg, scale, pag.column_width());
@@ -3813,6 +3878,10 @@ impl Engine {
                                     marker_text: para.resolved_marker.clone(),
                                     px_size_for_marker: cfg.px_size * scale,
                                     inline_objects: &inline_infos,
+                                    tab_stops_px: &tab_stops_to_layout_px(
+                                        &para.props.tab_stops,
+                                        scale,
+                                    ),
                                 };
                                 let laid = layout_paragraph(para_cfg);
                                 cache.put(key, laid.clone());
@@ -3847,6 +3916,12 @@ impl Engine {
                         height. */
                         para_box.page_break_after_line =
                             compute_page_break_lines(&para.text, &para_box);
+                        /* Audit gap A.M4 — propagate `<w:pBdr>` strokes
+                        into the laid-out box so the renderer can paint
+                        them against the paragraph rect. Cloning the
+                        engine model's `CellBorders` is cheap (a handful
+                        of `Option<BorderStroke>` slots). */
+                        para_box.borders = para.props.borders.clone();
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
@@ -5111,8 +5186,8 @@ impl Engine {
             .current()
             .paragraph_at_path(&engine_path)
             .map_or(SpanStyle::default(), |p| p.style_at(pos.offset));
-        if apply_pending && let Some(pending) = self.pending_format {
-            style = style.merged_with(pending);
+        if apply_pending && let Some(pending) = self.pending_format.as_ref() {
+            style = style.merged_with(pending.clone());
         }
         let default_size = self.layout_cfg.as_ref().map_or(16.0, |c| c.px_size);
         let [r, g, b, a] = style.color.unwrap_or([0, 0, 0, 255]);
@@ -5180,7 +5255,7 @@ impl Engine {
         onto the just-inserted run. It is intentionally NOT cleared here — it
         stays armed across consecutive keystrokes so a whole typed run shares
         the style, and is dropped only when the caret moves. */
-        if let Some(pending) = self.pending_format {
+        if let Some(pending) = self.pending_format.clone() {
             new_doc = new_doc.apply_style(
                 to_engine_pos(start.clone()),
                 EnginePos {
@@ -5979,6 +6054,7 @@ mod tests {
             underline: engine::UnderlineStyle::None,
             strike: false,
             bg_color: None,
+            baseline_shift_px: 0.0,
         };
         let glyph = |cluster: u32, adv: f32, synthetic: bool| layout::PositionedGlyph {
             id: 1,

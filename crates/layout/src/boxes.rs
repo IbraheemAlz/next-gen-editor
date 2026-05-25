@@ -50,6 +50,12 @@ pub struct TextAttrs {
     pub strike: bool,
     /// Highlight colour painted behind the run's glyphs (Backlog #1).
     pub bg_color: Option<[u8; 4]>,
+    /// Audit gap A.M1 — `<w:vertAlign>` baseline shift in layout pt.
+    /// Positive lifts the run above the line baseline (superscript);
+    /// negative drops it below (subscript). The renderer subtracts
+    /// this from each glyph's pen Y when emitting paint commands.
+    /// `0.0` for the baseline (the default — no per-glyph offset).
+    pub baseline_shift_px: f32,
 }
 
 /// A resolved rich-text style span — a paragraph byte range `[start, end)` with
@@ -77,6 +83,18 @@ pub struct StyleSpan {
     /// (e.g. German `ß` → "SS") to keep glyph clusters aligned with the
     /// paragraph's source bytes.
     pub caps_transform: bool,
+    /// Audit gap A.M1 — `<w:vertAlign>` baseline shift in layout pt
+    /// (positive = up, the renderer subtracts from the glyph baseline).
+    /// Set by `build_style_spans` for `Superscript` (positive shift,
+    /// ~30 % of base px) / `Subscript` (negative). `0.0` for baseline
+    /// runs — paint takes the fast path with no per-glyph offset.
+    /// `px_size` already reflects the ~65 % shrink so the shaper
+    /// produces small glyphs directly; the shift only re-anchors the
+    /// pen Y. Keeping shift + shrink on the layout span (vs the
+    /// renderer) means line-height math sees the smaller cap-height
+    /// and the line doesn't grow visibly when a single superscript
+    /// gets inserted into a body run.
+    pub baseline_shift_px: f32,
 }
 
 /// One shaped glyph, positioned by advance/offset relative to the pen. There is
@@ -196,6 +214,12 @@ pub struct ParagraphBox {
     /// paragraph split (head keeps `[i ≤ split_idx]`; tail keeps
     /// `[i > split_idx]` shifted by `split_idx + 1`).
     pub page_break_after_line: Vec<usize>,
+    /// Audit gap A.M4 — `<w:pPr><w:pBdr>` border strokes painted
+    /// around the paragraph's bounding rectangle. Renderer pulls
+    /// strokes from `top` / `left` / `bottom` / `right` and reuses
+    /// the cell-border drawing primitive. `None` ⇒ no border (the
+    /// default — fast path skips stroke emission entirely).
+    pub borders: Option<engine::CellBorders>,
 }
 
 impl ParagraphBox {

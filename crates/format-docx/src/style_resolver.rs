@@ -55,14 +55,14 @@ impl<'a> StyleResolver<'a> {
         direct_rpr: SpanStyle,
     ) -> (ParaProperties, SpanStyle) {
         let mut para = self.table.defaults.para.clone();
-        let mut run = self.table.defaults.run;
+        let mut run = self.table.defaults.run.clone();
         if let Some(id) = p_style {
             let chain = self.collect_chain(id, StyleKind::Paragraph);
             /* Chain is leaf-first; reverse so the most distant ancestor
             applies first and the leaf overrides last. */
             for s in chain.iter().rev() {
                 para = para.merged_with(s.para.clone());
-                run = run.merged_with(s.run);
+                run = run.merged_with(s.run.clone());
             }
         }
         /* Direct `<w:pPr>` is the highest specificity for paragraph
@@ -88,7 +88,7 @@ impl<'a> StyleResolver<'a> {
         if let Some(id) = r_style {
             let chain = self.collect_chain(id, StyleKind::Character);
             for s in chain.iter().rev() {
-                run = run.merged_with(s.run);
+                run = run.merged_with(s.run.clone());
             }
         }
         run.merged_with(direct_rpr)

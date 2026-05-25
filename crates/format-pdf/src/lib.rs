@@ -730,6 +730,7 @@ mod tests {
             bg_color: None,
             font_family: None,
             caps_transform: false,
+            baseline_shift_px: 0.0,
         }];
         let mut para = layout_paragraph(ParagraphConfig {
             text: "Hello world",
@@ -746,6 +747,7 @@ mod tests {
             marker_text: None,
             px_size_for_marker: 26.0,
             inline_objects: &[],
+            tab_stops_px: &[],
         });
         /* Phase 6 — `source_paragraph_id` is engine-wasm's job in
         production; the test stamps it manually so `/ToUnicode` lookups
@@ -814,6 +816,7 @@ mod tests {
             bg_color: None,
             font_family: None,
             caps_transform: false,
+            baseline_shift_px: 0.0,
         }];
         let para = layout_paragraph(ParagraphConfig {
             text: "hi",
@@ -830,6 +833,7 @@ mod tests {
             marker_text: None,
             px_size_for_marker: 22.0,
             inline_objects: &[],
+            tab_stops_px: &[],
         });
         let cell_borders = engine::default_word_borders();
         let cell = layout::TableCellBox {
