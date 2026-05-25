@@ -250,6 +250,49 @@ impl HeaderFooterRefs {
     }
 }
 
+/// Audit gap A.H2 — `<w:sectPr><w:cols/>` descriptor. Holds the column
+/// count and inter-column gutter for a section; equal-width snake flow
+/// is the only supported layout this sprint (uneven `<w:col>` child
+/// widths fall back to equal partitioning). Gutter is layout pixels
+/// converted from twips at parse time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColumnSpec {
+    pub count: u8,
+    pub gutter_pt: f32,
+}
+
+impl ColumnSpec {
+    /// Word's stock single-column body — `<w:cols>` absent or
+    /// `w:num="1"`; gutter is irrelevant when `count == 1`.
+    pub const fn single() -> Self {
+        Self {
+            count: 1,
+            gutter_pt: 0.0,
+        }
+    }
+
+    /// Build from raw twips. `<w:cols w:space>` defaults to 720 twips
+    /// (½ inch / 36 pt) per OOXML when absent; callers pass the parsed
+    /// value through unchanged. `num == 0` collapses to single column
+    /// — defensive against malformed files.
+    pub fn from_twips(num: u8, space_twips: i32) -> Self {
+        Self {
+            count: num.max(1),
+            gutter_pt: (space_twips as f32) / 20.0,
+        }
+    }
+
+    pub fn is_multi(self) -> bool {
+        self.count > 1
+    }
+}
+
+impl Default for ColumnSpec {
+    fn default() -> Self {
+        Self::single()
+    }
+}
+
 /// One OOXML `<w:sectPr>` worth of state. A section spans a contiguous
 /// half-open block range `[start, end)`; the page geometry is applied to
 /// every page the paginator emits while flowing those blocks. The
@@ -270,6 +313,31 @@ pub struct Section {
     /// `<w:titlePg/>` — when `true`, the first page of this section uses
     /// the `First` header / footer slot instead of `Default`.
     pub title_pg: bool,
+    /// Audit gap A.H2 — `<w:cols>` descriptor. `Default` is the implicit
+    /// single-column body; multi-column sections snake-flow inside the
+    /// section's page geometry.
+    pub columns: ColumnSpec,
+}
+
+impl Section {
+    /// Width of one column in this section's page geometry, in layout
+    /// pixels. For a single-column section that's just `content_width`.
+    pub fn column_width_pt(&self) -> f32 {
+        let cw = self.geometry.content_width();
+        let n = self.columns.count.max(1) as f32;
+        if n <= 1.0 {
+            return cw;
+        }
+        let gutters = (n - 1.0) * self.columns.gutter_pt;
+        ((cw - gutters) / n).max(0.0)
+    }
+
+    /// Distance (in layout pixels) from the section's content-area
+    /// leading edge to the leading edge of column `idx`.
+    pub fn column_x_offset_pt(&self, idx: u8) -> f32 {
+        let cw = self.column_width_pt();
+        (idx.min(self.columns.count.saturating_sub(1)) as f32) * (cw + self.columns.gutter_pt)
+    }
 }
 
 /// Document-wide flags pulled from `word/settings.xml`. Phase 2 — only
@@ -1467,6 +1535,7 @@ impl DocumentTree {
                 header_refs: HeaderFooterRefs::default(),
                 footer_refs: HeaderFooterRefs::default(),
                 title_pg: false,
+                columns: ColumnSpec::single(),
             }];
         }
         self.sections.clone()

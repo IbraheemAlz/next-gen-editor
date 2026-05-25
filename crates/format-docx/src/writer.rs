@@ -951,8 +951,32 @@ fn build_document_xml(doc: &DocumentTree) -> String {
     for block in &doc.blocks {
         emit_block(block, &mut out);
     }
-    out.push_str(DOC_XML_FOOTER);
+    /* Audit gap A.H2 — the trailing body-level `<w:sectPr/>` carries the
+    last section's properties; when that section has multi-column, swap
+    the bare empty element for one that holds `<w:cols w:num w:space/>`.
+    Sections without `<w:cols>` (the historical case) still emit the
+    empty form, so existing roundtrip fixtures stay byte-identical. */
+    let trailing = doc.sections.last().map(|s| s.columns).unwrap_or_default();
+    if trailing.is_multi() {
+        out.push_str("<w:sectPr>");
+        emit_cols(trailing, &mut out);
+        out.push_str("</w:sectPr></w:body></w:document>");
+    } else {
+        out.push_str(DOC_XML_FOOTER);
+    }
     out
+}
+
+/// Audit gap A.H2 — emit `<w:cols w:num w:space/>`. Caller has already
+/// confirmed the section is multi-column. `w:space` is round-tripped in
+/// twips to avoid pt → twip rounding drift on a value Word stamps as an
+/// exact integer (720, 360, etc.).
+fn emit_cols(cols: engine::ColumnSpec, out: &mut String) {
+    let space_twips = (cols.gutter_pt * 20.0).round() as i32;
+    out.push_str(&format!(
+        "<w:cols w:num=\"{}\" w:space=\"{}\"/>",
+        cols.count, space_twips
+    ));
 }
 
 /// Repack `archive`'s sibling entries verbatim + a freshly serialized
@@ -1422,6 +1446,78 @@ mod tests {
         assert!(s.footer_refs.first.is_none());
         assert!(s.footer_refs.even.is_none());
         assert!(s.title_pg, "<w:titlePg/> toggle must capture as on");
+    }
+
+    /// Audit gap A.H2 — `<w:cols w:num w:space/>` round-trip. Reader
+    /// produces a multi-column `ColumnSpec`; writer re-emits the
+    /// element inside the trailing body `<w:sectPr>` for a multi-column
+    /// document. Single-column sections (no `<w:cols>` at all) stay on
+    /// the legacy empty `<w:sectPr/>` path so existing fixtures don't
+    /// drift.
+    #[test]
+    fn section_round_trips_multi_column_descriptor() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p><w:r><w:t xml:space="preserve">body</w:t></w:r></w:p>
+<w:sectPr><w:cols w:num="2" w:space="360"/></w:sectPr>
+</w:body>
+</w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        let sect = parsed.document.sections.last().expect("section");
+        assert_eq!(sect.columns.count, 2);
+        assert!(
+            (sect.columns.gutter_pt - 18.0).abs() < 0.001,
+            "360 twips = 18 pt, got {}",
+            sect.columns.gutter_pt
+        );
+        /* Writer round-trip: the regenerated document.xml must contain
+        the structural `<w:cols ...>` element inside `<w:sectPr>`. */
+        let resaved = write_docx(&parsed, &parsed.document).expect("write");
+        let archive = read_docx(&resaved).expect("re-read");
+        let xml = archive
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "word/document.xml")
+            .map(|(_, b)| std::str::from_utf8(b).unwrap_or("").to_string())
+            .unwrap_or_else(|| {
+                /* Writer rebuilds `word/document.xml` instead of stashing
+                it in `other_entries`; pull the bytes from the resaved
+                zip directly. */
+                let mut zip = zip::ZipArchive::new(Cursor::new(&resaved)).expect("zip");
+                let mut file = zip.by_name("word/document.xml").expect("doc");
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut file, &mut s).expect("read");
+                s
+            });
+        assert!(
+            xml.contains("<w:cols w:num=\"2\" w:space=\"360\"/>"),
+            "writer dropped `<w:cols>` on round-trip; got: {xml}"
+        );
+        let sect2 = archive.document.sections.last().expect("section after");
+        assert_eq!(sect2.columns.count, 2);
     }
 
     #[test]

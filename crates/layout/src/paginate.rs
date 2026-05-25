@@ -105,10 +105,22 @@ pub struct Paginator {
     /// the next page flushes. Drives the `First` slot selection when
     /// `title_pg` is on.
     section_first_page_pending: bool,
+    /// Audit gap A.H2 — `<w:cols w:num>` for the active section. `1` is
+    /// the single-column historical path; `> 1` enables snake-flow
+    /// where overflow advances [`Self::cur_column_index`] and only
+    /// flushes the page once every column is full.
+    column_count: u8,
+    /// `<w:cols w:space>` — gutter between adjacent columns, in layout
+    /// pt at the active scale. Zero when single-column.
+    column_gutter: f32,
+    /// Active column the cursor is currently flowing into (0-based).
+    /// Reset to 0 on every page flush + section break.
+    cur_column_index: u8,
     /// Accumulating page state.
     cur_blocks: Vec<LayoutBlock>,
-    /// Cursor inside the current page's content area, in content-relative
-    /// pt (0.0 at the top of the content rect).
+    /// Cursor inside the current column's content area, in content-relative
+    /// pt (0.0 at the top of the content rect). Reset on every column
+    /// advance + page flush.
     cur_y: f32,
     /// Finished pages.
     pages: Vec<PageBox>,
@@ -140,6 +152,9 @@ impl Paginator {
             title_pg,
             even_and_odd_headers,
             section_first_page_pending: true,
+            column_count: 1,
+            column_gutter: 0.0,
+            cur_column_index: 0,
             cur_blocks: Vec::new(),
             cur_y: 0.0,
             pages: Vec::new(),
@@ -147,6 +162,17 @@ impl Paginator {
             cur_footnote_ids: Vec::new(),
             cur_footnote_height: 0.0,
         }
+    }
+
+    /// Audit gap A.H2 — install the active section's `<w:cols>` descriptor.
+    /// Single-column sections leave the defaults (count = 1) untouched.
+    /// `count == 0` clamps to 1 (defensive against malformed input).
+    /// Always reset `cur_column_index` so a column-spec swap mid-flow
+    /// doesn't strand the cursor in a column that no longer exists.
+    pub fn set_columns(&mut self, count: u8, gutter_pt: f32) {
+        self.column_count = count.max(1);
+        self.column_gutter = gutter_pt.max(0.0);
+        self.cur_column_index = 0;
     }
 
     /// Single-slot convenience constructor — wraps the legacy
@@ -223,6 +249,51 @@ impl Paginator {
         self.geometry.width - self.geometry.margins.left - self.geometry.margins.right
     }
 
+    /// Audit gap A.H2 — width (in layout pt) of one column for the active
+    /// section's `<w:cols>` descriptor. Single-column ⇒ same as
+    /// [`Self::content_width`]; multi-column subtracts `(N - 1) *
+    /// gutter` from the content width and equal-shares the remainder.
+    pub fn column_width(&self) -> f32 {
+        let cw = self.content_width();
+        let n = self.column_count.max(1) as f32;
+        if n <= 1.0 {
+            return cw;
+        }
+        let gutters = (n - 1.0) * self.column_gutter;
+        ((cw - gutters) / n).max(0.0)
+    }
+
+    /// Distance (in layout pt) from the section's content-area leading
+    /// edge to the leading edge of column `idx`. `idx` clamps to the
+    /// last column when out of range.
+    pub fn column_x_offset(&self, idx: u8) -> f32 {
+        let cw = self.column_width();
+        (idx.min(self.column_count.saturating_sub(1)) as f32) * (cw + self.column_gutter)
+    }
+
+    /// The x origin (in content-area-relative pt) for blocks the
+    /// paginator is currently flowing into.
+    fn current_column_origin_x(&self) -> f32 {
+        self.column_x_offset(self.cur_column_index)
+    }
+
+    /// Audit gap A.H2 — overflow advance. If the active section has
+    /// another column available, snake into it (reset `cur_y`, leave
+    /// `cur_blocks` alone — they belong to the in-progress multi-column
+    /// page). Otherwise flush the page (which also resets the column
+    /// cursor back to 0 for the next page). The boolean return makes
+    /// the split paths' "did we cross a page boundary?" check explicit.
+    fn advance_column_or_flush_page(&mut self) -> bool {
+        if (self.cur_column_index as u16 + 1) < self.column_count as u16 {
+            self.cur_column_index += 1;
+            self.cur_y = 0.0;
+            false
+        } else {
+            self.flush_page();
+            true
+        }
+    }
+
     /// Switch to a new page geometry mid-flow. Closes the current page (even
     /// if it is empty — section breaks always emit a page in Word) and
     /// starts fresh with `new_geom`.
@@ -242,6 +313,13 @@ impl Paginator {
         the flag so `page_role` picks `First` (if `title_pg`) before
         the next flush clears it. */
         self.section_first_page_pending = true;
+        /* Audit gap A.H2 — column descriptor lives on the new section;
+        the caller installs it via `set_columns` after this call. Clear
+        the cursor so the first block of the new section lands in
+        column 0 of column-0 X offset. */
+        self.column_count = 1;
+        self.column_gutter = 0.0;
+        self.cur_column_index = 0;
     }
 
     /// Update the document-wide `even_and_odd_headers` toggle mid-flow.
@@ -311,7 +389,10 @@ impl Paginator {
         };
         if (block_height <= remaining || atomic_overflow_ok) && !has_forced_break {
             let mut origin = block.origin();
-            origin.x = 0.0;
+            /* Audit gap A.H2 — origin.x carries the column offset for
+            multi-column sections (zero for single-column, preserving
+            the legacy "page-wide" behaviour). */
+            origin.x = self.current_column_origin_x();
             origin.y = self.cur_y;
             block.set_origin(origin);
             self.cur_y += block_height + after;
@@ -438,30 +519,37 @@ impl Paginator {
                 let h = tail.size.height;
                 let mut t = tail;
                 t.origin = Point {
-                    x: 0.0,
+                    x: self.current_column_origin_x(),
                     y: self.cur_y,
                 };
                 self.cur_y += h + after;
                 self.cur_blocks.push(LayoutBlock::Paragraph(t));
             }
             (None, Some(tail)) => {
-                /* Not even the first line fits on the *current* page
-                but the page already has content — flush, retry on a
-                fresh page where the same paragraph gets a full budget. */
-                self.flush_page();
+                /* Not even the first line fits in the *current* column.
+                Audit gap A.H2 — snake into the next column if available,
+                otherwise flush the page. The tail re-enters `push_block`
+                with a full column-of-content budget so the next attempt
+                always succeeds (or hits the atomic-single-line clip
+                path above). */
+                self.advance_column_or_flush_page();
                 self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
             }
             (Some(head), tail) => {
                 let h = head.size.height;
                 let mut head = head;
                 head.origin = Point {
-                    x: 0.0,
+                    x: self.current_column_origin_x(),
                     y: self.cur_y,
                 };
                 self.cur_y += h;
                 self.cur_blocks.push(LayoutBlock::Paragraph(head));
                 if let Some(tail) = tail {
-                    self.flush_page();
+                    /* Audit gap A.H2 — column-aware tail routing. The
+                    head sits where it landed; the tail goes into the
+                    next column (snake) or, when this is the last
+                    column, onto a fresh page. */
+                    self.advance_column_or_flush_page();
                     self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
                 } else {
                     self.cur_y += after;
@@ -473,10 +561,13 @@ impl Paginator {
 
     fn push_table_split(&mut self, table: TableBox, after: f32) {
         /* If the table is non-empty, try moving the *whole* table to a new
-        page first — that handles the common "table just barely overflows
-        the page footer" case without an ugly row split. */
+        column (or, when no further columns exist, a new page) first —
+        that handles the common "table just barely overflows the column
+        footer" case without an ugly row split. Audit gap A.H2 — the
+        snake advance keeps the table inside the current page when a
+        sibling column has room. */
         if !self.cur_blocks.is_empty() {
-            self.flush_page();
+            self.advance_column_or_flush_page();
             self.push_block(LayoutBlock::Table(table), 0.0, after);
             return;
         }
@@ -504,7 +595,7 @@ impl Paginator {
         }
         let head = TableBox {
             origin: Point {
-                x: table.origin.x,
+                x: self.current_column_origin_x(),
                 y: self.cur_y,
             },
             size: Size {
@@ -529,7 +620,9 @@ impl Paginator {
                 rows: tail_rows,
                 outer_borders: table.outer_borders,
             };
-            self.flush_page();
+            /* Audit gap A.H2 — snake into the next column before
+            forcing a page; matches the paragraph split policy. */
+            self.advance_column_or_flush_page();
             self.push_block(LayoutBlock::Table(tail), 0.0, after);
         } else {
             self.cur_y += after;
@@ -582,6 +675,11 @@ impl Paginator {
     fn flush_page(&mut self) {
         let blocks = std::mem::take(&mut self.cur_blocks);
         self.cur_y = 0.0;
+        /* Audit gap A.H2 — every page starts in column 0 of its
+        section's column descriptor. The descriptor itself
+        (`column_count` / `column_gutter`) stays — it is a section
+        property, not a per-page one. */
+        self.cur_column_index = 0;
         /* Phase 8a — materialize the page's footnote band. The reserved
         height was already subtracted from the body budget during
         `push_block`, so the band fits without overflow. Entries are in
@@ -1498,5 +1596,74 @@ mod tests {
         page 1 carries no band. */
         assert_eq!(header_tag(&pages[0]), u32::MAX);
         assert_eq!(header_tag(&pages[1]), 99);
+    }
+
+    /// Audit gap A.H2 — a 2-column section keeps an oversized paragraph
+    /// on a single page: the first column overflows, the paginator
+    /// snakes into column 2, and only when both columns fill does it
+    /// flush a new page. Column-1 blocks land at `x = 0`; column-2
+    /// blocks land at `x = column_width + gutter`.
+    #[test]
+    fn paginator_snake_flows_two_columns_before_flushing_page() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        let column_width = geom.width - geom.margins.left - geom.margins.right; // pre-set
+        pag.set_columns(2, 12.0);
+        let new_column_width = pag.column_width();
+        assert!(new_column_width < column_width);
+        /* 120 lines × 16 pt = 1920 pt content. A4 column budget is
+        ~698 pt per column; two columns fit ~1396 pt → one overflow
+        page expected. */
+        let para = fake_paragraph(120, 16.0);
+        pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        let pages = pag.finish();
+        assert!(
+            pages.len() >= 2,
+            "120-line para in 2-col layout should span ≥2 pages; got {}",
+            pages.len()
+        );
+        /* Page 1 must carry blocks in both columns — at least one
+        with x=0 and at least one with x > 0. */
+        let page1 = &pages[0];
+        let xs: Vec<f32> = page1.blocks.iter().map(|b| b.origin().x).collect();
+        assert!(
+            xs.iter().any(|&x| x.abs() < 0.5),
+            "expected a column-0 block on page 1, got xs={xs:?}"
+        );
+        assert!(
+            xs.iter().any(|&x| x > 0.5),
+            "expected a column-1 block on page 1, got xs={xs:?}"
+        );
+        /* Page 2 starts a fresh page in column 0. */
+        let page2 = &pages[1];
+        assert!(
+            page2
+                .blocks
+                .first()
+                .map(|b| b.origin().x.abs() < 0.5)
+                .unwrap_or(false),
+            "first block of a fresh page must reset to column 0",
+        );
+    }
+
+    /// Audit gap A.H2 — single-column sections behave exactly as before.
+    /// Locks the regression-proofing invariant: every committed block
+    /// stays at `x = 0` and overflow flushes the page (no surprise
+    /// column-advance step). Mirror of the legacy single-page test.
+    #[test]
+    fn paginator_single_column_unchanged_origin_x() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        let para = fake_paragraph(3, 16.0);
+        pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 1);
+        for b in &pages[0].blocks {
+            assert!(
+                b.origin().x.abs() < 0.001,
+                "single-column block must have origin.x == 0; got {}",
+                b.origin().x
+            );
+        }
     }
 }

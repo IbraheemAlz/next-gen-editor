@@ -1258,10 +1258,20 @@ fn composition_layout_spans(
 /// alignment, and the same layout-affecting `RenderConfig` fields. `scale` is
 /// the value passed to `build_page` — PDF export lays out at `1.0` regardless
 /// of the cached device scale — so it is hashed explicitly.
-fn paragraph_layout_key(para: &engine::Paragraph, cfg: &RenderConfig, scale: f32) -> u64 {
+fn paragraph_layout_key(
+    para: &engine::Paragraph,
+    cfg: &RenderConfig,
+    scale: f32,
+    max_width_px: f32,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     para.text.hash(&mut h);
+    /* Audit gap A.H2 — the cache key now folds the laid-out max width
+    in. Same paragraph laid out at page-wide vs column-narrow widths
+    produces different line breaks; without the mix-in a doc that
+    swaps a section's `<w:cols>` mid-edit would serve stale layout. */
+    max_width_px.to_bits().hash(&mut h);
     (para.spans.len() as u64).hash(&mut h);
     for run in &para.spans {
         run.start.hash(&mut h);
@@ -3476,16 +3486,23 @@ impl Engine {
                 first: lay_band(section.footer_refs.first.as_ref(), &doc.footers),
                 even: lay_band(section.footer_refs.even.as_ref(), &doc.footers),
             };
-            paginator = Some(
-                Paginator::new(
-                    geom,
-                    headers,
-                    footers,
-                    section.title_pg,
-                    doc.settings.even_and_odd_headers,
-                )
-                .with_footnote_bodies(footnote_bodies.clone()),
-            );
+            let mut pag = Paginator::new(
+                geom,
+                headers,
+                footers,
+                section.title_pg,
+                doc.settings.even_and_odd_headers,
+            )
+            .with_footnote_bodies(footnote_bodies.clone());
+            /* Audit gap A.H2 — install the section's `<w:cols>`
+            descriptor before any block enters the paginator. Gutter
+            converts pt → scaled layout-px to live in the same space as
+            the geometry's margins (already scaled by
+            `scaled_paginator_geometry`). */
+            if section.columns.is_multi() {
+                pag.set_columns(section.columns.count, section.columns.gutter_pt * scale);
+            }
+            paginator = Some(pag);
             page_paths.clear();
             page_paths.push(Vec::new());
 
@@ -3499,7 +3516,7 @@ impl Engine {
                 match block {
                     engine::Block::Table(t) => {
                         let mut tb =
-                            layout_table_box(t, pag.content_width(), &font_stack, &cfg, scale);
+                            layout_table_box(t, pag.column_width(), &font_stack, &cfg, scale);
                         assign_source_ids_table(&mut tb, &mut next_para_id);
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Table(tb), 0.0, 0.0);
@@ -3540,7 +3557,7 @@ impl Engine {
                                 fonts: &font_stack,
                                 spans: &spans,
                                 base_direction: resolve_base_direction(para, &cfg),
-                                max_width: pag.content_width(),
+                                max_width: pag.column_width(),
                                 line_height: cfg.line_height * scale,
                                 alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
                                 indent_start_px: ind_s,
@@ -3552,7 +3569,7 @@ impl Engine {
                                 inline_objects: &[],
                             })
                         } else {
-                            let key = paragraph_layout_key(para, &cfg, scale);
+                            let key = paragraph_layout_key(para, &cfg, scale, pag.column_width());
                             if let Some(cached) = cache.get(&key) {
                                 cached.clone()
                             } else {
@@ -3573,7 +3590,7 @@ impl Engine {
                                     fonts: &font_stack,
                                     spans: &spans,
                                     base_direction: resolve_base_direction(para, &cfg),
-                                    max_width: pag.content_width(),
+                                    max_width: pag.column_width(),
                                     line_height: cfg.line_height * scale,
                                     alignment: para
                                         .props
@@ -5680,25 +5697,32 @@ mod tests {
         let a = para("hello world");
         /* Identical content + config -> identical key. */
         assert_eq!(
-            paragraph_layout_key(&a, &cfg, 1.0),
-            paragraph_layout_key(&a, &cfg, 1.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
         );
         /* Different text -> different key. */
         assert_ne!(
-            paragraph_layout_key(&a, &cfg, 1.0),
-            paragraph_layout_key(&para("hello there"), &cfg, 1.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
+            paragraph_layout_key(&para("hello there"), &cfg, 1.0, 451.0),
         );
         /* A paragraph alignment override -> different key. */
         let mut centered = para("hello world");
         centered.props.alignment = Some(EngineAlignment::Center);
         assert_ne!(
-            paragraph_layout_key(&a, &cfg, 1.0),
-            paragraph_layout_key(&centered, &cfg, 1.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
+            paragraph_layout_key(&centered, &cfg, 1.0, 451.0),
         );
         /* A different device scale -> different key. */
         assert_ne!(
-            paragraph_layout_key(&a, &cfg, 1.0),
-            paragraph_layout_key(&a, &cfg, 2.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
+            paragraph_layout_key(&a, &cfg, 2.0, 451.0),
+        );
+        /* Audit gap A.H2 — a different `max_width` (e.g. swapping a
+        single-column body for a 2-column section that halves the
+        layout width) must miss the cache. */
+        assert_ne!(
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 220.0),
         );
     }
 

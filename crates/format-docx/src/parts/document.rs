@@ -47,6 +47,10 @@ struct SectPrAccum {
     footer_refs: HeaderFooterRefs,
     /// `<w:titlePg/>` toggle.
     title_pg: bool,
+    /// Audit gap A.H2 — `<w:cols w:num w:space/>` snake-flow descriptor.
+    /// `None` ⇒ implicit single column (the writer omits the element so
+    /// existing fixtures round-trip byte-identical).
+    columns: Option<engine::ColumnSpec>,
 }
 
 /// Per-field accumulator on the [`field_stack`] in
@@ -169,6 +173,23 @@ impl SectPrAccum {
                 if let Some(rid) = attr_val(e, b"r:id") {
                     let role = parse_header_footer_role(attr_val(e, b"w:type").as_deref());
                     self.footer_refs.set(role, rid);
+                }
+            }
+            b"w:cols" => {
+                /* Audit gap A.H2 — `<w:cols w:num="N" w:space="T"/>`.
+                `w:num` defaults to 1 (single column); `w:space` defaults
+                to 720 twips (½ inch) per OOXML §17.6.4 when absent.
+                Per-column `<w:col>` children that would request unequal
+                widths are not yet honoured — the sprint ships equal
+                partitioning only; uneven widths degrade gracefully. */
+                let num = attr_val(e, b"w:num")
+                    .and_then(|v| v.trim().parse::<u8>().ok())
+                    .unwrap_or(1);
+                let space = attr_val(e, b"w:space")
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .unwrap_or(720);
+                if num > 1 {
+                    self.columns = Some(engine::ColumnSpec::from_twips(num, space));
                 }
             }
             b"w:titlePg" => {
@@ -756,6 +777,7 @@ pub fn parse_document_xml(
                                 let header_refs = taken.header_refs.clone();
                                 let footer_refs = taken.footer_refs.clone();
                                 let title_pg = taken.title_pg;
+                                let columns = taken.columns.unwrap_or_default();
                                 out_sections.push(Section {
                                     geometry: taken.into_geometry(),
                                     start_block: sect_start_block,
@@ -763,6 +785,7 @@ pub fn parse_document_xml(
                                     header_refs,
                                     footer_refs,
                                     title_pg,
+                                    columns,
                                 });
                                 sect_start_block = end;
                             }
@@ -849,6 +872,7 @@ pub fn parse_document_xml(
                                 let header_refs = sect.header_refs.clone();
                                 let footer_refs = sect.footer_refs.clone();
                                 let title_pg = sect.title_pg;
+                                let columns = sect.columns.unwrap_or_default();
                                 out_sections.push(Section {
                                     geometry: sect.into_geometry(),
                                     start_block: sect_start_block,
@@ -856,6 +880,7 @@ pub fn parse_document_xml(
                                     header_refs,
                                     footer_refs,
                                     title_pg,
+                                    columns,
                                 });
                                 sect_start_block = end;
                             }
@@ -887,6 +912,7 @@ pub fn parse_document_xml(
             header_refs: HeaderFooterRefs::default(),
             footer_refs: HeaderFooterRefs::default(),
             title_pg: false,
+            columns: engine::ColumnSpec::single(),
         });
     }
 
