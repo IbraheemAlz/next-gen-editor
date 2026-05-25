@@ -87,6 +87,90 @@ struct CompositionState {
     text: String,
 }
 
+/// Audit gap C.H1 — viewport-culled lazy pagination state. Owned by
+/// `Engine`; mutated by `SetViewport` (the TS shell records the scrolled
+/// viewport band) and `ExpandLayout` (the shell asks the engine to flow
+/// blocks down to a deeper Y). The Y coordinates are layout pixels at
+/// the active device scale, measured from the document top.
+///
+/// `min_target_y` is the high-water mark of how deep the paginator has
+/// been *asked* to lay out — `build_pages` keeps emitting pages while
+/// the running document height is below it (plus a buffer). Every edit
+/// resets it back to the initial cold-open target so an unrelated paint
+/// doesn't re-pay for the whole doc.
+#[derive(Clone, Copy)]
+struct LazyLayoutState {
+    viewport_y: f32,
+    viewport_h: f32,
+    /// Lower bound the paginator must cover on its next run. Floor is
+    /// `INITIAL_COLD_OPEN_BUDGET_PT` so a fresh / post-edit engine
+    /// always lays out the visible band even if the TS shell hasn't
+    /// posted a viewport yet.
+    min_target_y: f32,
+}
+
+impl Default for LazyLayoutState {
+    fn default() -> Self {
+        Self {
+            viewport_y: 0.0,
+            viewport_h: INITIAL_COLD_OPEN_BUDGET_PT,
+            min_target_y: INITIAL_COLD_OPEN_BUDGET_PT,
+        }
+    }
+}
+
+/// Audit gap C.H1 — how far below the viewport bottom the paginator
+/// keeps pre-laying out, in layout pt at scale=1. One-and-a-half
+/// page-heights of slack so a slow scroll doesn't visibly pause while
+/// the next page renders. The TS shell can still drive deeper by
+/// calling `ExpandLayout` directly.
+const LAYOUT_BUFFER_PT: f32 = 1200.0;
+
+/// Audit gap C.H1 — cold-open default budget, in layout pt at scale=1.
+/// Roughly two A4 pages tall (842 × 2 ≈ 1684); the paginator processes
+/// blocks until the running document height clears this much without
+/// waiting for the TS shell to register a viewport. Picked so the
+/// first paint after `LoadDocx` is bounded regardless of total document
+/// length.
+const INITIAL_COLD_OPEN_BUDGET_PT: f32 = 1684.0;
+
+/// Audit gap C.H1 — virtual-height fallback per *unlaid-out* body
+/// block, in layout pt at scale=1. Tuned against the perf-fixtures
+/// corpus: a typical .docx body block at 12 pt averages ~18 pt per
+/// line with ~3 lines per paragraph, so ~54 pt; round up so the
+/// scrollbar slightly *over-* rather than *under-* estimates and
+/// background completion only ever shrinks the scroll range. (An
+/// estimate that grew would yank the scroll thumb downward on every
+/// page filled in.)
+const AVG_BLOCK_HEIGHT_PT: f32 = 64.0;
+
+/// Audit gap C.H1 — pagination-completion info that rides alongside
+/// the laid-out pages. The caller folds this into `Painted` so the TS
+/// shell knows (a) whether more pages may materialize via
+/// `ExpandLayout`, and (b) the running virtual-height estimate that
+/// drives the scrollbar's backing store.
+struct LazyLayoutInfo {
+    /// `true` when every body block was consumed; `false` when the
+    /// viewport-cull budget halted the paginator early.
+    is_full_layout: bool,
+    /// Number of top-level blocks across the doc that have not yet
+    /// been processed (paragraph or table). Drives the height estimate.
+    remaining_blocks: u32,
+}
+
+/// Cached dimensions from the most recent `render_document`, replayed by
+/// the worker's synthetic `Painted` side-channel after every mutating
+/// command. Carries `estimated_document_height` + `is_full_layout` so
+/// the TS shell's scrollbar resizes against the virtual estimate, not
+/// just the laid-out tail.
+#[derive(Clone, Copy, Default)]
+struct LastPaintDims {
+    document_height: f32,
+    page_count: u32,
+    estimated_document_height: f32,
+    is_full_layout: bool,
+}
+
 /// A candidate caret position on a line — an absolute x (canvas device px)
 /// paired with the source byte offset a caret there maps to.
 #[derive(Clone, Copy)]
@@ -197,7 +281,19 @@ pub struct Engine {
     /// correctly after typing (Phase 6b documented this wire but only
     /// the `REQUEST_PAINT` path emitted `Painted` — mutating commands
     /// rendered but stayed silent on the dims).
-    last_paint_dims: (f32, u32),
+    last_paint_dims: LastPaintDims,
+    /// Audit gap C.H1 — viewport-culled lazy pagination state. The TS
+    /// shell drives this via `SetViewport` (records the visible band
+    /// the user is scrolled to) and `ExpandLayout` (asks the engine to
+    /// lay out down to a target Y). The paginator stops generating
+    /// pages once the laid-out tail covers `viewport_y + viewport_h +
+    /// LAYOUT_BUFFER_PT`. Cold open with a 50-page document touches
+    /// only the first few pages instead of every block — the document
+    /// height the TS shell sees on the first paint is an estimate; it
+    /// converges to the real height as `ExpandLayout` calls fill in
+    /// the tail (and the scrollbar never jumps because the estimate
+    /// is always ≥ the real running total).
+    lazy_layout: LazyLayoutState,
     /// Caret affinity at a BiDi seam (UX_BEHAVIOR_SPEC §III.5). When
     /// the caret offset lands on a byte with TWO valid visual slots —
     /// the end of one directional run and the start of the next —
@@ -245,7 +341,8 @@ fn assemble_engine(
         layout_cache: new_layout_cache(),
         a11y_cache: None,
         image_cache: HashMap::new(),
-        last_paint_dims: (0.0, 0),
+        last_paint_dims: LastPaintDims::default(),
+        lazy_layout: LazyLayoutState::default(),
         caret_affinity: CaretAffinity::default(),
     }
 }
@@ -335,10 +432,12 @@ impl Engine {
     /// multi-page documents grow + scroll instead of getting squashed
     /// vertically into a single A4 box.
     pub fn paint_dims(&self) -> Result<JsValue, JsValue> {
-        let (h, n) = self.last_paint_dims;
+        let dims = self.last_paint_dims;
         serde_wasm_bindgen::to_value(&PaintDimsOut {
-            document_height: h,
-            page_count: n,
+            document_height: dims.document_height,
+            page_count: dims.page_count,
+            estimated_document_height: dims.estimated_document_height,
+            is_full_layout: dims.is_full_layout,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -404,6 +503,14 @@ impl Engine {
 struct PaintDimsOut {
     document_height: f32,
     page_count: u32,
+    /// Audit gap C.H1 — virtual scrollbar height the TS shell should
+    /// size its backing CSS to. Equal to `document_height` once
+    /// `is_full_layout` is `true`.
+    estimated_document_height: f32,
+    /// Audit gap C.H1 — `true` once the paginator has consumed every
+    /// body block, `false` while a viewport-cull budget is still
+    /// holding back the tail.
+    is_full_layout: bool,
 }
 
 #[derive(::serde::Serialize)]
@@ -3071,9 +3178,10 @@ impl Engine {
                 self.do_update_composition(text, target_range)
             }
             Command::EndComposition { commit } => self.do_end_composition(commit),
-            Command::SetViewport { .. } => phase3_stub("SetViewport"),
+            Command::SetViewport { rect } => self.do_set_viewport(rect),
             Command::SetZoom { .. } => phase3_stub("SetZoom"),
             Command::RequestPaint { viewport, dirty } => self.do_request_paint(viewport, dirty),
+            Command::ExpandLayout { target_y } => self.do_expand_layout(target_y),
             Command::UnloadFont { .. } => phase3_stub("UnloadFont"),
             Command::RequestStats => self.request_stats(),
 
@@ -3434,12 +3542,30 @@ impl Engine {
     /// `Vec<EngineBlockPath>` is per-page, parallel to the `PageBox`
     /// vector: `paths[i][j]` is the engine block path of `pages[i].blocks[j]`.
     /// Paragraph splits emit the same engine path on both pages.
+    /// Audit gap C.H1 — `target_y == Some(y)` switches the build into
+    /// viewport-cull mode: the paginator stops processing further blocks
+    /// once `emitted_pages_height >= y + LAYOUT_BUFFER_PT`. `None`
+    /// preserves the historical "lay everything out" contract — used by
+    /// PDF export and hit-tests that need every page resolved.
+    ///
+    /// The returned [`LazyLayoutInfo`] carries the cull state so the
+    /// caller can synthesize the scrollbar's virtual height + know
+    /// whether more `ExpandLayout` round-trips are needed.
     #[allow(clippy::type_complexity)]
     fn build_pages(
         &self,
         scale: f32,
         with_composition: bool,
-    ) -> Result<(Vec<PageBox>, FontStack, Vec<Vec<EngineBlockPath>>), Box<Event>> {
+        target_y: Option<f32>,
+    ) -> Result<
+        (
+            Vec<PageBox>,
+            FontStack,
+            Vec<Vec<EngineBlockPath>>,
+            LazyLayoutInfo,
+        ),
+        Box<Event>,
+    > {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
@@ -3489,8 +3615,33 @@ impl Engine {
         by `push_block` (paginator may emit prior pages first). */
         let mut emitted_pages: Vec<PageBox> = Vec::new();
         let mut emitted_paths: Vec<Vec<EngineBlockPath>> = Vec::new();
+        /* Audit gap C.H1 — viewport-cull bookkeeping. `processed_blocks`
+        is the running count of top-level blocks fully consumed by the
+        paginator (paragraph or table). `total_blocks` is the doc-wide
+        count we'll subtract from to derive `remaining_blocks` for the
+        scrollbar estimator. `cull_budget` is the absolute Y past which
+        we may stop processing further blocks; `None` means "lay
+        everything out" (PDF export, hit-test, etc.). The 50 % buffer
+        on top of `LAYOUT_BUFFER_PT` is the slack that keeps a smooth
+        scroll from outrunning the layout. */
+        let mut processed_blocks: u32 = 0;
+        let total_blocks: u32 = doc.blocks.len() as u32;
+        let cull_budget = target_y.map(|y| y + LAYOUT_BUFFER_PT);
+        let mut culled = false;
+        let gap = render::scene::PAGE_GAP_PT * scale;
+        let height_so_far = |pages: &[PageBox], in_progress: f32| -> f32 {
+            if pages.is_empty() {
+                return in_progress;
+            }
+            pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap
+                + if in_progress > 0.0 {
+                    gap + in_progress
+                } else {
+                    0.0
+                }
+        };
 
-        for section in &sections {
+        'outer: for section in &sections {
             let geom = scaled_paginator_geometry(section.geometry, scale);
             /* Flush the prior paginator (if any) before swapping geometry. */
             if let Some(p) = paginator.take() {
@@ -3548,6 +3699,23 @@ impl Engine {
             page_paths.push(Vec::new());
 
             for block_idx in section.start_block..section.end_block {
+                /* Audit gap C.H1 — viewport-cull stop. Check at the
+                top of every block (so we don't half-process a block).
+                Compare the total height already committed (finished
+                pages + the paginator's in-progress cursor) against
+                the cull budget. We DON'T stop mid-section because the
+                paginator's flush_page on section break is a hard
+                guarantee — stopping mid-section would emit a
+                half-flushed page. The check fires at every block
+                boundary, which is enough granularity for typical
+                docs (50 pages × ~20 paragraphs each = 1000 boundaries). */
+                if let Some(budget) = cull_budget {
+                    let pag_h = paginator.as_ref().map_or(0.0, |p| p.cursor_y());
+                    if height_so_far(&emitted_pages, pag_h) >= budget {
+                        culled = true;
+                        break 'outer;
+                    }
+                }
                 let Some(block) = doc.blocks.get(block_idx as usize) else {
                     continue;
                 };
@@ -3562,6 +3730,7 @@ impl Engine {
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Table(tb), 0.0, 0.0);
                         attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
+                        processed_blocks += 1;
                     }
                     engine::Block::Paragraph(para) => {
                         let comp = composition.filter(|c| {
@@ -3681,6 +3850,7 @@ impl Engine {
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
+                        processed_blocks += 1;
                     }
                 }
             }
@@ -3711,7 +3881,12 @@ impl Engine {
             });
             emitted_paths.push(Vec::new());
         }
-        Ok((emitted_pages, font_stack, emitted_paths))
+        /* Audit gap C.H1 — fold the cull bookkeeping into the result. */
+        let info = LazyLayoutInfo {
+            is_full_layout: !culled,
+            remaining_blocks: total_blocks.saturating_sub(processed_blocks),
+        };
+        Ok((emitted_pages, font_stack, emitted_paths, info))
     }
 
     /// Backwards-compatible single-page wrapper for callers still on the
@@ -3724,7 +3899,8 @@ impl Engine {
         scale: f32,
         with_composition: bool,
     ) -> Result<(PageBox, FontStack, Vec<EngineBlockPath>), Box<Event>> {
-        let (mut pages, fonts, mut paths) = self.build_pages(scale, with_composition)?;
+        let (mut pages, fonts, mut paths, _info) =
+            self.build_pages(scale, with_composition, None)?;
         let page = pages.drain(..).next().unwrap_or_else(|| PageBox {
             size: Size {
                 width: 0.0,
@@ -3741,8 +3917,14 @@ impl Engine {
     }
 
     fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
-        /* `true` — splice the live IME composition preview into the paint. */
-        let (pages, _font_stack, _box_paths) = self.build_pages(self.scale(), true)?;
+        /* `true` — splice the live IME composition preview into the
+        paint. Audit gap C.H1 — `target_y` comes from `lazy_layout`
+        (high-water mark the TS shell has asked us to cover). The
+        running estimate the scrollbar reads adds an
+        `AVG_BLOCK_HEIGHT_PT` fudge per skipped block on top. */
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        let (pages, _font_stack, _box_paths, info) =
+            self.build_pages(self.scale(), true, target_y)?;
 
         let mut line_count: u32 = 0;
         let mut glyph_count: u32 = 0;
@@ -3776,12 +3958,27 @@ impl Engine {
         } else {
             pages.iter().map(|p| p.size.height + gap).sum::<f32>() - gap
         };
+        /* Audit gap C.H1 — virtual scrollbar height. When every block
+        was consumed, the estimate IS the real height. When the cull
+        budget halted us early, pad with a per-block average so the
+        scrollbar is large enough to allow scrolling into the
+        not-yet-laid-out tail; the estimate only ever *shrinks* as
+        background `ExpandLayout` calls fill in (real heights are
+        bounded above by the over-estimating average — the comment on
+        `AVG_BLOCK_HEIGHT_PT` calls this out). */
+        let estimated_document_height: f32 = if info.is_full_layout {
+            document_height
+        } else {
+            document_height + (info.remaining_blocks as f32) * AVG_BLOCK_HEIGHT_PT * scale
+        };
         let stats = RenderStats {
             page_width,
             page_height,
             line_count,
             glyph_count,
             document_height,
+            is_full_layout: info.is_full_layout,
+            estimated_document_height,
             page_count: pages.len() as u32,
         };
 
@@ -3801,7 +3998,12 @@ impl Engine {
                     message: format!("vello paint: {e}"),
                 })
             })?;
-            self.last_paint_dims = (stats.document_height, stats.page_count);
+            self.last_paint_dims = LastPaintDims {
+                document_height: stats.document_height,
+                page_count: stats.page_count,
+                estimated_document_height: stats.estimated_document_height,
+                is_full_layout: stats.is_full_layout,
+            };
             return Ok(stats);
         }
 
@@ -3848,7 +4050,12 @@ impl Engine {
             }
         }
 
-        self.last_paint_dims = (stats.document_height, stats.page_count);
+        self.last_paint_dims = LastPaintDims {
+            document_height: stats.document_height,
+            page_count: stats.page_count,
+            estimated_document_height: stats.estimated_document_height,
+            is_full_layout: stats.is_full_layout,
+        };
         Ok(stats)
     }
 
@@ -3861,7 +4068,9 @@ impl Engine {
     fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
         /* `false` — a PDF export is the committed document, never the
         in-progress IME composition. */
-        let (pages, font_stack, _box_paths) = match self.build_pages(1.0, false) {
+        /* `target_y: None` — PDF export is a full-document materialization,
+        not a viewport paint. The cull budget would corrupt page count. */
+        let (pages, font_stack, _box_paths, _info) = match self.build_pages(1.0, false, None) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -3898,12 +4107,92 @@ impl Engine {
     /// D3.8: repaint the document clipped to the dirty region. The command's
     /// `dirty` rect wins; else the accumulated [`DirtyTracker`] region; else
     /// the full `viewport`.
+    /// Audit gap C.H1 — bump the lazy-layout high-water mark to cover
+    /// `target_y_px` (device px from doc top). Any interactive
+    /// (hit-test, pointer click) that targets a Y past the current
+    /// laid-out tail must call this before `document_geometry()` so
+    /// the next layout pass extends to the new target. Cheaper than
+    /// `target_y: None` because the layout still respects the
+    /// established buffer — clicking on page 5 of a 50-page doc
+    /// extends to page 5, not all 50.
+    fn lazy_layout_bump_for_y(&mut self, target_y_px: f32) {
+        let scale = self.scale().max(0.0001);
+        let target_pt = target_y_px / scale;
+        if target_pt > self.lazy_layout.min_target_y {
+            self.lazy_layout.min_target_y = target_pt;
+        }
+    }
+
+    /// Audit gap C.H1 — the TS shell broadcasts the scrolled viewport
+    /// (in document-relative device pixels) on every scroll tick. The
+    /// engine records the visible band + lifts `min_target_y` so the
+    /// next paint lays out down to the bottom of the buffered band.
+    /// Returns the cached dimensions as a synthetic `Painted`; the
+    /// TS shell re-sizes its scrollbar against `estimated_document_height`
+    /// without waiting for the next real paint.
+    fn do_set_viewport(&mut self, rect: BridgeRect) -> Event {
+        let scale = self.scale().max(0.0001);
+        let bottom_pt = (rect.y + rect.h) / scale;
+        self.lazy_layout.viewport_y = rect.y / scale;
+        self.lazy_layout.viewport_h = rect.h / scale;
+        if bottom_pt > self.lazy_layout.min_target_y {
+            self.lazy_layout.min_target_y = bottom_pt;
+        }
+        let dims = self.last_paint_dims;
+        Event::Painted {
+            dirty: BridgeRect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            version: u64::from(self.undo.depth()),
+            paint_ms: 0.0,
+            document_height: dims.document_height,
+            page_count: dims.page_count,
+            is_full_layout: dims.is_full_layout,
+            estimated_document_height: dims.estimated_document_height,
+        }
+    }
+
+    /// Audit gap C.H1 — explicit "lay out down to `target_y` pt" request.
+    /// Used by the TS shell on scroll-near-bottom and by interactive
+    /// motions that would otherwise land in the not-yet-laid-out tail
+    /// (Ctrl+End, PageDown past the buffered band). Issues a fresh
+    /// paint so the new pages reach the canvas. `target_y` is in
+    /// layout pt at scale=1 (the engine multiplies by `self.scale()`
+    /// when it cull-checks).
+    fn do_expand_layout(&mut self, target_y: f32) -> Event {
+        if target_y > self.lazy_layout.min_target_y {
+            self.lazy_layout.min_target_y = target_y;
+        }
+        /* Re-render with the bumped target_y. The viewport rect we
+        pass is irrelevant — paint is computed against the new
+        `min_target_y`, not the rect arg. */
+        let scale = self.scale();
+        let rect = BridgeRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: target_y * scale,
+        };
+        self.do_request_paint(rect, None)
+    }
+
     fn do_request_paint(&mut self, viewport: BridgeRect, dirty: Option<BridgeRect>) -> Event {
         let drained = self.dirty.drain();
         let region = dirty
             .map(bridge_to_kurbo)
             .or(drained)
             .unwrap_or_else(|| bridge_to_kurbo(viewport));
+        /* Audit gap C.H1 — fold viewport hint into lazy_layout so the
+        next `render_document` call lays out down to the visible
+        bottom. Caller may have just sent a `SetViewport`; this is
+        also a safety net for clients that skip the explicit setter. */
+        let bottom_pt = (viewport.y + viewport.h) / self.scale();
+        if bottom_pt > self.lazy_layout.min_target_y {
+            self.lazy_layout.min_target_y = bottom_pt;
+        }
         let stats = match self.render_document(Some(region)) {
             Ok(s) => s,
             Err(e) => return *e,
@@ -3914,6 +4203,8 @@ impl Engine {
             paint_ms: 0.0,
             document_height: stats.document_height,
             page_count: stats.page_count,
+            is_full_layout: stats.is_full_layout,
+            estimated_document_height: stats.estimated_document_height,
         }
     }
 
@@ -3924,8 +4215,14 @@ impl Engine {
     /// single-page PoC; cache when editing lands.
     fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
         /* `false` — hit-test + caret geometry run on committed document
-        offsets, which `self.selection` is also expressed in. */
-        let (pages, _fonts, page_paths) = self.build_pages(self.scale(), false)?;
+        offsets, which `self.selection` is also expressed in. Audit gap
+        C.H1 — geometry queries that need to resolve a deep caret /
+        hit-test target must lay out far enough to cover it. `target_y`
+        is the high-water mark of any caret motion or scroll the TS
+        shell has requested; `do_hit_test_in_page` and the keyboard
+        navigation helpers bump it ahead of calling this. */
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        let (pages, _fonts, page_paths, _info) = self.build_pages(self.scale(), false, target_y)?;
         let gap = render::scene::PAGE_GAP_PT * self.scale();
         let mut geom: Vec<LineGeom> = Vec::new();
         let mut page_top: f32 = 0.0;
@@ -3972,7 +4269,18 @@ impl Engine {
     /// pixels (the legacy single-canvas convention). For the Phase 6c
     /// multi-canvas DOM architecture, the TS shell uses the page-aware
     /// path below.
-    fn do_hit_test(&self, at: BridgePoint) -> Event {
+    fn do_hit_test(&mut self, at: BridgePoint) -> Event {
+        /* Audit gap C.H1 — hit-test guardrail. The click's Y might
+        sit past the lazy-laid tail (user scrolled into estimated
+        space then clicked). Bump `min_target_y` to cover it so the
+        next `document_geometry()` extends the layout down to the
+        click. `at.y` is doc-relative device px; lazy_layout stores
+        layout pt at scale=1. */
+        let scale = self.scale().max(0.0001);
+        let target_pt = at.y / scale;
+        if target_pt > self.lazy_layout.min_target_y {
+            self.lazy_layout.min_target_y = target_pt;
+        }
         match self.document_geometry() {
             Ok(geom) => Event::HitResult {
                 pos: hit_test_geom(&geom, at.x, at.y),
@@ -3991,7 +4299,13 @@ impl Engine {
     fn do_hit_test_in_page(&self, page_idx: u32, at: BridgePoint) -> Event {
         let scale = self.scale();
         let gap = render::scene::PAGE_GAP_PT * scale;
-        let (pages, _, _) = match self.build_pages(scale, false) {
+        /* Audit gap C.H1 — hit-test guardrail. A click on page N where N
+        is beyond the laid-out tail must force the paginator to extend.
+        `target_y = None` requests a full layout; cheaper paths exist
+        (lay out to just-past-page-N) but the click is a user
+        interaction whose latency budget is generous, and full layout
+        also primes the cache for the next paint. */
+        let (pages, _, _, _info) = match self.build_pages(scale, false, None) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -4050,6 +4364,7 @@ impl Engine {
     /// `Command::SelectWordAt` — hit-test, then select the whole word
     /// (double-click).
     fn do_select_word_at(&mut self, at: BridgePoint) -> Event {
+        self.lazy_layout_bump_for_y(at.y);
         let geom = match self.document_geometry() {
             Ok(g) => g,
             Err(e) => return *e,
@@ -4080,6 +4395,7 @@ impl Engine {
     /// `Command::SelectParagraphAt` — hit-test then select the whole
     /// paragraph (triple-click).
     fn do_select_paragraph_at(&mut self, at: BridgePoint) -> Event {
+        self.lazy_layout_bump_for_y(at.y);
         let geom = match self.document_geometry() {
             Ok(g) => g,
             Err(e) => return *e,
@@ -4115,6 +4431,7 @@ impl Engine {
     /// lands at `text.len()` of its last paragraph. Outside any cell
     /// the command falls back to `SelectAll`.
     fn do_select_cell_at(&mut self, at: BridgePoint) -> Event {
+        self.lazy_layout_bump_for_y(at.y);
         let geom = match self.document_geometry() {
             Ok(g) => g,
             Err(e) => return *e,
@@ -5469,11 +5786,19 @@ struct RenderStats {
     page_height: f32,
     line_count: u32,
     glyph_count: u32,
-    /// Phase 6b — paginated total: every page's height summed plus the
-    /// inter-page gap on every join. The TS shell sizes its canvas to
-    /// this so multi-page docs scroll.
+    /// Phase 6b — paginated total of the pages **already laid out**:
+    /// every emitted page's height summed plus inter-page gaps.
     document_height: f32,
     page_count: u32,
+    /// Audit gap C.H1 — `true` when every body block was consumed;
+    /// `false` when the viewport-cull budget stopped the paginator early.
+    is_full_layout: bool,
+    /// Audit gap C.H1 — best-guess total document height including
+    /// blocks that have not been laid out yet (the running total plus
+    /// `AVG_BLOCK_HEIGHT_PT` × remaining body blocks). The scrollbar
+    /// reads this, so it always shrinks (never grows) as background
+    /// completion fills in.
+    estimated_document_height: f32,
 }
 
 #[cfg(test)]
@@ -5500,7 +5825,8 @@ mod tests {
             layout_cache: new_layout_cache(),
             a11y_cache: None,
             image_cache: HashMap::new(),
-            last_paint_dims: (0.0, 0),
+            last_paint_dims: LastPaintDims::default(),
+            lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
@@ -6085,7 +6411,8 @@ mod tests {
             layout_cache: new_layout_cache(),
             a11y_cache: None,
             image_cache: HashMap::new(),
-            last_paint_dims: (0.0, 0),
+            last_paint_dims: LastPaintDims::default(),
+            lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
         };
         e.do_move_caret(MoveDirection::DocHome, false);
@@ -6126,7 +6453,8 @@ mod tests {
             layout_cache: new_layout_cache(),
             a11y_cache: None,
             image_cache: HashMap::new(),
-            last_paint_dims: (0.0, 0),
+            last_paint_dims: LastPaintDims::default(),
+            lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
         };
         e.do_move_caret(MoveDirection::Right, false);
@@ -6158,7 +6486,8 @@ mod tests {
             layout_cache: new_layout_cache(),
             a11y_cache: None,
             image_cache: HashMap::new(),
-            last_paint_dims: (0.0, 0),
+            last_paint_dims: LastPaintDims::default(),
+            lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
         };
         e.do_move_caret(MoveDirection::Left, false);
@@ -6267,7 +6596,8 @@ mod tests {
             layout_cache: new_layout_cache(),
             a11y_cache: None,
             image_cache: HashMap::new(),
-            last_paint_dims: (0.0, 0),
+            last_paint_dims: LastPaintDims::default(),
+            lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
         };
         e.do_delete_at_caret(false, true);

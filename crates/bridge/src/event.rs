@@ -100,14 +100,29 @@ pub enum Event {
         dirty: Rect,
         version: u64,
         paint_ms: f32,
-        /// Phase 6b — total document height in layout pixels at the current
-        /// `dpr` scale, including inter-page gaps. The TS shell sizes its
-        /// canvas backing store to this so the browser scrollbar exposes
-        /// every paginated page. `0.0` for harness paths that bypass
-        /// pagination (Phase-1 `?test=` cases).
+        /// Phase 6b — total height in layout pixels of the pages **already
+        /// laid out**, including inter-page gaps. The TS shell sizes its
+        /// canvas backing store to `estimated_document_height` (≥ this),
+        /// but uses this value for `last_emitted_y` so a hit-test below
+        /// it triggers a layout-extend request. `0.0` for harness paths
+        /// that bypass pagination (Phase-1 `?test=` cases).
         document_height: f32,
-        /// Phase 6b — number of paginated pages the renderer drew.
+        /// Phase 6b — number of paginated pages the renderer drew so far.
         page_count: u32,
+        /// Audit gap C.H1 — pagination state on this paint. `true` when
+        /// every body block was consumed; `false` when the paginator
+        /// stopped early under a `viewport_budget` so the scrollbar
+        /// reflects the *estimated* document height, not the final one.
+        /// The TS shell uses this to know whether more pages may
+        /// materialize on scroll / `ExpandLayout`.
+        is_full_layout: bool,
+        /// Audit gap C.H1 — best-guess total document height in layout
+        /// pixels at the current scale, including the inter-page gaps
+        /// and an `AVG_PARAGRAPH_HEIGHT_PT` × `remaining_blocks` reserve
+        /// for blocks that have not yet been laid out. `== document_height`
+        /// once `is_full_layout` is `true`. Drives the scrollbar so it
+        /// never jumps as background layout fills in the tail.
+        estimated_document_height: f32,
     },
 
     /* Selection */

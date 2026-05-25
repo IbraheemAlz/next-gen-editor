@@ -192,6 +192,17 @@ pub enum Command {
         viewport: Rect,
         dirty: Option<Rect>,
     },
+    /// Audit gap C.H1 — viewport-culled lazy pagination. The TS shell
+    /// asks the engine to extend its lazy layout down to `target_y` (in
+    /// layout pixels at the current device scale, measured from the
+    /// document top). Issued on scroll-near-bottom + on click /
+    /// PageDown that would land beyond the laid-out region. The reply
+    /// is a fresh `Painted` event whose `is_full_layout` flips `true`
+    /// when the extend exhausted every remaining block, or stays
+    /// `false` when the budget was hit again.
+    ExpandLayout {
+        target_y: f32,
+    },
 
     /* Fonts / resources */
     UnloadFont {
