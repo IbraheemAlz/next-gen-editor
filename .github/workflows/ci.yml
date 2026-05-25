@@ -82,12 +82,12 @@ jobs:
     # GitHub runner's Chrome is not yet proven, so a mismatch must surface
     # without breaking main. Promote to a required check once verified.
     continue-on-error: true
-    # Bound the runtime — historically the harness finishes in ~2 min on
-    # the runner. Any hang in the dev-server boot / memory-profile /
-    # perf harnesses is bounded so a stuck job doesn't burn an hour of
-    # runner time. continue-on-error keeps the overall workflow green
-    # when the cap fires.
-    timeout-minutes: 10
+    # Bound the runtime — visual-diff alone runs in ~1 min on a clean
+    # runner. The 5-min cap catches dev-server boot stalls without
+    # letting the whole job burn an hour of runner time.
+    # continue-on-error keeps the overall workflow green when the cap
+    # fires.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
 
@@ -124,7 +124,7 @@ jobs:
           pnpm --dir tools/memory-profile install --frozen-lockfile
           pnpm --dir tools/perf install --frozen-lockfile
 
-      - name: Run visual-diff, memory + performance harnesses
+      - name: Run visual-diff harness
         run: |
           set -uo pipefail
           pnpm --dir ts dev &
@@ -133,17 +133,20 @@ jobs:
             curl -sf http://localhost:5173 >/dev/null 2>&1 && break
             sleep 1
           done
-          # Per-harness wall-clock caps. Visual-diff: 7 cases × ~3 s each
-          # ≈ 21 s; budget 3 min. Memory-profile: 4 fixtures × ~10 s each;
-          # budget 3 min. Perf: cold-start + 100 keystrokes + open 50p;
-          # budget 3 min. `timeout` exits 124 on the cap — caller treats
-          # it like any other non-zero so continue-on-error catches it.
+          # Visual-diff alone runs every push — 7 tier-A cases × ~3 s on
+          # the runner ≈ 21 s real, capped at 3 min by `timeout`.
+          # `timeout` exits 124 on the cap; `continue-on-error: true`
+          # catches it so a flake never breaks main.
+          #
+          # Memory-profile + perf are excluded from per-push CI: on the
+          # shared GitHub runner the 100p/250p/500p `<docs>` consistently
+          # blew the 3-min cap (Playwright `page.evaluate` browser-context
+          # crash after ~77 s on the 50p fixture alone). Run them locally
+          # with `node tools/memory-profile/run.mjs --budgets` /
+          # `node tools/perf/run.mjs --strict` or wire a nightly schedule
+          # against a dedicated runner.
           timeout 180 node tools/visual-diff/run.mjs --tier A
           VD=$?
-          timeout 180 node tools/memory-profile/run.mjs --budgets
-          MP=$?
-          timeout 180 node tools/perf/run.mjs --strict
-          PF=$?
           kill "$DEV_PID" 2>/dev/null || true
-          echo "visual-diff exit=$VD  memory-profile exit=$MP  perf exit=$PF"
-          [ "$VD" -eq 0 ] && [ "$MP" -eq 0 ] && [ "$PF" -eq 0 ]
+          echo "visual-diff exit=$VD"
+          [ "$VD" -eq 0 ]
