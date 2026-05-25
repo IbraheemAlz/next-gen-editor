@@ -8,3 +8,4 @@ description = "Pure-Rust document model + undo/redo facade."
 
 [dependencies]
 im = { workspace = true }
+unicode-segmentation = { workspace = true }

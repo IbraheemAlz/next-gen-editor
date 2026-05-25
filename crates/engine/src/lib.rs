@@ -1077,22 +1077,31 @@ impl Paragraph {
         }
     }
 
-    /// Byte offset of the char boundary immediately before `o` (clamped to 0).
+    /// Byte offset of the UAX-#29 extended grapheme cluster boundary
+    /// immediately before `o` (clamped to 0). Audit gap B.H1 — stepping
+    /// by Unicode scalar (`char`) bisects Arabic harakat, Devanagari
+    /// conjuncts, emoji ZWJ sequences; grapheme stepping keeps each
+    /// user-perceived character atomic so Backspace removes a whole
+    /// cluster instead of leaving an orphaned combining mark.
     pub fn prev_offset(&self, o: u32) -> u32 {
+        use unicode_segmentation::UnicodeSegmentation;
         let o = (o as usize).min(self.text.len());
         self.text[..o]
-            .char_indices()
+            .grapheme_indices(true)
             .next_back()
             .map_or(0, |(i, _)| i as u32)
     }
 
-    /// Byte offset of the char boundary immediately after `o` (clamped to len).
+    /// Byte offset of the UAX-#29 extended grapheme cluster boundary
+    /// immediately after `o` (clamped to len). See [`Self::prev_offset`]
+    /// for the symmetric rationale.
     pub fn next_offset(&self, o: u32) -> u32 {
+        use unicode_segmentation::UnicodeSegmentation;
         let o = (o as usize).min(self.text.len());
         self.text[o..]
-            .chars()
-            .next()
-            .map_or(o as u32, |c| (o + c.len_utf8()) as u32)
+            .grapheme_indices(true)
+            .nth(1)
+            .map_or(self.text.len() as u32, |(rel_i, _)| (o + rel_i) as u32)
     }
 }
 
@@ -3473,7 +3482,7 @@ mod tests {
 
     #[test]
     fn prev_next_offset_utf8() {
-        /* "a"=1 byte, "م"=2 bytes, "b"=1 byte → char boundaries 0,1,3,4. */
+        /* "a"=1 byte, "م"=2 bytes, "b"=1 byte → grapheme boundaries 0,1,3,4. */
         let p = Paragraph {
             text: "aمb".into(),
             spans: Vec::new(),
@@ -3491,6 +3500,43 @@ mod tests {
         assert_eq!(p.next_offset(1), 3);
         assert_eq!(p.prev_offset(4), 3);
         assert_eq!(p.prev_offset(3), 1);
+    }
+
+    /// Audit gap B.H1 — `prev_offset` / `next_offset` step by UAX-#29
+    /// extended grapheme cluster, not Unicode scalar. The Arabic letter
+    /// `ي` plus FATHATAN diacritic `ً` forms one user-perceived
+    /// character (two `char`s, four UTF-8 bytes); Backspace must
+    /// remove the cluster atomically instead of leaving an orphaned
+    /// combining mark behind.
+    #[test]
+    fn prev_next_offset_step_grapheme_cluster() {
+        /* Byte map for "aيًb":
+          0: 'a'                              (1 byte)
+          1: 'ي'         start of cluster    (2 bytes)
+          3: ARABIC FATHATAN U+064B          (2 bytes, combining)
+          5: 'b'                              (1 byte)
+          6: end
+        The يً cluster spans bytes 1..5. */
+        let p = Paragraph {
+            text: "aيًb".into(),
+            spans: Vec::new(),
+            props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
+            dirty: false,
+            source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
+            revisions: Vec::new(),
+            fields: Vec::new(),
+        };
+        /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
+        assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
+        /* Backward from 'b' jumps over both letters of the cluster. */
+        assert_eq!(p.prev_offset(5), 1, "backward must skip the FATHATAN");
+        /* Edges still pin / clamp. */
+        assert_eq!(p.prev_offset(0), 0);
+        assert_eq!(p.next_offset(6), 6);
     }
 
     #[test]

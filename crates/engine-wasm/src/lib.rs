@@ -2104,6 +2104,36 @@ fn slot_x_for_byte(line: &LineGeom, byte: u32) -> f32 {
     nearest_slot_x(&line.slots, byte, line.start_x)
 }
 
+/// Audit gap B.H3 — pure spatial neighbour scan. Returns the byte of
+/// the caret slot whose `x` is strictly greater than `current_x`
+/// (`going_right`) or strictly less (`!going_right`); `None` when no
+/// such slot exists (the caret sits at the visual edge of the line).
+///
+/// This is *the* mechanism that makes ArrowLeft / ArrowRight feel
+/// natural across BiDi seams: the slot list interleaves bytes from
+/// both directional runs at their actual visual x positions, so the
+/// scan crosses the seam without needing to know that one logical
+/// byte sits before another. A run boundary is just another slot.
+///
+/// The 0.5 epsilon dodges floating-point ties — a caret sitting
+/// exactly on a slot would otherwise be returned as its own neighbour
+/// on the same-x edge.
+fn neighbor_slot_byte_by_x(slots: &[CaretSlot], current_x: f32, going_right: bool) -> Option<u32> {
+    use core::cmp::Ordering;
+    let candidate = if going_right {
+        slots
+            .iter()
+            .filter(|s| s.x > current_x + 0.5)
+            .min_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal))
+    } else {
+        slots
+            .iter()
+            .filter(|s| s.x < current_x - 0.5)
+            .max_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal))
+    };
+    candidate.map(|s| s.byte)
+}
+
 /// Caret slot whose `x` is closest to `target_x` (Backlog #14, ideal-x snap).
 /// `None` only when the line carries no slots — an empty paragraph.
 fn nearest_slot_by_x(slots: &[CaretSlot], target_x: f32) -> Option<&CaretSlot> {
@@ -2177,6 +2207,14 @@ fn step_left(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
 /// document is empty or `caret` doesn't resolve to any line — caller
 /// keeps the existing caret in that case.
 fn line_home(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalPos> {
+    /* Audit gap B.H2 — direction-aware Home. `start_byte` is the
+    paragraph-relative byte of the line's first **logical** character;
+    visual leading edge maps to that byte for both LTR (visually
+    leftmost) and RTL (visually rightmost) lines. This is the
+    direction-aware contract per UX_BEHAVIOR_SPEC §III.4: Home in RTL
+    lands on the rightmost slot because the rightmost slot IS the
+    logical start. No separate paragraph-direction check needed —
+    line geometry already encodes the asymmetry. */
     let geom = engine.document_geometry().ok()?;
     let line = geom.into_iter().find(|l| {
         l.path == caret.path && caret.offset >= l.start_byte && caret.offset <= l.end_byte
@@ -2188,7 +2226,10 @@ fn line_home(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalP
 }
 
 /// Caret position at the end of the visual line containing `caret`
-/// (End key). See [`line_home`].
+/// (End key). Audit gap B.H2 — direction-aware End. Symmetric to
+/// [`line_home`]: `end_byte` is the logical end of the line, which
+/// is the visually trailing edge of the line — visually rightmost
+/// for LTR, visually leftmost for RTL.
 fn line_end(engine: &Engine, caret: &BridgeLogicalPos) -> Option<BridgeLogicalPos> {
     let geom = engine.document_geometry().ok()?;
     let line = geom.into_iter().find(|l| {
@@ -4613,7 +4654,6 @@ impl Engine {
         caret: &BridgeLogicalPos,
         going_right: bool,
     ) -> (BridgeLogicalPos, CaretAffinity) {
-        use core::cmp::Ordering;
         let affinity = if going_right {
             CaretAffinity::TrailingX
         } else {
@@ -4625,22 +4665,11 @@ impl Engine {
             });
             if let Some(line) = line {
                 let current_x = slot_x_for_byte(line, caret.offset);
-                let next = if going_right {
-                    line.slots
-                        .iter()
-                        .filter(|s| s.x > current_x + 0.5)
-                        .min_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal))
-                } else {
-                    line.slots
-                        .iter()
-                        .filter(|s| s.x < current_x - 0.5)
-                        .max_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal))
-                };
-                if let Some(s) = next {
+                if let Some(byte) = neighbor_slot_byte_by_x(&line.slots, current_x, going_right) {
                     return (
                         BridgeLogicalPos {
                             path: caret.path.clone(),
-                            offset: s.byte,
+                            offset: byte,
                         },
                         affinity,
                     );
@@ -6138,6 +6167,50 @@ mod tests {
     }
 
     /* ---- Roadmap Phase 2: run-level visual step (§III.1) -------- */
+
+    /// Audit gap B.H3 — spatial visual arrow stepping is byte-order-agnostic.
+    /// Build a synthetic mixed-direction slot list where the LTR run
+    /// covers bytes 0..4 left-to-right (x: 0,10,20,30,40) and the RTL
+    /// run covers bytes 4..8 right-to-left (x: 90,80,70,60,50). The
+    /// directional seam sits at byte 4 / x≈45. ArrowRight from byte 3
+    /// (x=30) must land at x=40 (byte 4) — the visually next slot —
+    /// **not** stride into the Arabic run logically. Successive
+    /// ArrowRight presses then climb x=50,60,70,80,90, which step
+    /// **logically backward** through the RTL bytes (8,7,6,5,4) — the
+    /// hallmark of correct BiDi visual stepping.
+    #[test]
+    fn spatial_visual_step_crosses_bidi_seam_by_x_alone() {
+        let slots = vec![
+            CaretSlot { x: 0.0, byte: 0 },
+            CaretSlot { x: 10.0, byte: 1 },
+            CaretSlot { x: 20.0, byte: 2 },
+            CaretSlot { x: 30.0, byte: 3 },
+            CaretSlot { x: 40.0, byte: 4 }, // LTR trailing edge
+            CaretSlot { x: 50.0, byte: 8 }, // RTL trailing (logical end)
+            CaretSlot { x: 60.0, byte: 7 },
+            CaretSlot { x: 70.0, byte: 6 },
+            CaretSlot { x: 80.0, byte: 5 },
+            CaretSlot { x: 90.0, byte: 4 }, // RTL leading edge (logical start)
+        ];
+        /* Right from x=30 → x=40, byte 4 (LTR side of the seam). */
+        assert_eq!(neighbor_slot_byte_by_x(&slots, 30.0, true), Some(4));
+        /* Right from x=40 → x=50, byte 8 (RTL trailing, logical END
+        of the Arabic word — the scan crossed the seam by x). */
+        assert_eq!(neighbor_slot_byte_by_x(&slots, 40.0, true), Some(8));
+        /* Right from x=50 → x=60, byte 7 (logical step BACKWARD inside
+        the RTL run; the spatial scan doesn't care). */
+        assert_eq!(neighbor_slot_byte_by_x(&slots, 50.0, true), Some(7));
+        /* Right at the visual edge (x=90) returns None — caller falls
+        back to logical step to wrap onto the next line. */
+        assert_eq!(neighbor_slot_byte_by_x(&slots, 90.0, true), None);
+        /* Symmetric: Left from x=60 → x=50 (byte 8). */
+        assert_eq!(neighbor_slot_byte_by_x(&slots, 60.0, false), Some(8));
+        /* Left from x=50 → x=40 (byte 4 LTR side); the scan re-crosses
+        the seam in the opposite direction with no special-case. */
+        assert_eq!(neighbor_slot_byte_by_x(&slots, 50.0, false), Some(4));
+        /* Left at the visual edge (x=0) returns None. */
+        assert_eq!(neighbor_slot_byte_by_x(&slots, 0.0, false), None);
+    }
 
     /// `slot_x_for_byte_with_affinity` resolves a BiDi-seam byte that
     /// hosts two slots to the side the caret's affinity asks for.
