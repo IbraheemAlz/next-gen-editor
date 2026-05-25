@@ -204,7 +204,14 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         <textarea
             ref={ref}
             class="hidden-input"
-            aria-hidden="true"
+            /* `aria-hidden` removed — browsers warn (and the WAI-ARIA spec
+               forbids) hiding a focused element from AT. The textarea
+               holds the OS text-input focus continuously; the canonical
+               AT surface is the visually-hidden `AccessibilityTree`
+               component rendered separately, not this one-shot input
+               buffer (cleared on every keystroke). `aria-label` gives
+               AT a one-word identifier instead of "edit, blank". */
+            aria-label="editor input"
             tabindex="-1"
             autocomplete="off"
             autocapitalize="off"
