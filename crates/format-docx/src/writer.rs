@@ -1023,20 +1023,66 @@ fn build_document_xml(doc: &DocumentTree) -> String {
     for block in &doc.blocks {
         emit_block(block, &mut out);
     }
-    /* Audit gap A.H2 — the trailing body-level `<w:sectPr/>` carries the
-    last section's properties; when that section has multi-column, swap
-    the bare empty element for one that holds `<w:cols w:num w:space/>`.
-    Sections without `<w:cols>` (the historical case) still emit the
-    empty form, so existing roundtrip fixtures stay byte-identical. */
-    let trailing = doc.sections.last().map(|s| s.columns).unwrap_or_default();
-    if trailing.is_multi() {
+    /* Audit gap A.H2 / A.M11 / A.M12 — trailing body-level `<w:sectPr/>`
+    carries the last section's column / page-numbering / section-type
+    descriptors. Emit the full element only when one of them is non-
+    default; otherwise stay on the bare `<w:sectPr/>` form so existing
+    roundtrip fixtures stay byte-identical. */
+    let trailing_sect = doc.sections.last().cloned().unwrap_or_default();
+    let cols = trailing_sect.columns;
+    let pgn = trailing_sect.page_num;
+    let sect_type = trailing_sect.section_type;
+    let needs_full = cols.is_multi()
+        || pgn != engine::PageNumType::default()
+        || sect_type != engine::SectionType::default();
+    if needs_full {
         out.push_str("<w:sectPr>");
-        emit_cols(trailing, &mut out);
+        if cols.is_multi() {
+            emit_cols(cols, &mut out);
+        }
+        emit_pg_num_type(pgn, &mut out);
+        emit_sect_type(sect_type, &mut out);
         out.push_str("</w:sectPr></w:body></w:document>");
     } else {
         out.push_str(DOC_XML_FOOTER);
     }
     out
+}
+
+/// Audit gap A.M11 — emit `<w:pgNumType w:start w:fmt/>`. Skips entirely
+/// when both fields are at their defaults (no `start` override, decimal
+/// format) to keep the trailing sectPr lean for plain documents.
+fn emit_pg_num_type(p: engine::PageNumType, out: &mut String) {
+    if p == engine::PageNumType::default() {
+        return;
+    }
+    out.push_str("<w:pgNumType");
+    if let Some(n) = p.start {
+        out.push_str(&format!(" w:start=\"{n}\""));
+    }
+    let fmt = match p.format {
+        engine::PageNumFormat::Decimal => None,
+        engine::PageNumFormat::LowerRoman => Some("lowerRoman"),
+        engine::PageNumFormat::UpperRoman => Some("upperRoman"),
+        engine::PageNumFormat::LowerLetter => Some("lowerLetter"),
+        engine::PageNumFormat::UpperLetter => Some("upperLetter"),
+    };
+    if let Some(f) = fmt {
+        out.push_str(&format!(" w:fmt=\"{f}\""));
+    }
+    out.push_str("/>");
+}
+
+/// Audit gap A.M12 — emit `<w:type w:val>`. `NextPage` is the implicit
+/// default; omit. Other variants round-trip explicitly.
+fn emit_sect_type(t: engine::SectionType, out: &mut String) {
+    let v = match t {
+        engine::SectionType::NextPage => return,
+        engine::SectionType::Continuous => "continuous",
+        engine::SectionType::EvenPage => "evenPage",
+        engine::SectionType::OddPage => "oddPage",
+    };
+    out.push_str(&format!("<w:type w:val=\"{v}\"/>"));
 }
 
 /// Audit gap A.H2 — emit `<w:cols w:num w:space/>`. Caller has already
@@ -2127,6 +2173,7 @@ mod tests {
             page_break_before: false,
             borders: None,
             tab_stops: Vec::new(),
+            list_item: None,
         };
         let para = Paragraph {
             text: "hello world".into(),

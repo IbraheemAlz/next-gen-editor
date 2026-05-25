@@ -27,6 +27,7 @@ use quick_xml::reader::Reader;
 /// `parse_table_bytes` call when we hit the `<w:tc>` close).
 pub fn parse_table_bytes(
     xml: &[u8],
+    resolver: &crate::style_resolver::StyleResolver<'_>,
 ) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
@@ -124,7 +125,7 @@ pub fn parse_table_bytes(
                             let end = reader.buffer_position() as usize;
                             if start < end && end <= xml.len() {
                                 let raw = xml[start..end].to_vec();
-                                if let Ok((g, p, r)) = parse_table_bytes(&raw) {
+                                if let Ok((g, p, r)) = parse_table_bytes(&raw, resolver) {
                                     cell.blocks.push(Block::Table(Table {
                                         grid: g,
                                         props: p,
@@ -168,7 +169,7 @@ pub fn parse_table_bytes(
                                 for round-trip. Full cascade + numbering
                                 inside cells lands in Phase 5 PR 3. */
                                 cell.blocks
-                                    .push(Block::Paragraph(parse_cell_paragraph(&raw)));
+                                    .push(Block::Paragraph(parse_cell_paragraph(&raw, resolver)));
                             }
                         }
                     }
@@ -193,16 +194,51 @@ pub fn parse_table_bytes(
 /// round-trip. Full pPr / rPr / numPr cascade inside cells deferred
 /// to Phase 5 PR 3 (a refactor of `parts::document::parse_document_xml`
 /// to share its run-aware loop with cell content).
-fn parse_cell_paragraph(xml: &[u8]) -> engine::Paragraph {
+fn parse_cell_paragraph(
+    xml: &[u8],
+    resolver: &crate::style_resolver::StyleResolver<'_>,
+) -> engine::Paragraph {
+    use crate::schema::ct_rpr::{apply_rpr, attr_val};
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut text = String::new();
     let mut in_text = false;
+    let mut in_ppr = false;
+    let mut in_rpr = false;
+    let mut in_num_pr = false;
+    let mut p_style: Option<String> = None;
+    let mut pmark_rpr = engine::SpanStyle::default();
+    let mut list_num_id: Option<u32> = None;
+    let mut list_ilvl: Option<u8> = None;
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) if e.name().as_ref() == b"w:t" => in_text = true,
-            Ok(Event::End(e)) if e.name().as_ref() == b"w:t" => in_text = false,
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"w:t" => in_text = true,
+                b"w:pPr" => in_ppr = true,
+                b"w:rPr" if in_ppr => in_rpr = true,
+                b"w:numPr" if in_ppr => in_num_pr = true,
+                n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => match e.name().as_ref() {
+                b"w:pStyle" if in_ppr => p_style = attr_val(&e, b"w:val"),
+                b"w:numId" if in_num_pr => {
+                    list_num_id = attr_val(&e, b"w:val").and_then(|v| v.trim().parse().ok());
+                }
+                b"w:ilvl" if in_num_pr => {
+                    list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.trim().parse().ok());
+                }
+                n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"w:t" => in_text = false,
+                b"w:pPr" => in_ppr = false,
+                b"w:rPr" => in_rpr = false,
+                b"w:numPr" => in_num_pr = false,
+                _ => {}
+            },
             Ok(Event::Text(t)) if in_text => {
                 if let Ok(s) = t.unescape() {
                     text.push_str(&s);
@@ -213,11 +249,27 @@ fn parse_cell_paragraph(xml: &[u8]) -> engine::Paragraph {
         }
         buf.clear();
     }
+    /* Audit gap A.M18 — resolve cell paragraph through the style cascade.
+    Doc defaults + pStyle chain + the paragraph-mark rPr all fold into
+    the effective `props`. List binding from a direct `<w:numPr>` wins
+    over the cascade-inherited `props.list_item`. */
+    let (props, _baseline) = resolver.resolve_paragraph(
+        p_style.as_deref(),
+        engine::ParaProperties::default(),
+        pmark_rpr,
+    );
+    let list_item = match (list_num_id, list_ilvl) {
+        (Some(num_id), ilvl) => Some(engine::ListItem {
+            num_id,
+            ilvl: ilvl.unwrap_or(0),
+        }),
+        (None, _) => props.list_item,
+    };
     engine::Paragraph {
         text,
         spans: Vec::new(),
-        props: Default::default(),
-        list_item: None,
+        props,
+        list_item,
         resolved_marker: None,
         /* Cell paragraphs ride their parent table's passthrough — the
         cell's raw `<w:p>` bytes are inside `Table.source_xml`. We don't
@@ -498,11 +550,22 @@ fn parse_border_stroke(e: &BytesStart) -> BorderStroke {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parts::styles::StyleTable;
+    use crate::style_resolver::StyleResolver;
+
+    /// Tests built against a default (empty) style table — no pStyle
+    /// chain, doc defaults only. Cell paragraphs still get resolved
+    /// through the cascade now (audit A.M18); empty cascade reduces
+    /// to the prior `Default::default()` behaviour bit-for-bit.
+    fn empty_resolver() -> StyleTable {
+        StyleTable::default()
+    }
 
     #[test]
     fn parses_2x2_table_with_grid() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
-        let (grid, _props, rows) = parse_table_bytes(xml).expect("parse");
+        let (grid, _props, rows) =
+            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
         assert_eq!(grid, vec![2880, 2880]);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].cells.len(), 2);
@@ -521,7 +584,8 @@ mod tests {
     #[test]
     fn parses_grid_span_and_vmerge() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>merged</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>top</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>r1c2</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc><w:tc><w:p><w:r><w:t>r2c2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
-        let (_, _, rows) = parse_table_bytes(xml).expect("parse");
+        let (_, _, rows) =
+            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
         assert_eq!(rows[0].cells[0].props.grid_span, 2);
         assert_eq!(rows[1].cells[0].props.v_merge, VMergeRole::Restart);
         assert_eq!(rows[2].cells[0].props.v_merge, VMergeRole::Continue);
@@ -530,7 +594,8 @@ mod tests {
     #[test]
     fn parses_cell_shading_and_borders() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="FFEB78"/><w:tcBorders><w:top w:val="double" w:sz="12" w:color="FF0000"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
-        let (_, _, rows) = parse_table_bytes(xml).expect("parse");
+        let (_, _, rows) =
+            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
         let cell = &rows[0].cells[0];
         assert_eq!(cell.props.shading, Some([0xFF, 0xEB, 0x78, 0xFF]));
         let top = cell
@@ -547,7 +612,8 @@ mod tests {
     #[test]
     fn nested_table_recurses() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>outer</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc></w:tr></w:tbl>"#;
-        let (_, _, rows) = parse_table_bytes(xml).expect("parse");
+        let (_, _, rows) =
+            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
         let cell = &rows[0].cells[0];
         /* `outer` paragraph + nested table block. */
         assert_eq!(cell.blocks.len(), 2);

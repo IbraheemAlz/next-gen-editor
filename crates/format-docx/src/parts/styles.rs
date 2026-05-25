@@ -108,6 +108,13 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
             .map(|n| n.as_slice() == b"w:pPr")
             .unwrap_or(false)
     };
+    /* Audit gap A.M17 — `<w:style>/<w:pPr>/<w:numPr>`. */
+    let in_numpr = |stack: &[Vec<u8>]| -> bool {
+        stack
+            .last()
+            .map(|n| n.as_slice() == b"w:numPr")
+            .unwrap_or(false)
+    };
 
     loop {
         match reader.read_event_into(&mut buf)? {
@@ -126,6 +133,15 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                     n if in_rpr(&stack) && !pmark_rpr(&stack) => {
                         apply_to_rpr(n, &e, &mut table, &mut cur_style, in_doc_defaults);
                     }
+                    n if in_numpr(&stack) => {
+                        apply_to_numpr_style(
+                            n,
+                            &e,
+                            &mut cur_style,
+                            &mut table.defaults.para,
+                            in_doc_defaults,
+                        );
+                    }
                     n if in_ppr(&stack) => {
                         apply_to_ppr(n, &e, &mut table, &mut cur_style, in_doc_defaults);
                     }
@@ -143,6 +159,15 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                     }
                     n if in_rpr(&stack) && !pmark_rpr(&stack) => {
                         apply_to_rpr(n, &e, &mut table, &mut cur_style, in_doc_defaults);
+                    }
+                    n if in_numpr(&stack) => {
+                        apply_to_numpr_style(
+                            n,
+                            &e,
+                            &mut cur_style,
+                            &mut table.defaults.para,
+                            in_doc_defaults,
+                        );
                     }
                     n if in_ppr(&stack) => {
                         apply_to_ppr(n, &e, &mut table, &mut cur_style, in_doc_defaults);
@@ -232,6 +257,43 @@ fn apply_to_ppr(
         apply_ppr(name, e, &mut table.defaults.para);
     } else if let Some(s) = cur_style.as_mut() {
         apply_ppr(name, e, &mut s.para);
+    }
+}
+
+/// Audit gap A.M17 — fold `<w:numPr>` children inside a style's `<w:pPr>`
+/// into the style's `para.list_item`. The style cascade then propagates
+/// the binding to any paragraph referencing this style by `<w:pStyle>`.
+/// Called from the styles parser when the event stack carries
+/// `<w:style>/<w:pPr>/<w:numPr>`. Partial refs (numId without ilvl) get
+/// the same defaults as in `document.rs` — ilvl 0 stands in.
+fn apply_to_numpr_style(
+    name: &[u8],
+    e: &BytesStart,
+    cur_style: &mut Option<StyleScratch>,
+    defaults_para: &mut ParaProperties,
+    in_doc_defaults: bool,
+) {
+    let target = if in_doc_defaults && cur_style.is_none() {
+        &mut defaults_para.list_item
+    } else if let Some(s) = cur_style.as_mut() {
+        &mut s.para.list_item
+    } else {
+        return;
+    };
+    /* Lazy-init the slot — patches `num_id` / `ilvl` independently. */
+    let item = target.get_or_insert(engine::ListItem { num_id: 0, ilvl: 0 });
+    match name {
+        b"w:numId" => {
+            if let Some(v) = attr_val(e, b"w:val").and_then(|v| v.trim().parse().ok()) {
+                item.num_id = v;
+            }
+        }
+        b"w:ilvl" => {
+            if let Some(v) = attr_val(e, b"w:val").and_then(|v| v.trim().parse().ok()) {
+                item.ilvl = v;
+            }
+        }
+        _ => {}
     }
 }
 

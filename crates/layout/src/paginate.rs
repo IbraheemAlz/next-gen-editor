@@ -135,6 +135,17 @@ pub struct Paginator {
     /// footnote band, including the separator gap. Subtracted from
     /// the content budget so the body never overruns the band.
     cur_footnote_height: f32,
+    /// Audit gap A.M11 — `<w:pgNumType>` for the active section.
+    /// PAGE-field evaluator translates the doc-wide page number into
+    /// (start + (doc_page - section_start_page)) when `start` is
+    /// `Some`, then formats per `PageNumFormat`.
+    page_num: engine::PageNumType,
+    /// Audit gap A.M11 — doc-wide page index (1-based) at the start of
+    /// the section this paginator owns. Engine-wasm sets this when it
+    /// creates the per-section paginator. PAGE-field eval uses it to
+    /// compute section-relative page numbers without needing to know
+    /// about the global page accumulator.
+    doc_page_offset: u32,
 }
 
 impl Paginator {
@@ -161,7 +172,27 @@ impl Paginator {
             footnote_bodies: HashMap::new(),
             cur_footnote_ids: Vec::new(),
             cur_footnote_height: 0.0,
+            page_num: engine::PageNumType::default(),
+            doc_page_offset: 0,
         }
+    }
+
+    /// Audit gap A.M11 — install the section's `<w:pgNumType>` plus the
+    /// doc-wide page index this section starts at. Engine-wasm calls
+    /// this right after constructing a per-section paginator.
+    pub fn set_page_numbering(&mut self, page_num: engine::PageNumType, doc_page_offset: u32) {
+        self.page_num = page_num;
+        self.doc_page_offset = doc_page_offset;
+    }
+
+    /// Audit gap A.M12 — install the section's column descriptor + the
+    /// paginator's existing cursor state. `continue_in_place=true`
+    /// (continuous section break) preserves `cur_y` / `cur_blocks` so
+    /// the new section's first block flows directly below the previous
+    /// section on the SAME page. `false` (NextPage default) is handled
+    /// by the engine-wasm flush path instead.
+    pub fn set_section_cursor(&mut self, geometry: PageGeometry) {
+        self.geometry = geometry;
     }
 
     /// Audit gap A.H2 — install the active section's `<w:cols>` descriptor.
@@ -669,7 +700,12 @@ impl Paginator {
     /// value is `pages.len()` at end-of-document, which is unknown
     /// here; [`Paginator::finish`] walks every emitted page and
     /// patches them in a second pass.
-    fn evaluate_fields_on_paragraph(para: &mut ParagraphBox, current_page: u32) {
+    fn evaluate_fields_on_paragraph(
+        para: &mut ParagraphBox,
+        doc_page: u32,
+        page_num: engine::PageNumType,
+        section_start_doc_page: u32,
+    ) {
         for f in para.fields.iter_mut() {
             /* Keyword extraction lives on `engine::Field` so the
             layout box doesn't need to reimplement the trim + split
@@ -681,7 +717,16 @@ impl Paginator {
                 instruction: f.instruction.clone(),
             };
             if synthetic.keyword() == "PAGE" {
-                f.evaluated_text = Some(current_page.to_string());
+                /* Audit gap A.M11 — section-relative page numbering.
+                `start: Some(n)` rebases: the section's first page is
+                `n`, every subsequent page is `n + (doc_page -
+                section_start_doc_page)`. `start: None` keeps the
+                doc-wide count. Format renders the integer. */
+                let section_page = match page_num.start {
+                    Some(n) => n + doc_page.saturating_sub(section_start_doc_page),
+                    None => doc_page,
+                };
+                f.evaluated_text = Some(page_num.format.render(section_page));
             }
         }
     }
@@ -749,21 +794,27 @@ impl Paginator {
         Stamp every body block + header + footer paragraph the page
         owns; `evaluate_fields_on_paragraph` mutates the
         `evaluated_text` slot the renderer eventually reads. */
-        let current_page = (self.pages.len() + 1) as u32;
+        /* Audit gap A.M11 — doc-wide page index is the section's
+        `doc_page_offset` plus this paginator's local page count. The
+        +1 is the 1-based convention (Word, OOXML, and Word's PAGE
+        field are all 1-based). */
+        let doc_page = self.doc_page_offset + (self.pages.len() as u32) + 1;
+        let section_start_doc_page = self.doc_page_offset + 1;
+        let page_num = self.page_num;
         let mut blocks = blocks;
         for block in blocks.iter_mut() {
             Self::for_each_paragraph_in_block(block, &mut |p| {
-                Self::evaluate_fields_on_paragraph(p, current_page);
+                Self::evaluate_fields_on_paragraph(p, doc_page, page_num, section_start_doc_page);
             });
         }
         if let Some(hf) = header.as_mut() {
             for p in hf.paragraphs.iter_mut() {
-                Self::evaluate_fields_on_paragraph(p, current_page);
+                Self::evaluate_fields_on_paragraph(p, doc_page, page_num, section_start_doc_page);
             }
         }
         if let Some(hf) = footer.as_mut() {
             for p in hf.paragraphs.iter_mut() {
-                Self::evaluate_fields_on_paragraph(p, current_page);
+                Self::evaluate_fields_on_paragraph(p, doc_page, page_num, section_start_doc_page);
             }
         }
 

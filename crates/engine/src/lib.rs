@@ -317,6 +317,118 @@ pub struct Section {
     /// single-column body; multi-column sections snake-flow inside the
     /// section's page geometry.
     pub columns: ColumnSpec,
+    /// Audit gap A.M11 — `<w:pgNumType>` descriptor. Controls section-
+    /// relative `PAGE` field rendering (start value + number format).
+    /// `Default` keeps the doc-wide absolute page count.
+    pub page_num: PageNumType,
+    /// Audit gap A.M12 — `<w:sectPr><w:type w:val>`. Default `NextPage`
+    /// forces a page break at section start; `Continuous` flows the
+    /// new section directly below the previous one on the SAME page.
+    /// `EvenPage` / `OddPage` round-trip but degrade to `NextPage`
+    /// (parity routing is paginator work deferred to a later sprint).
+    pub section_type: SectionType,
+}
+
+/// Audit gap A.M11 — `<w:pgNumType>` descriptor.
+///
+/// `start: Some(n)` restarts the section's page numbering at `n`; the
+/// paginator's PAGE-field evaluator uses `(current_doc_page -
+/// section_first_page + n)` instead of the absolute count. `None`
+/// keeps doc-wide numbering. `format` picks the glyph set: decimal,
+/// lower/upper roman, lower/upper letter — anything else falls back
+/// to decimal so an unrecognised `w:fmt` doesn't crash the paginator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PageNumType {
+    pub start: Option<u32>,
+    pub format: PageNumFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageNumFormat {
+    #[default]
+    Decimal,
+    LowerRoman,
+    UpperRoman,
+    LowerLetter,
+    UpperLetter,
+}
+
+impl PageNumFormat {
+    /// Audit gap A.M11 — render a 1-based page number under this
+    /// format. Roman conversion clamps to the 1..=3999 range (above
+    /// that the classical Roman system has no glyphs — beyond Word's
+    /// supported range too). Letter format cycles A-Z / AA-ZZ / ...
+    pub fn render(self, n: u32) -> String {
+        match self {
+            PageNumFormat::Decimal => n.to_string(),
+            PageNumFormat::LowerRoman => to_roman(n).to_lowercase(),
+            PageNumFormat::UpperRoman => to_roman(n),
+            PageNumFormat::LowerLetter => to_letter(n, false),
+            PageNumFormat::UpperLetter => to_letter(n, true),
+        }
+    }
+}
+
+fn to_roman(mut n: u32) -> String {
+    if n == 0 || n > 3999 {
+        return n.to_string();
+    }
+    let table: &[(u32, &str)] = &[
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut out = String::new();
+    for &(v, s) in table {
+        while n >= v {
+            out.push_str(s);
+            n -= v;
+        }
+    }
+    out
+}
+
+fn to_letter(n: u32, upper: bool) -> String {
+    if n == 0 {
+        return n.to_string();
+    }
+    let base = if upper { b'A' } else { b'a' };
+    /* Word's `lowerLetter` / `upperLetter`: 1..=26 → A..Z; 27..=52 →
+    AA..ZZ (NOT base-26 — letters REPEAT). Match that quirk. */
+    let count = ((n - 1) / 26) + 1;
+    let letter = base + ((n - 1) % 26) as u8;
+    let mut out = String::with_capacity(count as usize);
+    for _ in 0..count {
+        out.push(letter as char);
+    }
+    out
+}
+
+/// Audit gap A.M12 — `<w:sectPr><w:type>` discriminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SectionType {
+    /// Section starts on a fresh page (the default when `<w:type>` is
+    /// absent).
+    #[default]
+    NextPage,
+    /// New section flows in-line on the same page — the paginator does
+    /// NOT flush before swapping geometry. Used for layouts like
+    /// "1-column title, then 2-column body on the same page".
+    Continuous,
+    /// Round-trips through reader / writer but degrades to `NextPage`
+    /// in the paginator until parity-aware page routing lands.
+    EvenPage,
+    OddPage,
 }
 
 impl Section {
@@ -822,6 +934,12 @@ pub struct ParaProperties {
     /// grid the line builder uses. Position is layout pt at scale=1
     /// (1 twip = 1/20 pt; reader converts at parse time).
     pub tab_stops: Vec<TabStop>,
+    /// Audit gap A.M17 — `<w:pPr><w:numPr>` numbering binding inherited
+    /// via the pStyle chain. Carries the resolved (num_id, ilvl) when
+    /// the paragraph's style cascade specifies a list binding. The
+    /// document parser folds this into `Paragraph.list_item` when no
+    /// direct `<w:pPr><w:numPr>` appears on the paragraph itself.
+    pub list_item: Option<ListItem>,
 }
 
 impl ParaProperties {
@@ -866,6 +984,9 @@ impl ParaProperties {
             } else {
                 patch.tab_stops
             },
+            /* Audit gap A.M17 — list binding cascades: patch wins
+            when set, otherwise inherit. */
+            list_item: patch.list_item.or(self.list_item),
         }
     }
 }
@@ -1650,6 +1771,8 @@ impl DocumentTree {
                 footer_refs: HeaderFooterRefs::default(),
                 title_pg: false,
                 columns: ColumnSpec::single(),
+                page_num: PageNumType::default(),
+                section_type: SectionType::default(),
             }];
         }
         self.sections.clone()

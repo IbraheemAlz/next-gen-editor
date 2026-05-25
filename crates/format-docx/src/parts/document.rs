@@ -51,6 +51,11 @@ struct SectPrAccum {
     /// `None` ⇒ implicit single column (the writer omits the element so
     /// existing fixtures round-trip byte-identical).
     columns: Option<engine::ColumnSpec>,
+    /// Audit gap A.M11 — `<w:pgNumType w:start w:fmt>`. `None` ⇒
+    /// inherit doc-wide page numbering.
+    page_num: Option<engine::PageNumType>,
+    /// Audit gap A.M12 — `<w:type w:val>` section-break discriminator.
+    section_type: engine::SectionType,
 }
 
 /// Per-field accumulator on the [`field_stack`] in
@@ -286,6 +291,27 @@ impl SectPrAccum {
                 self.title_pg = match attr_val(e, b"w:val").as_deref() {
                     Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "off"),
                     None => true,
+                };
+            }
+            /* Audit gap A.M11 — `<w:pgNumType w:start w:fmt/>`. */
+            b"w:pgNumType" => {
+                let start = attr_val(e, b"w:start").and_then(|v| v.trim().parse::<u32>().ok());
+                let format = match attr_val(e, b"w:fmt").as_deref().map(str::trim) {
+                    Some("lowerRoman") => engine::PageNumFormat::LowerRoman,
+                    Some("upperRoman") => engine::PageNumFormat::UpperRoman,
+                    Some("lowerLetter") => engine::PageNumFormat::LowerLetter,
+                    Some("upperLetter") => engine::PageNumFormat::UpperLetter,
+                    _ => engine::PageNumFormat::Decimal,
+                };
+                self.page_num = Some(engine::PageNumType { start, format });
+            }
+            /* Audit gap A.M12 — `<w:sectPr><w:type w:val>`. */
+            b"w:type" => {
+                self.section_type = match attr_val(e, b"w:val").as_deref().map(str::trim) {
+                    Some("continuous") => engine::SectionType::Continuous,
+                    Some("evenPage") => engine::SectionType::EvenPage,
+                    Some("oddPage") => engine::SectionType::OddPage,
+                    _ => engine::SectionType::NextPage,
                 };
             }
             _ => {}
@@ -776,9 +802,15 @@ pub fn parse_document_xml(
                             `parts::table::parse_table_bytes`. Source bytes
                             still ride the passthrough so the writer is
                             byte-stable for unedited tables. */
+                            /* Audit gap A.M18 — thread the resolver into
+                            cell parsing so cell paragraphs pick up the
+                            doc-defaults + pStyle cascade. Without this,
+                            cells silently drop list bindings + paragraph
+                            styles, breaking visual fidelity on numbered
+                            tables. */
                             let (grid, props, rows) = source_xml
                                 .as_deref()
-                                .map(|b| parse_table_bytes(b).unwrap_or_default())
+                                .map(|b| parse_table_bytes(b, resolver).unwrap_or_default())
                                 .unwrap_or_default();
                             out_blocks.push(Block::Table(Table {
                                 grid,
@@ -890,6 +922,8 @@ pub fn parse_document_xml(
                                 let footer_refs = taken.footer_refs.clone();
                                 let title_pg = taken.title_pg;
                                 let columns = taken.columns.unwrap_or_default();
+                                let page_num = taken.page_num.unwrap_or_default();
+                                let section_type = taken.section_type;
                                 out_sections.push(Section {
                                     geometry: taken.into_geometry(),
                                     start_block: sect_start_block,
@@ -898,6 +932,8 @@ pub fn parse_document_xml(
                                     footer_refs,
                                     title_pg,
                                     columns,
+                                    page_num,
+                                    section_type,
                                 });
                                 sect_start_block = end;
                             }
@@ -954,13 +990,20 @@ pub fn parse_document_xml(
                         /* Compose `ListItem` from the per-paragraph numPr
                         accumulators; partial refs (numId without ilvl, or
                         vice versa) default the missing field to 0 — Word
-                        treats absent `<w:ilvl>` as level 0. */
+                        treats absent `<w:ilvl>` as level 0.
+
+                        Audit gap A.M17 — when the paragraph has no
+                        direct `<w:pPr><w:numPr>` but its resolved style
+                        cascade (`props.list_item`) carries one, inherit
+                        the binding. Direct numPr still wins (highest
+                        specificity). The cascade was folded by
+                        `resolve_paragraph` above. */
                         let list_item = match (list_num_id.take(), list_ilvl.take()) {
                             (Some(num_id), ilvl) => Some(ListItem {
                                 num_id,
                                 ilvl: ilvl.unwrap_or(0),
                             }),
-                            (None, _) => None,
+                            (None, _) => props.list_item,
                         };
                         out_blocks.push(Block::Paragraph(Paragraph {
                             text: std::mem::take(&mut para_text),
@@ -988,6 +1031,8 @@ pub fn parse_document_xml(
                                 let footer_refs = sect.footer_refs.clone();
                                 let title_pg = sect.title_pg;
                                 let columns = sect.columns.unwrap_or_default();
+                                let page_num = sect.page_num.unwrap_or_default();
+                                let section_type = sect.section_type;
                                 out_sections.push(Section {
                                     geometry: sect.into_geometry(),
                                     start_block: sect_start_block,
@@ -996,6 +1041,8 @@ pub fn parse_document_xml(
                                     footer_refs,
                                     title_pg,
                                     columns,
+                                    page_num,
+                                    section_type,
                                 });
                                 sect_start_block = end;
                             }
@@ -1028,6 +1075,8 @@ pub fn parse_document_xml(
             footer_refs: HeaderFooterRefs::default(),
             title_pg: false,
             columns: engine::ColumnSpec::single(),
+            page_num: engine::PageNumType::default(),
+            section_type: engine::SectionType::default(),
         });
     }
 

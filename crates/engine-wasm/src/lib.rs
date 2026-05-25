@@ -3909,13 +3909,22 @@ impl Engine {
                 }
         };
 
-        'outer: for section in &sections {
+        'outer: for (sect_idx, section) in sections.iter().enumerate() {
             let geom = scaled_paginator_geometry(section.geometry, scale);
-            /* Flush the prior paginator (if any) before swapping geometry. */
-            if let Some(p) = paginator.take() {
+            /* Audit gap A.M12 — `Continuous` section break swaps
+            geometry / columns / page-numbering in place on the SAME
+            paginator without flushing the page. The new section's
+            first block flows directly below the previous section.
+            First-section is always non-continuous (there's no prior
+            page to continue from). */
+            let is_continuous = sect_idx > 0
+                && matches!(section.section_type, engine::SectionType::Continuous)
+                && paginator.is_some();
+            if !is_continuous && let Some(p) = paginator.take() {
+                /* NextPage / EvenPage / OddPage section break — finish
+                the prior paginator (which flushes the in-progress
+                page if any), then build a fresh one below. */
                 let mut pages = p.finish();
-                /* `paginator` was started fresh — `page_paths` carries the
-                same number of entries. Move them en bloc. */
                 let consume = pages.len();
                 emitted_pages.append(&mut pages);
                 let mut paths_taken: Vec<Vec<EngineBlockPath>> = std::mem::take(&mut page_paths);
@@ -3925,10 +3934,6 @@ impl Engine {
             /* Phase 6b — resolve header / footer text the parser stashed
             on `doc.headers` / `doc.footers` (keyed by `r:id`) into laid-
             out paragraphs the renderer paints into the margin bands. */
-            /* Phase 2 audit — sections now carry a per-role
-            `HeaderFooterRefs` instead of a single `Option<String>`. Lay
-            out every populated slot into a `layout::HeaderBands` so the
-            paginator can pick by page parity / first-page / default. */
             let content_w = geom.width - geom.margins.left - geom.margins.right;
             let lay_band = |slot: Option<&String>,
                             table: &std::collections::HashMap<String, Vec<engine::Paragraph>>|
@@ -3946,25 +3951,50 @@ impl Engine {
                 first: lay_band(section.footer_refs.first.as_ref(), &doc.footers),
                 even: lay_band(section.footer_refs.even.as_ref(), &doc.footers),
             };
-            let mut pag = Paginator::new(
-                geom,
-                headers,
-                footers,
-                section.title_pg,
-                doc.settings.even_and_odd_headers,
-            )
-            .with_footnote_bodies(footnote_bodies.clone());
-            /* Audit gap A.H2 — install the section's `<w:cols>`
-            descriptor before any block enters the paginator. Gutter
-            converts pt → scaled layout-px to live in the same space as
-            the geometry's margins (already scaled by
-            `scaled_paginator_geometry`). */
-            if section.columns.is_multi() {
-                pag.set_columns(section.columns.count, section.columns.gutter_pt * scale);
+            if is_continuous {
+                /* Audit gap A.M12 — in-place section swap. Keep the
+                existing paginator's `cur_y` / `cur_blocks` so the new
+                section's content begins immediately below the prior
+                content on the same page. Headers / footers / title-pg
+                flag belong to the NEW section but only matter on the
+                page that flushes — the current page's header / footer
+                stays whatever the prior section had. */
+                let pag = paginator
+                    .as_mut()
+                    .expect("continuous: paginator must exist");
+                pag.set_section_cursor(geom);
+                /* Re-install the new section's column descriptor.
+                `set_columns` already resets `cur_column_index = 0`
+                which is the right answer for a continuous swap —
+                the new column layout starts fresh below the prior
+                content. `cur_y` is preserved by `set_columns`. */
+                pag.set_columns(
+                    section.columns.count.max(1),
+                    section.columns.gutter_pt * scale,
+                );
+                let doc_offset = emitted_pages.len() as u32;
+                pag.set_page_numbering(section.page_num, doc_offset);
+            } else {
+                let mut pag = Paginator::new(
+                    geom,
+                    headers,
+                    footers,
+                    section.title_pg,
+                    doc.settings.even_and_odd_headers,
+                )
+                .with_footnote_bodies(footnote_bodies.clone());
+                if section.columns.is_multi() {
+                    pag.set_columns(section.columns.count, section.columns.gutter_pt * scale);
+                }
+                /* Audit gap A.M11 — install pgNumType + doc-offset so
+                PAGE fields in this section render as section-relative
+                / formatted numbers. */
+                let doc_offset = emitted_pages.len() as u32;
+                pag.set_page_numbering(section.page_num, doc_offset);
+                paginator = Some(pag);
+                page_paths.clear();
+                page_paths.push(Vec::new());
             }
-            paginator = Some(pag);
-            page_paths.clear();
-            page_paths.push(Vec::new());
 
             for block_idx in section.start_block..section.end_block {
                 /* Audit gap C.H1 — viewport-cull stop. Check at the
