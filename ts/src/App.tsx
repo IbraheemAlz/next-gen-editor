@@ -10,8 +10,6 @@ import { ExtraPageCanvas } from './components/ExtraPageCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
 import { PageSelectionOverlay } from './components/PageSelectionOverlay';
 import { HiddenInput } from './components/HiddenInput';
-import { Toolbar } from './components/Toolbar';
-import { TablePanel } from './components/TablePanel';
 import { SdkShelf } from './sdk-bridge';
 import { AccessibilityTree } from './components/AccessibilityTree';
 import { Announcements } from './components/Announcements';
@@ -26,7 +24,6 @@ import LIBERATION_URL from '../fonts/LiberationSans-Regular.ttf?url';
 import NOTO_URL from '../fonts/NotoNaskhArabic-Regular.ttf?url';
 import './styles/editor.css';
 import './styles/caret.css';
-import './styles/toolbar.css';
 import './styles/a11y.css';
 
 /* Amiri is a dual-script Naskh face — renders mixed Arabic/English from a
@@ -165,11 +162,10 @@ export function App() {
 
     return (
         <div class="editor-shell">
-            <Toolbar client={client} store={store} />
-            {/* Sprint 1+ (UI Edition) shelf — `@nge/ui` components
-                wired through `@nge/core`. Renders below the legacy
-                `Toolbar` until the legacy toolbar is decommissioned
-                (see `sdk-bridge.tsx` doc header). */}
+            {/* SDK shelf — every UI surface ships through `@nge/ui`
+                wired through `@nge/core`. The legacy Phase-4
+                `Toolbar` + `TablePanel` were retired in the post-
+                `v0.6.0-beta.2` purge (1109 LOC removed). */}
             <SdkShelf client={client} />
             <div class="editor-body">
                 <div class="editor-viewport">
@@ -205,7 +201,6 @@ export function App() {
                         </For>
                     </div>
                 </div>
-                <TablePanel client={client} store={store} />
             </div>
             <AccessibilityTree client={client} />
             <Announcements store={store} />
