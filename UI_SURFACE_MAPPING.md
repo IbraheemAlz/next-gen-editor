@@ -237,7 +237,7 @@
 | **Comments snapshot** (read-only) | `Engine::comments_snapshot()` → `Vec<Comment>` (`lib.rs:478`) | Comments rail on right with anchored callouts | 🛑 Blocked — engine exposes full list; **zero UI** — high-value gap |
 | **Insert comment** | No engine command yet | Right-click selection → "New comment" + toolbar Review → Comment | 🛑 Blocked — needs bridge addition |
 | **Reply to comment** | No command | Reply field on each comment thread | 🛑 Blocked |
-| **Resolve / delete comment** | No command | Per-comment ⋯ menu | 🛑 Blocked |
+| **Resolve / delete comment** | `Command::ResolveComment` / `Command::DeleteComment` | `CommentsRail.tsx` per-comment row | ✅ Wired (Sprint 9) — `resolved` round-trips through `word/commentsExtended.xml` (`#15` closed) |
 | **Comment-anchor highlight in body** | Engine has range info | Coloured underline at comment range | 🛑 Blocked |
 
 ---
@@ -261,8 +261,8 @@
 | **Open `.docx` (file picker)** | `Command::OpenDocument { bytes, format: Docx }` | Toolbar File → Open button | 🛑 Blocked — only drag-and-drop entrypoint exists (`input/dnd.ts:10`) |
 | **Open `.docx` (drag-and-drop)** | Same | `input/dnd.ts:10` | ✅ Wired |
 | **Save `.docx`** | `Command::SaveDocument { format: Docx }` / legacy `Command::SaveDocx` | Toolbar File → Save + `Ctrl/Cmd+S` shortcut | ⚠️ Partial — toolbar wired (`Toolbar.tsx:90`); **no keyboard shortcut** |
-| **Export plain text** | `DocFormat::PlainText` (`common.rs:156`) | Toolbar File → Export → Text | 🛑 Blocked — enum variant unused by UI |
-| **Export HTML** | `DocFormat::Html` | Toolbar File → Export → HTML | 🛑 Blocked |
+| **Export plain text** | `DocFormat::PlainText` (`common.rs:156`) | Toolbar File → Export → Plain Text | ✅ Wired (Sprint 9) — `engine::DocumentTree::to_plain_text` (`#9` closed) |
+| **Export HTML** | `DocFormat::Html` | Toolbar File → Export → HTML | ✅ Wired (Sprint 9) — `crates/format-html::to_html` (`#9` closed) |
 | **Export PDF (`PdfProfile::A1b`)** | `Command::ExportPdf { conformance }` | Toolbar Export PDF button | ✅ Wired (`Toolbar.tsx:70`) — only `A1b` selected; user can't choose conformance |
 | **Export PDF (`A2u`, `X3`)** | `PdfConformance` enum supports both (`command.rs:425`) | Export dialog with conformance dropdown | 🛑 Blocked — enum values unused |
 | **Close document** | `Command::CloseDocument` | Toolbar File → Close + `Ctrl/Cmd+W` | 🛑 Blocked — no UI; one-doc-per-tab assumed |
@@ -398,3 +398,12 @@ Bridge **events** without UI handlers:
 - **UI dispatchers (current):** `Toolbar.tsx`, `HiddenInput.tsx`, `TablePanel.tsx`, `input/{pointer,clipboard,dnd}.ts`, `engine/{engine-client,engine.worker}.ts`, `App.tsx`.
 
 **Coverage summary:** **48 / 57** bridge commands have at least one UI dispatch site; **9** are fully blocked. **8 / 25** events have no UI consumer at all. Two read-only engine snapshots (`revisions_snapshot`, `comments_snapshot`) representing significant `.docx` semantic content have **zero** UI rendering. These gaps are the primary obstacle to systematic manual QA against the current engine.
+
+**Sprint 9 (closed `#9`, `#15`).** Three rows flipped 🛑 Blocked → ✅ Wired:
+section 13 *Resolve / delete comment* (`Command::ResolveComment` /
+`Command::DeleteComment` now round-trip `resolved` through
+`word/commentsExtended.xml`), section 15 *Export plain text*
+(`engine::DocumentTree::to_plain_text`), and section 15 *Export HTML*
+(new `crates/format-html`). Engine-minted comment paraId synthesis +
+OPC plumbing for fresh-document commentsExtended.xml remain open as
+`#18` (tech-debt).
