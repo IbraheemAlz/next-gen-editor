@@ -60,3 +60,6 @@ export { SettingsMenu } from './SettingsMenu';
 
 export { TrapOverlay } from './TrapOverlay';
 export type { TrapOverlayProps } from './TrapOverlay';
+
+export { Ruler } from './Ruler';
+export type { RulerProps } from './Ruler';

@@ -48,6 +48,8 @@ export type {
     AnnouncementPriority,
     BridgeSectionGeometry,
     BridgeCellProperties,
+    BridgeTabStop,
+    BridgeTabKind,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 import type {

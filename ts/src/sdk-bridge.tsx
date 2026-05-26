@@ -37,6 +37,7 @@ import {
     ReviewControls,
     StatusBar,
     TrapOverlay,
+    Ruler,
 } from '@nge/ui';
 import type { EngineClient } from './engine/engine-client';
 
@@ -75,6 +76,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                     <LayoutControls />
                     <ReviewControls />
                 </div>
+                <Ruler />
                 <div class="nge-sprint1-shelf__rails">
                     <TrackChangesSidebar />
                     <CommentsRail />

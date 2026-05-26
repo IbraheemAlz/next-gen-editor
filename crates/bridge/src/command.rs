@@ -493,6 +493,16 @@ pub enum Command {
     DeleteComment {
         id: u32,
     },
+    /// Sprint 11 (#13) — replace `<w:pPr><w:tabs>` on every paragraph
+    /// the range spans. Empty `stops` clears the paragraph's custom
+    /// tab grid (falls back to the default 0.5-inch grid). The Ruler
+    /// dispatches this ONCE on `pointerup` after a drag — never
+    /// continuously on `pointermove` — so one user action produces
+    /// exactly one undo entry.
+    SetTabStops {
+        range: LogicalRange,
+        stops: Vec<BridgeTabStop>,
+    },
     /// Sprint 7 (UI Edition) — toggle the in-memory `resolved` flag
     /// on a comment. NOT yet round-tripped to `commentsExtended.xml`
     /// — see project backlog.
@@ -546,6 +556,30 @@ pub enum PageOrientation {
     #[default]
     Portrait,
     Landscape,
+}
+
+/// Sprint 11 (#13) — wire shape for one `<w:pPr><w:tabs><w:tab>`
+/// entry. `position_pt` is layout pt (1/72 in) at scale=1 — the
+/// engine model unit. Kind mirrors `engine::TabKind`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq)]
+pub struct BridgeTabStop {
+    pub position_pt: f32,
+    pub kind: BridgeTabKind,
+}
+
+/// Sprint 11 (#13) — wire shape for `engine::TabKind`. `Decimal` is
+/// round-tripped but renders as `Left` today (proper measure-then-
+/// place pass deferred — see BACKLOG / out-of-scope §11).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BridgeTabKind {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Decimal,
+    /// `<w:clear>` — explicit "no tab at this position", used to
+    /// defeat an inherited tab stop from the style cascade.
+    Clear,
 }
 
 /// Sprint 2 (UI Edition) hotfix — anchor side for `InsertRow` /

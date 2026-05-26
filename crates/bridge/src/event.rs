@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
-use crate::command::{BridgeCellBorders, PageOrientation};
+use crate::command::{BridgeCellBorders, BridgeTabStop, PageOrientation};
 use crate::common::{
     Alignment, Color, Direction, DocFormat, LogicalPos, LogicalRange, Rect, Script, SelectionKind,
     TextAttrs,
@@ -171,6 +171,11 @@ pub enum Event {
         /// cell when the caret is inside a table. `None` outside any
         /// table — `CellPropertiesDialog` falls back to engine defaults.
         cell_properties: Option<BridgeCellProperties>,
+        /// Sprint 11 (#13) — `<w:pPr><w:tabs>` custom tab stops of the
+        /// paragraph under the caret. Empty when the paragraph
+        /// inherits the default 0.5-inch grid. Drives the Ruler's
+        /// tab-stop markers + their drag-edit handles.
+        tab_stops: Vec<BridgeTabStop>,
     },
 
     /* IME */

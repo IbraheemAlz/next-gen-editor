@@ -64,4 +64,9 @@ export type {
     EngineCapabilities,
     A11yTree,
     A11yPatch,
+    AnnouncementPriority,
+    BridgeSectionGeometry,
+    BridgeCellProperties,
+    BridgeTabStop,
+    BridgeTabKind,
 } from './types';

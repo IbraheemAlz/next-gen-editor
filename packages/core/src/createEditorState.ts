@@ -22,6 +22,7 @@ import type {
     AttrsMixed,
     BridgeCellProperties,
     BridgeSectionGeometry,
+    BridgeTabStop,
     Direction,
     EngineStats,
     Event,
@@ -75,6 +76,12 @@ export interface EditorState {
      * `CellPropertiesDialog` then falls back to engine defaults.
      */
     cellProperties: Accessor<BridgeCellProperties | undefined>;
+    /**
+     * Sprint 11 (#13) — custom tab stops of the paragraph under the
+     * caret. Empty array when the paragraph inherits the default
+     * 0.5-inch grid. Drives the Ruler's tab-stop markers.
+     */
+    tabStops: Accessor<BridgeTabStop[]>;
 }
 
 export function createEditorState(): EditorState {
@@ -99,6 +106,7 @@ export function createEditorState(): EditorState {
         createSignal<BridgeSectionGeometry | undefined>(undefined);
     const [cellProperties, setCellProperties] =
         createSignal<BridgeCellProperties | undefined>(undefined);
+    const [tabStops, setTabStops] = createSignal<BridgeTabStop[]>([]);
 
     const unsubscribe = engine.subscribe((evt: Event) => {
         switch (evt.type) {
@@ -115,6 +123,7 @@ export function createEditorState(): EditorState {
                 setCanRedo(evt.can_redo);
                 setSectionGeometry(evt.section_geometry);
                 setCellProperties(evt.cell_properties);
+                setTabStops(evt.tab_stops);
                 break;
             }
             case 'UNDO_STATE_CHANGED': {
@@ -164,5 +173,6 @@ export function createEditorState(): EditorState {
         renderer,
         sectionGeometry,
         cellProperties,
+        tabStops,
     };
 }

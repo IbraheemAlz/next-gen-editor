@@ -1951,15 +1951,21 @@ impl DocumentTree {
         n
     }
 
-    /// Sprint 8 (UI Edition) — total word count via whitespace
-    /// splitting. Cheap; matches Word's count closely for Latin
-    /// scripts. Arabic / CJK word boundaries deserve UAX-#29
-    /// segmentation (the engine already ships a `LineSegmenter`)
-    /// — `word_count_uax` is the future-proof slot for that.
+    /// Sprint 11 (#17) — total word count via UAX-#29 word
+    /// segmentation. Replaces the Sprint 8 whitespace-split
+    /// fallback so CJK / Thai / Khmer (scripts without inter-word
+    /// whitespace) report a meaningful count.
+    ///
+    /// `icu_segmenter::WordSegmenter::new_auto` shares its data
+    /// tables with `text-pipeline`'s `LineSegmenter::new_auto`, so
+    /// the wasm artifact does not grow beyond the icu data already
+    /// linked for line breaking. We filter `WordType::Word` so
+    /// punctuation and inter-word whitespace runs don't count as
+    /// words.
     pub fn word_count(&self) -> u32 {
         let mut n = 0u32;
         walk_paragraphs(&self.blocks, &mut |p| {
-            n = n.saturating_add(p.text.split_whitespace().count() as u32);
+            n = n.saturating_add(count_uax_words(&p.text) as u32);
         });
         n
     }
@@ -2514,6 +2520,47 @@ impl DocumentTree {
                 first_line_twips,
                 hanging_twips,
             };
+        };
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 11 (#13) — replace `<w:pPr><w:tabs>` on every paragraph
+    /// the range spans with `stops`. Empty `stops` clears the
+    /// paragraph's custom tab grid (it falls back to the default
+    /// 0.5-inch grid the line builder ships). One commit per call,
+    /// so the Ruler's drag-end dispatch produces exactly one undo
+    /// entry per tab-stop edit (matches Word's "release commits"
+    /// behaviour).
+    pub fn set_tab_stops(&self, start: LogicalPos, end: LogicalPos, stops: Vec<TabStop>) -> Self {
+        let (start, end) = order_positions(start, end);
+        let mut blocks = self.blocks.clone();
+        let apply = |para: &mut Paragraph| {
+            para.props.tab_stops = stops.clone();
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -3846,6 +3893,25 @@ fn flatten_blocks_plain(blocks: &[Block]) -> String {
     s
 }
 
+/// Sprint 11 — UAX-#29 word count for one paragraph's text. Shares
+/// the `WordSegmenter::new_auto` thread-local with the line-break
+/// path so the icu data tables compile in exactly once; subsequent
+/// calls are pure boundary walks.
+fn count_uax_words(text: &str) -> usize {
+    use icu_segmenter::options::WordBreakInvariantOptions;
+    use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed};
+    thread_local! {
+        static SEGMENTER: WordSegmenterBorrowed<'static> =
+            WordSegmenter::new_auto(WordBreakInvariantOptions::default());
+    }
+    SEGMENTER.with(|seg| {
+        seg.segment_str(text)
+            .iter_with_word_type()
+            .filter(|(_, ty)| ty.is_word_like())
+            .count()
+    })
+}
+
 /// Word-style default cell-edge stroke — single 0.5 pt black.
 pub fn default_word_stroke() -> BorderStroke {
     BorderStroke {
@@ -4436,6 +4502,37 @@ mod tests {
         assert_eq!(d.to_plain_text(), "a\tb\nc\td");
     }
 
+    /* ---- Sprint 11 (#17): UAX-#29 word_count ---------------------- */
+
+    #[test]
+    fn word_count_latin_matches_word_like_split() {
+        let d = DocumentTree::from_text("Hello, brave new world!");
+        assert_eq!(d.word_count(), 4);
+    }
+
+    #[test]
+    fn word_count_cjk_segments_chars() {
+        /* Mandarin "我喜欢编程" (I like programming) — 5 Han chars.
+        Whitespace-split would return 1; UAX-#29 with dictionary
+        segmentation returns a CJK-meaningful count > 1. The exact
+        count varies with the segmenter's dictionary; assert > 1 so
+        the test survives dictionary updates without sacrificing
+        regression coverage for "CJK reports a meaningful value". */
+        let d = DocumentTree::from_text("我喜欢编程");
+        assert!(
+            d.word_count() > 1,
+            "CJK word_count should segment, got {}",
+            d.word_count()
+        );
+    }
+
+    #[test]
+    fn word_count_punctuation_excluded() {
+        /* Five word-like tokens; commas + period must NOT count. */
+        let d = DocumentTree::from_text("one, two, three, four, five.");
+        assert_eq!(d.word_count(), 5);
+    }
+
     /* ---- Sprint 10: section + cell read-back helpers --------------- */
 
     #[test]
@@ -4505,9 +4602,7 @@ mod tests {
                 PathStep::Block(0),
             ],
         };
-        let props = d
-            .innermost_cell_props_at(&path)
-            .expect("cell resolved");
+        let props = d.innermost_cell_props_at(&path).expect("cell resolved");
         assert_eq!(props.shading, Some([0xff, 0, 0, 0xff]));
     }
 

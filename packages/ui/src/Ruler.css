@@ -1,0 +1,176 @@
+/* Sprint 11 (#13) — horizontal page ruler.
+ *
+ * Strictly scoped under `.nge-ruler`. No external UI libraries; no
+ * Tailwind. Theme tokens (`--nge-color-*`, `--nge-space-*`) come from
+ * `@nge/ui/theme.css`.
+ */
+
+.nge-ruler {
+    position: relative;
+    height: 24px;
+    background: var(--nge-color-bg, #fff);
+    border-bottom: 1px solid var(--nge-color-border, #ddd);
+    overflow-x: auto;
+    overflow-y: visible;
+    user-select: none;
+    font-family: var(--nge-font-system, system-ui, sans-serif);
+    font-size: 10px;
+    color: var(--nge-color-text-muted, #666);
+}
+
+.nge-ruler__strip {
+    position: relative;
+    height: 100%;
+    touch-action: none;
+    cursor: crosshair;
+}
+
+/* Greyed-out margin bands at the leading + trailing edges of the
+ * paper. Cosmetic; clicks here are intercepted by the strip's
+ * pointer-down handler but never produce a tab-add (content-pt
+ * negative). */
+.nge-ruler__margin {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: var(--nge-color-surface-muted, rgba(0, 0, 0, 0.05));
+    pointer-events: none;
+}
+
+.nge-ruler__tick {
+    position: absolute;
+    top: 50%;
+    width: 1px;
+    height: 4px;
+    background: var(--nge-color-text-muted, #999);
+    transform: translateX(-0.5px);
+    pointer-events: none;
+}
+
+.nge-ruler__tick[data-major='true'] {
+    height: 10px;
+    top: calc(50% - 5px);
+    background: var(--nge-color-text, #333);
+}
+
+.nge-ruler__tick-label {
+    position: absolute;
+    top: -14px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 9px;
+    color: var(--nge-color-text-muted, #666);
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+/* Indent handles — small triangular glyphs anchored to the leading
+ * edge of the content area. Two stack vertically: ▽ on top (first-
+ * line indent), △ on bottom (left indent). */
+.nge-ruler__handle {
+    position: absolute;
+    width: 14px;
+    height: 12px;
+    margin-left: -7px;
+    text-align: center;
+    line-height: 12px;
+    font-size: 12px;
+    color: var(--nge-color-primary, #2563eb);
+    cursor: ew-resize;
+    z-index: 2;
+    touch-action: none;
+    background: transparent;
+    border: 0;
+    padding: 0;
+}
+
+.nge-ruler__handle--first-line {
+    top: 0;
+}
+
+.nge-ruler__handle--left-indent {
+    bottom: 0;
+}
+
+.nge-ruler__handle:focus-visible {
+    outline: 2px solid var(--nge-color-primary, #2563eb);
+    outline-offset: 1px;
+    border-radius: 2px;
+}
+
+/* Tab-stop markers — clickable badges sitting on the strip mid-line.
+ * `data-kind` flips the colour so a user can tell L/C/R/D apart at a
+ * glance. */
+.nge-ruler__tab {
+    position: absolute;
+    top: calc(50% - 7px);
+    width: 14px;
+    height: 14px;
+    margin-left: -7px;
+    border: 1px solid var(--nge-color-border, #ccc);
+    background: var(--nge-color-surface, #fff);
+    color: var(--nge-color-text, #333);
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 12px;
+    text-align: center;
+    border-radius: 2px;
+    cursor: grab;
+    padding: 0;
+    z-index: 3;
+    touch-action: none;
+}
+
+.nge-ruler__tab:active {
+    cursor: grabbing;
+}
+
+.nge-ruler__tab[data-kind='Center'] {
+    border-color: var(--nge-color-warning, #d97706);
+}
+
+.nge-ruler__tab[data-kind='Right'] {
+    border-color: var(--nge-color-success, #059669);
+}
+
+.nge-ruler__tab[data-kind='Decimal'] {
+    border-color: var(--nge-color-primary, #2563eb);
+}
+
+/* Local-only preview marker the user sees while dragging a new tab
+ * stop into existence. Never tied to engine state. */
+.nge-ruler__ghost {
+    position: absolute;
+    top: calc(50% - 7px);
+    width: 14px;
+    height: 14px;
+    margin-left: -7px;
+    background: var(--nge-color-primary, #2563eb);
+    color: var(--nge-color-on-primary, #fff);
+    font-size: 9px;
+    font-weight: 700;
+    text-align: center;
+    line-height: 14px;
+    border-radius: 2px;
+    pointer-events: none;
+    opacity: 0.8;
+    z-index: 4;
+}
+
+/* RTL: visually flip the leading-edge band labelling. The actual
+ * positioning is computed in TSX so this rule is cosmetic only. */
+.nge-ruler[data-rtl='true'] .nge-ruler__tick-label {
+    direction: rtl;
+}
+
+.nge-ruler__unit-badge {
+    position: absolute;
+    top: 2px;
+    right: 4px;
+    font-size: 9px;
+    color: var(--nge-color-text-muted, #999);
+    background: var(--nge-color-surface, #fff);
+    padding: 0 4px;
+    border-radius: 2px;
+    pointer-events: none;
+}

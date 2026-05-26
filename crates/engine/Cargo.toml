@@ -9,3 +9,8 @@ description = "Pure-Rust document model + undo/redo facade."
 [dependencies]
 im = { workspace = true }
 unicode-segmentation = { workspace = true }
+# Sprint 11 (#17) — UAX-#29 word segmentation for `word_count`.
+# `WordSegmenter::new_auto` is the same constructor `text-pipeline` already
+# uses for `LineSegmenter`, so the compiled-in data tables are shared
+# (no incremental wasm bloat beyond the workspace's existing icu surface).
+icu_segmenter = { workspace = true }

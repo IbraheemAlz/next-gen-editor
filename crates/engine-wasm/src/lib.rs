@@ -3571,6 +3571,7 @@ impl Engine {
                 end_pt,
                 first_line_pt,
             } => self.do_set_paragraph_indent(range, start_pt, end_pt, first_line_pt),
+            Command::SetTabStops { range, stops } => self.do_set_tab_stops(range, stops),
             Command::SetLineSpacing { range, multiplier } => {
                 self.do_set_line_spacing(range, multiplier)
             }
@@ -5280,7 +5281,33 @@ impl Engine {
             paragraph_direction: self.paragraph_direction_over(&start, &end),
             section_geometry: self.section_geometry_for_caret(&sel.caret.path),
             cell_properties: self.cell_properties_for_caret(&sel.caret.path),
+            tab_stops: self.tab_stops_for_caret(&sel.caret.path),
         }
+    }
+
+    /// Sprint 11 (#13) — extract the paragraph-under-caret's
+    /// `<w:tabs>` stops as a wire-shaped `Vec<BridgeTabStop>`. Empty
+    /// when the caret is not inside a paragraph or when the paragraph
+    /// has no custom tabs (Ruler renders the default grid).
+    fn tab_stops_for_caret(&self, path: &BridgeBlockPath) -> Vec<bridge::BridgeTabStop> {
+        let engine_path = bridge_path_to_engine(path);
+        let Some(para) = self.undo.current().paragraph_at_path(&engine_path) else {
+            return Vec::new();
+        };
+        para.props
+            .tab_stops
+            .iter()
+            .map(|s| bridge::BridgeTabStop {
+                position_pt: s.position_pt,
+                kind: match s.kind {
+                    engine::TabKind::Left => bridge::BridgeTabKind::Left,
+                    engine::TabKind::Center => bridge::BridgeTabKind::Center,
+                    engine::TabKind::Right => bridge::BridgeTabKind::Right,
+                    engine::TabKind::Decimal => bridge::BridgeTabKind::Decimal,
+                    engine::TabKind::Clear => bridge::BridgeTabKind::Clear,
+                },
+            })
+            .collect()
     }
 
     /// Sprint 10 — resolve the section that covers the caret's
@@ -6216,6 +6243,43 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
+        self.selection_changed()
+    }
+
+    /// Sprint 11 (#13) — `Command::SetTabStops`. The Ruler dispatches
+    /// once on drag-release; the entire stops vector replaces the
+    /// paragraph's `<w:pPr><w:tabs>` so one drag = one undo entry.
+    fn do_set_tab_stops(
+        &mut self,
+        range: BridgeLogicalRange,
+        stops: Vec<bridge::BridgeTabStop>,
+    ) -> Event {
+        let (start, end) = ordered(range.start, range.end);
+        let engine_stops: Vec<engine::TabStop> = stops
+            .into_iter()
+            .map(|s| engine::TabStop {
+                position_pt: s.position_pt,
+                kind: match s.kind {
+                    bridge::BridgeTabKind::Left => engine::TabKind::Left,
+                    bridge::BridgeTabKind::Center => engine::TabKind::Center,
+                    bridge::BridgeTabKind::Right => engine::TabKind::Right,
+                    bridge::BridgeTabKind::Decimal => engine::TabKind::Decimal,
+                    bridge::BridgeTabKind::Clear => engine::TabKind::Clear,
+                },
+            })
+            .collect();
+        let new_doc = self.undo.current().set_tab_stops(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            engine_stops,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(AnnouncementPriority::Polite, "Tab stops updated");
         self.selection_changed()
     }
 

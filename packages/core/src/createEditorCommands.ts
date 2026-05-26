@@ -37,6 +37,7 @@ import type {
     BlockPath,
     Color,
     BridgeCellBorders,
+    BridgeTabStop,
     InsertSide,
     PageOrientation,
     ListKind,
@@ -190,6 +191,13 @@ export interface EditorCommands {
     decreaseIndent(stepPt?: number, range?: LogicalRange): Promise<Event>;
     setLineSpacing(multiplier: number, range?: LogicalRange): Promise<Event>;
     setParagraphShading(color: Color | undefined, range?: LogicalRange): Promise<Event>;
+    /**
+     * Sprint 11 (#13) — replace `<w:pPr><w:tabs>` on every paragraph
+     * the range spans. Dispatch ONCE on `pointerup` after a Ruler
+     * drag — never on `pointermove` — so one user gesture produces
+     * exactly one undo entry.
+     */
+    setTabStops(stops: BridgeTabStop[], range?: LogicalRange): Promise<Event>;
 
     /* Review (Sprint 7 UI Edition). `toggleTrackChanges` dispatches
      * but the engine returns `Event::Error` until recording ships. */
@@ -470,6 +478,12 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 type: 'SET_PARAGRAPH_SHADING',
                 range: currentRange(range),
                 color,
+            }),
+        setTabStops: (stops, range) =>
+            dispatch({
+                type: 'SET_TAB_STOPS',
+                range: currentRange(range),
+                stops,
             }),
 
         toggleTrackChanges: (enabled) =>
