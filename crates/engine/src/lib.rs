@@ -865,16 +865,22 @@ impl Field {
 pub enum RevisionKind {
     Insert,
     Delete,
+    /// Sprint 14 (#14) — `<w:rPrChange>` tracked formatting change.
+    /// The original `SpanStyle` (pre-mutation) lives on
+    /// [`Revision::prev_attrs`] so accept/reject can restore it.
+    /// Payload-free here to keep `RevisionKind: Copy`, which a dozen
+    /// existing match sites rely on.
+    FormatChange,
 }
 
-/// Phase 8b — one `<w:ins>` / `<w:del>` overlay on a paragraph's byte
-/// range. `author` + `date` carry the OOXML `w:author` / `w:date`
-/// attributes so the TS shell can surface them on hover. `id` carries
-/// the `w:id` attribute Word's accept/reject UI uses to address an
-/// individual change; `None` for revisions the engine synthesised
-/// (writer assigns a fresh sequential id at emission time) or for
-/// source files that omit the attribute.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Phase 8b — one `<w:ins>` / `<w:del>` / `<w:rPrChange>` overlay on a
+/// paragraph's byte range. `author` + `date` carry the OOXML
+/// `w:author` / `w:date` attributes so the TS shell can surface them
+/// on hover. `id` carries the `w:id` attribute Word's accept/reject
+/// UI uses to address an individual change; `None` for revisions the
+/// engine synthesised (writer assigns a fresh sequential id at
+/// emission time) or for source files that omit the attribute.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Revision {
     pub start: u32,
     pub end: u32,
@@ -882,6 +888,11 @@ pub struct Revision {
     pub author: String,
     pub date: String,
     pub id: Option<u32>,
+    /// Sprint 14 (#14) — pre-mutation `SpanStyle` snapshot for a
+    /// `RevisionKind::FormatChange` so reject can restore the
+    /// original look. `None` for `Insert` / `Delete` revisions where
+    /// the attribute is irrelevant.
+    pub prev_attrs: Option<SpanStyle>,
 }
 
 /// Phase 7 — a media blob stashed for the renderer to decode.
@@ -2131,6 +2142,345 @@ impl DocumentTree {
     /// Insert `text` at `at`. Out-of-range positions are clamped to end of
     /// document. Returns the new tree (the old one is structurally shared via
     /// `im::Vector`).
+    /// Sprint 14 (#14) — track-changes-aware text insertion.
+    ///
+    /// Boundary math:
+    /// - **Inside an existing Insert by same author** → existing
+    ///   Insert grows via the offset shift; NO new revision added
+    ///   (prevents per-keystroke fragmentation).
+    /// - **Inside an existing Delete** → split the Delete around the
+    ///   insertion point and stamp a fresh Insert in the gap (typing
+    ///   inside a `<w:del>` logically replaces deleted text).
+    /// - **Adjacent to an Insert by same author** (cursor at its
+    ///   right edge) → extend the existing Insert end (merge
+    ///   keystrokes).
+    /// - Otherwise → add a fresh `Insert` revision over `[at,
+    ///   at+len)`.
+    pub fn tracked_insert_text(
+        &self,
+        at: LogicalPos,
+        text: &str,
+        author: String,
+        date: String,
+    ) -> Self {
+        if text.is_empty() {
+            return self.clone();
+        }
+        /* Empty doc: fall through to plain insert_text + stamp the
+        Insert revision on paragraph 0. */
+        let mut doc = self.insert_text(at.clone(), text);
+        let len = text.len() as u32;
+        /* Resolve the path the insert actually landed on (insert_text
+        clamps to the document end when the original path is stale). */
+        let target_path = if doc.paragraph_at_path(&at.path).is_some() {
+            at.path
+        } else {
+            doc.path_to_last_top_paragraph()
+                .unwrap_or(BlockPath::top(0))
+        };
+        let mut blocks = doc.blocks.clone();
+        let off_input = at.offset;
+        let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
+            /* `insert_text` clamps `at.offset` to `para.text.len()`
+            BEFORE inserting; mirror that clamp so revision math
+            uses the same byte position the insertion actually
+            landed at. */
+            let pre_text_len = (para.text.len() as u32).saturating_sub(len);
+            let off = off_input.min(pre_text_len);
+
+            /* Detect boundary state BEFORE shifting revisions so the
+            classifier sees the pre-insert geometry. */
+            let inside_insert_same_author = para.revisions.iter().any(|r| {
+                r.kind == RevisionKind::Insert && r.start < off && off < r.end && r.author == author
+            });
+            let inside_delete = para
+                .revisions
+                .iter()
+                .any(|r| r.kind == RevisionKind::Delete && r.start <= off && off < r.end);
+
+            /* Shift trailing revisions by `len`. Mirrors the span-shift
+            in `insert_text`: revisions starting at or after `off`
+            slide right; revisions containing `off` grow (end +=
+            len). Inline `objects` + `hyperlinks` shifts are deferred
+            to a future sprint — Sprint 14 keeps the surface bounded. */
+            for r in &mut para.revisions {
+                if r.start >= off {
+                    r.start += len;
+                }
+                if r.end > off {
+                    r.end += len;
+                }
+            }
+
+            /* If we landed inside a Delete, the shift above grew the
+            Delete to span both halves. Split it back into the two
+            halves around the new Insert. */
+            if inside_delete {
+                let mut split: Vec<Revision> = Vec::with_capacity(para.revisions.len() + 1);
+                for r in para.revisions.drain(..) {
+                    let was_split =
+                        r.kind == RevisionKind::Delete && r.start <= off && off + len < r.end;
+                    if !was_split {
+                        split.push(r);
+                        continue;
+                    }
+                    /* Left half [r.start, off) keeps Delete kind. */
+                    if off > r.start {
+                        split.push(Revision {
+                            start: r.start,
+                            end: off,
+                            kind: RevisionKind::Delete,
+                            author: r.author.clone(),
+                            date: r.date.clone(),
+                            id: None,
+                            prev_attrs: None,
+                        });
+                    }
+                    /* Right half [off + len, r.end) — note r.end was
+                    already shifted by +len above, so it correctly
+                    covers the post-insert remainder. */
+                    if r.end > off + len {
+                        split.push(Revision {
+                            start: off + len,
+                            end: r.end,
+                            kind: RevisionKind::Delete,
+                            author: r.author,
+                            date: r.date,
+                            id: None,
+                            prev_attrs: None,
+                        });
+                    }
+                }
+                para.revisions = split;
+            }
+
+            /* Add (or merge-grow) the new Insert revision unless we're
+            already inside an Insert by the same author (the offset-
+            shift already extended its end). */
+            if !inside_insert_same_author {
+                let new_end = off + len;
+                let merged = para
+                    .revisions
+                    .iter_mut()
+                    .find(|r| r.kind == RevisionKind::Insert && r.end == off && r.author == author);
+                if let Some(left) = merged {
+                    left.end = new_end;
+                    left.date = date.clone();
+                } else {
+                    para.revisions.push(Revision {
+                        start: off,
+                        end: new_end,
+                        kind: RevisionKind::Insert,
+                        author: author.clone(),
+                        date: date.clone(),
+                        id: None,
+                        prev_attrs: None,
+                    });
+                }
+            }
+            para.dirty = true;
+        });
+        doc.blocks = blocks;
+        doc
+    }
+
+    /// Sprint 14 (#14) — track-changes-aware delete.
+    ///
+    /// Boundary math:
+    /// - **Range entirely inside a same-author Insert** → shrink the
+    ///   Insert AND remove the text. Inserts never originated in the
+    ///   source; deleting one's own pending insertion is a no-revision
+    ///   undo of that pending edit.
+    /// - **Range outside any Insert** → preserve the text, mark a
+    ///   fresh `Delete` revision covering the range. Adjacent
+    ///   same-author Delete gets merged.
+    /// - Mixed cases (range straddles Insert + non-Insert) fall back
+    ///   to the marker-only behaviour for v1 (text preserved, Delete
+    ///   stamped over the whole range; the overlapped Insert remains).
+    pub fn tracked_delete_range(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        author: String,
+        date: String,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        if start == end || !same_parent(&start.path, &end.path) {
+            return self.clone();
+        }
+        let Some(s_idx) = start.path.last_block_index() else {
+            return self.clone();
+        };
+        let Some(e_idx) = end.path.last_block_index() else {
+            return self.clone();
+        };
+        if s_idx != e_idx {
+            /* Cross-paragraph tracked-delete falls back to the
+            mark-only flow per-paragraph; v1 limitation. */
+            return self.clone();
+        }
+        let target_path = start.path.clone();
+        let s_off = start.offset;
+        let e_off = end.offset;
+        let mut blocks = self.blocks.clone();
+        let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
+            /* Range entirely inside a same-author Insert? If so, undo
+            the Insert (remove text + shrink the Insert overlay). */
+            let owning_insert = para.revisions.iter().position(|r| {
+                r.kind == RevisionKind::Insert
+                    && r.author == author
+                    && r.start <= s_off
+                    && e_off <= r.end
+            });
+            if let Some(idx) = owning_insert {
+                let s = (s_off as usize).min(para.text.len());
+                let e = (e_off as usize).min(para.text.len());
+                let removed_len = (e - s) as u32;
+                if e > s {
+                    para.text.replace_range(s..e, "");
+                }
+                /* Shrink the owning Insert by removed_len; shift
+                trailing revisions left by removed_len. */
+                let owning = &mut para.revisions[idx];
+                owning.end -= removed_len;
+                let owning_empty = owning.end <= owning.start;
+                /* Now shift everything else after e_off. */
+                for (i, r) in para.revisions.iter_mut().enumerate() {
+                    if i == idx {
+                        continue;
+                    }
+                    if r.start >= e_off {
+                        r.start = r.start.saturating_sub(removed_len);
+                    }
+                    if r.end > e_off {
+                        r.end = r.end.saturating_sub(removed_len);
+                    }
+                }
+                if owning_empty {
+                    para.revisions.remove(idx);
+                }
+                /* Shift spans + their byte-offset relatives. */
+                for s in &mut para.spans {
+                    if s.start >= e_off {
+                        s.start = s.start.saturating_sub(removed_len);
+                    }
+                    if s.end > e_off {
+                        s.end = s.end.saturating_sub(removed_len);
+                    }
+                }
+                para.dirty = true;
+                return;
+            }
+            /* Marker-only delete: stamp a fresh Delete over the range
+            (text preserved). Merge with adjacent same-author Delete. */
+            let new_end = e_off;
+            let merged_left = para
+                .revisions
+                .iter_mut()
+                .find(|r| r.kind == RevisionKind::Delete && r.end == s_off && r.author == author);
+            if let Some(left) = merged_left {
+                left.end = new_end;
+                left.date = date.clone();
+            } else {
+                para.revisions.push(Revision {
+                    start: s_off,
+                    end: new_end,
+                    kind: RevisionKind::Delete,
+                    author: author.clone(),
+                    date: date.clone(),
+                    id: None,
+                    prev_attrs: None,
+                });
+            }
+            para.dirty = true;
+        });
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
+        }
+    }
+
+    /// Sprint 14 (#14) — track-changes-aware format-change stamp.
+    /// Records a `FormatChange` revision over the range carrying the
+    /// pre-mutation `SpanStyle` snapshot (so reject can restore it).
+    /// Caller still applies the formatting via the existing path —
+    /// this helper only adds the overlay.
+    pub fn tracked_format_change(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        prev_attrs: SpanStyle,
+        author: String,
+        date: String,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        if start == end || !same_parent(&start.path, &end.path) {
+            return self.clone();
+        }
+        let Some(s_idx) = start.path.last_block_index() else {
+            return self.clone();
+        };
+        let Some(e_idx) = end.path.last_block_index() else {
+            return self.clone();
+        };
+        let parent = start.path.parent();
+        let s_off = start.offset;
+        let e_off = end.offset;
+        let mut blocks = self.blocks.clone();
+        let single_paragraph = s_idx == e_idx;
+        for idx in s_idx..=e_idx {
+            let child_path = parent.clone().push(PathStep::Block(idx));
+            let author_local = author.clone();
+            let date_local = date.clone();
+            let prev_local = prev_attrs.clone();
+            let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+                let r_start = if single_paragraph { s_off } else { 0 };
+                let r_end = if single_paragraph {
+                    e_off
+                } else {
+                    para.text.len() as u32
+                };
+                if r_end <= r_start {
+                    return;
+                }
+                para.revisions.push(Revision {
+                    start: r_start,
+                    end: r_end,
+                    kind: RevisionKind::FormatChange,
+                    author: author_local,
+                    date: date_local,
+                    id: None,
+                    prev_attrs: Some(prev_local),
+                });
+                para.dirty = true;
+            });
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
+        }
+    }
+
     pub fn insert_text(&self, at: LogicalPos, text: &str) -> Self {
         if text.is_empty() {
             return self.clone();
@@ -5022,6 +5372,187 @@ mod tests {
         let p = d.nth_paragraph(0).unwrap();
         assert_eq!(p.props.alignment, Some(Alignment::Center));
         assert_eq!(p.props.direction, Some(TextDirection::Rtl));
+    }
+
+    /* ---- Sprint 14 (#14): track-changes recording ----------------- */
+
+    fn tracked_doc() -> DocumentTree {
+        DocumentTree::from_text("hello")
+    }
+
+    fn pos0(off: u32) -> LogicalPos {
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: off,
+        }
+    }
+
+    #[test]
+    fn tracked_insert_outside_revision_adds_insert_revision() {
+        let d = tracked_doc();
+        let d = d.tracked_insert_text(pos0(0), "X", "Alice".into(), "2026-01-01".into());
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "Xhello");
+        assert_eq!(p.revisions.len(), 1);
+        assert_eq!(p.revisions[0].kind, RevisionKind::Insert);
+        assert_eq!(p.revisions[0].start, 0);
+        assert_eq!(p.revisions[0].end, 1);
+        assert_eq!(p.revisions[0].author, "Alice");
+    }
+
+    #[test]
+    fn tracked_insert_grows_adjacent_same_author_insert() {
+        let d = tracked_doc();
+        let d = d.tracked_insert_text(pos0(5), "A", "Alice".into(), "t1".into());
+        /* Cursor now at offset 6; same author types another char. */
+        let d = d.tracked_insert_text(pos0(6), "B", "Alice".into(), "t2".into());
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "helloAB");
+        assert_eq!(
+            p.revisions.len(),
+            1,
+            "adjacent same-author Inserts must merge — got {:?}",
+            p.revisions
+        );
+        assert_eq!(p.revisions[0].start, 5);
+        assert_eq!(p.revisions[0].end, 7);
+    }
+
+    #[test]
+    fn tracked_insert_inside_existing_insert_grows_it_no_new_revision() {
+        let d = tracked_doc();
+        let d = d.tracked_insert_text(pos0(5), "AAA", "Alice".into(), "t1".into());
+        /* Type INSIDE the Insert at offset 6 (between AAA). */
+        let d = d.tracked_insert_text(pos0(6), "Z", "Alice".into(), "t2".into());
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "helloAZAA");
+        assert_eq!(
+            p.revisions.len(),
+            1,
+            "inside-Insert keystroke must grow the Insert, not split"
+        );
+        assert_eq!(p.revisions[0].kind, RevisionKind::Insert);
+        assert_eq!(p.revisions[0].start, 5);
+        assert_eq!(p.revisions[0].end, 9);
+    }
+
+    #[test]
+    fn tracked_insert_inside_delete_splits_delete_and_adds_insert() {
+        let d = tracked_doc();
+        /* First mark "hello" entirely as a tracked Delete. */
+        let d = d.tracked_delete_range(pos0(0), pos0(5), "Alice".into(), "t1".into());
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().revisions.len(),
+            1,
+            "single Delete after mark"
+        );
+        /* Now type inside the Delete at offset 2 (between "he" and "llo"). */
+        let d = d.tracked_insert_text(pos0(2), "X", "Alice".into(), "t2".into());
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "heXllo");
+        /* Expected: [0, 2) Delete (he) + [2, 3) Insert (X) + [3, 6) Delete (llo). */
+        let kinds: Vec<_> = p
+            .revisions
+            .iter()
+            .map(|r| (r.kind, r.start, r.end))
+            .collect();
+        assert!(
+            kinds.contains(&(RevisionKind::Delete, 0, 2)),
+            "left Delete half missing: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(RevisionKind::Delete, 3, 6)),
+            "right Delete half missing: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(RevisionKind::Insert, 2, 3)),
+            "Insert in gap missing: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn tracked_delete_marker_only_preserves_text() {
+        let d = tracked_doc();
+        let d = d.tracked_delete_range(pos0(0), pos0(3), "Alice".into(), "t1".into());
+        let p = d.nth_paragraph(0).unwrap();
+        /* Marker-only delete: text remains. */
+        assert_eq!(p.text, "hello");
+        assert_eq!(p.revisions.len(), 1);
+        assert_eq!(p.revisions[0].kind, RevisionKind::Delete);
+        assert_eq!(p.revisions[0].start, 0);
+        assert_eq!(p.revisions[0].end, 3);
+    }
+
+    #[test]
+    fn tracked_delete_inside_own_insert_shrinks_insert_removes_text() {
+        let d = tracked_doc();
+        /* Type 3 chars at offset 5 — Insert overlay covers [5, 8). */
+        let d = d.tracked_insert_text(pos0(5), "ABC", "Alice".into(), "t1".into());
+        assert_eq!(d.nth_paragraph(0).unwrap().text, "helloABC");
+        /* Backspace one char (delete [7, 8)). Range is fully inside
+        the same-author Insert → uninsert: text shrinks AND Insert
+        end shifts left by 1. */
+        let d = d.tracked_delete_range(pos0(7), pos0(8), "Alice".into(), "t2".into());
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "helloAB");
+        assert_eq!(p.revisions.len(), 1);
+        assert_eq!(p.revisions[0].kind, RevisionKind::Insert);
+        assert_eq!(p.revisions[0].start, 5);
+        assert_eq!(p.revisions[0].end, 7);
+    }
+
+    #[test]
+    fn tracked_delete_merges_adjacent_same_author_delete() {
+        let d = tracked_doc();
+        let d = d.tracked_delete_range(pos0(0), pos0(2), "Alice".into(), "t1".into());
+        let d = d.tracked_delete_range(pos0(2), pos0(4), "Alice".into(), "t2".into());
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(
+            p.revisions.len(),
+            1,
+            "adjacent same-author Deletes must merge"
+        );
+        assert_eq!(p.revisions[0].start, 0);
+        assert_eq!(p.revisions[0].end, 4);
+    }
+
+    #[test]
+    fn tracked_format_change_carries_prev_attrs() {
+        let d = tracked_doc();
+        let prev = SpanStyle {
+            bold: Some(false),
+            ..Default::default()
+        };
+        let d =
+            d.tracked_format_change(pos0(0), pos0(5), prev.clone(), "Alice".into(), "t1".into());
+        let p = d.nth_paragraph(0).unwrap();
+        let rev = p
+            .revisions
+            .iter()
+            .find(|r| r.kind == RevisionKind::FormatChange);
+        let rev = rev.expect("FormatChange revision present");
+        assert_eq!(rev.start, 0);
+        assert_eq!(rev.end, 5);
+        assert_eq!(rev.prev_attrs, Some(prev));
+    }
+
+    #[test]
+    fn undo_of_tracked_insert_restores_snapshot_no_counter_delete() {
+        /* UndoStack is snapshot-based: undo restores the prior tree,
+        which had no revisions. No counter-Delete should appear. */
+        let initial = tracked_doc();
+        let mut stack = UndoStack::new(initial.clone(), 100);
+        let after_insert = initial.tracked_insert_text(pos0(0), "X", "Alice".into(), "t1".into());
+        stack.push(after_insert);
+        assert_eq!(stack.current().nth_paragraph(0).unwrap().text, "Xhello");
+        assert_eq!(stack.current().nth_paragraph(0).unwrap().revisions.len(), 1);
+        stack.undo();
+        let p = stack.current().nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "hello");
+        assert!(
+            p.revisions.is_empty(),
+            "undo of tracked insert must NOT leave a counter-Delete revision"
+        );
     }
 
     /* ---- Sprint 11 (#17): UAX-#29 word_count ---------------------- */

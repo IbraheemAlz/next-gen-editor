@@ -314,6 +314,20 @@ pub struct Engine {
     /// broadcast `Event::Announcement` so the TS shell's `aria-live`
     /// region narrates engine actions in order.
     pending_announcements: Vec<(AnnouncementPriority, String)>,
+    /// Sprint 14 (#14) — track-changes RECORDING flag. When `true`,
+    /// every text-mutation handler gates its work into a tracked
+    /// `Revision` instead of mutating in place. Toggled via
+    /// `Command::ToggleTrackChanges`; reflected on every
+    /// `Event::SelectionChanged.is_tracking_changes` so the UI's
+    /// toggle stays in sync with engine state.
+    tracking_changes: bool,
+    /// Sprint 14 (#14) — review identity stamped onto every tracked
+    /// revision the engine synthesises (`w:author` / `w:date`).
+    /// Default `author = "You"`; set via `Command::SetReviewIdentity`.
+    review_author: String,
+    /// Sprint 14 (#14) — review date for synthesised revisions.
+    /// Empty until the worker stamps `Date.now()` at command time.
+    review_date: String,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -354,6 +368,9 @@ fn assemble_engine(
         lazy_layout: LazyLayoutState::default(),
         caret_affinity: CaretAffinity::default(),
         pending_announcements: Vec::new(),
+        tracking_changes: false,
+        review_author: "You".to_string(),
+        review_date: String::new(),
     }
 }
 
@@ -486,6 +503,7 @@ impl Engine {
                         kind: match r.kind {
                             engine::RevisionKind::Insert => "insert",
                             engine::RevisionKind::Delete => "delete",
+                            engine::RevisionKind::FormatChange => "format",
                         },
                         author: r.author.clone(),
                         date: r.date.clone(),
@@ -1083,6 +1101,10 @@ fn apply_revision_overlay(
                             sub.color = REVISION_DELETE_COLOR;
                         }
                     }
+                    /* Sprint 14 (#14) — FormatChange has no text-wrap
+                    visual; the style change itself is the visible
+                    diff. Skip styling. */
+                    engine::RevisionKind::FormatChange => {}
                 }
             }
             out.push(sub);
@@ -3580,12 +3602,11 @@ impl Engine {
                 self.do_set_paragraph_shading(range, color)
             }
 
-            // Sprint 7 (UI Edition) — review commands.
-            Command::ToggleTrackChanges { enabled } => Event::Error {
-                message: format!(
-                    "ToggleTrackChanges({enabled}): tracked-change RECORDING not yet implemented — see Core: gate edits into <w:ins>/<w:del>"
-                ),
-            },
+            // Sprint 14 (#14) — review recording commands.
+            Command::ToggleTrackChanges { enabled } => self.do_toggle_track_changes(enabled),
+            Command::SetReviewIdentity { author, date } => {
+                self.do_set_review_identity(author, date)
+            }
             Command::AcceptRevision { block, start, end } => {
                 self.do_accept_revision(block, start, end)
             }
@@ -3813,11 +3834,35 @@ impl Engine {
             self.pending_format = Some(armed);
             return self.selection_changed();
         }
+        /* Sprint 14 (#14) — capture the pre-mutation `SpanStyle` at
+        the range's start before applying the patch; the
+        `FormatChange` revision carries it as `prev_attrs` so reject
+        can restore the original look. */
+        let prev_attrs_for_revision = if self.tracking_changes {
+            self.undo
+                .current()
+                .paragraph_at_path(&bridge_to_engine_path(range.start.path.clone()))
+                .map(|p| p.style_at(range.start.offset))
+                .unwrap_or_default()
+        } else {
+            SpanStyle::default()
+        };
         let new_doc = self.undo.current().apply_style(
             to_engine_pos(range.start.clone()),
             to_engine_pos(range.end.clone()),
             patch,
         );
+        let new_doc = if self.tracking_changes {
+            new_doc.tracked_format_change(
+                to_engine_pos(range.start.clone()),
+                to_engine_pos(range.end.clone()),
+                prev_attrs_for_revision,
+                self.review_author.clone(),
+                self.current_review_date(),
+            )
+        } else {
+            new_doc
+        };
         self.undo.push(new_doc);
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -5283,6 +5328,7 @@ impl Engine {
             section_geometry: self.section_geometry_for_caret(&sel.caret.path),
             cell_properties: self.cell_properties_for_caret(&sel.caret.path),
             tab_stops: self.tab_stops_for_caret(&sel.caret.path),
+            is_tracking_changes: self.tracking_changes,
         }
     }
 
@@ -5672,14 +5718,35 @@ impl Engine {
             kind: SelectionKind::Linear,
         });
         let (start, end) = ordered(sel.anchor, sel.caret);
+        let tracking = self.tracking_changes;
+        let author = self.review_author.clone();
+        let date = self.current_review_date();
         let base = if start == end {
             self.undo.current().clone()
+        } else if tracking {
+            /* Sprint 14 (#14) — replacing a selection while tracking
+            = mark-old-as-delete + insert-new-as-insert. */
+            self.undo.current().tracked_delete_range(
+                to_engine_pos(start.clone()),
+                to_engine_pos(end),
+                author.clone(),
+                date.clone(),
+            )
         } else {
             self.undo
                 .current()
                 .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
-        let mut new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
+        let mut new_doc = if tracking {
+            base.tracked_insert_text(
+                to_engine_pos(start.clone()),
+                &text,
+                author.clone(),
+                date.clone(),
+            )
+        } else {
+            base.insert_text(to_engine_pos(start.clone()), &text)
+        };
         let inserted_end = start.offset + text.len() as u32;
         /* Sticky formatting (Backlog #11): overlay any armed pending style
         onto the just-inserted run. It is intentionally NOT cleared here — it
@@ -5703,13 +5770,28 @@ impl Engine {
     }
 
     /// `Command::DeleteRange` — delete an explicit logical range.
+    /// Sprint 14 (#14) — when track-changes is on, mark the range as
+    /// a `Delete` revision instead of removing text.
     fn do_delete_range(&mut self, range: BridgeLogicalRange) -> Event {
         let (start, end) = ordered(range.start, range.end);
-        let new_doc = self
-            .undo
-            .current()
-            .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
-        self.commit_edit(new_doc, start)
+        let (new_doc, caret) = if self.tracking_changes {
+            let d = self.undo.current().tracked_delete_range(
+                to_engine_pos(start.clone()),
+                to_engine_pos(end.clone()),
+                self.review_author.clone(),
+                self.current_review_date(),
+            );
+            /* Marker-only tracked delete keeps text; caret lands at
+            the end of the marked range so further typing extends past. */
+            (d, end)
+        } else {
+            let d = self
+                .undo
+                .current()
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
+            (d, start)
+        };
+        self.commit_edit(new_doc, caret)
     }
 
     /// `Command::SplitParagraph` — break the paragraph at the caret (replacing
@@ -5748,21 +5830,41 @@ impl Engine {
         };
         let (start, end) = ordered(sel.anchor, sel.caret.clone());
         if start != end {
-            let new_doc = self
-                .undo
-                .current()
-                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
-            return self.commit_edit(new_doc, start);
+            let (new_doc, caret) = self.delete_or_mark(start.clone(), end);
+            return self.commit_edit(new_doc, caret);
         }
         let Some((del_start, del_end)) = self.delete_target(sel.caret, forward, by_word) else {
             /* Caret at a document edge — nothing to delete. */
             return self.selection_changed();
         };
-        let new_doc = self
-            .undo
-            .current()
-            .delete_range(to_engine_pos(del_start.clone()), to_engine_pos(del_end));
-        self.commit_edit(new_doc, del_start)
+        let (new_doc, caret) = self.delete_or_mark(del_start, del_end);
+        self.commit_edit(new_doc, caret)
+    }
+
+    /// Sprint 14 (#14) — shared dispatch for "delete a logical range":
+    /// route through `tracked_delete_range` when tracking is on
+    /// (marker-only, caret lands at end), else the plain `delete_range`
+    /// (text removed, caret lands at start).
+    fn delete_or_mark(
+        &self,
+        start: BridgeLogicalPos,
+        end: BridgeLogicalPos,
+    ) -> (engine::DocumentTree, BridgeLogicalPos) {
+        if self.tracking_changes {
+            let d = self.undo.current().tracked_delete_range(
+                to_engine_pos(start.clone()),
+                to_engine_pos(end.clone()),
+                self.review_author.clone(),
+                self.current_review_date(),
+            );
+            (d, end)
+        } else {
+            let d = self
+                .undo
+                .current()
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
+            (d, start)
+        }
     }
 
     /// The range a collapsed-caret delete should remove. `None` at the matching
@@ -6137,6 +6239,54 @@ impl Engine {
     }
 
     /// `Command::AcceptRevision` (Sprint 7 UI Edition).
+    /// Sprint 14 (#14) — best-effort current review date stamp.
+    /// Prefers the explicit value `Command::SetReviewIdentity` set;
+    /// otherwise falls back to the worker thread's `Date.now()` via
+    /// `js_sys::Date::new_0().to_iso_string()`.
+    fn current_review_date(&self) -> String {
+        if !self.review_date.is_empty() {
+            return self.review_date.clone();
+        }
+        js_sys::Date::new_0()
+            .to_iso_string()
+            .as_string()
+            .unwrap_or_default()
+    }
+
+    /// Sprint 14 (#14) — `Command::ToggleTrackChanges`. Flips the
+    /// engine's recording flag; subsequent mutations route through
+    /// the tracked-revision-wrap path. UI binds its toggle's active
+    /// state to `Event::SelectionChanged.is_tracking_changes` so a
+    /// `ToggleTrackChanges` issued from any path (UI, macro, undo)
+    /// stays in sync.
+    fn do_toggle_track_changes(&mut self, enabled: bool) -> Event {
+        self.tracking_changes = enabled;
+        self.announce(
+            AnnouncementPriority::Polite,
+            if enabled {
+                "Track changes on"
+            } else {
+                "Track changes off"
+            },
+        );
+        self.selection_changed()
+    }
+
+    /// Sprint 14 (#14) — `Command::SetReviewIdentity`. Stamped onto
+    /// every tracked revision the engine synthesises. Empty `date`
+    /// leaves the engine's stored date untouched so the worker can
+    /// stamp `Date.now()` per-mutation; empty `author` keeps the
+    /// existing author.
+    fn do_set_review_identity(&mut self, author: String, date: String) -> Event {
+        if !author.is_empty() {
+            self.review_author = author;
+        }
+        if !date.is_empty() {
+            self.review_date = date;
+        }
+        self.selection_changed()
+    }
+
     fn do_accept_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
         let new_doc = self.undo.current().accept_revision_at(block, start, end);
         self.undo.push(new_doc);
@@ -6943,6 +7093,9 @@ mod tests {
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
             pending_announcements: Vec::new(),
+            tracking_changes: false,
+            review_author: "You".to_string(),
+            review_date: String::new(),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -7537,6 +7690,9 @@ mod tests {
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
             pending_announcements: Vec::new(),
+            tracking_changes: false,
+            review_author: "You".to_string(),
+            review_date: String::new(),
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -7580,6 +7736,9 @@ mod tests {
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
             pending_announcements: Vec::new(),
+            tracking_changes: false,
+            review_author: "You".to_string(),
+            review_date: String::new(),
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -7614,6 +7773,9 @@ mod tests {
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
             pending_announcements: Vec::new(),
+            tracking_changes: false,
+            review_author: "You".to_string(),
+            review_date: String::new(),
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -7725,6 +7887,9 @@ mod tests {
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
             pending_announcements: Vec::new(),
+            tracking_changes: false,
+            review_author: "You".to_string(),
+            review_date: String::new(),
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier

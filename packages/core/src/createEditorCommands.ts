@@ -204,6 +204,14 @@ export interface EditorCommands {
     /* Review (Sprint 7 UI Edition). `toggleTrackChanges` dispatches
      * but the engine returns `Event::Error` until recording ships. */
     toggleTrackChanges(enabled: boolean): Promise<Event>;
+    /**
+     * Sprint 14 (#14) — stamp `author` + `date` on every subsequent
+     * tracked revision. Empty `date` leaves the engine's stored
+     * date untouched so the worker can stamp `Date.now()` per
+     * mutation; empty `author` keeps the prior value (default
+     * `"You"`).
+     */
+    setReviewIdentity(author: string, date: string): Promise<Event>;
     acceptRevision(block: number, start: number, end: number): Promise<Event>;
     rejectRevision(block: number, start: number, end: number): Promise<Event>;
     insertComment(
@@ -490,6 +498,8 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
 
         toggleTrackChanges: (enabled) =>
             dispatch({ type: 'TOGGLE_TRACK_CHANGES', enabled }),
+        setReviewIdentity: (author, date) =>
+            dispatch({ type: 'SET_REVIEW_IDENTITY', author, date }),
         acceptRevision: (block, start, end) =>
             dispatch({ type: 'ACCEPT_REVISION', block, start, end }),
         rejectRevision: (block, start, end) =>

@@ -503,6 +503,15 @@ pub enum Command {
         range: LogicalRange,
         stops: Vec<BridgeTabStop>,
     },
+    /// Sprint 14 (#14) — UI calls this when the user enters their
+    /// review identity; the engine stamps every new tracked revision
+    /// with these values. Default `author = "You"` + ISO 8601
+    /// `date = ""` (engine fills `Date.now()` at stamp time) when
+    /// unset. `author` is the OOXML `w:author` attribute.
+    SetReviewIdentity {
+        author: String,
+        date: String,
+    },
     /// Sprint 12 (#11) — apply (or detach when `None`) a paragraph
     /// style on every paragraph the range spans. The engine sets
     /// `Paragraph.style_id` and recomputes the resolved `props` view

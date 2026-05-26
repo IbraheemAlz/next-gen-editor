@@ -238,6 +238,10 @@ fn emit_revision_open(rev: &Revision, fallback_id: u32, out: &mut String) {
     let tag = match rev.kind {
         RevisionKind::Insert => "w:ins",
         RevisionKind::Delete => "w:del",
+        /* FormatChange should never reach the text-wrap path — caller
+        filters it. Defensive default to ins so a stray entry never
+        produces malformed XML. */
+        RevisionKind::FormatChange => "w:ins",
     };
     let id = rev.id.unwrap_or(fallback_id);
     out.push_str(&format!("<{tag} w:id=\"{id}\""));
@@ -258,6 +262,7 @@ fn emit_revision_close(kind: RevisionKind, out: &mut String) {
     let tag = match kind {
         RevisionKind::Insert => "w:ins",
         RevisionKind::Delete => "w:del",
+        RevisionKind::FormatChange => "w:ins",
     };
     out.push_str(&format!("</{tag}>"));
 }
@@ -538,8 +543,16 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
     }
     let cuts: Vec<usize> = cuts.into_iter().collect();
 
-    /* Revisions sorted for stable open-order at any shared start. */
-    let mut sorted_revs: Vec<&Revision> = para.revisions.iter().collect();
+    /* Revisions sorted for stable open-order at any shared start.
+    Sprint 14 (#14) — only `Insert` / `Delete` wrap text with
+    `<w:ins>` / `<w:del>`; `FormatChange` rides on `<w:rPr>` via
+    `<w:rPrChange>` (emitted by `serialize_run`'s rPr block, NOT
+    here), so the text-wrap stack must filter it out. */
+    let mut sorted_revs: Vec<&Revision> = para
+        .revisions
+        .iter()
+        .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+        .collect();
     sorted_revs.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
 
     /* Fields sorted the same way. Nesting model: revisions wrap fields
@@ -1541,6 +1554,7 @@ mod tests {
                     author: "Alice".into(),
                     date: "2026-01-01T00:00:00Z".into(),
                     id: Some(7),
+                    prev_attrs: None,
                 },
                 Revision {
                     start: 6,
@@ -1549,6 +1563,7 @@ mod tests {
                     author: "Bob".into(),
                     date: "2026-01-02T00:00:00Z".into(),
                     id: Some(8),
+                    prev_attrs: None,
                 },
             ],
             fields: Vec::new(),
@@ -2235,6 +2250,7 @@ mod tests {
                 author: String::new(),
                 date: String::new(),
                 id: None,
+                prev_attrs: None,
             }],
             fields: Vec::new(),
             style_id: None,

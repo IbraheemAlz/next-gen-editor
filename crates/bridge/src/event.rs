@@ -176,6 +176,12 @@ pub enum Event {
         /// inherits the default 0.5-inch grid. Drives the Ruler's
         /// tab-stop markers + their drag-edit handles.
         tab_stops: Vec<BridgeTabStop>,
+        /// Sprint 14 (#14) — current engine track-changes recording
+        /// state. The UI binds `ReviewControls`'s Track-Changes
+        /// toggle to this field instead of carrying local Solid
+        /// state, so a `ToggleTrackChanges` issued by another tab,
+        /// macro, or undo path stays in sync.
+        is_tracking_changes: bool,
     },
 
     /* IME */

@@ -82,6 +82,14 @@ export interface EditorState {
      * 0.5-inch grid. Drives the Ruler's tab-stop markers.
      */
     tabStops: Accessor<BridgeTabStop[]>;
+    /**
+     * Sprint 14 (#14) — engine track-changes recording state.
+     * `ReviewControls`'s Track toggle binds its active state to
+     * this accessor instead of carrying local Solid state, so a
+     * `ToggleTrackChanges` issued by any path (macro, undo, second
+     * tab) stays in sync.
+     */
+    isTrackingChanges: Accessor<boolean>;
 }
 
 export function createEditorState(): EditorState {
@@ -107,6 +115,7 @@ export function createEditorState(): EditorState {
     const [cellProperties, setCellProperties] =
         createSignal<BridgeCellProperties | undefined>(undefined);
     const [tabStops, setTabStops] = createSignal<BridgeTabStop[]>([]);
+    const [isTrackingChanges, setIsTrackingChanges] = createSignal(false);
 
     const unsubscribe = engine.subscribe((evt: Event) => {
         switch (evt.type) {
@@ -124,6 +133,7 @@ export function createEditorState(): EditorState {
                 setSectionGeometry(evt.section_geometry);
                 setCellProperties(evt.cell_properties);
                 setTabStops(evt.tab_stops);
+                setIsTrackingChanges(evt.is_tracking_changes);
                 break;
             }
             case 'UNDO_STATE_CHANGED': {
@@ -174,5 +184,6 @@ export function createEditorState(): EditorState {
         sectionGeometry,
         cellProperties,
         tabStops,
+        isTrackingChanges,
     };
 }

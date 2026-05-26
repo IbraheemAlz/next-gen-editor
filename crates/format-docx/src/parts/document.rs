@@ -845,6 +845,7 @@ pub fn parse_document_xml(
                                     author,
                                     date,
                                     id,
+                                    prev_attrs: None,
                                 });
                             }
                         }

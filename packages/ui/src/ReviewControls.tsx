@@ -1,20 +1,13 @@
 /**
  * ReviewControls — toolbar shelf for review workflow.
  *
- * Three controls:
- *   1. Track Changes toggle — dispatches `Command::ToggleTrackChanges`
- *      but the engine currently returns `Event::Error` (recording
- *      infrastructure not yet implemented — see Core Engine backlog).
- *      Rendered with an "Engine pending" badge so QA does not assume
- *      edits are being recorded.
- *   2. New Comment button — opens an inline editor at the bottom of
- *      the surface that collects text + author, then dispatches
- *      `Command::InsertComment` against the current selection range.
- *      Hidden behind a disabled state when no range is selected.
- *   3. Accept All / Reject All — convenience triggers that walk the
- *      latest `revisionsSnapshot` and accept (or reject) each entry
- *      in document order. Wired since `AcceptRevision` /
- *      `RejectRevision` are live.
+ * Sprint 14 (#14) — Track Changes toggle wired through real
+ * `Command::ToggleTrackChanges`. The toggle's "active" state binds
+ * to `state.isTrackingChanges()` (broadcast on every
+ * `SELECTION_CHANGED`) — NOT a local Solid signal — so a tracked-
+ * changes toggle issued by macro, undo, or another tab stays in
+ * sync. New Comment + Accept/Reject All controls keep their Sprint 7
+ * behaviour.
  */
 import {
     createEffect,
@@ -39,7 +32,10 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
     const cmd = createEditorCommands();
     const state = createEditorState();
     const engine = useEngine();
-    const [tracking, setTracking] = createSignal(false);
+    /* Sprint 14 (#14) — track state comes from the engine via
+     * Event::SelectionChanged.is_tracking_changes, NOT a local
+     * Solid signal. */
+    const tracking = () => state.isTrackingChanges();
     const [error, setError] = createSignal<string | null>(null);
     const [commentDraftOpen, setCommentDraftOpen] = createSignal(false);
     const [commentText, setCommentText] = createSignal('');
@@ -49,14 +45,12 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
 
     const ready = () => state.selection() !== undefined;
 
-    /* The track-changes toggle stays a click-and-flag toggle even
-     * though the engine returns Error today — flipping the UI state
-     * is helpful for the QA flow that wants to "pretend tracking is
-     * on and watch this break". The error surfaces in the inline
-     * banner below the controls. */
+    /* Sprint 14 (#14) — dispatch + let the engine's
+     * SelectionChanged reply drive the visual active state.
+     * `tracking()` reads `state.isTrackingChanges()` so the toggle
+     * lights up only when the engine confirms recording is on. */
     const onToggleTracking = async () => {
         const next = !tracking();
-        setTracking(next);
         try {
             await cmd.toggleTrackChanges(next);
         } catch (e) {
@@ -118,12 +112,11 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 aria-label="Track changes"
                 aria-pressed={tracking()}
                 data-active={tracking()}
-                title="Track Changes — recording engine path pending (see backlog)"
+                title={tracking() ? 'Track Changes — recording' : 'Track Changes — off'}
                 onClick={() => void onToggleTracking()}
             >
                 <span aria-hidden="true">⌖</span>
                 <span>Track</span>
-                <span class="nge-review__badge">Engine pending</span>
             </button>
 
             <button
