@@ -500,7 +500,46 @@ inside a list); restart numbering UI; custom bullet picker;
 
 ---
 
-## Sprint 14 — Track Changes Recording (cross-cutting)
+## Sprint 14 — Track Changes Recording (cross-cutting) ✅ DONE
+
+**Status:** Closed 2026-05-27 (originally shipped in commit
+`eb1ca60 feat(core+ui): Sprint 14 — Track Changes Recording (#14)`).
+Issue #14 resolved.
+
+  * **Engine parallel API**: `DocumentTree::tracked_insert_text`
+    (line 2159) + `tracked_delete_range` (line 2300) sit alongside
+    the original `insert_text` + `delete_range`. Same `Self`
+    return type, same persistent-vector cloning. The lowest-level
+    mutators were NOT modified — keeps Phase-1 PoC commands +
+    visual-diff harness path untouched.
+  * **Bridge-side gate**: `do_insert_text_interactive` (line 5978)
+    reads `Engine.tracking_changes` and routes to the tracked
+    variant. Selection-replace branch splits into
+    `tracked_delete_range` + `tracked_insert_text`.
+  * **Format-change tracking**: `tracked_format_change` (line 4090+
+    in engine-wasm) captures pre-state attrs and stamps a Format
+    revision when tracking is on.
+  * **Undo/Redo discipline**: `Revision` lives INSIDE
+    `Paragraph.revisions` (the document tree), not in a side
+    table. `UndoStack::push(new_doc)` treats tracked + untracked
+    snapshots identically — undoing a tracked Insert pops both
+    the text and the revision metadata in one step.
+  * **Boundary math** (per `tracked_insert_text` doc comment):
+    typing inside an own-author Insert extends it (no per-
+    keystroke fragmentation); typing inside a Delete splits the
+    Delete + stamps fresh Insert; adjacent same-author Inserts
+    merge; otherwise fresh `Insert(author, date, range)`.
+  * **UI binding**: `packages/ui/src/ReviewControls.tsx` Track-
+    Changes toggle binds to `state.isTrackingChanges()` reactive
+    to every `Event::SelectionChanged.is_tracking_changes`.
+    `TrackChangesSidebar.tsx` lists revisions with author + date;
+    Accept / Reject buttons dispatch the existing Sprint 7
+    `AcceptRevision` / `RejectRevision` commands.
+  * Panic surface in the tracked mutators: 0.
+
+---
+
+## Sprint 14 — Original plan (archived)
 
 **Issue:** [#14](https://github.com/IbraheemAlz/next-gen-editor/issues/14)
 
