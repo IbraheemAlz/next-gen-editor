@@ -318,7 +318,41 @@ decimal-tab rendering itself (`A.M3` partial; separate ticket).
 
 ---
 
-## Sprint 12 — Live Style Table + Cascade Re-application
+## Sprint 12 — Live Style Table + Cascade Re-application ✅ DONE
+
+**Status:** Closed 2026-05-27. Issue #11 resolved per its explicit
+scope (ApplyStyle + cascade + writer + StylesDropdown rewire).
+
+  * `engine::DocumentTree.styles: HashMap<String, ParagraphStyle>`
+    populated by `crates/format-docx`'s reader from
+    `word/styles.xml`. `MAX_STYLE_CHAIN = 10` caps `basedOn`
+    traversal per ECMA-376 §17.7.4.5.
+  * `engine::Paragraph.style_id: Option<String>` +
+    `direct_overrides: ParaProperties` — the "cascade-source
+    shadow" v1 approach picked in the original plan. Resolver
+    folds `defaults → style chain → direct_overrides` into the
+    paragraph's resolved `props`.
+  * `Command::ApplyStyle { range, style_id }` routes to
+    `DocumentTree::set_paragraph_style`;
+    `do_apply_style` clears `layout_cache` + invalidates the dirty
+    rect + announces (`"Applied style {id}"` /
+    `"Cleared paragraph style"`). Zero `unwrap()` in the handler.
+  * Writer emits `<w:pStyle w:val>` when `style_id.is_some()`;
+    `styles.xml` rides the OPC passthrough byte-identical on the
+    additive-only case. `paragraph_style_id_round_trips_via_p_style`
+    test (writer.rs line 3430) pins the invariant.
+  * UI follow-up shipped: `packages/ui/src/StylesDropdown.tsx` line
+    46 — `await cmd.applyStyle(id)` against the real engine path.
+
+**Follow-up filed:** [#21](https://github.com/IbraheemAlz/next-gen-editor/issues/21)
+— Core: Implement `Command::ModifyStyle` and Cascade Re-application.
+Out-of-#11-scope (style **definition** mutation vs the **assignment**
+this sprint shipped). Lands with its own UI dialog so the bridge
+doesn't ship as a Phantom command.
+
+---
+
+## Sprint 12 — Original plan (archived)
 
 **Issue:** [#11](https://github.com/IbraheemAlz/next-gen-editor/issues/11)
 
