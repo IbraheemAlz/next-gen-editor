@@ -14,8 +14,9 @@ session? Skim:
 | File | When loaded | Purpose |
 | --- | --- | --- |
 | `../CLAUDE.md` | every session | Top-level invariants the agent must always know |
-| `rules/rust.md` | when touching `**/*.rs` / `Cargo.toml` / `.cargo/**` | Rust 1.85, LTO, wasm-ld flags |
-| `rules/typescript.md` | when touching `ts/**` / `tools/**/*.mjs` | tsify-next, dispatch channel, web-sys |
+| `rules/rust.md` | when touching `**/*.rs` / `Cargo.toml` / `.cargo/**` | Rust 1.95, LTO, wasm-ld flags |
+| `rules/typescript.md` | when touching `ts/**` / `packages/**` / `tools/**/*.mjs` | tsify-next, dispatch channel, Solid.js, pnpm workspace |
+| `rules/sdk-architecture.md` | when touching `packages/**` / `ts/src/sdk-bridge.tsx` | **Monaco Standard** — pnpm workspace, `@nge/core` + `@nge/ui`, Solid.js, `.nge-*` CSS, Honest UX |
 | `rules/docx.md` | when touching `crates/format-docx/**` / `tools/roundtrip/**` | `.docx` round-trip invariants |
 | `rules/visual-diff.md` | when touching `tools/visual-diff/**` / `ts/**` | Playwright + golden management |
 | `skills/ci-gate` | `/ci-gate` | Run all gates in order, fail fast |
@@ -23,6 +24,7 @@ session? Skim:
 | `skills/wasm-size` | `/wasm-size` | Current vs 15 MiB budget |
 | `skills/start-dev` | `/start-dev` | Vite dev server in background |
 | `skills/run-roundtrip` | `/run-roundtrip` | `.docx` round-trip harness one-shot |
+| `skills/gh-issue-logger` | `/gh-issue-logger` | **MANDATORY** when a turn discovers a missing core feature, ships a pragmatic UI workaround, or surfaces tech debt outside sprint scope. File issues before concluding the turn. |
 | `agents/phase-executor` | when delegating multi-week phase work | Isolated context for Phase N execution |
 
 ## Settings rationale

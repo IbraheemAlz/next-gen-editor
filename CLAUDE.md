@@ -47,6 +47,9 @@ crates/
   format-docx/    .docx reader (zip + quick-xml) + writer (preserves siblings)
   format-pdf/     PDF export (pdf-writer) — box tree + full font embedding
 ts/               Vite + TS shell, worker, EngineClient, event log, e2e suite
+packages/         pnpm workspace — Monaco Standard SDK split (post-beta.3)
+  core/           @nge/core — Locked Surface + Headless API (Solid.js primitives)
+  ui/             @nge/ui — default UI components (vanilla CSS, .nge-* prefix)
 tools/
   visual-diff/    Playwright + pixelmatch golden farm (tiered, D5.1)
   memory-profile/ engine + JS heap snapshot harness (D5.2)
@@ -140,6 +143,67 @@ D5.10 are external/human sign-offs, not code.
   memory and perf harnesses — non-blocking because golden pixel-reproducibility
   on the GitHub runner is unproven across machines.
 
+## SDK architecture — the "Monaco Standard" (post-`beta.3`)
+
+The shell is split into a headless SDK + an isolated default UI, following the
+Monaco Editor's "Locked Surface with Headless Controls" precedent. The split is
+**load-bearing**: violations are never acceptable shortcuts.
+
+- **`pnpm` workspace** at the repo root. `pnpm-workspace.yaml` globs
+  `packages/*`, `ts`, `tools/*`. Inter-package deps use `workspace:*`.
+- **`@nge/core`** (`packages/core/`) — the Locked Surface + Headless API.
+  - Contains: `EditorSurface` (owns `<canvas>` + hidden `<textarea>` +
+    `transferControlToOffscreen` lifecycle), `EngineProvider` (Solid
+    context), `createEditorCommands` (typed facade over `dispatch`),
+    `createEditorState` (Solid signals derived from engine events).
+  - Re-exports every bridge type (`Command`, `Event`, `TextAttrsPatch`,
+    `BridgeCellBorders`, `InsertSide`, `PageOrientation`, `ListKind`,
+    `ParagraphStyleId`, `STYLE_PRESETS`, …). Downstream UI imports
+    **only from `@nge/core`** — never from `crates/engine-wasm/pkg`.
+  - Built with **Solid.js primitives** (`createSignal`, `createEffect`,
+    `onCleanup`, `useContext`). No React patterns.
+- **`@nge/ui`** (`packages/ui/`) — the default UI shelf.
+  - Strict **`.nge-*` CSS namespace prefix** on every selector.
+    Theme variables on `:root` / `.nge-root` (e.g. `--nge-color-primary`,
+    `--nge-space-3`, `--nge-radius-md`). Sibling `Component.css`
+    imports per component.
+  - **Zero Tailwind. Zero Shadcn. Zero external UI libraries.**
+  - Modals use `solid-js/web` `<Portal>` (escapes the canvas z-index).
+- **Framework rule.** The shell is **Solid.js** (`vite-plugin-solid`,
+  `jsxImportSource: "solid-js"`). Default to Solid primitives, never
+  React hooks / lifecycle. The existing `ts/src/App.tsx` is Solid; the
+  SDK packages are Solid; downstream code is Solid.
+- **Migration anchor.** `ts/src/sdk-bridge.tsx` wires the concrete
+  `EngineClient` (still living in `ts/src/engine/`) into
+  `EngineProvider` and mounts the `@nge/ui` shelf. Eventually
+  `EngineClient` moves into `@nge/core`; that refactor is a separate
+  PR.
+
+## "Honest UX" discipline — never ship Phantom UI
+
+If an engine path is stubbed, missing, or partial, the UI must **visibly
+gate** the affordance. Three discipline rules, in priority order:
+
+1. **No silent dead buttons.** A button that dispatches into a
+   `phase3_stub` / `Event::Error` path must render `disabled` with an
+   amber **"Engine pending"** badge (the canonical pattern is in
+   `@nge/ui` `ListButtons.tsx` / `FileMenu.tsx`).
+2. **Log the gap immediately.** When you discover a missing core
+   feature, a pragmatic workaround, or tech debt outside the current
+   sprint's scope, use the `gh-issue-logger` skill (`/gh-issue-logger`)
+   **before** concluding your turn. The skill enforces the issue
+   format and label discipline.
+3. **Surface the wire shape, not the user wish.** When the spec calls
+   for a command the bridge does not have, audit the bridge first
+   (`grep crates/bridge/src/`). Surface the gap via `AskUserQuestion`
+   before writing speculative Rust. Memory rule
+   [[feedback_pragmatic_scope]] is load-bearing.
+
+The standing backlog of "engine pending" issues lives in the GitHub
+Issues tracker — labels `core-engine` / `ui` / `enhancement` /
+`tech-debt`. Each Sprint X (UI Edition) JSDoc note that says "see Core
+Engine backlog" references a real issue.
+
 ## Validation (CI gates, all -D warnings)
 
 - `cargo fmt --all -- --check` clean.
@@ -217,6 +281,17 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 - ❌ Regenerate goldens without visually diffing.
 - ❌ Block the RPC reply on the IndexedDB event-log write — log off the critical path.
 - ❌ Re-call `transferControlToOffscreen()` on a consumed canvas — swap in a fresh `<canvas>`.
+- ❌ Default to React patterns. The shell + SDK are Solid.js. Use
+  `createSignal` / `createEffect` / `<Show>` / `<For>` / `<Portal>`.
+- ❌ Add a Tailwind / Shadcn / external UI library to `@nge/ui`. Vanilla
+  CSS with `.nge-*` prefix + CSS variables. No exceptions.
+- ❌ Import from `crates/engine-wasm/pkg` outside `@nge/core`. The SDK
+  boundary owns that coupling.
+- ❌ Ship a UI button that silently dispatches into a stubbed engine
+  path ("Phantom UI"). Disable + amber "Engine pending" badge + filed
+  GitHub issue is the only acceptable state.
+- ❌ Discover a missing core engine feature mid-sprint and forget to
+  file the issue. Use `/gh-issue-logger` before concluding the turn.
 
 ## Where the deferred work landed
 

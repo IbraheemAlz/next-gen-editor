@@ -7,14 +7,24 @@ paths:
   - "tools/**/*.mjs"
   - "ts/tsconfig.json"
   - "ts/vite.config.ts"
+  - "packages/**/*.ts"
+  - "packages/**/*.tsx"
 ---
+
+> **Companion rule.** When touching `packages/**` or `ts/src/sdk-bridge.tsx`,
+> also load `.claude/rules/sdk-architecture.md` — that file owns the
+> Monaco Standard + `.nge-*` CSS + Honest UX discipline. This file
+> stays focused on TS / worker / browser plumbing.
 
 # TypeScript / browser rules
 
 ## Config
 - TS strict + `noUncheckedIndexedAccess` + `noImplicitOverride` + `exactOptionalPropertyTypes`.
 - `target: ES2024`, `module: ESNext`, `moduleResolution: Bundler`.
+- `jsx: "preserve"` + `jsxImportSource: "solid-js"` — the shell is Solid.js, NOT React. Default to `createSignal` / `createEffect` / `onCleanup` / `<Show>` / `<For>` / `<Portal>`; React `useState` / `useEffect` / `useRef` patterns are wrong here.
 - `types: ["node", "vite/client"]` — `vite.config.ts` uses `node:path`.
+- **`packages/core/`** + **`packages/ui/`** carry their own per-package `tsconfig.json` and `package.json`; the root `pnpm-workspace.yaml` globs them in. Run `pnpm -r tsc` for a workspace-wide type-check.
+- Inter-package deps use `workspace:*` (see `ts/package.json` for `@nge/core` + `@nge/ui` consumption).
 
 ## tsify-next interop
 - `Option<T>` in Rust → `T | undefined` in `.d.ts`. **Pass `undefined`, not `null`** from TS.
