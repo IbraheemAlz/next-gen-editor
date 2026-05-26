@@ -4334,6 +4334,15 @@ impl Engine {
                 let pag = paginator
                     .as_mut()
                     .expect("continuous: paginator must exist");
+                /* L2.3 (#8) — column balance pass. Runs BEFORE
+                `set_section_cursor` / `set_columns` so the prior
+                multi-column section's column descriptor is still
+                installed on the paginator. The pass redistributes
+                the prior section's `cur_blocks` so all columns end
+                near the average height and updates `cur_y` to the
+                deepest column's bottom edge — the new section's
+                first block then lands cleanly below that edge. */
+                pag.balance_current_section_columns();
                 pag.set_section_cursor(geom);
                 /* Re-install the new section's column descriptor.
                 `set_columns` already resets `cur_column_index = 0`

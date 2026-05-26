@@ -118,6 +118,12 @@ pub struct Paginator {
     cur_column_index: u8,
     /// Accumulating page state.
     cur_blocks: Vec<LayoutBlock>,
+    /// L2.3 (#8) — index in [`Self::cur_blocks`] where the current
+    /// section's first block sits. Stamped by
+    /// [`Self::balance_current_section_columns`] when a continuous
+    /// section break terminates a multi-column section; reset to 0
+    /// on every page flush (when [`Self::cur_blocks`] is taken).
+    cur_section_start_idx: usize,
     /// Cursor inside the current column's content area, in content-relative
     /// pt (0.0 at the top of the content rect). Reset on every column
     /// advance + page flush.
@@ -167,6 +173,7 @@ impl Paginator {
             column_gutter: 0.0,
             cur_column_index: 0,
             cur_blocks: Vec::new(),
+            cur_section_start_idx: 0,
             cur_y: 0.0,
             pages: Vec::new(),
             footnote_bodies: HashMap::new(),
@@ -204,6 +211,98 @@ impl Paginator {
         self.column_count = count.max(1);
         self.column_gutter = gutter_pt.max(0.0);
         self.cur_column_index = 0;
+    }
+
+    /// L2.3 (#8) — column balance pass for the just-finished section.
+    /// Called by the continuous-section-break handoff in engine-wasm
+    /// BEFORE [`Self::set_section_cursor`] / [`Self::set_columns`]
+    /// swap the column descriptor.
+    ///
+    /// Walks the blocks in `cur_blocks[cur_section_start_idx..]`
+    /// (i.e. every block pushed since the prior section started on
+    /// this page) and redistributes them across the section's
+    /// columns using a greedy snake-fill targeting
+    /// `total_section_height / column_count`. Each block's
+    /// `origin.x` is rewritten to the column's x offset; `origin.y`
+    /// is rewritten to the block's running position within the
+    /// column, anchored at the section's top-of-page y baseline.
+    ///
+    /// `cur_y` is updated to the bottom edge of the deepest column
+    /// so the next section's first block lands strictly below every
+    /// column's tail with no overlap.
+    ///
+    /// Single-column sections (or sections with no pushed blocks)
+    /// short-circuit; the existing snake-flow output is preserved
+    /// byte-identical and the regression goldens stay at 0.000 %.
+    ///
+    /// The implementation is greedy O(n_blocks). Pathological block-
+    /// size mixes can leave one column up to `max(block_height)`
+    /// taller than the target; Knuth-LP balance is a follow-up if
+    /// the v1 result surfaces unacceptable cases on real corpora.
+    pub fn balance_current_section_columns(&mut self) {
+        let end = self.cur_blocks.len();
+        /* Single-column sections need no balancing — stamp the
+        boundary so any subsequent push lands in the "new" section
+        and short-circuit. */
+        if self.column_count <= 1 {
+            self.cur_section_start_idx = end;
+            return;
+        }
+        let n = self.column_count as usize;
+        let start = self.cur_section_start_idx;
+        if start >= end {
+            return;
+        }
+
+        /* Section's y-baseline = origin.y of the first block placed
+        by this section. Captures the bottom of any prior same-page
+        section (e.g. a 1-col title above the 2-col body). */
+        let section_top_y = self.cur_blocks[start].origin().y;
+
+        let total_h: f32 = self.cur_blocks[start..end]
+            .iter()
+            .map(|b| b.size().height)
+            .sum();
+        if total_h <= 0.0 {
+            self.cur_section_start_idx = end;
+            return;
+        }
+        let target_h = total_h / n as f32;
+
+        /* Precompute per-column x offsets so the inner loop can take
+        a mutable borrow on `cur_blocks` without aliasing `self`. */
+        let col_x: Vec<f32> = (0..n).map(|i| self.column_x_offset(i as u8)).collect();
+
+        /* Greedy snake-fill. Place blocks in logical order; advance
+        the column when the next block would push past `target_h`
+        AND another column is available. The last column accepts
+        whatever remains (cannot snake past N - 1). */
+        let mut col: usize = 0;
+        let mut y_in_col = 0.0_f32;
+        let mut col_tails = vec![0.0_f32; n];
+        for block in &mut self.cur_blocks[start..end] {
+            let h = block.size().height;
+            if y_in_col > 0.0 && y_in_col + h > target_h && col < n - 1 {
+                col += 1;
+                y_in_col = 0.0;
+            }
+            block.set_origin(Point {
+                x: col_x[col],
+                y: section_top_y + y_in_col,
+            });
+            y_in_col += h;
+            col_tails[col] = y_in_col;
+        }
+
+        /* Cursor handoff: next section begins below the LONGEST
+        column's bottom edge so no block overlaps the new flow. */
+        let max_tail = col_tails.iter().copied().fold(0.0_f32, f32::max);
+        self.cur_y = section_top_y + max_tail;
+
+        /* Section boundary stamp — subsequent push_blocks belong to
+        the NEW section. `set_section_cursor` + `set_columns` run
+        after this call. */
+        self.cur_section_start_idx = end;
     }
 
     /// Single-slot convenience constructor — wraps the legacy
@@ -759,6 +858,9 @@ impl Paginator {
         (`column_count` / `column_gutter`) stays — it is a section
         property, not a per-page one. */
         self.cur_column_index = 0;
+        /* L2.3 (#8) — `cur_blocks` was just emptied; the next push
+        starts the section's first-on-this-page block at index 0. */
+        self.cur_section_start_idx = 0;
         /* Phase 8a — materialize the page's footnote band. The reserved
         height was already subtracted from the body budget during
         `push_block`, so the band fits without overflow. Entries are in
@@ -1764,5 +1866,131 @@ mod tests {
                 b.origin().x
             );
         }
+    }
+
+    /* ---------- L2.3 (#8) continuous-section column balancing ---------- */
+
+    /// L2.3 (#8) — even-sized blocks in a 2-column section must
+    /// balance to columns ending within ±1 pt of each other after
+    /// the balance pass.
+    #[test]
+    fn continuous_section_balances_two_col_within_one_pt() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.set_columns(2, 12.0);
+        /* 4 paragraphs × 50 pt each = 200 pt total → target 100 pt
+        per column. */
+        for _ in 0..4 {
+            let para = fake_paragraph(1, 50.0);
+            pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        }
+        pag.balance_current_section_columns();
+        /* Inspect cur_blocks via finishing the paginator. */
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 1, "all content fits one A4 page");
+        let blocks = &pages[0].blocks;
+        assert_eq!(blocks.len(), 4);
+
+        let col_x_0 = blocks[0].origin().x;
+        let col_x_1 = blocks[2].origin().x;
+        assert!(
+            (col_x_0 - 0.0).abs() < 0.5,
+            "col 0 first block x ≈ 0; got {col_x_0}"
+        );
+        assert!(
+            col_x_1 > col_x_0 + 0.5,
+            "col 1 first block x must be greater than col 0; got col0={col_x_0} col1={col_x_1}"
+        );
+
+        /* Column tails: bottom of last block in each column. */
+        let col0_tail = blocks[1].origin().y + blocks[1].size().height;
+        let col1_tail = blocks[3].origin().y + blocks[3].size().height;
+        assert!(
+            (col0_tail - col1_tail).abs() < 1.0,
+            "balanced columns must end within ±1 pt; col0_tail={col0_tail}, col1_tail={col1_tail}"
+        );
+    }
+
+    /// L2.3 (#8) — single-column sections short-circuit the balance
+    /// pass; block origins stay byte-identical to today's snake-flow
+    /// output. Regression guard for the visual-diff farm.
+    #[test]
+    fn continuous_section_single_column_skips_balance() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        /* No set_columns call → default single-column. */
+        for _ in 0..3 {
+            let para = fake_paragraph(1, 50.0);
+            pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        }
+        /* Snapshot block origins BEFORE the balance pass via a
+        finish() round-trip. Then re-run on a fresh paginator with
+        balance interleaved, and confirm identical y-stack. */
+        let mut pag_balanced = Paginator::with_default_bands(geom, None, None);
+        for _ in 0..3 {
+            let para = fake_paragraph(1, 50.0);
+            pag_balanced.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        }
+        pag_balanced.balance_current_section_columns();
+
+        let pages_a = pag.finish();
+        let pages_b = pag_balanced.finish();
+        assert_eq!(pages_a.len(), pages_b.len(), "page count unchanged");
+        for (a, b) in pages_a[0].blocks.iter().zip(pages_b[0].blocks.iter()) {
+            assert!(
+                (a.origin().x - b.origin().x).abs() < 0.001,
+                "single-col x unchanged; before={} after={}",
+                a.origin().x,
+                b.origin().x
+            );
+            assert!(
+                (a.origin().y - b.origin().y).abs() < 0.001,
+                "single-col y unchanged; before={} after={}",
+                a.origin().y,
+                b.origin().y
+            );
+        }
+    }
+
+    /// L2.3 (#8) — uneven block sizes in a 2-col section: the last
+    /// column accepts overflow because it cannot snake further.
+    /// Greedy v1 pins the documented imbalance behaviour; LP-style
+    /// balance is a follow-up.
+    #[test]
+    fn continuous_section_uneven_blocks_respect_last_column_overflow() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.set_columns(2, 12.0);
+        /* One 80 pt block + three 40 pt blocks = 200 pt total →
+        target 100 pt. Block 0 (80) lands in col 0 (y_in_col=80).
+        Block 1 (40): 80+40=120 > 100 → advance to col 1.
+        Blocks 1, 2, 3 chain in col 1 → col 1 tail = 120. */
+        let heights = [80.0_f32, 40.0, 40.0, 40.0];
+        for h in heights {
+            let para = fake_paragraph(1, h);
+            pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        }
+        pag.balance_current_section_columns();
+        let pages = pag.finish();
+        let blocks = &pages[0].blocks;
+        assert_eq!(blocks.len(), 4);
+
+        /* Block 0 (the 80 pt block) is alone in col 0. */
+        let col0_first_x = blocks[0].origin().x;
+        let col1_first_x = blocks[1].origin().x;
+        assert!(
+            col1_first_x > col0_first_x + 0.5,
+            "block 1 must snake into col 1; col0_x={col0_first_x}, col1_x={col1_first_x}"
+        );
+        let col0_tail = blocks[0].origin().y + blocks[0].size().height;
+        let col1_tail = blocks[3].origin().y + blocks[3].size().height;
+        assert!(
+            (col0_tail - 80.0).abs() < 0.5,
+            "col 0 ends at the 80 pt block's bottom; got {col0_tail}"
+        );
+        assert!(
+            (col1_tail - 120.0).abs() < 0.5,
+            "col 1 absorbs the three 40 pt blocks; got {col1_tail}"
+        );
     }
 }

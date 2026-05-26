@@ -33,7 +33,7 @@
 | **#5** | Sprint 4 (C.H1): virtual scrollbar over-estimates by `AVG_BLOCK_HEIGHT_PT = 64.0` | `crates/engine-wasm/src/lib.rs` (`build_pages`, `LazyLayoutState`, `LAYOUT_BUFFER_PT`) | Sprint 4 trade-off (commit `09d8a48`) | **Fix.** Predictive pre-layout — double `LAYOUT_BUFFER_PT` window when `target_y` set. |
 | **#6** | Sprint 5 (A.M3): geometric tab stops drift on Center/Right/Justified/RTL + Decimal/Center/Right kinds render as Left | `crates/layout/src/paragraph.rs::apply_tab_advances` | Sprint 5 trade-off (commit `547d20e`) | **Done (L2.1).** Indent-aware pen + shape-then-place math for `Left`/`Center`/`Right`/`Decimal` kinds. 6 native tests + 3 visual-diff goldens (tier A 10/10 at 0.000 %). Center/End/Justify alignment + tabs deferred (Word-conformant). RTL anchoring deferred to issue #20. |
 | **#7** | Sprint 6 (A.M8): table autofit skips true `min-content`; long URLs clip in narrow columns | `crates/engine-wasm/src/lib.rs::autofit_distribute` | Sprint 6 trade-off (commit `c706bab`) | **Done (L2.2).** `measure_unbreakable_width` walks `break_opportunities` + `shape_text` per segment to compute `(min_content, max_content)`. `autofit_distribute` enforces `col_floor = max(grid_hint, min_content)` via 3-case dispatch (overflow / fit / iterative pin-and-redistribute). 3 native tests + 1 visual-diff golden (tier A 11/11 at 0.000 %). |
-| **#8** | Sprint 7 (A.M12): continuous section break skips column-height balancing | `crates/engine-wasm/src/lib.rs` (continuous-section path) | Sprint 7 trade-off (commit `046754b`) | **Fix.** Column-balance pass before the section transition. |
+| **#8** | Sprint 7 (A.M12): continuous section break skips column-height balancing | `crates/engine-wasm/src/lib.rs` (continuous-section path) | Sprint 7 trade-off (commit `046754b`) | **Done (L2.3).** `Paginator::balance_current_section_columns()` runs a greedy O(n) snake-fill before the section swap; new `cur_section_start_idx` tracks the section boundary in `cur_blocks`. 3 native tests in `paginate::tests`. Visual-diff golden deferred (no worker command path to compose multi-section docs); tier-A no-regression sweep at 11/11 0.000 % protects the corpus. |
 | **#18** | Mint `w14:paraId` + synthesize OPC plumbing for engine-minted resolved comments | `crates/format-docx/src/parts/comments.rs`, `crates/format-docx/src/writer.rs` | Sprint 9 follow-up (issue #15 v1 closure gap) | **Done (L1.2).** `build_comments_xml` mints paraId + textId; additive `inject_content_type_override` / `inject_doc_rel` splice the Override + Relationship rows; untouched docs stay byte-identical. 4 new tests green. |
 
 **Monaco-arch impact:** zero. Five layout/engine polish items, one writer-
@@ -424,6 +424,60 @@ Mirror `CORE_SPRINTS_PLAN.md` discipline. After each cleanup commits:
    reference back here.
 
 ### Activity log
+
+- **2026-05-27 — L2.3 (#8) landed.**
+  - `crates/layout/src/paginate.rs`: new
+    `Paginator::cur_section_start_idx` field tracks the index in
+    `cur_blocks` where the current section's first block sits.
+    Initialised to 0 in `new()`; reset to 0 in `flush_page()` when
+    `cur_blocks` is taken; stamped to `cur_blocks.len()` by the new
+    `balance_current_section_columns()` method.
+  - `Paginator::balance_current_section_columns()` — greedy O(n)
+    snake-fill of `cur_blocks[cur_section_start_idx..]`. Sums the
+    section's total height, divides by `column_count` to get the
+    target, then walks blocks in logical order: advance the column
+    when the next block would push past target AND another column
+    is available; the last column accepts whatever remains.
+    Updates each block's `origin.x` (column x offset) +
+    `origin.y` (running position anchored at the section's top-of-
+    page y baseline). Sets `cur_y` to the deepest column's bottom
+    edge so the next section's first block lands cleanly below
+    every column. Single-column sections (or empty sections) early-
+    return; existing snake-flow goldens stay 0.000 %.
+  - `crates/engine-wasm/src/lib.rs` continuous-break handoff:
+    `pag.balance_current_section_columns()` runs BEFORE
+    `set_section_cursor` / `set_columns` so the prior section's
+    multi-column descriptor is still installed on the paginator
+    when the balance pass reads it.
+  - 3 new native tests in `paginate::tests`:
+    `continuous_section_balances_two_col_within_one_pt` (even
+    blocks → columns end within ±1 pt),
+    `continuous_section_single_column_skips_balance` (1-col
+    no-op regression guard — block origins byte-identical to the
+    no-balance path),
+    `continuous_section_uneven_blocks_respect_last_column_overflow`
+    (greedy-v1 documented imbalance behaviour).
+  - **Visual-diff golden deferred.** A 3-section fixture (1-col title
+    + 2-col body + 1-col footer with continuous breaks) is not
+    constructible via the Phase-1 worker command vocabulary —
+    `SET_COLUMNS` mutates the existing section's `<w:cols>` but
+    there is no `INSERT_SECTION_BREAK` command. Wiring a
+    `LOAD_DOCX` fixture is out of L2.3's bounded scope. The tier-A
+    farm sweep (11/11 at 0.000 %) provides the no-regression guard;
+    native tests cover the math directly. Tracked as a follow-up if
+    a multi-section visual-diff harness becomes worthwhile.
+  - **Greedy-v1 imbalance caveat.** Pathological block-size mixes
+    can leave one column up to `max(block_height)` taller than the
+    target. Documented in the method's doc comment; Knuth-LP
+    balance is a follow-up if real corpora surface unacceptable
+    cases.
+  - CI gates: `cargo test --workspace --lib` 278+ tests
+    (layout 32 → 35); `cargo clippy --workspace --all-targets --
+    -D warnings` clean; `cargo fmt --all -- --check` clean;
+    `cargo run -p shape-regression --release` 6/6; `cargo run -p
+    roundtrip --release` PASS; visual-diff tier A 11/11 at
+    0.000 %; `wasm-pack build --release` artifact at 5.99 MiB / 15
+    MiB budget.
 
 - **2026-05-27 — L2.2 (#7) landed.**
   - `crates/engine-wasm/src/lib.rs::autofit_distribute` rewritten with
