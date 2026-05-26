@@ -1,0 +1,15 @@
+.nge-vscript {
+    display: inline-flex;
+    gap: 2px;
+}
+
+.nge-vscript__btn {
+    font-feature-settings: "sups" 0, "subs" 0;
+    letter-spacing: 0;
+}
+
+.nge-vscript__btn sup,
+.nge-vscript__btn sub {
+    font-size: 0.7em;
+    margin-left: 1px;
+}

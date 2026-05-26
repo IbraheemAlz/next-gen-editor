@@ -104,13 +104,17 @@ export function TablePanel(props: { client: EngineClient; store: EngineStore }) 
         const path = targetPath();
         if (!path) return;
         const row = clampCell(table()!, from()).row;
-        dispatch({ type: 'INSERT_ROW', table_path: path, after_row: Math.max(0, row - 1) });
+        /* Sprint 2 hotfix: explicit Before/After side replaces the
+         * old `after_row: row - 1` shape that mis-inserted on row 0
+         * (and would have underflowed on the wire as a negative
+         * `Number` into a `u32` field). */
+        dispatch({ type: 'INSERT_ROW', table_path: path, row, side: 'Before' });
     };
     const insertRowBelow = (): void => {
         const path = targetPath();
         if (!path) return;
         const row = clampCell(table()!, from()).row;
-        dispatch({ type: 'INSERT_ROW', table_path: path, after_row: row });
+        dispatch({ type: 'INSERT_ROW', table_path: path, row, side: 'After' });
     };
     const deleteRow = (): void => {
         const path = targetPath();
@@ -122,13 +126,13 @@ export function TablePanel(props: { client: EngineClient; store: EngineStore }) 
         const path = targetPath();
         if (!path) return;
         const col = clampCell(table()!, from()).col;
-        dispatch({ type: 'INSERT_COLUMN', table_path: path, after_col: Math.max(0, col - 1) });
+        dispatch({ type: 'INSERT_COLUMN', table_path: path, col, side: 'Before' });
     };
     const insertColRight = (): void => {
         const path = targetPath();
         if (!path) return;
         const col = clampCell(table()!, from()).col;
-        dispatch({ type: 'INSERT_COLUMN', table_path: path, after_col: col });
+        dispatch({ type: 'INSERT_COLUMN', table_path: path, col, side: 'After' });
     };
     const deleteCol = (): void => {
         const path = targetPath();

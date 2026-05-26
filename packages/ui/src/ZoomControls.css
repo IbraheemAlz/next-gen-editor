@@ -1,0 +1,25 @@
+.nge-zoom {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+    padding: var(--nge-space-1);
+    background: var(--nge-color-surface);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+}
+
+.nge-zoom__select {
+    height: 26px;
+    padding: 0 var(--nge-space-2);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    background: var(--nge-color-bg);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm)/1 var(--nge-font-ui);
+    cursor: pointer;
+}
+
+.nge-zoom__select:focus-visible {
+    outline: 2px solid var(--nge-color-primary);
+    outline-offset: 1px;
+}

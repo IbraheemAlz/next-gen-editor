@@ -1,0 +1,59 @@
+.nge-settings {
+    position: relative;
+    display: inline-flex;
+}
+
+.nge-settings__menu {
+    position: absolute;
+    bottom: calc(100% + var(--nge-space-1));
+    right: 0;
+    z-index: var(--nge-z-popover);
+    min-width: 280px;
+    padding: var(--nge-space-3);
+    background: var(--nge-color-bg);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-md);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm)/1.4 var(--nge-font-ui);
+}
+
+.nge-settings__section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--nge-space-2);
+}
+
+.nge-settings__heading {
+    font-size: var(--nge-font-size-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--nge-color-text-muted);
+}
+
+.nge-settings__row {
+    display: flex;
+    gap: var(--nge-space-2);
+    flex-wrap: wrap;
+}
+
+.nge-settings__current {
+    color: var(--nge-color-text);
+}
+
+.nge-settings__action {
+    flex: 1 1 auto;
+}
+
+.nge-settings__hint {
+    color: var(--nge-color-text-muted);
+    font-size: var(--nge-font-size-xs);
+    line-height: 1.4;
+}
+
+.nge-settings__separator {
+    height: 1px;
+    margin: var(--nge-space-3) 0;
+    background: var(--nge-color-border);
+}

@@ -17,6 +17,8 @@
     "vite-plugin-solid": "^2.11.12"
   },
   "dependencies": {
+    "@nge/core": "workspace:*",
+    "@nge/ui": "workspace:*",
     "solid-js": "^1.9.13"
   }
 }

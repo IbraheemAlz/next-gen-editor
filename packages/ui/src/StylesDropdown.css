@@ -1,0 +1,72 @@
+.nge-styles {
+    position: relative;
+    display: inline-flex;
+}
+
+.nge-styles__trigger {
+    min-width: 130px;
+    justify-content: space-between;
+    gap: var(--nge-space-2);
+}
+
+.nge-styles__chevron {
+    color: var(--nge-color-text-muted);
+    font-size: 10px;
+}
+
+.nge-styles__menu {
+    position: absolute;
+    top: calc(100% + var(--nge-space-1));
+    left: 0;
+    z-index: var(--nge-z-popover);
+    min-width: 220px;
+    margin: 0;
+    padding: var(--nge-space-1);
+    list-style: none;
+    background: var(--nge-color-bg);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-md);
+}
+
+.nge-styles__item {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: 36px;
+    padding: var(--nge-space-1) var(--nge-space-3);
+    border: none;
+    border-radius: var(--nge-radius-sm);
+    background: transparent;
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm)/1 var(--nge-font-ui);
+    text-align: left;
+    cursor: pointer;
+}
+
+.nge-styles__item:hover,
+.nge-styles__item[aria-checked="true"] {
+    background: var(--nge-color-surface-alt);
+}
+
+.nge-styles__preview {
+    line-height: 1.2;
+    color: var(--nge-color-text);
+}
+
+.nge-styles__note {
+    margin-top: var(--nge-space-1);
+    padding: var(--nge-space-2) var(--nge-space-3);
+    border-top: 1px solid var(--nge-color-border);
+    color: var(--nge-color-text-muted);
+    font-size: var(--nge-font-size-xs);
+    line-height: 1.4;
+}
+
+.nge-styles__note code {
+    background: var(--nge-color-surface-alt);
+    padding: 1px 4px;
+    border-radius: var(--nge-radius-sm);
+    font-family: var(--nge-font-mono);
+    font-size: 11px;
+}

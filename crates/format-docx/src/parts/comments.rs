@@ -73,6 +73,11 @@ pub fn parse_comments_xml(xml: &[u8]) -> Result<CommentDefinitions, DocxError> {
                                 author: std::mem::take(&mut cur_author),
                                 date: std::mem::take(&mut cur_date),
                                 paragraphs: std::mem::take(&mut cur_paras),
+                                /* `resolved` round-trip lives in
+                                 * `commentsExtended.xml` per OOXML; the
+                                 * Sprint 7 path tracks it in-memory only.
+                                 * See Core Engine backlog issue. */
+                                resolved: false,
                             },
                         );
                     }

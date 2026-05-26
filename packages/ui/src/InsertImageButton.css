@@ -1,0 +1,8 @@
+.nge-insert-image {
+    gap: var(--nge-space-2);
+}
+
+.nge-insert-image__icon {
+    font-size: 14px;
+    line-height: 1;
+}

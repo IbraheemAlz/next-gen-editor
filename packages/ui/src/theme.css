@@ -1,0 +1,121 @@
+/*
+ * @nge/ui — theme tokens.
+ *
+ * Every visual constant in the default UI lives here as a CSS custom
+ * property on `:root` (or `.nge-root` when consumers want to scope the
+ * theme to a sub-tree). Components reference tokens by var() and never
+ * hard-code colours, radii, or fonts.
+ *
+ * Naming: --nge-<scope>-<role>. E.g. --nge-color-primary,
+ * --nge-radius-md, --nge-toolbar-height.
+ *
+ * Override at the consumer site:
+ *
+ *   <div class="nge-root" style={{ "--nge-color-primary": "#7c3aed" }}>
+ *     ...
+ *   </div>
+ */
+
+:root,
+.nge-root {
+    /* Colour */
+    --nge-color-bg:           #ffffff;
+    --nge-color-surface:      #f8fafc;
+    --nge-color-surface-alt:  #f1f5f9;
+    --nge-color-border:       #e2e8f0;
+    --nge-color-border-strong:#cbd5e1;
+    --nge-color-text:         #0f172a;
+    --nge-color-text-muted:   #475569;
+    --nge-color-primary:      #2563eb;
+    --nge-color-primary-hover:#1d4ed8;
+    --nge-color-danger:       #dc2626;
+    --nge-color-success:      #16a34a;
+    --nge-color-warning:      #d97706;
+    --nge-color-accent-ins:   #16a34a;
+    --nge-color-accent-del:   #dc2626;
+    --nge-color-comment-bg:   #fef9c3;
+    --nge-color-overlay:      rgba(15, 23, 42, 0.06);
+
+    /* Typography */
+    --nge-font-ui:            ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --nge-font-mono:          ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --nge-font-size-xs:       11px;
+    --nge-font-size-sm:       12px;
+    --nge-font-size-md:       13px;
+    --nge-font-size-lg:       15px;
+
+    /* Spacing */
+    --nge-space-1:            4px;
+    --nge-space-2:            8px;
+    --nge-space-3:            12px;
+    --nge-space-4:            16px;
+    --nge-space-5:            24px;
+
+    /* Radius */
+    --nge-radius-sm:          3px;
+    --nge-radius-md:          5px;
+    --nge-radius-lg:          8px;
+
+    /* Elevation */
+    --nge-shadow-sm:          0 1px 2px rgba(15, 23, 42, 0.06);
+    --nge-shadow-md:          0 4px 12px rgba(15, 23, 42, 0.10);
+    --nge-shadow-lg:          0 12px 32px rgba(15, 23, 42, 0.16);
+
+    /* Layout */
+    --nge-toolbar-height:     40px;
+    --nge-sidebar-width:      280px;
+    --nge-hud-min-width:      220px;
+
+    /* Motion */
+    --nge-transition-fast:    120ms ease-out;
+    --nge-transition-base:    180ms ease-out;
+    --nge-z-overlay:          900;
+    --nge-z-popover:          1000;
+    --nge-z-hud:              1100;
+}
+
+/* Base button reset shared by every component. Keeps the prefix
+ * discipline tight; never bleeds onto host-app buttons. */
+.nge-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--nge-space-1);
+    height: 28px;
+    padding: 0 var(--nge-space-2);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    background: var(--nge-color-surface);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm)/1 var(--nge-font-ui);
+    cursor: pointer;
+    user-select: none;
+    transition: background var(--nge-transition-fast),
+                border-color var(--nge-transition-fast);
+}
+
+.nge-btn:hover {
+    background: var(--nge-color-surface-alt);
+    border-color: var(--nge-color-border-strong);
+}
+
+.nge-btn:focus-visible {
+    outline: 2px solid var(--nge-color-primary);
+    outline-offset: 1px;
+}
+
+.nge-btn[data-active="true"] {
+    background: var(--nge-color-primary);
+    border-color: var(--nge-color-primary);
+    color: #ffffff;
+}
+
+.nge-btn[disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.nge-btn--icon {
+    width: 28px;
+    padding: 0;
+}

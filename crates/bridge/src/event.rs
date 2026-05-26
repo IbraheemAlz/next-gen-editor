@@ -268,6 +268,16 @@ pub struct EngineStats {
     pub fonts_resident: u32,
     pub last_paint_ms: f32,
     pub last_command_ms: f32,
+    /// Sprint 8 (UI Edition) — total paragraph count across the
+    /// active document, including paragraphs nested in tables.
+    pub paragraph_count: u32,
+    /// Sprint 8 (UI Edition) — whitespace-split word count. Cheap
+    /// and Latin-script-leaning; UAX-#29 segmentation is queued
+    /// as a follow-up.
+    pub word_count: u32,
+    /// Sprint 8 (UI Edition) — Unicode scalar character count
+    /// (matches Word's "Characters (with spaces)").
+    pub character_count: u32,
 }
 
 /// A full accessibility snapshot of the document — the structure mirrored into

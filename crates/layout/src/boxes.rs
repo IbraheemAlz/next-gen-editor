@@ -220,6 +220,11 @@ pub struct ParagraphBox {
     /// the cell-border drawing primitive. `None` ⇒ no border (the
     /// default — fast path skips stroke emission entirely).
     pub borders: Option<engine::CellBorders>,
+    /// Sprint 6 (UI Edition) — `<w:pPr><w:shd>` paragraph shading.
+    /// Renderer paints a filled rect at the paragraph's bounding
+    /// rectangle BEFORE `borders` (so the strokes draw on top of the
+    /// fill). `None` ⇒ no shading (fast path skips emission).
+    pub shading: Option<[u8; 4]>,
 }
 
 impl ParagraphBox {

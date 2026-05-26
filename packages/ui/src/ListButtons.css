@@ -1,0 +1,42 @@
+.nge-lists {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+    padding: var(--nge-space-1) var(--nge-space-2);
+    background: var(--nge-color-surface);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+}
+
+.nge-lists__btn {
+    gap: var(--nge-space-2);
+}
+
+.nge-lists__icon {
+    font-family: var(--nge-font-mono);
+    font-size: 13px;
+    line-height: 1;
+}
+
+.nge-lists__badge {
+    padding: 2px 6px;
+    background: rgba(217, 119, 6, 0.12);
+    border: 1px solid var(--nge-color-warning);
+    color: var(--nge-color-warning);
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-left: var(--nge-space-1);
+}
+
+/* Disabled buttons still need their "engine pending" badge visible
+ * with full contrast — opacity on the parent dulls everything. */
+.nge-lists__btn--disabled[disabled] {
+    opacity: 0.85;
+}
+
+.nge-lists__btn--disabled[disabled]:hover {
+    background: var(--nge-color-surface);
+}

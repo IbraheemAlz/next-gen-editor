@@ -333,17 +333,25 @@ pub enum Command {
     DeleteTable {
         path: BlockPath,
     },
+    /// Insert a row at the given `row` index, on the named `side`.
+    /// Sprint 2 (UI Edition) hotfix — replaces the previous
+    /// `after_row: u32` shape that could not express "insert before
+    /// row 0" without `0u32 - 1` underflow on the wire.
     InsertRow {
         table_path: BlockPath,
-        after_row: u32,
+        row: u32,
+        side: InsertSide,
     },
     DeleteRow {
         table_path: BlockPath,
         row: u32,
     },
+    /// Insert a column at the given `col` index, on the named `side`.
+    /// See [`Command::InsertRow`] for the same hotfix rationale.
     InsertColumn {
         table_path: BlockPath,
-        after_col: u32,
+        col: u32,
+        side: InsertSide,
     },
     DeleteColumn {
         table_path: BlockPath,
@@ -376,6 +384,122 @@ pub enum Command {
         col: u32,
         borders: BridgeCellBorders,
     },
+    /// Sprint 2 (UI Edition) — set the multi-column layout of the
+    /// section containing `at`. `count == 1` collapses to single
+    /// column (gutter ignored); `count >= 2` enables snake-flow
+    /// pagination at the given `gutter_pt`. The engine writes
+    /// `Section.columns` and the paginator picks the change up on
+    /// the next reflow.
+    SetColumns {
+        at: LogicalPos,
+        count: u8,
+        gutter_pt: f32,
+    },
+    /// Sprint 2 (UI Edition) — flip `ParaProperties.page_break_before`
+    /// on the paragraph that contains `at`. The paginator already
+    /// understands the flag (rendered from `<w:pageBreakBefore>` on
+    /// `.docx` load); this command lets the editor author one.
+    InsertPageBreak {
+        at: LogicalPos,
+    },
+    /// Sprint 2 (UI Edition) — set `<w:pPr><w:pBdr>` on every
+    /// paragraph the range spans. Mirrors `SetCellBorders` over the
+    /// paragraph-border model that shipped in Sprint 5. Pass an
+    /// all-edges-`None` `BridgeCellBorders` to clear the borders.
+    SetParagraphBorders {
+        range: LogicalRange,
+        borders: BridgeCellBorders,
+    },
+    /// Sprint 4 (UI Edition) — set `<w:pgMar>` on the section
+    /// containing `at`. All four edges in points (1 pt = 1/72 inch).
+    SetPageMargins {
+        at: LogicalPos,
+        top_pt: f32,
+        right_pt: f32,
+        bottom_pt: f32,
+        left_pt: f32,
+    },
+    /// Sprint 4 (UI Edition) — flip page orientation on the section
+    /// containing `at`. Swaps `<w:pgSz>` width/height; margins are
+    /// preserved per-edge (no rotation — Word's behavior).
+    SetPageOrientation {
+        at: LogicalPos,
+        orientation: PageOrientation,
+    },
+    /// Sprint 5 (UI Edition) — toggle list membership on every
+    /// paragraph the range spans. `Off` clears `list_item` (works
+    /// today); `Bullet` / `Number` return `Event::Error` until
+    /// `numbering.xml` synthesis ships (tracked in the project
+    /// backlog as a Core Engine task).
+    ToggleList {
+        range: LogicalRange,
+        kind: ListKind,
+    },
+    /// Sprint 6 (UI Edition) — set `<w:pPr><w:ind>` on every
+    /// paragraph the range spans. All values in points. Negative
+    /// `first_line_pt` populates `<w:hanging>`; non-negative
+    /// populates `<w:firstLine>` (Word's mutually-exclusive
+    /// semantics — engine handles the swap).
+    SetParagraphIndent {
+        range: LogicalRange,
+        start_pt: f32,
+        end_pt: f32,
+        first_line_pt: f32,
+    },
+    /// Sprint 6 (UI Edition) — set line spacing as a multiplier of
+    /// single-line height (1.0 = single, 1.5 = one-and-a-half,
+    /// 2.0 = double). Multiplier `<= 0.0` clears the line-height
+    /// override (paragraph inherits the renderer default).
+    SetLineSpacing {
+        range: LogicalRange,
+        multiplier: f32,
+    },
+    /// Sprint 6 (UI Edition) — set `<w:pPr><w:shd w:fill>` paragraph
+    /// background colour. `None` clears the shading.
+    SetParagraphShading {
+        range: LogicalRange,
+        color: Option<Color>,
+    },
+    /// Sprint 7 (UI Edition) — toggle the engine's tracked-changes
+    /// RECORDING flag. Currently returns `Event::Error` until the
+    /// recording infrastructure (gating every edit into
+    /// `<w:ins>`/`<w:del>`) ships — see project backlog.
+    ToggleTrackChanges {
+        enabled: bool,
+    },
+    /// Sprint 7 (UI Edition) — accept a tracked-change revision
+    /// addressed by top-level `block` index + byte `start` + byte
+    /// `end`. Insert+Accept keeps text; Delete+Accept removes it.
+    AcceptRevision {
+        block: u32,
+        start: u32,
+        end: u32,
+    },
+    /// Sprint 7 (UI Edition) — reject a tracked-change revision.
+    /// Insert+Reject removes text; Delete+Reject keeps it.
+    RejectRevision {
+        block: u32,
+        start: u32,
+        end: u32,
+    },
+    /// Sprint 7 (UI Edition) — insert a new `<w:comment>` anchored
+    /// to `range`. Engine assigns a fresh sequential `w:id`.
+    InsertComment {
+        range: LogicalRange,
+        text: String,
+        author: String,
+    },
+    /// Sprint 7 (UI Edition) — delete a comment by id.
+    DeleteComment {
+        id: u32,
+    },
+    /// Sprint 7 (UI Edition) — toggle the in-memory `resolved` flag
+    /// on a comment. NOT yet round-tripped to `commentsExtended.xml`
+    /// — see project backlog.
+    ResolveComment {
+        id: u32,
+        resolved: bool,
+    },
 }
 
 /// Wire shape for `engine::CellBorders` — per-edge strokes for one
@@ -397,6 +521,45 @@ pub struct BridgeBorderStroke {
     pub style: BridgeBorderStyle,
     pub size_eighth_pt: u16,
     pub color: Option<Color>,
+}
+
+/// Sprint 5 (UI Edition) — list kind for [`Command::ToggleList`].
+/// `Off` clears the paragraph's `list_item`; `Bullet` / `Number`
+/// would bind to a `<w:abstractNum>` entry but require a numbering
+/// synthesis path the engine does not yet ship — those variants
+/// surface a clear "engine pending" error on dispatch.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListKind {
+    #[default]
+    Off,
+    Bullet,
+    Number,
+}
+
+/// Sprint 4 (UI Edition) — page orientation enum for
+/// [`Command::SetPageOrientation`]. Portrait keeps the section's
+/// page dimensions as-is when width ≤ height; Landscape forces
+/// width > height. The handler swaps when needed and is a no-op
+/// when the page already matches.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PageOrientation {
+    #[default]
+    Portrait,
+    Landscape,
+}
+
+/// Sprint 2 (UI Edition) hotfix — anchor side for `InsertRow` /
+/// `InsertColumn`. The previous `after_row: u32` / `after_col: u32`
+/// shape could not represent "insert before row/column 0" because the
+/// wire type is unsigned; callers were forced into `0 - 1` math that
+/// would either underflow in Rust or be rejected by serde when
+/// arriving as a negative `Number`. Tsify renders this enum as
+/// `"Before" | "After"`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InsertSide {
+    #[default]
+    After,
+    Before,
 }
 
 /// Wire shape for `engine::BorderStyle`. PR 3b ships the common

@@ -100,6 +100,11 @@ pub struct CommentDef {
     pub author: String,
     pub date: String,
     pub paragraphs: Vec<String>,
+    /// Sprint 7 (UI Edition) — in-memory resolved flag. NOT yet
+    /// round-tripped to `commentsExtended.xml` (`<w15:commentEx
+    /// done="true"/>`); preserved across the active session only.
+    /// Tracked as a Core Engine task.
+    pub resolved: bool,
 }
 
 /// Phase 8a — one `<w:commentRangeStart>` / `<w:commentRangeEnd>` overlay
@@ -940,6 +945,12 @@ pub struct ParaProperties {
     /// document parser folds this into `Paragraph.list_item` when no
     /// direct `<w:pPr><w:numPr>` appears on the paragraph itself.
     pub list_item: Option<ListItem>,
+    /// Sprint 6 (UI Edition) — `<w:pPr><w:shd w:fill>` paragraph
+    /// background fill. `None` ⇒ transparent (the implicit default).
+    /// Mirror of the cell-shading model; the renderer paints a filled
+    /// rect at the paragraph's bounding rectangle before drawing the
+    /// `<w:pBdr>` strokes.
+    pub shading: Option<[u8; 4]>,
 }
 
 impl ParaProperties {
@@ -956,6 +967,7 @@ impl ParaProperties {
     /// acceptable for Phase 3; Phase 4+ may widen to `Option`.
     pub fn merged_with(self, patch: ParaProperties) -> ParaProperties {
         ParaProperties {
+            shading: patch.shading.or(self.shading),
             alignment: patch.alignment.or(self.alignment),
             indent: if patch.indent == Indent::default() {
                 self.indent
@@ -1858,6 +1870,32 @@ impl DocumentTree {
         self.blocks.len() as u32
     }
 
+    /// Sprint 8 (UI Edition) — total character count across every
+    /// paragraph in the document, including paragraphs nested in
+    /// table cells. Counts Unicode scalars (`char`s), not bytes —
+    /// matches Word's "Characters (no spaces)" minus the no-space
+    /// filter. Cheap O(n) walk.
+    pub fn character_count(&self) -> u32 {
+        let mut n = 0u32;
+        walk_paragraphs(&self.blocks, &mut |p| {
+            n = n.saturating_add(p.text.chars().count() as u32);
+        });
+        n
+    }
+
+    /// Sprint 8 (UI Edition) — total word count via whitespace
+    /// splitting. Cheap; matches Word's count closely for Latin
+    /// scripts. Arabic / CJK word boundaries deserve UAX-#29
+    /// segmentation (the engine already ships a `LineSegmenter`)
+    /// — `word_count_uax` is the future-proof slot for that.
+    pub fn word_count(&self) -> u32 {
+        let mut n = 0u32;
+        walk_paragraphs(&self.blocks, &mut |p| {
+            n = n.saturating_add(p.text.split_whitespace().count() as u32);
+        });
+        n
+    }
+
     /// The Nth `Block::Paragraph`, skipping tables. Phase 5 PR 1 shim
     /// that keeps Phase 1-4 callers working unchanged. Phase 5 PR 3
     /// widens callers to `BlockPath`.
@@ -2108,6 +2146,669 @@ impl DocumentTree {
         } else {
             let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
                 para.props.direction = Some(direction);
+            });
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 2 (UI Edition) — set `Section.columns` for the section
+    /// containing the top-level block step at `pos`. `count == 0`
+    /// collapses to single column (matches `ColumnSpec::from_twips`
+    /// defensive clamping). The paginator picks the new geometry up
+    /// on the next reflow.
+    pub fn set_section_columns_at(&self, pos: LogicalPos, count: u8, gutter_pt: f32) -> Self {
+        let block_idx = pos
+            .path
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                PathStep::Block(n) => Some(*n),
+                PathStep::Cell { .. } => None,
+            })
+            .unwrap_or(0);
+        let mut sections = self.sections.clone();
+        let section_idx = sections
+            .iter()
+            .position(|s| s.start_block <= block_idx && block_idx < s.end_block)
+            .or_else(|| sections.len().checked_sub(1));
+        if let Some(idx) = section_idx
+            && let Some(s) = sections.get_mut(idx)
+        {
+            s.columns = ColumnSpec {
+                count: count.max(1),
+                gutter_pt,
+            };
+        }
+        Self {
+            blocks: self.blocks.clone(),
+            sections,
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 2 (UI Edition) — set `ParaProperties.page_break_before`
+    /// on the paragraph identified by `pos`. The flag is already
+    /// honoured by the paginator (renders from `<w:pageBreakBefore>`
+    /// on `.docx` load); this method is what the editor calls when the
+    /// user inserts a page break via `Ctrl+Enter`.
+    pub fn set_page_break_before(&self, pos: LogicalPos, value: bool) -> Self {
+        let mut blocks = self.blocks.clone();
+        let _ = mutate_paragraph_in_top(&mut blocks, &pos.path, |para| {
+            para.props.page_break_before = value;
+        });
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /* ===========================================================
+    Sprint 7 (UI Edition) — review mutators.
+    Track changes RECORDING (gating new edits as `<w:ins>`/`<w:del>`)
+    is a separate Core Engine task and is NOT implemented here; the
+    bridge `ToggleTrackChanges` surfaces an Error. The mutators
+    below operate on revisions and comments already present in the
+    `DocumentTree`.
+    =========================================================== */
+
+    /// Accept a tracked-change revision identified by (top-level
+    /// `block`, byte `start`, byte `end`). Semantics:
+    ///   - `Insert + Accept` → keep the inserted text, drop the overlay
+    ///   - `Delete + Accept` → drop the deleted text + drop the overlay
+    pub fn accept_revision_at(&self, block: u32, start: u32, end: u32) -> Self {
+        self.apply_revision_decision(block, start, end, /* accept = */ true)
+    }
+
+    /// Reject a tracked-change revision identified by (top-level
+    /// `block`, byte `start`, byte `end`). Semantics:
+    ///   - `Insert + Reject` → drop the inserted text + drop the overlay
+    ///   - `Delete + Reject` → keep the original text, drop the overlay
+    pub fn reject_revision_at(&self, block: u32, start: u32, end: u32) -> Self {
+        self.apply_revision_decision(block, start, end, /* accept = */ false)
+    }
+
+    fn apply_revision_decision(
+        &self,
+        block: u32,
+        start: u32,
+        end: u32,
+        accept: bool,
+    ) -> Self {
+        let mut blocks = self.blocks.clone();
+        let path = BlockPath::top(block);
+        let _ = mutate_paragraph_in_top(&mut blocks, &path, |para| {
+            let Some(idx) = para
+                .revisions
+                .iter()
+                .position(|r| r.start == start && r.end == end)
+            else {
+                return;
+            };
+            /* Remove the matched revision FIRST so the offset-shift
+             * helper does not also `retain`-drop it (which would make
+             * any post-shift index lookup brittle). */
+            let rev = para.revisions.remove(idx);
+            let delete_text = match (rev.kind, accept) {
+                (RevisionKind::Insert, false) => true, // Reject Insert
+                (RevisionKind::Delete, true) => true,  // Accept Delete
+                _ => false,                            // text stays live
+            };
+            if delete_text {
+                let s = (rev.start as usize).min(para.text.len());
+                let e = (rev.end as usize).min(para.text.len());
+                if s < e {
+                    let removed_len = (e - s) as u32;
+                    para.text.replace_range(s..e, "");
+                    shift_paragraph_offsets_after(para, rev.start, removed_len);
+                }
+            }
+            para.dirty = true;
+        });
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 7 (UI Edition) — append a new comment anchored to a
+    /// logical range. Picks a fresh `id` (max existing + 1) and
+    /// installs both a `CommentDef` (with `paragraphs = [text]`)
+    /// and a matching `CommentRange`. Returns `(new_doc, id)`.
+    pub fn insert_comment(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        text: String,
+        author: String,
+        date: String,
+    ) -> (Self, u32) {
+        let (start, end) = order_positions(start, end);
+        let new_id = self
+            .comment_defs
+            .keys()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut comment_defs = self.comment_defs.clone();
+        comment_defs.insert(
+            new_id,
+            CommentDef {
+                author,
+                date,
+                paragraphs: vec![text],
+                resolved: false,
+            },
+        );
+        let mut comment_ranges = self.comment_ranges.clone();
+        comment_ranges.push(CommentRange {
+            id: new_id,
+            start,
+            end,
+        });
+        let doc = Self {
+            blocks: self.blocks.clone(),
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs,
+            comment_ranges,
+            settings: self.settings.clone(),
+        };
+        (doc, new_id)
+    }
+
+    /// Sprint 7 (UI Edition) — remove a comment by id from both
+    /// `comment_defs` and `comment_ranges`.
+    pub fn delete_comment(&self, id: u32) -> Self {
+        let mut comment_defs = self.comment_defs.clone();
+        comment_defs.remove(&id);
+        let mut comment_ranges = self.comment_ranges.clone();
+        comment_ranges.retain(|r| r.id != id);
+        Self {
+            blocks: self.blocks.clone(),
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs,
+            comment_ranges,
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 7 (UI Edition) — set the in-memory `resolved` flag on
+    /// the comment with the given id. No `commentsExtended.xml`
+    /// round-trip yet — see Core Engine backlog.
+    pub fn set_comment_resolved(&self, id: u32, resolved: bool) -> Self {
+        let mut comment_defs = self.comment_defs.clone();
+        if let Some(cd) = comment_defs.get_mut(&id) {
+            cd.resolved = resolved;
+        }
+        Self {
+            blocks: self.blocks.clone(),
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs,
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 6 (UI Edition) — set `<w:pPr><w:ind>` (paragraph
+    /// indentation) on every paragraph the range spans. Values in pt
+    /// (1 pt = 20 twips). `first_line_pt > 0` populates
+    /// `first_line_twips`; `first_line_pt < 0` populates
+    /// `hanging_twips` with `|first_line_pt| * 20` (Word's mutually-
+    /// exclusive `<w:firstLine>` vs `<w:hanging>` semantics).
+    pub fn set_paragraph_indent(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        start_pt: f32,
+        end_pt: f32,
+        first_line_pt: f32,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        let start_twips = (start_pt.max(0.0) * 20.0).round() as i32;
+        let end_twips = (end_pt.max(0.0) * 20.0).round() as i32;
+        let (first_line_twips, hanging_twips) = if first_line_pt >= 0.0 {
+            ((first_line_pt * 20.0).round() as i32, 0)
+        } else {
+            (0, (-first_line_pt * 20.0).round() as i32)
+        };
+        let mut blocks = self.blocks.clone();
+        let apply = |para: &mut Paragraph| {
+            para.props.indent = Indent {
+                start_twips,
+                end_twips,
+                first_line_twips,
+                hanging_twips,
+            };
+        };
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 6 (UI Edition) — set `<w:pPr><w:spacing w:line>` as an
+    /// `Auto` (multiplier) line height. 240 twips = single (1.0×).
+    /// Pass `multiplier <= 0.0` to clear (`line_height: None`).
+    pub fn set_line_spacing(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        multiplier: f32,
+    ) -> Self {
+        let target = if multiplier > 0.0 {
+            Some(LineHeight::Auto {
+                twips: (multiplier * 240.0).round() as i32,
+            })
+        } else {
+            None
+        };
+        let (start, end) = order_positions(start, end);
+        let mut blocks = self.blocks.clone();
+        let apply = |para: &mut Paragraph| {
+            para.props.line_height = target;
+        };
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 6 (UI Edition) — set `<w:pPr><w:shd>` (paragraph
+    /// shading) on every paragraph the range spans. `None` clears.
+    pub fn set_paragraph_shading(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        color: Option<[u8; 4]>,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        let mut blocks = self.blocks.clone();
+        let apply = |para: &mut Paragraph| {
+            para.props.shading = color;
+        };
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 5 (UI Edition) — clear `list_item` on every paragraph
+    /// the range spans. The engine has no numbering synthesizer
+    /// today, so this is the only list mutation that is safe to
+    /// expose: removing list membership cannot introduce a dangling
+    /// `num_id`. Adding list membership is filed as a Core Engine
+    /// task (see project backlog).
+    pub fn clear_list_item_on_range(&self, start: LogicalPos, end: LogicalPos) -> Self {
+        let (start, end) = order_positions(start, end);
+        let mut blocks = self.blocks.clone();
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+                    para.list_item = None;
+                    para.resolved_marker = None;
+                });
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
+                para.list_item = None;
+                para.resolved_marker = None;
+            });
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 4 (UI Edition) — set `<w:pgMar>` (top/right/bottom/left
+    /// in points) on the section containing the top-level block step
+    /// at `pos`. Header/footer offsets are preserved.
+    pub fn set_section_margins_at(
+        &self,
+        pos: LogicalPos,
+        top_pt: f32,
+        right_pt: f32,
+        bottom_pt: f32,
+        left_pt: f32,
+    ) -> Self {
+        let block_idx = pos
+            .path
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                PathStep::Block(n) => Some(*n),
+                PathStep::Cell { .. } => None,
+            })
+            .unwrap_or(0);
+        let mut sections = self.sections.clone();
+        let section_idx = sections
+            .iter()
+            .position(|s| s.start_block <= block_idx && block_idx < s.end_block)
+            .or_else(|| sections.len().checked_sub(1));
+        if let Some(idx) = section_idx
+            && let Some(s) = sections.get_mut(idx)
+        {
+            s.geometry.margin_top = top_pt.max(0.0);
+            s.geometry.margin_right = right_pt.max(0.0);
+            s.geometry.margin_bottom = bottom_pt.max(0.0);
+            s.geometry.margin_left = left_pt.max(0.0);
+        }
+        Self {
+            blocks: self.blocks.clone(),
+            sections,
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 4 (UI Edition) — force the orientation of the section
+    /// containing `pos`. `landscape == true` swaps width and height
+    /// when width <= height; `landscape == false` swaps the other
+    /// way. Margins are NOT rotated — Word treats `<w:pgMar>` as
+    /// edge-labelled, not paper-relative.
+    pub fn set_section_orientation_at(&self, pos: LogicalPos, landscape: bool) -> Self {
+        let block_idx = pos
+            .path
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                PathStep::Block(n) => Some(*n),
+                PathStep::Cell { .. } => None,
+            })
+            .unwrap_or(0);
+        let mut sections = self.sections.clone();
+        let section_idx = sections
+            .iter()
+            .position(|s| s.start_block <= block_idx && block_idx < s.end_block)
+            .or_else(|| sections.len().checked_sub(1));
+        if let Some(idx) = section_idx
+            && let Some(s) = sections.get_mut(idx)
+        {
+            let is_landscape = s.geometry.width > s.geometry.height;
+            if landscape != is_landscape {
+                let (w, h) = (s.geometry.width, s.geometry.height);
+                s.geometry.width = h;
+                s.geometry.height = w;
+            }
+        }
+        Self {
+            blocks: self.blocks.clone(),
+            sections,
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 3 (UI Edition) — insert a brand-new inline image at
+    /// `pos`. Picks a fresh `rel_id` (collision-free against
+    /// `media`), inserts a U+FFFC sentinel in the paragraph text at
+    /// the byte offset, shifts existing styled spans + inline
+    /// objects + hyperlinks + revisions + fields rightward by the
+    /// sentinel's UTF-8 length, and appends a new
+    /// [`InlineKind::Image`] entry pointing at the registered blob.
+    ///
+    /// Width/height are passed in EMU (English Metric Units —
+    /// 914_400 per inch) so the model unit matches what `.docx`
+    /// readers and the renderer already expect.
+    pub fn insert_inline_image_at(
+        &self,
+        pos: LogicalPos,
+        blob: ImageBlob,
+        width_emu: i64,
+        height_emu: i64,
+    ) -> Self {
+        let mut media = self.media.clone();
+        /* Find a rel_id not already in the media map. Walk a counter
+         * past any existing `nge_img_*` keys so removal-then-insert
+         * cycles never collide. */
+        let mut counter = media.len() as u32 + 1;
+        let rel_id = loop {
+            let candidate = format!("nge_img_{counter}");
+            if !media.contains_key(&candidate) {
+                break candidate;
+            }
+            counter = counter.saturating_add(1);
+        };
+        media.insert(rel_id.clone(), blob);
+
+        let mut blocks = self.blocks.clone();
+        let target = if self.paragraph_at_path(&pos.path).is_some() {
+            pos.path.clone()
+        } else {
+            self.path_to_last_top_paragraph()
+                .unwrap_or(BlockPath::top(0))
+        };
+        const SENTINEL: char = '\u{FFFC}';
+        let sentinel_len = SENTINEL.len_utf8() as u32;
+        let off = pos.offset;
+        let rel_id_for_inline = rel_id.clone();
+        let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
+            let offset = (off as usize).min(para.text.len());
+            para.text.insert(offset, SENTINEL);
+            let off = offset as u32;
+            for s in &mut para.spans {
+                if s.start >= off {
+                    s.start += sentinel_len;
+                }
+                if s.end >= off {
+                    s.end += sentinel_len;
+                }
+            }
+            for io in &mut para.inline_objects {
+                if io.at >= off {
+                    io.at += sentinel_len;
+                }
+            }
+            for h in &mut para.hyperlinks {
+                if h.start >= off {
+                    h.start += sentinel_len;
+                }
+                if h.end >= off {
+                    h.end += sentinel_len;
+                }
+            }
+            for r in &mut para.revisions {
+                if r.start >= off {
+                    r.start += sentinel_len;
+                }
+                if r.end >= off {
+                    r.end += sentinel_len;
+                }
+            }
+            for f in &mut para.fields {
+                if f.start >= off {
+                    f.start += sentinel_len;
+                }
+                if f.end >= off {
+                    f.end += sentinel_len;
+                }
+            }
+            para.inline_objects.push(InlineObject {
+                at: off,
+                kind: InlineKind::Image {
+                    rel_id: rel_id_for_inline.clone(),
+                    width_emu,
+                    height_emu,
+                },
+            });
+            para.inline_objects.sort_by_key(|i| i.at);
+            para.dirty = true;
+        });
+
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media,
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    /// Sprint 2 (UI Edition) — set `<w:pPr><w:pBdr>` on every
+    /// paragraph the range spans. Mirrors [`Self::set_alignment`] but
+    /// writes `props.borders`. Pass `None` to clear the borders.
+    pub fn set_paragraph_borders(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        borders: Option<CellBorders>,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        let mut blocks = self.blocks.clone();
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
+                    para.props.borders = borders.clone();
+                });
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
+                para.props.borders = borders.clone();
             });
         }
         Self {
@@ -2739,10 +3440,16 @@ impl DocumentTree {
         }
     }
 
-    /// Insert a fresh row at `after_row` (or at the end when
-    /// `after_row >= row_count`). Cell count matches the existing
-    /// rows' cell count.
-    pub fn insert_row(&self, table_path: BlockPath, after_row: u32) -> Self {
+    /// Insert a fresh row at `at` (`at` is the index the new row will
+    /// occupy; existing rows at that index and below shift down). When
+    /// `at >= row_count` the row is appended. Cell count matches the
+    /// existing rows' cell count.
+    ///
+    /// Sprint 2 (UI Edition) hotfix: caller chooses Before vs After
+    /// at the bridge boundary (see [`bridge::InsertSide`]); the engine
+    /// receives a single resolved insert position in `usize` and
+    /// performs no signed arithmetic of its own.
+    pub fn insert_row(&self, table_path: BlockPath, at: usize) -> Self {
         self.mutate_table(table_path, |t| {
             let cols = t
                 .rows
@@ -2753,7 +3460,7 @@ impl DocumentTree {
                 props: RowProperties::default(),
                 cells: (0..cols).map(|_| default_table_cell()).collect(),
             };
-            let insert_at = (after_row as usize + 1).min(t.rows.len());
+            let insert_at = at.min(t.rows.len());
             t.rows.insert(insert_at, new_row);
         })
     }
@@ -2767,9 +3474,13 @@ impl DocumentTree {
         })
     }
 
-    pub fn insert_column(&self, table_path: BlockPath, after_col: u32) -> Self {
+    /// Insert a column at `at` (new column occupies that index; rows
+    /// to the right shift). When `at >= column_count` the column is
+    /// appended. Sprint 2 (UI Edition) hotfix — same rationale as
+    /// [`Self::insert_row`].
+    pub fn insert_column(&self, table_path: BlockPath, at: usize) -> Self {
         self.mutate_table(table_path, |t| {
-            let insert_at = (after_col as usize + 1).min(t.grid.len());
+            let insert_at = at.min(t.grid.len());
             /* Re-divide the A4 content width across the new column
             count so an inserted column shrinks the existing ones
             instead of pushing the table past the right margin. */
@@ -3028,6 +3739,74 @@ fn block_at_descend<'a>(block: &'a Block, steps: &[PathStep]) -> Option<&'a Bloc
     };
     let next = cell.blocks.get(n as usize)?;
     block_at_descend(next, &steps[2..])
+}
+
+/// Sprint 8 (UI Edition) helper — depth-first walk over every
+/// `Block::Paragraph` in the tree, including paragraphs nested
+/// inside `Block::Table` cells. Used by the count-style helpers
+/// that need to visit every text-bearing node regardless of
+/// container.
+fn walk_paragraphs<F: FnMut(&Paragraph)>(blocks: &Vector<Block>, f: &mut F) {
+    for b in blocks.iter() {
+        match b {
+            Block::Paragraph(p) => f(p),
+            Block::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        for nested in &cell.blocks {
+                            match nested {
+                                Block::Paragraph(p) => f(p),
+                                Block::Table(_) => {
+                                    /* Nested tables — uncommon;
+                                     * defer until a real corpus
+                                     * exercises them. */
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sprint 7 (UI Edition) helper — shift every byte-offset-bearing
+/// field on `para` LEFT by `removed_len`, for every value at or
+/// after `from`. Mirrors the rightward shift performed by
+/// `insert_inline_image_at` in reverse. Used when a tracked-change
+/// revision is rejected (Insert) or accepted (Delete) and the
+/// covered text range is sliced out.
+fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u32) {
+    let shift = |v: &mut u32| {
+        if *v >= from + removed_len {
+            *v -= removed_len;
+        } else if *v > from {
+            *v = from;
+        }
+    };
+    for s in &mut para.spans {
+        shift(&mut s.start);
+        shift(&mut s.end);
+    }
+    para.spans.retain(|s| s.start < s.end);
+    for io in &mut para.inline_objects {
+        shift(&mut io.at);
+    }
+    for h in &mut para.hyperlinks {
+        shift(&mut h.start);
+        shift(&mut h.end);
+    }
+    para.hyperlinks.retain(|h| h.start < h.end);
+    for r in &mut para.revisions {
+        shift(&mut r.start);
+        shift(&mut r.end);
+    }
+    para.revisions.retain(|r| r.start < r.end);
+    for f in &mut para.fields {
+        shift(&mut f.start);
+        shift(&mut f.end);
+    }
+    para.fields.retain(|f| f.start < f.end);
 }
 
 /// Mutate the paragraph addressed by `path` in `top` (the
@@ -4435,6 +5214,39 @@ mod tests {
         let t = d.blocks[1].as_table().unwrap();
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[1].cells.len(), 2);
+    }
+
+    /// Sprint 2 (UI Edition) hotfix — prepending a row at index 0
+    /// must NOT underflow the wire `u32` or be silently coerced to
+    /// "insert after row 0". `insert_row(path, 0)` lands the new row
+    /// at index 0; the original row shifts to index 1.
+    #[test]
+    fn insert_row_at_zero_prepends_no_underflow() {
+        let d = DocumentTree::new().insert_table(BlockPath::top(0), 2, 2);
+        let before = d.blocks[0].as_table().unwrap().clone();
+        let d = d.insert_row(BlockPath::top(0), 0);
+        let t = d.blocks[0].as_table().unwrap();
+        assert_eq!(t.rows.len(), 3, "row was not inserted");
+        assert_eq!(
+            t.rows[1].cells.len(),
+            before.rows[0].cells.len(),
+            "row 1 should be the original row 0 after prepend",
+        );
+        /* Appending at `at == row_count` lands at the end. */
+        let d = d.insert_row(BlockPath::top(0), 3);
+        let t = d.blocks[0].as_table().unwrap();
+        assert_eq!(t.rows.len(), 4);
+    }
+
+    /// Sprint 2 (UI Edition) hotfix — prepending a column at index 0
+    /// is the mirror invariant for [`insert_row_at_zero_prepends_no_underflow`].
+    #[test]
+    fn insert_column_at_zero_prepends_no_underflow() {
+        let d = DocumentTree::new().insert_table(BlockPath::top(0), 2, 2);
+        let d = d.insert_column(BlockPath::top(0), 0);
+        let t = d.blocks[0].as_table().unwrap();
+        assert_eq!(t.grid.len(), 3);
+        assert!(t.rows.iter().all(|r| r.cells.len() == 3));
     }
 
     #[test]

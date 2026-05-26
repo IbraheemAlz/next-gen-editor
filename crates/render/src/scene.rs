@@ -352,6 +352,20 @@ fn paint_border_edge(
 fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd>) {
     let para_x = base_x + para.origin.x;
     let para_y = base_y + para.origin.y;
+    /* Sprint 6 (UI Edition) — `<w:pPr><w:shd>` paragraph shading.
+    Painted BEFORE borders + glyphs so both draw on top of the fill.
+    Mirror of the cell-shading code path in `paint_table_cell`. */
+    if let Some([r, g, b, a]) = para.shading {
+        cmds.push(DisplayCmd::FillRect {
+            rect: Rect::new(
+                para_x as f64,
+                para_y as f64,
+                (para_x + para.size.width) as f64,
+                (para_y + para.size.height) as f64,
+            ),
+            paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+        });
+    }
     /* Audit gap A.M4 — `<w:pBdr>` strokes around the paragraph rect.
     Painted FIRST so the text glyphs draw on top of the border (matches
     Word's compositing order); the table-border edge primitive is

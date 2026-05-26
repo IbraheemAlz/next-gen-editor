@@ -7,10 +7,10 @@
 use bridge::{
     A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRow, A11yRun, A11yTable, A11yTree,
     Alignment as BridgeAlignment, BlockPath as BridgeBlockPath, Color, Command, Direction,
-    EngineStats, Event, FontMetrics as BridgeMetrics, LogicalPos as BridgeLogicalPos,
-    LogicalRange as BridgeLogicalRange, MoveDirection, PathStep as BridgePathStep, PdfConformance,
-    Point as BridgePoint, Rect as BridgeRect, SelectionKind, TextAttrs, TextAttrsPatch,
-    UnderlineStyle, VerticalScript,
+    DocFormat, EngineStats, Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob,
+    ImageFit, LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, MoveDirection,
+    PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
+    SelectionKind, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{
     Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
@@ -682,9 +682,11 @@ fn cell_tab_step(
         } else {
             /* Last cell + forward → append a fresh row and land on its
             first cell (Word default). */
+            /* Append a row at the end: `at = n_rows` lands after the
+             * current last row under the post-hotfix signature. */
             let new_doc = undo
                 .current()
-                .insert_row(bridge_to_engine_path(table_path.clone()), n_rows - 1);
+                .insert_row(bridge_to_engine_path(table_path.clone()), n_rows as usize);
             undo.push(new_doc);
             (n_rows, 0)
         }
@@ -3368,37 +3370,9 @@ impl Engine {
             Command::Undo => self.do_undo(),
             Command::Redo => self.do_redo(),
 
-            Command::LoadDocx { bytes } => match format_docx::read_docx(&bytes) {
-                Ok(archive) => {
-                    let paragraph_count = archive.document.paragraph_count();
-                    self.undo = UndoStack::new(archive.document, 100);
-                    /* The prior selection points into the replaced document —
-                    reset the caret to the start of the loaded one. */
-                    self.selection = Some(SelectionState {
-                        anchor: bpos_top(0, 0),
-                        caret: bpos_top(0, 0),
-                        ideal_x: None,
-                        kind: SelectionKind::Linear,
-                    });
-                    self.layout_cache.get_mut().clear();
-                    self.dirty.invalidate(full_page_rect(self.scale()));
-                    self.maybe_repaint();
-                    Event::DocumentLoaded { paragraph_count }
-                }
-                Err(e) => Event::Error {
-                    message: format!("LoadDocx: {e}"),
-                },
-            },
+            Command::LoadDocx { bytes } => self.load_docx_bytes(&bytes, "LoadDocx"),
 
-            Command::SaveDocx => match build_minimal_docx(self.undo.current()) {
-                Ok(bytes) => {
-                    let size = bytes.len() as u32;
-                    Event::DocumentSaved { bytes, size }
-                }
-                Err(e) => Event::Error {
-                    message: format!("SaveDocx: {e}"),
-                },
-            },
+            Command::SaveDocx => self.save_docx_bytes("SaveDocx"),
 
             // ===============================================================
             // Phase 2 schema stubs — PHASE_2_BRIDGE_MEMORY.md §4.
@@ -3409,8 +3383,30 @@ impl Engine {
             Command::Recover { .. } => phase3_stub("Recover"),
             Command::Dispose => phase3_stub("Dispose"),
             Command::Tick { .. } => phase3_stub("Tick"),
-            Command::OpenDocument { .. } => phase3_stub("OpenDocument"),
-            Command::SaveDocument { .. } => phase3_stub("SaveDocument"),
+            // Sprint 3 (UI Edition) — Document I/O. OpenDocument /
+            // SaveDocument route to the existing legacy load/save_docx
+            // pipelines for the Docx format. PlainText + HTML report a
+            // clear "not yet implemented" error (tracked in the project
+            // backlog as a Core Engine task; see UI_SURFACE_MAPPING.md).
+            Command::OpenDocument { bytes, format, name: _ } => match format {
+                DocFormat::Docx => self.load_docx_bytes(&bytes, "OpenDocument"),
+                other => Event::Error {
+                    message: format!(
+                        "OpenDocument: format {other:?} not supported — only Docx ships today"
+                    ),
+                },
+            },
+            Command::SaveDocument { format } => match format {
+                DocFormat::Docx => self.save_docx_bytes("SaveDocument"),
+                DocFormat::Pdf => Event::Error {
+                    message: "SaveDocument: use ExportPdf for PDF output".into(),
+                },
+                other => Event::Error {
+                    message: format!(
+                        "SaveDocument: format {other:?} serializer not yet implemented"
+                    ),
+                },
+            },
             Command::ExportPdf { conformance } => self.do_export_pdf(conformance),
             Command::CloseDocument => phase3_stub("CloseDocument"),
             Command::DeleteRange { range } => self.do_delete_range(range),
@@ -3418,7 +3414,10 @@ impl Engine {
             Command::ApplyFormatting { range, attrs } => self.apply_formatting(range, attrs),
             Command::SplitParagraph { at } => self.do_split_paragraph(at),
             Command::MergeParagraph { .. } => phase3_stub("MergeParagraph"),
-            Command::InsertImage { .. } => phase3_stub("InsertImage"),
+            // Sprint 3 (UI Edition) — wired now (was a Phase 3 stub
+            // through Sprint 1, which silently broke the InsertImageButton
+            // I shipped over it).
+            Command::InsertImage { at, image, fit } => self.do_insert_image(at, image, fit),
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => self.do_select_all(),
@@ -3429,7 +3428,9 @@ impl Engine {
             }
             Command::EndComposition { commit } => self.do_end_composition(commit),
             Command::SetViewport { rect } => self.do_set_viewport(rect),
-            Command::SetZoom { .. } => phase3_stub("SetZoom"),
+            // Sprint 3 (UI Edition) — wired now (Sprint 1 shipped the
+            // ZoomControls component over a stubbed dispatch).
+            Command::SetZoom { scale } => self.do_set_zoom(scale),
             Command::RequestPaint { viewport, dirty } => self.do_request_paint(viewport, dirty),
             Command::ExpandLayout { target_y } => self.do_expand_layout(target_y),
             Command::UnloadFont { .. } => phase3_stub("UnloadFont"),
@@ -3472,13 +3473,15 @@ impl Engine {
             Command::DeleteTable { path } => self.do_delete_table(path),
             Command::InsertRow {
                 table_path,
-                after_row,
-            } => self.do_insert_row(table_path, after_row),
+                row,
+                side,
+            } => self.do_insert_row(table_path, row, side),
             Command::DeleteRow { table_path, row } => self.do_delete_row(table_path, row),
             Command::InsertColumn {
                 table_path,
-                after_col,
-            } => self.do_insert_column(table_path, after_col),
+                col,
+                side,
+            } => self.do_insert_column(table_path, col, side),
             Command::DeleteColumn { table_path, col } => self.do_delete_column(table_path, col),
             Command::MergeCells {
                 table_path,
@@ -3504,6 +3507,69 @@ impl Engine {
                 col,
                 borders,
             } => self.do_set_cell_borders(table_path, row, col, borders),
+
+            // Sprint 2 (UI Edition) — layout authoring commands.
+            Command::SetColumns {
+                at,
+                count,
+                gutter_pt,
+            } => self.do_set_columns(at, count, gutter_pt),
+            Command::InsertPageBreak { at } => self.do_insert_page_break(at),
+            Command::SetParagraphBorders { range, borders } => {
+                self.do_set_paragraph_borders(range, borders)
+            }
+
+            // Sprint 4 (UI Edition) — page setup commands.
+            Command::SetPageMargins {
+                at,
+                top_pt,
+                right_pt,
+                bottom_pt,
+                left_pt,
+            } => self.do_set_page_margins(at, top_pt, right_pt, bottom_pt, left_pt),
+            Command::SetPageOrientation { at, orientation } => {
+                self.do_set_page_orientation(at, orientation)
+            }
+
+            // Sprint 5 (UI Edition) — list toggle. Off path mutates
+            // the model; Bullet / Number return Error until the
+            // numbering synthesizer ships.
+            Command::ToggleList { range, kind } => self.do_toggle_list(range, kind),
+
+            // Sprint 6 (UI Edition) — paragraph indent, line spacing,
+            // shading.
+            Command::SetParagraphIndent {
+                range,
+                start_pt,
+                end_pt,
+                first_line_pt,
+            } => self.do_set_paragraph_indent(range, start_pt, end_pt, first_line_pt),
+            Command::SetLineSpacing { range, multiplier } => {
+                self.do_set_line_spacing(range, multiplier)
+            }
+            Command::SetParagraphShading { range, color } => {
+                self.do_set_paragraph_shading(range, color)
+            }
+
+            // Sprint 7 (UI Edition) — review commands.
+            Command::ToggleTrackChanges { enabled } => Event::Error {
+                message: format!(
+                    "ToggleTrackChanges({enabled}): tracked-change RECORDING not yet implemented — see Core: gate edits into <w:ins>/<w:del>"
+                ),
+            },
+            Command::AcceptRevision { block, start, end } => {
+                self.do_accept_revision(block, start, end)
+            }
+            Command::RejectRevision { block, start, end } => {
+                self.do_reject_revision(block, start, end)
+            }
+            Command::InsertComment { range, text, author } => {
+                self.do_insert_comment(range, text, author)
+            }
+            Command::DeleteComment { id } => self.do_delete_comment(id),
+            Command::ResolveComment { id, resolved } => {
+                self.do_resolve_comment(id, resolved)
+            }
         }
     }
 
@@ -3779,6 +3845,9 @@ impl Engine {
             fonts_resident: self.fonts.len() as u32,
             last_paint_ms: 0.0,
             last_command_ms: 0.0,
+            paragraph_count: doc.paragraph_count(),
+            word_count: doc.word_count(),
+            character_count: doc.character_count(),
         })
     }
 
@@ -4157,6 +4226,9 @@ impl Engine {
                         engine model's `CellBorders` is cheap (a handful
                         of `Option<BorderStroke>` slots). */
                         para_box.borders = para.props.borders.clone();
+                        /* Sprint 6 (UI Edition) — propagate `<w:shd>`
+                        paragraph shading into the laid-out box. */
+                        para_box.shading = para.props.shading;
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
@@ -5946,6 +6018,404 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// `Command::AcceptRevision` (Sprint 7 UI Edition).
+    fn do_accept_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
+        let new_doc = self.undo.current().accept_revision_at(block, start, end);
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::RejectRevision` (Sprint 7 UI Edition).
+    fn do_reject_revision(&mut self, block: u32, start: u32, end: u32) -> Event {
+        let new_doc = self.undo.current().reject_revision_at(block, start, end);
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::InsertComment` (Sprint 7 UI Edition). Uses an
+    /// ISO-8601 timestamp derived from `Date.now()` on the worker
+    /// thread (passed in via `js_sys::Date::new_0().to_iso_string()`)
+    /// when wired through; for the engine handler the date is the
+    /// current `wasm_bindgen` UTC epoch ms formatted as RFC 3339.
+    fn do_insert_comment(
+        &mut self,
+        range: BridgeLogicalRange,
+        text: String,
+        author: String,
+    ) -> Event {
+        let now = js_sys::Date::new_0().to_iso_string();
+        let date = now.as_string().unwrap_or_default();
+        let (start, end) = ordered(range.start, range.end);
+        let (new_doc, _new_id) = self.undo.current().insert_comment(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            text,
+            author,
+            date,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::DeleteComment` (Sprint 7 UI Edition).
+    fn do_delete_comment(&mut self, id: u32) -> Event {
+        let new_doc = self.undo.current().delete_comment(id);
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::ResolveComment` (Sprint 7 UI Edition). Toggles the
+    /// in-memory `resolved` flag; round-trip to `commentsExtended.xml`
+    /// is filed as a Core Engine task.
+    fn do_resolve_comment(&mut self, id: u32, resolved: bool) -> Event {
+        let new_doc = self.undo.current().set_comment_resolved(id, resolved);
+        self.undo.push(new_doc);
+        self.selection_changed()
+    }
+
+    /// `Command::SetParagraphIndent` (Sprint 6 UI Edition).
+    fn do_set_paragraph_indent(
+        &mut self,
+        range: BridgeLogicalRange,
+        start_pt: f32,
+        end_pt: f32,
+        first_line_pt: f32,
+    ) -> Event {
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self.undo.current().set_paragraph_indent(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            start_pt,
+            end_pt,
+            first_line_pt,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::SetLineSpacing` (Sprint 6 UI Edition).
+    fn do_set_line_spacing(&mut self, range: BridgeLogicalRange, multiplier: f32) -> Event {
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self.undo.current().set_line_spacing(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            multiplier,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::SetParagraphShading` (Sprint 6 UI Edition).
+    fn do_set_paragraph_shading(
+        &mut self,
+        range: BridgeLogicalRange,
+        color: Option<Color>,
+    ) -> Event {
+        let target = color.map(|c| [c.r, c.g, c.b, c.a]);
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self.undo.current().set_paragraph_shading(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            target,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::ToggleList` (Sprint 5 UI Edition) — Off clears the
+    /// paragraph's `list_item`; Bullet / Number surface a clear
+    /// error pointing at the missing numbering synthesizer.
+    fn do_toggle_list(&mut self, range: BridgeLogicalRange, kind: bridge::ListKind) -> Event {
+        match kind {
+            bridge::ListKind::Off => {
+                let (start, end) = ordered(range.start, range.end);
+                let new_doc = self
+                    .undo
+                    .current()
+                    .clear_list_item_on_range(to_engine_pos(start), to_engine_pos(end));
+                self.undo.push(new_doc);
+                self.layout_cache.get_mut().clear();
+                self.dirty.invalidate(full_page_rect(self.scale()));
+                if let Err(e) = self.maybe_repaint_result() {
+                    return *e;
+                }
+                self.selection_changed()
+            }
+            bridge::ListKind::Bullet | bridge::ListKind::Number => Event::Error {
+                message: format!(
+                    "ToggleList({kind:?}): list synthesis not yet implemented — see Core: numbering.xml writer and List Synthesis"
+                ),
+            },
+        }
+    }
+
+    /// `Command::SetPageMargins` (Sprint 4 UI Edition) — set the
+    /// page margins (pt) on the section containing `at`.
+    fn do_set_page_margins(
+        &mut self,
+        at: BridgeLogicalPos,
+        top_pt: f32,
+        right_pt: f32,
+        bottom_pt: f32,
+        left_pt: f32,
+    ) -> Event {
+        let new_doc = self.undo.current().set_section_margins_at(
+            to_engine_pos(at),
+            top_pt,
+            right_pt,
+            bottom_pt,
+            left_pt,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::SetPageOrientation` (Sprint 4 UI Edition) — flip
+    /// the orientation of the section containing `at`. No-op when
+    /// the page already matches the requested orientation.
+    fn do_set_page_orientation(
+        &mut self,
+        at: BridgeLogicalPos,
+        orientation: bridge::PageOrientation,
+    ) -> Event {
+        let landscape = matches!(orientation, bridge::PageOrientation::Landscape);
+        let new_doc = self
+            .undo
+            .current()
+            .set_section_orientation_at(to_engine_pos(at), landscape);
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// Sprint 3 (UI Edition) — shared body for the legacy
+    /// `LoadDocx` and the new `OpenDocument { format: Docx }`
+    /// commands. Replaces the active document, resets the caret,
+    /// invalidates layout and repaints.
+    fn load_docx_bytes(&mut self, bytes: &[u8], origin: &'static str) -> Event {
+        match format_docx::read_docx(bytes) {
+            Ok(archive) => {
+                let paragraph_count = archive.document.paragraph_count();
+                self.undo = UndoStack::new(archive.document, 100);
+                self.selection = Some(SelectionState {
+                    anchor: bpos_top(0, 0),
+                    caret: bpos_top(0, 0),
+                    ideal_x: None,
+                    kind: SelectionKind::Linear,
+                });
+                self.layout_cache.get_mut().clear();
+                self.dirty.invalidate(full_page_rect(self.scale()));
+                self.maybe_repaint();
+                Event::DocumentLoaded { paragraph_count }
+            }
+            Err(e) => Event::Error {
+                message: format!("{origin}: {e}"),
+            },
+        }
+    }
+
+    /// Sprint 3 (UI Edition) — shared body for the legacy `SaveDocx`
+    /// and the new `SaveDocument { format: Docx }` commands.
+    fn save_docx_bytes(&self, origin: &'static str) -> Event {
+        match build_minimal_docx(self.undo.current()) {
+            Ok(bytes) => {
+                let size = bytes.len() as u32;
+                Event::DocumentSaved { bytes, size }
+            }
+            Err(e) => Event::Error {
+                message: format!("{origin}: {e}"),
+            },
+        }
+    }
+
+    /// Sprint 3 (UI Edition) — set the device-pixel scale and force
+    /// a full repaint. Clamped to `[0.25, 4.0]`; `RenderPage` must
+    /// have cached a `layout_cfg` first (a fresh engine before any
+    /// render has no scale to mutate — return a no-op
+    /// `selection_changed` so the caller still sees a reply).
+    fn do_set_zoom(&mut self, scale: f32) -> Event {
+        let scale = scale.clamp(0.25, 4.0);
+        if let Some(cfg) = self.layout_cfg.as_mut() {
+            cfg.scale = scale;
+        } else {
+            return self.selection_changed();
+        }
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// Sprint 3 (UI Edition) — insert an inline image at `at` (or at
+    /// the active caret when `at` lands on a no-longer-resolvable
+    /// path). Width/height are computed from the bridge `ImageBlob`
+    /// pixel dimensions + the requested `ImageFit` mode, then passed
+    /// to the engine in EMU (914_400 / inch).
+    ///
+    /// **Renderer note.** The blob lands in `DocumentTree.media`; the
+    /// renderer paints a placeholder rect until the worker decodes
+    /// the bytes via `createImageBitmap` and calls
+    /// `Engine::register_image(rel_id, bitmap)`. That worker-side
+    /// post-insert registration is filed alongside this handler as
+    /// a follow-up sprint deliverable.
+    fn do_insert_image(
+        &mut self,
+        at: BridgeLogicalPos,
+        image: BridgeImageBlob,
+        fit: ImageFit,
+    ) -> Event {
+        const EMU_PER_PX: i64 = 9525; // 914_400 EMU/inch ÷ 96 px/inch
+        const FIT_WIDTH_EMU: i64 = 5_486_400; // 6 inches — Word stock
+        const FIT_PAGE_EMU: i64 = 4_572_000; // 5 inches — slightly inset
+
+        let natural_w_emu = i64::from(image.width).saturating_mul(EMU_PER_PX);
+        let natural_h_emu = i64::from(image.height).saturating_mul(EMU_PER_PX);
+        let (w_emu, h_emu) = match fit {
+            ImageFit::Original => (natural_w_emu, natural_h_emu),
+            ImageFit::FitWidth | ImageFit::FitPage => {
+                let target = if matches!(fit, ImageFit::FitWidth) {
+                    FIT_WIDTH_EMU
+                } else {
+                    FIT_PAGE_EMU
+                };
+                /* Preserve aspect ratio. Guard against zero-sized
+                 * blobs the decoder may report. */
+                if natural_w_emu <= 0 {
+                    (target, target)
+                } else {
+                    let h =
+                        (natural_h_emu as i128 * target as i128 / natural_w_emu as i128) as i64;
+                    (target, h.max(1))
+                }
+            }
+        };
+
+        let engine_blob = engine::ImageBlob {
+            content_type: image.mime,
+            data: image.bytes,
+        };
+        let new_doc = self.undo.current().insert_inline_image_at(
+            to_engine_pos(at),
+            engine_blob,
+            w_emu,
+            h_emu,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::SetColumns` (Sprint 2 UI Edition) — set the multi-
+    /// column layout on the section containing `at`. Mutates
+    /// `Section.columns` via [`engine::DocumentTree::set_section_columns_at`]
+    /// and triggers a full repaint so the paginator re-flows.
+    fn do_set_columns(&mut self, at: BridgeLogicalPos, count: u8, gutter_pt: f32) -> Event {
+        let new_doc =
+            self.undo
+                .current()
+                .set_section_columns_at(to_engine_pos(at), count, gutter_pt);
+        self.undo.push(new_doc);
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::InsertPageBreak` (Sprint 2 UI Edition) — flip
+    /// `ParaProperties.page_break_before` on the paragraph at `at`.
+    fn do_insert_page_break(&mut self, at: BridgeLogicalPos) -> Event {
+        let new_doc = self
+            .undo
+            .current()
+            .set_page_break_before(to_engine_pos(at), true);
+        self.undo.push(new_doc);
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::SetParagraphBorders` (Sprint 2 UI Edition) — set
+    /// `<w:pPr><w:pBdr>` on every paragraph the range spans. Reuses
+    /// [`bridge_to_engine_borders`] from the cell-border path; an
+    /// all-edges-`None` value clears the borders.
+    fn do_set_paragraph_borders(
+        &mut self,
+        range: BridgeLogicalRange,
+        borders: bridge::BridgeCellBorders,
+    ) -> Event {
+        let engine_borders = bridge_to_engine_borders(borders);
+        let cleared = engine_borders.top.is_none()
+            && engine_borders.left.is_none()
+            && engine_borders.bottom.is_none()
+            && engine_borders.right.is_none();
+        let target = if cleared { None } else { Some(engine_borders) };
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self.undo.current().set_paragraph_borders(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            target,
+        );
+        self.undo.push(new_doc);
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
     /* ===========================================================
     Phase 5 PR 3 — table command dispatch.
     Each method maps the bridge `BlockPath` → engine, runs the
@@ -5968,11 +6438,29 @@ impl Engine {
             .delete_table(bridge_to_engine_path(path));
         self.push_table_edit(new_doc)
     }
-    fn do_insert_row(&mut self, path: bridge::BlockPath, after_row: u32) -> Event {
+    fn do_insert_row(
+        &mut self,
+        path: bridge::BlockPath,
+        row: u32,
+        side: bridge::InsertSide,
+    ) -> Event {
+        /* Resolve Before/After at the bridge boundary so the engine
+         * never performs signed arithmetic on `usize`. `Before` lands
+         * the new row at `row`; `After` lands it at `row + 1`. The
+         * `usize` widening of `u32` is lossless on 32-bit and
+         * 64-bit targets — wasm32 is 32-bit but `usize` is 32-bit
+         * there too, so the `+ 1` for `After` cannot overflow given
+         * we already arrived from a `u32` (`u32::MAX + 1` could
+         * overflow `usize` only on a 32-bit target; treat it as
+         * "append to the end" by saturating). */
+        let at = match side {
+            bridge::InsertSide::Before => row as usize,
+            bridge::InsertSide::After => (row as usize).saturating_add(1),
+        };
         let new_doc = self
             .undo
             .current()
-            .insert_row(bridge_to_engine_path(path), after_row);
+            .insert_row(bridge_to_engine_path(path), at);
         self.push_table_edit(new_doc)
     }
     fn do_delete_row(&mut self, path: bridge::BlockPath, row: u32) -> Event {
@@ -5982,11 +6470,20 @@ impl Engine {
             .delete_row(bridge_to_engine_path(path), row);
         self.push_table_edit(new_doc)
     }
-    fn do_insert_column(&mut self, path: bridge::BlockPath, after_col: u32) -> Event {
+    fn do_insert_column(
+        &mut self,
+        path: bridge::BlockPath,
+        col: u32,
+        side: bridge::InsertSide,
+    ) -> Event {
+        let at = match side {
+            bridge::InsertSide::Before => col as usize,
+            bridge::InsertSide::After => (col as usize).saturating_add(1),
+        };
         let new_doc = self
             .undo
             .current()
-            .insert_column(bridge_to_engine_path(path), after_col);
+            .insert_column(bridge_to_engine_path(path), at);
         self.push_table_edit(new_doc)
     }
     fn do_delete_column(&mut self, path: bridge::BlockPath, col: u32) -> Event {

@@ -1,0 +1,60 @@
+.nge-hud {
+    position: fixed;
+    right: var(--nge-space-3);
+    bottom: var(--nge-space-3);
+    z-index: var(--nge-z-hud);
+    min-width: var(--nge-hud-min-width);
+    padding: var(--nge-space-3);
+    background: var(--nge-color-bg);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-lg);
+    font: 500 var(--nge-font-size-xs)/1.4 var(--nge-font-mono);
+    color: var(--nge-color-text);
+}
+
+.nge-hud__title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--nge-space-2);
+    padding-bottom: var(--nge-space-2);
+    border-bottom: 1px solid var(--nge-color-border);
+    font: 600 var(--nge-font-size-sm)/1 var(--nge-font-ui);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.nge-hud__close {
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--nge-color-text-muted);
+    font: 600 16px/1 var(--nge-font-ui);
+    cursor: pointer;
+    border-radius: var(--nge-radius-sm);
+}
+
+.nge-hud__close:hover {
+    background: var(--nge-color-surface-alt);
+    color: var(--nge-color-text);
+}
+
+.nge-hud__grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: var(--nge-space-1) var(--nge-space-3);
+    margin: 0;
+}
+
+.nge-hud__grid dt {
+    color: var(--nge-color-text-muted);
+}
+
+.nge-hud__grid dd {
+    margin: 0;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
