@@ -16,6 +16,7 @@ text-pipeline = { path = "../text-pipeline" }
 layout = { path = "../layout" }
 render = { path = "../render" }
 format-docx = { path = "../format-docx" }
+format-html = { path = "../format-html" }
 format-pdf = { path = "../format-pdf" }
 kurbo = { workspace = true }
 lru = { workspace = true }

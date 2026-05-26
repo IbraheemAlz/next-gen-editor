@@ -4,7 +4,8 @@
 //! `word/document.xml` is regenerated.
 
 use crate::error::DocxError;
-use crate::opc::archive::{DOC_XML, DocxArchive};
+use crate::opc::archive::{COMMENTS_EXTENDED_XML, DOC_XML, DocxArchive};
+use crate::parts::comments::build_comments_extended_xml;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
     FontFamily, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, Revision,
@@ -1107,10 +1108,43 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o644);
 
-        /* Write sibling entries verbatim, in original order. */
+        /* Sprint 9 — regenerate `word/commentsExtended.xml` only when
+        the document carries at least one resolved comment with a
+        captured paraId. Untouched comments fall through the
+        passthrough so unrelated documents stay byte-identical. */
+        let extended_bytes = if doc.comment_defs.values().any(|c| c.resolved) {
+            build_comments_extended_xml(&doc.comment_defs)
+        } else {
+            None
+        };
+        let extended_already_present = archive
+            .other_entries
+            .iter()
+            .any(|(n, _)| n == COMMENTS_EXTENDED_XML);
+
+        /* Write sibling entries verbatim, in original order — except
+        for `commentsExtended.xml` which we replace in-place when we
+        have new bytes to emit. */
         for (name, bytes) in &archive.other_entries {
             zip.start_file(name, opts)?;
-            zip.write_all(bytes)?;
+            if name == COMMENTS_EXTENDED_XML
+                && let Some(new_bytes) = extended_bytes.as_deref()
+            {
+                zip.write_all(new_bytes)?;
+            } else {
+                zip.write_all(bytes)?;
+            }
+        }
+        /* New extended part on a document that never had one before:
+        append the entry. The corresponding `[Content_Types].xml`
+        override and rels entry are NOT synthesized in v1 — Word
+        tolerates the part's presence in most readers, and the
+        common Sprint 9 case (open .docx that already had comments,
+        toggle resolved, save) hits the in-place replace above.
+        Synthesizing the OPC plumbing is tracked as tech-debt. */
+        if !extended_already_present && let Some(new_bytes) = extended_bytes.as_deref() {
+            zip.start_file(COMMENTS_EXTENDED_XML, opts)?;
+            zip.write_all(new_bytes)?;
         }
 
         /* Write the regenerated document.xml. */
@@ -2174,6 +2208,7 @@ mod tests {
             borders: None,
             tab_stops: Vec::new(),
             list_item: None,
+            shading: None,
         };
         let para = Paragraph {
             text: "hello world".into(),
@@ -2731,6 +2766,98 @@ mod tests {
         assert_eq!(
             media.data,
             vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+    }
+
+    /// Sprint 9 — full round-trip of the resolved-comment bit through
+    /// `word/commentsExtended.xml`. Hand-build a minimal docx that
+    /// already carries a comment-with-paraId in `comments.xml` (so the
+    /// reader can map `<w15:commentEx paraId>` back to the right
+    /// `CommentDef`), open it, flip `resolved`, save, reopen, and
+    /// confirm the bit survived. Also verifies that an *un-resolved*
+    /// re-save leaves the original `commentsExtended.xml` byte-
+    /// identical (the passthrough invariant).
+    #[test]
+    fn resolved_comment_round_trips_via_extended_part() {
+        let para_id = "DEADBEEF";
+        let comments_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+             <w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+                         xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\">\
+               <w:comment w:id=\"1\" w:author=\"Test\" w:date=\"2026-01-01T00:00:00Z\">\
+                 <w:p w14:paraId=\"{para_id}\"><w:r><w:t>body</w:t></w:r></w:p>\
+               </w:comment>\
+             </w:comments>"
+        );
+        /* Initial extended part marks the comment NOT resolved. After
+        we flip it and re-save the writer should regenerate this part. */
+        let extended_xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+             <w15:commentsEx xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">\
+               <w15:commentEx w15:paraId=\"{para_id}\" w15:done=\"0\"/>\
+             </w15:commentsEx>"
+        );
+
+        let doc = DocumentTree::from_text("body");
+        let extensions = media_extensions(&doc);
+        let content_types = build_content_types(&extensions);
+        let doc_rels = build_doc_rels(&doc);
+        let other = vec![
+            ("[Content_Types].xml".into(), content_types.into_bytes()),
+            ("_rels/.rels".into(), DOT_RELS_XML.as_bytes().to_vec()),
+            ("word/_rels/document.xml.rels".into(), doc_rels.into_bytes()),
+            ("word/comments.xml".into(), comments_xml.into_bytes()),
+            (
+                "word/commentsExtended.xml".into(),
+                extended_xml.clone().into_bytes(),
+            ),
+        ];
+        let archive = DocxArchive {
+            other_entries: other,
+            document: doc.clone(),
+        };
+        let bytes = write_docx(&archive, &doc).expect("initial write");
+
+        /* Re-open: the reader should attach the paraId + populate
+        resolved = false from the extended part. */
+        let opened = read_docx(&bytes).expect("read");
+        let cdef = opened.document.comment_defs.get(&1).expect("comment def 1");
+        assert_eq!(cdef.first_para_id.as_deref(), Some(para_id));
+        assert!(
+            !cdef.resolved,
+            "comment starts un-resolved (extended part says done=0)"
+        );
+
+        /* Flip resolved -> true, save, reopen -> resolved should
+        survive. */
+        let mut flipped = opened.document.clone();
+        if let Some(c) = flipped.comment_defs.get_mut(&1) {
+            c.resolved = true;
+        }
+        let resaved = write_docx(&opened, &flipped).expect("resave");
+        let reopened = read_docx(&resaved).expect("re-read");
+        let cdef2 = reopened
+            .document
+            .comment_defs
+            .get(&1)
+            .expect("comment def 1");
+        assert!(cdef2.resolved, "resolved bit survived the .docx round-trip");
+
+        /* Without any resolved comment, the extended part is passed
+        through byte-identical (no regeneration). */
+        let unflipped = opened.document.clone();
+        let untouched = write_docx(&opened, &unflipped).expect("resave without flip");
+        let archive_back = read_docx(&untouched).expect("re-read");
+        let raw_back = archive_back
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "word/commentsExtended.xml")
+            .map(|(_, b)| b.as_slice())
+            .expect("extended part still present");
+        assert_eq!(
+            raw_back,
+            extended_xml.as_bytes(),
+            "no resolved → passthrough byte-identical"
         );
     }
 }

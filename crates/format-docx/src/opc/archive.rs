@@ -10,7 +10,7 @@
 
 use crate::error::DocxError;
 use crate::numbering_resolver::resolve_markers_blocks;
-use crate::parts::comments::parse_comments_xml;
+use crate::parts::comments::{parse_comments_extended_xml, parse_comments_xml};
 use crate::parts::document::parse_document_xml;
 use crate::parts::footer::parse_footer_xml;
 use crate::parts::footnotes::parse_footnotes_xml;
@@ -30,6 +30,7 @@ pub const NUMBERING_XML: &str = "word/numbering.xml";
 pub const RELS_XML: &str = "word/_rels/document.xml.rels";
 pub const FOOTNOTES_XML: &str = "word/footnotes.xml";
 pub const COMMENTS_XML: &str = "word/comments.xml";
+pub const COMMENTS_EXTENDED_XML: &str = "word/commentsExtended.xml";
 pub const SETTINGS_XML: &str = "word/settings.xml";
 
 /// All raw archive entries except `word/document.xml`. Carried through the
@@ -237,6 +238,27 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         && let Ok(defs) = parse_comments_xml(bytes)
     {
         document.comment_defs = defs.comments;
+    }
+
+    /* Sprint 9 — second pass: `word/commentsExtended.xml` carries the
+    `w15:done` resolved bit, keyed by `w15:paraId`. Map each entry's
+    paraId back to its owning `CommentDef` (via the `first_para_id`
+    we just captured) and flip `resolved`. Failures are silent — Word
+    treats a malformed extended part as "no resolved comments". */
+    if let Some(bytes) = other_entries
+        .iter()
+        .find(|(n, _)| n == COMMENTS_EXTENDED_XML)
+        .map(|(_, b)| b.as_slice())
+        && let Ok(entries) = parse_comments_extended_xml(bytes)
+    {
+        let lookup: std::collections::HashMap<String, bool> = entries.into_iter().collect();
+        for c in document.comment_defs.values_mut() {
+            if let Some(pid) = c.first_para_id.as_deref()
+                && let Some(done) = lookup.get(pid).copied()
+            {
+                c.resolved = done;
+            }
+        }
     }
 
     /* Phase 2 audit — `word/settings.xml` rides `other_entries`

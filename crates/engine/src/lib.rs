@@ -100,11 +100,19 @@ pub struct CommentDef {
     pub author: String,
     pub date: String,
     pub paragraphs: Vec<String>,
-    /// Sprint 7 (UI Edition) — in-memory resolved flag. NOT yet
-    /// round-tripped to `commentsExtended.xml` (`<w15:commentEx
-    /// done="true"/>`); preserved across the active session only.
-    /// Tracked as a Core Engine task.
+    /// Sprint 9 — round-tripped through `word/commentsExtended.xml`.
+    /// The reader populates from `<w15:commentEx w15:done="1"/>`; the
+    /// writer regenerates `commentsExtended.xml` when ANY comment
+    /// carries `resolved = true`, otherwise the OPC passthrough keeps
+    /// the original part byte-identical.
     pub resolved: bool,
+    /// Sprint 9 — `w14:paraId` of this comment's first paragraph as
+    /// captured by the comments.xml reader. `<w15:commentEx>` keys its
+    /// entries by this id; without one, a synthesized comment cannot
+    /// round-trip its resolved bit. Engine-minted comments leave this
+    /// `None` until the comments.xml writer learns to mint paraIds —
+    /// tracked as Core Engine tech-debt.
+    pub first_para_id: Option<String>,
 }
 
 /// Phase 8a — one `<w:commentRangeStart>` / `<w:commentRangeEnd>` overlay
@@ -1910,6 +1918,33 @@ impl DocumentTree {
         self.nth_paragraph(idx).map(|p| p.text.as_str())
     }
 
+    /// Sprint 9 — flatten the whole document to plain text.
+    ///
+    /// Paragraphs join with `\n`. Tables emit one tab-separated row per
+    /// `TableRow` (cells joined with `\t`, in their visual order); the
+    /// table itself sits on its own line, with a blank-line separator
+    /// before and after. Inline objects (images, footnote refs) render
+    /// as the placeholder marker `[image]` / `[footnote N]` so the
+    /// caller never silently drops them.
+    pub fn to_plain_text(&self) -> String {
+        let mut out = String::new();
+        for block in self.blocks.iter() {
+            match block {
+                Block::Paragraph(p) => {
+                    push_paragraph_plain(p, &mut out);
+                    out.push('\n');
+                }
+                Block::Table(t) => push_table_plain(t, &mut out),
+            }
+        }
+        /* Drop the trailing newline so single-paragraph docs are not
+        terminated by an empty line. */
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
+
     pub fn end_of_document(&self) -> LogicalPos {
         let Some(path) = self.path_to_last_top_paragraph() else {
             return LogicalPos {
@@ -2250,13 +2285,7 @@ impl DocumentTree {
         self.apply_revision_decision(block, start, end, /* accept = */ false)
     }
 
-    fn apply_revision_decision(
-        &self,
-        block: u32,
-        start: u32,
-        end: u32,
-        accept: bool,
-    ) -> Self {
+    fn apply_revision_decision(&self, block: u32, start: u32, end: u32, accept: bool) -> Self {
         let mut blocks = self.blocks.clone();
         let path = BlockPath::top(block);
         let _ = mutate_paragraph_in_top(&mut blocks, &path, |para| {
@@ -2328,6 +2357,10 @@ impl DocumentTree {
                 date,
                 paragraphs: vec![text],
                 resolved: false,
+                /* Engine-minted comments have no paraId yet — their
+                resolved state survives only in-memory until the
+                comments.xml writer learns to mint paraIds. */
+                first_para_id: None,
             },
         );
         let mut comment_ranges = self.comment_ranges.clone();
@@ -2453,12 +2486,7 @@ impl DocumentTree {
     /// Sprint 6 (UI Edition) — set `<w:pPr><w:spacing w:line>` as an
     /// `Auto` (multiplier) line height. 240 twips = single (1.0×).
     /// Pass `multiplier <= 0.0` to clear (`line_height: None`).
-    pub fn set_line_spacing(
-        &self,
-        start: LogicalPos,
-        end: LogicalPos,
-        multiplier: f32,
-    ) -> Self {
+    pub fn set_line_spacing(&self, start: LogicalPos, end: LogicalPos, multiplier: f32) -> Self {
         let target = if multiplier > 0.0 {
             Some(LineHeight::Auto {
                 twips: (multiplier * 240.0).round() as i32,
@@ -3681,6 +3709,83 @@ const DEFAULT_BORDER_SIZE_EIGHTH_PT: u16 = 4;
 /// 5c will switch to `<w:tblLayout w:type="autofit"/>`.
 const DEFAULT_A4_CONTENT_TWIPS: i32 = 6765;
 
+/* ---- Sprint 9 plain-text flattening helpers ------------------------- */
+
+/// Flatten one paragraph's text + inline objects into the running plain-
+/// text buffer (no trailing newline). U+FFFC anchors render as marker
+/// strings so the caller never silently drops an image / footnote ref.
+fn push_paragraph_plain(p: &Paragraph, out: &mut String) {
+    let mut cursor: usize = 0;
+    for obj in &p.inline_objects {
+        let at = obj.at as usize;
+        if at > p.text.len() {
+            break;
+        }
+        if at > cursor {
+            out.push_str(&p.text[cursor..at]);
+        }
+        match &obj.kind {
+            InlineKind::Image { .. } => out.push_str("[image]"),
+            InlineKind::FootnoteRef { display_number, .. } => {
+                out.push_str(&format!("[footnote {display_number}]"));
+            }
+        }
+        /* Skip the 3-byte U+FFFC sentinel. */
+        cursor = at.saturating_add(3).min(p.text.len());
+    }
+    if cursor < p.text.len() {
+        out.push_str(&p.text[cursor..]);
+    }
+}
+
+/// Flatten a table — one tab-separated row per `TableRow`, with a
+/// leading + trailing blank line so the surrounding paragraphs do not
+/// glue against the table. `VMergeRole::Continue` cells emit an empty
+/// column so the row width matches the document grid.
+fn push_table_plain(t: &Table, out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for row in &t.rows {
+        let mut first = true;
+        for cell in &row.cells {
+            if !first {
+                out.push('\t');
+            }
+            first = false;
+            if cell.props.v_merge == VMergeRole::Continue {
+                continue;
+            }
+            let cell_text = flatten_blocks_plain(&cell.blocks);
+            /* Within a cell, newlines + tabs would break the row layout —
+            collapse them to spaces. */
+            for ch in cell_text.chars() {
+                match ch {
+                    '\n' | '\r' | '\t' => out.push(' '),
+                    other => out.push(other),
+                }
+            }
+        }
+        out.push('\n');
+    }
+}
+
+fn flatten_blocks_plain(blocks: &[Block]) -> String {
+    let mut s = String::new();
+    for (i, b) in blocks.iter().enumerate() {
+        match b {
+            Block::Paragraph(p) => {
+                if i > 0 {
+                    s.push('\n');
+                }
+                push_paragraph_plain(p, &mut s);
+            }
+            Block::Table(inner) => push_table_plain(inner, &mut s),
+        }
+    }
+    s
+}
+
 /// Word-style default cell-edge stroke — single 0.5 pt black.
 pub fn default_word_stroke() -> BorderStroke {
     BorderStroke {
@@ -4204,6 +4309,72 @@ impl UndoStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* ---- Sprint 9: plain-text flattening -------------------------- */
+
+    #[test]
+    fn plain_text_two_paragraphs() {
+        let d = DocumentTree::from_text("hello");
+        let d = d.split_paragraph(LogicalPos {
+            path: BlockPath::top(0),
+            offset: 5,
+        });
+        let d = d.insert_text(
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
+            "world",
+        );
+        assert_eq!(d.to_plain_text(), "hello\nworld");
+    }
+
+    #[test]
+    fn plain_text_image_marker_replaces_sentinel() {
+        let mut d = DocumentTree::default();
+        d.blocks.push_back(Block::Paragraph(Paragraph {
+            text: "a\u{FFFC}b".into(),
+            inline_objects: vec![InlineObject {
+                at: 1,
+                kind: InlineKind::Image {
+                    rel_id: "rId1".into(),
+                    width_emu: 0,
+                    height_emu: 0,
+                },
+            }],
+            ..Default::default()
+        }));
+        assert_eq!(d.to_plain_text(), "a[image]b");
+    }
+
+    #[test]
+    fn plain_text_table_tab_separates_cells() {
+        let mut d = DocumentTree::default();
+        let cell = |s: &str| TableCell {
+            props: CellProperties::default(),
+            blocks: vec![Block::Paragraph(Paragraph {
+                text: s.into(),
+                ..Default::default()
+            })],
+        };
+        d.blocks.push_back(Block::Table(Table {
+            grid: vec![6765, 6765],
+            props: TableProperties::default(),
+            rows: vec![
+                TableRow {
+                    props: RowProperties::default(),
+                    cells: vec![cell("a"), cell("b")],
+                },
+                TableRow {
+                    props: RowProperties::default(),
+                    cells: vec![cell("c"), cell("d")],
+                },
+            ],
+            dirty: true,
+            source_xml: None,
+        }));
+        assert_eq!(d.to_plain_text(), "a\tb\nc\td");
+    }
 
     #[test]
     fn insert_into_empty() {

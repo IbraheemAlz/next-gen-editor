@@ -9,11 +9,11 @@
  *     `Ctrl/Cmd+S` globally.
  *   - **Export PDF** → `Command::ExportPdf { conformance }`. Conformance
  *     picker exposes the full `PdfConformance` enum (`A1b` / `A2u` / `X3`).
- *   - **Export HTML / Plain Text** → rendered as disabled menu items
- *     with an "Engine Pending" badge. The dispatch path is in place
- *     (`Command::SaveDocument { format: html | plain_text }`) but the
- *     engine returns `Event::Error` until the Core Engine ships
- *     serializers (tracked separately).
+ *   - **Export HTML / Plain Text** → `Command::SaveDocument { format }`
+ *     with `html` / `plain_text`. Sprint 9 wired the engine
+ *     serializers (`crates/format-html` + `DocumentTree::to_plain_text`);
+ *     bytes flow back through `DOCUMENT_SAVED` and the auto-download
+ *     subscriber picks the right MIME + extension.
  *
  * Download trigger: subscribes to `DOCUMENT_SAVED` / `PDF_EXPORTED`
  * events, wraps the returned `bytes` in a `Blob`, and synthesises a
@@ -76,23 +76,35 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
     };
 
     /* Subscribe to engine events so saves + exports auto-download.
-     * `Event::Error` from the stubbed HTML / PlainText paths bubbles
-     * into the error banner. */
+     * `Event::Error` from any DocFormat path bubbles into the error
+     * banner. Sprint 9 — DocFormat::Html / PlainText share the same
+     * DOCUMENT_SAVED reply; `pendingExportFormat` (set by the export
+     * handler) tells us which MIME + extension to pick. */
     createEffect(() => {
         const unsub = engine.subscribe((evt) => {
             switch (evt.type) {
-                case 'DOCUMENT_SAVED':
-                    triggerDownload(
-                        evt.bytes,
-                        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                        `${stem()}.docx`,
-                    );
+                case 'DOCUMENT_SAVED': {
+                    const pending = pendingExportFormat();
+                    if (pending === 'html') {
+                        triggerDownload(evt.bytes, 'text/html;charset=utf-8', `${stem()}.html`);
+                    } else if (pending === 'plain_text') {
+                        triggerDownload(evt.bytes, 'text/plain;charset=utf-8', `${stem()}.txt`);
+                    } else {
+                        triggerDownload(
+                            evt.bytes,
+                            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                            `${stem()}.docx`,
+                        );
+                    }
+                    setPendingExportFormat(null);
                     break;
+                }
                 case 'PDF_EXPORTED':
                     triggerDownload(evt.bytes, 'application/pdf', `${stem()}.pdf`);
                     break;
                 case 'ERROR':
                     setError(evt.message);
+                    setPendingExportFormat(null);
                     setTimeout(() => setError(null), 6000);
                     break;
             }
@@ -147,6 +159,26 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
     const onExportPdf = async (conformance: PdfConformance) => {
         closeAll();
         await cmd.exportPdf(conformance);
+    };
+
+    /* Sprint 9 — HTML / Plain Text exports go through the same
+     * Command::SaveDocument path; the DOCUMENT_SAVED subscriber above
+     * triggers the download. Track which format is in flight so the
+     * download wrapper picks the right MIME + extension. */
+    const [pendingExportFormat, setPendingExportFormat] = createSignal<
+        'html' | 'plain_text' | null
+    >(null);
+
+    const onExportHtml = async () => {
+        closeAll();
+        setPendingExportFormat('html');
+        await cmd.saveDocument('html');
+    };
+
+    const onExportPlainText = async () => {
+        closeAll();
+        setPendingExportFormat('plain_text');
+        await cmd.saveDocument('plain_text');
     };
 
     return (
@@ -234,26 +266,24 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                     </li>
                                     <li role="none">
                                         <button
-                                            class="nge-fm__item nge-fm__item--disabled"
+                                            class="nge-fm__item"
                                             type="button"
                                             role="menuitem"
-                                            disabled
-                                            title="HTML serializer is a Core Engine task"
+                                            onClick={() => void onExportHtml()}
                                         >
                                             <span>HTML</span>
-                                            <span class="nge-fm__badge">Engine pending</span>
+                                            <span class="nge-fm__shortcut">.html</span>
                                         </button>
                                     </li>
                                     <li role="none">
                                         <button
-                                            class="nge-fm__item nge-fm__item--disabled"
+                                            class="nge-fm__item"
                                             type="button"
                                             role="menuitem"
-                                            disabled
-                                            title="Plain-text serializer is a Core Engine task"
+                                            onClick={() => void onExportPlainText()}
                                         >
                                             <span>Plain Text</span>
-                                            <span class="nge-fm__badge">Engine pending</span>
+                                            <span class="nge-fm__shortcut">.txt</span>
                                         </button>
                                     </li>
                                 </ul>

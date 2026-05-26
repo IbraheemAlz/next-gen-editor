@@ -1,0 +1,10 @@
+[package]
+name = "format-html"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DocumentTree -> standalone HTML serializer (Sprint 9 I/O)."
+
+[dependencies]
+engine = { path = "../engine" }

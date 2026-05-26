@@ -135,7 +135,7 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                                         class="nge-btn nge-cm__action"
                                         type="button"
                                         aria-label={c.resolved ? 'Reopen comment' : 'Resolve comment'}
-                                        title={c.resolved ? 'Reopen' : 'Resolve (in-memory only)'}
+                                        title={c.resolved ? 'Reopen' : 'Resolve'}
                                         onClick={() => void toggleResolved(c)}
                                     >
                                         {c.resolved ? '↺ Reopen' : '✓ Resolve'}

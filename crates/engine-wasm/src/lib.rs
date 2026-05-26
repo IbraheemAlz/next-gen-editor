@@ -3388,7 +3388,11 @@ impl Engine {
             // pipelines for the Docx format. PlainText + HTML report a
             // clear "not yet implemented" error (tracked in the project
             // backlog as a Core Engine task; see UI_SURFACE_MAPPING.md).
-            Command::OpenDocument { bytes, format, name: _ } => match format {
+            Command::OpenDocument {
+                bytes,
+                format,
+                name: _,
+            } => match format {
                 DocFormat::Docx => self.load_docx_bytes(&bytes, "OpenDocument"),
                 other => Event::Error {
                     message: format!(
@@ -3401,11 +3405,8 @@ impl Engine {
                 DocFormat::Pdf => Event::Error {
                     message: "SaveDocument: use ExportPdf for PDF output".into(),
                 },
-                other => Event::Error {
-                    message: format!(
-                        "SaveDocument: format {other:?} serializer not yet implemented"
-                    ),
-                },
+                DocFormat::Html => self.save_html_bytes(),
+                DocFormat::PlainText => self.save_plain_text_bytes(),
             },
             Command::ExportPdf { conformance } => self.do_export_pdf(conformance),
             Command::CloseDocument => phase3_stub("CloseDocument"),
@@ -3563,13 +3564,13 @@ impl Engine {
             Command::RejectRevision { block, start, end } => {
                 self.do_reject_revision(block, start, end)
             }
-            Command::InsertComment { range, text, author } => {
-                self.do_insert_comment(range, text, author)
-            }
+            Command::InsertComment {
+                range,
+                text,
+                author,
+            } => self.do_insert_comment(range, text, author),
             Command::DeleteComment { id } => self.do_delete_comment(id),
-            Command::ResolveComment { id, resolved } => {
-                self.do_resolve_comment(id, resolved)
-            }
+            Command::ResolveComment { id, resolved } => self.do_resolve_comment(id, resolved),
         }
     }
 
@@ -6272,6 +6273,26 @@ impl Engine {
         }
     }
 
+    /// Sprint 9 — serialize the current document to a standalone HTML5
+    /// blob via `format_html::to_html`. `String::into_bytes()` consumes
+    /// the buffer in place — no extra copy crossing the wasm bridge;
+    /// the resulting `Vec<u8>` flows back to TS as a single `Uint8Array`.
+    fn save_html_bytes(&self) -> Event {
+        let html = format_html::to_html(self.undo.current());
+        let bytes = html.into_bytes();
+        let size = bytes.len() as u32;
+        Event::DocumentSaved { bytes, size }
+    }
+
+    /// Sprint 9 — flatten the current document to plain text via
+    /// `DocumentTree::to_plain_text`.
+    fn save_plain_text_bytes(&self) -> Event {
+        let text = self.undo.current().to_plain_text();
+        let bytes = text.into_bytes();
+        let size = bytes.len() as u32;
+        Event::DocumentSaved { bytes, size }
+    }
+
     /// Sprint 3 (UI Edition) — set the device-pixel scale and force
     /// a full repaint. Clamped to `[0.25, 4.0]`; `RenderPage` must
     /// have cached a `layout_cfg` first (a fresh engine before any
@@ -6329,8 +6350,7 @@ impl Engine {
                 if natural_w_emu <= 0 {
                     (target, target)
                 } else {
-                    let h =
-                        (natural_h_emu as i128 * target as i128 / natural_w_emu as i128) as i64;
+                    let h = (natural_h_emu as i128 * target as i128 / natural_w_emu as i128) as i64;
                     (target, h.max(1))
                 }
             }

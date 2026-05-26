@@ -1243,7 +1243,7 @@ mod tests {
                 fields: Vec::new(),
                 page_break_after_line: Vec::new(),
                 borders: None,
-            shading: None,
+                shading: None,
             }],
         }
     }
