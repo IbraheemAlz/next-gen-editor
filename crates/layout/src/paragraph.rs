@@ -12,6 +12,7 @@
 use crate::boxes::{
     LineBox, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TextAttrs, VisualRun,
 };
+use std::borrow::Cow;
 use std::mem::take;
 use text_pipeline::{
     Alignment, FontStack, JustifyMode, Script, ShapingDirection, analyze_bidi, break_opportunities,
@@ -613,36 +614,19 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                 continue;
             };
             let sub_text_raw = &brun_text[rel_start..rel_end];
-            /* Audit gap A.H3 / A.M5 — two shape-time substitutions both
-            preserve UTF-8 byte length so glyph clusters keep indexing
-            the source paragraph bytes:
-              * `caps_transform` upper-cases the slice. Guarded — German
-                `ß` → "SS" + a few ligatures change byte length and
-                degrade to "no transform" rather than corrupt clusters.
-              * U+0009 TAB → U+0020 SPACE (always safe, both 1-byte
-                UTF-8). The tab anchor survives in `para.text` for the
-                writer; the shaper just needs a glyph that is not
-                `.notdef` so the user sees a visible gap. */
+            /* L1.3 (#4) — two shape-time substitutions:
+            * `caps_transform` upper-cases the slice. Byte-length
+              changes (German `ß → SS`, ligature `ﬁ → FI`, etc.) are
+              handled via `transform_for_shape`'s per-byte
+              transformed→source map, so glyph clusters land on
+              source char boundaries downstream.
+            * U+0009 TAB → U+0020 SPACE keeps the tab anchor in
+              `para.text` for the writer while giving the shaper a
+              non-`.notdef` glyph. */
             let needs_tab_sub = sub_text_raw.contains('\u{0009}');
-            let owned: Option<String> = if span.caps_transform {
-                let upper = sub_text_raw.to_uppercase();
-                if upper.len() == sub_text_raw.len() {
-                    Some(if needs_tab_sub {
-                        upper.replace('\t', " ")
-                    } else {
-                        upper
-                    })
-                } else if needs_tab_sub {
-                    Some(sub_text_raw.replace('\t', " "))
-                } else {
-                    None
-                }
-            } else if needs_tab_sub {
-                Some(sub_text_raw.replace('\t', " "))
-            } else {
-                None
-            };
-            let sub_text = owned.as_deref().unwrap_or(sub_text_raw);
+            let (sub_text_cow, cluster_map) =
+                transform_for_shape(sub_text_raw, span.caps_transform, needs_tab_sub);
+            let sub_text: &str = &sub_text_cow;
             let shaped = shape_text(face, sub_text, brun.direction, span.px_size);
             let brun_abs_start = brun_abs + rel_start as u32;
             let glyphs: Vec<PositionedGlyph> = shaped
@@ -651,13 +635,23 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                 .map(|g| {
                     /* Phase 7 — paragraph-absolute byte offset of this
                     glyph's cluster. The shaper reports cluster relative
-                    to the input string we passed (`sub_text`), so we
-                    re-anchor at the sub-run's paragraph offset. A glyph
-                    sitting on the U+FFFC sentinel of an inline object
-                    has its advance overridden to the object's reserved
-                    width and its `inline_object_id` set so the renderer
-                    paints the bitmap instead of the placeholder glyph. */
-                    let abs_cluster = brun_abs_start + g.cluster;
+                    to the input string we passed (`sub_text`); for
+                    caps/tab-substituted slices `cluster_map` remaps
+                    transformed-byte → source-byte so the cluster always
+                    lands on a UTF-8 char boundary in the original text.
+                    A glyph sitting on the U+FFFC sentinel of an inline
+                    object has its advance overridden to the object's
+                    reserved width and its `inline_object_id` set so the
+                    renderer paints the bitmap instead of the placeholder
+                    glyph. */
+                    let cluster_src = match cluster_map.as_deref() {
+                        Some(map) => map
+                            .get(g.cluster as usize)
+                            .copied()
+                            .unwrap_or(sub_text_raw.len() as u32),
+                        None => g.cluster,
+                    };
+                    let abs_cluster = brun_abs_start + cluster_src;
                     let info = cfg
                         .inline_objects
                         .iter()
@@ -673,7 +667,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     };
                     PositionedGlyph {
                         id: g.glyph_id as u16,
-                        cluster: g.cluster,
+                        cluster: cluster_src,
                         x_advance: info.map_or(g.x_advance, |i| i.width_px),
                         y_advance: g.y_advance,
                         x_offset: g.x_offset,
@@ -722,6 +716,50 @@ fn line_advance(runs: &[VisualRun]) -> f32 {
         .sum()
 }
 
+/// L1.3 (#4) — apply caps and/or tab-to-space substitution to `src`,
+/// returning the transformed text plus an optional per-byte
+/// transformed→source map.
+///
+/// The shaper reports cluster offsets relative to the slice it was
+/// handed; when caps expands a character to a multi-byte run (German
+/// `ß → SS`, Latin ligatures `ﬁ → FI`, etc.) every byte of the
+/// expansion maps back to the SOURCE byte offset of the originating
+/// char. Downstream consumers that index `source_text` by cluster
+/// (caret rendering, hit-testing, BiDi reordering, revision overlays)
+/// therefore always land on a UTF-8 char boundary.
+///
+/// Tab substitution preserves byte alignment (`\t` and ` ` are both
+/// 1-byte ASCII), so when caps is off the map is unnecessary.
+///
+/// Returns `(Cow::Borrowed(src), None)` for the no-op case to avoid
+/// allocation on the 99% path.
+fn transform_for_shape(
+    src: &str,
+    caps: bool,
+    tabs_to_space: bool,
+) -> (Cow<'_, str>, Option<Vec<u32>>) {
+    if !caps && !tabs_to_space {
+        return (Cow::Borrowed(src), None);
+    }
+    if !caps {
+        return (Cow::Owned(src.replace('\t', " ")), None);
+    }
+    /* Caps path — must construct the transformed→source byte map. */
+    let mut upper = String::with_capacity(src.len());
+    let mut map: Vec<u32> = Vec::with_capacity(src.len());
+    for (src_byte_idx, ch) in src.char_indices() {
+        let normalized = if tabs_to_space && ch == '\t' { ' ' } else { ch };
+        for upper_ch in normalized.to_uppercase() {
+            let before = upper.len();
+            upper.push(upper_ch);
+            for _ in before..upper.len() {
+                map.push(src_byte_idx as u32);
+            }
+        }
+    }
+    (Cow::Owned(upper), Some(map))
+}
+
 /// The style span covering byte `offset`. `cfg.spans` covers the whole
 /// paragraph with no gaps, so a miss only happens past the text end.
 fn style_at(spans: &[StyleSpan], offset: u32) -> Option<StyleSpan> {
@@ -759,32 +797,13 @@ fn measure_text(
                 break;
             };
             let sub_raw = &text[(cursor - abs_start) as usize..(piece_end - abs_start) as usize];
-            /* Audit gap A.H3 / A.M5 — keep the greedy width probe in
-            sync with `build_line`'s shape input so a line that fits at
-            measure time also fits at build time. Mirror both the
-            caps/smallCaps uppercase transform (length-guarded) and the
-            U+0009 → U+0020 tab substitution (always length-safe). */
+            /* L1.3 (#4) — keep the greedy width probe in sync with
+            `build_line`'s shape input via the shared
+            `transform_for_shape` helper. Width probe ignores the
+            cluster map (only the total advance matters here). */
             let needs_tab_sub = sub_raw.contains('\u{0009}');
-            let owned: Option<String> = if span.caps_transform {
-                let upper = sub_raw.to_uppercase();
-                if upper.len() == sub_raw.len() {
-                    Some(if needs_tab_sub {
-                        upper.replace('\t', " ")
-                    } else {
-                        upper
-                    })
-                } else if needs_tab_sub {
-                    Some(sub_raw.replace('\t', " "))
-                } else {
-                    None
-                }
-            } else if needs_tab_sub {
-                Some(sub_raw.replace('\t', " "))
-            } else {
-                None
-            };
-            let sub = owned.as_deref().unwrap_or(sub_raw);
-            total += shape_text(face, sub, direction, span.px_size).total_advance;
+            let (sub_cow, _) = transform_for_shape(sub_raw, span.caps_transform, needs_tab_sub);
+            total += shape_text(face, &sub_cow, direction, span.px_size).total_advance;
             cursor = piece_end;
         }
     }
@@ -1027,5 +1046,92 @@ fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &Fon
     };
     for _ in 0..n {
         run.glyphs.insert(glyph_idx + 1, tatweel_glyph.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transform_for_shape_noop_borrows() {
+        let (text, map) = transform_for_shape("hello", false, false);
+        assert!(matches!(text, Cow::Borrowed(_)));
+        assert_eq!(text.as_ref(), "hello");
+        assert!(map.is_none());
+    }
+
+    #[test]
+    fn transform_for_shape_tabs_only_skips_map() {
+        let (text, map) = transform_for_shape("a\tb", false, true);
+        assert_eq!(text.as_ref(), "a b");
+        assert!(
+            map.is_none(),
+            "tab subs are byte-aligned, no cluster remap needed"
+        );
+    }
+
+    #[test]
+    fn transform_for_shape_maps_german_sharp_s() {
+        /* `Straße` = S t r a ß e at byte indices 0,1,2,3,4,6
+        (ß is 2 UTF-8 bytes at byte index 4). Uppercase expands
+        ß → "SS" so the transformed text is 7 ASCII bytes "STRASSE";
+        the two "SS" bytes both map back to source byte index 4. */
+        let (text, map) = transform_for_shape("Straße", true, false);
+        assert_eq!(text.as_ref(), "STRASSE");
+        let map = map.expect("caps path returns map");
+        assert_eq!(map, vec![0, 1, 2, 3, 4, 4, 6]);
+    }
+
+    #[test]
+    fn transform_for_shape_maps_ligature_expansion() {
+        /* `ﬁle`: ﬁ (U+FB01) is 3 UTF-8 bytes at index 0, then `l`
+        at index 3, `e` at index 4. ﬁ uppercases to "FI" (2 ASCII
+        bytes), so the transformed string is 4 bytes "FILE" and the
+        first two bytes both map back to source byte 0. */
+        let (text, map) = transform_for_shape("ﬁle", true, false);
+        assert_eq!(text.as_ref(), "FILE");
+        let map = map.expect("caps path returns map");
+        assert_eq!(map, vec![0, 0, 3, 4]);
+    }
+
+    #[test]
+    fn transform_for_shape_greek_final_sigma() {
+        /* `ως` (omega + final sigma): ω at byte 0 (2 bytes),
+        ς at byte 2 (2 bytes). Uppercase → ΩΣ, same byte width.
+        Map is identity in source-space. */
+        let (text, map) = transform_for_shape("ως", true, false);
+        assert_eq!(text.as_ref(), "ΩΣ");
+        let map = map.expect("caps path returns map");
+        assert_eq!(map, vec![0, 0, 2, 2]);
+    }
+
+    #[test]
+    fn transform_for_shape_caps_with_tabs() {
+        /* `a\tß` — tab at byte 1, ß at byte 2 (2 bytes). With caps
+        + tab subs: tab → ' ', ß → "SS". Transformed = "A SS",
+        map = [0,1,2,2]. */
+        let (text, map) = transform_for_shape("a\tß", true, true);
+        assert_eq!(text.as_ref(), "A SS");
+        let map = map.expect("caps path returns map");
+        assert_eq!(map, vec![0, 1, 2, 2]);
+    }
+
+    #[test]
+    fn transform_for_shape_cluster_stays_on_char_boundary() {
+        /* Every cluster index in the transformed string, when
+        remapped, must land on a UTF-8 char boundary in the source.
+        Run a small alphabet of expanding cases and verify. */
+        for src in &["Straße", "ﬁle", "ﬂip", "ﬀ", "a\tß", "ως"] {
+            let (text, map) = transform_for_shape(src, true, true);
+            let map = map.expect("caps path returns map");
+            for &source_byte in &map {
+                assert!(
+                    src.is_char_boundary(source_byte as usize),
+                    "source byte {source_byte} not a char boundary in {src:?}"
+                );
+            }
+            assert_eq!(map.len(), text.len(), "map covers every transformed byte");
+        }
     }
 }

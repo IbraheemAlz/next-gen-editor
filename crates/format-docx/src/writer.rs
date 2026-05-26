@@ -4,8 +4,12 @@
 //! `word/document.xml` is regenerated.
 
 use crate::error::DocxError;
-use crate::opc::archive::{COMMENTS_EXTENDED_XML, DOC_XML, DocxArchive, NUMBERING_XML};
-use crate::parts::comments::build_comments_extended_xml;
+use crate::opc::archive::{
+    COMMENTS_EXTENDED_XML, COMMENTS_XML, DOC_XML, DocxArchive, NUMBERING_XML, RELS_XML,
+};
+use crate::parts::comments::{
+    build_comments_extended_xml, build_comments_extended_xml_with_overrides, build_comments_xml,
+};
 use crate::parts::numbering::build_numbering_xml;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
@@ -13,6 +17,8 @@ use engine::{
     RevisionKind, RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection, UnderlineStyle,
     VMergeRole,
 };
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
 
@@ -1159,19 +1165,45 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o644);
 
-        /* Sprint 9 — regenerate `word/commentsExtended.xml` only when
-        the document carries at least one resolved comment with a
-        captured paraId. Untouched comments fall through the
-        passthrough so unrelated documents stay byte-identical. */
-        let extended_bytes = if doc.comment_defs.values().any(|c| c.resolved) {
-            build_comments_extended_xml(&doc.comment_defs)
-        } else {
-            None
-        };
+        let comments_already_present = archive.other_entries.iter().any(|(n, _)| n == COMMENTS_XML);
         let extended_already_present = archive
             .other_entries
             .iter()
             .any(|(n, _)| n == COMMENTS_EXTENDED_XML);
+
+        /* L1.2 (#18) — synthesize `word/comments.xml` only when the
+        archive carries no `comments.xml` AND the engine holds at least
+        one resolved comment with no captured paraId. The synthesis
+        path mints fresh `w14:paraId` / `w14:textId` values per `<w:p>`
+        so the matching `commentsExtended.xml` row can refer to them.
+        Existing Word-authored `comments.xml` is never overwritten —
+        the writer continues to ride the OPC passthrough. */
+        let any_unminted_resolved = doc
+            .comment_defs
+            .values()
+            .any(|c| c.resolved && c.first_para_id.is_none());
+        let (comments_bytes, minted_paraids): (Option<Vec<u8>>, HashMap<u32, String>) =
+            if any_unminted_resolved && !comments_already_present {
+                let (bytes, map) = build_comments_xml(&doc.comment_defs);
+                (Some(bytes), map)
+            } else {
+                (None, HashMap::new())
+            };
+
+        /* Sprint 9 — regenerate `word/commentsExtended.xml` only when
+        the document carries at least one resolved comment. Untouched
+        comments fall through the passthrough so unrelated documents
+        stay byte-identical. The mint map populates first_para_id for
+        engine-minted comments synthesized above. */
+        let extended_bytes = if doc.comment_defs.values().any(|c| c.resolved) {
+            if minted_paraids.is_empty() {
+                build_comments_extended_xml(&doc.comment_defs)
+            } else {
+                build_comments_extended_xml_with_overrides(&doc.comment_defs, &minted_paraids)
+            }
+        } else {
+            None
+        };
 
         /* Sprint 13 (#12) — regenerate `word/numbering.xml` only when
         `doc.numbering.dirty` is `true` (an in-engine synth flipped
@@ -1188,18 +1220,87 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             .iter()
             .any(|(n, _)| n == NUMBERING_XML);
 
+        /* L1.2 (#18) — when comments.xml or commentsExtended.xml is
+        being synthesized on a fresh document, splice the matching
+        `<Override>` / `<Relationship>` rows into the passthrough OPC
+        entries additively. Both helpers are no-ops when the row is
+        already present, so untouched documents stay byte-identical. */
+        let synth_comments = comments_bytes.is_some();
+        let synth_extended = !extended_already_present && extended_bytes.is_some();
+
         /* Write sibling entries verbatim, in original order — except
-        for parts we have a regenerated copy for (replace in-place). */
+        for parts we have a regenerated copy for (replace in-place).
+        `[Content_Types].xml` and `word/_rels/document.xml.rels` may
+        also receive additive splices when L1.2 synthesizes a new
+        part on a fresh document. */
         for (name, bytes) in &archive.other_entries {
             zip.start_file(name, opts)?;
             if name == COMMENTS_EXTENDED_XML
                 && let Some(new_bytes) = extended_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
+            } else if name == COMMENTS_XML
+                && let Some(new_bytes) = comments_bytes.as_deref()
+            {
+                /* Synthesis path is guarded behind `!comments_already_present`;
+                if comments.xml IS in `other_entries`, `comments_bytes` is
+                `None` and this branch is unreachable. Kept defensive for
+                the case where the gate evolves. */
+                zip.write_all(new_bytes)?;
             } else if name == NUMBERING_XML
                 && let Some(new_bytes) = numbering_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
+            } else if name == "[Content_Types].xml" && (synth_comments || synth_extended) {
+                let raw = std::str::from_utf8(bytes)?;
+                let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
+                if synth_comments {
+                    patched = match inject_content_type_override(
+                        &patched,
+                        COMMENTS_PART_NAME,
+                        COMMENTS_CONTENT_TYPE,
+                    ) {
+                        Cow::Borrowed(_) => patched,
+                        Cow::Owned(s) => Cow::Owned(s),
+                    };
+                }
+                if synth_extended {
+                    patched = match inject_content_type_override(
+                        &patched,
+                        COMMENTS_EXT_PART_NAME,
+                        COMMENTS_EXT_CONTENT_TYPE,
+                    ) {
+                        Cow::Borrowed(_) => patched,
+                        Cow::Owned(s) => Cow::Owned(s),
+                    };
+                }
+                zip.write_all(patched.as_bytes())?;
+            } else if name == RELS_XML && (synth_comments || synth_extended) {
+                let raw = std::str::from_utf8(bytes)?;
+                let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
+                let mut next = next_rel_id(&patched);
+                if synth_comments {
+                    let rid = format!("rId{next}");
+                    let new =
+                        inject_doc_rel(&patched, &rid, COMMENTS_REL_TYPE, COMMENTS_REL_TARGET);
+                    if let Cow::Owned(s) = new {
+                        patched = Cow::Owned(s);
+                        next += 1;
+                    }
+                }
+                if synth_extended {
+                    let rid = format!("rId{next}");
+                    let new = inject_doc_rel(
+                        &patched,
+                        &rid,
+                        COMMENTS_EXT_REL_TYPE,
+                        COMMENTS_EXT_REL_TARGET,
+                    );
+                    if let Cow::Owned(s) = new {
+                        patched = Cow::Owned(s);
+                    }
+                }
+                zip.write_all(patched.as_bytes())?;
             } else {
                 zip.write_all(bytes)?;
             }
@@ -1211,13 +1312,14 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             zip.start_file(NUMBERING_XML, opts)?;
             zip.write_all(new_bytes)?;
         }
-        /* New extended part on a document that never had one before:
-        append the entry. The corresponding `[Content_Types].xml`
-        override and rels entry are NOT synthesized in v1 — Word
-        tolerates the part's presence in most readers, and the
-        common Sprint 9 case (open .docx that already had comments,
-        toggle resolved, save) hits the in-place replace above.
-        Synthesizing the OPC plumbing is tracked as tech-debt. */
+        /* L1.2 (#18) — append comments.xml when synthesized fresh.
+        Content_Types + rels were patched in the write loop above. */
+        if let Some(new_bytes) = comments_bytes.as_deref() {
+            zip.start_file(COMMENTS_XML, opts)?;
+            zip.write_all(new_bytes)?;
+        }
+        /* Append `commentsExtended.xml` when synthesized fresh.
+        Content_Types + rels were patched in the write loop above. */
         if !extended_already_present && let Some(new_bytes) = extended_bytes.as_deref() {
             zip.start_file(COMMENTS_EXTENDED_XML, opts)?;
             zip.write_all(new_bytes)?;
@@ -1352,6 +1454,91 @@ const DOT_RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="y
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>"#;
+
+/* L1.2 (#18) — OPC plumbing constants for `comments.xml` and
+`commentsExtended.xml`. Content-type names + rel-type IRIs match the
+OOXML spec; targets are relative to `word/`. */
+const COMMENTS_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
+const COMMENTS_EXT_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml";
+const COMMENTS_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+const COMMENTS_EXT_REL_TYPE: &str =
+    "http://schemas.microsoft.com/office/2011/relationships/commentsExtended";
+const COMMENTS_PART_NAME: &str = "/word/comments.xml";
+const COMMENTS_EXT_PART_NAME: &str = "/word/commentsExtended.xml";
+const COMMENTS_REL_TARGET: &str = "comments.xml";
+const COMMENTS_EXT_REL_TARGET: &str = "commentsExtended.xml";
+
+/// L1.2 (#18) — additive-or-noop splice of a `<Override>` row into an
+/// existing `[Content_Types].xml`. Returns `Cow::Borrowed` when the
+/// part name is already present, preserving the source bytes
+/// byte-identical (no whitespace / attribute-order drift).
+fn inject_content_type_override<'a>(
+    xml: &'a str,
+    part_name: &str,
+    content_type: &str,
+) -> Cow<'a, str> {
+    let needle = format!("PartName=\"{part_name}\"");
+    if xml.contains(&needle) {
+        return Cow::Borrowed(xml);
+    }
+    let Some(close_idx) = xml.find("</Types>") else {
+        /* Malformed — leave it alone rather than corrupt further. */
+        return Cow::Borrowed(xml);
+    };
+    let mut out = String::with_capacity(xml.len() + 192);
+    out.push_str(&xml[..close_idx]);
+    out.push_str(&format!(
+        "<Override PartName=\"{part_name}\" ContentType=\"{content_type}\"/>\n"
+    ));
+    out.push_str(&xml[close_idx..]);
+    Cow::Owned(out)
+}
+
+/// L1.2 (#18) — pick a fresh `rId` that does not collide with any
+/// existing `Id="rIdN"` value in `rels_xml`. Returns the next sequence
+/// number (so `rId{n}` is unused).
+fn next_rel_id(rels_xml: &str) -> u32 {
+    let mut max = 0u32;
+    let mut rest = rels_xml;
+    while let Some(idx) = rest.find("Id=\"rId") {
+        rest = &rest[idx + 7..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        if let Ok(n) = rest[..end].parse::<u32>() {
+            max = max.max(n);
+        }
+        rest = &rest[end..];
+    }
+    max + 1
+}
+
+/// L1.2 (#18) — additive-or-noop splice of a `<Relationship>` row into
+/// `word/_rels/document.xml.rels`. Skips when any existing row already
+/// points at `target` (regardless of its rId). Returns the rId actually
+/// used (caller-allocated when injected, the existing one otherwise).
+fn inject_doc_rel<'a>(
+    rels_xml: &'a str,
+    rel_id: &str,
+    rel_type: &str,
+    target: &str,
+) -> Cow<'a, str> {
+    let target_needle = format!("Target=\"{target}\"");
+    if rels_xml.contains(&target_needle) {
+        return Cow::Borrowed(rels_xml);
+    }
+    let Some(close_idx) = rels_xml.find("</Relationships>") else {
+        return Cow::Borrowed(rels_xml);
+    };
+    let mut out = String::with_capacity(rels_xml.len() + 256);
+    out.push_str(&rels_xml[..close_idx]);
+    out.push_str(&format!(
+        "<Relationship Id=\"{rel_id}\" Type=\"{rel_type}\" Target=\"{target}\"/>\n"
+    ));
+    out.push_str(&rels_xml[close_idx..]);
+    Cow::Owned(out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2956,6 +3143,218 @@ mod tests {
             extended_xml.as_bytes(),
             "no resolved → passthrough byte-identical"
         );
+    }
+
+    /// L1.2 (#18) — synthesize a fresh `.docx` that holds an engine-
+    /// minted comment (`first_para_id = None`), mark it resolved, save,
+    /// reopen. The writer must mint a `w14:paraId`, emit
+    /// `commentsExtended.xml`, and splice the matching `<Override>` +
+    /// `<Relationship>` rows into `[Content_Types].xml` and
+    /// `word/_rels/document.xml.rels` so the round-trip carries the
+    /// resolved bit back.
+    #[test]
+    fn engine_minted_comment_synthesizes_paraid_and_opc() {
+        use engine::{BlockPath, LogicalPos};
+        let pos = || LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        };
+        let doc = DocumentTree::from_text("hello");
+        let (mut doc, comment_id) = doc.insert_comment(
+            pos(),
+            pos(),
+            "needs review".into(),
+            "tester".into(),
+            "2026-05-26T12:00:00Z".into(),
+        );
+        /* Sanity: engine-minted comment has no paraId yet. */
+        assert!(
+            doc.comment_defs
+                .get(&comment_id)
+                .expect("inserted comment")
+                .first_para_id
+                .is_none()
+        );
+        /* Mark it resolved. */
+        if let Some(c) = doc.comment_defs.get_mut(&comment_id) {
+            c.resolved = true;
+        }
+
+        let bytes = build_minimal_docx(&doc).expect("build");
+
+        /* The archive carries comments.xml + commentsExtended.xml. */
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip");
+        let names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
+        assert!(
+            names.contains(&"word/comments.xml".to_string()),
+            "synthesized comments.xml: {names:?}"
+        );
+        assert!(
+            names.contains(&"word/commentsExtended.xml".to_string()),
+            "synthesized commentsExtended.xml: {names:?}"
+        );
+
+        /* [Content_Types].xml carries both Overrides. */
+        let mut a = archive;
+        let ct_raw = {
+            let mut f = a.by_name("[Content_Types].xml").expect("content types");
+            let mut s = String::new();
+            use std::io::Read;
+            f.read_to_string(&mut s).expect("read ct");
+            s
+        };
+        assert!(
+            ct_raw.contains("PartName=\"/word/comments.xml\""),
+            "Content_Types Override for comments.xml missing: {ct_raw}"
+        );
+        assert!(
+            ct_raw.contains("PartName=\"/word/commentsExtended.xml\""),
+            "Content_Types Override for commentsExtended.xml missing: {ct_raw}"
+        );
+
+        /* word/_rels/document.xml.rels carries both relationships. */
+        let rels_raw = {
+            let mut f = a.by_name("word/_rels/document.xml.rels").expect("doc rels");
+            let mut s = String::new();
+            use std::io::Read;
+            f.read_to_string(&mut s).expect("read rels");
+            s
+        };
+        assert!(
+            rels_raw.contains("Target=\"comments.xml\""),
+            "rels missing comments.xml: {rels_raw}"
+        );
+        assert!(
+            rels_raw.contains("Target=\"commentsExtended.xml\""),
+            "rels missing commentsExtended.xml: {rels_raw}"
+        );
+
+        /* Reopen — the resolved bit survives and first_para_id is now set. */
+        let reopened = read_docx(&bytes).expect("re-read");
+        let cdef = reopened
+            .document
+            .comment_defs
+            .get(&comment_id)
+            .expect("comment def round-tripped");
+        assert!(
+            cdef.resolved,
+            "resolved bit survived round-trip on engine-minted comment"
+        );
+        assert!(
+            cdef.first_para_id.is_some(),
+            "first_para_id was minted: {cdef:?}"
+        );
+    }
+
+    /// L1.2 (#18) — invariant guard: when no comment carries the
+    /// resolved bit, an existing archive with `comments.xml` already
+    /// present must round-trip byte-identical (no Content_Types /
+    /// rels mutation). Protects unrelated Word-authored documents
+    /// from accidental rewriting on every save.
+    #[test]
+    fn untouched_doc_with_comments_stays_byte_identical() {
+        let comments_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+            <w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+                        xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\">\
+              <w:comment w:id=\"1\" w:author=\"Alice\" w:date=\"2026-01-01T00:00:00Z\">\
+                <w:p w14:paraId=\"AAAA0001\"><w:r><w:t>old</w:t></w:r></w:p>\
+              </w:comment>\
+            </w:comments>";
+
+        let doc = DocumentTree::from_text("body");
+        let extensions = media_extensions(&doc);
+        let content_types = build_content_types(&extensions);
+        let doc_rels = build_doc_rels(&doc);
+        let original_ct = content_types.clone();
+        let original_rels = doc_rels.clone();
+        let other = vec![
+            ("[Content_Types].xml".into(), content_types.into_bytes()),
+            ("_rels/.rels".into(), DOT_RELS_XML.as_bytes().to_vec()),
+            ("word/_rels/document.xml.rels".into(), doc_rels.into_bytes()),
+            ("word/comments.xml".into(), comments_xml.as_bytes().to_vec()),
+        ];
+        let archive = DocxArchive {
+            other_entries: other,
+            document: doc.clone(),
+        };
+
+        let bytes = write_docx(&archive, &doc).expect("resave");
+        let archive_back = read_docx(&bytes).expect("re-read");
+
+        let raw_comments = archive_back
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "word/comments.xml")
+            .map(|(_, b)| b.as_slice())
+            .expect("comments.xml still present");
+        assert_eq!(
+            raw_comments,
+            comments_xml.as_bytes(),
+            "comments.xml passthrough byte-identical"
+        );
+
+        let raw_ct = archive_back
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "[Content_Types].xml")
+            .map(|(_, b)| b.clone())
+            .expect("content types present");
+        assert_eq!(
+            String::from_utf8(raw_ct).expect("utf-8"),
+            original_ct,
+            "Content_Types passthrough byte-identical"
+        );
+
+        let raw_rels = archive_back
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "word/_rels/document.xml.rels")
+            .map(|(_, b)| b.clone())
+            .expect("rels present");
+        assert_eq!(
+            String::from_utf8(raw_rels).expect("utf-8"),
+            original_rels,
+            "rels passthrough byte-identical"
+        );
+    }
+
+    /// L1.2 (#18) — `inject_content_type_override` and `inject_doc_rel`
+    /// must be no-ops when the target row is already present, even if
+    /// the rId or attribute order differs. Guards against duplicate
+    /// emission on docs that hand-roll their own rels.
+    #[test]
+    fn opc_inject_helpers_are_idempotent_when_target_present() {
+        let ct = "<?xml version=\"1.0\"?>\n\
+            <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+            <Override PartName=\"/word/comments.xml\" ContentType=\"foo\"/>\
+            </Types>";
+        let after = inject_content_type_override(ct, COMMENTS_PART_NAME, COMMENTS_CONTENT_TYPE);
+        assert!(matches!(after, Cow::Borrowed(_)), "no-op when present");
+
+        let rels = "<?xml version=\"1.0\"?>\n\
+            <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+            <Relationship Id=\"rId99\" Type=\"foo\" Target=\"comments.xml\"/>\
+            </Relationships>";
+        let after = inject_doc_rel(rels, "rId500", COMMENTS_REL_TYPE, COMMENTS_REL_TARGET);
+        assert!(
+            matches!(after, Cow::Borrowed(_)),
+            "no-op when target present"
+        );
+    }
+
+    /// L1.2 (#18) — `next_rel_id` must skip over the highest existing
+    /// `rIdN` so the new row never collides.
+    #[test]
+    fn next_rel_id_picks_unused_value() {
+        let rels = "<Relationships>\
+            <Relationship Id=\"rId1\" .../>\
+            <Relationship Id=\"rId7\" .../>\
+            <Relationship Id=\"rId42\" .../>\
+            </Relationships>";
+        assert_eq!(next_rel_id(rels), 43);
+
+        let no_rids = "<Relationships></Relationships>";
+        assert_eq!(next_rel_id(no_rids), 1);
     }
 
     /// Sprint 13 (#12) — repeated `Bullet ↔ Number ↔ Bullet`
