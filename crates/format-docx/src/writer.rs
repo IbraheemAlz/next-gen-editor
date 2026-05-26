@@ -4,8 +4,9 @@
 //! `word/document.xml` is regenerated.
 
 use crate::error::DocxError;
-use crate::opc::archive::{COMMENTS_EXTENDED_XML, DOC_XML, DocxArchive};
+use crate::opc::archive::{COMMENTS_EXTENDED_XML, DOC_XML, DocxArchive, NUMBERING_XML};
 use crate::parts::comments::build_comments_extended_xml;
+use crate::parts::numbering::build_numbering_xml;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
     FontFamily, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, Revision,
@@ -280,8 +281,13 @@ fn jc_val(a: Alignment) -> &'static str {
 /// Sprint 12 (#11) — `style_id` is `Some` when the paragraph references a
 /// `<w:style>` entry. Emitted as the FIRST `<w:pPr>` child per OOXML
 /// schema order (CT_PPrBase: `<w:pStyle>` before everything else).
-fn emit_ppr(props: &ParaProperties, style_id: Option<&str>, out: &mut String) {
-    if *props == ParaProperties::default() && style_id.is_none() {
+fn emit_ppr(
+    props: &ParaProperties,
+    style_id: Option<&str>,
+    list_item: Option<engine::ListItem>,
+    out: &mut String,
+) {
+    if *props == ParaProperties::default() && style_id.is_none() && list_item.is_none() {
         return;
     }
     out.push_str("<w:pPr>");
@@ -396,6 +402,15 @@ fn emit_ppr(props: &ParaProperties, style_id: Option<&str>, out: &mut String) {
             TextDirection::Ltr => out.push_str("<w:bidi w:val=\"false\"/>"),
         }
     }
+    /* Sprint 13 (#12) — `<w:numPr>` carries list membership; emitted
+    last so it sits at the tail of `<w:pPr>` (Word's canonical
+    placement; CT_PPrBase's `numPr` follows the other body fields). */
+    if let Some(li) = list_item {
+        out.push_str(&format!(
+            "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
+            li.ilvl, li.num_id
+        ));
+    }
     out.push_str("</w:pPr>");
 }
 
@@ -406,7 +421,7 @@ fn emit_ppr(props: &ParaProperties, style_id: Option<&str>, out: &mut String) {
 /// gaps included.
 fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("<w:p>");
-    emit_ppr(&para.props, para.style_id.as_deref(), out);
+    emit_ppr(&para.props, para.style_id.as_deref(), para.list_item, out);
     /* `<w:br>` (Phase 2 audit, gap A.12) lives as U+2028 / U+000C in
     `para.text`; the structural `<w:r><w:br/></w:r>` emission needs
     the cut-point walk. The fast path stays open for plain
@@ -1145,18 +1160,43 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             .iter()
             .any(|(n, _)| n == COMMENTS_EXTENDED_XML);
 
+        /* Sprint 13 (#12) — regenerate `word/numbering.xml` only when
+        `doc.numbering.dirty` is `true` (an in-engine synth flipped
+        it). Otherwise the OPC passthrough keeps the original bytes
+        verbatim — round-trip remains byte-identical for documents
+        that never touched a list. */
+        let numbering_bytes: Option<Vec<u8>> = if doc.numbering.dirty {
+            Some(build_numbering_xml(&doc.numbering))
+        } else {
+            None
+        };
+        let numbering_already_present = archive
+            .other_entries
+            .iter()
+            .any(|(n, _)| n == NUMBERING_XML);
+
         /* Write sibling entries verbatim, in original order — except
-        for `commentsExtended.xml` which we replace in-place when we
-        have new bytes to emit. */
+        for parts we have a regenerated copy for (replace in-place). */
         for (name, bytes) in &archive.other_entries {
             zip.start_file(name, opts)?;
             if name == COMMENTS_EXTENDED_XML
                 && let Some(new_bytes) = extended_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
+            } else if name == NUMBERING_XML
+                && let Some(new_bytes) = numbering_bytes.as_deref()
+            {
+                zip.write_all(new_bytes)?;
             } else {
                 zip.write_all(bytes)?;
             }
+        }
+        /* Sprint 13 (#12) — append numbering.xml if synthesized fresh
+        on a document that never had one. Per Sprint 13 v1, no
+        Content_Types Override / rels synth; Word tolerates this. */
+        if !numbering_already_present && let Some(new_bytes) = numbering_bytes.as_deref() {
+            zip.start_file(NUMBERING_XML, opts)?;
+            zip.write_all(new_bytes)?;
         }
         /* New extended part on a document that never had one before:
         append the entry. The corresponding `[Content_Types].xml`
@@ -2900,6 +2940,71 @@ mod tests {
             extended_xml.as_bytes(),
             "no resolved → passthrough byte-identical"
         );
+    }
+
+    /// Sprint 13 (#12) — repeated `Bullet ↔ Number ↔ Bullet`
+    /// toggles on the same paragraph must NOT inflate
+    /// `numbering.xml`. The synth path reuses the matching template
+    /// it minted on the first toggle; the writer's regenerated XML
+    /// stays at exactly one bullet AbstractNum + one number
+    /// AbstractNum + two Num instances regardless of toggle count.
+    #[test]
+    fn list_toggle_idempotency_via_round_trip() {
+        use engine::numbering::ListSynthesisKind;
+        use engine::{BlockPath, LogicalPos};
+        let pos = || LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        };
+        let mut doc = DocumentTree::from_text("toggle me");
+        /* 20 toggles, alternating Bullet ↔ Number. */
+        for i in 0..20 {
+            let kind = if i % 2 == 0 {
+                ListSynthesisKind::Bullet
+            } else {
+                ListSynthesisKind::Number
+            };
+            doc = doc.toggle_list_on_range(pos(), pos(), kind);
+        }
+        /* Exactly two AbstractNums + two Num instances — one of each
+        kind, reused across every toggle. */
+        assert_eq!(
+            doc.numbering.abstract_nums.len(),
+            2,
+            "abstract_nums must stay at 2 (one Bullet + one Decimal) after repeated toggles"
+        );
+        assert_eq!(
+            doc.numbering.num_instances.len(),
+            2,
+            "num_instances must stay at 2 after repeated toggles"
+        );
+        assert!(doc.numbering.dirty, "synth must flip dirty");
+        /* Round-trip: write + read back; counts hold. */
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("re-read");
+        assert_eq!(parsed.document.numbering.abstract_nums.len(), 2);
+        assert_eq!(parsed.document.numbering.num_instances.len(), 2);
+        /* The last toggle was Number (i=19 odd); paragraph 0's
+        list_item should point at the Number-kind num_id. */
+        let p = parsed.document.nth_paragraph(0).expect("paragraph 0");
+        let li = p.list_item.expect("list_item on toggled paragraph");
+        let abs_id = parsed
+            .document
+            .numbering
+            .num_instances
+            .get(&li.num_id)
+            .map(|n| n.abstract_num_id)
+            .expect("num_id resolves");
+        let abs = parsed
+            .document
+            .numbering
+            .abstract_nums
+            .get(&abs_id)
+            .expect("abstract resolves");
+        assert!(matches!(
+            abs.level(0).map(|l| &l.num_fmt),
+            Some(engine::numbering::NumFmt::Decimal)
+        ));
     }
 
     /// Sprint 12 (#11) — `Paragraph.style_id` survives a full `.docx`

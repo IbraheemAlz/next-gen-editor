@@ -6349,31 +6349,47 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::ToggleList` (Sprint 5 UI Edition) — Off clears the
-    /// paragraph's `list_item`; Bullet / Number surface a clear
-    /// error pointing at the missing numbering synthesizer.
+    /// `Command::ToggleList` — Sprint 13 (#12).
+    /// - `Off` clears the paragraph's `list_item`.
+    /// - `Bullet` / `Number` run the idempotent numbering synthesis
+    ///   (`DocumentTree::toggle_list_on_range`) so repeated toggles
+    ///   reuse existing AbstractNum / Num templates and never bloat
+    ///   `numbering.xml`.
     fn do_toggle_list(&mut self, range: BridgeLogicalRange, kind: bridge::ListKind) -> Event {
-        match kind {
+        let (start, end) = ordered(range.start, range.end);
+        let (new_doc, label) = match kind {
             bridge::ListKind::Off => {
-                let (start, end) = ordered(range.start, range.end);
-                let new_doc = self
+                let d = self
                     .undo
                     .current()
                     .clear_list_item_on_range(to_engine_pos(start), to_engine_pos(end));
-                self.undo.push(new_doc);
-                self.layout_cache.get_mut().clear();
-                self.dirty.invalidate(full_page_rect(self.scale()));
-                if let Err(e) = self.maybe_repaint_result() {
-                    return *e;
-                }
-                self.selection_changed()
+                (d, "List cleared")
             }
-            bridge::ListKind::Bullet | bridge::ListKind::Number => Event::Error {
-                message: format!(
-                    "ToggleList({kind:?}): list synthesis not yet implemented — see Core: numbering.xml writer and List Synthesis"
-                ),
-            },
+            bridge::ListKind::Bullet => {
+                let d = self.undo.current().toggle_list_on_range(
+                    to_engine_pos(start),
+                    to_engine_pos(end),
+                    engine::numbering::ListSynthesisKind::Bullet,
+                );
+                (d, "Bullet list")
+            }
+            bridge::ListKind::Number => {
+                let d = self.undo.current().toggle_list_on_range(
+                    to_engine_pos(start),
+                    to_engine_pos(end),
+                    engine::numbering::ListSynthesisKind::Number,
+                );
+                (d, "Numbered list")
+            }
+        };
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
         }
+        self.announce(AnnouncementPriority::Polite, label);
+        self.selection_changed()
     }
 
     /// `Command::SetPageMargins` (Sprint 4 UI Edition) — set the

@@ -91,34 +91,6 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     let resolver = StyleResolver::new(&style_table);
     let mut document = parse_document_xml(&xml, &resolver)?;
 
-    /* Sprint 12 (#11) — mirror the `StyleTable` into the engine model
-    so the live editor can apply / re-resolve styles without the
-    format-docx crate. Paragraph styles only — character styles
-    (`<w:rStyle>`) stay out of scope per the sprint plan. The OOXML
-    file itself stays passthrough byte-identical (the writer never
-    re-emits `styles.xml` unless a style is added — Sprint 12 does
-    not add any). */
-    document.style_defaults = style_table.defaults.para.clone();
-    for (id, def) in &style_table.by_id {
-        if !matches!(def.kind, crate::parts::styles::StyleKind::Paragraph) {
-            continue;
-        }
-        document.styles.insert(
-            id.clone(),
-            engine::ParagraphStyle {
-                id: id.clone(),
-                /* `StyleDef` does not currently capture `<w:name>`;
-                fall back to the id so the styles dropdown still has
-                a label. A future pass can widen the reader to grab
-                the `w:name w:val` attribute. */
-                name: id.clone(),
-                based_on: def.based_on.clone(),
-                para: def.para.clone(),
-                run: def.run.clone(),
-            },
-        );
-    }
-
     /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
     numbering resolver. Second pass over the parsed paragraphs fills each
     list paragraph's `resolved_marker`. */
@@ -248,6 +220,37 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         .with_header_footer_parts(headers, footers);
     document.media = media;
 
+    /* Sprint 12 (#11) — mirror the `StyleTable` into the engine model
+    so the live editor can apply / re-resolve styles without the
+    format-docx crate. Paragraph styles only — character styles
+    (`<w:rStyle>`) stay out of scope per the sprint plan. Re-stamped
+    AFTER `from_blocks_with_sections` rebuilds since those rebuild
+    constructors otherwise zero the field. */
+    document.style_defaults = style_table.defaults.para.clone();
+    for (id, def) in &style_table.by_id {
+        if !matches!(def.kind, crate::parts::styles::StyleKind::Paragraph) {
+            continue;
+        }
+        document.styles.insert(
+            id.clone(),
+            engine::ParagraphStyle {
+                id: id.clone(),
+                name: id.clone(),
+                based_on: def.based_on.clone(),
+                para: def.para.clone(),
+                run: def.run.clone(),
+            },
+        );
+    }
+
+    /* Sprint 13 (#12) — mirror the parsed `NumberingDefinitions` into
+    the engine model so `Command::ToggleList` synthesis can reuse
+    existing templates and the live editor can recompute markers
+    without re-traversing `other_entries`. Source of truth for parse
+    semantics remains `format-docx`; this is a value-copy. `.dirty`
+    stays `false` — read-only ingest never bloats the on-disk part. */
+    document.numbering = engine_numbering_from(&numbering);
+
     // Phase 8a — parse footnotes.xml + comments.xml if present, attach
     // to the document. Both XML parts still ride other_entries verbatim
     // so the passthrough writer round-trips them byte-identical.
@@ -361,4 +364,67 @@ fn resolve_hyperlinks_block(
             engine::Block::Table(t)
         }
     }
+}
+
+/// Sprint 13 (#12) — value-copy from format-docx's
+/// `NumberingDefinitions` (the canonical OOXML parser) into the engine
+/// mirror that lives on `DocumentTree.numbering`. Shapes are
+/// parallel; the enum / struct mapping is line-by-line. `.dirty`
+/// stays `false` so the writer keeps `numbering.xml` byte-identical
+/// until an in-engine synth flips it.
+fn engine_numbering_from(src: &NumberingDefinitions) -> engine::numbering::NumberingDefinitions {
+    use crate::parts::numbering as fd;
+    use engine::numbering as eg;
+    fn cvt_fmt(f: &fd::NumFmt) -> eg::NumFmt {
+        match f {
+            fd::NumFmt::Decimal => eg::NumFmt::Decimal,
+            fd::NumFmt::DecimalZero => eg::NumFmt::DecimalZero,
+            fd::NumFmt::LowerLetter => eg::NumFmt::LowerLetter,
+            fd::NumFmt::UpperLetter => eg::NumFmt::UpperLetter,
+            fd::NumFmt::LowerRoman => eg::NumFmt::LowerRoman,
+            fd::NumFmt::UpperRoman => eg::NumFmt::UpperRoman,
+            fd::NumFmt::Bullet => eg::NumFmt::Bullet,
+            fd::NumFmt::None => eg::NumFmt::None,
+            fd::NumFmt::Other(s) => eg::NumFmt::Other(s.clone()),
+        }
+    }
+    fn cvt_lvl(l: &fd::LvlDef) -> eg::LvlDef {
+        eg::LvlDef {
+            ilvl: l.ilvl,
+            start: l.start,
+            num_fmt: cvt_fmt(&l.num_fmt),
+            lvl_text: l.lvl_text.clone(),
+            lvl_restart: l.lvl_restart,
+            indent: l.indent,
+        }
+    }
+    let mut out = engine::numbering::NumberingDefinitions::default();
+    for (id, abs) in &src.abstract_nums {
+        out.abstract_nums.insert(
+            *id,
+            eg::AbstractNum {
+                id: abs.id,
+                levels: abs.levels.iter().map(cvt_lvl).collect(),
+            },
+        );
+    }
+    for (id, num) in &src.num_instances {
+        out.num_instances.insert(
+            *id,
+            eg::NumInstance {
+                num_id: num.num_id,
+                abstract_num_id: num.abstract_num_id,
+                overrides: num
+                    .overrides
+                    .iter()
+                    .map(|o| eg::LvlOverride {
+                        ilvl: o.ilvl,
+                        start_override: o.start_override,
+                        lvl: o.lvl.as_ref().map(cvt_lvl),
+                    })
+                    .collect(),
+            },
+        );
+    }
+    out
 }

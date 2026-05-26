@@ -6,6 +6,7 @@
 use im::Vector;
 
 pub mod html;
+pub mod numbering;
 
 /// Top-level document block (Phase 5 PR 1). Tables sit alongside
 /// paragraphs in the body; future block variants (Phase 7 floating
@@ -115,6 +116,13 @@ pub struct DocumentTree {
     /// resolver merges `defaults → style chain → direct_overrides`
     /// in document order.
     pub style_defaults: ParaProperties,
+    /// Sprint 13 (#12) — in-memory mirror of `word/numbering.xml`.
+    /// Drives marker resolution + the synthesis path the
+    /// `Command::ToggleList { Bullet | Number }` handler invokes.
+    /// `.dirty` flips to `true` only when synth_list_definition
+    /// actually appends new entries; the writer then regenerates
+    /// the part, otherwise the OPC passthrough byte-identical.
+    pub numbering: numbering::NumberingDefinitions,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -1698,6 +1706,7 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            numbering: numbering::NumberingDefinitions::default(),
         }
     }
 
@@ -1731,6 +1740,7 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            numbering: numbering::NumberingDefinitions::default(),
         }
     }
 
@@ -1766,6 +1776,7 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            numbering: numbering::NumberingDefinitions::default(),
         }
     }
 
@@ -1788,6 +1799,7 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            numbering: numbering::NumberingDefinitions::default(),
         }
     }
 
@@ -1810,6 +1822,7 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            numbering: numbering::NumberingDefinitions::default(),
         }
     }
 
@@ -1849,6 +1862,7 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            numbering: numbering::NumberingDefinitions::default(),
         }
     }
 
@@ -2151,6 +2165,7 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                numbering: self.numbering.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -2193,6 +2208,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2243,6 +2259,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2270,6 +2287,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2316,6 +2334,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2368,6 +2387,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2411,6 +2431,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2436,6 +2457,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2507,6 +2529,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2562,6 +2585,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         };
         (doc, new_id)
     }
@@ -2585,6 +2609,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2608,6 +2633,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2672,6 +2698,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2752,6 +2779,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2797,6 +2825,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2845,6 +2874,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2890,6 +2920,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2899,6 +2930,73 @@ impl DocumentTree {
     /// expose: removing list membership cannot introduce a dangling
     /// `num_id`. Adding list membership is filed as a Core Engine
     /// task (see project backlog).
+    /// Sprint 13 (#12) — set `Paragraph.list_item = Some(ListItem {
+    /// num_id, ilvl: 0 })` on every paragraph the range spans, then
+    /// re-resolve markers for the whole document. `num_id` is the
+    /// idempotent return from
+    /// [`numbering::NumberingDefinitions::synth_list_definition`] —
+    /// reuses an existing matching template when one is present so
+    /// repeated toggles do not inflate `numbering.xml`.
+    ///
+    /// The synth runs against a CLONED numbering store; only if it
+    /// flips `.dirty` does the new store replace the existing one
+    /// (preserves passthrough byte-identity in the no-op reuse
+    /// case).
+    pub fn toggle_list_on_range(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        kind: numbering::ListSynthesisKind,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        let mut next_numbering = self.numbering.clone();
+        let num_id = next_numbering.synth_list_definition(kind);
+        let mut blocks = self.blocks.clone();
+        let apply = |para: &mut Paragraph| {
+            para.list_item = Some(ListItem { num_id, ilvl: 0 });
+            /* resolved_marker is re-stamped by the document-wide
+            resolver below — clearing now keeps it consistent if the
+            resolver bails on a malformed cascade. */
+            para.resolved_marker = None;
+        };
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
+        }
+        /* Document-wide marker refresh — counters reset at the top
+        because the toggled range might appear in the middle. */
+        let mut paragraph_refs: Vec<&mut Paragraph> = blocks
+            .iter_mut()
+            .filter_map(|b| b.as_paragraph_mut())
+            .collect();
+        numbering::resolve_markers_in_place(&mut paragraph_refs, &next_numbering);
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
+            numbering: next_numbering,
+        }
+    }
+
     pub fn clear_list_item_on_range(&self, start: LogicalPos, end: LogicalPos) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
@@ -2935,6 +3033,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -2983,6 +3082,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -3028,6 +3128,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -3139,6 +3240,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -3184,6 +3286,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -3213,6 +3316,7 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                numbering: self.numbering.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -3269,6 +3373,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -3291,6 +3396,7 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                numbering: self.numbering.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -3311,6 +3417,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -3450,6 +3557,7 @@ impl DocumentTree {
                     settings: self.settings.clone(),
                     styles: self.styles.clone(),
                     style_defaults: self.style_defaults.clone(),
+                    numbering: self.numbering.clone(),
                 },
                 caret,
             );
@@ -3488,6 +3596,7 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                numbering: self.numbering.clone(),
             },
             caret,
         )
@@ -3654,6 +3763,7 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                numbering: self.numbering.clone(),
             },
             caret,
         )
@@ -3793,6 +3903,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -3818,6 +3929,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 
@@ -4036,6 +4148,7 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
         }
     }
 }
@@ -6140,6 +6253,7 @@ mod tests {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            numbering: numbering::NumberingDefinitions::default(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

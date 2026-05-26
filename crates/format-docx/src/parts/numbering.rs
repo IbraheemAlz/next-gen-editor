@@ -398,6 +398,108 @@ fn apply_lvl_ind(e: &BytesStart, ind: &mut Indent) {
     }
 }
 
+/// Sprint 13 (#12) — serialize an engine `NumberingDefinitions` into
+/// `word/numbering.xml`. Only called by the writer when
+/// `doc.numbering.dirty` is `true`; otherwise the OPC passthrough
+/// preserves the original bytes verbatim.
+///
+/// Output is deterministic — abstractNums and num instances sort by
+/// id so consecutive saves of the same document produce identical
+/// bytes (matters for the round-trip diff harness).
+pub fn build_numbering_xml(defs: &engine::numbering::NumberingDefinitions) -> Vec<u8> {
+    use engine::numbering as eg;
+    let mut s = String::with_capacity(256 + defs.abstract_nums.len() * 400);
+    s.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+    );
+    /* AbstractNums first (Word's canonical order: every abstract
+    before any num that references it). */
+    let mut abs_ids: Vec<u32> = defs.abstract_nums.keys().copied().collect();
+    abs_ids.sort_unstable();
+    for id in abs_ids {
+        let Some(abs) = defs.abstract_nums.get(&id) else {
+            continue;
+        };
+        s.push_str(&format!("<w:abstractNum w:abstractNumId=\"{}\">", abs.id));
+        for lvl in &abs.levels {
+            s.push_str(&format!("<w:lvl w:ilvl=\"{}\">", lvl.ilvl));
+            s.push_str(&format!("<w:start w:val=\"{}\"/>", lvl.start));
+            let fmt_tok = match &lvl.num_fmt {
+                eg::NumFmt::Decimal => "decimal",
+                eg::NumFmt::DecimalZero => "decimalZero",
+                eg::NumFmt::LowerLetter => "lowerLetter",
+                eg::NumFmt::UpperLetter => "upperLetter",
+                eg::NumFmt::LowerRoman => "lowerRoman",
+                eg::NumFmt::UpperRoman => "upperRoman",
+                eg::NumFmt::Bullet => "bullet",
+                eg::NumFmt::None => "none",
+                eg::NumFmt::Other(s) => s.as_str(),
+            };
+            s.push_str(&format!("<w:numFmt w:val=\"{fmt_tok}\"/>"));
+            s.push_str("<w:lvlText w:val=\"");
+            for ch in lvl.lvl_text.chars() {
+                match ch {
+                    '&' => s.push_str("&amp;"),
+                    '<' => s.push_str("&lt;"),
+                    '>' => s.push_str("&gt;"),
+                    '"' => s.push_str("&quot;"),
+                    other => s.push(other),
+                }
+            }
+            s.push_str("\"/>");
+            if let Some(restart) = lvl.lvl_restart {
+                s.push_str(&format!("<w:lvlRestart w:val=\"{restart}\"/>"));
+            }
+            let ind = &lvl.indent;
+            if ind.start_twips != 0
+                || ind.end_twips != 0
+                || ind.first_line_twips != 0
+                || ind.hanging_twips != 0
+            {
+                s.push_str("<w:pPr><w:ind");
+                if ind.start_twips != 0 {
+                    s.push_str(&format!(" w:start=\"{}\"", ind.start_twips));
+                }
+                if ind.end_twips != 0 {
+                    s.push_str(&format!(" w:end=\"{}\"", ind.end_twips));
+                }
+                if ind.first_line_twips != 0 {
+                    s.push_str(&format!(" w:firstLine=\"{}\"", ind.first_line_twips));
+                }
+                if ind.hanging_twips != 0 {
+                    s.push_str(&format!(" w:hanging=\"{}\"", ind.hanging_twips));
+                }
+                s.push_str("/></w:pPr>");
+            }
+            s.push_str("</w:lvl>");
+        }
+        s.push_str("</w:abstractNum>");
+    }
+    let mut num_ids: Vec<u32> = defs.num_instances.keys().copied().collect();
+    num_ids.sort_unstable();
+    for id in num_ids {
+        let Some(num) = defs.num_instances.get(&id) else {
+            continue;
+        };
+        s.push_str(&format!("<w:num w:numId=\"{}\">", num.num_id));
+        s.push_str(&format!(
+            "<w:abstractNumId w:val=\"{}\"/>",
+            num.abstract_num_id
+        ));
+        for ovr in &num.overrides {
+            s.push_str(&format!("<w:lvlOverride w:ilvl=\"{}\">", ovr.ilvl));
+            if let Some(start) = ovr.start_override {
+                s.push_str(&format!("<w:startOverride w:val=\"{start}\"/>"));
+            }
+            s.push_str("</w:lvlOverride>");
+        }
+        s.push_str("</w:num>");
+    }
+    s.push_str("</w:numbering>");
+    s.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

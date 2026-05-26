@@ -1,17 +1,13 @@
 /**
  * ListButtons — Bullet + Numbered list toggle group.
  *
- * Sprint 5 (UI Edition) reality:
- *   - "Turn list off" → `Command::ToggleList { kind: Off }`. Works.
- *   - "Turn bullet on" / "Turn number on" → require numbering
- *     synthesis (`numbering.xml` writer + `<w:abstractNum>` /
- *     `<w:num>` generators). Engine returns `Event::Error` and the
- *     UI surfaces this honestly as a disabled button with an
- *     amber "Engine pending" badge.
- *
- * Once the Core Engine ships numbering synthesis (project backlog
- * issue "Core: Implement numbering.xml writer and List Synthesis"),
- * removing the `disabled` attribute + the badge is a 4-line change.
+ * Sprint 13 (#12) — wired through the real engine path. Each
+ * Bullet / Number / Remove dispatch goes to `Command::ToggleList`;
+ * the engine's idempotent `synth_list_definition` reuses an
+ * existing matching template when one is present so repeated
+ * toggles never inflate `numbering.xml`. Markers are recomputed
+ * document-wide after every toggle so visible bullets / numbers
+ * refresh immediately.
  */
 import { type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
@@ -23,21 +19,11 @@ export const ListButtons: Component = () => {
 
     const ready = () => state.selection() !== undefined;
 
-    /* `Off` is the only kind that actually mutates today; binding it
-     * to BOTH bullet- and numbered-removal would be misleading.
-     * Instead expose a single "Remove list" affordance via the
-     * bullet/numbered click-when-active path once read-back tells us
-     * the caret is in a list. Until that read-back exists, ship a
-     * single explicit "Remove list" button alongside the disabled
-     * on-buttons. */
     const removeList = async () => {
         await cmd.toggleList('Off');
     };
 
     const bulletOn = async () => {
-        /* Intentionally dispatches — surfaces the engine's clear
-         * error message in the FileMenu's error toast (which
-         * subscribes to ERROR events globally). */
         await cmd.toggleList('Bullet');
     };
 
@@ -48,28 +34,26 @@ export const ListButtons: Component = () => {
     return (
         <div class="nge-lists" role="group" aria-label="List">
             <button
-                class="nge-btn nge-lists__btn nge-lists__btn--disabled"
+                class="nge-btn nge-lists__btn"
                 type="button"
                 aria-label="Bulleted list"
-                title="Bulleted list — engine pending (numbering synthesis)"
+                title="Bulleted list"
                 disabled={!ready()}
                 onClick={() => void bulletOn()}
             >
                 <span class="nge-lists__icon" aria-hidden="true">•≡</span>
                 <span>Bullet</span>
-                <span class="nge-lists__badge">Engine pending</span>
             </button>
             <button
-                class="nge-btn nge-lists__btn nge-lists__btn--disabled"
+                class="nge-btn nge-lists__btn"
                 type="button"
                 aria-label="Numbered list"
-                title="Numbered list — engine pending (numbering synthesis)"
+                title="Numbered list"
                 disabled={!ready()}
                 onClick={() => void numberOn()}
             >
                 <span class="nge-lists__icon" aria-hidden="true">1≡</span>
                 <span>Number</span>
-                <span class="nge-lists__badge">Engine pending</span>
             </button>
             <button
                 class="nge-btn nge-lists__btn"
