@@ -118,11 +118,11 @@ jobs:
       - name: Install JS dependencies
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
-        run: |
-          pnpm --dir ts install --frozen-lockfile
-          pnpm --dir tools/visual-diff install --frozen-lockfile
-          pnpm --dir tools/memory-profile install --frozen-lockfile
-          pnpm --dir tools/perf install --frozen-lockfile
+        # Root install covers every workspace member (packages/*, ts,
+        # tools/*) via the workspace lockfile. The sub-dir `--dir ts`
+        # pattern from the pre-workspace era now resolves to a stale
+        # lockfile with no @nge/* deps — CI fails ERR_PNPM_OUTDATED_LOCKFILE.
+        run: pnpm install --frozen-lockfile
 
       - name: Run visual-diff harness
         run: |

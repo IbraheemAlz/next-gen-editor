@@ -45,7 +45,10 @@ jobs:
           node-version: 22
 
       - name: Install TS deps
-        run: pnpm --dir ts install --frozen-lockfile
+        # Workspace lockfile lives at repo root (pnpm-workspace.yaml
+        # globs packages/* + ts + tools/*); `--dir ts` would point
+        # pnpm at the stale pre-workspace sub-dir lockfile.
+        run: pnpm install --frozen-lockfile
 
       - name: Build site
         run: pnpm --dir ts build

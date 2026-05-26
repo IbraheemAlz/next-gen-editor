@@ -54,8 +54,12 @@ jobs:
           fi
 
       - name: Build the static site
+        # Root install covers every workspace member (packages/*, ts,
+        # tools/*) via the workspace lockfile. The sub-dir `--dir ts`
+        # pattern from the pre-workspace era now resolves to a stale
+        # lockfile with no @nge/* deps — CI fails ERR_PNPM_OUTDATED_LOCKFILE.
         run: |
-          pnpm --dir ts install --frozen-lockfile
+          pnpm install --frozen-lockfile
           pnpm --dir ts build
 
       - name: Package the static site
