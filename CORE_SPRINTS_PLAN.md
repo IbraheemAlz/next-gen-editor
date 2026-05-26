@@ -408,7 +408,46 @@ new style entry); character styles (`<w:rStyle>`).
 
 ---
 
-## Sprint 13 — Numbering Synthesis
+## Sprint 13 — Numbering Synthesis ✅ DONE
+
+**Status:** Closed 2026-05-27. Issue #12 resolved.
+
+  * `crates/engine/src/numbering.rs` (546 lines) — dedicated module:
+    `NumFmt` enum (Decimal / LowerLetter / UpperRoman / Bullet /
+    Hebrew / Aiueo / IroIro / DecimalEnclosedCircle / …);
+    `LvlDef` (one `<w:lvl>` row with format, restart rules, indent,
+    marker template); `AbstractNum` (9-level `LvlDef` array, one
+    `<w:abstractNum>`); `LvlOverride` (per-instance start delta);
+    `NumInstance` (`<w:num>` ↔ `abstract_num_id`); `ListSynthesisKind`
+    (Bullet / Number toggle target); `NumberingDefinitions`
+    (HashMap<abstract_id, AbstractNum> + HashMap<num_id, NumInstance>
+    + `dirty` flag).
+  * `render_marker` projects `(num_id, ilvl, sibling_counter)` into
+    a marker string per the resolved `LvlDef.fmt_text` template
+    (`%1.`, `%1.%2.`, `(%3)`, etc.).
+  * `resolve_markers_in_place` walks the document in order, maintains
+    per-level counters, resets deeper levels when shallower levels
+    advance (Word's default restart-on-parent-change semantics).
+  * `DocumentTree.numbering.dirty` flag controls writer regeneration
+    of `word/numbering.xml`; passthrough byte-identical otherwise.
+    L1.2 (#18) discipline applied for OPC plumbing synthesis on fresh
+    docs (`<Override>` for `numbering.xml` MIME type +
+    `<Relationship>` Id in `word/_rels/document.xml.rels`).
+  * `toggle_list_on_range` mints fresh AbstractNums on first toggle
+    and reuses them on subsequent toggles. The
+    `list_toggle_idempotency_via_round_trip` test (writer.rs)
+    pins exactly **2** AbstractNums + **2** NumInstances after 20
+    Bullet ↔ Number toggles, not 40.
+  * Panic surface in production code: 0. (Two `.unwrap()` in
+    `numbering.rs` are inside `#[cfg(test)]` and target
+    test-fixture-constructed counters.)
+  * UI wired: `packages/ui/src/ListButtons.tsx` dispatches
+    `cmd.toggleList('Off' | 'Bullet' | 'Number')` against the
+    real engine path.
+
+---
+
+## Sprint 13 — Original plan (archived)
 
 **Issue:** [#12](https://github.com/IbraheemAlz/next-gen-editor/issues/12)
 
