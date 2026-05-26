@@ -109,7 +109,7 @@
 | **Section break (next page / continuous)** | Continuous `<w:type>` ships Sprint 7; no insertion command | Toolbar Layout → Breaks dropdown | 🛑 Blocked |
 | **Multi-column layout (snake flow)** | Per-section geometry resolved (Sprint 2); no `Command::SetColumns` | Toolbar Layout → Columns dropdown (1/2/3/Custom) | 🛑 Blocked — engine renders perfectly; cannot author |
 | **Column gutter / equal-width toggle** | Resolved from section properties | Columns dialog (right rail) | 🛑 Blocked |
-| **Page margins / orientation / size** | Renders from section model | Toolbar Layout → Margins / Orientation / Size dropdowns | 🛑 Blocked |
+| **Page margins / orientation / size** | `Command::SetPageMargins` / `Command::SetPageOrientation` + `Event::SelectionChanged.section_geometry` (Sprint 10) | `PageSetupDialog.tsx` (Layout → Page Setup) | ✅ Wired (Sprint 10) — dialog prefills from active section (`#10` closed) |
 | **Headers & footers** | No model surface yet | Header/footer edit zones above/below page | 🛑 Blocked |
 | **Page number type / format** (Decimal, Roman lower/upper, Letter lower/upper) | Sprint 7 `<w:pgNumType>` + PAGE field evaluator | Header/Footer dialog → "Format Page Numbers…" | 🛑 Blocked — engine renders correctly via field; cannot author |
 | **Page number start value** | Sprint 7 start-at honoured | Same dialog as above | 🛑 Blocked |
@@ -296,7 +296,7 @@
 | **Screen-reader DOM mirror** | One `<p dir>` per paragraph, `<span>` per run | `AccessibilityTree.tsx` (visually hidden) | ✅ Wired |
 | **Table a11y** (`role="table"` + cells) | `A11yTable` / `A11yRow` / `A11yCell` shipped | Reconciler emits matching DOM | ✅ Wired |
 | **Stable a11y IDs across edits** | Engine diffs by content (Sprint 9); position-identity deferred | None (assistive tech tracks by structural path) | 🕳 Deferred — BACKLOG #10 |
-| **ARIA live announcements** | `Announcements.tsx` | Visible in `Announcements.tsx` | ⚠️ Partial — present, but no event source currently emits human-readable announcements |
+| **ARIA live announcements** | `Event::Announcement { priority, message }` (Sprint 10) | `Announcements.tsx` — polite + assertive `aria-live` regions | ✅ Wired (Sprint 10) — engine emits from every user-visible mutation handler (`#16` closed) |
 
 ---
 
@@ -407,3 +407,13 @@ section 13 *Resolve / delete comment* (`Command::ResolveComment` /
 (new `crates/format-html`). Engine-minted comment paraId synthesis +
 OPC plumbing for fresh-document commentsExtended.xml remain open as
 `#18` (tech-debt).
+
+**Sprint 10 (closed `#10`, `#16`).** Two rows flipped to ✅ Wired:
+section 5 *Page margins / orientation / size* (`PageSetupDialog`
+prefills from `Event::SelectionChanged.section_geometry`) and section
+17 *ARIA live announcements* (`Event::Announcement { priority,
+message }` from engine mutation handlers + polite + assertive
+`aria-live` regions in `Announcements.tsx`). `CellPropertiesDialog`
+also prefills from `Event::SelectionChanged.cell_properties` (per-
+edge edit remains a future enhancement — section 7 *Cell borders*
+stays ⚠️ Partial).
