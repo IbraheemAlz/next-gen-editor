@@ -83,6 +83,10 @@ export function createEngineStore(client: EngineClient) {
        reflects the SELECTION's paragraph direction. */
     const [paragraphDirection, setParagraphDirection] = createSignal<Direction | null>('Ltr');
     const [announcement, setAnnouncement] = createSignal('');
+    /* Sprint 10 — separate `aria-live="assertive"` channel. Engine
+       emits this priority only for errors / blocked actions; the UI
+       interrupts the screen reader instead of waiting for a pause. */
+    const [assertiveAnnouncement, setAssertiveAnnouncement] = createSignal('');
     /* Mirror of every table in the document — extracted from the a11y
        delta stream so the Table panel can list/target tables by
        BlockPath::top(block_index). The current paragraph-flat
@@ -156,6 +160,26 @@ export function createEngineStore(client: EngineClient) {
                 const n = first && first.type === 'REPLACE' ? first.tree.nodes.length : 0;
                 setAnnouncement(`Document loaded — ${n} block${n === 1 ? '' : 's'}.`);
             }
+        } else if (ev.type === 'ANNOUNCEMENT') {
+            /* Sprint 10 — engine-side announcement (priority + message
+               computed by the engine; the UI just routes to the right
+               aria-live region). Re-emit on every event so a duplicate
+               message still narrates (the screen reader otherwise
+               skips identical successive content). */
+            if (ev.priority === 'Assertive') {
+                setAssertiveAnnouncement('');
+                queueMicrotask(() => setAssertiveAnnouncement(ev.message));
+            } else {
+                setAnnouncement('');
+                queueMicrotask(() => setAnnouncement(ev.message));
+            }
+        } else if (ev.type === 'ERROR') {
+            /* Sprint 10 — errors interrupt; the engine doesn't emit an
+               explicit Assertive announcement for these (Event::Error
+               is the primary reply, not a broadcast), so we synthesise
+               one client-side. */
+            setAssertiveAnnouncement('');
+            queueMicrotask(() => setAssertiveAnnouncement(`Error: ${ev.message}`));
         }
     });
 
@@ -170,6 +194,7 @@ export function createEngineStore(client: EngineClient) {
         baseDirection,
         paragraphDirection,
         announcement,
+        assertiveAnnouncement,
         tables,
         selectionKind,
         documentHeight,

@@ -16,6 +16,7 @@
 import { createSignal, createEffect, type Component } from 'solid-js';
 import {
     createEditorCommands,
+    createEditorState,
     type BlockPath,
     type BridgeBorderStyle,
     type BridgeCellBorders,
@@ -55,18 +56,36 @@ export interface CellPropertiesDialogProps {
 
 export const CellPropertiesDialog: Component<CellPropertiesDialogProps> = (props) => {
     const cmd = createEditorCommands();
+    const state = createEditorState();
     const [shadingHex, setShadingHex] = createSignal('');
     const [borderStyle, setBorderStyle] = createSignal<BridgeBorderStyle>('Single');
     const [borderWidthEighth, setBorderWidthEighth] = createSignal(4); // 0.5pt
     const [borderColorHex, setBorderColorHex] = createSignal('#000000');
     const [error, setError] = createSignal<string | null>(null);
 
-    /* Reset form when dialog reopens — props.tablePath/row/col are
-     * the identity of the target cell. */
+    /* Sprint 10 — prefill from `cellProperties()` so the dialog opens
+     * with the cell's current shading + top-edge stroke style. The
+     * dialog still applies the stroke uniformly across all 4 edges,
+     * so the prefill picks ONE representative edge (top, then left,
+     * then any present) — per-edge editing remains a future
+     * enhancement. */
     createEffect(() => {
-        if (props.open) {
-            setError(null);
+        if (!props.open) return;
+        const cell = state.cellProperties();
+        const shading = cell?.shading;
+        setShadingHex(shading ? colorToHex(shading) : '');
+        const representative =
+            cell?.borders?.top ?? cell?.borders?.left ?? cell?.borders?.bottom ?? cell?.borders?.right;
+        if (representative) {
+            setBorderStyle(representative.style);
+            setBorderWidthEighth(Math.max(1, representative.size_eighth_pt));
+            setBorderColorHex(colorToHex(representative.color) || '#000000');
+        } else {
+            setBorderStyle('Single');
+            setBorderWidthEighth(4);
+            setBorderColorHex('#000000');
         }
+        setError(null);
     });
 
     const apply = async () => {

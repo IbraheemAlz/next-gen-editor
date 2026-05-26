@@ -1831,6 +1831,66 @@ impl DocumentTree {
         self.block_at(path)?.as_table()
     }
 
+    /// Sprint 10 — walk `path` and return a borrowed reference to the
+    /// **innermost** `CellProperties` the caret is sitting inside, or
+    /// `None` when the path never enters a table cell. Backs the
+    /// `Event::SelectionChanged.cell_properties` field that drives
+    /// `CellPropertiesDialog` prefill.
+    pub fn innermost_cell_props_at(&self, path: &BlockPath) -> Option<&CellProperties> {
+        let mut last: Option<&CellProperties> = None;
+        let mut i = 0usize;
+        let first = path.steps.first()?;
+        let PathStep::Block(n) = first else {
+            return None;
+        };
+        let mut current: &Block = self.blocks.get(*n as usize)?;
+        i += 1;
+        while i < path.steps.len() {
+            let Block::Table(t) = current else {
+                return last;
+            };
+            let PathStep::Cell { row, col } = path.steps[i] else {
+                return last;
+            };
+            let cell = t.rows.get(row as usize)?.cells.get(col as usize)?;
+            last = Some(&cell.props);
+            i += 1;
+            let Some(PathStep::Block(b_idx)) = path.steps.get(i) else {
+                return last;
+            };
+            current = cell.blocks.get(*b_idx as usize)?;
+            i += 1;
+        }
+        last
+    }
+
+    /// Sprint 10 — locate the `Section` covering top-level block
+    /// `block_idx`. Falls back to a synthesised default-A4 section
+    /// when the document carries no `<w:sectPr>` (the pre-Phase-6
+    /// behaviour). The caller can read the returned section's
+    /// geometry directly into the `SelectionChanged` event's
+    /// `section_geometry` field.
+    pub fn section_for_block(&self, block_idx: u32) -> Section {
+        if let Some(s) = self
+            .sections
+            .iter()
+            .find(|s| block_idx >= s.start_block && block_idx < s.end_block)
+        {
+            return s.clone();
+        }
+        Section {
+            geometry: PageGeometry::a4(),
+            start_block: 0,
+            end_block: self.blocks.len() as u32,
+            header_refs: HeaderFooterRefs::default(),
+            footer_refs: HeaderFooterRefs::default(),
+            title_pg: false,
+            columns: ColumnSpec::single(),
+            page_num: PageNumType::default(),
+            section_type: SectionType::default(),
+        }
+    }
+
     /// Path to the Nth top-level paragraph (skipping tables). Compat
     /// shim for callers that still index paragraph-flat — RFC §4
     /// `BlockPath::root_paragraph(n)`.
@@ -4374,6 +4434,81 @@ mod tests {
             source_xml: None,
         }));
         assert_eq!(d.to_plain_text(), "a\tb\nc\td");
+    }
+
+    /* ---- Sprint 10: section + cell read-back helpers --------------- */
+
+    #[test]
+    fn section_for_block_returns_default_a4_when_no_sections() {
+        let d = DocumentTree::from_text("hello");
+        let s = d.section_for_block(0);
+        assert!((s.geometry.width - 595.3).abs() < 0.5);
+        assert!((s.geometry.height - 841.9).abs() < 0.5);
+        assert_eq!(s.columns.count, 1);
+    }
+
+    #[test]
+    fn section_for_block_picks_matching_section() {
+        let mut d = DocumentTree::from_text("a");
+        let mut narrow = PageGeometry::a4();
+        narrow.margin_left = 36.0;
+        d.sections = vec![
+            Section {
+                geometry: narrow,
+                start_block: 0,
+                end_block: 1,
+                ..Default::default()
+            },
+            Section {
+                geometry: PageGeometry::a4(),
+                start_block: 1,
+                end_block: 5,
+                ..Default::default()
+            },
+        ];
+        assert!((d.section_for_block(0).geometry.margin_left - 36.0).abs() < 0.1);
+        assert!((d.section_for_block(2).geometry.margin_left - 72.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn innermost_cell_props_returns_none_outside_table() {
+        let d = DocumentTree::from_text("hello");
+        let path = BlockPath::top(0);
+        assert!(d.innermost_cell_props_at(&path).is_none());
+    }
+
+    #[test]
+    fn innermost_cell_props_finds_cell_at_top_level_table() {
+        let mut d = DocumentTree::default();
+        let mut cell = TableCell {
+            props: CellProperties::default(),
+            blocks: vec![Block::Paragraph(Paragraph {
+                text: "x".into(),
+                ..Default::default()
+            })],
+        };
+        cell.props.shading = Some([0xff, 0, 0, 0xff]);
+        d.blocks.push_back(Block::Table(Table {
+            grid: vec![6765],
+            props: TableProperties::default(),
+            rows: vec![TableRow {
+                props: RowProperties::default(),
+                cells: vec![cell],
+            }],
+            dirty: true,
+            source_xml: None,
+        }));
+        let path = BlockPath {
+            steps: vec![
+                PathStep::Block(0),
+                PathStep::Cell { row: 0, col: 0 },
+                PathStep::Block(0),
+            ],
+        };
+        let props = d
+            .innermost_cell_props_at(&path)
+            .expect("cell resolved");
+        assert_eq!(props.shading, Some([0xff, 0, 0, 0xff]));
     }
 
     #[test]

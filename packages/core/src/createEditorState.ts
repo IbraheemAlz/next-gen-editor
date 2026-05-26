@@ -20,6 +20,8 @@ import { useEngine } from './EngineProvider';
 import type {
     Alignment,
     AttrsMixed,
+    BridgeCellProperties,
+    BridgeSectionGeometry,
     Direction,
     EngineStats,
     Event,
@@ -60,6 +62,19 @@ export interface EditorState {
     estimatedDocumentHeight: Accessor<number>;
     /** Active renderer reported by the worker at INIT. */
     renderer: Accessor<string>;
+    /**
+     * Sprint 10 — page geometry of the section under the caret. Drives
+     * `PageSetupDialog` prefill (margin / orientation / columns).
+     * `undefined` before the first `SELECTION_CHANGED`, or when the
+     * caret has no addressable top-level block (defensive).
+     */
+    sectionGeometry: Accessor<BridgeSectionGeometry | undefined>;
+    /**
+     * Sprint 10 — shading + per-edge borders for the active cell when
+     * the caret is inside a table. `undefined` outside any table —
+     * `CellPropertiesDialog` then falls back to engine defaults.
+     */
+    cellProperties: Accessor<BridgeCellProperties | undefined>;
 }
 
 export function createEditorState(): EditorState {
@@ -80,6 +95,10 @@ export function createEditorState(): EditorState {
     const [paintVersion, setPaintVersion] = createSignal(0);
     const [estimatedDocumentHeight, setEstimatedDocumentHeight] = createSignal(0);
     const [renderer] = createSignal(engine.renderer);
+    const [sectionGeometry, setSectionGeometry] =
+        createSignal<BridgeSectionGeometry | undefined>(undefined);
+    const [cellProperties, setCellProperties] =
+        createSignal<BridgeCellProperties | undefined>(undefined);
 
     const unsubscribe = engine.subscribe((evt: Event) => {
         switch (evt.type) {
@@ -94,6 +113,8 @@ export function createEditorState(): EditorState {
                 setSelectionKind(evt.selection_kind);
                 setCanUndo(evt.can_undo);
                 setCanRedo(evt.can_redo);
+                setSectionGeometry(evt.section_geometry);
+                setCellProperties(evt.cell_properties);
                 break;
             }
             case 'UNDO_STATE_CHANGED': {
@@ -141,5 +162,7 @@ export function createEditorState(): EditorState {
         paintVersion,
         estimatedDocumentHeight,
         renderer,
+        sectionGeometry,
+        cellProperties,
     };
 }

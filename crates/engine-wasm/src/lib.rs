@@ -6,9 +6,11 @@
 
 use bridge::{
     A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRow, A11yRun, A11yTable, A11yTree,
-    Alignment as BridgeAlignment, BlockPath as BridgeBlockPath, Color, Command, Direction,
-    DocFormat, EngineStats, Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob,
-    ImageFit, LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, MoveDirection,
+    Alignment as BridgeAlignment, AnnouncementPriority, BlockPath as BridgeBlockPath,
+    BridgeBorderStroke, BridgeBorderStyle, BridgeCellProperties, BridgeSectionGeometry, Color,
+    Command, Direction, DocFormat, EngineStats, Event, FontMetrics as BridgeMetrics,
+    ImageBlob as BridgeImageBlob, ImageFit, LogicalPos as BridgeLogicalPos,
+    LogicalRange as BridgeLogicalRange, MoveDirection, PageOrientation as BridgePageOrientation,
     PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
     SelectionKind, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
@@ -305,6 +307,13 @@ pub struct Engine {
     /// `SelectionState` so the 13+ places that mint a `SelectionState`
     /// struct literal stay untouched.
     caret_affinity: CaretAffinity,
+    /// Sprint 10 — `aria-live` announcements queued by user-visible
+    /// mutation handlers ("Aligned center", "Page break inserted", …).
+    /// The worker drains this after each command via
+    /// `Engine::drain_announcements` and posts each entry as a
+    /// broadcast `Event::Announcement` so the TS shell's `aria-live`
+    /// region narrates engine actions in order.
+    pending_announcements: Vec<(AnnouncementPriority, String)>,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -344,6 +353,7 @@ fn assemble_engine(
         last_paint_dims: LastPaintDims::default(),
         lazy_layout: LazyLayoutState::default(),
         caret_affinity: CaretAffinity::default(),
+        pending_announcements: Vec::new(),
     }
 }
 
@@ -440,6 +450,22 @@ impl Engine {
             is_full_layout: dims.is_full_layout,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
+    }
+
+    /// Sprint 10 — drain queued `aria-live` announcements as
+    /// `Event::Announcement` payloads. The worker calls this after
+    /// every command and posts each entry as a broadcast event so the
+    /// `Announcements.tsx` `aria-live` region narrates engine
+    /// actions in dispatch order. Returns an array of events; empty
+    /// when no announcement was queued.
+    pub fn drain_announcements(&mut self) -> Result<JsValue, JsValue> {
+        let drained: Vec<Event> = self
+            .pending_announcements
+            .drain(..)
+            .map(|(priority, message)| Event::Announcement { priority, message })
+            .collect();
+        serde_wasm_bindgen::to_value(&drained)
+            .map_err(|e| JsValue::from_str(&format!("encode announcements: {e}")))
     }
 
     /// Phase 8b — flat snapshot of every tracked-change revision the
@@ -5180,6 +5206,14 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Sprint 10 — queue an `aria-live` announcement for the worker to
+    /// drain after the current command's primary reply lands. The
+    /// engine owns the wording + priority so the TS shell never has
+    /// to compute ARIA semantics from event payloads.
+    fn announce(&mut self, priority: AnnouncementPriority, message: impl Into<String>) {
+        self.pending_announcements.push((priority, message.into()));
+    }
+
     /// Assemble a `SelectionChanged` event from the current selection.
     fn selection_changed(&self) -> Event {
         let Some(sel) = self.selection.clone() else {
@@ -5244,7 +5278,50 @@ impl Engine {
             selection_kind: sel.kind.clone(),
             attrs_mixed: self.attrs_mixed_over(&start, &end),
             paragraph_direction: self.paragraph_direction_over(&start, &end),
+            section_geometry: self.section_geometry_for_caret(&sel.caret.path),
+            cell_properties: self.cell_properties_for_caret(&sel.caret.path),
         }
+    }
+
+    /// Sprint 10 — resolve the section that covers the caret's
+    /// top-level block and project its geometry onto the wire shape.
+    /// Returns `None` for an empty path (the caret can't sit nowhere
+    /// in a valid selection, but the helper is defensive).
+    fn section_geometry_for_caret(&self, path: &BridgeBlockPath) -> Option<BridgeSectionGeometry> {
+        let top_idx = match path.steps.first()? {
+            BridgePathStep::Block { idx } => *idx,
+            BridgePathStep::Cell { .. } => return None,
+        };
+        let doc = self.undo.current();
+        let section = doc.section_for_block(top_idx);
+        let geo = section.geometry;
+        let orientation = if geo.width > geo.height {
+            BridgePageOrientation::Landscape
+        } else {
+            BridgePageOrientation::Portrait
+        };
+        Some(BridgeSectionGeometry {
+            width_pt: geo.width,
+            height_pt: geo.height,
+            margin_top_pt: geo.margin_top,
+            margin_right_pt: geo.margin_right,
+            margin_bottom_pt: geo.margin_bottom,
+            margin_left_pt: geo.margin_left,
+            orientation,
+            columns: u32::from(section.columns.count.max(1)),
+            column_gutter_pt: section.columns.gutter_pt,
+        })
+    }
+
+    /// Sprint 10 — project the innermost cell's shading + borders into
+    /// the wire shape; `None` outside any table.
+    fn cell_properties_for_caret(&self, path: &BridgeBlockPath) -> Option<BridgeCellProperties> {
+        let engine_path = bridge_path_to_engine(path);
+        let cell = self.undo.current().innermost_cell_props_at(&engine_path)?;
+        Some(BridgeCellProperties {
+            shading: cell.shading.map(rgba_to_bridge_color),
+            borders: engine_borders_to_bridge(cell.borders.as_ref()),
+        })
     }
 
     /// Compute the per-flag "mixed across the selection" bitmap. A
@@ -5985,6 +6062,13 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
+        let label = match align {
+            BridgeAlignment::Start => "Aligned start",
+            BridgeAlignment::End => "Aligned end",
+            BridgeAlignment::Center => "Aligned center",
+            BridgeAlignment::Justify => "Justified",
+        };
+        self.announce(AnnouncementPriority::Polite, label);
         self.selection_changed()
     }
 
@@ -6016,6 +6100,11 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
+        let label = match direction {
+            Direction::Ltr => "Direction set to left to right",
+            Direction::Rtl => "Direction set to right to left",
+        };
+        self.announce(AnnouncementPriority::Polite, label);
         self.selection_changed()
     }
 
@@ -6028,6 +6117,7 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
+        self.announce(AnnouncementPriority::Polite, "Revision accepted");
         self.selection_changed()
     }
 
@@ -6040,6 +6130,7 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
+        self.announce(AnnouncementPriority::Polite, "Revision rejected");
         self.selection_changed()
     }
 
@@ -6070,6 +6161,7 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
+        self.announce(AnnouncementPriority::Polite, "Comment added");
         self.selection_changed()
     }
 
@@ -6082,15 +6174,23 @@ impl Engine {
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
+        self.announce(AnnouncementPriority::Polite, "Comment deleted");
         self.selection_changed()
     }
 
-    /// `Command::ResolveComment` (Sprint 7 UI Edition). Toggles the
-    /// in-memory `resolved` flag; round-trip to `commentsExtended.xml`
-    /// is filed as a Core Engine task.
+    /// `Command::ResolveComment` (Sprint 9 — resolved round-trips
+    /// through `word/commentsExtended.xml`).
     fn do_resolve_comment(&mut self, id: u32, resolved: bool) -> Event {
         let new_doc = self.undo.current().set_comment_resolved(id, resolved);
         self.undo.push(new_doc);
+        self.announce(
+            AnnouncementPriority::Polite,
+            if resolved {
+                "Comment resolved"
+            } else {
+                "Comment reopened"
+            },
+        );
         self.selection_changed()
     }
 
@@ -6400,6 +6500,7 @@ impl Engine {
             .current()
             .set_page_break_before(to_engine_pos(at), true);
         self.undo.push(new_doc);
+        self.announce(AnnouncementPriority::Polite, "Page break inserted");
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -6625,6 +6726,68 @@ fn bridge_to_engine_path(p: bridge::BlockPath) -> engine::BlockPath {
     }
 }
 
+/// Sprint 10 — borrow-shaped variant of `bridge_to_engine_path` for the
+/// `SelectionChanged` hot path; cloning is the same `Vec` walk the
+/// owned variant does, but the call sites already hold `&BridgeBlockPath`.
+fn bridge_path_to_engine(p: &bridge::BlockPath) -> engine::BlockPath {
+    engine::BlockPath {
+        steps: p
+            .steps
+            .iter()
+            .map(|s| match s {
+                bridge::PathStep::Block { idx } => engine::PathStep::Block(*idx),
+                bridge::PathStep::Cell { row, col } => engine::PathStep::Cell {
+                    row: *row,
+                    col: *col,
+                },
+            })
+            .collect(),
+    }
+}
+
+/// Sprint 10 — engine RGBA bytes → bridge `Color`.
+fn rgba_to_bridge_color(c: [u8; 4]) -> bridge::Color {
+    bridge::Color {
+        r: c[0],
+        g: c[1],
+        b: c[2],
+        a: c[3],
+    }
+}
+
+/// Sprint 10 — engine `CellBorders` (option-of-strokes) → bridge wire
+/// shape. `None` collapses to an all-`None` `BridgeCellBorders` (a
+/// `Default` value) so the dialog sees "no overrides".
+fn engine_borders_to_bridge(b: Option<&engine::CellBorders>) -> bridge::BridgeCellBorders {
+    let Some(b) = b else {
+        return bridge::BridgeCellBorders::default();
+    };
+    bridge::BridgeCellBorders {
+        top: b.top.as_ref().map(engine_stroke_to_bridge),
+        left: b.left.as_ref().map(engine_stroke_to_bridge),
+        bottom: b.bottom.as_ref().map(engine_stroke_to_bridge),
+        right: b.right.as_ref().map(engine_stroke_to_bridge),
+    }
+}
+
+fn engine_stroke_to_bridge(s: &engine::BorderStroke) -> BridgeBorderStroke {
+    let style = match s.style {
+        engine::BorderStyle::Single => BridgeBorderStyle::Single,
+        engine::BorderStyle::Double => BridgeBorderStyle::Double,
+        engine::BorderStyle::Dotted => BridgeBorderStyle::Dotted,
+        engine::BorderStyle::Dashed => BridgeBorderStyle::Dashed,
+        /* `BorderStyle::None` + the round-trip-preserving `Other`
+        token collapse to wire `None` — Word treats unknown stroke
+        styles as a solid edge. */
+        engine::BorderStyle::None | engine::BorderStyle::Other(_) => BridgeBorderStyle::None,
+    };
+    BridgeBorderStroke {
+        style,
+        size_eighth_pt: s.size_eighth_pt,
+        color: s.color.map(rgba_to_bridge_color),
+    }
+}
+
 struct RenderStats {
     page_width: f32,
     page_height: f32,
@@ -6672,6 +6835,7 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            pending_announcements: Vec::new(),
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -7259,6 +7423,7 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            pending_announcements: Vec::new(),
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -7301,6 +7466,7 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            pending_announcements: Vec::new(),
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -7334,6 +7500,7 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            pending_announcements: Vec::new(),
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -7444,6 +7611,7 @@ mod tests {
             last_paint_dims: LastPaintDims::default(),
             lazy_layout: LazyLayoutState::default(),
             caret_affinity: CaretAffinity::default(),
+            pending_announcements: Vec::new(),
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier

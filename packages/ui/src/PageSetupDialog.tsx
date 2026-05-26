@@ -5,18 +5,16 @@
  *   - `Command::SetPageMargins { at, top_pt, right_pt, bottom_pt, left_pt }`
  *   - `Command::SetPageOrientation { at, orientation }`
  *
- * Units: input field accepts inches (`in`) or points (`pt`); the
- * dialog normalises to points before dispatch. Default is inches —
- * Word's preset (1 inch = 72 pt margins on all four edges).
- *
- * No engine read-back: the form opens with sensible defaults (the
- * `defaultMarginInches` prop or 1.0). A future enhancement could
- * resolve the current section geometry from a SelectionChanged
- * extension and prefill — out of scope for Sprint 4.
+ * Sprint 10 prefill: opens with the active section's geometry, read
+ * from `createEditorState().sectionGeometry()`. Margins arrive in pt;
+ * we display in the user-selected unit (inches by default — Word's
+ * preset is 1 in = 72 pt). When the engine has not emitted geometry
+ * yet (fresh empty document), falls back to 1-inch margins.
  */
 import { createSignal, createEffect, type Component } from 'solid-js';
 import {
     createEditorCommands,
+    createEditorState,
     type PageOrientation,
 } from '@nge/core';
 import { Dialog } from './Dialog';
@@ -29,6 +27,12 @@ function toPt(value: number, unit: Unit): number {
     return unit === 'in' ? value * PT_PER_INCH : value;
 }
 
+function ptToUnit(pt: number, unit: Unit): number {
+    /* Round inches to 2 decimals so a 72-pt margin shows as 1.00 not
+     * 0.9999999... when fed back through f32 wire conversion. */
+    return unit === 'in' ? Math.round((pt / PT_PER_INCH) * 100) / 100 : pt;
+}
+
 export interface PageSetupDialogProps {
     open: boolean;
     onClose: () => void;
@@ -38,6 +42,7 @@ export interface PageSetupDialogProps {
 
 export const PageSetupDialog: Component<PageSetupDialogProps> = (props) => {
     const cmd = createEditorCommands();
+    const state = createEditorState();
     const [unit, setUnit] = createSignal<Unit>('in');
     const [top, setTop] = createSignal(1);
     const [right, setRight] = createSignal(1);
@@ -46,18 +51,27 @@ export const PageSetupDialog: Component<PageSetupDialogProps> = (props) => {
     const [orientation, setOrientation] = createSignal<PageOrientation>('Portrait');
     const [error, setError] = createSignal<string | null>(null);
 
-    /* Re-seed defaults each time the dialog reopens. */
+    /* Sprint 10 — re-seed from live engine state each time the dialog
+     * reopens. `sectionGeometry()` is the section under the caret;
+     * margins arrive in pt and the user-selected unit converts on
+     * display + apply. Falls back to the legacy default when the
+     * engine has not emitted geometry yet (fresh empty document). */
     createEffect(() => {
-        if (props.open) {
-            const d = props.defaultMarginInches ?? 1;
-            setTop(d);
-            setRight(d);
-            setBottom(d);
-            setLeft(d);
-            setUnit('in');
-            setOrientation('Portrait');
-            setError(null);
-        }
+        if (!props.open) return;
+        const geom = state.sectionGeometry();
+        const fallbackPt = (props.defaultMarginInches ?? 1) * PT_PER_INCH;
+        const topPt = geom?.margin_top_pt ?? fallbackPt;
+        const rightPt = geom?.margin_right_pt ?? fallbackPt;
+        const bottomPt = geom?.margin_bottom_pt ?? fallbackPt;
+        const leftPt = geom?.margin_left_pt ?? fallbackPt;
+        /* Default unit = inches; convert pt → in. */
+        setUnit('in');
+        setTop(ptToUnit(topPt, 'in'));
+        setRight(ptToUnit(rightPt, 'in'));
+        setBottom(ptToUnit(bottomPt, 'in'));
+        setLeft(ptToUnit(leftPt, 'in'));
+        setOrientation(geom?.orientation ?? 'Portrait');
+        setError(null);
     });
 
     const apply = async () => {

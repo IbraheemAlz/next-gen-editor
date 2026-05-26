@@ -534,6 +534,12 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
                emits more pages. */
             broadcastPaintDims();
         }
+        /* Sprint 10 — drain queued aria-live announcements (queued by
+           the engine's mutation handlers via `Engine::announce`). Each
+           one rides the subscribe path (no `id`) so the
+           `Announcements.tsx` aria-live region narrates engine
+           actions in dispatch order. */
+        broadcastAnnouncements();
     } catch (e: unknown) {
         replyError(msg.id, e);
     }
@@ -561,6 +567,24 @@ function broadcastPaintDims(): void {
         });
     } catch (e: unknown) {
         console.warn('[worker] paint_dims broadcast failed', e);
+    }
+}
+
+/**
+ * Sprint 10 — drain every queued `Event::Announcement` from the engine
+ * and broadcast each one through the subscribe path so the TS shell's
+ * `Announcements.tsx` `aria-live` region narrates it. No-op when the
+ * engine's queue is empty.
+ */
+function broadcastAnnouncements(): void {
+    if (!engine) return;
+    try {
+        const drained = engine.drain_announcements() as Event[];
+        for (const evt of drained) {
+            self.postMessage({ evt });
+        }
+    } catch (e: unknown) {
+        console.warn('[worker] drain_announcements failed', e);
     }
 }
 

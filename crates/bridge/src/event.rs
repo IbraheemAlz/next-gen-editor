@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
+use crate::command::{BridgeCellBorders, PageOrientation};
 use crate::common::{
-    Alignment, Direction, DocFormat, LogicalPos, LogicalRange, Rect, Script, SelectionKind,
+    Alignment, Color, Direction, DocFormat, LogicalPos, LogicalRange, Rect, Script, SelectionKind,
     TextAttrs,
 };
 
@@ -161,6 +162,15 @@ pub enum Event {
         /// `None` when paragraphs disagree → toolbar renders both
         /// direction buttons as INDETERMINATE.
         paragraph_direction: Option<Direction>,
+        /// Sprint 10 — page geometry of the section the caret sits in.
+        /// Drives `PageSetupDialog` prefill (margin / orientation /
+        /// columns). `None` when no section data is available (e.g. a
+        /// fresh empty document still on the implicit-default A4).
+        section_geometry: Option<BridgeSectionGeometry>,
+        /// Sprint 10 — cell shading + per-edge borders for the active
+        /// cell when the caret is inside a table. `None` outside any
+        /// table — `CellPropertiesDialog` falls back to engine defaults.
+        cell_properties: Option<BridgeCellProperties>,
     },
 
     /* IME */
@@ -219,6 +229,64 @@ pub enum Event {
         #[tsify(type = "Uint8Array")]
         docx_fragment: Vec<u8>,
     },
+
+    /// Sprint 10 — broadcast a short, human-readable message describing
+    /// a user-visible mutation ("Aligned center", "Page break inserted",
+    /// "Comment added"). The TS shell pipes these into an `aria-live`
+    /// region so screen readers narrate engine actions; the engine
+    /// owns the wording + priority so the UI never has to compute
+    /// ARIA semantics from event payloads.
+    Announcement {
+        priority: AnnouncementPriority,
+        message: String,
+    },
+}
+
+/// Sprint 10 — `aria-live` priority for an `Event::Announcement`. The
+/// TS shell routes `Polite` into an `aria-live="polite"` region (the
+/// reader waits for the user to stop typing) and `Assertive` into an
+/// `aria-live="assertive"` region (the reader interrupts immediately).
+///
+/// Engine-side mapping: every user-visible mutation emits `Polite`;
+/// only error / blocked-action notifications emit `Assertive`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnouncementPriority {
+    Polite,
+    Assertive,
+}
+
+/// Sprint 10 — lightweight wire shape for the page geometry of the
+/// section under the caret. Units are layout pt (1/72 in) at scale=1,
+/// matching `engine::PageGeometry` exactly; the UI converts to its
+/// preferred unit (in / mm / pt) for display.
+///
+/// "Lightweight" matters: `SelectionChanged` fires on every keystroke
+/// and pointer move. Eight `f32`s + one `u32` + one enum is a single
+/// 40-ish byte struct, allocation-free across the wasm bridge.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+pub struct BridgeSectionGeometry {
+    pub width_pt: f32,
+    pub height_pt: f32,
+    pub margin_top_pt: f32,
+    pub margin_right_pt: f32,
+    pub margin_bottom_pt: f32,
+    pub margin_left_pt: f32,
+    pub orientation: PageOrientation,
+    /// `<w:cols w:num>` — 1 for the default single-column body.
+    pub columns: u32,
+    /// `<w:cols w:space>` — inter-column gutter in pt.
+    pub column_gutter_pt: f32,
+}
+
+/// Sprint 10 — wire shape for the active cell's shading + per-edge
+/// borders. Mirror of `engine::CellProperties`'s
+/// CellPropertiesDialog-relevant subset; `grid_span`, `v_merge`,
+/// `cell_margins` are deliberately omitted (the dialog does not edit
+/// them).
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+pub struct BridgeCellProperties {
+    pub shading: Option<Color>,
+    pub borders: BridgeCellBorders,
 }
 
 /// Per-flag "this attribute is mixed across the selection" bitmap that

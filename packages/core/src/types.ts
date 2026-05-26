@@ -45,6 +45,9 @@ export type {
     EngineCapabilities,
     A11yTree,
     A11yPatch,
+    AnnouncementPriority,
+    BridgeSectionGeometry,
+    BridgeCellProperties,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 import type {
