@@ -72,7 +72,7 @@
 | **Line height** (single / 1.5 / double / custom multiple / exact pt) | Engine renders from style cascade (Sprint 5) | Toolbar Line-spacing dropdown | 🛑 Blocked — no command |
 | **Space before / after paragraph** | Engine renders from style | Paragraph properties dialog (right rail) | 🛑 Blocked |
 | **Keep with next / Keep together / Page break before** | `cantSplit` plumbed Sprint 6; no `keepNext` command yet | Paragraph properties dialog | 🛑 Blocked |
-| **Outline level / heading style** | Style cascade applies; no `Command::ApplyStyle` | Toolbar Style dropdown (Heading 1–6, Normal, …) | 🛑 Blocked — high-value gap |
+| **Outline level / heading style** | `Command::ApplyStyle` + `DocumentTree.styles` cascade (Sprint 12) | `StylesDropdown.tsx` — Normal / Title / Heading 1-3 | ✅ Wired (Sprint 12) — shadow direct_overrides preserves user edits across style swaps (`#11` closed) |
 | **Pending formatting** (sticky style on collapsed caret) | `SpanStyle` cache armed on toolbar click before typing (Sprint 1) | Toolbar buttons visually reflect armed state | ⚠️ Partial — wired but no visible toolbar "armed" feedback |
 
 ---
@@ -86,7 +86,7 @@
 | **Multilevel / outline list** | numPr cascade resolves nested levels (Sprint 7) | Toolbar Multilevel dropdown + `Tab`/`Shift+Tab` to demote/promote inside list | 🛑 Blocked |
 | **List restart / continue** | No command | Context menu "Restart numbering at 1" / "Continue previous list" | 🛑 Blocked |
 | **Custom bullet character / number format** | No command | List properties dialog | 🛑 Blocked |
-| **Style-driven numbering** (`<w:style>/<w:numPr>`) | Cascade resolver Sprint 7 | None — drives automatically when style applied | 🕳 Latent — needs Heading/Style UI (see §2) to test |
+| **Style-driven numbering** (`<w:style>/<w:numPr>`) | Cascade resolver Sprint 7 + `Command::ApplyStyle` (Sprint 12) | `StylesDropdown.tsx` triggers the cascade | ⚠️ Partial — style cascade drives, but numbering synthesis (Sprint 13) is the remaining authoring gap |
 
 ---
 
@@ -428,3 +428,13 @@ gesture is one undo entry. Word-count now uses
 > 1; wasm 4.18 → 5.93 MiB (well within the 15 MiB budget). Center /
 Right / Decimal tab-stop **rendering** still degrades to Left
 (out-of-scope per plan).
+
+**Sprint 12 (closed `#11`, HIGH risk).** One row flipped to ✅ Wired:
+section 2 *Outline level / heading style* — `StylesDropdown` now
+dispatches `Command::ApplyStyle` against the real engine cascade
+(`DocumentTree.styles` + shadow `direct_overrides`). Style-driven
+numbering (§4) flipped from 🕳 Latent to ⚠️ Partial — the cascade
+drives, but numbering synthesis remains a Sprint 13 deliverable.
+Custom-style creation UI + character styles (`<w:rStyle>`) stay
+out of scope per plan. WASM unchanged at 5.94 MiB (Sprint 12 added
+no new deps).
