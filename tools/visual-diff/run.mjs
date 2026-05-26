@@ -60,6 +60,7 @@ const VIEWPORTS = {
     'tab-stops-center-kind-ltr': { width: 595, height: 842 },
     'tab-stops-right-kind-ltr': { width: 595, height: 842 },
     'tab-stops-decimal-kind-ltr': { width: 595, height: 842 },
+    'autofit-long-url-overflow': { width: 595, height: 842 },
 };
 function viewportFor(name) {
     if (process.env.VIEWPORT) {

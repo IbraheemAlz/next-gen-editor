@@ -406,6 +406,45 @@ async function handleInit(msg: InitMsg): Promise<void> {
             break;
         }
 
+        case 'autofit-long-url-overflow': {
+            /* L2.2 (#7) — single-cell autofit table containing a pure-
+               letter token (no break opportunities). The column floor
+               anchors at the token's min_content, so the table
+               overflows the right page margin rather than wrapping
+               the token mid-character. */
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: '',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 18,
+                line_height: 26,
+                align: 'START',
+            } as Command);
+            await dispatch({
+                type: 'INSERT_TABLE',
+                at: { steps: [{ kind: 'BLOCK', idx: 1 }] },
+                rows: 1,
+                cols: 1,
+            } as Command);
+            const cellStart = {
+                path: {
+                    steps: [
+                        { kind: 'BLOCK', idx: 1 },
+                        { kind: 'CELL', row: 0, col: 0 },
+                        { kind: 'BLOCK', idx: 0 },
+                    ],
+                },
+                offset: 0,
+            };
+            paintEvt = await dispatch({
+                type: 'INSERT_TEXT',
+                at: cellStart,
+                text: 'a'.repeat(100),
+            } as Command);
+            break;
+        }
+
         case 'tab-stops-decimal-kind-ltr': {
             /* L2.1 (#6) — Decimal tab kind at 250 pt. Segment "12.50"
                aligns its `.` separator at column 250. */

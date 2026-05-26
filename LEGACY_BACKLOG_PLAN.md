@@ -32,7 +32,7 @@
 | **#4** | Sprint 1 (A.H3): smallCaps drops uppercase on byte-length-changing chars (`ß → SS`) | `crates/layout/src/paragraph.rs::build_line` | Sprint 1 trade-off (commit `ec065c1`) | **Done (L1.3).** `transform_for_shape` helper + per-byte transformed→source map; cluster always lands on a UTF-8 char boundary. 7 new unit tests green. |
 | **#5** | Sprint 4 (C.H1): virtual scrollbar over-estimates by `AVG_BLOCK_HEIGHT_PT = 64.0` | `crates/engine-wasm/src/lib.rs` (`build_pages`, `LazyLayoutState`, `LAYOUT_BUFFER_PT`) | Sprint 4 trade-off (commit `09d8a48`) | **Fix.** Predictive pre-layout — double `LAYOUT_BUFFER_PT` window when `target_y` set. |
 | **#6** | Sprint 5 (A.M3): geometric tab stops drift on Center/Right/Justified/RTL + Decimal/Center/Right kinds render as Left | `crates/layout/src/paragraph.rs::apply_tab_advances` | Sprint 5 trade-off (commit `547d20e`) | **Done (L2.1).** Indent-aware pen + shape-then-place math for `Left`/`Center`/`Right`/`Decimal` kinds. 6 native tests + 3 visual-diff goldens (tier A 10/10 at 0.000 %). Center/End/Justify alignment + tabs deferred (Word-conformant). RTL anchoring deferred to issue #20. |
-| **#7** | Sprint 6 (A.M8): table autofit skips true `min-content`; long URLs clip in narrow columns | `crates/engine-wasm/src/lib.rs::autofit_distribute` | Sprint 6 trade-off (commit `c706bab`) | **Fix.** Add `measure_unbreakable_width(text, fonts, cfg)` returning `(min_content, max_content)`; use `min_content` as hard floor. |
+| **#7** | Sprint 6 (A.M8): table autofit skips true `min-content`; long URLs clip in narrow columns | `crates/engine-wasm/src/lib.rs::autofit_distribute` | Sprint 6 trade-off (commit `c706bab`) | **Done (L2.2).** `measure_unbreakable_width` walks `break_opportunities` + `shape_text` per segment to compute `(min_content, max_content)`. `autofit_distribute` enforces `col_floor = max(grid_hint, min_content)` via 3-case dispatch (overflow / fit / iterative pin-and-redistribute). 3 native tests + 1 visual-diff golden (tier A 11/11 at 0.000 %). |
 | **#8** | Sprint 7 (A.M12): continuous section break skips column-height balancing | `crates/engine-wasm/src/lib.rs` (continuous-section path) | Sprint 7 trade-off (commit `046754b`) | **Fix.** Column-balance pass before the section transition. |
 | **#18** | Mint `w14:paraId` + synthesize OPC plumbing for engine-minted resolved comments | `crates/format-docx/src/parts/comments.rs`, `crates/format-docx/src/writer.rs` | Sprint 9 follow-up (issue #15 v1 closure gap) | **Done (L1.2).** `build_comments_xml` mints paraId + textId; additive `inject_content_type_override` / `inject_doc_rel` splice the Override + Relationship rows; untouched docs stay byte-identical. 4 new tests green. |
 
@@ -424,6 +424,51 @@ Mirror `CORE_SPRINTS_PLAN.md` discipline. After each cleanup commits:
    reference back here.
 
 ### Activity log
+
+- **2026-05-27 — L2.2 (#7) landed.**
+  - `crates/engine-wasm/src/lib.rs::autofit_distribute` rewritten with
+    a min-content floor + 3-case dispatch:
+      1. `Σ col_floor > available` → return `col_floor` verbatim;
+         the table overflows the page right margin rather than
+         clipping a token mid-character.
+      2. `Σ col_natural <= available` → scale columns proportionally
+         to fill the available band (existing Word "Autofit Window"
+         behaviour, no floor violations possible).
+      3. shrink case → iterative pin-and-redistribute: each pass
+         pins columns whose proportional share falls below the
+         floor and reallocates the remaining width among the
+         unpinned columns; bounded by `n_cols` iterations.
+  - New helper `measure_unbreakable_width(blocks, fonts, cfg, scale)`
+    returns `(min_content, max_content)` by walking
+    `text_pipeline::break_opportunities` (UAX-#14 from
+    `icu_segmenter`) and summing `shape_text(seg).total_advance`
+    per segment. Bypasses the layout's `compose_lines` force-break
+    path so the floor reflects the longest *truly* unbreakable
+    atom (a pure-letter token), not a single glyph. Nested tables
+    recurse via `autofit_distribute(t, 1.0, …)`.
+  - 3 new native tests:
+    `autofit_one_cell_long_url_floors_at_min_content`,
+    `autofit_two_col_url_plus_prose_floors_url_column`,
+    `autofit_short_text_unchanged_by_min_content_floor`. The latter
+    pins the "no regression on the common case" invariant.
+  - 1 new visual-diff golden `autofit-long-url-overflow` (A4 page,
+    `"a" × 100` in a 1-cell autofit table). The cell border extends
+    past the right page margin, demonstrating Word-compatible
+    horizontal overflow. Tier-A farm 11/11 at 0.000 %.
+  - TS harness: new `?test=autofit-long-url-overflow` case in
+    `engine.worker.ts` (RENDER_PAGE + INSERT_TABLE + INSERT_TEXT
+    into cell `(0,0)`); viewport registered.
+  - **Paginator + renderer verified.** `paginate.rs::push_table_split`
+    paginates by row count, not width. `render::scene::paint_table`
+    walks cells without clipping; Canvas2D `put_image_data` ignores
+    the canvas clip per spec. A table with `t.size.width >
+    page_content_width` paints cleanly past the right margin
+    inside the canvas viewport (CLAUDE.md note carried forward).
+  - CI gates: `cargo test --workspace --lib` 275+ tests green
+    (engine-wasm 30→33); `cargo clippy --workspace --all-targets
+    -- -D warnings` clean; `cargo fmt --all -- --check` clean;
+    `cargo run -p shape-regression --release` 6/6; `cargo run -p
+    roundtrip --release` PASS; visual-diff tier A 11/11 at 0.000 %.
 
 - **2026-05-27 — L2.1 (#6) landed.**
   - `crates/layout/src/paragraph.rs`: `apply_tab_advances` rewritten to

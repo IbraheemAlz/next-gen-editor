@@ -2049,20 +2049,34 @@ fn layout_table_box(
 /// contribute their natural width split evenly across the spanned
 /// columns.
 ///
-/// Pass 2 (distribute): if the sum of column max-content widths
-/// already fits in `available_width_px`, expand columns proportionally
-/// to fill the available band (Word's "Autofit Window" behaviour);
-/// otherwise scale every column down by the same factor so the total
-/// equals available. Either way, columns whose grid hint is set are
-/// allowed to grow but never shrink below their grid value plus a
-/// tiny epsilon — explicit grid widths from `<w:tblGrid>` are still
-/// honoured as a soft minimum.
+/// Pass 2 (min-content measure, L2.2 #7): for every cell, also probe
+/// the line breaker at `width = 1.0` to learn the *longest unbreakable
+/// atom* (a URL, a code token, a single glyph). `col_min_content[i]`
+/// records the worst such atom across cells in column `i`.
+/// `col_floor[i] = max(grid_hint[i], col_min_content[i])` — a HARD
+/// floor every column must respect so the line breaker never wraps
+/// mid-character.
 ///
-/// Cost: O(rows × cols) calls to `layout_cell_blocks` in the measure
-/// pass. Cells re-layout once more at the final widths in the caller,
-/// so the total is 2× a fixed-grid table for autofit. Bounded for
-/// typical tables; infinite-loop risk is zero because the distribute
-/// pass is a one-shot transformation, not an iterative solver.
+/// Pass 3 (distribute): three cases against `available_width_px`:
+///   * **Overflow** — `Σ col_floor > available`. Return `col_floor`
+///     as-is; the table grows past the page margin rather than
+///     clipping a URL or token mid-character. Word does the same.
+///   * **Fit** — `Σ col_natural <= available`. Scale columns
+///     proportionally up to fill the available band (Word's "Autofit
+///     Window" behaviour). No floor violations possible since
+///     `col_natural >= col_floor` after pass 1.
+///   * **Shrink** — `Σ col_natural > available` but
+///     `Σ col_floor <= available`. Iteratively pin columns whose
+///     proportional share would fall below the floor, then redistribute
+///     the remaining width among the unpinned columns. Bounded by
+///     `n_cols` iterations.
+///
+/// Cost: 2 × O(rows × cols) calls to `layout_cell_blocks` in the
+/// measure passes (probe width + min-content width). Cells re-layout
+/// once more at the final widths in the caller. Total ≈ 3× a fixed-
+/// grid table for autofit. Bounded for typical tables; infinite-loop
+/// risk in the iterative shrink is zero because each iteration pins
+/// strictly more columns or terminates.
 fn autofit_distribute(
     table: &engine::Table,
     available_width_px: f32,
@@ -2092,6 +2106,7 @@ fn autofit_distribute(
     let probe_width = (available_width_px / n_cols as f32).max(MIN_COL_WIDTH_PT * scale);
 
     let mut col_natural: Vec<f32> = vec![MIN_COL_WIDTH_PT * scale; n_cols];
+    let mut col_min_content: Vec<f32> = vec![0.0_f32; n_cols];
     for row in &table.rows {
         let mut col_cursor: usize = 0;
         for cell in &row.cells {
@@ -2112,15 +2127,7 @@ fn autofit_distribute(
             /* Lay out at the probe width — max line width across all
             paragraphs is the natural fit. */
             let inner = layout_cell_blocks(&cell.blocks, probe_width, fonts, cfg, scale);
-            let natural_content_w = inner
-                .iter()
-                .map(|b| match b {
-                    LayoutBlock::Paragraph(p) => {
-                        p.lines.iter().map(|l| l.width).fold(0.0_f32, f32::max)
-                    }
-                    LayoutBlock::Table(t) => t.size.width,
-                })
-                .fold(0.0_f32, f32::max);
+            let natural_content_w = block_max_width(&inner);
             let cell_natural = natural_content_w + pad;
             let share = cell_natural / span as f32;
             for i in 0..span {
@@ -2129,22 +2136,232 @@ fn autofit_distribute(
                     col_natural[ci] = share;
                 }
             }
+            /* L2.2 (#7) — min-content probe. Width=1.0 forces the line
+            breaker to wrap at every available break opportunity from
+            `icu_segmenter`; the resulting max line width is the
+            longest atom that cannot be split. Padding is folded into
+            the floor on the same basis as the natural measure. */
+            let (cell_min_content, _cell_max_content) =
+                measure_unbreakable_width(&cell.blocks, fonts, cfg, scale);
+            let min_share = (cell_min_content + pad) / span as f32;
+            for i in 0..span {
+                let ci = col_cursor + i;
+                if ci < col_min_content.len() && col_min_content[ci] < min_share {
+                    col_min_content[ci] = min_share;
+                }
+            }
             col_cursor += span;
         }
     }
-    /* Honour grid hints as a soft minimum — never shrink below them.
-    Empty grid contributes nothing here. */
-    for (i, &hint) in grid_hint.iter().enumerate() {
-        if i < col_natural.len() && col_natural[i] < hint {
-            col_natural[i] = hint;
+    /* L2.2 (#7) — column floor: max(grid_hint, min_content). The
+    natural measurement must respect this floor too, since a column
+    whose probe-width yielded a small width but whose min-content
+    is large would otherwise propose a shrunk-then-clipped layout. */
+    let col_floor: Vec<f32> = (0..n_cols)
+        .map(|i| {
+            let hint = grid_hint.get(i).copied().unwrap_or(0.0);
+            hint.max(col_min_content[i])
+        })
+        .collect();
+    for i in 0..n_cols {
+        if col_natural[i] < col_floor[i] {
+            col_natural[i] = col_floor[i];
         }
     }
+
     let total: f32 = col_natural.iter().sum();
+    let floor_total: f32 = col_floor.iter().sum();
+
     if total <= 0.0 {
         return vec![available_width_px / n_cols as f32; n_cols];
     }
-    let scale_factor = available_width_px / total;
-    col_natural.iter().map(|w| w * scale_factor).collect()
+
+    /* CASE 1 — overflow. Even the floors won't fit; emit the floors
+    and let the table extend past the available band. No column ever
+    shrinks below its longest unbreakable atom (the issue #7 invariant). */
+    if floor_total > available_width_px {
+        return col_floor;
+    }
+
+    /* CASE 2 — fit. The natural total fits; scale proportionally to
+    fill the available width. Word's "Autofit Window" expand path.
+    No floor violations possible since col_natural >= col_floor. */
+    if total <= available_width_px {
+        let factor = available_width_px / total;
+        return col_natural.iter().map(|w| w * factor).collect();
+    }
+
+    /* CASE 3 — shrink. Natural total exceeds available, but floors
+    fit. Iteratively pin columns whose proportional share would fall
+    below their floor; redistribute remaining width among the
+    unpinned ones. Convergence: each iteration pins ≥ 1 more column
+    or terminates, bounded by n_cols passes. */
+    let mut pinned = vec![false; n_cols];
+    let mut final_widths = vec![0.0_f32; n_cols];
+    loop {
+        let mut pinned_total = 0.0_f32;
+        let mut unpinned_natural = 0.0_f32;
+        for i in 0..n_cols {
+            if pinned[i] {
+                pinned_total += col_floor[i];
+            } else {
+                unpinned_natural += col_natural[i];
+            }
+        }
+        if unpinned_natural <= 0.0 {
+            /* All columns pinned. Total may exceed available; same
+            "horizontal overflow rather than clip" rule applies. */
+            final_widths[..n_cols].copy_from_slice(&col_floor[..n_cols]);
+            break;
+        }
+        let unpinned_room = (available_width_px - pinned_total).max(0.0);
+        let factor = unpinned_room / unpinned_natural;
+        let mut newly_pinned = false;
+        for i in 0..n_cols {
+            if !pinned[i] {
+                let proposed = col_natural[i] * factor;
+                if proposed < col_floor[i] {
+                    pinned[i] = true;
+                    newly_pinned = true;
+                }
+            }
+        }
+        if !newly_pinned {
+            for i in 0..n_cols {
+                if pinned[i] {
+                    final_widths[i] = col_floor[i];
+                } else {
+                    final_widths[i] = col_natural[i] * factor;
+                }
+            }
+            break;
+        }
+    }
+    final_widths
+}
+
+/// L2.2 (#7) — measure a cell's `(min_content, max_content)` widths.
+///
+/// `min_content` is the pixel width of the longest contiguous segment
+/// between adjacent break opportunities reported by `icu_segmenter`
+/// (UAX #14). For pure-letter text "aaa..." there is one segment
+/// covering the whole string, so min_content equals the string's
+/// shaped advance; for URLs / hyphenated tokens, ICU breaks at `/`,
+/// `-`, `:` and similar characters, so the segment widths are
+/// individually smaller. This bypasses the layout's `compose_lines`
+/// force-break path (which would otherwise wrap mid-character when
+/// probed at width = 1.0, reducing min_content to a single glyph).
+///
+/// `max_content` is the sum of every segment's advance — equivalent
+/// to shaping the entire text on one line.
+///
+/// Nested tables recurse through `autofit_distribute` at width = 1.0
+/// so the inner table's min-content sum bubbles up to its parent
+/// cell.
+///
+/// Cost: one extra `shape_text` call per segment per paragraph. The
+/// existing probe-width `layout_cell_blocks` pass continues to drive
+/// the natural-width measurement.
+fn measure_unbreakable_width(
+    blocks: &[engine::Block],
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+) -> (f32, f32) {
+    let mut min_content = 0.0_f32;
+    let mut max_content = 0.0_f32;
+    for block in blocks {
+        match block {
+            engine::Block::Paragraph(para) => {
+                let (mc, xc) = paragraph_min_max_advance(para, fonts, cfg, scale);
+                if mc > min_content {
+                    min_content = mc;
+                }
+                if xc > max_content {
+                    max_content = xc;
+                }
+            }
+            engine::Block::Table(t) => {
+                /* Nested table — recurse. Sum of inner column min-content
+                widths bubbles up as this cell's contribution. Probe the
+                inner table against width = 1.0 so its own
+                `autofit_distribute` lands in the CASE 1 overflow path
+                (returns col_floor verbatim). */
+                let sub_widths = autofit_distribute(t, 1.0, fonts, cfg, scale, &[]);
+                let sub_sum: f32 = sub_widths.iter().sum();
+                if sub_sum > min_content {
+                    min_content = sub_sum;
+                }
+                if sub_sum > max_content {
+                    max_content = sub_sum;
+                }
+            } /* `engine::Block` is exhaustive at Paragraph + Table; the
+              non-exhaustive marker is `#[allow(clippy::large_enum_variant)]`
+              only. New variants land here as separate arms. */
+        }
+    }
+    (min_content, max_content)
+}
+
+/// L2.2 (#7) — per-paragraph helper for `measure_unbreakable_width`.
+/// Walks `break_opportunities` returned by `icu_segmenter`; for each
+/// adjacent pair, measures the segment's shaped advance via
+/// `shape_text`. Returns `(longest_segment, sum_of_segments)`.
+fn paragraph_min_max_advance(
+    para: &engine::Paragraph,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+) -> (f32, f32) {
+    use text_pipeline::break_opportunities;
+    if para.text.is_empty() {
+        return (0.0, 0.0);
+    }
+    let breaks = break_opportunities(&para.text);
+    let mut longest = 0.0_f32;
+    let mut total = 0.0_f32;
+    for window in breaks.windows(2) {
+        let a = window[0];
+        let b = window[1];
+        if a >= b {
+            continue;
+        }
+        let seg = &para.text[a..b];
+        let seg_w = measure_segment_advance(seg, fonts, cfg, scale);
+        if seg_w > longest {
+            longest = seg_w;
+        }
+        total += seg_w;
+    }
+    (longest, total)
+}
+
+/// L2.2 (#7) — shape `text` against the resolved font for each
+/// script segment at `cfg.px_size * scale`; sum the per-segment
+/// `total_advance` to get the natural pixel width.
+fn measure_segment_advance(text: &str, fonts: &FontStack, cfg: &RenderConfig, scale: f32) -> f32 {
+    use text_pipeline::{segment_by_script, shape_text};
+    let mut total = 0.0_f32;
+    for (range, script) in segment_by_script(text) {
+        let Some((_, face, _)) = fonts.resolve(script, None, false, false) else {
+            continue;
+        };
+        let shaped = shape_text(face, &text[range], cfg.base_direction, cfg.px_size * scale);
+        total += shaped.total_advance;
+    }
+    total
+}
+
+/// Max width across a slice of laid-out cell blocks. Paragraphs report
+/// the widest line; nested tables report the table's outer width.
+fn block_max_width(blocks: &[LayoutBlock]) -> f32 {
+    blocks
+        .iter()
+        .map(|b| match b {
+            LayoutBlock::Paragraph(p) => p.lines.iter().map(|l| l.width).fold(0.0_f32, f32::max),
+            LayoutBlock::Table(t) => t.size.width,
+        })
+        .fold(0.0_f32, f32::max)
 }
 
 /// Audit gap C.M1 — vertical-merge height pass. For every Restart cell
@@ -7914,5 +8131,167 @@ mod tests {
                 .text,
             "isn't "
         );
+    }
+
+    /* ---------- L2.2 (#7) table autofit min-content ---------- */
+
+    fn test_font_stack() -> FontStack {
+        use std::sync::Arc;
+        let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("test-latin".to_string(), bytes).expect("parse test font");
+        let mut faces: HashMap<String, Arc<LoadedFont>> = HashMap::new();
+        faces.insert("test-latin".to_string(), Arc::new(font));
+        FontStack::from_faces(faces, "test-latin")
+    }
+
+    fn autofit_test_cfg() -> RenderConfig {
+        RenderConfig {
+            font_id: "test-latin".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 12.0,
+            line_height: 16.0,
+            alignment: Alignment::Start,
+            scale: 1.0,
+        }
+    }
+
+    fn cell_with_text(text: &str) -> engine::TableCell {
+        engine::TableCell {
+            props: engine::CellProperties::default(),
+            blocks: vec![engine::Block::Paragraph(engine::Paragraph {
+                text: text.to_string(),
+                spans: Vec::new(),
+                props: engine::ParaProperties::default(),
+                list_item: None,
+                resolved_marker: None,
+                dirty: false,
+                source_xml: None,
+                inline_objects: Vec::new(),
+                hyperlinks: Vec::new(),
+                revisions: Vec::new(),
+                fields: Vec::new(),
+                style_id: None,
+                direct_overrides: engine::ParaProperties::default(),
+            })],
+        }
+    }
+
+    fn one_row_table(cells: Vec<engine::TableCell>) -> engine::Table {
+        engine::Table {
+            grid: Vec::new(),
+            props: engine::TableProperties::default(),
+            rows: vec![engine::TableRow {
+                props: engine::RowProperties::default(),
+                cells,
+            }],
+            dirty: true,
+            source_xml: None,
+        }
+    }
+
+    /// L2.2 (#7) — a single cell containing an unbreakable long word
+    /// (no `/`, `-`, or other ICU break opportunities) must keep the
+    /// column at least as wide as the word's rendered pixel width even
+    /// when that exceeds the available band; the table overflows
+    /// horizontally rather than wrapping the token mid-char.
+    #[test]
+    fn autofit_one_cell_long_url_floors_at_min_content() {
+        let fonts = test_font_stack();
+        let cfg = autofit_test_cfg();
+        /* Pure-letter run — ICU `LineSegmenter::new_auto` reports no
+        break opportunity inside contiguous letters, so this is the
+        true min_content case the issue describes. */
+        let token: String = "a".repeat(80);
+        let table = one_row_table(vec![cell_with_text(&token)]);
+
+        /* Narrow viewport — well under the token's pixel width. */
+        let available = 80.0_f32;
+        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[]);
+
+        assert_eq!(widths.len(), 1);
+        let (cell_min, _cell_max) =
+            measure_unbreakable_width(&table.rows[0].cells[0].blocks, &fonts, &cfg, 1.0);
+        assert!(
+            cell_min > available,
+            "test fixture sanity: the long token's min_content ({cell_min}) \
+             must exceed the available viewport ({available}); raise the token \
+             length or shrink the viewport"
+        );
+        assert!(
+            widths[0] >= cell_min - 0.5,
+            "column floor must be at least cell min_content ({cell_min}); got {}",
+            widths[0]
+        );
+        assert!(
+            widths[0] > available,
+            "narrow viewport must allow horizontal overflow rather than clip; \
+             available={available}, got width={}",
+            widths[0]
+        );
+    }
+
+    /// L2.2 (#7) — a 2-col table with an unbreakable long token in
+    /// column 0 and normal prose in column 1 must pin column 0 to the
+    /// token's min_content; column 1 absorbs the remaining width.
+    #[test]
+    fn autofit_two_col_url_plus_prose_floors_url_column() {
+        let fonts = test_font_stack();
+        let cfg = autofit_test_cfg();
+        let token: String = "a".repeat(40);
+        let table = one_row_table(vec![
+            cell_with_text(&token),
+            cell_with_text("normal short prose"),
+        ]);
+
+        /* Wide-enough viewport that the token's min_content alone fits
+        plus some room for column 1. */
+        let available = 600.0_f32;
+        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[]);
+
+        assert_eq!(widths.len(), 2);
+        let (col0_min, _) =
+            measure_unbreakable_width(&table.rows[0].cells[0].blocks, &fonts, &cfg, 1.0);
+        assert!(
+            widths[0] >= col0_min - 0.5,
+            "col0 must respect token min_content {col0_min}; got {}",
+            widths[0]
+        );
+        /* Column 1 must take what's left. Floor on col1 is its own
+        min_content (small) — it should expand to absorb the slack. */
+        let sum = widths[0] + widths[1];
+        assert!(
+            (sum - available).abs() < 1.0,
+            "two-col layout fills available width; got sum={sum}, available={available}"
+        );
+    }
+
+    /// L2.2 (#7) — short-text cells whose min_content is far below the
+    /// probe width must see the existing scale-to-fit behaviour. Pins
+    /// the "no regression on the common case" invariant; this guard
+    /// protects the visual-diff farm from any drift introduced by the
+    /// new floor.
+    #[test]
+    fn autofit_short_text_unchanged_by_min_content_floor() {
+        let fonts = test_font_stack();
+        let cfg = autofit_test_cfg();
+        let table = one_row_table(vec![
+            cell_with_text("Name"),
+            cell_with_text("Age"),
+            cell_with_text("City"),
+        ]);
+        let available = 600.0_f32;
+        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[]);
+
+        assert_eq!(widths.len(), 3);
+        let sum: f32 = widths.iter().sum();
+        assert!(
+            (sum - available).abs() < 1.0,
+            "short-text autofit fills available width; sum={sum}, available={available}"
+        );
+        /* No column compressed below its short-word min_content — that
+        is the trivial floor case (column already >= floor). */
+        for &w in &widths {
+            assert!(w > 30.0, "every column expands above MIN_COL_WIDTH_PT");
+        }
     }
 }
