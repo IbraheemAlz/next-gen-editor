@@ -95,9 +95,9 @@
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
 | **Tab character round-trip** | Sprint 1 preserved `\t` in model | None — typing `Tab` inserts via `beforeinput` | ⚠️ Partial — `Tab` key currently navigates table cells only; outside tables it should insert `\t` |
-| **Geometric tab stops** (Left / Center / Right / Decimal / Clear) | Engine model carries kinds (Sprint 5); render only `Left` ships | Ruler with draggable tab markers + tab-kind selector chip; `Tabs…` dialog | 🛑 Blocked — render of Center/Right/Decimal **deferred**; rendering UI also missing |
-| **First-line indent ruler handle** | No command | Ruler with first-line ▽ marker | 🛑 Blocked |
-| **Hanging indent ruler handle** | No command | Ruler with hanging △ marker | 🛑 Blocked |
+| **Geometric tab stops** (Left / Center / Right / Decimal / Clear) | `Command::SetTabStops` + `Event::SelectionChanged.tab_stops` (Sprint 11) | `Ruler.tsx` — L/C/R/D markers, click cycles kind, drag moves, drag-off removes | ✅ Wired (Sprint 11) — authoring works; render of Center/Right/Decimal still **deferred** (`#13` closed) |
+| **First-line indent ruler handle** | `Command::SetParagraphIndent` + Ruler (Sprint 11) | `Ruler.tsx` first-line ▽ marker at leading edge | ✅ Wired (Sprint 11, `#13` closed) |
+| **Hanging indent ruler handle** | `Command::SetParagraphIndent` (negative `first_line_pt`) + Ruler (Sprint 11) | `Ruler.tsx` left-indent △ marker | ✅ Wired (Sprint 11, `#13` closed) |
 
 ---
 
@@ -417,3 +417,14 @@ message }` from engine mutation handlers + polite + assertive
 also prefills from `Event::SelectionChanged.cell_properties` (per-
 edge edit remains a future enhancement — section 7 *Cell borders*
 stays ⚠️ Partial).
+
+**Sprint 11 (closed `#13`, `#17`).** Three rows flipped to ✅ Wired:
+section 4 *Geometric tab stops*, *First-line indent ruler handle*,
+*Hanging indent ruler handle* — all served by the new `Ruler.tsx` +
+`Command::SetTabStops` / `Command::SetParagraphIndent`. `Ruler`
+dispatches once on `pointerup`, never on `pointermove`, so one drag
+gesture is one undo entry. Word-count now uses
+`icu_segmenter::WordSegmenter::new_auto` (UAX-#29) so CJK reports
+> 1; wasm 4.18 → 5.93 MiB (well within the 15 MiB budget). Center /
+Right / Decimal tab-stop **rendering** still degrades to Left
+(out-of-scope per plan).
