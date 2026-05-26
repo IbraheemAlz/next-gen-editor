@@ -225,7 +225,7 @@
 | **Show/hide markup** | No engine command | Toolbar Review → "Display for Review" dropdown (Final / All Markup / No Markup / Original) | 🛑 Blocked |
 | **Accept / Reject revision** | No engine command yet | Per-revision Accept ✓ / Reject ✗ buttons in sidebar | 🛑 Blocked — needs bridge addition |
 | **Accept All / Reject All** | No engine command | Toolbar Review buttons | 🛑 Blocked |
-| **Track-changes toggle** | No engine command | Toolbar Review → Track Changes toggle (records new edits as `<w:ins>`) | 🛑 Blocked |
+| **Track-changes toggle** | `Command::ToggleTrackChanges` + `Event::SelectionChanged.is_tracking_changes` (Sprint 14) | `ReviewControls.tsx` Track toggle (binds to engine state, no local UI signal) | ✅ Wired (Sprint 14) — every InsertText / DeleteRange / DeleteAtCaret / ApplyFormatting gates into `<w:ins>` / `<w:del>` / `<w:rPrChange>` revisions; boundary math preserves invariants (`#14` closed) |
 | **Author / colour assignment** | Engine preserves on round-trip | Settings → user identity (already in `.docx` model) | 🕳 Latent |
 
 ---
@@ -448,3 +448,19 @@ upgraded ⚠️ Partial → ✅ Wired now that the synthesis half ships.
 WASM 5.94 → 5.96 MiB (+20 KiB; no new deps, only added engine
 mirror types). Tab/Shift-Tab demote/promote, restart-numbering UI,
 custom bullet pickers stay out of scope per plan.
+
+**Sprint 14 (closed `#14`, HIGHEST risk — FINAL Core sprint).** One
+row flipped to ✅ Wired in §12: *Track-changes toggle* — every
+text mutation (InsertText / DeleteRange / DeleteAtCaret /
+ApplyFormatting) gates through three new engine helpers
+(`tracked_insert_text`, `tracked_delete_range`,
+`tracked_format_change`). Boundary math:
+typing-in-same-author-Insert grows it (no fragmentation);
+typing-in-Delete splits the Delete and stamps a new Insert in the
+gap (no nested `<w:ins>` in `<w:del>`); adjacent same-author
+revisions merge. Undo restores prior tree snapshots — no counter-
+revisions. `ReviewControls` Track toggle binds to
+`state.isTrackingChanges()` (broadcast on every SelectionChanged)
+instead of carrying local Solid state. WASM 5.96 → 5.97 MiB (+12
+KiB). Cross-paragraph tracked-delete, FormatChange-reject restoring
+prev_attrs, and mixed-overlap deletes stay v1 limitations.
