@@ -49,38 +49,59 @@ async function profile(browser, label) {
         return null;
     }
 
+    const t0 = Date.now();
+    console.log(`[memory-profile] ${label}: starting...`);
     const ctx = await browser.newContext();
     try {
         const page = await ctx.newPage();
-        await page.goto(ORIGIN, { waitUntil: 'load', timeout: 20000 });
-        await page.waitForFunction(() => window.__paintIdle === true, { timeout: 30000 });
+        page.on('pageerror', e => console.log(`[memory-profile] ${label} pageerror: ${e.message}`));
+        await page.goto(ORIGIN, { waitUntil: 'load', timeout: 60000 });
+        await page.waitForFunction(() => window.__paintIdle === true, { timeout: 120000 });
+        console.log(`[memory-profile] ${label}: page loaded ${Date.now() - t0}ms`);
 
         const docxBytes = Array.from(readFileSync(docxPath));
-        const loaded = await page.evaluate(async (bytes) => {
-            const evt = await window.__dispatch({
-                type: 'LOAD_DOCX',
-                bytes: new Uint8Array(bytes),
-            });
-            return evt.type === 'ERROR' ? evt.message : evt.type;
-        }, docxBytes);
+        console.log(`[memory-profile] ${label}: dispatching LOAD_DOCX (${docxBytes.length}B)`);
+        const loadStart = Date.now();
+        const loaded = await Promise.race([
+            page.evaluate(async (bytes) => {
+                const evt = await window.__dispatch({
+                    type: 'LOAD_DOCX',
+                    bytes: new Uint8Array(bytes),
+                });
+                return evt.type === 'ERROR' ? evt.message : evt.type;
+            }, docxBytes),
+            new Promise(r => setTimeout(() => r('TIMEOUT_300S'), 300000)),
+        ]);
+        console.log(`[memory-profile] ${label}: LOAD_DOCX -> ${loaded} in ${Date.now() - loadStart}ms`);
         if (loaded !== 'DOCUMENT_LOADED') {
             console.error(`[memory-profile] ${label}: LOAD_DOCX failed — ${loaded}`);
             return { label, ok: false };
         }
 
-        /* Let layout + paint settle, then force a full GC so the reading is
-           steady state, not transient allocation. */
-        await page.waitForTimeout(300);
+        /* Brief settle window, then GC. LOAD_DOCX already includes the
+           full layout + auto-repaint synchronously, so the worker is
+           free as soon as DOCUMENT_LOADED returned. */
+        await page.waitForTimeout(500);
         await page.evaluate(() => window.gc?.());
         await page.waitForTimeout(100);
 
-        const stats = await page.evaluate(async () => {
-            const evt = await window.__dispatch({ type: 'REQUEST_STATS' });
-            return evt.type === 'STATS' ? evt : null;
-        });
+        console.log(`[memory-profile] ${label}: requesting stats`);
+        const statsStart = Date.now();
+        const stats = await Promise.race([
+            page.evaluate(async () => {
+                const evt = await window.__dispatch({ type: 'REQUEST_STATS' });
+                return evt.type === 'STATS' ? evt : null;
+            }),
+            new Promise(r => setTimeout(() => r(null), 1800000)),
+        ]);
+        console.log(`[memory-profile] ${label}: stats returned in ${Date.now() - statsStart}ms`);
         const jsHeap = await page.evaluate(() => performance.memory?.usedJSHeapSize ?? 0);
 
-        const engine = stats?.wasm_heap_bytes ?? 0;
+        if (!stats) {
+            console.error(`[memory-profile] ${label}: REQUEST_STATS did not return — worker busy past timeout`);
+            return { label, ok: false };
+        }
+        const engine = stats.wasm_heap_bytes ?? 0;
         const budget = BUDGETS[label];
         const ok = engine < budget.engine && jsHeap < budget.jsHeap;
         console.log(
@@ -101,18 +122,21 @@ console.log(
         `mode=${enforce ? 'enforce' : 'report'}`,
 );
 
-const browser = await chromium.launch({
-    headless: true,
-    channel: 'chrome',
-    args: ['--enable-precise-memory-info', '--js-flags=--expose-gc'],
-});
 const results = [];
-try {
-    for (const label of labels) {
+for (const label of labels) {
+    const browser = await chromium.launch({
+        headless: true,
+        channel: 'chrome',
+        args: ['--enable-precise-memory-info', '--js-flags=--expose-gc'],
+    });
+    try {
         results.push(await profile(browser, label));
+    } catch (e) {
+        console.error(`[memory-profile] ${label}: ERROR ${e.message}`);
+        results.push({ label, ok: false, error: e.message });
+    } finally {
+        await browser.close();
     }
-} finally {
-    await browser.close();
 }
 
 const profiled = results.filter((r) => r !== null);

@@ -121,8 +121,15 @@ async function handleInit(msg: InitMsg): Promise<void> {
             import.meta.url,
         ),
     });
-    engine = new Engine(msg.canvas);
-    self.postMessage({ type: 'BOOT_OK' });
+    /* Backlog #4: harness path now honours detect_backend like the
+       interactive (EngineClient) path. Vello when WebGPU available,
+       Canvas2D fallback. */
+    const renderer = await detect_backend();
+    engine =
+        renderer === 'vello'
+            ? await Engine.with_vello(msg.canvas)
+            : new Engine(msg.canvas);
+    self.postMessage({ type: 'BOOT_OK', renderer });
 
     const pong = await dispatch({ type: 'PING' } as Command);
     self.postMessage({ type: 'PING_RESULT', event: pong });
