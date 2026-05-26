@@ -138,7 +138,50 @@
 
 ---
 
-## Sprint 10 — State Read-back + ARIA Announcements
+## Sprint 10 — State Read-back + ARIA Announcements ✅ DONE
+
+**Status:** Closed 2026-05-27. Issues #10 + #16 both resolved.
+
+  * `crates/bridge/src/event.rs` carries the additive
+    `SelectionChanged { section_geometry: Option<BridgeSectionGeometry>,
+    cell_properties: Option<BridgeCellProperties>, … }` extension +
+    the new `Event::Announcement { priority, message }` variant.
+    `BridgeSectionGeometry` is a 40-byte `Copy` struct (8 `f32`s + 1
+    `u32` + enum); `BridgeCellProperties` is a `Default` mirror of
+    the dialog-relevant subset of `CellProperties`.
+  * `engine-wasm::selection_changed` populates both fields via
+    `section_geometry_for_caret` + `cell_properties_for_caret`. Zero
+    `unwrap()` / `expect()` in the resolution path — all `Option<T>`
+    propagation via `?`. `section_for_block` falls back to a
+    synthesized A4 default when the document carries no `<w:sectPr>`;
+    `innermost_cell_props_at` walks the engine tree with `?` early-
+    return at every step. Lookups are O(sections) / O(table-depth)
+    — no full-tree traversal per keystroke.
+  * `Engine::announce()` queues messages; the worker drains them
+    into `Event::Announcement` events after every command. Sprint
+    10 closure pass added missing announce sites for table
+    mutations:
+      - `Table inserted, N rows by M columns`
+      - `Table deleted`
+      - `Row inserted` / `Row deleted`
+      - `Column inserted` / `Column deleted`
+      - `Cells merged` / `Cell split`
+      - `Cell shading updated` / `Cell shading cleared`
+      - `Cell borders updated`
+    Joins the existing coverage (revision accepted / rejected,
+    comment added / deleted, tab stops updated, page break
+    inserted, formatting label-driven for bold / italic / align).
+  * UI consumption:
+    `@nge/core::createEditorState` exposes `sectionGeometry()` +
+    `cellProperties()` Solid signals;
+    `@nge/ui::PageSetupDialog.tsx` + `CellPropertiesDialog.tsx` +
+    `Ruler.tsx` prefill from them;
+    `ts/src/components/Announcements.tsx` routes the announcement
+    stream into a polite + assertive `aria-live` DOM region.
+
+---
+
+## Sprint 10 — Original plan (archived)
 
 **Issues:** [#10](https://github.com/IbraheemAlz/next-gen-editor/issues/10), [#16](https://github.com/IbraheemAlz/next-gen-editor/issues/16)
 

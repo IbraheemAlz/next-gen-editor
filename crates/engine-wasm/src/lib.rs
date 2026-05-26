@@ -7072,6 +7072,10 @@ impl Engine {
             .undo
             .current()
             .insert_table(bridge_to_engine_path(at), rows, cols);
+        self.announce(
+            AnnouncementPriority::Polite,
+            format!("Table inserted, {rows} rows by {cols} columns"),
+        );
         self.push_table_edit(new_doc)
     }
     fn do_delete_table(&mut self, path: bridge::BlockPath) -> Event {
@@ -7079,6 +7083,7 @@ impl Engine {
             .undo
             .current()
             .delete_table(bridge_to_engine_path(path));
+        self.announce(AnnouncementPriority::Polite, "Table deleted");
         self.push_table_edit(new_doc)
     }
     fn do_insert_row(
@@ -7104,6 +7109,7 @@ impl Engine {
             .undo
             .current()
             .insert_row(bridge_to_engine_path(path), at);
+        self.announce(AnnouncementPriority::Polite, "Row inserted");
         self.push_table_edit(new_doc)
     }
     fn do_delete_row(&mut self, path: bridge::BlockPath, row: u32) -> Event {
@@ -7111,6 +7117,7 @@ impl Engine {
             .undo
             .current()
             .delete_row(bridge_to_engine_path(path), row);
+        self.announce(AnnouncementPriority::Polite, "Row deleted");
         self.push_table_edit(new_doc)
     }
     fn do_insert_column(
@@ -7127,6 +7134,7 @@ impl Engine {
             .undo
             .current()
             .insert_column(bridge_to_engine_path(path), at);
+        self.announce(AnnouncementPriority::Polite, "Column inserted");
         self.push_table_edit(new_doc)
     }
     fn do_delete_column(&mut self, path: bridge::BlockPath, col: u32) -> Event {
@@ -7134,6 +7142,7 @@ impl Engine {
             .undo
             .current()
             .delete_column(bridge_to_engine_path(path), col);
+        self.announce(AnnouncementPriority::Polite, "Column deleted");
         self.push_table_edit(new_doc)
     }
     fn do_merge_cells(
@@ -7151,6 +7160,7 @@ impl Engine {
             to_row,
             to_col,
         );
+        self.announce(AnnouncementPriority::Polite, "Cells merged");
         self.push_table_edit(new_doc)
     }
     fn do_split_cell(&mut self, path: bridge::BlockPath, row: u32, col: u32) -> Event {
@@ -7158,6 +7168,7 @@ impl Engine {
             .undo
             .current()
             .split_cell(bridge_to_engine_path(path), row, col);
+        self.announce(AnnouncementPriority::Polite, "Cell split");
         self.push_table_edit(new_doc)
     }
     fn do_set_cell_shading(
@@ -7172,6 +7183,14 @@ impl Engine {
             self.undo
                 .current()
                 .set_cell_shading(bridge_to_engine_path(path), row, col, rgba);
+        self.announce(
+            AnnouncementPriority::Polite,
+            if rgba.is_some() {
+                "Cell shading updated"
+            } else {
+                "Cell shading cleared"
+            },
+        );
         self.push_table_edit(new_doc)
     }
     fn do_set_cell_borders(
@@ -7187,6 +7206,7 @@ impl Engine {
             col,
             bridge_to_engine_borders(borders),
         );
+        self.announce(AnnouncementPriority::Polite, "Cell borders updated");
         self.push_table_edit(new_doc)
     }
 
