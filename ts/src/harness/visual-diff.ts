@@ -29,7 +29,10 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
         testCase === 'a4-justified-mixed' ||
         testCase === 'rich-text' ||
         testCase === 'editing-arabic' ||
-        testCase === 'docx-round-trip'
+        testCase === 'docx-round-trip' ||
+        testCase === 'tab-stops-center-kind-ltr' ||
+        testCase === 'tab-stops-right-kind-ltr' ||
+        testCase === 'tab-stops-decimal-kind-ltr'
     ) {
         return { w: 595, h: 842 };
     }

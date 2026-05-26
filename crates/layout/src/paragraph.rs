@@ -82,19 +82,42 @@ pub struct ParagraphConfig<'a> {
     /// default at the engine-wasm boundary.
     pub px_size_for_marker: f32,
     /// Audit gap A.M3 — `<w:pPr><w:tabs>` custom stops in
-    /// paragraph-content-relative layout px. Empty ⇒ the line builder
-    /// falls back to the default 0.5-inch grid (`DEFAULT_TAB_GRID_PX`).
-    /// `Clear` entries are filtered out by the engine-wasm adapter
-    /// before reaching us — the line builder treats `position_px` as
-    /// the absolute advance target.
-    pub tab_stops_px: &'a [f32],
+    /// paragraph-content-relative layout px, paired with the stop's
+    /// geometric kind. Empty ⇒ the line builder falls back to the
+    /// default 0.5-inch grid (`DEFAULT_TAB_GRID_PT`). `Clear` entries
+    /// are filtered out by the engine-wasm adapter before reaching us.
+    /// L2.1 (#6) — non-`Left` kinds (Center/Right/Decimal) trigger the
+    /// shape-then-place pass in `apply_tab_advances`.
+    pub tab_stops_px: &'a [(f32, TabKind)],
+}
+
+/// L2.1 (#6) — geometric kind of a single custom tab stop. Mirrors
+/// `engine::TabKind` minus `Clear` (which the engine-wasm adapter
+/// strips before reaching the layout pass). Kept local to the layout
+/// crate so `engine` does not leak into `ParagraphConfig`'s public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabKind {
+    /// Tab cursor jumps to the stop; the following text lands flush
+    /// against its left edge. Word's default and the only kind honoured
+    /// before L2.1.
+    #[default]
+    Left,
+    /// Following text's midpoint lands at the stop.
+    Center,
+    /// Following text's right edge lands at the stop.
+    Right,
+    /// Following text's decimal separator (`.` or `,`) lands at the
+    /// stop. Falls back to `Right` semantics when the segment contains
+    /// no separator.
+    Decimal,
 }
 
 /// Audit gap A.M3 — default tab grid in layout pt at scale=1. Word's
 /// "default tab stops" knob (`<w:settings><w:defaultTabStop>`) defaults
 /// to 720 twips = 36 pt = ½ inch; the line builder steps in 36-pt
 /// increments whenever no custom stop in the paragraph's tab list
-/// fits.
+/// fits. Grid stops are always `TabKind::Left` — Word does not allow
+/// kind overrides on default-grid stops.
 pub const DEFAULT_TAB_GRID_PT: f32 = 36.0;
 
 /// Lay out `cfg.text` into a [`ParagraphBox`] with positioned lines.
@@ -109,16 +132,24 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     let content_width = (cfg.max_width - cfg.indent_start_px - cfg.indent_end_px).max(0.0);
     let mut composed = compose_lines_with_width(&cfg, content_width);
 
-    /* Audit gap A.M3 — geometric tab stops. Pass runs BEFORE justify so
-    the post-fix advances are baked into `line.width` and justify gets
-    a clean total. Each tab character (U+0009) in a glyph's source
-    cluster has its advance overridden to land the *next* glyph at the
-    next custom stop in `tab_stops_px`, falling back to the default
-    half-inch grid (`DEFAULT_TAB_GRID_PT`). The pen is line-local
-    (origin.x already carries the alignment + indent offset, so the
-    tab math operates against the line's "content-leading" pen at 0). */
+    /* Audit gap A.M3 / L2.1 (#6) — geometric tab stops. Pass runs
+    BEFORE justify so post-fix advances are baked into `line.width`
+    and justify sees a clean total. Each tab character (U+0009) in a
+    glyph's source cluster has its advance overridden so the next
+    glyph lands at the requested stop. Custom stops carry a
+    `TabKind` (`Left`/`Center`/`Right`/`Decimal`); the helper does
+    shape-then-place for the non-Left kinds. Falls back to the
+    default half-inch grid (`DEFAULT_TAB_GRID_PT`, always `Left`).
+    The pen starts at the line's leading-edge indent so it tracks
+    paragraph-content-relative coordinates — tab stops (also
+    paragraph-content-relative) compare directly without a transform. */
+    let pre_alignment_leading_off = if matches!(cfg.base_direction, ShapingDirection::Rtl) {
+        cfg.indent_end_px
+    } else {
+        cfg.indent_start_px
+    };
     for (line, _) in composed.iter_mut() {
-        apply_tab_advances(line, cfg.text, cfg.tab_stops_px);
+        apply_tab_advances(line, cfg.text, cfg.tab_stops_px, pre_alignment_leading_off);
     }
 
     /* Justify every line except the last and any hard-broken (overflow) line. */
@@ -329,6 +360,207 @@ fn compose_lines_with_width<'a>(
     compose_lines(&scoped)
 }
 
+/// L2.1 (#6) — minimum advance assigned to a tab glyph after a
+/// non-Left shape-then-place computation lands beyond the next stop.
+///
+/// Prevents the tab from collapsing to 0 (which would visually overlap
+/// the preceding content); the segment then naturally overflows the
+/// stop instead. Chosen at 4 px to match Word's observable minimum tab
+/// width on a 12-pt body.
+const MIN_TAB_FILL_PX: f32 = 4.0;
+
+/// L2.1 (#6) — locator for a single tab glyph inside a [`LineBox`].
+/// `next_tab` is `None` when this is the last tab in the line, in
+/// which case the segment walks all the way to the line's end.
+#[derive(Debug, Clone, Copy)]
+struct TabPosition {
+    cur_run: usize,
+    cur_glyph: usize,
+    next_tab: Option<(usize, usize)>,
+}
+
+// Audit gap A.M3 / L2.1 (#6) — geometric tab-stop advance.
+//
+// Walks `line.runs` in visual order accumulating the pen position. The
+// pen starts at `leading_off_px` so it tracks paragraph-content-relative
+// coordinates from the leading edge; tab stops in `tab_stops_px` are
+// stored in the same frame and compare directly.
+//
+// When a glyph's source cluster points to a U+0009 TAB byte, the
+// advance is rewritten according to the matching stop's `TabKind`:
+//   * `Left`   — next glyph lands at the stop (`advance = stop - pen`).
+//   * `Center` — segment's midpoint lands at the stop.
+//   * `Right`  — segment's right edge lands at the stop.
+//   * `Decimal`— segment's first `.` or `,` character lands at the stop.
+//                Falls back to `Right` semantics when no separator is
+//                present.
+//
+// The non-Left kinds shape-then-place: the helper walks forward
+// (visual order) from the current tab to the next tab (or end of
+// line) to measure the segment's advance + decimal-separator offset
+// before computing the tab's fill. Grid-fallback stops are always
+// `Left`.
+//
+// `line.width` is updated to the post-adjustment line-local extent
+// (`pen - leading_off_px`) so downstream justify / alignment math
+// operates on visual width.
+//
+// Known limitations (tracked separately):
+//   * Center / End / Justify alignment + tabs: the whole line still
+//     center-shifts (Word-conformant). Tab stops within a Centered
+//     line therefore visually drift by the alignment offset.
+//   * RTL paragraphs: tab positions are treated LTR-style. See issue
+//     #20 for the directional mirror pass.
+fn apply_tab_advances(
+    line: &mut LineBox,
+    para_text: &str,
+    tab_stops_px: &[(f32, TabKind)],
+    leading_off_px: f32,
+) {
+    if !para_text.contains('\u{0009}') {
+        line.width = line_advance(&line.runs);
+        return;
+    }
+    /* Build a flat (run, glyph) index of every tab in the line so the
+    non-Left kinds can look up "the next tab past this one" in O(1)
+    without rewalking the run tree. Visual-order index. */
+    let tab_indices: Vec<(usize, usize)> = line
+        .runs
+        .iter()
+        .enumerate()
+        .flat_map(|(ri, run)| {
+            let source_start = run.source_range.start as usize;
+            let bytes = para_text.as_bytes();
+            run.glyphs.iter().enumerate().filter_map(move |(gi, g)| {
+                let cluster_byte = source_start + g.cluster as usize;
+                if bytes.get(cluster_byte).copied() == Some(b'\t') {
+                    Some((ri, gi))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    let mut pen = leading_off_px;
+    let mut tab_cursor = 0usize;
+    for ri in 0..line.runs.len() {
+        for gi in 0..line.runs[ri].glyphs.len() {
+            let is_tab = tab_indices
+                .get(tab_cursor)
+                .is_some_and(|&(tri, tgi)| tri == ri && tgi == gi);
+            if is_tab {
+                let (stop_pos, stop_kind) = next_tab_stop_after(pen, tab_stops_px);
+                let pos = TabPosition {
+                    cur_run: ri,
+                    cur_glyph: gi,
+                    next_tab: tab_indices.get(tab_cursor + 1).copied(),
+                };
+                let advance = compute_tab_advance(pen, stop_pos, stop_kind, line, para_text, pos);
+                line.runs[ri].glyphs[gi].x_advance = advance;
+                tab_cursor += 1;
+            }
+            pen += line.runs[ri].glyphs[gi].x_advance;
+        }
+    }
+    line.width = (pen - leading_off_px).max(0.0);
+}
+
+/// L2.1 (#6) — compute the `x_advance` for a tab glyph at line-local
+/// pen `pen` targeting stop `stop_pos` with geometric kind `stop_kind`.
+/// For non-`Left` kinds, walks forward through the glyph stream
+/// (between the current tab and `next_tab_idx`, or end-of-line) to
+/// measure the segment's natural advance and — for `Decimal` — the
+/// byte offset of the first `.` or `,` separator.
+fn compute_tab_advance(
+    pen: f32,
+    stop_pos: f32,
+    stop_kind: TabKind,
+    line: &LineBox,
+    para_text: &str,
+    pos: TabPosition,
+) -> f32 {
+    if matches!(stop_kind, TabKind::Left) {
+        return (stop_pos - pen).max(MIN_TAB_FILL_PX);
+    }
+
+    let bytes = para_text.as_bytes();
+    let mut segment_advance = 0.0_f32;
+    let mut decimal_offset: Option<f32> = None;
+
+    /* Walk forward visual-order from the glyph AFTER the current tab,
+    summing advances until we hit the next tab (exclusive) or the end
+    of the line. */
+    let stop_at = |ri: usize, gi: usize| -> bool {
+        if let Some((nri, ngi)) = pos.next_tab {
+            ri == nri && gi == ngi
+        } else {
+            false
+        }
+    };
+
+    let mut started = false;
+    let mut found_decimal = false;
+    'walk: for (ri, run) in line.runs.iter().enumerate() {
+        for (gi, g) in run.glyphs.iter().enumerate() {
+            /* Skip everything up to and including the current tab. */
+            if !started {
+                if ri == pos.cur_run && gi == pos.cur_glyph {
+                    started = true;
+                }
+                continue;
+            }
+            if stop_at(ri, gi) {
+                break 'walk;
+            }
+            /* `Decimal` records the cumulative advance up to (but not
+            including) the first `.` or `,` glyph. */
+            if !found_decimal && matches!(stop_kind, TabKind::Decimal) {
+                let cluster_byte = run.source_range.start as usize + g.cluster as usize;
+                let ch = bytes.get(cluster_byte).copied();
+                if ch == Some(b'.') || ch == Some(b',') {
+                    decimal_offset = Some(segment_advance);
+                    found_decimal = true;
+                }
+            }
+            segment_advance += g.x_advance;
+        }
+    }
+
+    let advance = match stop_kind {
+        TabKind::Left => stop_pos - pen,
+        TabKind::Center => stop_pos - pen - segment_advance / 2.0,
+        TabKind::Right => stop_pos - pen - segment_advance,
+        TabKind::Decimal => match decimal_offset {
+            Some(d) => stop_pos - pen - d,
+            /* Fallback: behave like Right when the segment has no
+            decimal separator (Word's documented fallback). */
+            None => stop_pos - pen - segment_advance,
+        },
+    };
+    advance.max(MIN_TAB_FILL_PX)
+}
+
+/// Audit gap A.M3 / L2.1 (#6) — choose the next tab stop strictly past
+/// `pen_x`. Custom stops win when one fits; otherwise the default
+/// half-inch grid (`DEFAULT_TAB_GRID_PT`) ceiling-rounded. Grid stops
+/// are always `Left` — Word does not allow kind overrides on default-
+/// grid stops.
+fn next_tab_stop_after(pen_x: f32, custom: &[(f32, TabKind)]) -> (f32, TabKind) {
+    let custom_next = custom
+        .iter()
+        .copied()
+        .filter(|&(p, _)| p > pen_x + 0.001)
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(stop) = custom_next {
+        return stop;
+    }
+    /* Grid fallback. `(pen / grid).floor() + 1` jumps to the next
+    multiple of the grid step regardless of how close pen is. */
+    let grid = DEFAULT_TAB_GRID_PT;
+    (((pen_x / grid).floor() + 1.0) * grid, TabKind::Left)
+}
+
 /// Compute one line's `(ascent, descent)` — the line box's height split at
 /// the baseline. The configured `line_height` is the author's target
 /// (the `<w:spacing w:line>`-equivalent at the engine boundary, matching
@@ -350,63 +582,6 @@ fn compose_lines_with_width<'a>(
 /// - Phase 7 inline images can still grow the line above `line_height`
 ///   when an image's height exceeds the box — clipping a glyph is fine,
 ///   clipping an image's content is not.
-// Audit gap A.M3 — geometric tab-stop advance.
-//
-// Walks `line.runs` in visual order accumulating the pen position. When
-// a glyph's source cluster points to a U+0009 TAB byte, the advance is
-// rewritten so the following glyph lands at the next tab stop strictly
-// past the current pen. Custom stops in `tab_stops_px` are tried
-// first; if none qualify, the default half-inch
-// (`DEFAULT_TAB_GRID_PT`) grid kicks in. `line.width` is updated to
-// the post-adjustment cumulative pen so downstream justify / alignment
-// math sees the right total.
-//
-// Limitations: tab stops are paragraph-content-relative, but the pen
-// here is line-local. The discrepancy is the line's `origin.x`
-// (alignment + indent offset). For Start-aligned LTR paragraphs the
-// two are equal; other cases drift, accepted as a known trade-off for
-// this sprint. Decimal / Center / Right kinds on the stop itself round-
-// trip on parse + emit but render as Left for now.
-fn apply_tab_advances(line: &mut LineBox, para_text: &str, tab_stops_px: &[f32]) {
-    if !para_text.contains('\u{0009}') {
-        return;
-    }
-    let bytes = para_text.as_bytes();
-    let mut pen = 0.0_f32;
-    for run in line.runs.iter_mut() {
-        for g in run.glyphs.iter_mut() {
-            let cluster_byte = run.source_range.start as usize + g.cluster as usize;
-            let is_tab = bytes.get(cluster_byte).copied() == Some(b'\t');
-            if is_tab {
-                let next = next_tab_stop_after(pen, tab_stops_px);
-                if next > pen {
-                    g.x_advance = next - pen;
-                }
-            }
-            pen += g.x_advance;
-        }
-    }
-    line.width = pen;
-}
-
-/// Audit gap A.M3 — choose the next tab stop strictly past `pen_x`.
-/// Custom stops win when one fits; otherwise the default half-inch
-/// grid (`DEFAULT_TAB_GRID_PT`) ceiling-rounded.
-fn next_tab_stop_after(pen_x: f32, custom: &[f32]) -> f32 {
-    let custom_next = custom
-        .iter()
-        .copied()
-        .filter(|&p| p > pen_x + 0.001)
-        .reduce(f32::min);
-    if let Some(p) = custom_next {
-        return p;
-    }
-    /* Grid fallback. `(pen / grid).floor() + 1` jumps to the next
-    multiple of the grid step regardless of how close pen is. */
-    let grid = DEFAULT_TAB_GRID_PT;
-    ((pen_x / grid).floor() + 1.0) * grid
-}
-
 fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32) -> (f32, f32) {
     let mut font_ascent = 0.0_f32;
     let mut font_descent = 0.0_f32;
@@ -1115,6 +1290,214 @@ mod tests {
         assert_eq!(text.as_ref(), "A SS");
         let map = map.expect("caps path returns map");
         assert_eq!(map, vec![0, 1, 2, 2]);
+    }
+
+    /* ---------- L2.1 (#6) tab stops ---------- */
+
+    fn test_glyph(cluster: u32, x_advance: f32) -> PositionedGlyph {
+        PositionedGlyph {
+            id: 0,
+            cluster,
+            x_advance,
+            y_advance: 0.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            synthetic: false,
+            inline_image_rel_id: None,
+            inline_footnote_marker: None,
+            inline_object_height: 0.0,
+        }
+    }
+
+    fn test_attrs() -> TextAttrs {
+        TextAttrs {
+            px_size: 12.0,
+            color: [0, 0, 0, 255],
+            faux_bold: false,
+            faux_italic: false,
+            underline: engine::UnderlineStyle::None,
+            strike: false,
+            bg_color: None,
+            baseline_shift_px: 0.0,
+        }
+    }
+
+    /// Build a one-run LineBox where each `(cluster_byte, x_advance)`
+    /// pair describes one glyph in visual order. `source_range` spans
+    /// the entire input text so the cluster lookup in
+    /// `apply_tab_advances` resolves against `text`.
+    fn line_with_glyphs(text: &str, glyphs: &[(u32, f32)]) -> LineBox {
+        let runs = vec![VisualRun {
+            glyphs: glyphs
+                .iter()
+                .copied()
+                .map(|(c, a)| test_glyph(c, a))
+                .collect(),
+            font: "test".to_string(),
+            direction: ShapingDirection::Ltr,
+            source_range: 0..text.len() as u32,
+            attrs: test_attrs(),
+        }];
+        LineBox {
+            origin: Point::default(),
+            baseline: 0.0,
+            height: 0.0,
+            width: 0.0,
+            runs,
+            alignment: Alignment::Start,
+        }
+    }
+
+    fn assert_close(actual: f32, expected: f32, label: &str) {
+        let delta = (actual - expected).abs();
+        assert!(
+            delta < 0.001,
+            "{label}: expected {expected}, got {actual} (Δ {delta})"
+        );
+    }
+
+    #[test]
+    fn tab_pen_starts_at_indent_for_indented_ltr() {
+        /* Pen starts at `leading_off_px = 20`. Tab at line-local 0
+        becomes paragraph-relative 20; next stop after 20 is 100;
+        tab.x_advance = 80 so the next glyph lands at paragraph
+        position 100. */
+        let mut line = line_with_glyphs("\tA", &[(0, 0.0), (1, 10.0)]);
+        let stops = [(100.0_f32, TabKind::Left)];
+        apply_tab_advances(&mut line, "\tA", &stops, 20.0);
+
+        let tab_adv = line.runs[0].glyphs[0].x_advance;
+        assert_close(tab_adv, 80.0, "tab fills from 20 to 100");
+        /* Line.width = paragraph-relative pen (110) - leading_off (20) = 90. */
+        assert_close(line.width, 90.0, "line width is line-local extent");
+    }
+
+    #[test]
+    fn tab_kind_center_lands_segment_midpoint_at_stop() {
+        /* text = "X\tWORD"; X has advance 10. Tab kind = Center.
+        Stop = 100. Segment "WORD" advance = 40 (4 glyphs × 10).
+        Expected: tab.x_advance = 100 - 10 - 40/2 = 70.
+        Segment midpoint then lands at pen=80 + 20 = 100. */
+        let mut line = line_with_glyphs(
+            "X\tWORD",
+            &[
+                (0, 10.0),
+                (1, 0.0),
+                (2, 10.0),
+                (3, 10.0),
+                (4, 10.0),
+                (5, 10.0),
+            ],
+        );
+        let stops = [(100.0_f32, TabKind::Center)];
+        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0);
+
+        let tab_adv = line.runs[0].glyphs[1].x_advance;
+        assert_close(tab_adv, 70.0, "Center: tab fills to stop - w/2");
+        /* Recompute pen at midpoint of segment for sanity. */
+        let pen_after_tab = 10.0 + tab_adv;
+        let segment_midpoint = pen_after_tab + 40.0 / 2.0;
+        assert_close(segment_midpoint, 100.0, "segment midpoint at stop");
+    }
+
+    #[test]
+    fn tab_kind_right_lands_segment_right_at_stop() {
+        /* Same shape as the Center test but kind = Right. tab.x_advance
+        = 100 - 10 - 40 = 50. Segment right edge at 60 + 40 = 100. */
+        let mut line = line_with_glyphs(
+            "X\tWORD",
+            &[
+                (0, 10.0),
+                (1, 0.0),
+                (2, 10.0),
+                (3, 10.0),
+                (4, 10.0),
+                (5, 10.0),
+            ],
+        );
+        let stops = [(100.0_f32, TabKind::Right)];
+        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0);
+
+        let tab_adv = line.runs[0].glyphs[1].x_advance;
+        assert_close(tab_adv, 50.0, "Right: tab fills to stop - w");
+        let pen_after_tab = 10.0 + tab_adv;
+        let segment_right = pen_after_tab + 40.0;
+        assert_close(segment_right, 100.0, "segment right edge at stop");
+    }
+
+    #[test]
+    fn tab_kind_decimal_lands_separator_at_stop_dot() {
+        /* text = "X\t12.5"; "1" + "2" advance to the '.' at cluster 4.
+        decimal_offset = 20 (two digits × 10 each). tab.x_advance =
+        100 - 10 - 20 = 70. Decimal sits at pen 80 + 20 = 100. */
+        let mut line = line_with_glyphs(
+            "X\t12.5",
+            &[
+                (0, 10.0),
+                (1, 0.0),
+                (2, 10.0),
+                (3, 10.0),
+                (4, 10.0),
+                (5, 10.0),
+            ],
+        );
+        let stops = [(100.0_f32, TabKind::Decimal)];
+        apply_tab_advances(&mut line, "X\t12.5", &stops, 0.0);
+
+        let tab_adv = line.runs[0].glyphs[1].x_advance;
+        assert_close(tab_adv, 70.0, "Decimal: tab fills to stop - decimal_offset");
+        let pen_after_tab = 10.0 + tab_adv;
+        let decimal_pos = pen_after_tab + 20.0;
+        assert_close(decimal_pos, 100.0, "decimal separator at stop");
+    }
+
+    #[test]
+    fn tab_kind_decimal_falls_back_to_right_when_no_separator() {
+        /* text = "X\thello"; no '.' / ',' so Decimal falls back to
+        Right. tab.x_advance = 100 - 10 - 50 = 40. */
+        let mut line = line_with_glyphs(
+            "X\thello",
+            &[
+                (0, 10.0),
+                (1, 0.0),
+                (2, 10.0),
+                (3, 10.0),
+                (4, 10.0),
+                (5, 10.0),
+                (6, 10.0),
+            ],
+        );
+        let stops = [(100.0_f32, TabKind::Decimal)];
+        apply_tab_advances(&mut line, "X\thello", &stops, 0.0);
+
+        let tab_adv = line.runs[0].glyphs[1].x_advance;
+        assert_close(
+            tab_adv,
+            40.0,
+            "Decimal without separator falls back to Right",
+        );
+    }
+
+    #[test]
+    fn tab_clamp_when_segment_overflows_stop() {
+        /* text = "X\tWORD"; stop = 15 (too close to fit). Center math
+        gives 15 - 10 - 20 = -15. Clamp to MIN_TAB_FILL_PX (4.0). */
+        let mut line = line_with_glyphs(
+            "X\tWORD",
+            &[
+                (0, 10.0),
+                (1, 0.0),
+                (2, 10.0),
+                (3, 10.0),
+                (4, 10.0),
+                (5, 10.0),
+            ],
+        );
+        let stops = [(15.0_f32, TabKind::Center)];
+        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0);
+
+        let tab_adv = line.runs[0].glyphs[1].x_advance;
+        assert_close(tab_adv, MIN_TAB_FILL_PX, "overflow clamps to min fill");
     }
 
     #[test]

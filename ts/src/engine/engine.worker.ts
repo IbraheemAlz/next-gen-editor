@@ -357,6 +357,79 @@ async function handleInit(msg: InitMsg): Promise<void> {
             break;
         }
 
+        case 'tab-stops-center-kind-ltr': {
+            /* L2.1 (#6) — Center tab kind at 250 pt. Segment "City"
+               sits to the right of a TAB; its midpoint lands at
+               column 250 in paragraph-content coords. */
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'Name\tCity',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 18,
+                line_height: 26,
+                align: 'START',
+            } as Command);
+            const wholeRange = {
+                start: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 },
+                end: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 },
+            };
+            paintEvt = await dispatch({
+                type: 'SET_TAB_STOPS',
+                range: wholeRange,
+                stops: [{ position_pt: 250, kind: 'Center' }],
+            } as Command);
+            break;
+        }
+
+        case 'tab-stops-right-kind-ltr': {
+            /* L2.1 (#6) — Right tab kind at 300 pt. Segment "Total"
+               right-edge lands at column 300. */
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'Year\tTotal',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 18,
+                line_height: 26,
+                align: 'START',
+            } as Command);
+            const wholeRange = {
+                start: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 },
+                end: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 },
+            };
+            paintEvt = await dispatch({
+                type: 'SET_TAB_STOPS',
+                range: wholeRange,
+                stops: [{ position_pt: 300, kind: 'Right' }],
+            } as Command);
+            break;
+        }
+
+        case 'tab-stops-decimal-kind-ltr': {
+            /* L2.1 (#6) — Decimal tab kind at 250 pt. Segment "12.50"
+               aligns its `.` separator at column 250. */
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'Price\t12.50',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 18,
+                line_height: 26,
+                align: 'START',
+            } as Command);
+            const wholeRange = {
+                start: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 },
+                end: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 0 },
+            };
+            paintEvt = await dispatch({
+                type: 'SET_TAB_STOPS',
+                range: wholeRange,
+                stops: [{ position_pt: 250, kind: 'Decimal' }],
+            } as Command);
+            break;
+        }
+
         case 'interactive':
             /* Blank A4 page seeded with one empty paragraph. RenderPage
                caches the layout config so subsequent InsertText / Undo /

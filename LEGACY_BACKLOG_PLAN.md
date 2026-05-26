@@ -31,7 +31,7 @@
 | **#3** | Discontinuous + cross-container selection (UX §IV.6) | `crates/engine`, `crates/engine-wasm`, TS `pointer.ts` | UX_BEHAVIOR_SPEC §IV.6 | **Keep deferred.** No concrete user; selection model carries the cost on every op. Revisit after Phase 6b headers/footers + Phase 8a footnotes land. |
 | **#4** | Sprint 1 (A.H3): smallCaps drops uppercase on byte-length-changing chars (`ß → SS`) | `crates/layout/src/paragraph.rs::build_line` | Sprint 1 trade-off (commit `ec065c1`) | **Done (L1.3).** `transform_for_shape` helper + per-byte transformed→source map; cluster always lands on a UTF-8 char boundary. 7 new unit tests green. |
 | **#5** | Sprint 4 (C.H1): virtual scrollbar over-estimates by `AVG_BLOCK_HEIGHT_PT = 64.0` | `crates/engine-wasm/src/lib.rs` (`build_pages`, `LazyLayoutState`, `LAYOUT_BUFFER_PT`) | Sprint 4 trade-off (commit `09d8a48`) | **Fix.** Predictive pre-layout — double `LAYOUT_BUFFER_PT` window when `target_y` set. |
-| **#6** | Sprint 5 (A.M3): geometric tab stops drift on Center/Right/Justified/RTL + Decimal/Center/Right kinds render as Left | `crates/layout/src/paragraph.rs::apply_tab_advances` | Sprint 5 trade-off (commit `547d20e`) | **Fix in two passes.** Indent-aware pen (cheap), then non-Left kinds (measure-then-place). |
+| **#6** | Sprint 5 (A.M3): geometric tab stops drift on Center/Right/Justified/RTL + Decimal/Center/Right kinds render as Left | `crates/layout/src/paragraph.rs::apply_tab_advances` | Sprint 5 trade-off (commit `547d20e`) | **Done (L2.1).** Indent-aware pen + shape-then-place math for `Left`/`Center`/`Right`/`Decimal` kinds. 6 native tests + 3 visual-diff goldens (tier A 10/10 at 0.000 %). Center/End/Justify alignment + tabs deferred (Word-conformant). RTL anchoring deferred to issue #20. |
 | **#7** | Sprint 6 (A.M8): table autofit skips true `min-content`; long URLs clip in narrow columns | `crates/engine-wasm/src/lib.rs::autofit_distribute` | Sprint 6 trade-off (commit `c706bab`) | **Fix.** Add `measure_unbreakable_width(text, fonts, cfg)` returning `(min_content, max_content)`; use `min_content` as hard floor. |
 | **#8** | Sprint 7 (A.M12): continuous section break skips column-height balancing | `crates/engine-wasm/src/lib.rs` (continuous-section path) | Sprint 7 trade-off (commit `046754b`) | **Fix.** Column-balance pass before the section transition. |
 | **#18** | Mint `w14:paraId` + synthesize OPC plumbing for engine-minted resolved comments | `crates/format-docx/src/parts/comments.rs`, `crates/format-docx/src/writer.rs` | Sprint 9 follow-up (issue #15 v1 closure gap) | **Done (L1.2).** `build_comments_xml` mints paraId + textId; additive `inject_content_type_override` / `inject_doc_rel` splice the Override + Relationship rows; untouched docs stay byte-identical. 4 new tests green. |
@@ -424,6 +424,46 @@ Mirror `CORE_SPRINTS_PLAN.md` discipline. After each cleanup commits:
    reference back here.
 
 ### Activity log
+
+- **2026-05-27 — L2.1 (#6) landed.**
+  - `crates/layout/src/paragraph.rs`: `apply_tab_advances` rewritten to
+    pen-from-leading-edge (paragraph-content-relative) coordinates;
+    `compute_tab_advance` implements shape-then-place math for the
+    `Center`/`Right`/`Decimal` kinds with a 4 px clamp (`MIN_TAB_FILL_PX`)
+    when the segment width exceeds the stop-minus-pen room. `Decimal`
+    falls back to `Right` semantics when the segment contains no `.` /
+    `,` separator (Word's documented fallback). New `TabKind` enum +
+    `TabPosition` locator struct keep the helper signature under
+    clippy's 7-arg threshold.
+  - `ParagraphConfig::tab_stops_px`: `&[f32]` → `&[(f32, TabKind)]`.
+  - `crates/engine-wasm/src/lib.rs::tab_stops_to_layout_px`: returns
+    `Vec<(f32, layout::paragraph::TabKind)>`; bridge `BridgeTabKind`
+    maps 1:1 to layout `TabKind` (Clear filtered at the boundary).
+  - 6 new native tests in `paragraph::tests`:
+    `tab_pen_starts_at_indent_for_indented_ltr`,
+    `tab_kind_center_lands_segment_midpoint_at_stop`,
+    `tab_kind_right_lands_segment_right_at_stop`,
+    `tab_kind_decimal_lands_separator_at_stop_dot`,
+    `tab_kind_decimal_falls_back_to_right_when_no_separator`,
+    `tab_clamp_when_segment_overflows_stop`.
+  - 3 new visual-diff goldens (tier A, ≤ 0.5 % tolerance) — `tab-stops-
+    center-kind-ltr` (`"Name\tCity"`, stop 250 pt Center), `tab-stops-
+    right-kind-ltr` (`"Year\tTotal"`, stop 300 pt Right), `tab-stops-
+    decimal-kind-ltr` (`"Price\t12.50"`, stop 250 pt Decimal). Tier A
+    full sweep 10/10 at 0.000 %.
+  - TS harness: 3 new `?test=` cases in `engine.worker.ts` driving
+    `RENDER_PAGE` + `SET_TAB_STOPS`; viewports registered in
+    `tools/visual-diff/run.mjs` + `ts/src/harness/visual-diff.ts`.
+  - **Known limitations carried forward.** Center/End/Justify alignment
+    + tabs still center-shift the whole line (Word-conformant behaviour;
+    tabs become decorative). RTL anchoring still LTR-style — tracked as
+    issue #20 (`Core: RTL Tab Anchoring and Directional Stops`).
+  - CI gates: `cargo test --workspace --lib` 272+ tests green;
+    `cargo clippy --workspace --all-targets -- -D warnings` clean;
+    `cargo fmt --all -- --check` clean; `cargo run -p shape-regression
+    --release` 6/6; `cargo run -p roundtrip --release` PASS;
+    `wasm-pack build --release` 6.0 MiB / 15 MiB budget; visual-diff
+    farm tier A 10/10 at 0.000 %.
 
 - **2026-05-26 — L1.2 (#18) + L1.3 (#4) landed together.**
   - `crates/layout/src/paragraph.rs`: `transform_for_shape` helper +

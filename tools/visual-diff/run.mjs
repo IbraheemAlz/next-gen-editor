@@ -57,6 +57,9 @@ const VIEWPORTS = {
     'rich-text': { width: 595, height: 842 },
     'editing-arabic': { width: 595, height: 842 },
     'docx-round-trip': { width: 595, height: 842 },
+    'tab-stops-center-kind-ltr': { width: 595, height: 842 },
+    'tab-stops-right-kind-ltr': { width: 595, height: 842 },
+    'tab-stops-decimal-kind-ltr': { width: 595, height: 842 },
 };
 function viewportFor(name) {
     if (process.env.VIEWPORT) {

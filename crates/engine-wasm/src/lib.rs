@@ -1823,19 +1823,31 @@ fn props_to_layout_indents(props: &engine::ParaProperties, scale: f32) -> (f32, 
     )
 }
 
-/// Audit gap A.M3 — convert `engine::TabStop` positions (pt at scale=1)
-/// into device-px positions the layout pass consumes. `Clear` kinds
-/// drop here (the layout treats absence as "no stop"; clear-of-
-/// inherited only matters for the cascade resolver, not the line
-/// builder). Sorted ascending so `next_tab_stop_after`'s `reduce(min)`
-/// scan is monotonic.
-fn tab_stops_to_layout_px(stops: &[engine::TabStop], scale: f32) -> Vec<f32> {
-    let mut out: Vec<f32> = stops
+/// Audit gap A.M3 / L2.1 (#6) — convert `engine::TabStop` positions
+/// (pt at scale=1) into `(device-px, layout::paragraph::TabKind)`
+/// pairs the layout pass consumes. `Clear` kinds drop here (the
+/// layout treats absence as "no stop"; clear-of-inherited only
+/// matters for the cascade resolver, not the line builder). Sorted
+/// ascending by position so `next_tab_stop_after`'s `min_by` scan is
+/// monotonic.
+fn tab_stops_to_layout_px(
+    stops: &[engine::TabStop],
+    scale: f32,
+) -> Vec<(f32, layout::paragraph::TabKind)> {
+    let mut out: Vec<(f32, layout::paragraph::TabKind)> = stops
         .iter()
-        .filter(|s| !matches!(s.kind, engine::TabKind::Clear))
-        .map(|s| s.position_pt * scale)
+        .filter_map(|s| {
+            let kind = match s.kind {
+                engine::TabKind::Left => layout::paragraph::TabKind::Left,
+                engine::TabKind::Center => layout::paragraph::TabKind::Center,
+                engine::TabKind::Right => layout::paragraph::TabKind::Right,
+                engine::TabKind::Decimal => layout::paragraph::TabKind::Decimal,
+                engine::TabKind::Clear => return None,
+            };
+            Some((s.position_pt * scale, kind))
+        })
         .collect();
-    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
 
