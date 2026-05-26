@@ -231,7 +231,40 @@ tweaking (today they overwrite from defaults).
 
 ---
 
-## Sprint 11 — Accurate Word Count + Interactive Ruler
+## Sprint 11 — Accurate Word Count + Interactive Ruler ✅ DONE
+
+**Status:** Closed 2026-05-27. Issues #13 + #17 both resolved.
+
+  * `engine::DocumentTree::word_count` now segments via
+    UAX-#29 `icu_segmenter::WordSegmenter::new_auto` (filtering to
+    `WordType::Word`) so CJK / Thai / Khmer text reports a
+    meaningful count instead of "one word per whitespace run".
+    `walk_paragraphs` + `saturating_add` for overflow safety.
+  * **Performance discipline**: `count_uax_words` parks the
+    segmenter in a `thread_local!` so the icu data tables compile
+    in exactly once per worker; subsequent calls are pure boundary
+    walks. Shares data with `text-pipeline::break_opportunities`'s
+    `LineSegmenter::new_auto` so the wasm artifact does not grow
+    beyond what was already linked.
+  * Native tests in `engine::tests`:
+    `word_count_latin_matches_word_like_split`,
+    `word_count_cjk_segments_chars`.
+  * `packages/ui/src/Ruler.tsx` exposes 4 marker handles (start
+    indent / first-line indent / right indent / tab stops).
+    Pointer drag dispatches `cmd.setParagraphIndent` /
+    `cmd.setTabStops` at gesture release (one drag = one undo
+    entry); local Solid state mirrors the marker during drag for
+    instant visual feedback. Markers read `sectionGeometry()` +
+    `tab_stops()` from `@nge/core::createEditorState`. Zero
+    layout math in Solid — every committed position becomes a
+    bridge command.
+  * Drag-off-strip removal is wired: dropping a tab marker below
+    the ruler strip dispatches `setTabStops` with that stop
+    omitted (matches Word).
+
+---
+
+## Sprint 11 — Original plan (archived)
 
 **Issues:** [#17](https://github.com/IbraheemAlz/next-gen-editor/issues/17), [#13](https://github.com/IbraheemAlz/next-gen-editor/issues/13)
 
