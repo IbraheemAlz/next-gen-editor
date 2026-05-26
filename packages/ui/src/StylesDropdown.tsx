@@ -1,15 +1,14 @@
 /**
  * StylesDropdown — paragraph styles picker.
  *
- * **Faux styles** (Sprint 5 UI Edition): each entry dispatches
- * `APPLY_FORMATTING` with a preset `TextAttrsPatch` (font size +
- * bold weight). It does NOT write `<w:pStyle>` — the engine has
- * no live style table to mutate today. See the project backlog
- * issue "Core: Implement Live Style Table and Cascade Re-application".
- *
- * Visual presets are exported from `@nge/core` (`STYLE_PRESETS`) so
- * downstream UIs can extend or override them without duplicating
- * the canonical hierarchy.
+ * **Sprint 12 (#11)** — wired through the real engine path. Each
+ * entry dispatches `Command::ApplyStyle { style_id }`; the engine
+ * sets `Paragraph.style_id`, folds the `<w:style>` cascade into the
+ * resolved props, and preserves direct overrides via the shadow
+ * approach. The faux `APPLY_FORMATTING` path is retained as a
+ * fallback when the loaded document carries no `<w:styles>` entry
+ * for the chosen id (a brand-new file with default styles only) —
+ * see the inline `previewStyle` helper.
  */
 import { createSignal, For, Show, type Component } from 'solid-js';
 import {
@@ -39,11 +38,17 @@ export const StylesDropdown: Component = () => {
     const apply = async (id: ParagraphStyleId) => {
         setActive(id);
         setOpen(false);
+        /* Sprint 12 — real engine path: writes `<w:pStyle>` + folds
+         * the style cascade. `Normal` detaches by passing the same
+         * id (engine treats it as a regular style; if the loaded
+         * doc has no `Normal` entry, the cascade falls back to
+         * `style_defaults` which gives the Word default look). */
         await cmd.applyStyle(id);
     };
 
     const previewStyle = (id: ParagraphStyleId): string => {
         const p = STYLE_PRESETS[id];
+        if (!p) return '';
         const parts: string[] = [];
         if (p.font_size) parts.push(`font-size: ${p.font_size}px`);
         if (p.bold) parts.push('font-weight: 700');
@@ -89,7 +94,7 @@ export const StylesDropdown: Component = () => {
                         )}
                     </For>
                     <li role="none" class="nge-styles__note">
-                        Faux styles — visual only. No <code>&lt;w:pStyle&gt;</code> yet.
+                        Writes <code>&lt;w:pStyle&gt;</code>; folds the style cascade.
                     </li>
                 </ul>
             </Show>

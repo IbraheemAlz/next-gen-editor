@@ -276,11 +276,34 @@ fn jc_val(a: Alignment) -> &'static str {
 /// `ParaProperties` must produce an empty pPr to keep the Phase 1 plain
 /// fixtures byte-stable. Children follow the CT_PPr schema order: keepNext,
 /// keepLines, pageBreakBefore, spacing, ind, jc, bidi.
-fn emit_ppr(props: &ParaProperties, out: &mut String) {
-    if *props == ParaProperties::default() {
+///
+/// Sprint 12 (#11) — `style_id` is `Some` when the paragraph references a
+/// `<w:style>` entry. Emitted as the FIRST `<w:pPr>` child per OOXML
+/// schema order (CT_PPrBase: `<w:pStyle>` before everything else).
+fn emit_ppr(props: &ParaProperties, style_id: Option<&str>, out: &mut String) {
+    if *props == ParaProperties::default() && style_id.is_none() {
         return;
     }
     out.push_str("<w:pPr>");
+    if let Some(id) = style_id {
+        out.push_str("<w:pStyle w:val=\"");
+        /* Style ids are XML names — no `<`/`>`/`&`/`"` per OOXML — but
+        defensively escape so a malformed id can't break the file. */
+        for ch in id.chars() {
+            match ch {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                other => out.push(other),
+            }
+        }
+        out.push_str("\"/>");
+    }
+    if *props == ParaProperties::default() {
+        /* Style-only paragraph: open + style + close. The structured
+        emit body below will skip every per-field block (all defaults). */
+    }
     if props.keep_next {
         out.push_str("<w:keepNext/>");
     }
@@ -383,7 +406,7 @@ fn emit_ppr(props: &ParaProperties, out: &mut String) {
 /// gaps included.
 fn serialize_paragraph(para: &Paragraph, out: &mut String) {
     out.push_str("<w:p>");
-    emit_ppr(&para.props, out);
+    emit_ppr(&para.props, para.style_id.as_deref(), out);
     /* `<w:br>` (Phase 2 audit, gap A.12) lives as U+2028 / U+000C in
     `para.text`; the structural `<w:r><w:br/></w:r>` emission needs
     the cut-point walk. The fast path stays open for plain
@@ -1318,6 +1341,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -1353,6 +1378,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -1388,6 +1415,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -1483,6 +1512,8 @@ mod tests {
                 },
             ],
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc);
@@ -2113,6 +2144,8 @@ mod tests {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: Vec::new(),
+                style_id: None,
+                direct_overrides: engine::ParaProperties::default(),
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -2164,6 +2197,8 @@ mod tests {
                 id: None,
             }],
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc);
@@ -2222,6 +2257,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -2262,6 +2299,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]));
         let p = xml.find("<w:pPr>").unwrap();
@@ -2732,6 +2771,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -2859,5 +2900,49 @@ mod tests {
             extended_xml.as_bytes(),
             "no resolved → passthrough byte-identical"
         );
+    }
+
+    /// Sprint 12 (#11) — `Paragraph.style_id` survives a full `.docx`
+    /// round-trip: writer emits `<w:pStyle w:val="...">` as the first
+    /// `<w:pPr>` child; reader recovers it from `<w:pStyle>` back
+    /// onto the new `Paragraph.style_id` field.
+    #[test]
+    fn paragraph_style_id_round_trips_via_p_style() {
+        let para = Paragraph {
+            text: "styled paragraph".into(),
+            spans: Vec::new(),
+            props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
+            dirty: true, // force regenerate (skip source_xml passthrough)
+            source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
+            revisions: Vec::new(),
+            fields: Vec::new(),
+            style_id: Some("Heading1".into()),
+            direct_overrides: ParaProperties::default(),
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        /* Inspect the regenerated `document.xml` so the assertion is
+        wire-shape-aware. */
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip");
+        let raw = {
+            let mut a = archive;
+            let mut f = a.by_name("word/document.xml").expect("doc.xml");
+            let mut s = String::new();
+            use std::io::Read;
+            f.read_to_string(&mut s).expect("read doc.xml");
+            s
+        };
+        assert!(
+            raw.contains("<w:pStyle w:val=\"Heading1\"/>"),
+            "writer must emit <w:pStyle>: {raw}"
+        );
+        let reread = read_docx(&bytes).expect("re-read");
+        let p = reread.document.nth_paragraph(0).expect("paragraph 0");
+        assert_eq!(p.style_id.as_deref(), Some("Heading1"));
+        assert_eq!(p.text, "styled paragraph");
     }
 }

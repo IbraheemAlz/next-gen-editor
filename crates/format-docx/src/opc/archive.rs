@@ -91,6 +91,34 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     let resolver = StyleResolver::new(&style_table);
     let mut document = parse_document_xml(&xml, &resolver)?;
 
+    /* Sprint 12 (#11) — mirror the `StyleTable` into the engine model
+    so the live editor can apply / re-resolve styles without the
+    format-docx crate. Paragraph styles only — character styles
+    (`<w:rStyle>`) stay out of scope per the sprint plan. The OOXML
+    file itself stays passthrough byte-identical (the writer never
+    re-emits `styles.xml` unless a style is added — Sprint 12 does
+    not add any). */
+    document.style_defaults = style_table.defaults.para.clone();
+    for (id, def) in &style_table.by_id {
+        if !matches!(def.kind, crate::parts::styles::StyleKind::Paragraph) {
+            continue;
+        }
+        document.styles.insert(
+            id.clone(),
+            engine::ParagraphStyle {
+                id: id.clone(),
+                /* `StyleDef` does not currently capture `<w:name>`;
+                fall back to the id so the styles dropdown still has
+                a label. A future pass can widen the reader to grab
+                the `w:name w:val` attribute. */
+                name: id.clone(),
+                based_on: def.based_on.clone(),
+                para: def.para.clone(),
+                run: def.run.clone(),
+            },
+        );
+    }
+
     /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
     numbering resolver. Second pass over the parsed paragraphs fills each
     list paragraph's `resolved_marker`. */

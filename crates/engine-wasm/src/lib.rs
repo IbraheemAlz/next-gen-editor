@@ -3572,6 +3572,7 @@ impl Engine {
                 first_line_pt,
             } => self.do_set_paragraph_indent(range, start_pt, end_pt, first_line_pt),
             Command::SetTabStops { range, stops } => self.do_set_tab_stops(range, stops),
+            Command::ApplyStyle { range, style_id } => self.do_apply_style(range, style_id),
             Command::SetLineSpacing { range, multiplier } => {
                 self.do_set_line_spacing(range, multiplier)
             }
@@ -6283,6 +6284,32 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Sprint 12 (#11) — `Command::ApplyStyle`. Routes through the
+    /// engine's shadow-direct-overrides resolver: sets `style_id` on
+    /// every paragraph the range spans, then recomputes the resolved
+    /// `props` view from `style_cascade(style_id) ∪ direct_overrides`.
+    /// Pre-existing direct edits survive.
+    fn do_apply_style(&mut self, range: BridgeLogicalRange, style_id: Option<String>) -> Event {
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self.undo.current().set_paragraph_style(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            style_id.clone(),
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        let label = match style_id.as_deref() {
+            Some(id) => format!("Applied style {id}"),
+            None => "Cleared paragraph style".to_string(),
+        };
+        self.announce(AnnouncementPriority::Polite, label);
+        self.selection_changed()
+    }
+
     /// `Command::SetLineSpacing` (Sprint 6 UI Edition).
     fn do_set_line_spacing(&mut self, range: BridgeLogicalRange, multiplier: f32) -> Event {
         let (start, end) = ordered(range.start, range.end);
@@ -7121,6 +7148,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -7265,6 +7294,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, 3, 3, 16.0, 1.0);
@@ -7296,6 +7327,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
         };
         let spans = composition_layout_spans(&p, 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);

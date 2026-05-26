@@ -979,6 +979,14 @@ pub fn parse_document_xml(
                             .filter(|&s| s < p_end_byte && p_end_byte <= xml.len())
                             .map(|s| xml[s..p_end_byte].to_vec());
 
+                        /* Sprint 12 (#11) — preserve the direct `<w:pPr>`
+                        and the `<w:pStyle>` reference on the Paragraph
+                        so the live editor can re-resolve the cascade on
+                        a future ApplyStyle. The resolver still consumes
+                        the originals to produce the up-front resolved
+                        view; we clone before consumption. */
+                        let style_id_for_paragraph = p_style_id.clone();
+                        let direct_overrides_for_paragraph = direct_ppr.clone();
                         /* Paragraph cascade: bake direct_ppr on top of doc
                         defaults + pStyle chain. The baseline rPr we computed
                         per-run is informational here. */
@@ -1019,6 +1027,8 @@ pub fn parse_document_xml(
                             hyperlinks: std::mem::take(&mut para_hyperlinks),
                             revisions: std::mem::take(&mut para_revisions),
                             fields: std::mem::take(&mut para_fields),
+                            style_id: style_id_for_paragraph,
+                            direct_overrides: direct_overrides_for_paragraph,
                         }));
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this
                         paragraph. Emit a `Section` covering everything since

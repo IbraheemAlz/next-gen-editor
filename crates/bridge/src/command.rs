@@ -503,6 +503,16 @@ pub enum Command {
         range: LogicalRange,
         stops: Vec<BridgeTabStop>,
     },
+    /// Sprint 12 (#11) — apply (or detach when `None`) a paragraph
+    /// style on every paragraph the range spans. The engine sets
+    /// `Paragraph.style_id` and recomputes the resolved `props` view
+    /// (`style_cascade(style_id) ∪ direct_overrides`); pre-existing
+    /// `direct_overrides` are preserved verbatim. Character styles
+    /// (`<w:rStyle>`) are out of scope.
+    ApplyStyle {
+        range: LogicalRange,
+        style_id: Option<String>,
+    },
     /// Sprint 7 (UI Edition) — toggle the in-memory `resolved` flag
     /// on a comment. NOT yet round-tripped to `commentsExtended.xml`
     /// — see project backlog.

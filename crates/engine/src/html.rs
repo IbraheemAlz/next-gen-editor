@@ -1001,6 +1001,8 @@ impl ParaBuilder {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         })
     }
 }
@@ -1112,6 +1114,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -1130,6 +1134,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -1156,6 +1162,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         assert_eq!(
             to_html(&[p]),
@@ -1185,6 +1193,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);
@@ -1335,6 +1345,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         let html = to_html(&[p]);
         assert!(html.contains("data-rel-id=\"rId7\""));

@@ -43,19 +43,21 @@ import type {
     ListKind,
 } from './types';
 
-/** Sprint 5 (UI Edition) — paragraph style preset id. Faux styles —
- *  dispatched as `APPLY_FORMATTING` with the preset patch, NOT
- *  `<w:pStyle>` (which the engine does not yet model). */
-export type ParagraphStyleId =
-    | 'Normal'
-    | 'Title'
-    | 'Heading1'
-    | 'Heading2'
-    | 'Heading3';
+/** Sprint 12 (#11) — paragraph style id. The engine now models real
+ *  `<w:styles>` entries on `DocumentTree.styles`; `cmd.applyStyle`
+ *  dispatches `Command::ApplyStyle { style_id }` and the engine
+ *  cascades the style's `<w:pPr>` into the resolved paragraph
+ *  properties. `string` because the live set comes from the loaded
+ *  document's stylesheet — not a closed UI enum. */
+export type ParagraphStyleId = string;
 
-/** Visual preset that ships with each `ParagraphStyleId`. Hand-tuned
- *  to match Word's stock heading hierarchy at common defaults. */
-export const STYLE_PRESETS: Record<ParagraphStyleId, Partial<TextAttrsPatch>> = {
+/** Sprint 5 → 12 — stock preset values used as a FALLBACK only.
+ *  When the user picks a heading-style id that the loaded document
+ *  doesn't ship (a brand-new file with no `styles.xml` shipped
+ *  customizations), the UI degrades to a direct-formatting patch via
+ *  the legacy `cmd.applyAttrs` path so the user still sees a visible
+ *  change. The real engine path is `Command::ApplyStyle`. */
+export const STYLE_PRESETS: Record<string, Partial<TextAttrsPatch>> = {
     Normal: { bold: false, italic: false, font_size: 12 },
     Title: { bold: true, italic: false, font_size: 32 },
     Heading1: { bold: true, italic: false, font_size: 24 },
@@ -503,7 +505,11 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
         resolveComment: (id, resolved) =>
             dispatch({ type: 'RESOLVE_COMMENT', id, resolved }),
         applyStyle: (styleId, range) =>
-            fmt(STYLE_PRESETS[styleId], range),
+            dispatch({
+                type: 'APPLY_STYLE',
+                range: currentRange(range),
+                style_id: styleId,
+            }),
 
         setPageMargins: (at, top_pt, right_pt, bottom_pt, left_pt) =>
             dispatch({

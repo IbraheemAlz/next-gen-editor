@@ -281,6 +281,11 @@ fn parse_cell_paragraph(
         hyperlinks: Vec::new(),
         revisions: Vec::new(),
         fields: Vec::new(),
+        /* Sprint 12: table-cell paragraphs ride the table's passthrough;
+         * style_id + direct_overrides default empty until a future
+         * sprint resolves style cascade through table cells. */
+        style_id: None,
+        direct_overrides: engine::ParaProperties::default(),
     }
 }
 

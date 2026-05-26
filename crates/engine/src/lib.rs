@@ -10,6 +10,18 @@ pub mod html;
 /// Top-level document block (Phase 5 PR 1). Tables sit alongside
 /// paragraphs in the body; future block variants (Phase 7 floating
 /// images, Phase 8 footnotes) extend this enum.
+///
+/// Sprint 12 (#11) — `Paragraph` grew past clippy's
+/// `large_enum_variant` threshold once the shadow direct_overrides
+/// field landed (Paragraph now carries a full ParaProperties + a
+/// shadow ParaProperties + style_id + everything from prior phases).
+/// Boxing `Paragraph` here would touch every `Block::Paragraph(p)`
+/// match site across nine crates; the trade-off is not worth the
+/// memory savings for the typical 50-page document the engine
+/// targets (the persistent `im::Vector` shares structurally between
+/// snapshots anyway). Allowing the lint here is the documented
+/// pragmatic choice.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Block {
     Paragraph(Paragraph),
@@ -90,6 +102,42 @@ pub struct DocumentTree {
     /// Phase 2 audit — typed `word/settings.xml` flags. Currently only
     /// `even_and_odd_headers`; grows as more settings get modelled.
     pub settings: DocumentSettings,
+    /// Sprint 12 (#11) — parsed `word/styles.xml` entries keyed by
+    /// `w:styleId`. Sprint 12 ships paragraph styles only; character
+    /// styles (`<w:rStyle>`) are deliberately out of scope. The
+    /// reader populates this from `<w:style w:type="paragraph">`
+    /// entries; the cascade walker
+    /// (`DocumentTree::resolve_style_cascade`) folds a `style_id`
+    /// chain through `based_on` into a flat `ParaProperties`.
+    pub styles: std::collections::HashMap<String, ParagraphStyle>,
+    /// Sprint 12 (#11) — document-wide `<w:docDefaults>`. Sits at
+    /// the bottom of every paragraph's resolved cascade. The
+    /// resolver merges `defaults → style chain → direct_overrides`
+    /// in document order.
+    pub style_defaults: ParaProperties,
+}
+
+/// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
+/// modelled in the engine so the live editor can apply / re-resolve
+/// styles without the format-docx crate's `StyleTable`. Character
+/// styles + table styles are deliberately out of scope.
+#[derive(Debug, Clone, Default)]
+pub struct ParagraphStyle {
+    pub id: String,
+    /// Human-readable name from `<w:name w:val>`. Drives the styles
+    /// dropdown label; falls back to `id` when absent.
+    pub name: String,
+    /// `<w:basedOn w:val>` — parent style id. The cascade walker
+    /// folds the chain root-first.
+    pub based_on: Option<String>,
+    /// `<w:pPr>` overrides this style contributes (folded onto the
+    /// root-most ancestor's already-folded baseline).
+    pub para: ParaProperties,
+    /// `<w:rPr>` overrides this style contributes — Sprint 12 carries
+    /// the data but does not yet apply it to spans (per-paragraph
+    /// run cascade is the same problem with a wider blast radius;
+    /// see CORE_SPRINTS_PLAN.md "out of scope").
+    pub run: SpanStyle,
 }
 
 /// Phase 8a — author + date + body for one entry of `word/comments.xml`.
@@ -1069,6 +1117,21 @@ pub struct Paragraph {
     /// at flush time for `PAGE` / `NUMPAGES`; other instructions
     /// (`DATE`, `TIME`, …) render their cached value.
     pub fields: Vec<Field>,
+    /// Sprint 12 (#11) — `<w:pPr><w:pStyle w:val>` paragraph-style id.
+    /// `Some` when the paragraph references an entry in
+    /// `DocumentTree.styles`; the cascade walker
+    /// (`DocumentTree::resolve_style_cascade`) folds the style's
+    /// properties into the bottom of the resolved `props`, with
+    /// [`Self::direct_overrides`] layered on top.
+    pub style_id: Option<String>,
+    /// Sprint 12 (#11) — shadow holding ONLY fields the user
+    /// explicitly set on this paragraph (or a `<w:pPr>` that the
+    /// reader saw directly on the `<w:p>` element). Resolved `props`
+    /// = `style_cascade(style_id) ∪ direct_overrides`. On a style
+    /// change, `direct_overrides` is preserved verbatim — that is the
+    /// whole point of the shadow approach (a user's manual bold
+    /// survives a style switch).
+    pub direct_overrides: ParaProperties,
 }
 
 impl Paragraph {
@@ -1135,6 +1198,8 @@ impl Paragraph {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         }
     }
 
@@ -1223,6 +1288,8 @@ impl Paragraph {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         }
     }
 
@@ -1261,6 +1328,8 @@ impl Paragraph {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: Vec::new(),
+                style_id: None,
+                direct_overrides: ParaProperties::default(),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -1274,6 +1343,8 @@ impl Paragraph {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: Vec::new(),
+                style_id: None,
+                direct_overrides: ParaProperties::default(),
             },
         )
     }
@@ -1305,6 +1376,8 @@ impl Paragraph {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         }
     }
 
@@ -1623,6 +1696,8 @@ impl DocumentTree {
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
+            styles: std::collections::HashMap::new(),
+            style_defaults: ParaProperties::default(),
         }
     }
 
@@ -1641,6 +1716,8 @@ impl DocumentTree {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         }));
         Self {
             blocks,
@@ -1652,6 +1729,8 @@ impl DocumentTree {
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
+            styles: std::collections::HashMap::new(),
+            style_defaults: ParaProperties::default(),
         }
     }
 
@@ -1671,6 +1750,8 @@ impl DocumentTree {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: Vec::new(),
+                style_id: None,
+                direct_overrides: ParaProperties::default(),
             }));
         }
         Self {
@@ -1683,6 +1764,8 @@ impl DocumentTree {
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
+            styles: std::collections::HashMap::new(),
+            style_defaults: ParaProperties::default(),
         }
     }
 
@@ -1703,6 +1786,8 @@ impl DocumentTree {
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
+            styles: std::collections::HashMap::new(),
+            style_defaults: ParaProperties::default(),
         }
     }
 
@@ -1723,6 +1808,8 @@ impl DocumentTree {
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
+            styles: std::collections::HashMap::new(),
+            style_defaults: ParaProperties::default(),
         }
     }
 
@@ -1760,6 +1847,8 @@ impl DocumentTree {
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
+            styles: std::collections::HashMap::new(),
+            style_defaults: ParaProperties::default(),
         }
     }
 
@@ -2047,6 +2136,8 @@ impl DocumentTree {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: Vec::new(),
+                style_id: None,
+                direct_overrides: ParaProperties::default(),
             }));
             return Self {
                 blocks,
@@ -2058,6 +2149,8 @@ impl DocumentTree {
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
+                styles: self.styles.clone(),
+                style_defaults: self.style_defaults.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -2098,6 +2191,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2146,6 +2241,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2171,6 +2268,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2194,11 +2293,15 @@ impl DocumentTree {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.alignment = Some(align);
+                    /* Sprint 12 (#11) — shadow direct_overrides so a
+                    subsequent ApplyStyle preserves this user edit. */
+                    para.direct_overrides.alignment = Some(align);
                 });
             }
         } else {
             let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
                 para.props.alignment = Some(align);
+                para.direct_overrides.alignment = Some(align);
             });
         }
         Self {
@@ -2211,6 +2314,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2242,11 +2347,13 @@ impl DocumentTree {
                 let child_path = parent.clone().push(PathStep::Block(idx));
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.props.direction = Some(direction);
+                    para.direct_overrides.direction = Some(direction);
                 });
             }
         } else {
             let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
                 para.props.direction = Some(direction);
+                para.direct_overrides.direction = Some(direction);
             });
         }
         Self {
@@ -2259,6 +2366,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2300,6 +2409,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2323,6 +2434,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2392,6 +2505,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2445,6 +2560,8 @@ impl DocumentTree {
             comment_defs,
             comment_ranges,
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         };
         (doc, new_id)
     }
@@ -2466,6 +2583,8 @@ impl DocumentTree {
             comment_defs,
             comment_ranges,
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2487,6 +2606,8 @@ impl DocumentTree {
             comment_defs,
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2514,12 +2635,15 @@ impl DocumentTree {
         };
         let mut blocks = self.blocks.clone();
         let apply = |para: &mut Paragraph| {
-            para.props.indent = Indent {
+            let new_ind = Indent {
                 start_twips,
                 end_twips,
                 first_line_twips,
                 hanging_twips,
             };
+            para.props.indent = new_ind;
+            /* Sprint 12 (#11) — shadow into direct_overrides. */
+            para.direct_overrides.indent = new_ind;
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -2546,6 +2670,88 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
+        }
+    }
+
+    /// Sprint 12 (#11) — resolve the paragraph cascade for `style_id`
+    /// into a flat `ParaProperties`. Cycle-safe (visited set) +
+    /// depth-capped at [`MAX_STYLE_CHAIN`] entries, matching ECMA-376
+    /// §17.7.4.5 implementation guidance. Used both by
+    /// [`Self::recompute_paragraph_props`] (on every style mutation)
+    /// and by the reader's first-pass cascade.
+    pub fn resolve_style_cascade(&self, style_id: Option<&str>) -> ParaProperties {
+        let mut out = self.style_defaults.clone();
+        let Some(leaf) = style_id else {
+            return out;
+        };
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut chain: Vec<&ParagraphStyle> = Vec::new();
+        let mut current: Option<&str> = Some(leaf);
+        while let Some(id) = current {
+            if chain.len() >= MAX_STYLE_CHAIN || !visited.insert(id) {
+                break;
+            }
+            let Some(def) = self.styles.get(id) else {
+                break;
+            };
+            chain.push(def);
+            current = def.based_on.as_deref();
+        }
+        for def in chain.iter().rev() {
+            out = out.clone().merged_with(def.para.clone());
+        }
+        out
+    }
+
+    /// Sprint 12 (#11) — apply `style_id` to every paragraph the range
+    /// spans. The user's pre-existing `direct_overrides` are
+    /// preserved; only `props` (the resolved view) is recomputed so
+    /// downstream rendering picks up the cascade. Empty `style_id`
+    /// detaches the paragraph from any style (resolved view falls
+    /// back to `style_defaults ∪ direct_overrides`).
+    pub fn set_paragraph_style(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        style_id: Option<String>,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        let mut blocks = self.blocks.clone();
+        let styles_for_apply = self.styles.clone();
+        let defaults_for_apply = self.style_defaults.clone();
+        let apply = |para: &mut Paragraph| {
+            para.style_id = style_id.clone();
+            recompute_paragraph_props(para, &styles_for_apply, &defaults_for_apply);
+        };
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2561,6 +2767,8 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let apply = |para: &mut Paragraph| {
             para.props.tab_stops = stops.clone();
+            /* Sprint 12 (#11) — shadow into direct_overrides. */
+            para.direct_overrides.tab_stops = stops.clone();
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -2587,6 +2795,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2605,6 +2815,8 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let apply = |para: &mut Paragraph| {
             para.props.line_height = target;
+            /* Sprint 12 (#11) — shadow into direct_overrides. */
+            para.direct_overrides.line_height = target;
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -2631,6 +2843,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2646,6 +2860,8 @@ impl DocumentTree {
         let mut blocks = self.blocks.clone();
         let apply = |para: &mut Paragraph| {
             para.props.shading = color;
+            /* Sprint 12 (#11) — shadow into direct_overrides. */
+            para.direct_overrides.shading = color;
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -2672,6 +2888,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2715,6 +2933,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2761,6 +2981,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2804,6 +3026,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2913,6 +3137,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2956,6 +3182,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -2983,6 +3211,8 @@ impl DocumentTree {
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
+                styles: self.styles.clone(),
+                style_defaults: self.style_defaults.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -3037,6 +3267,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -3057,6 +3289,8 @@ impl DocumentTree {
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
+                styles: self.styles.clone(),
+                style_defaults: self.style_defaults.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -3075,6 +3309,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -3212,6 +3448,8 @@ impl DocumentTree {
                     comment_defs: self.comment_defs.clone(),
                     comment_ranges: self.comment_ranges.clone(),
                     settings: self.settings.clone(),
+                    styles: self.styles.clone(),
+                    style_defaults: self.style_defaults.clone(),
                 },
                 caret,
             );
@@ -3248,6 +3486,8 @@ impl DocumentTree {
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
+                styles: self.styles.clone(),
+                style_defaults: self.style_defaults.clone(),
             },
             caret,
         )
@@ -3412,6 +3652,8 @@ impl DocumentTree {
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
+                styles: self.styles.clone(),
+                style_defaults: self.style_defaults.clone(),
             },
             caret,
         )
@@ -3549,6 +3791,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -3572,6 +3816,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 
@@ -3788,6 +4034,8 @@ impl DocumentTree {
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
         }
     }
 }
@@ -3891,6 +4139,46 @@ fn flatten_blocks_plain(blocks: &[Block]) -> String {
         }
     }
     s
+}
+
+/// Sprint 12 (#11) — depth cap on `<w:basedOn>` style chains, matching
+/// ECMA-376 §17.7.4.5 implementation guidance. Anything beyond is
+/// almost certainly a malformed stylesheet; we silently clamp.
+pub const MAX_STYLE_CHAIN: usize = 10;
+
+/// Sprint 12 (#11) — recompute the resolved `props` view on a single
+/// paragraph from its `style_id` cascade ∪ `direct_overrides`.
+/// `style_defaults` is the document's `<w:docDefaults>` snapshot
+/// (sits at the bottom of every cascade).
+pub fn recompute_paragraph_props(
+    para: &mut Paragraph,
+    styles: &std::collections::HashMap<String, ParagraphStyle>,
+    style_defaults: &ParaProperties,
+) {
+    let mut resolved = style_defaults.clone();
+    /* Walk the style chain leaf → root with the same cycle / depth
+    guard as `DocumentTree::resolve_style_cascade` (kept here as a
+    free fn so callers without a borrowed `DocumentTree` can still
+    invoke it — e.g. the reader's per-paragraph fold loop). */
+    if let Some(leaf) = para.style_id.as_deref() {
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut chain: Vec<&ParagraphStyle> = Vec::new();
+        let mut current: Option<&str> = Some(leaf);
+        while let Some(id) = current {
+            if chain.len() >= MAX_STYLE_CHAIN || !visited.insert(id) {
+                break;
+            }
+            let Some(def) = styles.get(id) else {
+                break;
+            };
+            chain.push(def);
+            current = def.based_on.as_deref();
+        }
+        for def in chain.iter().rev() {
+            resolved = resolved.merged_with(def.para.clone());
+        }
+    }
+    para.props = resolved.merged_with(para.direct_overrides.clone());
 }
 
 /// Sprint 11 — UAX-#29 word count for one paragraph's text. Shares
@@ -4502,6 +4790,127 @@ mod tests {
         assert_eq!(d.to_plain_text(), "a\tb\nc\td");
     }
 
+    /* ---- Sprint 12 (#11): style cascade + shadow direct_overrides --- */
+
+    fn doc_with_heading_style() -> DocumentTree {
+        let mut d = DocumentTree::from_text("hello");
+        d.styles.insert(
+            "Heading1".into(),
+            ParagraphStyle {
+                id: "Heading1".into(),
+                name: "Heading 1".into(),
+                based_on: None,
+                para: ParaProperties {
+                    alignment: Some(Alignment::Center),
+                    ..Default::default()
+                },
+                run: SpanStyle::default(),
+            },
+        );
+        d
+    }
+
+    #[test]
+    fn apply_style_sets_style_id_and_props() {
+        let d = doc_with_heading_style();
+        let p0 = LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        };
+        let d = d.set_paragraph_style(p0.clone(), p0, Some("Heading1".into()));
+        let p = d.nth_paragraph(0).expect("paragraph 0");
+        assert_eq!(p.style_id.as_deref(), Some("Heading1"));
+        assert_eq!(
+            p.props.alignment,
+            Some(Alignment::Center),
+            "style cascade should fold into resolved props"
+        );
+    }
+
+    #[test]
+    fn direct_override_survives_subsequent_style_change() {
+        /* Apply a direct alignment (Right) first; then apply
+        Heading1 (which sets Center). The shadow approach must keep
+        Right because direct_overrides win over the style cascade. */
+        let d = doc_with_heading_style();
+        let p0 = LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        };
+        let d = d.set_alignment(p0.clone(), p0.clone(), Alignment::End);
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.direct_overrides.alignment, Some(Alignment::End));
+        let d = d.set_paragraph_style(p0.clone(), p0, Some("Heading1".into()));
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.style_id.as_deref(), Some("Heading1"));
+        assert_eq!(
+            p.props.alignment,
+            Some(Alignment::End),
+            "direct_overrides must win over style cascade"
+        );
+    }
+
+    #[test]
+    fn detach_style_falls_back_to_direct_overrides_only() {
+        let d = doc_with_heading_style();
+        let p0 = LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        };
+        let d = d.set_paragraph_style(p0.clone(), p0.clone(), Some("Heading1".into()));
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.alignment,
+            Some(Alignment::Center)
+        );
+        let d = d.set_paragraph_style(p0.clone(), p0, None);
+        assert_eq!(d.nth_paragraph(0).unwrap().style_id, None);
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().props.alignment,
+            None,
+            "detached style + no direct_overrides → default"
+        );
+    }
+
+    #[test]
+    fn style_cascade_walks_based_on_chain() {
+        let mut d = DocumentTree::from_text("x");
+        d.styles.insert(
+            "Base".into(),
+            ParagraphStyle {
+                id: "Base".into(),
+                name: "Base".into(),
+                based_on: None,
+                para: ParaProperties {
+                    alignment: Some(Alignment::Center),
+                    ..Default::default()
+                },
+                run: SpanStyle::default(),
+            },
+        );
+        d.styles.insert(
+            "Child".into(),
+            ParagraphStyle {
+                id: "Child".into(),
+                name: "Child".into(),
+                based_on: Some("Base".into()),
+                /* Child contributes direction; alignment inherits from Base. */
+                para: ParaProperties {
+                    direction: Some(TextDirection::Rtl),
+                    ..Default::default()
+                },
+                run: SpanStyle::default(),
+            },
+        );
+        let p0 = LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        };
+        let d = d.set_paragraph_style(p0.clone(), p0, Some("Child".into()));
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.props.alignment, Some(Alignment::Center));
+        assert_eq!(p.props.direction, Some(TextDirection::Rtl));
+    }
+
     /* ---- Sprint 11 (#17): UAX-#29 word_count ---------------------- */
 
     #[test]
@@ -4762,6 +5171,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -4785,6 +5196,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -4805,6 +5218,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -4903,6 +5318,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -4937,6 +5354,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -5397,6 +5816,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -5437,6 +5858,8 @@ mod tests {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -5476,6 +5899,8 @@ mod tests {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: Vec::new(),
+                style_id: None,
+                direct_overrides: ParaProperties::default(),
             },
             Paragraph {
                 text: "two".into(),
@@ -5493,6 +5918,8 @@ mod tests {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: Vec::new(),
+                style_id: None,
+                direct_overrides: ParaProperties::default(),
             },
         ];
         let (out, caret) = doc.insert_rich(
@@ -5711,6 +6138,8 @@ mod tests {
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
+            styles: std::collections::HashMap::new(),
+            style_defaults: ParaProperties::default(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

@@ -445,6 +445,8 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields: Vec::new(),
+            style_id: None,
+            direct_overrides: ParaProperties::default(),
         }]),
     };
     vec![
