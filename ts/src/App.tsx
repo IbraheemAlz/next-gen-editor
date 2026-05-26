@@ -12,6 +12,7 @@ import { PageSelectionOverlay } from './components/PageSelectionOverlay';
 import { HiddenInput } from './components/HiddenInput';
 import { Toolbar } from './components/Toolbar';
 import { TablePanel } from './components/TablePanel';
+import { SdkShelf } from './sdk-bridge';
 import { AccessibilityTree } from './components/AccessibilityTree';
 import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
@@ -165,6 +166,11 @@ export function App() {
     return (
         <div class="editor-shell">
             <Toolbar client={client} store={store} />
+            {/* Sprint 1+ (UI Edition) shelf — `@nge/ui` components
+                wired through `@nge/core`. Renders below the legacy
+                `Toolbar` until the legacy toolbar is decommissioned
+                (see `sdk-bridge.tsx` doc header). */}
+            <SdkShelf client={client} />
             <div class="editor-body">
                 <div class="editor-viewport">
                     {/* Phase 6c multi-canvas DOM — one `.editor-page` per
