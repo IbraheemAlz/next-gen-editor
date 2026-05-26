@@ -141,6 +141,44 @@ fn run_default() -> Result<()> {
     }
     println!("[roundtrip] step 6b OK — document.xml diff within bound");
 
+    /* Sprint 9 — exercise the non-OOXML emitters too. The `DocumentTree`
+    that came back from the edited round-trip is the freshest view of
+    the model — feed it to `format_html::to_html` + `to_plain_text`
+    and assert each emits a non-empty payload containing the seed +
+    inserted-text bytes. Guards against regressions in the
+    `Command::SaveDocument { Html | PlainText }` engine surface. */
+    let html = format_html::to_html(&edited);
+    if !html.starts_with("<!DOCTYPE html>") {
+        bail!(
+            "HTML emit missing doctype prefix: {}",
+            &html[..80.min(html.len())]
+        );
+    }
+    if !html.contains(SEED_TEXT) {
+        bail!("HTML emit dropped seed text");
+    }
+    if !html.contains(INSERT_TEXT.trim_start()) {
+        bail!("HTML emit dropped inserted text");
+    }
+    println!(
+        "[roundtrip] step 7 OK — format_html::to_html emitted {} bytes",
+        html.len()
+    );
+
+    let plain = edited.to_plain_text();
+    let expected_plain = format!("{SEED_TEXT}{INSERT_TEXT}");
+    if plain != expected_plain {
+        bail!(
+            "to_plain_text mismatch — expected `{}`, got `{}`",
+            expected_plain,
+            plain
+        );
+    }
+    println!(
+        "[roundtrip] step 8 OK — to_plain_text emitted {} bytes",
+        plain.len()
+    );
+
     println!("\nPASS");
     Ok(())
 }

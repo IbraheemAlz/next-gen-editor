@@ -1255,6 +1255,7 @@ dependencies = [
  "anyhow",
  "engine",
  "format-docx",
+ "format-html",
  "serde",
  "serde_json",
  "zip",

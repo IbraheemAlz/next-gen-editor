@@ -52,7 +52,38 @@
 
 ---
 
-## Sprint 9 — Core I/O Serializers + Resolved Comments
+## Sprint 9 — Core I/O Serializers + Resolved Comments ✅ DONE
+
+**Status:** Closed 2026-05-27. Issues #9 + #15 both resolved.
+
+  * `crates/format-html/` — 793-line crate, panic-free, 10 native
+    tests covering the 5 mandatory acceptance cases + bonuses (HTML
+    escapes, explicit LTR, missing-blob cid fallback, vMerge rowspan,
+    colspan, font-family resolved + raw).
+  * `engine::DocumentTree::to_plain_text` — folded into the engine
+    crate per the "<80 LOC = method" guidance. 3 tests cover join,
+    inline-image marker, and tab-separated table flatten.
+  * `engine-wasm::save_html_bytes` + `save_plain_text_bytes` route
+    `Command::SaveDocument { Html | PlainText }` through the new
+    crates and return `Event::DocumentSaved { bytes, size }`. Zero
+    extra copies on the WASM side via `String::into_bytes()` reuse
+    of the underlying `Vec<u8>` allocation; the bridge crosses as a
+    single `Uint8Array` via `serde_bytes` + `tsify`.
+  * `tools/roundtrip` extended with step 7 (HTML emit) + step 8
+    (plain-text emit) covering the seed-plus-edit DocumentTree.
+  * `format-docx/src/parts/comments.rs` reader + writer round-trip
+    `w15:done` through `commentsExtended.xml` (Sprint 9 v1 + L1.2 #18
+    OPC plumbing finishes the engine-minted-comment case).
+  * UI activation: `packages/ui/src/FileMenu.tsx` HTML + Plain Text
+    entries enabled with no "Engine pending" badge;
+    `packages/ui/src/CommentsRail.tsx` Resolve button title carries
+    no "(in-memory only)" caveat.
+  * `UI_SURFACE_MAPPING.md` §13 (Resolve / delete comment) + §15
+    (Export Plain Text + Export HTML) flipped to ✅ Wired.
+
+---
+
+## Sprint 9 — Original plan (archived)
 
 **Issues:** [#9](https://github.com/IbraheemAlz/next-gen-editor/issues/9), [#15](https://github.com/IbraheemAlz/next-gen-editor/issues/15)
 
