@@ -81,12 +81,12 @@
 
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
-| **Bulleted list** | No `Command::ToggleList { kind: Bullet }` yet | Toolbar Bullet List button + `Ctrl+Shift+8` | 🛑 Blocked — `numPr` cascade resolves (Sprint 7); no edit command |
-| **Numbered list** | No `Command::ToggleList { kind: Number }` | Toolbar Numbered List button + `Ctrl+Shift+7` | 🛑 Blocked |
+| **Bulleted list** | `Command::ToggleList { kind: Bullet }` + idempotent `synth_list_definition` (Sprint 13) | `ListButtons.tsx` Bullet button | ✅ Wired (Sprint 13) — reuses existing matching templates; never inflates `numbering.xml` (`#12` closed) |
+| **Numbered list** | `Command::ToggleList { kind: Number }` + idempotent synth (Sprint 13) | `ListButtons.tsx` Number button | ✅ Wired (Sprint 13, `#12` closed) |
 | **Multilevel / outline list** | numPr cascade resolves nested levels (Sprint 7) | Toolbar Multilevel dropdown + `Tab`/`Shift+Tab` to demote/promote inside list | 🛑 Blocked |
 | **List restart / continue** | No command | Context menu "Restart numbering at 1" / "Continue previous list" | 🛑 Blocked |
 | **Custom bullet character / number format** | No command | List properties dialog | 🛑 Blocked |
-| **Style-driven numbering** (`<w:style>/<w:numPr>`) | Cascade resolver Sprint 7 + `Command::ApplyStyle` (Sprint 12) | `StylesDropdown.tsx` triggers the cascade | ⚠️ Partial — style cascade drives, but numbering synthesis (Sprint 13) is the remaining authoring gap |
+| **Style-driven numbering** (`<w:style>/<w:numPr>`) | Cascade resolver Sprint 7 + `Command::ApplyStyle` (Sprint 12) + numbering synthesis (Sprint 13) | `StylesDropdown.tsx` + `ListButtons.tsx` | ✅ Wired |
 
 ---
 
@@ -438,3 +438,13 @@ drives, but numbering synthesis remains a Sprint 13 deliverable.
 Custom-style creation UI + character styles (`<w:rStyle>`) stay
 out of scope per plan. WASM unchanged at 5.94 MiB (Sprint 12 added
 no new deps).
+
+**Sprint 13 (closed `#12`, HIGH risk).** Two rows flipped to ✅
+Wired in §4: *Bulleted list* and *Numbered list* — both routed
+through `Command::ToggleList` + engine `synth_list_definition`
+(idempotent: repeated toggles reuse existing matching templates,
+never inflate `numbering.xml`). §4 *Style-driven numbering*
+upgraded ⚠️ Partial → ✅ Wired now that the synthesis half ships.
+WASM 5.94 → 5.96 MiB (+20 KiB; no new deps, only added engine
+mirror types). Tab/Shift-Tab demote/promote, restart-numbering UI,
+custom bullet pickers stay out of scope per plan.
