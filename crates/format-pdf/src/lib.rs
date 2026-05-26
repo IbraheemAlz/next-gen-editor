@@ -532,8 +532,11 @@ fn embed_font(pdf: &mut Pdf, id: &str, face: &LoadedFont, fo: &FontObj) {
                 supplement: 0,
             })
             .font_descriptor(fo.descriptor)
-            .default_width(1000.0);
+            .default_width(0.0);
         cid.cid_to_gid_map_predefined(Name(b"Identity"));
+        /* PDF/A-1b §6.3.5: per-CID widths in /W must match the font program's
+        glyph advances. Use the font's own hmtx values in 1000-em units. */
+        cid.widths().consecutive(0, face.widths_em1000());
     }
 
     pdf.font_descriptor(fo.descriptor)

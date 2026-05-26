@@ -52,19 +52,20 @@ pub async fn detect_backend() -> RendererBackend {
     {
         return RendererBackend::Canvas2d;
     }
-    /* Until Backlog #4 lands, Canvas2D is the contract:
-    `let _have_gpu = request_gpu_device().await;` (probe kept reachable
-    in the rendered binary by `Engine::with_vello` + the harness path —
-    this function no longer gates on it). */
-    RendererBackend::Canvas2d
+    /* Backlog #4 — opt-in Vello activation, gated on the WebGPU adapter
+    actually being acquirable in this worker. Multi-page rendering on
+    the Vello path is still the known Phase 6 bug; single-page works. */
+    if request_gpu_device().await {
+        RendererBackend::Vello
+    } else {
+        RendererBackend::Canvas2d
+    }
 }
 
 /// Try to acquire a WebGPU adapter + device via `wgpu`. `wgpu`'s WebGPU
 /// backend reads `navigator.gpu` from the current (worker) global scope.
 ///
-/// Kept reachable for Backlog #4 (Vello activation); `detect_backend`
-/// no longer calls it.
-#[allow(dead_code)]
+/// Backlog #4 — `detect_backend` calls this to gate Vello activation.
 async fn request_gpu_device() -> bool {
     let instance = wgpu::Instance::default();
     let adapter = match instance

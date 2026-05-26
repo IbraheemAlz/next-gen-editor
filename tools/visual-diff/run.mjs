@@ -27,9 +27,14 @@ import pixelmatch from 'pixelmatch';
 import { chromium } from 'playwright';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const GOLDEN_DIR = join(HERE, 'golden');
+/* PR #19 cherry-pick — dual-tier goldens. Canvas2D goldens live at
+   `golden/`; Vello goldens at `golden/vello/`. CLI `--renderer vello`
+   switches both the golden dir and the harness `?renderer=vello`
+   query param so the worker boots Vello. */
+const ROOT_GOLDEN_DIR = join(HERE, 'golden');
+const VELLO_GOLDEN_DIR = join(ROOT_GOLDEN_DIR, 'vello');
 const TMP_DIR = '/tmp/visual-diff';
-mkdirSync(GOLDEN_DIR, { recursive: true });
+mkdirSync(ROOT_GOLDEN_DIR, { recursive: true });
 mkdirSync(TMP_DIR, { recursive: true });
 
 /* Per-tier pass criteria (Phase 5 §3). `tol` is the maximum diff fraction a
@@ -62,8 +67,9 @@ function viewportFor(name) {
 }
 
 /** Screenshot one `?test=<name>` case; returns the PNG buffer. Throws on a
- *  page error. */
-async function capture(browser, name) {
+ *  page error. `renderer === 'vello'` adds `&renderer=vello` so the harness
+ *  boots Vello against the parallel `golden/vello/` corpus. */
+async function capture(browser, name, renderer) {
     const viewport = viewportFor(name);
     const ctx = await browser.newContext({ viewport });
     try {
@@ -76,7 +82,11 @@ async function capture(browser, name) {
                 errors.push(`console.error: ${m.text()}`);
             }
         });
-        await page.goto(`${ORIGIN}/?test=${name}`, { waitUntil: 'load' });
+        const url =
+            renderer === 'vello'
+                ? `${ORIGIN}/?test=${name}&renderer=vello`
+                : `${ORIGIN}/?test=${name}`;
+        await page.goto(url, { waitUntil: 'load' });
         await page.waitForFunction(() => window.__paintIdle === true, { timeout: 15000 });
         if (errors.length) throw new Error(`page errors:\n  ${errors.join('\n  ')}`);
         return await page.screenshot({
@@ -87,9 +97,9 @@ async function capture(browser, name) {
     }
 }
 
-/** Diff an actual capture against the committed golden. */
-function diffGolden(name, actualBuf, tol) {
-    const goldenPath = join(GOLDEN_DIR, `${name}.png`);
+/** Diff an actual capture against the committed golden in `goldenDir`. */
+function diffGolden(name, actualBuf, tol, goldenDir) {
+    const goldenPath = join(goldenDir, `${name}.png`);
     if (!existsSync(goldenPath)) return { status: 'no-golden', pct: 1 };
     const golden = PNG.sync.read(readFileSync(goldenPath));
     const actual = PNG.sync.read(actualBuf);
@@ -109,10 +119,29 @@ function diffGolden(name, actualBuf, tol) {
 
 const args = process.argv.slice(2);
 const tierIdx = args.indexOf('--tier');
-const firstPositional = args.find((a) => !a.startsWith('--'));
+const rendererIdx = args.indexOf('--renderer');
+/* `--tier` + `--renderer` are flag pairs; a positional case is anything
+   not preceded by either flag. */
+const flagValuePositions = new Set([
+    tierIdx >= 0 ? tierIdx + 1 : -1,
+    rendererIdx >= 0 ? rendererIdx + 1 : -1,
+]);
+const firstPositional = args.find(
+    (a, i) => !a.startsWith('--') && !flagValuePositions.has(i),
+);
 const singleCase = tierIdx < 0 && firstPositional !== undefined;
 
 const tier = (tierIdx >= 0 ? args[tierIdx + 1] : 'A')?.toUpperCase() ?? 'A';
+const renderer =
+    rendererIdx >= 0 ? args[rendererIdx + 1]?.toLowerCase() : 'canvas2d';
+if (renderer !== 'canvas2d' && renderer !== 'vello') {
+    console.error(
+        `[visual-diff] unknown renderer '${renderer}' (expected canvas2d or vello)`,
+    );
+    process.exit(2);
+}
+const GOLDEN_DIR = renderer === 'vello' ? VELLO_GOLDEN_DIR : ROOT_GOLDEN_DIR;
+mkdirSync(GOLDEN_DIR, { recursive: true });
 if (!singleCase && !TIERS[tier]) {
     console.error(`[visual-diff] unknown tier '${tier}' (expected A, B or C)`);
     process.exit(2);
@@ -124,41 +153,45 @@ try {
     if (singleCase) {
         const name = firstPositional;
         const tol = parseFloat(args[args.indexOf(name) + 1] ?? '0.02');
-        console.log(`[visual-diff] single case=${name} tol=${(tol * 100).toFixed(2)}%`);
-        const buf = await capture(browser, name);
+        console.log(
+            `[visual-diff] single case=${name} tol=${(tol * 100).toFixed(2)}% ` +
+                `renderer=${renderer}`,
+        );
+        const buf = await capture(browser, name, renderer);
         if (update || !existsSync(join(GOLDEN_DIR, `${name}.png`))) {
             writeFileSync(join(GOLDEN_DIR, `${name}.png`), buf);
             console.log(`[visual-diff] golden ${update ? 'updated' : 'created'}: ${name}`);
         } else {
-            const r = diffGolden(name, buf, tol);
+            const r = diffGolden(name, buf, tol, GOLDEN_DIR);
             console.log(`[visual-diff] ${name}: ${r.status} (diff ${(r.pct * 100).toFixed(3)}%)`);
             if (r.status !== 'pass') exitCode = 1;
         }
     } else {
         const cfg = TIERS[tier];
-        const cases = readdirSync(GOLDEN_DIR)
-            .filter((f) => f.endsWith('.png'))
-            .map((f) => basename(f, '.png'))
+        const cases = readdirSync(GOLDEN_DIR, { withFileTypes: true })
+            .filter((d) => d.isFile() && d.name.endsWith('.png'))
+            .map((d) => basename(d.name, '.png'))
             .sort();
         if (!cases.length) {
             console.warn(`[visual-diff] no goldens in ${GOLDEN_DIR} — nothing to run`);
             process.exit(0);
         }
         console.log(
-            `[visual-diff] FARM tier=${tier} tol=${(cfg.tol * 100).toFixed(2)}% ` +
+            `[visual-diff] FARM tier=${tier} renderer=${renderer} ` +
+                `tol=${(cfg.tol * 100).toFixed(2)}% ` +
                 `cases=${cases.length}${update ? ' (UPDATE)' : ''}`,
         );
         let passes = 0;
         for (const name of cases) {
             try {
-                const buf = await capture(browser, name);
+                const buf = await capture(browser, name, renderer);
                 if (update) {
                     writeFileSync(join(GOLDEN_DIR, `${name}.png`), buf);
                     console.log(`[visual-diff]   ${name}: golden updated`);
                     passes++;
                     continue;
                 }
-                const r = diffGolden(name, buf, cfg.tol);
+                const r = diffGolden(name, buf, cfg.tol, GOLDEN_DIR);
                 if (r.status === 'pass') passes++;
                 console.log(`[visual-diff]   ${name}: ${r.status} (diff ${(r.pct * 100).toFixed(3)}%)`);
             } catch (e) {
@@ -167,7 +200,8 @@ try {
         }
         const rate = passes / cases.length;
         console.log(
-            `[visual-diff] tier-${tier} pass rate ${(rate * 100).toFixed(1)}% ` +
+            `[visual-diff] tier-${tier} renderer=${renderer} ` +
+                `pass rate ${(rate * 100).toFixed(1)}% ` +
                 `(${passes}/${cases.length}, threshold ${(cfg.threshold * 100).toFixed(0)}%)`,
         );
         if (update) {

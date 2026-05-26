@@ -82,7 +82,7 @@ try {
                advances it — a faithful "type one character" keystroke. */
             await window.__dispatch({
                 type: 'INSERT_TEXT',
-                at: { para: 0, offset: i },
+                at: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: i },
                 text: 'x',
             });
             timings.push(performance.now() - start);

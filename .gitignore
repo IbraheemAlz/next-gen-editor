@@ -20,6 +20,20 @@ tmp/
 .idea/
 *.log
 
+# Local toolchain installs (portable JDK, veraPDF, chromedriver)
+.tools/
+.driver/
+
+# Diagnostic one-shots
+find-driver.mjs
+ts/probe-renderer.mjs
+
+# Per-user scheduled task locks
+.claude/scheduled_tasks.lock
+
+# Visual-diff golden backups (kept locally for human inspection only)
+tools/visual-diff/golden.*.bak/
+
 # OS
 .DS_Store
 Thumbs.db

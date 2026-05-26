@@ -105,6 +105,24 @@ impl LoadedFont {
         &self.rb_face
     }
 
+    /// Per-glyph horizontal advance widths in 1000-em units — the PDF font
+    /// `/W` array convention. PDF/A-1b §6.3.5 requires the values to match
+    /// the embedded font program's `hmtx` advances.
+    pub fn widths_em1000(&self) -> Vec<f32> {
+        let upem = self.rb_face.units_per_em() as f32;
+        let n = self.rb_face.number_of_glyphs();
+        let scale = if upem > 0.0 { 1000.0 / upem } else { 1.0 };
+        (0..n)
+            .map(|gid| {
+                let adv = self
+                    .rb_face
+                    .glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(gid))
+                    .unwrap_or(0) as f32;
+                (adv * scale).round()
+            })
+            .collect()
+    }
+
     /// Whether the font's cmap maps `ch` to a real (non-`.notdef`) glyph.
     pub fn covers(&self, ch: char) -> bool {
         self.face().charmap().map(ch) != 0

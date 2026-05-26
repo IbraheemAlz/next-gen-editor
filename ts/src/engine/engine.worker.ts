@@ -15,7 +15,18 @@ declare const self: DedicatedWorkerGlobalScope;
 /* Phase 1 PoC harness envelope — used only by the visual-diff harness
    (ts/src/harness/visual-diff.ts) for the `?test=` golden cases. The
    interactive editor drives the engine through the EngineClient path below. */
-type InitMsg = { type: 'INIT'; canvas: OffscreenCanvas; testCase: string };
+type InitMsg = {
+    type: 'INIT';
+    canvas: OffscreenCanvas;
+    testCase: string;
+    /* PR #19 cherry-pick: explicit renderer override for the dual-tier
+       golden suite. `'vello'` opts the harness into Vello (and the
+       `golden/vello/` corpus); absent or `'canvas2d'` keeps the
+       Canvas2D default that the root `golden/` corpus is calibrated
+       against. Never auto-detected here — auto-detection produced
+       non-deterministic CI failures in PR #19. */
+    renderer?: 'canvas2d' | 'vello';
+};
 type CommandMsg = { type: 'COMMAND'; id: number; cmd: Command };
 
 /* Phase 2 §6/§7 — EngineClient envelope. Every request carries a numeric
@@ -121,8 +132,22 @@ async function handleInit(msg: InitMsg): Promise<void> {
             import.meta.url,
         ),
     });
-    engine = new Engine(msg.canvas);
-    self.postMessage({ type: 'BOOT_OK' });
+    /* PR #19 cherry-pick: harness path stays Canvas2D-locked by default
+       so the root `golden/` corpus is reproducible across machines.
+       Opt-in to Vello via the `renderer` field on the INIT envelope
+       (visual-diff.ts sets it from `?renderer=vello`); falls back to
+       Canvas2D when Vello requested but no WebGPU adapter — that way
+       the harness fails closed (mismatch shows up clearly in
+       `golden/vello/`) instead of silently emitting Canvas2D pixels
+       against Vello goldens. */
+    const wantVello = msg.renderer === 'vello';
+    if (wantVello && (await detect_backend()) === 'vello') {
+        engine = await Engine.with_vello(msg.canvas);
+        self.postMessage({ type: 'BOOT_OK', renderer: 'vello' });
+    } else {
+        engine = new Engine(msg.canvas);
+        self.postMessage({ type: 'BOOT_OK', renderer: 'canvas2d' });
+    }
 
     const pong = await dispatch({ type: 'PING' } as Command);
     self.postMessage({ type: 'PING_RESULT', event: pong });

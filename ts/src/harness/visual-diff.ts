@@ -43,6 +43,15 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
  * protocol. Sets `window.__paintIdle` once the case finishes painting.
  */
 export function runVisualDiffHarness(testCase: string): void {
+    /* Sprint-9-PR-cherry-pick — dual-tier golden routing. The harness
+       stays Canvas2D-locked by DEFAULT (CI determinism); the `?renderer=vello`
+       query param opts in to Vello for the parallel `golden/vello/`
+       corpus. NO auto detect_backend() — coupling the golden bytes to
+       GPU presence broke PR #19's QA harness. */
+    const renderer =
+        new URLSearchParams(window.location.search).get('renderer') === 'vello'
+            ? 'vello'
+            : 'canvas2d';
     /* Test mode: only the engine canvas should be in the screenshot. */
     document.documentElement.style.background = '#fff';
     document.body.style.background = '#fff';
@@ -110,5 +119,8 @@ export function runVisualDiffHarness(testCase: string): void {
         console.error('[harness] worker fatal:', e.message);
     };
 
-    worker.postMessage({ type: 'INIT', canvas: offscreen, testCase }, [offscreen]);
+    worker.postMessage(
+        { type: 'INIT', canvas: offscreen, testCase, renderer },
+        [offscreen],
+    );
 }
