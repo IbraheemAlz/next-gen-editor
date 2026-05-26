@@ -146,6 +146,26 @@ const INITIAL_COLD_OPEN_BUDGET_PT: f32 = 1684.0;
 /// page filled in.)
 const AVG_BLOCK_HEIGHT_PT: f32 = 64.0;
 
+/// L3.1 (#5) — predictive runway past the requested `target_y` for the
+/// lazy-pagination cull budget. Returns the larger of:
+///
+/// * `LAYOUT_BUFFER_PT` — the legacy static buffer; protects clients
+///   that haven't posted a viewport yet (initial cold open, headless
+///   harness) and small viewports (mobile) where doubling the band
+///   would still fall under the legacy floor.
+/// * `viewport_h * scale * 2.0` — two viewport-heights ahead of the
+///   target. A fast-flick scroll up to one viewport-height past the
+///   current band still hits already-laid-out pages, eliminating the
+///   blank-frame window on hard scrolls.
+///
+/// Units: `viewport_h` is layout pt at scale=1 (what `do_set_viewport`
+/// records); the multiplication by `scale` converts to device px so
+/// the result is directly addable to the device-px `target_y` cull
+/// arithmetic.
+fn lazy_runway(viewport_h_pt: f32, scale: f32) -> f32 {
+    LAYOUT_BUFFER_PT.max(viewport_h_pt * scale * 2.0)
+}
+
 /// Audit gap C.H1 — pagination-completion info that rides alongside
 /// the laid-out pages. The caller folds this into `Painted` so the TS
 /// shell knows (a) whether more pages may materialize via
@@ -4266,7 +4286,14 @@ impl Engine {
         scroll from outrunning the layout. */
         let mut processed_blocks: u32 = 0;
         let total_blocks: u32 = doc.blocks.len() as u32;
-        let cull_budget = target_y.map(|y| y + LAYOUT_BUFFER_PT);
+        /* L3.1 (#5) — predictive runway. See `lazy_runway` for the
+        `max(LAYOUT_BUFFER_PT, viewport_h × scale × 2)` rationale: a
+        fast-flick scroll up to one viewport-height past the current
+        band still hits laid-out pages, eliminating the blank-frame
+        window. Falls back to the legacy `LAYOUT_BUFFER_PT` floor for
+        small viewports and pre-viewport clients. */
+        let runway = lazy_runway(self.lazy_layout.viewport_h, scale);
+        let cull_budget = target_y.map(|y| y + runway);
         let mut culled = false;
         let gap = render::scene::PAGE_GAP_PT * scale;
         let height_so_far = |pages: &[PageBox], in_progress: f32| -> f32 {
@@ -8271,6 +8298,57 @@ mod tests {
         assert!(
             (sum - available).abs() < 1.0,
             "two-col layout fills available width; got sum={sum}, available={available}"
+        );
+    }
+
+    /* ---------- L3.1 (#5) predictive lazy_runway ---------- */
+
+    /// L3.1 (#5) — `lazy_runway` returns the larger of `LAYOUT_BUFFER_PT`
+    /// and `viewport_h × scale × 2`. Pins the four observable scenarios
+    /// from the design table.
+    #[test]
+    fn lazy_runway_picks_doubled_viewport_or_legacy_floor() {
+        /* Headless cold open: default viewport_h = 1684 pt (two A4
+        pages). Doubled = 3368, exceeds the 1200 floor. */
+        let cold_open = lazy_runway(1684.0, 1.0);
+        assert!(
+            (cold_open - 3368.0).abs() < 0.01,
+            "cold open: expected 3368, got {cold_open}"
+        );
+
+        /* A4 desktop viewport: 842 pt × 1.0 × 2 = 1684; exceeds floor. */
+        let a4_desktop = lazy_runway(842.0, 1.0);
+        assert!(
+            (a4_desktop - 1684.0).abs() < 0.01,
+            "A4 desktop: expected 1684, got {a4_desktop}"
+        );
+
+        /* A4 hi-DPI (Retina): 842 × 2.0 × 2 = 3368; exceeds floor. */
+        let a4_retina = lazy_runway(842.0, 2.0);
+        assert!(
+            (a4_retina - 3368.0).abs() < 0.01,
+            "A4 Retina: expected 3368, got {a4_retina}"
+        );
+
+        /* Mobile narrow viewport: 400 × 1.0 × 2 = 800; under the 1200
+        floor → floor wins. */
+        let mobile = lazy_runway(400.0, 1.0);
+        assert!(
+            (mobile - LAYOUT_BUFFER_PT).abs() < 0.01,
+            "mobile small viewport: expected LAYOUT_BUFFER_PT={LAYOUT_BUFFER_PT}, got {mobile}"
+        );
+
+        /* Pre-viewport (TS shell hasn't posted a SetViewport yet but
+        the engine seeded `viewport_h = INITIAL_COLD_OPEN_BUDGET_PT`).
+        Doubled = 3368 — same as cold open. */
+        let pre_viewport = lazy_runway(INITIAL_COLD_OPEN_BUDGET_PT, 1.0);
+        assert!(
+            pre_viewport >= LAYOUT_BUFFER_PT,
+            "pre-viewport must never regress below LAYOUT_BUFFER_PT floor"
+        );
+        assert!(
+            (pre_viewport - 3368.0).abs() < 0.01,
+            "pre-viewport: expected 3368, got {pre_viewport}"
         );
     }
 

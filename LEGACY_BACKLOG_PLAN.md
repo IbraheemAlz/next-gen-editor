@@ -30,7 +30,7 @@
 | **#2** | IME composition preview verify on real OS CJK IME | Manual QA only — `HiddenInput` already wires `compositionstart/update/end` | Phase 4 / Backlog #8 | **Verify-then-close.** No code. Needs macOS or Windows with Japanese IME (or Pinyin). |
 | **#3** | Discontinuous + cross-container selection (UX §IV.6) | `crates/engine`, `crates/engine-wasm`, TS `pointer.ts` | UX_BEHAVIOR_SPEC §IV.6 | **Keep deferred.** No concrete user; selection model carries the cost on every op. Revisit after Phase 6b headers/footers + Phase 8a footnotes land. |
 | **#4** | Sprint 1 (A.H3): smallCaps drops uppercase on byte-length-changing chars (`ß → SS`) | `crates/layout/src/paragraph.rs::build_line` | Sprint 1 trade-off (commit `ec065c1`) | **Done (L1.3).** `transform_for_shape` helper + per-byte transformed→source map; cluster always lands on a UTF-8 char boundary. 7 new unit tests green. |
-| **#5** | Sprint 4 (C.H1): virtual scrollbar over-estimates by `AVG_BLOCK_HEIGHT_PT = 64.0` | `crates/engine-wasm/src/lib.rs` (`build_pages`, `LazyLayoutState`, `LAYOUT_BUFFER_PT`) | Sprint 4 trade-off (commit `09d8a48`) | **Fix.** Predictive pre-layout — double `LAYOUT_BUFFER_PT` window when `target_y` set. |
+| **#5** | Sprint 4 (C.H1): virtual scrollbar over-estimates by `AVG_BLOCK_HEIGHT_PT = 64.0` | `crates/engine-wasm/src/lib.rs` (`build_pages`, `LazyLayoutState`, `LAYOUT_BUFFER_PT`) | Sprint 4 trade-off (commit `09d8a48`) | **Done (L3.1).** New `lazy_runway(viewport_h_pt, scale)` helper picks `max(LAYOUT_BUFFER_PT, viewport_h × scale × 2)`. `build_pages::cull_budget` calls it; fast-flick scrolls up to one viewport past the target hit laid-out pages. `AVG_BLOCK_HEIGHT_PT` untouched (scroll-thumb stability invariant preserved). 1 native test pinning the 5 design-table scenarios. Memory profile 50p engine 83.8 MiB / 128 MiB budget. |
 | **#6** | Sprint 5 (A.M3): geometric tab stops drift on Center/Right/Justified/RTL + Decimal/Center/Right kinds render as Left | `crates/layout/src/paragraph.rs::apply_tab_advances` | Sprint 5 trade-off (commit `547d20e`) | **Done (L2.1).** Indent-aware pen + shape-then-place math for `Left`/`Center`/`Right`/`Decimal` kinds. 6 native tests + 3 visual-diff goldens (tier A 10/10 at 0.000 %). Center/End/Justify alignment + tabs deferred (Word-conformant). RTL anchoring deferred to issue #20. |
 | **#7** | Sprint 6 (A.M8): table autofit skips true `min-content`; long URLs clip in narrow columns | `crates/engine-wasm/src/lib.rs::autofit_distribute` | Sprint 6 trade-off (commit `c706bab`) | **Done (L2.2).** `measure_unbreakable_width` walks `break_opportunities` + `shape_text` per segment to compute `(min_content, max_content)`. `autofit_distribute` enforces `col_floor = max(grid_hint, min_content)` via 3-case dispatch (overflow / fit / iterative pin-and-redistribute). 3 native tests + 1 visual-diff golden (tier A 11/11 at 0.000 %). |
 | **#8** | Sprint 7 (A.M12): continuous section break skips column-height balancing | `crates/engine-wasm/src/lib.rs` (continuous-section path) | Sprint 7 trade-off (commit `046754b`) | **Done (L2.3).** `Paginator::balance_current_section_columns()` runs a greedy O(n) snake-fill before the section swap; new `cur_section_start_idx` tracks the section boundary in `cur_blocks`. 3 native tests in `paginate::tests`. Visual-diff golden deferred (no worker command path to compose multi-section docs); tier-A no-regression sweep at 11/11 0.000 % protects the corpus. |
@@ -424,6 +424,54 @@ Mirror `CORE_SPRINTS_PLAN.md` discipline. After each cleanup commits:
    reference back here.
 
 ### Activity log
+
+- **2026-05-27 — L3.1 (#5) landed — LEGACY BACKLOG CLEARED.**
+  - `crates/engine-wasm/src/lib.rs`: new
+    `lazy_runway(viewport_h_pt, scale) -> f32` helper returns
+    `max(LAYOUT_BUFFER_PT, viewport_h × scale × 2.0)`. Pure
+    function; no side effects.
+  - `build_pages` cull_budget calculation now uses
+    `let runway = lazy_runway(self.lazy_layout.viewport_h, scale);
+    let cull_budget = target_y.map(|y| y + runway);`. Single
+    structural change in the hot pagination loop; no other call
+    site touched.
+  - **Invariants preserved.** `AVG_BLOCK_HEIGHT_PT = 64.0`
+    untouched — scroll thumb continues to over-estimate (shrinks-
+    only as pages materialize, never yanks). `min_target_y`
+    bumping in `do_expand_layout` / `do_set_viewport` /
+    `lazy_layout_bump_for_y` unchanged. `target_y=None` callers
+    (PDF export, hit-test) get `cull_budget=None` → full layout
+    as before.
+  - **Runway scenarios** (`lazy_runway` design table):
+    | scenario | viewport_h | scale | result |
+    |---|---|---|---|
+    | Headless cold open | 1684 | 1.0 | 3368 |
+    | A4 desktop | 842 | 1.0 | 1684 |
+    | A4 Retina | 842 | 2.0 | 3368 |
+    | Mobile small | 400 | 1.0 | 1200 (floor wins) |
+    | Pre-viewport (cold-open seed) | 1684 | 1.0 | 3368 |
+
+    Mobile case proves the `LAYOUT_BUFFER_PT` floor guarantees no
+    regression vs the current behaviour even on small viewports.
+  - 1 new native test in `engine_wasm::tests`:
+    `lazy_runway_picks_doubled_viewport_or_legacy_floor` —
+    pinpoints all five scenarios above.
+  - **Memory profile.** 50p fixture: engine 83.8 MiB / 128 MiB
+    budget (65 % usage; well within tier C.H1 §5 budget). Larger
+    fixtures (100p / 250p / 500p) run on the non-blocking
+    `qa-harness` CI job; bounded growth confirmed analytically
+    (doubled viewport adds ≤ 2 A4 pages of laid-out content per
+    `ExpandLayout` round-trip vs the static-1200 baseline).
+  - **No visual-diff golden needed.** The change is purely a
+    TIMING optimization — same pages emitted, just earlier. Tier-
+    A farm 11/11 at 0.000 % protects the corpus.
+  - CI gates: `cargo test --workspace --lib` 279+ tests
+    (engine-wasm 33 → 34); `cargo clippy --workspace --all-targets
+    -- -D warnings` clean; `cargo fmt --all -- --check` clean;
+    `cargo run -p shape-regression --release` 6/6; `cargo run -p
+    roundtrip --release` PASS; visual-diff tier A 11/11 at 0.000
+    %; `wasm-pack build --release` artifact at 5.99 MiB / 15 MiB
+    budget.
 
 - **2026-05-27 — L2.3 (#8) landed.**
   - `crates/layout/src/paginate.rs`: new
