@@ -568,20 +568,26 @@ fn next_tab_stop_after(pen_x: f32, custom: &[(f32, TabKind)]) -> (f32, TabKind) 
 /// placed so font ascender / descender fit inside.
 ///
 /// Naskh fonts (Amiri, Noto Naskh) ship intrinsic ascent + descent of
-/// 2-3× the em size to leave room for tashkeel + verse marks. Before this
-/// fix the layer used the raw font metrics directly — a 24 pt Amiri
-/// paragraph rendered at ~70 CSS px per line instead of the configured
-/// 36 pt, blowing the page out vertically.
+/// 2-3× the em size to leave room for tashkeel + verse marks. Before the
+/// original fix the layer used the raw font metrics directly — a 24 pt
+/// Amiri paragraph rendered at ~70 CSS px per line instead of the
+/// configured 36 pt, blowing the page out vertically.
 ///
-/// Policy (mirrors Word's default Auto rule):
-/// - The line box is `line_height` tall; baseline at `0.82 ×
-///   line_height` from the top (ascender takes 82%, descender 18% —
-///   typical for Latin / Naskh mix).
-/// - If `line_height` is somehow zero (callers pass a positive value, but
-///   defensive), fall back to font metrics.
-/// - Phase 7 inline images can still grow the line above `line_height`
-///   when an image's height exceeds the box — clipping a glyph is fine,
-///   clipping an image's content is not.
+/// Policy (mirrors Word's default Auto rule, with a floor for huge runs):
+/// - The line box is **at least** `line_height` tall, with baseline at
+///   `0.82 × line_height` from the top when font metrics fit inside.
+/// - When a run's resolved font envelope (`max ascent + max descent`)
+///   exceeds `line_height` — e.g. a 300 pt font in a 36 pt paragraph
+///   — the line **expands to fit the envelope** instead of clipping
+///   into the top margin or overlapping the next line. The baseline
+///   sits at the run's max ascent so the glyph never crosses the line's
+///   top edge.
+/// - If `line_height` is zero (defensive), fall back to font metrics.
+/// - Phase 7 inline images grow the line above `line_height` when an
+///   image's height exceeds the box.
+///
+/// Closes Issue #22 symptoms (1) and (2): top-padding clip + overlapping
+/// line wrap on massive `font_size`.
 fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32) -> (f32, f32) {
     let mut font_ascent = 0.0_f32;
     let mut font_descent = 0.0_f32;
@@ -609,8 +615,27 @@ fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32) -> (f32, f3
         return (font_ascent.max(inline_image_h), font_descent);
     }
 
-    /* Inline image grows the line above `line_height` if needed. */
-    let total = line_height.max(inline_image_h + line_height * 0.18);
+    /* Issue #22 — the line must accommodate the tallest glyph in any
+    of its runs. When `font_ascent + font_descent > line_height` the
+    `line_height` target alone clips the glyph into the previous line
+    or the top margin. Take the max so the line box grows under massive
+    font sizes; small sizes stay on the original Auto path. */
+    let glyph_envelope = font_ascent + font_descent;
+    let inline_floor = inline_image_h + line_height * 0.18;
+    let total = line_height.max(glyph_envelope).max(inline_floor);
+
+    if glyph_envelope > line_height {
+        /* Big glyph — baseline at the run's actual ascent so the top of
+        the glyph aligns with the line box top. Descender fills the
+        remainder; if the total grew further (inline image floor),
+        the slack goes to the descent band. */
+        let ascent = font_ascent.max(inline_image_h);
+        let descent = (total - ascent).max(font_descent);
+        return (ascent, descent);
+    }
+
+    /* Small glyph (the original Word Auto path): baseline at 82% of the
+    line box height. */
     let ascent = (total * 0.82).max(inline_image_h);
     let descent = total - ascent;
     (ascent, descent)

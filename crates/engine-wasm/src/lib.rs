@@ -3679,7 +3679,7 @@ impl Engine {
             // behavior lands in Phase 3 behind the RequestPaint pipeline.
             // ===============================================================
             Command::Init { .. } => phase3_stub("Init"),
-            Command::Recover { .. } => phase3_stub("Recover"),
+            Command::Recover { .. } => self.do_recover(),
             Command::Dispose => phase3_stub("Dispose"),
             Command::Tick { .. } => phase3_stub("Tick"),
             // Sprint 3 (UI Edition) — Document I/O. OpenDocument /
@@ -4140,6 +4140,49 @@ impl Engine {
             return *e;
         }
         self.after_history_change()
+    }
+
+    /// Issue #22 — warm crash recovery. The worker has already been
+    /// respawned by the host (see `EngineClient.onTrap` in
+    /// `ts/src/engine/engine-client.ts`) so a fresh `Engine` already
+    /// owns the new `OffscreenCanvas`. This handler ensures the
+    /// engine starts every recovery path in the same state a cold
+    /// boot would — *no* lingering font / layout / undo / a11y
+    /// cache from a prior session can poison the next one (the
+    /// reported HarfBuzz / Arabic-shaping degradation post-recovery
+    /// was a stale-cache symptom).
+    ///
+    /// `setupEngine` on the TS side re-issues `loadFont` + the boot
+    /// `RenderPage` after this returns, so wiping the engine to a
+    /// near-cold state is safe and idempotent. Rendering surfaces
+    /// (`page_ctxs`, `ctx`, `vello`, `atlas`) are preserved — those
+    /// own the live `OffscreenCanvas` context, which cannot be
+    /// re-transferred.
+    fn do_recover(&mut self) -> Event {
+        /* Full-stack rehydration: clear every cache + transient state
+        and reset the document to a fresh `DocumentTree`. The TS
+        shell's `setupEngine` immediately repopulates fonts + seed
+        text via the established cold-boot path. */
+        self.fonts.clear();
+        self.undo = UndoStack::new(DocumentTree::new(), 100);
+        self.layout_cfg = None;
+        self.selection = None;
+        self.composition = None;
+        self.pending_format = None;
+        self.layout_cache = new_layout_cache();
+        self.a11y_cache = None;
+        self.image_cache.clear();
+        self.last_paint_dims = LastPaintDims::default();
+        self.lazy_layout = LazyLayoutState::default();
+        self.caret_affinity = CaretAffinity::default();
+        self.pending_announcements.clear();
+        self.tracking_changes = false;
+        self.review_author = "You".to_string();
+        self.review_date = String::new();
+        self.dirty = DirtyTracker::new();
+        Event::Recovered {
+            applied_commands: 0,
+        }
     }
 
     fn do_redo(&mut self) -> Event {
