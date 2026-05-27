@@ -1,0 +1,9 @@
+.nge-hist {
+    display: inline-flex;
+    gap: 2px;
+}
+
+.nge-hist__btn {
+    font-size: 16px;
+    line-height: 1;
+}

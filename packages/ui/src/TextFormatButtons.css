@@ -1,0 +1,30 @@
+.nge-tfmt {
+    display: inline-flex;
+    gap: 2px;
+}
+
+.nge-tfmt__btn {
+    width: 28px;
+    padding: 0;
+    font: 700 var(--nge-font-size-md)/1 var(--nge-font-ui);
+}
+
+.nge-tfmt__btn--italic {
+    font-style: italic;
+    font-weight: 600;
+}
+
+.nge-tfmt__btn--strike {
+    text-decoration: line-through;
+    font-weight: 600;
+}
+
+.nge-tfmt__btn[data-mixed="true"] {
+    background: repeating-linear-gradient(
+        45deg,
+        var(--nge-color-surface) 0,
+        var(--nge-color-surface) 4px,
+        var(--nge-color-surface-alt) 4px,
+        var(--nge-color-surface-alt) 8px
+    );
+}

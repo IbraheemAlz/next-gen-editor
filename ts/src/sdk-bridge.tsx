@@ -37,6 +37,13 @@ import {
     StatusBar,
     TrapOverlay,
     Ruler,
+    ZoomControls,
+    TextFormatButtons,
+    FontPickers,
+    ColorPickers,
+    AlignmentButtons,
+    InsertTableButton,
+    HistoryButtons,
 } from '@nge/ui';
 import type { EngineClient } from './engine/engine-client';
 
@@ -64,16 +71,22 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 <header class="nge-shell__topbar">
                     <div class="nge-shell__toolbar-row">
                         <FileMenu />
+                        <StylesDropdown />
+                        <HistoryButtons />
                     </div>
                     <div class="nge-shell__toolbar-row">
-                        <StylesDropdown />
+                        <FontPickers />
+                        <TextFormatButtons />
                         <UnderlineStyleDropdown />
                         <SuperSubButtons />
-                        <ListButtons />
-                        <InsertImageButton />
+                        <ColorPickers />
                     </div>
                     <div class="nge-shell__toolbar-row">
+                        <AlignmentButtons />
+                        <ListButtons />
                         <ParagraphControls />
+                        <InsertImageButton />
+                        <InsertTableButton />
                         <LayoutControls />
                         <ReviewControls />
                     </div>
@@ -92,6 +105,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 </aside>
                 <footer class="nge-shell__statusbar">
                     <StatusBar />
+                    <ZoomControls />
                 </footer>
                 <TableContextMenu />
                 <DevHud pollMs={1000} />

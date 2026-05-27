@@ -1,0 +1,47 @@
+.nge-color {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+}
+
+.nge-color__field {
+    display: inline-flex;
+    align-items: center;
+    height: 28px;
+    padding: 0 var(--nge-space-1) 0 var(--nge-space-2);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    background: var(--nge-color-surface);
+    gap: var(--nge-space-1);
+    cursor: pointer;
+}
+
+.nge-color__field:hover {
+    background: var(--nge-color-surface-alt);
+}
+
+.nge-color__icon {
+    font-weight: 700;
+    font-size: var(--nge-font-size-md);
+    line-height: 1;
+    color: var(--nge-color-text-muted);
+}
+
+.nge-color__swatch {
+    width: 24px;
+    height: 20px;
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    background: transparent;
+    padding: 0;
+    cursor: pointer;
+}
+
+.nge-color__swatch:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.nge-color__clear {
+    font-size: 12px;
+}

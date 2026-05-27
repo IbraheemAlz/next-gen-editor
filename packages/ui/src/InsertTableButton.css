@@ -1,0 +1,12 @@
+.nge-itable {
+    gap: var(--nge-space-1);
+}
+
+.nge-itable__icon {
+    font-size: 14px;
+    line-height: 1;
+}
+
+.nge-itable__label {
+    font-size: var(--nge-font-size-sm);
+}

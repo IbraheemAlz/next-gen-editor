@@ -1,0 +1,22 @@
+.nge-align {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-2);
+}
+
+.nge-align__group {
+    display: inline-flex;
+    gap: 2px;
+}
+
+.nge-align__btn {
+    font-size: 14px;
+    line-height: 1;
+}
+
+.nge-align__btn--dir {
+    width: auto;
+    padding: 0 var(--nge-space-2);
+    font-size: var(--nge-font-size-sm);
+    font-variant-numeric: tabular-nums;
+}

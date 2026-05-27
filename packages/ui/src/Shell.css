@@ -87,6 +87,21 @@
 
 .nge-shell__statusbar {
     grid-area: status;
+    display: flex;
+    align-items: stretch;
     background: var(--nge-color-bg);
     border-top: 1px solid var(--nge-color-border);
+}
+
+.nge-shell__statusbar > :first-child {
+    flex: 1 1 auto;
+    min-width: 0;
+    border-top: 0;
+}
+
+.nge-shell__statusbar > :not(:first-child) {
+    flex: 0 0 auto;
+    align-self: center;
+    padding: 0 var(--nge-space-3);
+    border-left: 1px solid var(--nge-color-border);
 }

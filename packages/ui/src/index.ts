@@ -63,3 +63,11 @@ export type { TrapOverlayProps } from './TrapOverlay';
 
 export { Ruler } from './Ruler';
 export type { RulerProps } from './Ruler';
+
+export { TextFormatButtons } from './TextFormatButtons';
+export { FontPickers } from './FontPickers';
+export { ColorPickers } from './ColorPickers';
+export { AlignmentButtons } from './AlignmentButtons';
+export { InsertTableButton } from './InsertTableButton';
+export type { InsertTableButtonProps } from './InsertTableButton';
+export { HistoryButtons } from './HistoryButtons';

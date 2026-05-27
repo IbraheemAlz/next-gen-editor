@@ -1,0 +1,35 @@
+.nge-font {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+}
+
+.nge-font__family {
+    height: 28px;
+    padding: 0 var(--nge-space-2);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    background: var(--nge-color-surface);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm)/1 var(--nge-font-ui);
+    min-width: 140px;
+}
+
+.nge-font__family:disabled,
+.nge-font__size:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.nge-font__size {
+    width: 56px;
+    height: 28px;
+    padding: 0 var(--nge-space-2);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    background: var(--nge-color-surface);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm)/1 var(--nge-font-ui);
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
