@@ -78,6 +78,8 @@ export function emptyPatch(): TextAttrsPatch {
         bg_color: undefined,
         script: undefined,
         language: undefined,
+        caps: undefined,
+        small_caps: undefined,
     };
 }
 
@@ -119,6 +121,10 @@ export interface EditorCommands {
     setFontSize(pt: number, range?: LogicalRange): Promise<Event>;
     setColor(r: number, g: number, b: number, a?: number, range?: LogicalRange): Promise<Event>;
     setHighlight(r: number, g: number, b: number, a?: number, range?: LogicalRange): Promise<Event>;
+    /** `<w:caps/>` — render every glyph uppercase. */
+    setCaps(value: boolean, range?: LogicalRange): Promise<Event>;
+    /** `<w:smallCaps/>` — render lowercase as smaller uppercase glyphs. */
+    setSmallCaps(value: boolean, range?: LogicalRange): Promise<Event>;
 
     /* Paragraph — `range` defaults to current selection. */
     setParagraphAlign(align: Alignment, range?: LogicalRange): Promise<Event>;
@@ -340,6 +346,8 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
         setColor: (r, g, b, a = 255, range) => fmt({ color: { r, g, b, a } }, range),
         setHighlight: (r, g, b, a = 255, range) =>
             fmt({ bg_color: { r, g, b, a } }, range),
+        setCaps: (value, range) => fmt({ caps: value }, range),
+        setSmallCaps: (value, range) => fmt({ small_caps: value }, range),
 
         setParagraphAlign: (align, range) =>
             dispatch({

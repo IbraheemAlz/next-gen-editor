@@ -121,7 +121,12 @@ export const ParagraphControls: Component = () => {
                     aria-label="Paragraph shading colour"
                     disabled={!ready()}
                     value={shadingHex() || '#ffffff'}
-                    onInput={(e) => void applyShading(e.currentTarget.value)}
+                    /* `onChange` fires once on commit; `onInput` would
+                     * dispatch a SetParagraphShading on every cursor
+                     * tick of the continuous picker and flood the
+                     * bridge (the same anti-pattern the text/highlight
+                     * pickers replaced with a discrete swatch grid). */
+                    onChange={(e) => void applyShading(e.currentTarget.value)}
                 />
                 <button
                     class="nge-btn nge-btn--icon nge-pcontrols__icon"

@@ -12,13 +12,15 @@ import { createMemo, type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
 import './FontPickers.css';
 
+/* Only fonts the engine actually has resident raster data for. CSS
+ * generic stacks (`system-ui` / `serif` / `monospace`) don't resolve
+ * — the engine's `FontStack` keys on the loaded `.ttf` ids that
+ * `App.tsx` hands to `client.loadFont(...)`. Adding more entries here
+ * requires loading the matching font in `App.tsx`. */
 const FONT_FAMILIES: { label: string; value: string }[] = [
-    { label: 'Amiri',          value: 'amiri' },
+    { label: 'Amiri',           value: 'amiri' },
     { label: 'Liberation Sans', value: 'liberation' },
-    { label: 'Noto Naskh',     value: 'noto-naskh' },
-    { label: 'System UI',      value: 'system-ui' },
-    { label: 'Serif',          value: 'serif' },
-    { label: 'Monospace',      value: 'monospace' },
+    { label: 'Noto Naskh',      value: 'noto-naskh' },
 ];
 
 const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72];

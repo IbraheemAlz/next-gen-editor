@@ -1,0 +1,16 @@
+.nge-caps {
+    display: inline-flex;
+    gap: 2px;
+}
+
+.nge-caps__btn {
+    width: 32px;
+    padding: 0;
+    font: 700 var(--nge-font-size-sm)/1 var(--nge-font-ui);
+    font-variant-caps: all-petite-caps;
+    letter-spacing: 0.5px;
+}
+
+.nge-caps__small {
+    font-size: 0.7em;
+}

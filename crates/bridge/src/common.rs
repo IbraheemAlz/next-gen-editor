@@ -239,4 +239,9 @@ pub struct TextAttrs {
     pub bg_color: Option<Color>,
     pub script: VerticalScript,
     pub language: String,
+    /// `<w:caps/>` — render every glyph in its uppercase form. Wins
+    /// over `small_caps` per OOXML §17.3.2.7 when both are set.
+    pub caps: bool,
+    /// `<w:smallCaps/>` — render lowercase as smaller uppercase glyphs.
+    pub small_caps: bool,
 }

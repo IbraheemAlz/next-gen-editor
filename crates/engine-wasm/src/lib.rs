@@ -993,6 +993,8 @@ fn resolved_attrs(patch: &TextAttrsPatch, default_size: f32) -> TextAttrs {
         bg_color: patch.bg_color,
         script: patch.script.unwrap_or(VerticalScript::Normal),
         language: patch.language.clone().unwrap_or_default(),
+        caps: patch.caps.unwrap_or(false),
+        small_caps: patch.small_caps.unwrap_or(false),
     }
 }
 
@@ -4047,12 +4049,12 @@ impl Engine {
             strike: attrs.strike,
             bg_color: attrs.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
             font_family: attrs.font_family.as_deref().and_then(parse_font_family),
-            /* Audit gap A.H3 — caps / smallCaps round-trip on read +
-            write; the interactive `ApplyFormatting` bridge surface does
-            not yet expose toggles (additive extension for a later
-            sprint), so direct edits leave the flags untouched. */
-            caps: None,
-            small_caps: None,
+            /* Audit gap A.H3 — closed: `TextAttrsPatch` now carries
+            `caps` / `small_caps` so the toolbar's Caps controls
+            round-trip through the same `ApplyFormatting` path as
+            bold / italic. */
+            caps: attrs.caps,
+            small_caps: attrs.small_caps,
             /* Audit gap A.M1 — `<w:vertAlign>` toggles map from the
             existing `script: Option<VerticalScript>` patch field. The
             bridge enum's `Normal` variant ⇒ explicit `Baseline`
@@ -5945,8 +5947,19 @@ impl Engine {
             font_size: style.font_size.unwrap_or(default_size),
             color: Color { r, g, b, a },
             bg_color: style.bg_color.map(|[r, g, b, a]| Color { r, g, b, a }),
-            script: VerticalScript::Normal,
+            /* Map the engine's `VertAlign` (Baseline / Superscript /
+            Subscript) to the bridge's `VerticalScript`
+            (Normal / Superscript / Subscript). Hardcoding `Normal`
+            here used to defeat the SuperSub button's active-state
+            read-back. */
+            script: match style.vert_align {
+                Some(engine::VertAlign::Superscript) => VerticalScript::Superscript,
+                Some(engine::VertAlign::Subscript) => VerticalScript::Subscript,
+                _ => VerticalScript::Normal,
+            },
             language: String::new(),
+            caps: style.caps.unwrap_or(false),
+            small_caps: style.small_caps.unwrap_or(false),
         }
     }
 

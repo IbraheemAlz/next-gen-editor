@@ -47,7 +47,13 @@ export const UnderlineStyleDropdown: Component<UnderlineStyleDropdownProps> = (p
     };
 
     const choose = async (style: UnderlineStyle) => {
-        setLastStyle(style);
+        /* `None` is a clear, not a style pick — keep the prior
+         * `lastStyle` so the next U-button click re-applies the
+         * user's last real choice instead of dispatching another
+         * no-op `None`. */
+        if (style !== 'None') {
+            setLastStyle(style);
+        }
         setOpen(false);
         await cmd.setUnderline(style);
     };

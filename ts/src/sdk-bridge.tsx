@@ -44,6 +44,7 @@ import {
     AlignmentButtons,
     InsertTableButton,
     HistoryButtons,
+    CapsButtons,
 } from '@nge/ui';
 import type { EngineClient } from './engine/engine-client';
 
@@ -79,6 +80,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                         <TextFormatButtons />
                         <UnderlineStyleDropdown />
                         <SuperSubButtons />
+                        <CapsButtons />
                         <ColorPickers />
                     </div>
                     <div class="nge-shell__toolbar-row">

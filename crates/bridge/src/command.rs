@@ -658,6 +658,13 @@ pub struct TextAttrsPatch {
     pub bg_color: Option<Color>,
     pub script: Option<VerticalScript>,
     pub language: Option<String>,
+    /// `<w:caps/>` — display every character as uppercase. Closes the
+    /// audit gap A.H3 noted in `engine-wasm::apply_formatting` — the
+    /// engine `SpanStyle.caps` field has existed since Phase 3 but the
+    /// interactive bridge surface only just routes a toggle.
+    pub caps: Option<bool>,
+    /// `<w:smallCaps/>` — same provenance as [`Self::caps`].
+    pub small_caps: Option<bool>,
 }
 
 /// Stable identifier for a paragraph in the document model.
