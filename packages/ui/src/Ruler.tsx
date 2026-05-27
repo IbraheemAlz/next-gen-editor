@@ -111,6 +111,11 @@ export const Ruler: Component<RulerProps> = (props) => {
      * but mutated locally during a drag for instant visual feedback.
      * Committed back via `cmd.setTabStops` on drag release. */
     const [localStops, setLocalStops] = createSignal<BridgeTabStop[] | null>(null);
+    /* Ref to the ruler strip — bound by the JSX `ref={stripEl}` attribute.
+     * Used by the window-level pointermove handler, which sees
+     * `e.currentTarget === window` (no `.getBoundingClientRect`); reading
+     * the strip directly via this ref is the only safe path. */
+    let stripEl: HTMLDivElement | undefined;
 
     const geom = () => state.sectionGeometry();
     const isRtl = () => state.paragraphDirection() === 'Rtl';
@@ -174,10 +179,11 @@ export const Ruler: Component<RulerProps> = (props) => {
     const onPointerMove = (e: PointerEvent) => {
         const d = drag();
         if (!d) return;
-        const ruler = (e.currentTarget as HTMLElement | null) ??
-            document.querySelector('.nge-ruler__strip');
-        if (!ruler) return;
-        const rect = (ruler as HTMLElement).getBoundingClientRect();
+        /* `e.currentTarget` is `window` for the window-level listener and
+         * has no `.getBoundingClientRect`. Read the strip via the bound
+         * ref instead; guard in case Solid disposed the node mid-drag. */
+        if (!stripEl) return;
+        const rect = stripEl.getBoundingClientRect();
         const pt = clientXToContentPt(e.clientX, rect);
         /* Discard when the pointer leaves the ruler strip vertically by
          * more than a tolerance — Word's "drag off to remove" behaviour. */
@@ -282,7 +288,10 @@ export const Ruler: Component<RulerProps> = (props) => {
         const target = e.target as HTMLElement;
         /* Clicks on a handle / marker have their own onpointerdown. */
         if (target.closest('.nge-ruler__handle, .nge-ruler__tab')) return;
-        const strip = e.currentTarget as HTMLElement;
+        /* Prefer the bound ref; fall back to `currentTarget` so the
+         * listener still works if it ever moves off the strip. */
+        const strip = stripEl ?? (e.currentTarget as HTMLElement | null);
+        if (!strip) return;
         const rect = strip.getBoundingClientRect();
         const pt = clientXToContentPt(e.clientX, rect);
         /* Outside content area = no-op. */
@@ -398,6 +407,7 @@ export const Ruler: Component<RulerProps> = (props) => {
             aria-label="Page ruler — drag to set indents and tab stops"
         >
             <div
+                ref={stripEl}
                 class="nge-ruler__strip"
                 style={{ width: `${totalPx()}px` }}
                 onPointerDown={onStripPointerDown}
