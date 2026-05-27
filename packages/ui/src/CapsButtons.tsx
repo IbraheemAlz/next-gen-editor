@@ -20,6 +20,28 @@ export const CapsButtons: Component = () => {
     const isCaps = () => state.attrsAtCaret()?.caps === true;
     const isSmallCaps = () => state.attrsAtCaret()?.small_caps === true;
 
+    /* UI-side mutual exclusivity: clicking the inactive button clears
+     * the other flag in the same patch so the user never sees both
+     * "pressed" simultaneously. The engine's render path (caps wins
+     * over small_caps per OOXML §17.3.2.7) would also handle it, but
+     * pressing one and seeing the other stay highlighted is confusing
+     * — Word's Format > Font dialog allows both flags to coexist;
+     * our toolbar's two-button shelf does not. */
+    const toggleCaps = () => {
+        if (isCaps()) {
+            void cmd.applyAttrs({ caps: false });
+        } else {
+            void cmd.applyAttrs({ caps: true, small_caps: false });
+        }
+    };
+    const toggleSmallCaps = () => {
+        if (isSmallCaps()) {
+            void cmd.applyAttrs({ small_caps: false });
+        } else {
+            void cmd.applyAttrs({ small_caps: true, caps: false });
+        }
+    };
+
     return (
         <div class="nge-caps" role="group" aria-label="Caps">
             <button
@@ -30,7 +52,7 @@ export const CapsButtons: Component = () => {
                 data-active={isCaps()}
                 disabled={!ready()}
                 title="All caps"
-                onClick={() => void cmd.setCaps(!isCaps())}
+                onClick={toggleCaps}
             >
                 AB
             </button>
@@ -42,7 +64,7 @@ export const CapsButtons: Component = () => {
                 data-active={isSmallCaps()}
                 disabled={!ready()}
                 title="Small caps"
-                onClick={() => void cmd.setSmallCaps(!isSmallCaps())}
+                onClick={toggleSmallCaps}
             >
                 A<span class="nge-caps__small">B</span>
             </button>

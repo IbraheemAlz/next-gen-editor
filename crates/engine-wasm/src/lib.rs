@@ -1480,6 +1480,21 @@ fn paragraph_layout_key(
         run.style.strike.hash(&mut h);
         run.style.bg_color.hash(&mut h);
         run.style.font_family.hash(&mut h);
+        /* Without these three, flipping `<w:caps>`, `<w:smallCaps>`, or
+        `<w:vertAlign>` produces the same hash as the prior state and
+        the cache returns a stale `ParagraphBox` — the visible bug the
+        Caps toggle reproduced (text stayed all-uppercase after caps
+        was unset; small caps rendered identically to all caps because
+        the 0.8× shrink in `push_caps_spans` was bypassed by the cache
+        hit). Encode each as a small discriminant. */
+        run.style.caps.hash(&mut h);
+        run.style.small_caps.hash(&mut h);
+        match run.style.vert_align {
+            None => 0u8.hash(&mut h),
+            Some(engine::VertAlign::Baseline) => 1u8.hash(&mut h),
+            Some(engine::VertAlign::Superscript) => 2u8.hash(&mut h),
+            Some(engine::VertAlign::Subscript) => 3u8.hash(&mut h),
+        }
     }
     /* `engine::Alignment` / `text_pipeline::Alignment` carry no `Hash` derive —
     hash a small discriminant instead. */
