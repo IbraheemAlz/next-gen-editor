@@ -1,0 +1,92 @@
+/*
+ * @nge/ui — shell grid.
+ *
+ * Classic word-processor frame: stacked toolbar rows, ruler, main row
+ * (canvas + right rails), pinned status bar. CSS Grid with named
+ * template areas owns the page layout; child `.editor-*` styles (in
+ * `ts/src/styles/editor.css`) own the gray desk + A4 page card inside
+ * `.nge-shell__canvas`.
+ *
+ * `min-height: 0` / `min-width: 0` on the inner flex containers is
+ * load-bearing: without them the canvas viewport refuses to shrink
+ * inside the grid track and the scrollbar disappears.
+ */
+
+.nge-shell {
+    height: 100vh;
+    width: 100vw;
+    display: grid;
+    grid-template-areas:
+        "topbar topbar"
+        "ruler  ruler"
+        "main   rails"
+        "status status";
+    grid-template-rows: auto auto 1fr auto;
+    grid-template-columns: 1fr var(--nge-rails-width);
+    background: var(--nge-color-surface);
+    color: var(--nge-color-text);
+    overflow: hidden;
+}
+
+.nge-shell__topbar {
+    grid-area: topbar;
+    display: flex;
+    flex-direction: column;
+    background: var(--nge-color-bg);
+    border-bottom: 1px solid var(--nge-color-border);
+}
+
+.nge-shell__toolbar-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--nge-space-2);
+    padding: var(--nge-space-2) var(--nge-space-3);
+    border-bottom: 1px solid var(--nge-color-border);
+}
+
+.nge-shell__toolbar-row:last-child {
+    border-bottom: 0;
+}
+
+.nge-shell__ruler {
+    grid-area: ruler;
+    background: var(--nge-color-bg);
+    border-bottom: 1px solid var(--nge-color-border);
+}
+
+.nge-shell__main {
+    grid-area: main;
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.nge-shell__canvas {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.nge-shell__rails {
+    grid-area: rails;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+    background: var(--nge-color-bg);
+    border-left: 1px solid var(--nge-color-border);
+}
+
+.nge-shell__rails > * + * {
+    border-top: 1px solid var(--nge-color-border);
+}
+
+.nge-shell__statusbar {
+    grid-area: status;
+    background: var(--nge-color-bg);
+    border-top: 1px solid var(--nge-color-border);
+}

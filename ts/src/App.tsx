@@ -161,13 +161,15 @@ export function App() {
     };
 
     return (
-        <div class="editor-shell">
+        <>
             {/* SDK shelf — every UI surface ships through `@nge/ui`
                 wired through `@nge/core`. The legacy Phase-4
                 `Toolbar` + `TablePanel` were retired in the post-
-                `v0.6.0-beta.2` purge (1109 LOC removed). */}
-            <SdkShelf client={client} />
-            <div class="editor-body">
+                `v0.6.0-beta.2` purge (1109 LOC removed). The editor
+                canvas mounts inside the shell's main grid track via
+                the children slot; `engineReady` gates the right-rail
+                snapshot calls so they don't fire before INIT. */}
+            <SdkShelf client={client} engineReady={() => !booting()}>
                 <div class="editor-viewport">
                     {/* Phase 6c multi-canvas DOM — one `.editor-page` per
                         paginated page. Page 0 hosts the boot canvas (the
@@ -201,12 +203,12 @@ export function App() {
                         </For>
                     </div>
                 </div>
-            </div>
+            </SdkShelf>
             <AccessibilityTree client={client} />
             <Announcements store={store} />
             <Show when={booting()}>
                 <div class="boot-overlay">Loading editor…</div>
             </Show>
-        </div>
+        </>
     );
 }

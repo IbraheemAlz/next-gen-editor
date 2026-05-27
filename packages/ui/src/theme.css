@@ -16,6 +16,8 @@
  *   </div>
  */
 
+@import './Shell.css';
+
 :root,
 .nge-root {
     /* Colour */
@@ -64,6 +66,7 @@
     /* Layout */
     --nge-toolbar-height:     40px;
     --nge-sidebar-width:      280px;
+    --nge-rails-width:        320px;
     --nge-hud-min-width:      220px;
 
     /* Motion */

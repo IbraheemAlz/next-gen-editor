@@ -1,28 +1,27 @@
 /**
  * sdk-bridge — adapter that wires the existing concrete EngineClient
  * (still living in `ts/src/engine/engine-client.ts`) into the new
- * @nge/core context, and assembles the Sprint 1 (UI Edition) shelf of
- * components from @nge/ui.
+ * @nge/core context, and assembles the default `@nge/ui` shell around
+ * the editor canvas.
  *
- * This file is the migration anchor: App.tsx can mount <SdkShelf
- * client={engineClient}/> alongside its existing Solid tree to gain the
- * new Dev HUD, zoom widget, underline dropdown, super/sub buttons,
- * insert-image button, track-changes sidebar, and comments rail —
- * without rewriting any of the existing Toolbar / EditorCanvas /
- * HiddenInput plumbing.
+ * The shell is a CSS-Grid frame (see `@nge/ui/Shell.css`): stacked
+ * toolbar rows on top, ruler beneath, the editor canvas in the main
+ * grid track, the review rails (Track Changes + Comments) pinned to
+ * the right, and the StatusBar pinned to the bottom. The host app
+ * (`ts/src/App.tsx`) passes the canvas + overlays in as `children`.
  *
- * Once the existing Toolbar is fully migrated onto createEditorCommands,
- * the legacy Toolbar.tsx can be deleted and this adapter collapses into
- * App.tsx directly.
+ * `engineReady` gates the right-rail snapshot calls so they don't fire
+ * before the worker finishes `Command::Init`; otherwise the engine
+ * rejects with "engine not initialized" and the rails render a red
+ * error banner.
  */
-import type { Component } from 'solid-js';
+import { Show, type JSX, type Component } from 'solid-js';
 import {
     EngineProvider,
     type EngineHandle,
 } from '@nge/core';
 import {
     DevHud,
-    ZoomControls,
     UnderlineStyleDropdown,
     SuperSubButtons,
     InsertImageButton,
@@ -45,46 +44,58 @@ import '@nge/ui/theme.css';
 
 export interface SdkShelfProps {
     client: EngineClient;
+    /** Editor canvas + overlays mount here, inside the main grid track. */
+    children: JSX.Element;
+    /** True once the worker has finished INIT. Defaults to true if omitted
+     *  so callers without a boot signal still mount the rails. */
+    engineReady?: () => boolean;
 }
 
-/**
- * Convenience composite that drops the entire Sprint 1 (UI Edition)
- * shelf into an app in one mount. Useful for the QA playground; in
- * production each component can be placed individually.
- */
 export const SdkShelf: Component<SdkShelfProps> = (props) => {
     /* The concrete EngineClient already implements the EngineHandle
      * contract (dispatch + subscribe + init + recover + crossOriginIsolated
      * + renderer + revisionsSnapshot + commentsSnapshot). Cast is safe. */
     const handle = props.client as unknown as EngineHandle;
+    const ready = () => (props.engineReady ? props.engineReady() : true);
 
     return (
         <EngineProvider client={handle}>
-            <div class="nge-root nge-sprint1-shelf">
-                <div class="nge-sprint1-shelf__toolbar">
-                    <FileMenu />
+            <div class="nge-root nge-shell">
+                <header class="nge-shell__topbar">
+                    <div class="nge-shell__toolbar-row">
+                        <FileMenu />
+                    </div>
+                    <div class="nge-shell__toolbar-row">
+                        <StylesDropdown />
+                        <UnderlineStyleDropdown />
+                        <SuperSubButtons />
+                        <ListButtons />
+                        <InsertImageButton />
+                    </div>
+                    <div class="nge-shell__toolbar-row">
+                        <ParagraphControls />
+                        <LayoutControls />
+                        <ReviewControls />
+                    </div>
+                </header>
+                <div class="nge-shell__ruler">
+                    <Ruler />
                 </div>
-                <div class="nge-sprint1-shelf__toolbar">
-                    <StylesDropdown />
-                    <UnderlineStyleDropdown />
-                    <SuperSubButtons />
-                    <ListButtons />
-                    <InsertImageButton />
-                </div>
-                <div class="nge-sprint1-shelf__toolbar">
-                    <ParagraphControls />
-                    <LayoutControls />
-                    <ReviewControls />
-                </div>
-                <Ruler />
-                <div class="nge-sprint1-shelf__rails">
-                    <TrackChangesSidebar />
-                    <CommentsRail />
-                </div>
+                <main class="nge-shell__main">
+                    <div class="nge-shell__canvas">{props.children}</div>
+                </main>
+                <aside class="nge-shell__rails">
+                    <Show when={ready()}>
+                        <TrackChangesSidebar />
+                        <CommentsRail />
+                    </Show>
+                </aside>
+                <footer class="nge-shell__statusbar">
+                    <StatusBar />
+                </footer>
                 <TableContextMenu />
                 <DevHud pollMs={1000} />
                 <TrapOverlay />
-                <StatusBar />
             </div>
         </EngineProvider>
     );

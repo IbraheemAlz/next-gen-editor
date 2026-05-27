@@ -1,19 +1,7 @@
-/* Phase 4 §5 — editor shell + canvas styling. */
-
-/* Column shell — toolbar on top, editor viewport fills the rest. */
-.editor-shell {
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-}
-
-/* Body row — viewport on the left, side rails (Tables panel) on the right. */
-.editor-body {
-    flex: 1 1 0;
-    min-height: 0;
-    display: flex;
-    flex-direction: row;
-}
+/* Phase 4 §5 — editor canvas styling.
+   Outer frame (toolbar / ruler / rails / status bar) lives in
+   `@nge/ui/Shell.css` as a CSS Grid; `.editor-viewport` is the gray
+   desk inside the shell's `.nge-shell__canvas` track. */
 
 /* The "desk" — a scrollable grey surround that centres the A4 page.
    `min-height: 0` lets it shrink inside the flex column; `overflow: auto`
