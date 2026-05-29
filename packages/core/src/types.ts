@@ -50,6 +50,7 @@ export type {
     BridgeCellProperties,
     BridgeTabStop,
     BridgeTabKind,
+    BridgeIndent,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 import type {

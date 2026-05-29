@@ -82,4 +82,5 @@ export type {
     BridgeCellProperties,
     BridgeTabStop,
     BridgeTabKind,
+    BridgeIndent,
 } from './types';

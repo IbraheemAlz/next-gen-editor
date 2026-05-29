@@ -10,7 +10,13 @@
     height: 24px;
     background: var(--nge-color-bg, #fff);
     border-bottom: 1px solid var(--nge-color-border, #ddd);
-    overflow-x: auto;
+    /* The strip is pinned (in TSX) to the measured paper card and may run
+     * wider than the ruler or scroll off the left when the page is zoomed
+     * or panned — clip it horizontally so it mirrors the page sliding
+     * under a fixed ruler frame (Google Docs / Word). `overflow-y` stays
+     * visible so the major-tick inch labels (which sit just above the
+     * strip) are not clipped. */
+    overflow-x: hidden;
     overflow-y: visible;
     user-select: none;
     font-family: var(--nge-font-system, system-ui, sans-serif);
@@ -18,9 +24,13 @@
     color: var(--nge-color-text-muted, #666);
 }
 
+/* Absolutely positioned so its `left` (set inline from the measured page
+ * offset) pins the 0-mark over the paper's left edge; `width` (also inline)
+ * matches the page width in pt-derived px. */
 .nge-ruler__strip {
-    position: relative;
-    height: 100%;
+    position: absolute;
+    top: 0;
+    bottom: 0;
     touch-action: none;
     cursor: crosshair;
 }

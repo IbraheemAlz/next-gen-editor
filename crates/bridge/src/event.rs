@@ -176,6 +176,16 @@ pub enum Event {
         /// inherits the default 0.5-inch grid. Drives the Ruler's
         /// tab-stop markers + their drag-edit handles.
         tab_stops: Vec<BridgeTabStop>,
+        /// Sprint 15 (#13) — `<w:pPr><w:ind>` indentation of the
+        /// paragraph under the caret, in layout pt. Lets the Ruler's
+        /// indent handles READ BACK the active paragraph's values
+        /// (so the markers jump to a 20 pt indent when the caret lands
+        /// there) instead of always sitting at the leading edge, and
+        /// lets a drag of one handle PRESERVE the others rather than
+        /// zeroing them. `Default` (all-zero) when the caret has no
+        /// addressable paragraph (defensive — same contract as
+        /// `tab_stops` being empty).
+        paragraph_indent: BridgeIndent,
         /// Sprint 14 (#14) — current engine track-changes recording
         /// state. The UI binds `ReviewControls`'s Track-Changes
         /// toggle to this field instead of carrying local Solid
@@ -274,6 +284,26 @@ pub enum AnnouncementPriority {
 /// "Lightweight" matters: `SelectionChanged` fires on every keystroke
 /// and pointer move. Eight `f32`s + one `u32` + one enum is a single
 /// 40-ish byte struct, allocation-free across the wasm bridge.
+/// Sprint 15 (#13) — wire shape for the paragraph-under-caret's
+/// `<w:pPr><w:ind>` indentation, in layout pt (1/72 in) at scale=1.
+/// Drives the Ruler's indent-handle read-back + clobber-free commits.
+///
+/// `first_line_pt` is **signed** to match `Command::SetParagraphIndent`'s
+/// convention: a positive value is a first-line indent (`<w:firstLine>`),
+/// a negative value is a hanging indent (`<w:hanging>`). The engine stores
+/// the two as mutually-exclusive non-negative twip fields and folds them
+/// into this single signed pt here so the UI round-trips a drag without
+/// re-deriving the sign.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq)]
+pub struct BridgeIndent {
+    /// Leading-edge indent (`<w:start>` / `<w:left>`).
+    pub start_pt: f32,
+    /// Trailing-edge indent (`<w:end>` / `<w:right>`).
+    pub end_pt: f32,
+    /// Signed first-line offset: `> 0` → `<w:firstLine>`, `< 0` → `<w:hanging>`.
+    pub first_line_pt: f32,
+}
+
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
 pub struct BridgeSectionGeometry {
     pub width_pt: f32,

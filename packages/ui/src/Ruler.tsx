@@ -7,6 +7,20 @@
  * Falls back to A4 + 1-inch margins when the engine has not emitted
  * geometry yet (fresh, empty document).
  *
+ * **Layout sync (Sprint 15).** The ruler row spans the full shell
+ * width, but the strip is absolutely pinned to the *measured* bounds
+ * of the real `.editor-page` card (`measurePage()` + a ResizeObserver
+ * / scroll listener). That inherits the viewport's centering,
+ * scrollbar gutter, and live horizontal scroll, so the 0-mark always
+ * sits over the paper's leading edge — like Word / Google Docs. Every
+ * `getBoundingClientRect` runs after `onMount` behind a null guard, so
+ * the component never measures an unmounted node.
+ *
+ * **Indent read-back (Sprint 15).** The active paragraph's `<w:ind>`
+ * rides on `SELECTION_CHANGED` as `state.paragraphIndent()`. The
+ * handles jump to those values when the caret moves, and a drag of one
+ * handle preserves the other two (no more zero-clobber).
+ *
  * Drag discipline:
  *  - First-line handle (▽) edits `Paragraph.props.indent.first_line`
  *    (positive) or `hanging` (negative).
@@ -30,6 +44,7 @@ import {
     createMemo,
     createSignal,
     onCleanup,
+    onMount,
     Show,
     For,
     type Component,
@@ -116,6 +131,68 @@ export const Ruler: Component<RulerProps> = (props) => {
      * `e.currentTarget === window` (no `.getBoundingClientRect`); reading
      * the strip directly via this ref is the only safe path. */
     let stripEl: HTMLDivElement | undefined;
+    /* Ref to the ruler root — the measurement frame the strip is pinned
+     * inside. `getBoundingClientRect` on either ref is ONLY ever called
+     * after `onMount` (and re-guarded with a null check), so the
+     * component never measures an unmounted node (failure #2). */
+    let rulerEl: HTMLDivElement | undefined;
+
+    /* Sprint 15 (#13) — measured position of the real `.editor-page` card,
+     * expressed in CSS px RELATIVE TO the ruler root. The strip is pinned
+     * to this so the 0-mark sits exactly over the paper's left edge,
+     * inheriting the viewport's centering, scrollbar gutter, and live
+     * horizontal scroll for free (failure #1 — alignment). `null` until
+     * the first measurement lands; the strip then falls back to the
+     * left edge for the single boot frame. */
+    const [pageLeftPx, setPageLeftPx] = createSignal<number | null>(null);
+
+    /* Re-measure the paper relative to the ruler. Guarded end-to-end:
+     * bails if either node is missing (pre-mount, crash remount) or the
+     * page has no layout box yet (width 0 before first paint). */
+    const measurePage = () => {
+        if (!rulerEl) return;
+        const page = document.querySelector<HTMLElement>(
+            '.editor-page[data-page-index="0"]',
+        );
+        if (!page) return;
+        const pageRect = page.getBoundingClientRect();
+        if (pageRect.width <= 0) return;
+        const rulerRect = rulerEl.getBoundingClientRect();
+        setPageLeftPx(pageRect.left - rulerRect.left);
+    };
+
+    /* Wire the measurement to every input that can move the paper:
+     * window resize + rail/toolbar reflow (ResizeObserver on the ruler
+     * itself), viewport resize, and live scroll. All teardown is
+     * registered through onCleanup so a crash remount leaves no dangling
+     * listeners. The scroll listener is `passive` — the ruler never
+     * cancels the scroll, it only follows it. */
+    onMount(() => {
+        const viewport = document.querySelector<HTMLElement>('.editor-viewport');
+
+        /* Initial measure now, plus one on the next frame in case the
+         * page card has not taken its final centered position yet (fonts,
+         * scrollbar appearing on first paint). */
+        measurePage();
+        const raf = requestAnimationFrame(measurePage);
+        onCleanup(() => cancelAnimationFrame(raf));
+
+        const onScroll = () => measurePage();
+        viewport?.addEventListener('scroll', onScroll, { passive: true });
+        onCleanup(() => viewport?.removeEventListener('scroll', onScroll));
+
+        if (typeof ResizeObserver !== 'undefined') {
+            const ro = new ResizeObserver(() => measurePage());
+            if (rulerEl) ro.observe(rulerEl);
+            if (viewport) ro.observe(viewport);
+            onCleanup(() => ro.disconnect());
+        }
+
+        /* Window resize re-centres the page even when neither observed box
+         * changes size (e.g. devtools dock toggling the inner width). */
+        window.addEventListener('resize', onScroll);
+        onCleanup(() => window.removeEventListener('resize', onScroll));
+    });
 
     const geom = () => state.sectionGeometry();
     const isRtl = () => state.paragraphDirection() === 'Rtl';
@@ -268,14 +345,17 @@ export const Ruler: Component<RulerProps> = (props) => {
 
     /* ---- indent value accessors (in pt) ---------------------------- */
 
-    /* The engine emits `attrs_at_caret` per-character but not the
-     * paragraph's indent. Until the bridge surfaces it, the ruler
-     * commits new values as ABSOLUTES with the other fields zeroed
-     * (matches `increaseIndent` / `decreaseIndent` semantics in
-     * `createEditorCommands`). Drag-release dispatches one command. */
-    const currentStartPt = () => 0;
-    const currentEndPt = () => 0;
-    const currentFirstLinePt = () => 0;
+    /* Sprint 15 (#13) — read-back of the active paragraph's `<w:ind>`,
+     * surfaced on every `SELECTION_CHANGED` via
+     * `state.paragraphIndent()`. This is what makes the handles JUMP to
+     * a paragraph's real indent when the caret lands there (failure #3),
+     * and what lets a drag of one handle PRESERVE the others instead of
+     * zeroing them — `commitDrag` reads the two it isn't editing from
+     * here. `first_line_pt` is SIGNED + relative to `start` (positive →
+     * first-line, negative → hanging), matching the engine. */
+    const currentStartPt = () => state.paragraphIndent().start_pt;
+    const currentEndPt = () => state.paragraphIndent().end_pt;
+    const currentFirstLinePt = () => state.paragraphIndent().first_line_pt;
 
     /* ---- tab-stop accessors ---------------------------------------- */
 
@@ -382,6 +462,10 @@ export const Ruler: Component<RulerProps> = (props) => {
     const liveFirstLinePt = () => {
         const d = drag();
         if (d?.kind === 'first-line') return d.livePt;
+        /* Dragging the left indent carries the first-line marker with it
+         * (the engine stores first-line RELATIVE to start), so preview it
+         * at the dragged start + the preserved relative offset. */
+        if (d?.kind === 'left-indent') return d.livePt + currentFirstLinePt();
         return currentStartPt() + currentFirstLinePt();
     };
     const liveLeftIndentPt = () => {
@@ -401,6 +485,7 @@ export const Ruler: Component<RulerProps> = (props) => {
 
     return (
         <div
+            ref={rulerEl}
             class="nge-ruler"
             data-rtl={isRtl() ? 'true' : 'false'}
             role="region"
@@ -409,7 +494,13 @@ export const Ruler: Component<RulerProps> = (props) => {
             <div
                 ref={stripEl}
                 class="nge-ruler__strip"
-                style={{ width: `${totalPx()}px` }}
+                style={{
+                    width: `${totalPx()}px`,
+                    /* Pin the strip's left edge to the measured paper card
+                     * so the 0-mark sits over the page's left edge. Falls
+                     * back to 0 for the single pre-measurement boot frame. */
+                    left: `${pageLeftPx() ?? 0}px`,
+                }}
                 onPointerDown={onStripPointerDown}
                 onPointerUp={restoreFocus}
             >

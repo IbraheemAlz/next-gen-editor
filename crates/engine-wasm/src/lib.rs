@@ -7,12 +7,13 @@
 use bridge::{
     A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRow, A11yRun, A11yTable, A11yTree,
     Alignment as BridgeAlignment, AnnouncementPriority, BlockPath as BridgeBlockPath,
-    BridgeBorderStroke, BridgeBorderStyle, BridgeCellProperties, BridgeSectionGeometry, Color,
-    Command, Direction, DocFormat, EngineStats, Event, FontMetrics as BridgeMetrics,
-    ImageBlob as BridgeImageBlob, ImageFit, LogicalPos as BridgeLogicalPos,
-    LogicalRange as BridgeLogicalRange, MoveDirection, PageOrientation as BridgePageOrientation,
-    PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
-    SelectionKind, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
+    BridgeBorderStroke, BridgeBorderStyle, BridgeCellProperties, BridgeIndent,
+    BridgeSectionGeometry, Color, Command, Direction, DocFormat, EngineStats, Event,
+    FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
+    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, MoveDirection,
+    PageOrientation as BridgePageOrientation, PathStep as BridgePathStep, PdfConformance,
+    Point as BridgePoint, Rect as BridgeRect, SelectionKind, TextAttrs, TextAttrsPatch,
+    UnderlineStyle, VerticalScript,
 };
 use engine::{
     Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
@@ -5651,7 +5652,33 @@ impl Engine {
             section_geometry: self.section_geometry_for_caret(&sel.caret.path),
             cell_properties: self.cell_properties_for_caret(&sel.caret.path),
             tab_stops: self.tab_stops_for_caret(&sel.caret.path),
+            paragraph_indent: self.indent_for_caret(&sel.caret.path),
             is_tracking_changes: self.tracking_changes,
+        }
+    }
+
+    /// Sprint 15 (#13) — extract the paragraph-under-caret's
+    /// `<w:pPr><w:ind>` indentation as a wire-shaped [`BridgeIndent`]
+    /// in layout pt. `Default` (all-zero) when the caret is not inside
+    /// a paragraph — same contract as [`Self::tab_stops_for_caret`]
+    /// returning empty. `first_line_pt` folds the engine's mutually-
+    /// exclusive `first_line_twips` / `hanging_twips` into one SIGNED
+    /// pt value (`> 0` first-line, `< 0` hanging), matching
+    /// `Command::SetParagraphIndent`'s convention so a Ruler drag
+    /// round-trips without re-deriving the sign.
+    fn indent_for_caret(&self, path: &BridgeBlockPath) -> BridgeIndent {
+        let engine_path = bridge_path_to_engine(path);
+        let Some(para) = self.undo.current().paragraph_at_path(&engine_path) else {
+            return BridgeIndent::default();
+        };
+        let ind = &para.props.indent;
+        /* twips → pt (20 twips = 1 pt). first_line/hanging are mutually
+        exclusive in OOXML; at most one is non-zero, so the difference
+        recovers the signed offset. */
+        BridgeIndent {
+            start_pt: ind.start_twips as f32 / 20.0,
+            end_pt: ind.end_twips as f32 / 20.0,
+            first_line_pt: (ind.first_line_twips - ind.hanging_twips) as f32 / 20.0,
         }
     }
 

@@ -21,6 +21,7 @@ import type {
     Alignment,
     AttrsMixed,
     BridgeCellProperties,
+    BridgeIndent,
     BridgeSectionGeometry,
     BridgeTabStop,
     Direction,
@@ -83,6 +84,15 @@ export interface EditorState {
      */
     tabStops: Accessor<BridgeTabStop[]>;
     /**
+     * Sprint 15 (#13) — `<w:pPr><w:ind>` indentation of the paragraph
+     * under the caret, in layout pt. Drives the Ruler's indent-handle
+     * read-back (markers jump to the active paragraph's values) and
+     * clobber-free commits (dragging one handle preserves the others).
+     * All-zero `BridgeIndent` before the first `SELECTION_CHANGED` or
+     * when the caret has no addressable paragraph.
+     */
+    paragraphIndent: Accessor<BridgeIndent>;
+    /**
      * Sprint 14 (#14) — engine track-changes recording state.
      * `ReviewControls`'s Track toggle binds its active state to
      * this accessor instead of carrying local Solid state, so a
@@ -115,6 +125,8 @@ export function createEditorState(): EditorState {
     const [cellProperties, setCellProperties] =
         createSignal<BridgeCellProperties | undefined>(undefined);
     const [tabStops, setTabStops] = createSignal<BridgeTabStop[]>([]);
+    const ZERO_INDENT: BridgeIndent = { start_pt: 0, end_pt: 0, first_line_pt: 0 };
+    const [paragraphIndent, setParagraphIndent] = createSignal<BridgeIndent>(ZERO_INDENT);
     const [isTrackingChanges, setIsTrackingChanges] = createSignal(false);
 
     const unsubscribe = engine.subscribe((evt: Event) => {
@@ -133,6 +145,7 @@ export function createEditorState(): EditorState {
                 setSectionGeometry(evt.section_geometry);
                 setCellProperties(evt.cell_properties);
                 setTabStops(evt.tab_stops);
+                setParagraphIndent(evt.paragraph_indent ?? ZERO_INDENT);
                 setIsTrackingChanges(evt.is_tracking_changes);
                 break;
             }
@@ -184,6 +197,7 @@ export function createEditorState(): EditorState {
         sectionGeometry,
         cellProperties,
         tabStops,
+        paragraphIndent,
         isTrackingChanges,
     };
 }
