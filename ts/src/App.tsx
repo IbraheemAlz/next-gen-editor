@@ -17,24 +17,12 @@ import { EngineClient } from './engine/engine-client';
 import { createEngineStore } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
 import { attachDragDrop } from './input/dnd';
+import { createFontRegistry, type FontRegistry } from '@nge/core';
 import type { Command, Event } from './engine/types';
 import { topPos } from './engine/types';
-import AMIRI_URL from '../fonts/Amiri-Regular.ttf?url';
-import LIBERATION_URL from '../fonts/LiberationSans-Regular.ttf?url';
-import NOTO_URL from '../fonts/NotoNaskhArabic-Regular.ttf?url';
 import './styles/editor.css';
 import './styles/caret.css';
 import './styles/a11y.css';
-
-/* Amiri is a dual-script Naskh face — renders mixed Arabic/English from a
-   single face. The three families load under the ids the engine's font
-   picker resolves against (Backlog #9). */
-const AMIRI_ID = 'amiri';
-const FONT_URLS: ReadonlyArray<readonly [string, string]> = [
-    [AMIRI_ID, AMIRI_URL],
-    ['liberation', LIBERATION_URL],
-    ['noto-naskh', NOTO_URL],
-];
 
 /** Print → screen DPI conversion: 1 pt (engine) = 1/72 inch; 1 CSS px = 1/96
  *  inch; so `screen_dpi_scale = 96 / 72 = 4 / 3 ≈ 1.333`. Multiplied into
@@ -43,19 +31,25 @@ const FONT_URLS: ReadonlyArray<readonly [string, string]> = [
  *  follow-up — pre-fix the 595 × 842 page rendered tiny at ~75% zoom. */
 const SCREEN_DPI_SCALE = 4 / 3;
 
-/** Load the editor fonts and seed a blank A4 page. Runs on boot + recovery. */
-async function setupEngine(client: EngineClient): Promise<void> {
-    /* loadFont hands each buffer to the worker as a Transferable — zero-copy. */
-    for (const [id, url] of FONT_URLS) {
-        const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
-        await client.loadFont(id, bytes);
-    }
+/** Load the minimal default font set + seed a blank A4 page. Runs on boot
+ *  AND crash recovery, so it must (re)establish fonts from scratch each
+ *  time — `Command::Recover` wipes the engine's font map. */
+async function setupEngine(client: EngineClient, fonts: FontRegistry): Promise<void> {
+    /* Forget any resident-font flags (recovery wiped the engine's map),
+       then push only the manifest's minimal boot set — one Latin + one
+       dual-script Arabic. Every other declared font lazy-loads (JIT) the
+       first time it is picked in the toolbar. */
+    fonts.reset();
+    await fonts.loadDefaults();
+    /* `defaults[0]` is the manifest's seed/primary face (dual-script Amiri
+       so the mixed RTL seed text shapes from one face). */
+    const seedFont = fonts.defaults()[0] ?? 'amiri';
     await client.dispatch({
         type: 'RENDER_PAGE',
         /* Seed mixed Arabic/English so the pointer + selection overlays have
            BiDi text to hit-test against. */
         text: 'Hello world مرحبا بالعالم',
-        font_id: AMIRI_ID,
+        font_id: seedFont,
         base_direction: 'RTL',
         px_size: 24,
         line_height: 36,
@@ -131,6 +125,12 @@ export function App() {
     window.__engineClient = client;
     window.__dispatch = dispatch;
 
+    /* Data-driven font registry — single instance shared by the boot
+       sequence (loadDefaults) and the toolbar (JIT ensureFont) so a font
+       loaded by either path is cached once. Manifest: public/fonts.json. */
+    const fontRegistry = createFontRegistry(client);
+    window.__fontRegistry = fontRegistry;
+
     /* §9 store — mirrors engine SELECTION_CHANGED events into signals the
        caret + selection overlays render from. */
     const store = createEngineStore(client);
@@ -145,7 +145,7 @@ export function App() {
             window.__engineReady = true;
             window.__renderer = client.renderer;
         }
-        await setupEngine(client);
+        await setupEngine(client, fontRegistry);
         setBooting(false);
         window.__paintIdle = true;
         if (generation > 0) {
@@ -169,7 +169,11 @@ export function App() {
                 canvas mounts inside the shell's main grid track via
                 the children slot; `engineReady` gates the right-rail
                 snapshot calls so they don't fire before INIT. */}
-            <SdkShelf client={client} engineReady={() => !booting()}>
+            <SdkShelf
+                client={client}
+                fontRegistry={fontRegistry}
+                engineReady={() => !booting()}
+            >
                 <div class="editor-viewport">
                     {/* Phase 6c multi-canvas DOM — one `.editor-page` per
                         paginated page. Page 0 hosts the boot canvas (the

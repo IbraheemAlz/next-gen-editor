@@ -4,6 +4,32 @@
     gap: var(--nge-space-1);
 }
 
+.nge-font__familywrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+}
+
+/* JIT load spinner — sits over the select's trailing edge while a
+ * font's bytes are being fetched + pushed to the engine. */
+.nge-font__spinner {
+    position: absolute;
+    right: 22px;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--nge-color-border-strong);
+    border-top-color: var(--nge-color-primary);
+    border-radius: 50%;
+    animation: nge-font-spin 0.6s linear infinite;
+    pointer-events: none;
+}
+
+@keyframes nge-font-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
 .nge-font__family {
     height: 28px;
     padding: 0 var(--nge-space-2);

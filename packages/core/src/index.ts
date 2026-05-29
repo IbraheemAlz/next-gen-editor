@@ -22,6 +22,19 @@ export type { EditorCommands, ParagraphStyleId } from './createEditorCommands';
 export { createEditorState } from './createEditorState';
 export type { EditorState } from './createEditorState';
 
+export { createFontRegistry } from './createFontRegistry';
+export type {
+    FontRegistry,
+    FontDescriptor,
+    FontManifest,
+    FontLoadState,
+    FontEngine,
+    FontRegistryConfig,
+} from './createFontRegistry';
+
+export { FontRegistryProvider, useFontRegistry } from './FontRegistryProvider';
+export type { FontRegistryProviderProps } from './FontRegistryProvider';
+
 export type {
     EngineClientLike,
     EngineClientSnapshots,

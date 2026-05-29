@@ -18,7 +18,9 @@
 import { Show, type JSX, type Component } from 'solid-js';
 import {
     EngineProvider,
+    FontRegistryProvider,
     type EngineHandle,
+    type FontRegistry,
 } from '@nge/core';
 import {
     DevHud,
@@ -52,6 +54,10 @@ import '@nge/ui/theme.css';
 
 export interface SdkShelfProps {
     client: EngineClient;
+    /** Data-driven font registry — supplies the FontPickers dropdown and
+     *  the JIT loader. Shared with App's boot sequence so the resident-font
+     *  cache is one instance across boot + toolbar. */
+    fontRegistry: FontRegistry;
     /** Editor canvas + overlays mount here, inside the main grid track. */
     children: JSX.Element;
     /** True once the worker has finished INIT. Defaults to true if omitted
@@ -68,6 +74,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
 
     return (
         <EngineProvider client={handle}>
+          <FontRegistryProvider registry={props.fontRegistry}>
             <div class="nge-root nge-shell">
                 <header class="nge-shell__topbar">
                     <div class="nge-shell__toolbar-row">
@@ -113,6 +120,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 <DevHud pollMs={1000} />
                 <TrapOverlay />
             </div>
+          </FontRegistryProvider>
         </EngineProvider>
     );
 };

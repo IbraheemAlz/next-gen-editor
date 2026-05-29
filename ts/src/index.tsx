@@ -6,6 +6,7 @@
  *   - otherwise → mount the Solid editor app on #root. */
 import { render } from 'solid-js/web';
 import { App } from './App';
+import type { FontRegistry } from '@nge/core';
 import type { Command, Event } from './engine/types';
 import type { EngineClient } from './engine/engine-client';
 
@@ -31,6 +32,8 @@ declare global {
         __recovered?: boolean;
         /** Force a telemetry batch flush now (D5.7 debug + e2e hook). */
         __telemetryFlush?: () => Promise<void>;
+        /** Data-driven font registry (JIT loader; debug + e2e hook). */
+        __fontRegistry?: FontRegistry;
     }
 }
 
