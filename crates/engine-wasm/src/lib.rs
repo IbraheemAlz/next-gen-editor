@@ -1560,11 +1560,26 @@ fn paragraph_layout_key(
     h.finish()
 }
 
-/// OOXML twips → layout px at the current device scale. 1 CSS px = 15 twips
-/// (= 0.75 pt = 1/96 inch when DPI = 96); multiplying by `scale` lifts to
-/// device px, which is the unit layout / render operate in.
+/// OOXML twips → layout px, the single conversion every twips-valued
+/// geometry field (paragraph indents, paragraph spacing, table grid
+/// widths, cell padding, row heights) shares.
+///
+/// **20 twips = 1 pt.** The result is `pt * scale`, IDENTICAL to how every
+/// other geometry field reaches layout px — page margins and tab stops
+/// (`position_pt * scale`), font sizes, line height. `scale` carries the
+/// whole logical-pt → device-px factor: the 96/72 = 4/3 print-DPI lift
+/// **and** the HiDPI `devicePixelRatio` (the TS shell folds both into the
+/// `device_pixel_ratio` it seeds — `dpr * 4/3`), or `1.0` for PDF export
+/// (PDF user space is logical points).
+///
+/// Previously this divided by **15** (twips-per-CSS-px at 96 DPI), which
+/// silently baked a SECOND 4/3 on top of the one already in `scale` — so a
+/// 48 pt indent rendered 4/3 too wide (85.3 px instead of 64 px at
+/// `scale = 4/3`) and never lined up with a 48 pt margin. Dividing by 20
+/// (twips → pt) and letting `scale` do the pt → px lift removes the
+/// double-dip and unifies the math.
 fn twips_to_layout_px(twips: i32, scale: f32) -> f32 {
-    (twips as f32) / 15.0 * scale
+    (twips as f32) / 20.0 * scale
 }
 
 /// Phase 8a — walk every body paragraph in document order, mirror the
