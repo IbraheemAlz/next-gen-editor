@@ -52,12 +52,12 @@ pub fn highlight_color(name: &str) -> Option<[u8; 4]> {
 }
 
 pub fn family_from_docx(name: &str) -> Option<FontFamily> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "amiri" => Some(FontFamily::Amiri),
-        "liberation sans" | "liberation" => Some(FontFamily::LiberationSans),
-        "noto naskh arabic" => Some(FontFamily::NotoNaskhArabic),
-        _ => None,
-    }
+    /* Issue #23 — resolve the three seed faces by name and preserve every
+    other `<w:rFonts w:ascii>` value as a `Custom` face (verbatim display
+    string + slugified resolution id), so a custom font both renders (when
+    its id is loaded) and round-trips byte-identically. `None` only for an
+    empty name, which then parks in `raw_font_family`. */
+    FontFamily::from_display_name(name)
 }
 
 /// An OOXML toggle property: bare `<w:b/>` is on; `<w:b w:val="false"/>` off.

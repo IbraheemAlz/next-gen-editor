@@ -197,8 +197,22 @@ fn build_inline_style(s: &SpanStyle) -> String {
     if let Some(c) = s.bg_color {
         css.push_str(&format!("background-color:{};", color_to_hex(c)));
     }
-    if let Some(fam) = s.font_family {
-        css.push_str(&format!("font-family:{};", family_css_name(fam)));
+    if let Some(fam) = &s.font_family {
+        match fam {
+            /* Seed faces have known, CSS-safe names — emit bare (matches the
+            prior output + the round-trip expectation). */
+            FontFamily::Amiri | FontFamily::LiberationSans | FontFamily::NotoNaskhArabic => {
+                css.push_str(&format!("font-family:{};", family_css_name(fam)));
+            }
+            /* Issue #23 — a Custom face's display is an arbitrary author string;
+            quote + escape it like the raw branch so spaces/specials can't break
+            out of the `style="..."` attribute. */
+            FontFamily::Custom { .. } => {
+                css.push_str("font-family:\"");
+                escape_attr_into(family_css_name(fam), &mut css);
+                css.push_str("\";");
+            }
+        }
     } else if let Some(name) = s.raw_font_family.as_deref() {
         /* Raw font name: a `<w:rFonts w:ascii>` value the engine could not
         resolve to a loaded face. Quote so spaces/specials are safe. */
@@ -212,12 +226,8 @@ fn build_inline_style(s: &SpanStyle) -> String {
     css
 }
 
-fn family_css_name(f: FontFamily) -> &'static str {
-    match f {
-        FontFamily::Amiri => "Amiri",
-        FontFamily::LiberationSans => "Liberation Sans",
-        FontFamily::NotoNaskhArabic => "Noto Naskh Arabic",
-    }
+fn family_css_name(f: &FontFamily) -> &str {
+    f.display_name()
 }
 
 fn color_to_hex(c: [u8; 4]) -> String {
@@ -789,5 +799,49 @@ mod tests {
         ]));
         assert!(html.contains("font-family:Amiri;"));
         assert!(html.contains("font-family:\"Cambria\";"));
+    }
+
+    /* Issue #23 — a Custom (string-backed) face emits its display name QUOTED +
+    escaped, so a multi-word name is valid CSS and an attribute-significant char
+    can't break out of `style="..."`. Seed faces stay bare (asserted above). */
+    #[test]
+    fn custom_font_family_emits_quoted_and_escaped() {
+        let multiword = Paragraph {
+            text: "a".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 1,
+                style: SpanStyle {
+                    font_family: Some(FontFamily::Custom {
+                        id: "times-new-roman".into(),
+                        display: "Times New Roman".into(),
+                    }),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let nasty = Paragraph {
+            text: "b".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 1,
+                style: SpanStyle {
+                    font_family: Some(FontFamily::Custom {
+                        id: "weird".into(),
+                        display: "Ev\"il".into(),
+                    }),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let html = to_html_fragment(&doc_with(vec![
+            Block::Paragraph(multiword),
+            Block::Paragraph(nasty),
+        ]));
+        assert!(html.contains("font-family:\"Times New Roman\";"));
+        // The double-quote in the display is escaped, not left to close the attr.
+        assert!(html.contains("font-family:\"Ev&quot;il\";"));
     }
 }

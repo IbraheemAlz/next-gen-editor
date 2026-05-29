@@ -623,14 +623,127 @@ impl BlockPath {
     }
 }
 
-/// A selectable font family (Backlog #9). `engine-wasm` resolves it to a
-/// loaded font face when building layout style spans; the pure document model
-/// just stores the choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A selectable font family (Backlog #9 / core-engine issue #23). `engine-wasm`
+/// resolves it to a loaded font face when building layout style spans; the pure
+/// document model just stores the choice.
+///
+/// The three named variants are the engine's seed faces and keep their
+/// canonical asymmetric id ↔ display mappings ("liberation" ↔ "Liberation
+/// Sans"). [`Custom`](FontFamily::Custom) is the dynamic, string-backed slot:
+/// `id` is the FontStack resolution id + toolbar id (e.g. `"cairo"`), `display`
+/// is the verbatim `.docx`/CSS family name. Carrying both makes a document
+/// round-trip byte-identically while still letting the layout engine resolve
+/// the loaded face. `Custom` holds owned `String`s, so the enum is `Clone` but
+/// **not** `Copy` — pass it by reference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FontFamily {
     Amiri,
     LiberationSans,
     NotoNaskhArabic,
+    Custom { id: String, display: String },
+}
+
+impl FontFamily {
+    /// The FontStack resolution id + toolbar id. Named faces keep their
+    /// canonical lowercase-hyphenated id; a [`Custom`](FontFamily::Custom)
+    /// face returns its stored id verbatim.
+    pub fn id(&self) -> &str {
+        match self {
+            FontFamily::Amiri => "amiri",
+            FontFamily::LiberationSans => "liberation",
+            FontFamily::NotoNaskhArabic => "noto-naskh",
+            FontFamily::Custom { id, .. } => id,
+        }
+    }
+
+    /// Human-facing family name for `.docx` `<w:rFonts>` and CSS
+    /// `font-family`. A custom face returns the verbatim display string so a
+    /// document round-trips byte-identically.
+    pub fn display_name(&self) -> &str {
+        match self {
+            FontFamily::Amiri => "Amiri",
+            FontFamily::LiberationSans => "Liberation Sans",
+            FontFamily::NotoNaskhArabic => "Noto Naskh Arabic",
+            FontFamily::Custom { display, .. } => display,
+        }
+    }
+
+    /// Parse a toolbar / resolution id (e.g. `"amiri"`, `"cairo"`) into a
+    /// family. Unknown ids become a [`Custom`](FontFamily::Custom) face whose
+    /// display name is humanized from the id. Empty input yields `None`.
+    pub fn from_id(id: &str) -> Option<FontFamily> {
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        Some(match id.to_ascii_lowercase().as_str() {
+            "amiri" => FontFamily::Amiri,
+            "liberation" => FontFamily::LiberationSans,
+            "noto-naskh" => FontFamily::NotoNaskhArabic,
+            _ => FontFamily::Custom {
+                id: id.to_string(),
+                display: humanize_font_id(id),
+            },
+        })
+    }
+
+    /// Parse a display / `.docx` / CSS family name (e.g. `"Amiri"`,
+    /// `"Liberation Sans"`, `"Cairo"`) into a family. Unknown names become a
+    /// [`Custom`](FontFamily::Custom) face that preserves the **verbatim**
+    /// display string and derives a resolution id by slugifying it. Empty
+    /// input yields `None`.
+    ///
+    /// The trimmed, unquoted form is used **only** to match a seed face and to
+    /// derive the Custom id — the stored `display` is the caller's untouched
+    /// input. This is load-bearing for `.docx` byte-identity: the docx reader
+    /// (`format-docx`'s `family_from_docx`) passes the raw `<w:rFonts>`
+    /// attribute value, which must round-trip byte-for-byte (surrounding
+    /// whitespace and any literal quote characters included). The CSS parser,
+    /// where quoting/padding are syntax rather than data, pre-cleans the token
+    /// before calling (see `engine::html`'s `family_from_name`).
+    pub fn from_display_name(name: &str) -> Option<FontFamily> {
+        let key = name.trim().trim_matches(['"', '\'']).trim();
+        if key.is_empty() {
+            return None;
+        }
+        Some(match key.to_ascii_lowercase().as_str() {
+            "amiri" => FontFamily::Amiri,
+            "liberation sans" | "liberation" => FontFamily::LiberationSans,
+            "noto naskh arabic" | "noto-naskh" => FontFamily::NotoNaskhArabic,
+            _ => FontFamily::Custom {
+                id: slugify_font_name(key),
+                display: name.to_string(),
+            },
+        })
+    }
+}
+
+/// Humanize a font id into a display name: split on `-`, upper-case the first
+/// letter of each word. `"cairo"` → `"Cairo"`, `"noto-naskh-arabic"` →
+/// `"Noto Naskh Arabic"`.
+fn humanize_font_id(id: &str) -> String {
+    id.split('-')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Slugify a display name into a resolution id: lowercase, collapse whitespace
+/// runs to a single `-`. `"Cairo"` → `"cairo"`, `"Times New Roman"` →
+/// `"times-new-roman"`.
+fn slugify_font_name(name: &str) -> String {
+    name.trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// Underline decoration style — OOXML `<w:u w:val="…"/>` variants the
@@ -5186,6 +5299,103 @@ impl UndoStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* ---- issue #23: dynamic, string-backed FontFamily ------------- */
+
+    #[test]
+    fn font_family_named_ids_and_display_names() {
+        assert_eq!(FontFamily::Amiri.id(), "amiri");
+        assert_eq!(FontFamily::LiberationSans.id(), "liberation");
+        assert_eq!(FontFamily::NotoNaskhArabic.id(), "noto-naskh");
+        assert_eq!(FontFamily::Amiri.display_name(), "Amiri");
+        assert_eq!(FontFamily::LiberationSans.display_name(), "Liberation Sans");
+        assert_eq!(
+            FontFamily::NotoNaskhArabic.display_name(),
+            "Noto Naskh Arabic"
+        );
+    }
+
+    #[test]
+    fn font_family_from_id_resolves_named_and_custom() {
+        assert_eq!(FontFamily::from_id("amiri"), Some(FontFamily::Amiri));
+        assert_eq!(
+            FontFamily::from_id("noto-naskh"),
+            Some(FontFamily::NotoNaskhArabic)
+        );
+        // Unknown id → Custom, display humanized from the id.
+        assert_eq!(
+            FontFamily::from_id("cairo"),
+            Some(FontFamily::Custom {
+                id: "cairo".into(),
+                display: "Cairo".into()
+            })
+        );
+        assert_eq!(
+            FontFamily::from_id("times-new-roman"),
+            Some(FontFamily::Custom {
+                id: "times-new-roman".into(),
+                display: "Times New Roman".into()
+            })
+        );
+        assert_eq!(FontFamily::from_id(""), None);
+        assert_eq!(FontFamily::from_id("   "), None);
+    }
+
+    #[test]
+    fn font_family_from_display_name_resolves_named_and_custom() {
+        assert_eq!(
+            FontFamily::from_display_name("Liberation Sans"),
+            Some(FontFamily::LiberationSans)
+        );
+        assert_eq!(
+            FontFamily::from_display_name("\"Amiri\""),
+            Some(FontFamily::Amiri)
+        );
+        // Unknown display name → Custom, verbatim display + slugified id.
+        assert_eq!(
+            FontFamily::from_display_name("Cairo"),
+            Some(FontFamily::Custom {
+                id: "cairo".into(),
+                display: "Cairo".into()
+            })
+        );
+        // Verbatim display is preserved even when slugify→humanize would not
+        // recover the original casing — this is what guards docx byte-identity.
+        let dejavu = FontFamily::from_display_name("DejaVu Sans").unwrap();
+        assert_eq!(dejavu.display_name(), "DejaVu Sans");
+        assert_eq!(dejavu.id(), "dejavu-sans");
+        assert_eq!(FontFamily::from_display_name("   "), None);
+    }
+
+    #[test]
+    fn font_family_from_display_name_preserves_verbatim_display() {
+        // The display is stored VERBATIM (surrounding whitespace + quotes
+        // intact) while the resolution id is derived from the trimmed/unquoted
+        // key. This is what guards .docx `<w:rFonts>` byte-identity — the docx
+        // reader passes the raw attribute value and must not see it normalized.
+        let f = FontFamily::from_display_name("Calibri ").unwrap();
+        assert_eq!(f.display_name(), "Calibri ", "trailing space must survive");
+        assert_eq!(f.id(), "calibri", "id is the slugified, trimmed key");
+
+        // A name that literally contains quote characters is preserved too.
+        let q = FontFamily::from_display_name("\"Weird\" Font").unwrap();
+        assert_eq!(q.display_name(), "\"Weird\" Font");
+        // Leading/trailing quote+space are stripped only for the match key.
+        let amiri = FontFamily::from_display_name("  \"Amiri\"  ").unwrap();
+        assert_eq!(amiri, FontFamily::Amiri);
+    }
+
+    #[test]
+    fn font_family_custom_id_display_round_trip_via_methods() {
+        // A custom face's id and display survive the accessor methods intact —
+        // the layout/render boundary reads id(), the docx/CSS writer reads
+        // display_name().
+        let f = FontFamily::Custom {
+            id: "cairo".into(),
+            display: "Cairo".into(),
+        };
+        assert_eq!(FontFamily::from_id(f.id()), Some(f.clone()));
+    }
 
     /* ---- Sprint 9: plain-text flattening -------------------------- */
 

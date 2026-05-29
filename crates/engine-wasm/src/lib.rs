@@ -1038,22 +1038,15 @@ fn engine_align(a: BridgeAlignment) -> EngineAlignment {
 /// rasterize at device resolution (`default_size` arrives logical).
 /// Map a font family to its loaded font id. The TS shell loads each family
 /// under exactly this id (Backlog #9).
-fn font_family_id(family: EngineFontFamily) -> &'static str {
-    match family {
-        EngineFontFamily::Amiri => "amiri",
-        EngineFontFamily::LiberationSans => "liberation",
-        EngineFontFamily::NotoNaskhArabic => "noto-naskh",
-    }
+fn font_family_id(family: &EngineFontFamily) -> &str {
+    family.id()
 }
 
-/// Parse a toolbar font-family id back to the document-model enum.
+/// Parse a toolbar font-family id back to the document-model enum. Unknown ids
+/// (any font registered in `fonts.json` beyond the three seed faces) resolve to
+/// a `Custom` face rather than being dropped — issue #23.
 fn parse_font_family(id: &str) -> Option<EngineFontFamily> {
-    match id {
-        "amiri" => Some(EngineFontFamily::Amiri),
-        "liberation" => Some(EngineFontFamily::LiberationSans),
-        "noto-naskh" => Some(EngineFontFamily::NotoNaskhArabic),
-        _ => None,
-    }
+    EngineFontFamily::from_id(id)
 }
 
 /// Phase 7 — Word's default hyperlink character style colour, mirroring the
@@ -1286,6 +1279,7 @@ fn build_style_spans(
             font_family: run
                 .style
                 .font_family
+                .as_ref()
                 .map(font_family_id)
                 .map(str::to_string),
             caps_transform: false,
@@ -1440,7 +1434,11 @@ fn composition_layout_spans(
         underline: engine::UnderlineStyle::Single,
         strike: st.strike.unwrap_or(false),
         bg_color: st.bg_color,
-        font_family: st.font_family.map(font_family_id).map(str::to_string),
+        font_family: st
+            .font_family
+            .as_ref()
+            .map(font_family_id)
+            .map(str::to_string),
         caps_transform: false,
         baseline_shift_px: 0.0,
     });
@@ -5998,6 +5996,7 @@ impl Engine {
             /* The span's own family, else the document's default font id. */
             font_family: style
                 .font_family
+                .as_ref()
                 .map(font_family_id)
                 .map(str::to_string)
                 .or_else(|| self.layout_cfg.as_ref().map(|c| c.font_id.clone()))

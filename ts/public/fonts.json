@@ -1,9 +1,10 @@
 {
-  "$comment": "Single source of truth for the editor's font registry. Add a font by dropping its .ttf in public/fonts/ and appending an entry here — no code change. `defaults` lists the ids loaded at boot (keep this minimal: one Latin + one dual-script Arabic for a fast interactive boot); every other font lazy-loads (JIT) the first time it is picked. `defaults[0]` is the seed/primary face. URLs are relative to the document base, so they survive a deploy under a subpath. NOTE: until the engine's FontFamily widening lands (core-engine issue), only ids the engine resolves (amiri / liberation / noto-naskh) actually render when applied; new ids load into WASM but fall back at paint.",
+  "$comment": "Single source of truth for the editor's font registry. Add a font by dropping its .ttf in public/fonts/ and appending an entry here — no code change. `defaults` lists the ids loaded at boot (keep this minimal: one Latin + one dual-script Arabic for a fast interactive boot); every other font lazy-loads (JIT) the first time it is picked. `defaults[0]` is the seed/primary face. URLs are relative to the document base, so they survive a deploy under a subpath. As of issue #23 the engine's FontFamily is string-backed, so ANY id registered here renders when applied — the engine resolves the loaded face by id (no hardcoded allowlist). `cairo` is the worked example of a JIT, non-default custom font.",
   "defaults": ["amiri", "liberation"],
   "fonts": [
     { "id": "amiri", "label": "Amiri", "url": "fonts/Amiri-Regular.ttf", "scripts": ["arabic", "latin"] },
     { "id": "liberation", "label": "Liberation Sans", "url": "fonts/LiberationSans-Regular.ttf", "scripts": ["latin"] },
-    { "id": "noto-naskh", "label": "Noto Naskh Arabic", "url": "fonts/NotoNaskhArabic-Regular.ttf", "scripts": ["arabic"] }
+    { "id": "noto-naskh", "label": "Noto Naskh Arabic", "url": "fonts/NotoNaskhArabic-Regular.ttf", "scripts": ["arabic"] },
+    { "id": "cairo", "label": "Cairo", "url": "fonts/Cairo-Regular.ttf", "scripts": ["arabic", "latin"] }
   ]
 }

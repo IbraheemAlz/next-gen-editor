@@ -323,3 +323,65 @@ impl FontStack {
         self.faces.get(id).map(|f| f.as_ref())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /* Issue #23 — a dynamically-registered custom font (here `cairo`, the
+    `fonts.json` worked example) resolves by its string id for both Latin and
+    Arabic, proving the string-backed `FontFamily` reaches the layout engine's
+    real glyphs rather than falling back. The bytes are the committed Cairo
+    face under `ts/public/fonts/`. */
+    fn cairo_stack() -> FontStack {
+        let cairo = include_bytes!("../../../ts/public/fonts/Cairo-Regular.ttf").to_vec();
+        let liberation = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let mut faces: HashMap<FontId, Arc<LoadedFont>> = HashMap::new();
+        faces.insert(
+            "cairo".to_string(),
+            Arc::new(LoadedFont::parse("cairo".to_string(), cairo).expect("parse Cairo")),
+        );
+        faces.insert(
+            "liberation".to_string(),
+            Arc::new(
+                LoadedFont::parse("liberation".to_string(), liberation).expect("parse Liberation"),
+            ),
+        );
+        // `liberation` is the primary/fallback root — a correct resolve must
+        // pick `cairo` *because the family was requested*, not by fallback.
+        FontStack::from_faces(faces, "liberation")
+    }
+
+    #[test]
+    fn custom_font_parses_and_covers_scripts() {
+        let stack = cairo_stack();
+        let cairo = stack.face("cairo").expect("cairo loaded");
+        assert!(cairo.covers('A'), "Cairo should cover Latin");
+        assert!(cairo.covers('\u{0628}'), "Cairo should cover Arabic (ب)");
+    }
+
+    #[test]
+    fn custom_font_id_resolves_to_loaded_face() {
+        let stack = cairo_stack();
+        let (id, _face, synth) = stack
+            .resolve(Script::Latin, Some("cairo"), false, false)
+            .expect("resolve latin");
+        assert_eq!(id, "cairo", "explicit custom family must win for Latin");
+        assert!(!synth.faux_bold && !synth.faux_italic);
+
+        let (id, _face, _synth) = stack
+            .resolve(Script::Arabic, Some("cairo"), false, false)
+            .expect("resolve arabic");
+        assert_eq!(id, "cairo", "explicit custom family must win for Arabic");
+    }
+
+    #[test]
+    fn unknown_family_id_falls_back_not_panics() {
+        // A requested-but-unloaded id resolves through the fallback chain.
+        let stack = cairo_stack();
+        let (id, _f, _s) = stack
+            .resolve(Script::Latin, Some("not-loaded"), false, false)
+            .expect("resolve falls back");
+        assert!(id == "cairo" || id == "liberation");
+    }
+}

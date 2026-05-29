@@ -26,13 +26,12 @@
  * under a subpath (`/editor/`) works without absolute-path breakage — the
  * same discipline the worker's `?url` font imports follow.
  *
- * NOTE — engine apply-layer constraint: the bridge's `LOAD_FONT` is
- * string-keyed and accepts any id, but the engine's `FontFamily` enum
- * currently resolves only `amiri` / `liberation` / `noto-naskh` when a font
- * is *applied* to text. Loading a brand-new id succeeds (bytes land in the
- * WASM font map) but paint falls back until the enum is widened — tracked in
- * the core-engine "Widen engine::FontFamily" issue. This module is the full
- * data-driven half; the engine half is deferred.
+ * Engine apply-layer (issue #23, closed): the engine's `FontFamily` is now
+ * string-backed (`Custom { id, display }`), so applying ANY loaded id resolves
+ * the loaded face and paints it on every backend (Canvas2D, Vello, PDF) — no
+ * hard-coded allowlist. `LOAD_FONT` (string-keyed) + this registry + a widened
+ * `FontFamily` are now a complete data-driven pipeline end to end: drop a
+ * `.ttf`, append a manifest row, and the new face renders when picked.
  */
 import { createSignal, type Accessor } from 'solid-js';
 import { createStore } from 'solid-js/store';

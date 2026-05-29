@@ -56,27 +56,19 @@ fn border_style_from_css(token: &str) -> BorderStyle {
 
 /* ---- font family <-> CSS name ------------------------------------------ */
 
-fn family_name(f: FontFamily) -> &'static str {
-    match f {
-        FontFamily::Amiri => "Amiri",
-        FontFamily::LiberationSans => "Liberation Sans",
-        FontFamily::NotoNaskhArabic => "Noto Naskh Arabic",
-    }
+fn family_name(f: &FontFamily) -> &str {
+    f.display_name()
 }
 
 fn family_from_name(s: &str) -> Option<FontFamily> {
-    /* Accept the CSS name and the engine's loaded-font id alike. */
-    match s
-        .trim()
-        .trim_matches(['"', '\''])
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "amiri" => Some(FontFamily::Amiri),
-        "liberation sans" | "liberation" => Some(FontFamily::LiberationSans),
-        "noto naskh arabic" | "noto-naskh" => Some(FontFamily::NotoNaskhArabic),
-        _ => None,
-    }
+    /* Accept the CSS name, the engine's loaded-font id, and any custom face
+    name alike. CSS quoting + padding are syntax, not part of the family name,
+    so strip them here before delegating — `from_display_name` stores its input
+    verbatim (it must, for the docx reader's byte-identity), so the caller owns
+    CSS normalization. An empty token yields `None` so `find_map` falls through
+    to the next family in a comma list. */
+    let cleaned = s.trim().trim_matches(['"', '\'']).trim();
+    FontFamily::from_display_name(cleaned)
 }
 
 /* ---- colour helpers ---------------------------------------------------- */
@@ -143,8 +135,29 @@ fn style_attr(s: &SpanStyle) -> Option<String> {
     if let Some(c) = s.bg_color {
         css.push_str(&format!("background-color:{};", color_to_hex(c)));
     }
-    if let Some(f) = s.font_family {
-        css.push_str(&format!("font-family:{};", family_name(f)));
+    if let Some(f) = &s.font_family {
+        match f {
+            /* Seed faces have known, CSS-safe names — emit bare. */
+            FontFamily::Amiri | FontFamily::LiberationSans | FontFamily::NotoNaskhArabic => {
+                css.push_str(&format!("font-family:{};", family_name(f)));
+            }
+            /* Issue #23 — a Custom face's display is an arbitrary author string;
+            quote + escape attribute-significant chars so it can't break out of
+            the `style="..."` attribute. */
+            FontFamily::Custom { .. } => {
+                css.push_str("font-family:\"");
+                for c in family_name(f).chars() {
+                    match c {
+                        '&' => css.push_str("&amp;"),
+                        '<' => css.push_str("&lt;"),
+                        '>' => css.push_str("&gt;"),
+                        '"' => css.push_str("&quot;"),
+                        _ => css.push(c),
+                    }
+                }
+                css.push_str("\";");
+            }
+        }
     }
     if let Some(px) = s.font_size {
         css.push_str(&format!("font-size:{px}px;"));

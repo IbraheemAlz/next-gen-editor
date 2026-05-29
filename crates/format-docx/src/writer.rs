@@ -76,12 +76,8 @@ fn doc_has_inline_images(doc: &DocumentTree) -> bool {
     })
 }
 
-fn family_docx_name(f: FontFamily) -> &'static str {
-    match f {
-        FontFamily::Amiri => "Amiri",
-        FontFamily::LiberationSans => "Liberation Sans",
-        FontFamily::NotoNaskhArabic => "Noto Naskh Arabic",
-    }
+fn family_docx_name(f: &FontFamily) -> &str {
+    f.display_name()
 }
 
 /// XML-escape character data (`&`, `<`, `>`) into `out`. Quotes don't matter
@@ -113,6 +109,7 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
     `font_theme`. Emit whichever slots are populated. */
     let rfonts_name: Option<String> = style
         .font_family
+        .as_ref()
         .map(|f| family_docx_name(f).to_string())
         .or_else(|| style.raw_font_family.clone());
     if rfonts_name.is_some() || style.font_theme.is_some() {
@@ -1628,6 +1625,106 @@ mod tests {
             parsed.document.nth_paragraph(0).unwrap().style_at(1),
             styled
         );
+    }
+
+    /* Issue #23 — a custom (string-backed) font family survives a full
+    write → read cycle, resolves to a `Custom` face on read, and re-saves to a
+    byte-identical `word/document.xml` (the verbatim display name is preserved
+    rather than dropped into `raw_font_family`). */
+    #[test]
+    fn round_trip_custom_font_family() {
+        let styled = SpanStyle {
+            font_family: Some(FontFamily::Custom {
+                id: "cairo".into(),
+                display: "Cairo".into(),
+            }),
+            ..Default::default()
+        };
+        let para = Paragraph {
+            text: "abc".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 3,
+                style: styled.clone(),
+            }],
+            props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
+            dirty: false,
+            source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
+            revisions: Vec::new(),
+            fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("read");
+        // Resolves to the Custom face — not parked in `raw_font_family`.
+        assert_eq!(
+            parsed.document.nth_paragraph(0).unwrap().style_at(1),
+            styled
+        );
+        assert!(
+            parsed
+                .document
+                .nth_paragraph(0)
+                .unwrap()
+                .style_at(1)
+                .raw_font_family
+                .is_none()
+        );
+        // Re-save is byte-identical: the verbatim "Cairo" round-trips.
+        let resaved = build_minimal_docx(&parsed.document).expect("re-build");
+        assert_eq!(bytes, resaved);
+    }
+
+    /* Issue #23 regression — a custom `<w:rFonts>` name carrying surrounding
+    whitespace must round-trip BYTE-IDENTICALLY. `FontFamily::from_display_name`
+    stores the verbatim display (it trims only to derive the resolution id), so
+    a trailing space survives read → re-save. Before the fix the reader trimmed
+    the stored display and the re-save dropped the space. */
+    #[test]
+    fn round_trip_custom_font_family_preserves_surrounding_whitespace() {
+        let styled = SpanStyle {
+            font_family: Some(FontFamily::Custom {
+                id: "calibri".into(),
+                display: "Calibri ".into(), // trailing space is data, not noise
+            }),
+            ..Default::default()
+        };
+        let para = Paragraph {
+            text: "abc".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 3,
+                style: styled.clone(),
+            }],
+            props: ParaProperties::default(),
+            list_item: None,
+            resolved_marker: None,
+            dirty: false,
+            source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
+            revisions: Vec::new(),
+            fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("read");
+        // The reader reconstructs the same Custom face, trailing space intact.
+        assert_eq!(
+            parsed.document.nth_paragraph(0).unwrap().style_at(1),
+            styled
+        );
+        // And a regenerated re-save is byte-identical — no whitespace drift.
+        let resaved = build_minimal_docx(&parsed.document).expect("re-build");
+        assert_eq!(bytes, resaved);
     }
 
     #[test]
