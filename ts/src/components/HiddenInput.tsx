@@ -16,9 +16,10 @@ function mapInputEventToCommand(e: InputEvent, caret: LogicalPos): Command | nul
     switch (e.inputType) {
         case 'insertText':
             return e.data ? { type: 'INSERT_TEXT', at: caret, text: e.data } : null;
-        /* A <textarea> fires `insertLineBreak` for Enter (and Shift+Enter);
-           `insertParagraph` is contenteditable semantics. The document model
-           has only paragraphs, so both split. */
+        /* A <textarea> fires `insertLineBreak` for Enter; Shift+Enter is
+           intercepted earlier in `onKeyDown` (soft break) and never reaches
+           here. `insertParagraph` is contenteditable semantics. The document
+           model has only paragraphs, so a hard Enter splits the block. */
         case 'insertParagraph':
         case 'insertLineBreak':
             return { type: 'SPLIT_PARAGRAPH', at: caret };
@@ -157,6 +158,34 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
                 direction: e.shiftKey ? 'PrevCell' : 'NextCell',
                 extend: false,
             });
+            return;
+        }
+
+        /* Shift+Enter — SOFT break. A <textarea> fires `insertLineBreak`
+           for both Enter and Shift+Enter, so the two are indistinguishable
+           at `beforeinput`; catch the soft break here (where `shiftKey` is
+           visible), insert a U+2028 LINE SEPARATOR into the run (no
+           paragraph split — the layout engine forces a new line on it),
+           and preventDefault so the textarea's `insertLineBreak` does NOT
+           also fire and split the paragraph. Plain Enter falls through to
+           `onBeforeInput` → SPLIT_PARAGRAPH. Modifier+Enter (Ctrl/Alt) is
+           left to its existing path. */
+        if (
+            e.key === 'Enter' &&
+            e.shiftKey &&
+            !e.ctrlKey &&
+            !e.metaKey &&
+            !e.altKey
+        ) {
+            e.preventDefault();
+            const caret = props.store.caretLogical();
+            if (caret) {
+                void props.client.dispatch({
+                    type: 'INSERT_TEXT',
+                    at: caret,
+                    text: '\u2028',
+                });
+            }
             return;
         }
 

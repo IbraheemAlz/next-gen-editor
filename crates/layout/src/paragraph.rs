@@ -186,12 +186,11 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         let (ascent, descent) = line_extents(&line, cfg.fonts, cfg.line_height);
         /* First-line indent / hanging: hanging shifts the first line *back*
         toward the leading edge; firstLine shifts it *forward* into the body.
-        Both already in layout px. Subsequent lines hug `leading_off`. */
-        let first_line_extra = if i == 0 {
-            cfg.first_line_indent_px - cfg.hanging_indent_px
-        } else {
-            0.0
-        };
+        Both already in layout px. Subsequent lines — soft-wrapped OR forced
+        by a soft break (Shift+Enter) — hug `leading_off` (the Golden Rule;
+        see `first_line_offset_px`). */
+        let first_line_extra =
+            first_line_offset_px(i, cfg.first_line_indent_px, cfg.hanging_indent_px);
         let inner_origin = alignment_origin_x(
             line.width,
             (content_width - first_line_extra).max(0.0),
@@ -650,14 +649,113 @@ fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32) -> (f32, f3
 /// not the O(breaks²) of re-measuring every growing prefix. Segment widths
 /// sum cleanly because break opportunities fall on spaces, where no ligature,
 /// kerning or cursive join crosses the boundary.
+/// Leading-edge offset applied to one line for `<w:ind w:firstLine>` /
+/// `<w:hanging>`.
+///
+/// **The Golden Rule.** The first-line indent (and the hanging pull-back)
+/// apply to the paragraph's absolute first line ONLY — visual index 0.
+/// Every continuation line — whether produced by soft wrapping or by an
+/// explicit soft break (Shift+Enter, U+2028) — hugs `indent_start` and
+/// receives zero first-line offset, mirroring Word / Google Docs. This is
+/// a pure function of the visual line index so the rule is unit-testable
+/// without shaping a single glyph.
+fn first_line_offset_px(line_index: usize, first_line_px: f32, hanging_px: f32) -> f32 {
+    if line_index == 0 {
+        first_line_px - hanging_px
+    } else {
+        0.0
+    }
+}
+
 fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
     if cfg.text.is_empty() {
         return vec![];
     }
     let breaks = break_opportunities(cfg.text);
+    let segments = soft_break_segments(cfg.text);
+
+    /* Fast path — no soft break (the overwhelmingly common case). One hard
+    segment spanning the whole text; delegate straight to the width-breaker
+    so output stays byte-identical to the pre-soft-break composer and the
+    visual-diff goldens hold at 0.000 %. */
+    if segments.len() == 1 {
+        return compose_width_lines(cfg, &breaks, 0, cfg.text.len());
+    }
+
+    /* Each U+2028 LINE SEPARATOR (inserted by Shift+Enter) forces a line
+    break WITHOUT splitting the paragraph block. Width-break every hard
+    segment independently and concatenate. The separator is excluded from
+    every segment's byte range (see `soft_break_segments`), so it never
+    shapes to a glyph. The line that ends a non-final segment ended at an
+    explicit break, not a width fill — flag it `broke == false` so justify
+    leaves it ragged (same treatment as a paragraph's final line). The key
+    consequence for indentation: every line a soft break produces lands at
+    visual index `i > 0` in `layout_paragraph`, so `first_line_indent`
+    applies to the paragraph's absolute first line only. */
+    let mut lines: Vec<(LineBox, bool)> = vec![];
+    let last_seg = segments.len() - 1;
+    for (si, &(lo, hi)) in segments.iter().enumerate() {
+        let mut seg_lines = compose_width_lines(cfg, &breaks, lo, hi);
+        if seg_lines.is_empty() {
+            /* Empty hard segment (doubled separators, or a soft break at the
+            very start / end) — emit a zero-width placeholder line so the
+            caret can rest on the blank line. */
+            seg_lines.push((build_line(cfg, lo, hi), false));
+        }
+        if si != last_seg {
+            if let Some(last_line) = seg_lines.last_mut() {
+                last_line.1 = false;
+            }
+        }
+        lines.extend(seg_lines);
+    }
+    lines
+}
+
+/// Rendered byte-ranges of `text`, split at each U+2028 LINE SEPARATOR
+/// (the soft-break character a Shift+Enter inserts). The separator itself
+/// is excluded from every range so [`build_line`] never shapes it to a
+/// glyph. Always returns at least one range; a trailing or doubled
+/// separator yields an empty range so the caret can rest on the blank
+/// line it produces. With no separator present the result is the single
+/// range `[(0, text.len())]` — the composer's fast path.
+fn soft_break_segments(text: &str) -> Vec<(usize, usize)> {
+    const LINE_SEP: char = '\u{2028}';
+    let sep_len = LINE_SEP.len_utf8();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0_usize;
+    for (pos, _) in text.match_indices(LINE_SEP) {
+        out.push((seg_start, pos));
+        seg_start = pos + sep_len;
+    }
+    out.push((seg_start, text.len()));
+    out
+}
+
+/// Greedy width-based line breaking over the byte range `[lo, hi)` of
+/// `cfg.text`, using the precomputed `breaks` (UAX #14 opportunities over
+/// the whole text, filtered to this range). Returns each line paired with
+/// whether it ended at a break opportunity (`true`) rather than the end of
+/// the range (`false`) — only opportunity-broken non-final lines are
+/// justified.
+///
+/// Each inter-break segment is measured exactly once and accumulated into a
+/// running line total — so the greedy walk is O(breaks) per range, not the
+/// O(breaks²) of re-measuring every growing prefix. Segment widths sum
+/// cleanly because break opportunities fall on spaces, where no ligature,
+/// kerning or cursive join crosses the boundary.
+fn compose_width_lines(
+    cfg: &ParagraphConfig<'_>,
+    breaks: &[usize],
+    lo: usize,
+    hi: usize,
+) -> Vec<(LineBox, bool)> {
+    if lo >= hi {
+        return vec![];
+    }
 
     let mut lines: Vec<(LineBox, bool)> = vec![];
-    let mut start = 0_usize;
+    let mut start = lo;
     let mut last_fit_end = start;
     /* `line_width` is the accumulated width of `[start..seg_from]` — the run
     of segments already accepted onto the current line. */
@@ -665,7 +763,10 @@ fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
     let mut line_width = 0.0_f32;
 
     for &b in breaks.iter() {
-        if b <= start {
+        /* Bound the opportunities to this hard segment: anything at or
+        before the line start is behind us; anything past `hi` belongs to
+        a later segment (a soft break splits them). */
+        if b <= start || b > hi {
             continue;
         }
         let seg_width = measure_text(
@@ -705,11 +806,11 @@ fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
         }
     }
 
-    if start < cfg.text.len() {
+    if start < hi {
         /* The final tail may itself overflow (e.g. a giant trailing
         URL) — keep force-breaking until it fits. */
-        while start < cfg.text.len() {
-            let end = cfg.text.len();
+        while start < hi {
+            let end = hi;
             let w = measure_text(
                 cfg.fonts,
                 &cfg.text[start..end],
@@ -1252,6 +1353,58 @@ fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &Fon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LINE_SEP: &str = "\u{2028}";
+
+    #[test]
+    fn soft_break_segments_no_separator_is_single_full_range() {
+        /* The fast path: text without a soft break yields exactly one
+        range spanning the whole string, so `compose_lines` delegates
+        straight to the width-breaker — byte-identical to the old path. */
+        assert_eq!(soft_break_segments("hello world"), vec![(0, 11)]);
+        assert_eq!(soft_break_segments(""), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn soft_break_segments_splits_and_excludes_separator() {
+        /* "a\u{2028}b": separator is 3 bytes at offset 1. Rendered ranges
+        are [0,1) = "a" and [4,5) = "b" — the separator bytes [1,4) are
+        excluded from BOTH, so it never shapes to a glyph. */
+        let s = format!("a{LINE_SEP}b");
+        assert_eq!(soft_break_segments(&s), vec![(0, 1), (4, 5)]);
+    }
+
+    #[test]
+    fn soft_break_segments_trailing_separator_adds_empty_range() {
+        /* "a\u{2028}" → "a" then an EMPTY range so a blank line exists for
+        the caret to rest on after the break. */
+        let s = format!("a{LINE_SEP}");
+        assert_eq!(soft_break_segments(&s), vec![(0, 1), (4, 4)]);
+    }
+
+    #[test]
+    fn soft_break_segments_leading_and_doubled_separators_are_empty_ranges() {
+        /* Leading break → empty first range. */
+        let lead = format!("{LINE_SEP}b");
+        assert_eq!(soft_break_segments(&lead), vec![(0, 0), (3, 4)]);
+        /* Doubled break → empty middle range (a blank line between). */
+        let doubled = format!("a{LINE_SEP}{LINE_SEP}b");
+        assert_eq!(soft_break_segments(&doubled), vec![(0, 1), (4, 4), (7, 8)]);
+    }
+
+    #[test]
+    fn first_line_offset_applies_to_absolute_first_line_only() {
+        /* THE GOLDEN RULE. Line 0 gets the full first-line indent (minus
+        any hanging); every later line — soft-wrapped OR forced by a soft
+        break — gets exactly zero, so it hugs `indent_start`. */
+        assert_eq!(first_line_offset_px(0, 20.0, 0.0), 20.0);
+        assert_eq!(first_line_offset_px(1, 20.0, 0.0), 0.0);
+        assert_eq!(first_line_offset_px(2, 20.0, 0.0), 0.0);
+        /* Hanging indent: line 0 pulls BACK by the hanging amount; later
+        lines still get zero offset (they sit at `indent_start`). */
+        assert_eq!(first_line_offset_px(0, 0.0, 18.0), -18.0);
+        assert_eq!(first_line_offset_px(1, 0.0, 18.0), 0.0);
+    }
 
     #[test]
     fn transform_for_shape_noop_borrows() {

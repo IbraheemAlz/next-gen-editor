@@ -103,6 +103,17 @@ export interface EditorCommands {
     replaceRange(range: LogicalRange, text: string): Promise<Event>;
     deleteAtCaret(forward: boolean, byWord?: boolean): Promise<Event>;
     splitParagraph(at: LogicalPos): Promise<Event>;
+    /**
+     * Insert a soft line break (Shift+Enter) at `at` (defaults to the
+     * current caret). A soft break wraps to the next line WITHOUT
+     * splitting the paragraph block — it inserts a U+2028 LINE SEPARATOR
+     * into the existing text run, so the layout engine forces a new line
+     * there while keeping one paragraph. The first-line indent applies to
+     * the paragraph's absolute first line only, so the soft-broken
+     * continuation hugs the left indent (Word / Google Docs behaviour).
+     * Contrast `splitParagraph`, which creates a new paragraph block.
+     */
+    insertSoftBreak(at?: LogicalPos): Promise<Event>;
 
     /* Selection */
     selectAll(): Promise<Event>;
@@ -324,6 +335,11 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
         deleteAtCaret: (forward, by_word = false) =>
             dispatch({ type: 'DELETE_AT_CARET', forward, by_word }),
         splitParagraph: (at) => dispatch({ type: 'SPLIT_PARAGRAPH', at }),
+        /* U+2028 LINE SEPARATOR — the engine's `insert_text` splices it into
+         * the paragraph's text run (no block split), and the layout engine
+         * forces a line break on it (see `paragraph.rs` `soft_break_segments`). */
+        insertSoftBreak: (at) =>
+            dispatch({ type: 'INSERT_TEXT', at: at ?? currentCaret(), text: '\u2028' }),
 
         selectAll: () => dispatch({ type: 'SELECT_ALL' }),
         setSelection: (range, caret) => dispatch({ type: 'SET_SELECTION', range, caret }),
