@@ -161,7 +161,13 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     with `leading_off` when the indents were symmetric. */
     let pre_alignment_leading_off = cfg.indent_start_px;
     for (line, _) in composed.iter_mut() {
-        apply_tab_advances(line, cfg.text, cfg.tab_stops_px, pre_alignment_leading_off);
+        apply_tab_advances(
+            line,
+            cfg.text,
+            cfg.tab_stops_px,
+            pre_alignment_leading_off,
+            cfg.base_direction,
+        );
     }
 
     /* Justify every line except the last and any hard-broken (overflow) line. */
@@ -429,17 +435,20 @@ const MIN_TAB_FILL_PX: f32 = 4.0;
 // which equals `pen − leading_off_px`) so downstream justify / alignment
 // math operates on visual width.
 //
-// Known limitation (issue #20 — directional mirror): the Center / Right /
-// Decimal *anchor* alignment is correct for a contiguous logical block, but
-// when the following segment embeds an opposite-direction run (e.g. an LTR
-// decimal number inside an RTL paragraph) the interior anchor (`.`, midpoint)
-// does not yet mirror onto the correct visual side. Left tabs — the common
-// case and the one the RTL explosion bug hit — are fully correct.
+// Interior-anchor directional mirror (issue #20): the alignment anchor of a
+// Center / Right / Decimal tab is measured along the segment's READING axis
+// from its leading edge, then placed via the same telescoping identity the
+// Left tab uses. For a Decimal tab the separator is an INTERIOR point of the
+// following segment, so its offset is measured in VISUAL order and mirrored
+// for RTL (`compute_tab_advance`) — without that the `.` of an LTR number
+// embedded in RTL text landed ~1 glyph-width short of the stop. `base_dir`
+// is the paragraph base direction (threaded from `cfg.base_direction`).
 fn apply_tab_advances(
     line: &mut LineBox,
     para_text: &str,
     tab_stops_px: &[(f32, TabKind)],
     leading_off_px: f32,
+    base_dir: ShapingDirection,
 ) {
     if !para_text.contains('\u{0009}') {
         line.width = line_advance(&line.runs);
@@ -466,12 +475,16 @@ fn apply_tab_advances(
         .collect();
     order.sort_by_key(|&(_, _, c)| c);
 
+    let ctx = TabCtx {
+        order: &order,
+        bytes,
+        base_dir,
+    };
     let mut pen = leading_off_px;
-    for k in 0..order.len() {
-        let (ri, gi, abs) = order[k];
+    for (k, &(ri, gi, abs)) in order.iter().enumerate() {
         if is_tab(abs) {
             let (stop_pos, stop_kind) = next_tab_stop_after(pen, tab_stops_px);
-            let advance = compute_tab_advance(pen, stop_pos, stop_kind, line, &order, k, bytes);
+            let advance = compute_tab_advance(pen, stop_pos, stop_kind, line, k, &ctx);
             line.runs[ri].glyphs[gi].x_advance = advance;
             pen += advance;
         } else {
@@ -481,63 +494,113 @@ fn apply_tab_advances(
     line.width = (pen - leading_off_px).max(0.0);
 }
 
-/// L2.1 (#6) — compute the `x_advance` for the tab glyph at logical index
-/// `tab_k` (into `order`) sitting at logical pen `pen`, targeting `stop_pos`
-/// with geometric kind `stop_kind`. For non-`Left` kinds, walks forward in
-/// LOGICAL order (from `tab_k + 1` to the next tab, or end of line) to
-/// measure the following segment's advance and — for `Decimal` — the offset
-/// of its first `.`/`,` separator. `order` is the `(run, glyph, absolute
-/// cluster)` reading-order index built by [`apply_tab_advances`].
+/// Read-only context threaded into [`compute_tab_advance`]: the logical-order
+/// glyph index, the paragraph byte buffer, and the base direction. Bundled so
+/// the helper stays within the argument-count lint while the (mutable) line
+/// is borrowed only per-call.
+struct TabCtx<'a> {
+    order: &'a [(usize, usize, usize)],
+    bytes: &'a [u8],
+    base_dir: ShapingDirection,
+}
+
+/// L2.1 (#6) / issue #20 — compute the `x_advance` for the tab glyph at
+/// logical index `tab_k` (into `ctx.order`) sitting at logical pen `pen`,
+/// targeting `stop_pos` with geometric kind `stop_kind`.
+///
+/// The non-`Left` kinds align an *anchor* of the logically-following segment
+/// (the content from `tab_k + 1` to the next tab, or end of line) to the
+/// stop:
+///
+/// * `Right` — the segment's reading-trailing edge.
+/// * `Center` — the segment's midpoint.
+/// * `Decimal` — the segment's first `.`/`,` separator (falls back to
+///   `Right` when absent).
+///
+/// **Directional mirror.** The segment's reading-LEADING edge (adjacent to
+/// the tab) lands at `box_x = pen + A` (LTR, physical-left) /
+/// `max_width − (pen + A)` (RTL, physical-right) — the telescoping identity
+/// the Left tab uses. So the advance only needs the anchor's offset *along
+/// the reading axis* from that leading edge: `A = stop − pen − anchor_off`.
+///
+/// `Right` (`segment_advance`) and `Center` (`segment_advance / 2`) offsets
+/// are direction-symmetric. The `Decimal` separator is an INTERIOR point, so
+/// its offset is measured in VISUAL order (`visual_pre` = advances of segment
+/// glyphs visually-left of the `.`) and mirrored for RTL: the reading-leading
+/// edge is the physical-RIGHT, so the offset is the complement
+/// `segment_advance − visual_pre`. The pre-fix code used the LOGICAL pre-`.`
+/// advance, which equals `visual_pre` only when the number runs in the base
+/// direction — an LTR number embedded in RTL drifted by the post-`.` span.
+///
+/// `ctx.order` is the `(run, glyph, absolute cluster)` reading-order index
+/// built by [`apply_tab_advances`]; `line.runs` is in VISUAL order, so a
+/// glyph's `(run, glyph)` locator compares lexicographically as its visual
+/// position.
 fn compute_tab_advance(
     pen: f32,
     stop_pos: f32,
     stop_kind: TabKind,
     line: &LineBox,
-    order: &[(usize, usize, usize)],
     tab_k: usize,
-    bytes: &[u8],
+    ctx: &TabCtx<'_>,
 ) -> f32 {
     if matches!(stop_kind, TabKind::Left) {
         return (stop_pos - pen).max(MIN_TAB_FILL_PX);
     }
 
+    let want_decimal = matches!(stop_kind, TabKind::Decimal);
     let mut segment_advance = 0.0_f32;
-    let mut decimal_offset: Option<f32> = None;
-    let mut found_decimal = false;
-    /* Walk forward in LOGICAL order from the glyph after this tab, summing
-    advances until the next tab (exclusive) or the end of the line. Using
-    `order` rather than the raw run/glyph nesting is what makes multi-tab
-    RTL / mixed-bidi lines measure the correct logical segment (the
-    visually-next tab is the logically-PREVIOUS one in RTL). */
-    for &(ri, gi, abs) in &order[tab_k + 1..] {
-        if bytes.get(abs).copied() == Some(b'\t') {
+    /* Visual locators + advances of the following segment's glyphs (only
+    collected when needed — Decimal — to find the `.`'s visual offset). */
+    let mut seg: Vec<(usize, usize, f32)> = Vec::new();
+    let mut dot: Option<(usize, usize)> = None;
+    /* Walk forward in LOGICAL order from the glyph after this tab, until the
+    next tab (exclusive) or end of line. Using `order` (not the raw run/glyph
+    nesting) is what makes multi-tab RTL / mixed-bidi lines measure the
+    correct logical segment — the visually-next tab is the logically-PREVIOUS
+    one in RTL. */
+    for &(ri, gi, abs) in &ctx.order[tab_k + 1..] {
+        if ctx.bytes.get(abs).copied() == Some(b'\t') {
             break;
         }
-        let g = &line.runs[ri].glyphs[gi];
-        /* `Decimal` records the cumulative advance up to (but not including)
-        the first `.` or `,` glyph. */
-        if !found_decimal && matches!(stop_kind, TabKind::Decimal) {
-            let ch = bytes.get(abs).copied();
-            if ch == Some(b'.') || ch == Some(b',') {
-                decimal_offset = Some(segment_advance);
-                found_decimal = true;
+        let adv = line.runs[ri].glyphs[gi].x_advance;
+        if want_decimal {
+            if dot.is_none() {
+                let ch = ctx.bytes.get(abs).copied();
+                if ch == Some(b'.') || ch == Some(b',') {
+                    dot = Some((ri, gi));
+                }
             }
+            seg.push((ri, gi, adv));
         }
-        segment_advance += g.x_advance;
+        segment_advance += adv;
     }
 
-    let advance = match stop_kind {
-        TabKind::Left => stop_pos - pen,
-        TabKind::Center => stop_pos - pen - segment_advance / 2.0,
-        TabKind::Right => stop_pos - pen - segment_advance,
-        TabKind::Decimal => match decimal_offset {
-            Some(d) => stop_pos - pen - d,
-            /* Fallback: behave like Right when the segment has no
-            decimal separator (Word's documented fallback). */
-            None => stop_pos - pen - segment_advance,
+    let rtl = matches!(ctx.base_dir, ShapingDirection::Rtl);
+    /* Offset of the alignment anchor from the segment's reading-leading edge. */
+    let anchor_off = match stop_kind {
+        TabKind::Left => 0.0, // unreachable — early return above.
+        TabKind::Right => segment_advance,
+        TabKind::Center => segment_advance / 2.0,
+        TabKind::Decimal => match dot {
+            Some(dloc) => {
+                let visual_pre: f32 = seg
+                    .iter()
+                    .filter(|&&(ri, gi, _)| (ri, gi) < dloc)
+                    .map(|&(_, _, adv)| adv)
+                    .sum();
+                if rtl {
+                    segment_advance - visual_pre
+                } else {
+                    visual_pre
+                }
+            }
+            /* No separator → Word's documented fallback to Right semantics. */
+            None => segment_advance,
         },
     };
-    advance.max(MIN_TAB_FILL_PX)
+
+    (stop_pos - pen - anchor_off).max(MIN_TAB_FILL_PX)
 }
 
 /// Audit gap A.M3 / L2.1 (#6) — choose the next tab stop strictly past
@@ -1546,7 +1609,7 @@ mod tests {
         position 100. */
         let mut line = line_with_glyphs("\tA", &[(0, 0.0), (1, 10.0)]);
         let stops = [(100.0_f32, TabKind::Left)];
-        apply_tab_advances(&mut line, "\tA", &stops, 20.0);
+        apply_tab_advances(&mut line, "\tA", &stops, 20.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[0].x_advance;
         assert_close(tab_adv, 80.0, "tab fills from 20 to 100");
@@ -1572,7 +1635,7 @@ mod tests {
             ],
         );
         let stops = [(100.0_f32, TabKind::Center)];
-        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0);
+        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
         assert_close(tab_adv, 70.0, "Center: tab fills to stop - w/2");
@@ -1598,7 +1661,7 @@ mod tests {
             ],
         );
         let stops = [(100.0_f32, TabKind::Right)];
-        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0);
+        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
         assert_close(tab_adv, 50.0, "Right: tab fills to stop - w");
@@ -1624,7 +1687,7 @@ mod tests {
             ],
         );
         let stops = [(100.0_f32, TabKind::Decimal)];
-        apply_tab_advances(&mut line, "X\t12.5", &stops, 0.0);
+        apply_tab_advances(&mut line, "X\t12.5", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
         assert_close(tab_adv, 70.0, "Decimal: tab fills to stop - decimal_offset");
@@ -1650,7 +1713,7 @@ mod tests {
             ],
         );
         let stops = [(100.0_f32, TabKind::Decimal)];
-        apply_tab_advances(&mut line, "X\thello", &stops, 0.0);
+        apply_tab_advances(&mut line, "X\thello", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
         assert_close(
@@ -1676,7 +1739,7 @@ mod tests {
             ],
         );
         let stops = [(15.0_f32, TabKind::Center)];
-        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0);
+        apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
         assert_close(tab_adv, MIN_TAB_FILL_PX, "overflow clamps to min fill");
@@ -1692,7 +1755,7 @@ mod tests {
         B's width and the Left advance ballooned — the RTL tab explosion. */
         let mut line = line_with_glyphs("A\tB", &[(2, 40.0), (1, 0.0), (0, 10.0)]);
         let stops = [(100.0_f32, TabKind::Left)];
-        apply_tab_advances(&mut line, "A\tB", &stops, 0.0);
+        apply_tab_advances(&mut line, "A\tB", &stops, 0.0, ShapingDirection::Rtl);
 
         /* Tab glyph is at visual index 1. Logical pen at the tab = width of
         A (10), so fill = 100 - 10 = 90 — NOT 100 - 40 = 60 (the old bug). */
@@ -1714,7 +1777,7 @@ mod tests {
         visually-following glyph A. fill = stop(100) - pen(10) - 40 = 50. */
         let mut line = line_with_glyphs("A\tBC", &[(3, 20.0), (2, 20.0), (1, 0.0), (0, 10.0)]);
         let stops = [(100.0_f32, TabKind::Right)];
-        apply_tab_advances(&mut line, "A\tBC", &stops, 0.0);
+        apply_tab_advances(&mut line, "A\tBC", &stops, 0.0, ShapingDirection::Rtl);
 
         /* Tab glyph is at visual index 2. */
         let tab_adv = line.runs[0].glyphs[2].x_advance;
@@ -1722,6 +1785,91 @@ mod tests {
             tab_adv,
             50.0,
             "Right tab measures the logical-following segment BC",
+        );
+    }
+
+    /* Physical-left box-x of the glyph at visual index `idx` under RTL Start
+    alignment: the line right-flushes, so line-local 0 sits at
+    `content_width − line.width`. Single-run test lines only. */
+    fn rtl_start_glyph_left(line: &LineBox, idx: usize, content_width: f32) -> f32 {
+        let line_width: f32 = line.runs[0].glyphs.iter().map(|g| g.x_advance).sum();
+        let before: f32 = line.runs[0].glyphs[..idx].iter().map(|g| g.x_advance).sum();
+        (content_width - line_width) + before
+    }
+
+    #[test]
+    fn tab_decimal_mirrors_interior_anchor_for_rtl_embedded_ltr_number() {
+        /* Issue #20 — RTL Arabic "س" + tab + embedded LTR number "3.5",
+        Decimal tab @ 100 in a 200-wide content box. Post-BiDi visual order
+        is [3, ., 5, tab, س]; "3.5" is an LTR-internal run, so the decimal
+        separator is an INTERIOR anchor of an embedded run. Advances:
+        3=10, .=5, 5=10, س=10. Pre-fix used the LOGICAL pre-'.' advance (10)
+        → tab fill 80 → '.' landed at box-x 95, one glyph-width (5) short.
+        The fix measures the anchor in VISUAL order (visual_pre = 10) and
+        mirrors for RTL (anchor_off = 25 − 10 = 15) → fill = 100 − 10 − 15
+        = 75. */
+        let cw = 200.0_f32;
+        let stop = 100.0_f32;
+        let mut line = line_with_glyphs(
+            "س\t3.5",
+            &[(3, 10.0), (4, 5.0), (5, 10.0), (2, 0.0), (0, 10.0)],
+        );
+        apply_tab_advances(
+            &mut line,
+            "س\t3.5",
+            &[(stop, TabKind::Decimal)],
+            0.0,
+            ShapingDirection::Rtl,
+        );
+
+        /* Tab glyph is at visual index 3. */
+        assert_close(
+            line.runs[0].glyphs[3].x_advance,
+            75.0,
+            "RTL decimal tab fill",
+        );
+        /* Mathematical proof: the '.' (visual index 1) physical-left edge
+        must equal the stop column box-x = content_width − stop = 100. */
+        let dot_left = rtl_start_glyph_left(&line, 1, cw);
+        assert_close(
+            dot_left,
+            cw - stop,
+            "decimal separator lands at the stop column",
+        );
+    }
+
+    #[test]
+    fn tab_center_lands_segment_midpoint_for_rtl_embedded_ltr() {
+        /* Same RTL line, Center @ 100. The midpoint is direction-symmetric
+        (segment_advance / 2 from either edge), so it was already correct —
+        this locks that in. segment "3.5" advance = 25, anchor_off = 12.5,
+        fill = 100 − 10 − 12.5 = 77.5; the block's centre lands on the stop. */
+        let cw = 200.0_f32;
+        let stop = 100.0_f32;
+        let mut line = line_with_glyphs(
+            "س\t3.5",
+            &[(3, 10.0), (4, 5.0), (5, 10.0), (2, 0.0), (0, 10.0)],
+        );
+        apply_tab_advances(
+            &mut line,
+            "س\t3.5",
+            &[(stop, TabKind::Center)],
+            0.0,
+            ShapingDirection::Rtl,
+        );
+
+        assert_close(
+            line.runs[0].glyphs[3].x_advance,
+            77.5,
+            "RTL center tab fill",
+        );
+        /* Segment "3.5" is visual glyphs 0..3 (advance 25); its centre is at
+        its left edge + 12.5 and must sit on the stop column box-x = 100. */
+        let seg_center = rtl_start_glyph_left(&line, 0, cw) + 25.0 / 2.0;
+        assert_close(
+            seg_center,
+            cw - stop,
+            "segment midpoint lands at the stop column",
         );
     }
 
