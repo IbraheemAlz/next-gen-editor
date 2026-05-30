@@ -197,6 +197,14 @@ export const Ruler: Component<RulerProps> = (props) => {
     const geom = () => state.sectionGeometry();
     const isRtl = () => state.paragraphDirection() === 'Rtl';
 
+    /* Direction-aware marker tooltips. The handles edit LOGICAL indents
+     * (`<w:start>` / `<w:firstLine>`), so the label names the logical
+     * property and the physical edge it currently sits on — the start
+     * handle is on the RIGHT for an RTL paragraph. */
+    const firstLineLabel = () => 'First-line indent';
+    const startIndentLabel = () =>
+        isRtl() ? 'Start indent (leading — right edge)' : 'Left (start) indent';
+
     /** Content-area width in pt. */
     const contentWidthPt = () => {
         const g = geom();
@@ -556,11 +564,19 @@ export const Ruler: Component<RulerProps> = (props) => {
 
                 {/* Indent handles. Always at the leading edge so the
                  * ruler looks like Word's even before any indent value
-                 * is wired through SELECTION_CHANGED. */}
+                 * is wired through SELECTION_CHANGED. Tooltips use the
+                 * LOGICAL name (`start`, not `left`) and call out the
+                 * physical edge per direction — the start handle sits on
+                 * the RIGHT for an RTL paragraph (`<w:start>` is the
+                 * leading edge), so a hard-coded "Left indent" label
+                 * would mislead. Standard `title` attributes, matching
+                 * the toolbar's tooltip convention (no Tooltip component
+                 * exists in @nge/ui). */}
                 <div
                     class="nge-ruler__handle nge-ruler__handle--first-line"
                     role="slider"
-                    aria-label="First-line indent"
+                    aria-label={firstLineLabel()}
+                    title={firstLineLabel()}
                     aria-valuenow={liveFirstLinePt()}
                     style={{ left: `${contentPtToLeftPx(liveFirstLinePt())}px` }}
                     onPointerDown={(e) => onHandlePointerDown(e, 'first-line')}
@@ -570,7 +586,8 @@ export const Ruler: Component<RulerProps> = (props) => {
                 <div
                     class="nge-ruler__handle nge-ruler__handle--left-indent"
                     role="slider"
-                    aria-label="Left indent"
+                    aria-label={startIndentLabel()}
+                    title={startIndentLabel()}
                     aria-valuenow={liveLeftIndentPt()}
                     style={{ left: `${contentPtToLeftPx(liveLeftIndentPt())}px` }}
                     onPointerDown={(e) => onHandlePointerDown(e, 'left-indent')}
