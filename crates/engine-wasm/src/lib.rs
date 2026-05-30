@@ -2675,18 +2675,24 @@ fn collect_paragraph_line_geom(
     for line in &para_box.lines {
         let line_x = para_x + line.origin.x;
         let line_y = para_y + line.origin.y;
+        /* Empty lines (a trailing / doubled soft-break placeholder) carry no
+        runs, so fall back to the layout-supplied `source_start` instead of
+        byte 0. Without this the line reports [0, 0]; a caret at
+        `offset == text.len()` then brackets NO line and `caret_rect_geom`
+        snaps it back to the paragraph's first line — the trailing-soft-break
+        "caret doesn't drop" bug. */
         let start_byte = line
             .runs
             .iter()
             .map(|r| r.source_range.start)
             .min()
-            .unwrap_or(0);
+            .unwrap_or(line.source_start);
         let end_byte = line
             .runs
             .iter()
             .map(|r| r.source_range.end)
             .max()
-            .unwrap_or(0);
+            .unwrap_or(line.source_start);
         let runs = build_line_run_geom(line, line_x);
         let slots: Vec<CaretSlot> = runs.iter().flat_map(|r| r.slots.iter().copied()).collect();
         out.push(LineGeom {
@@ -7676,6 +7682,7 @@ mod tests {
             width: 27.0,
             runs: vec![run],
             alignment: Alignment::Start,
+            source_start: 0,
         };
         let geom = build_line_run_geom(&line, 0.0);
         assert_eq!(geom.len(), 1);

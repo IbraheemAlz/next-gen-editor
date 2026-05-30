@@ -1255,6 +1255,7 @@ mod tests {
                 width: 200.0,
                 runs: Vec::new(),
                 alignment: text_pipeline::Alignment::Start,
+                source_start: 0,
             });
         }
         ParagraphBox {
@@ -1377,6 +1378,7 @@ mod tests {
                 width: 200.0,
                 runs: Vec::new(),
                 alignment: text_pipeline::Alignment::Start,
+                source_start: 0,
             }],
             direction: ShapingDirection::Ltr,
             marker: None,

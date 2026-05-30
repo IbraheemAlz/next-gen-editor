@@ -158,6 +158,14 @@ pub struct LineBox {
     pub width: f32,
     pub runs: Vec<VisualRun>,
     pub alignment: Alignment,
+    /// Source byte offset where this line begins. Normally redundant with
+    /// `runs[0].source_range.start`, but load-bearing for EMPTY lines that
+    /// carry no runs — a trailing/doubled soft break (`U+2028`) emits a
+    /// runless placeholder line, and the caret/hit-test geometry needs its
+    /// true source offset to resolve a caret at `offset == text.len()` onto
+    /// it (otherwise an empty line reports byte 0 and the caret snaps back
+    /// to the paragraph's first line).
+    pub source_start: u32,
 }
 
 /// Phase 2 audit (gap D.1) — complex-field overlay propagated from the
