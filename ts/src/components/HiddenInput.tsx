@@ -148,16 +148,32 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
             return;
         }
 
-        /* Tab / Shift+Tab — cell-to-cell navigation inside a table. The
-           engine no-ops when the caret is not inside a table; Ctrl+Tab
-           still inserts a literal tab via the textarea's default. */
+        /* Tab — context-sensitive (Ctrl+Tab still falls through to the
+           textarea default). Inside a table cell it navigates cell-to-cell
+           (Shift+Tab = previous). In body text it inserts a real `\t`
+           (U+0009), which the layout engine then aligns to the paragraph's
+           ruler tab stops (or the default 0.5-inch grid). preventDefault
+           stops the browser stealing Tab for focus navigation. */
         if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey) {
             e.preventDefault();
-            void props.client.dispatch({
-                type: 'MOVE_CARET',
-                direction: e.shiftKey ? 'PrevCell' : 'NextCell',
-                extend: false,
-            });
+            const caret = props.store.caretLogical();
+            const inCell = !!caret && caret.path.steps.some((s) => s.kind === 'CELL');
+            if (inCell) {
+                void props.client.dispatch({
+                    type: 'MOVE_CARET',
+                    direction: e.shiftKey ? 'PrevCell' : 'NextCell',
+                    extend: false,
+                });
+            } else if (caret && !e.shiftKey) {
+                /* Body paragraph → insert a tab character. Shift+Tab in body
+                   has no outdent command yet, so it is a no-op (it still
+                   preventDefaults to avoid focus loss). */
+                void props.client.dispatch({
+                    type: 'INSERT_TEXT',
+                    at: caret,
+                    text: '\t',
+                });
+            }
             return;
         }
 

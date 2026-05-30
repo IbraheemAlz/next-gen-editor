@@ -101,6 +101,22 @@ function tabLabel(k: BridgeTabKind): string {
     }
 }
 
+/* Human-readable tab-stop name for the marker tooltip. */
+function tabKindName(k: BridgeTabKind): string {
+    switch (k) {
+        case 'Left':
+            return 'Left';
+        case 'Center':
+            return 'Center';
+        case 'Right':
+            return 'Right';
+        case 'Decimal':
+            return 'Decimal';
+        default:
+            return 'Left';
+    }
+}
+
 export interface RulerProps {
     /**
      * Optional explicit unit toggle. Defaults to `in` (inches) — the
@@ -238,15 +254,16 @@ export const Ruler: Component<RulerProps> = (props) => {
     /** Map a pointer client-x to a logical pt offset from the 0-mark
      * (i.e. content-area leading edge). RTL flips the axis. */
     const clientXToContentPt = (clientX: number, rect: DOMRect): number => {
-        const rawPxFromLeft = clientX - rect.left;
-        const rawPt = rawPxFromLeft / PX_PER_PT;
-        if (isRtl()) {
-            /* Leading edge is the RIGHT side of the content area. */
-            const leadingPxFromLeft = leadingMarginPt() + contentWidthPt();
-            const leadingPt = leadingPxFromLeft;
-            return Math.max(0, leadingPt - rawPt);
-        }
-        return Math.max(0, rawPt - leadingMarginPt());
+        const rawPt = (clientX - rect.left) / PX_PER_PT;
+        /* Content-pt measured from the leading edge (the right side for RTL,
+         * so the axis flips). */
+        const raw = isRtl()
+            ? leadingMarginPt() + contentWidthPt() - rawPt
+            : rawPt - leadingMarginPt();
+        /* Strict boundary clamp — a marker can NEVER be dropped or dragged
+         * past the paper's content box into the grey margins. Every drag
+         * value is bounded to [0, contentWidth] (the "margin escape" fix). */
+        return Math.max(0, Math.min(contentWidthPt(), raw));
     };
 
     /** CSS `left` (px) for a content-pt offset measured from the
@@ -272,8 +289,11 @@ export const Ruler: Component<RulerProps> = (props) => {
         const rect = stripEl.getBoundingClientRect();
         const pt = clientXToContentPt(e.clientX, rect);
         /* Discard when the pointer leaves the ruler strip vertically by
-         * more than a tolerance — Word's "drag off to remove" behaviour. */
-        const discard = e.clientY - rect.bottom > HANDLE_HIT_PX;
+         * more than a tolerance, EITHER above or below — Word's "drag a tab
+         * stop off the ruler to remove it" behaviour. */
+        const discard =
+            e.clientY > rect.bottom + HANDLE_HIT_PX ||
+            e.clientY < rect.top - HANDLE_HIT_PX;
         setDrag({ ...d, livePt: pt, discard });
         if (d.kind === 'tab-move' && d.tabIndex !== undefined) {
             const stops = localStops();
@@ -403,7 +423,17 @@ export const Ruler: Component<RulerProps> = (props) => {
     ) => {
         e.stopPropagation();
         e.preventDefault();
-        setDrag({ kind, livePt: 0, discard: false });
+        /* Seed `livePt` at the marker's CURRENT content-pt (not 0) so the
+         * handle does not snap to the leading edge on grab, and a plain
+         * click with no drag commits the same value — no pixel drift. The
+         * first pointermove overwrites this with the pointer position. */
+        const initialPt =
+            kind === 'first-line'
+                ? currentStartPt() + currentFirstLinePt()
+                : kind === 'left-indent'
+                  ? currentStartPt()
+                  : contentWidthPt() - currentEndPt();
+        setDrag({ kind, livePt: initialPt, discard: false });
     };
 
     const onTabPointerDown = (e: PointerEvent, index: number, stop: BridgeTabStop) => {
@@ -430,7 +460,12 @@ export const Ruler: Component<RulerProps> = (props) => {
         const d = drag();
         if (!d || d.kind !== 'tab-move') return;
         const moved = Math.abs(d.livePt - stop.position_pt) * PX_PER_PT > 4;
-        if (moved) return; /* drag-commit path will handle it */
+        /* `moved` is HORIZONTAL only. A drag straight DOWN to remove the stop
+         * has no horizontal delta, so without the `d.discard` guard it would
+         * be mistaken for a click (kind-cycle) and cancel the removal. When
+         * the pointer left the strip vertically, let `commitDrag` run its
+         * discard/splice branch instead. */
+        if (moved || d.discard) return;
         /* Pure click — cycle kind. Replace the drag intent with an
          * in-place kind change; cancel commitDrag's tab-move branch
          * by short-circuiting via the local stops list. */
@@ -573,7 +608,7 @@ export const Ruler: Component<RulerProps> = (props) => {
                             class="nge-ruler__tab"
                             data-kind={stop.kind}
                             style={{ left: `${contentPtToLeftPx(stop.position_pt)}px` }}
-                            title={`Tab stop (${stop.kind})`}
+                            title={`${tabKindName(stop.kind)} tab stop — click to cycle kind, drag off ruler to remove`}
                             onPointerDown={(e) => onTabPointerDown(e, i(), stop)}
                             onPointerUp={(e) => onTabPointerUp(e, i(), stop)}
                         >
