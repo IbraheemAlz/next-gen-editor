@@ -17,8 +17,8 @@ No `iframe`s, no vendored binary blobs — the engine is built from source.
 > memory / performance), a **`cargo-fuzz`** suite, **telemetry** scaffolding
 > and a tag-triggered **release pipeline**. This is a **beta** — the external
 > security audit, operator runbook and Arabic typography sign-off are still
-> pending. Roadmap in [`MASTER_PLAN.md`](MASTER_PLAN.md); deferred scope in
-> [`BACKLOG.md`](BACKLOG.md).
+> pending. Roadmap in [`MASTER_PLAN.md`](plans/MASTER_PLAN.md); deferred scope in
+> [`BACKLOG.md`](plans/BACKLOG.md).
 
 ## Live demo
 
@@ -142,9 +142,10 @@ tools/
   shape-regression/  rustybuzz output snapshots
   roundtrip/      .docx open → edit → save → byte-diff harness
 fuzz/             cargo-fuzz crate — .docx reader + RPC command targets
-MASTER_PLAN.md    macro architecture + 5-phase roadmap
-PHASE_*.md        per-phase execution plans
-BACKLOG.md        deferred scope + technical debt
+plans/            planning + design docs (roadmap, phases, backlogs, specs)
+  MASTER_PLAN.md    macro architecture + 5-phase roadmap
+  PHASE_*.md        per-phase execution plans
+  BACKLOG.md        deferred scope + technical debt
 ```
 
 ## Roadmap
@@ -157,7 +158,7 @@ BACKLOG.md        deferred scope + technical debt
 | **4** ✅ | Headless UI shell: Solid.js, pointer + caret + selection, IME, toolbar, accessibility, clipboard, drag-drop |
 | **5 — Hardening** 🚧 | QA harness farm (visual-diff / memory / perf), `cargo-fuzz`, PDF/A-1b export, telemetry, release pipeline — engineering complete (`v0.5.0-beta.1`); external security audit, operator runbook + Arabic typography sign-off pending |
 
-See [`MASTER_PLAN.md`](MASTER_PLAN.md) and the `PHASE_*.md` documents.
+See [`MASTER_PLAN.md`](plans/MASTER_PLAN.md) and the `PHASE_*.md` documents.
 
 ## Known limitations
 
@@ -165,14 +166,14 @@ See [`MASTER_PLAN.md`](MASTER_PLAN.md) and the `PHASE_*.md` documents.
   them), but not yet rendered — bold/italic font faces and underline strokes
   are deferred, along with paragraph alignment, rich (HTML / `.docx`)
   clipboard, and `.docx` run-formatting round-trip — see
-  [`BACKLOG.md`](BACKLOG.md).
+  [`BACKLOG.md`](plans/BACKLOG.md).
 - Kashida elongation widens glyph advances; true `U+0640` tatweel-glyph
   insertion is deferred.
 - Vello / WebGPU is plumbed but Canvas2D is the active renderer.
 - Opening or editing a multi-page document relays out every paragraph — fast
   for one page (insert p95 ≈ 10 ms), but the synthetic 50-page open takes
   ~9 s. Incremental relayout is the open performance item — see
-  [`BACKLOG.md`](BACKLOG.md).
+  [`BACKLOG.md`](plans/BACKLOG.md).
 
 ## Licenses
 

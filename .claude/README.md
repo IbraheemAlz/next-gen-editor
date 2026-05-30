@@ -40,7 +40,7 @@ Personal overrides (e.g. local model choice, sensitive env vars) go in
 
 ## Don't put here
 
-- Phase plans (those live at repo root: `MASTER_PLAN.md`, `PHASE_*.md`).
+- Phase plans (those live under `plans/`: `MASTER_PLAN.md`, `PHASE_*.md`).
 - Generated artifacts (target/, pkg/, dist/ — all gitignored).
 - Secrets — they should never enter the repo at all.
 - Phase-specific runbooks — those belong in the phase plan docs.

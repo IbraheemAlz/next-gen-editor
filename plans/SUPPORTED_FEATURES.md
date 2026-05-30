@@ -5,22 +5,22 @@ only; no implementation details.
 
 ## Text formatting
 
-- Bold
-- Italic
-- Underline (Single / Double / Dotted / Dashed / Wave / None)
-- Strikethrough
-- Font family (resolved + raw)
-- Font size
-- Text color
-- Highlight / background color
-- Superscript / subscript
-- Small caps + all caps
-- Sticky / pending format on collapsed caret
+- Bold - ✅
+- Italic - ✅
+- Underline (Single / Double / Dotted / Dashed / Wave / None) - ✅
+- Strikethrough - ✅
+- Font family (resolved + raw) - ✅
+- Font size - ✅
+- Text color - ✅
+- Highlight / background color - ✅
+- Superscript / subscript - ✅
+- Small caps + all caps - ✅
+- Sticky / pending format on collapsed caret - ✅
 
 ## Paragraph & layout
 
-- Left / Center / Right / Justify alignment
-- Left-to-right and right-to-left direction (with mixed BiDi)
+- Left / Center / Right / Justify alignment - ✅ 
+- Left-to-right and right-to-left direction (with mixed BiDi) - ✅
 - First-line indent, hanging indent, left / right indent
 - Line spacing
 - Paragraph shading

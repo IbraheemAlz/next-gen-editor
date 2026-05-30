@@ -2,7 +2,7 @@
 
 Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–4. Don't relitigate without a measurement that contradicts it.
 
-**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**. Twelve post-`beta.1` backlog / tech-debt sprints then closed the bulk of [`BACKLOG.md`](BACKLOG.md) — rich-text decorations + faces (with faux bold / italic on both Canvas2D and Vello), Kashida ink, incremental relayout, typography, `.docx` interoperability, the Vello/WebGPU activation, fine-grained accessibility deltas, the inline IME preview, and the core arrow-key / multi-click / select-all navigation layer; the cut is now `v0.5.0-beta.3`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
+**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**. Twelve post-`beta.1` backlog / tech-debt sprints then closed the bulk of [`BACKLOG.md`](plans/BACKLOG.md) — rich-text decorations + faces (with faux bold / italic on both Canvas2D and Vello), Kashida ink, incremental relayout, typography, `.docx` interoperability, the Vello/WebGPU activation, fine-grained accessibility deltas, the inline IME preview, and the core arrow-key / multi-click / select-all navigation layer; the cut is now `v0.5.0-beta.3`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
 
 ---
 
@@ -297,7 +297,7 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 
 Phases 1–4 are complete; Phase 5's engineering deliverables shipped at
 `v0.5.0-beta.1`. Twelve post-`beta.1` backlog sprints then closed the bulk of
-[`BACKLOG.md`](BACKLOG.md) — rich-text decorations + bold/italic faces (with
+[`BACKLOG.md`](plans/BACKLOG.md) — rich-text decorations + bold/italic faces (with
 the Vello path now applying the same faux synthesis as Canvas2D), tatweel-
 glyph Kashida, incremental relayout, dynamic line height, paragraph auto-
 direction, discontinuous BiDi selection rects, the toolbar pickers, pending
@@ -307,7 +307,7 @@ Vello/WebGPU render-path activation, the inline IME composition preview, and
 core keyboard navigation (arrow keys with ideal-x, Shift-extend, `Ctrl/Cmd+A`,
 triple-click paragraph selection). The cut is `v0.5.0-beta.3`.
 
-Still open in [`BACKLOG.md`](BACKLOG.md): PDF `/W` widths + font subsetting and
+Still open in [`BACKLOG.md`](plans/BACKLOG.md): PDF `/W` widths + font subsetting and
 PDF/A-2 / PDF/X (#3); Vello as the *default* renderer plus its GPU-runner
 golden suite (#4 — GitHub issue #1); IME `target_range` sub-segment styling
 (#8 — GitHub issue #2); stable per-paragraph accessibility ids (#10); and

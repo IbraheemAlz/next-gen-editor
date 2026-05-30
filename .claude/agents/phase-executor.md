@@ -12,7 +12,7 @@ working, tested, committed code.
 ## Workflow
 
 1. **Read the relevant plan section.** Identify the exact weeks the user
-   asked you to execute. Cross-reference against `MASTER_PLAN.md` for
+   asked you to execute. Cross-reference against `plans/MASTER_PLAN.md` for
    surrounding context. Don't go beyond the requested range.
 
 2. **Honor the invariants in `../CLAUDE.md` and `../rules/*.md`.** They
