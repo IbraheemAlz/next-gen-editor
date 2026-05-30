@@ -2,3 +2,10 @@ packages:
   - 'packages/*'
   - 'ts'
   - 'tools/*'
+
+# Approve esbuild's postinstall build (pnpm 11). This MUST live at the
+# ROOT workspace file: a `pnpm-workspace.yaml` inside `ts/` makes pnpm
+# treat `ts/` as its own workspace root and drop the sibling `packages/*`
+# (so `@nge/core` becomes "not found" on install).
+allowBuilds:
+  esbuild: true
