@@ -63,7 +63,7 @@ const MAJOR_PER_INCH = 1;
 const MINOR_PER_INCH = 8; /* 0.125-inch tick spacing. */
 
 interface DragState {
-    kind: 'first-line' | 'left-indent' | 'tab-move' | 'tab-add';
+    kind: 'first-line' | 'left-indent' | 'end-indent' | 'tab-move' | 'tab-add';
     /** Tab-stop index in the local copy, when kind is `tab-move`. */
     tabIndex?: number;
     /** Live position in pt relative to content-area leading edge. */
@@ -204,6 +204,7 @@ export const Ruler: Component<RulerProps> = (props) => {
     const firstLineLabel = () => 'First-line indent';
     const startIndentLabel = () =>
         isRtl() ? 'Start indent (leading — right edge)' : 'Left (start) indent';
+    const endIndentLabel = () => 'End indent (trailing edge)';
 
     /** Content-area width in pt. */
     const contentWidthPt = () => {
@@ -312,6 +313,15 @@ export const Ruler: Component<RulerProps> = (props) => {
                 void cmd.setParagraphIndent(d.livePt, currentEndPt(), firstLinePt);
                 break;
             }
+            case 'end-indent': {
+                /* `d.livePt` is the pointer's content-pt measured from the
+                 * LEADING edge; the end indent is the inset from the
+                 * TRAILING edge, so `end = contentWidth - livePt`. Preserve
+                 * the start + first-line fields (read-back). */
+                const endPt = Math.max(0, contentWidthPt() - d.livePt);
+                void cmd.setParagraphIndent(currentStartPt(), endPt, currentFirstLinePt());
+                break;
+            }
             case 'tab-add': {
                 const stops = (localStops() ?? state.tabStops()).slice();
                 stops.push({ position_pt: d.livePt, kind: 'Left' });
@@ -389,7 +399,7 @@ export const Ruler: Component<RulerProps> = (props) => {
 
     const onHandlePointerDown = (
         e: PointerEvent,
-        kind: 'first-line' | 'left-indent',
+        kind: 'first-line' | 'left-indent' | 'end-indent',
     ) => {
         e.stopPropagation();
         e.preventDefault();
@@ -480,6 +490,16 @@ export const Ruler: Component<RulerProps> = (props) => {
         const d = drag();
         if (d?.kind === 'left-indent') return d.livePt;
         return currentStartPt();
+    };
+    /** End (trailing-edge) indent in pt. During a drag the pointer's
+     * leading-relative content-pt converts to a trailing inset
+     * (`contentWidth - livePt`); otherwise the committed engine value. */
+    const liveEndIndentPt = () => {
+        const d = drag();
+        if (d?.kind === 'end-indent') {
+            return Math.max(0, contentWidthPt() - d.livePt);
+        }
+        return currentEndPt();
     };
 
     /* Reset focus to whatever owned it before the drag — the canvas
@@ -591,6 +611,24 @@ export const Ruler: Component<RulerProps> = (props) => {
                     aria-valuenow={liveLeftIndentPt()}
                     style={{ left: `${contentPtToLeftPx(liveLeftIndentPt())}px` }}
                     onPointerDown={(e) => onHandlePointerDown(e, 'left-indent')}
+                >
+                    △
+                </div>
+                {/* End (trailing-edge) indent — physical RIGHT for LTR,
+                 * physical LEFT for RTL. Position is logically driven:
+                 * `contentWidth - end` from the leading edge, fed through
+                 * the same direction-aware `contentPtToLeftPx` as every
+                 * other marker, so the physical side flips for free. */}
+                <div
+                    class="nge-ruler__handle nge-ruler__handle--end-indent"
+                    role="slider"
+                    aria-label={endIndentLabel()}
+                    title={endIndentLabel()}
+                    aria-valuenow={liveEndIndentPt()}
+                    style={{
+                        left: `${contentPtToLeftPx(contentWidthPt() - liveEndIndentPt())}px`,
+                    }}
+                    onPointerDown={(e) => onHandlePointerDown(e, 'end-indent')}
                 >
                     △
                 </div>

@@ -102,6 +102,12 @@
     bottom: 0;
 }
 
+/* End (trailing-edge) indent — same bottom-anchored △ as the start
+ * handle, on the opposite physical side (positioned inline in TSX). */
+.nge-ruler__handle--end-indent {
+    bottom: 0;
+}
+
 .nge-ruler__handle:focus-visible {
     outline: 2px solid var(--nge-color-primary, #2563eb);
     outline-offset: 1px;

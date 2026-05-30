@@ -197,8 +197,19 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             line.alignment,
             cfg.base_direction,
         );
+        /* The first-line indent insets the LEADING edge. For LTR that edge is
+        the physical LEFT, so the line origin shifts right by `first_line_extra`.
+        For RTL the leading edge is the physical RIGHT: the shrunken width above
+        + RTL right-alignment already pull that right edge inward, so adding
+        `first_line_extra` to the (physical-left) origin as well DOUBLE-counts —
+        and under Start alignment it cancels algebraically, zeroing the indent
+        (the dead `▽` marker). RTL therefore contributes nothing to the origin
+        here; the inset lives entirely in the reduced width. Hanging
+        (`first_line_extra < 0`) rides the same path — it grows the width,
+        pushing the first line's leading edge OUT past the body indent. */
+        let first_line_origin_shift = if rtl { 0.0 } else { first_line_extra };
         line.origin = Point {
-            x: leading_off + first_line_extra + inner_origin,
+            x: leading_off + first_line_origin_shift + inner_origin,
             y,
         };
         line.baseline = ascent;
