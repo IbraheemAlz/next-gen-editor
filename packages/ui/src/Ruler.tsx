@@ -229,19 +229,40 @@ export const Ruler: Component<RulerProps> = (props) => {
         return g.width_pt - g.margin_left_pt - g.margin_right_pt;
     };
 
-    /** Leading-edge margin (the 0-mark offset from the ruler's left in pt). */
+    /** LOGICAL leading margin width in pt (the margin on the *leading* side:
+     * physical-left for LTR, physical-right for RTL). Bounds the outdent
+     * drag on the leading side. */
     const leadingMarginPt = () => {
         const g = geom();
         if (!g) return A4_FALLBACK.margin_left_pt;
         return isRtl() ? g.margin_right_pt : g.margin_left_pt;
     };
 
-    /** Trailing margin in pt — used to draw the trailing margin band. */
+    /** LOGICAL trailing margin width in pt (physical-right for LTR,
+     * physical-left for RTL). Bounds the outdent drag on the trailing side. */
     const trailingMarginPt = () => {
         const g = geom();
         if (!g) return A4_FALLBACK.margin_right_pt;
         return isRtl() ? g.margin_left_pt : g.margin_right_pt;
     };
+
+    /* ---- PHYSICAL geometry (px-from-page-left) ---------------------- *
+     * Bug C — pixel parity. The strip is pinned to the page card's physical
+     * left edge (device x = 0), so every px coordinate must be measured from
+     * there. The physical margins are direction-INVARIANT: `margin_left_pt`
+     * is always the physical left margin, `margin_right_pt` the physical
+     * right. Only the *logical→physical* mapping uses direction. The pre-fix
+     * code anchored RTL on the logical `margin_right`, which silently drifted
+     * by `(margin_right − margin_left)` whenever the page margins were
+     * asymmetric. */
+    const physLeftMarginPt = () => geom()?.margin_left_pt ?? A4_FALLBACK.margin_left_pt;
+    const physRightMarginPt = () => geom()?.margin_right_pt ?? A4_FALLBACK.margin_right_pt;
+
+    /** Physical px-from-page-left (in pt) of the content area's LEADING edge:
+     * the physical-left margin for LTR; the content's physical-right edge
+     * (`margin_left + contentWidth`) for RTL. */
+    const leadingEdgePhysPt = () =>
+        isRtl() ? physLeftMarginPt() + contentWidthPt() : physLeftMarginPt();
 
     const totalWidthPt = () => {
         const g = geom();
@@ -251,30 +272,35 @@ export const Ruler: Component<RulerProps> = (props) => {
     /** pt → CSS px (for absolute positioning inside the ruler). */
     const ptToPx = (pt: number) => pt * PX_PER_PT;
 
-    /** Map a pointer client-x to a logical pt offset from the 0-mark
-     * (i.e. content-area leading edge). RTL flips the axis. */
+    /** Map a pointer client-x to a LOGICAL pt offset from the 0-mark (the
+     * content-area leading edge). The pointer's physical distance from the
+     * page-left (`rect.left` is the strip = page card left) converts to a
+     * logical offset via the leading-edge physical anchor; RTL flips the
+     * axis. */
     const clientXToContentPt = (clientX: number, rect: DOMRect): number => {
-        const rawPt = (clientX - rect.left) / PX_PER_PT;
-        /* Content-pt measured from the leading edge (the right side for RTL,
-         * so the axis flips). */
+        const physPt = (clientX - rect.left) / PX_PER_PT;
         const raw = isRtl()
-            ? leadingMarginPt() + contentWidthPt() - rawPt
-            : rawPt - leadingMarginPt();
-        /* Strict boundary clamp — a marker can NEVER be dropped or dragged
-         * past the paper's content box into the grey margins. Every drag
-         * value is bounded to [0, contentWidth] (the "margin escape" fix). */
-        return Math.max(0, Math.min(contentWidthPt(), raw));
+            ? leadingEdgePhysPt() - physPt
+            : physPt - leadingEdgePhysPt();
+        /* Bug B — margin-aware bounds. A marker MAY be dragged into the grey
+         * page margins (negative indent / outdent), but never off the
+         * physical page: clamp to [−leadingMargin, contentWidth +
+         * trailingMargin] so the leading edge stops at the page edge on its
+         * side and the trailing edge at the page edge on the other. */
+        const lo = -leadingMarginPt();
+        const hi = contentWidthPt() + trailingMarginPt();
+        return Math.max(lo, Math.min(hi, raw));
     };
 
-    /** CSS `left` (px) for a content-pt offset measured from the
-     * leading edge. RTL: the further out the offset, the closer to
-     * the left of the content area visually. */
+    /** CSS `left` (px, from the strip = page-left) for a LOGICAL content-pt
+     * offset measured from the leading edge. Maps through the physical
+     * leading-edge anchor so it is pixel-exact for any margin configuration
+     * and direction (Bug C). RTL grows leftward from the right edge. */
     const contentPtToLeftPx = (contentPt: number): number => {
-        if (isRtl()) {
-            const trailingEdgePt = leadingMarginPt() + contentWidthPt();
-            return ptToPx(trailingEdgePt - contentPt);
-        }
-        return ptToPx(leadingMarginPt() + contentPt);
+        const physPt = isRtl()
+            ? leadingEdgePhysPt() - contentPt
+            : leadingEdgePhysPt() + contentPt;
+        return ptToPx(physPt);
     };
 
     /* ---- pointer drag plumbing ------------------------------------- */
@@ -336,9 +362,11 @@ export const Ruler: Component<RulerProps> = (props) => {
             case 'end-indent': {
                 /* `d.livePt` is the pointer's content-pt measured from the
                  * LEADING edge; the end indent is the inset from the
-                 * TRAILING edge, so `end = contentWidth - livePt`. Preserve
-                 * the start + first-line fields (read-back). */
-                const endPt = Math.max(0, contentWidthPt() - d.livePt);
+                 * TRAILING edge, so `end = contentWidth - livePt`. May be
+                 * negative — a trailing-edge outdent into the grey margin
+                 * (Bug B); `d.livePt` is already clamped to the page edge.
+                 * Preserve the start + first-line fields (read-back). */
+                const endPt = contentWidthPt() - d.livePt;
                 void cmd.setParagraphIndent(currentStartPt(), endPt, currentFirstLinePt());
                 break;
             }
@@ -492,9 +520,11 @@ export const Ruler: Component<RulerProps> = (props) => {
         for (let i = 0; i <= totalTicks; i++) {
             const pt = i / ticksPerPt;
             const major = i % MINOR_PER_INCH === 0;
-            /* Label inches relative to the content area's leading
-             * edge — that's the canonical Word ruler convention. */
-            const contentPt = isRtl() ? leadingMarginPt() + contentWidthPt() - pt : pt - leadingMarginPt();
+            /* Label inches relative to the content area's leading edge —
+             * the canonical Word ruler convention. `pt` is physical
+             * px-from-page-left, so map through the physical leading-edge
+             * anchor (Bug C — asymmetric-margin safe). */
+            const contentPt = isRtl() ? leadingEdgePhysPt() - pt : pt - leadingEdgePhysPt();
             let label = '';
             if (major && contentPt >= 0 && contentPt <= contentWidthPt() + 0.1) {
                 const inches = contentPt / PT_PER_INCH;
@@ -532,7 +562,8 @@ export const Ruler: Component<RulerProps> = (props) => {
     const liveEndIndentPt = () => {
         const d = drag();
         if (d?.kind === 'end-indent') {
-            return Math.max(0, contentWidthPt() - d.livePt);
+            /* Signed — a negative end is a trailing-edge outdent (Bug B). */
+            return contentWidthPt() - d.livePt;
         }
         return currentEndPt();
     };
@@ -567,22 +598,19 @@ export const Ruler: Component<RulerProps> = (props) => {
                 onPointerDown={onStripPointerDown}
                 onPointerUp={restoreFocus}
             >
-                {/* Margin bands (leading + trailing). */}
+                {/* Grey margin bands. PHYSICAL (direction-invariant): the
+                 * left band is always the physical-left margin, the right
+                 * band the physical-right margin. The pre-fix code keyed
+                 * these off the logical leading/trailing margins and even
+                 * swapped their widths for RTL — correct only when the
+                 * margins were symmetric (Bug C). */}
                 <div
-                    class="nge-ruler__margin nge-ruler__margin--leading"
-                    style={
-                        isRtl()
-                            ? { right: '0', width: `${ptToPx(trailingMarginPt())}px` }
-                            : { left: '0', width: `${ptToPx(leadingMarginPt())}px` }
-                    }
+                    class="nge-ruler__margin nge-ruler__margin--left"
+                    style={{ left: '0', width: `${ptToPx(physLeftMarginPt())}px` }}
                 />
                 <div
-                    class="nge-ruler__margin nge-ruler__margin--trailing"
-                    style={
-                        isRtl()
-                            ? { left: '0', width: `${ptToPx(leadingMarginPt())}px` }
-                            : { right: '0', width: `${ptToPx(trailingMarginPt())}px` }
-                    }
+                    class="nge-ruler__margin nge-ruler__margin--right"
+                    style={{ right: '0', width: `${ptToPx(physRightMarginPt())}px` }}
                 />
 
                 {/* Tick marks. */}

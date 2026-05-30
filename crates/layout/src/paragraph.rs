@@ -143,11 +143,23 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     The pen starts at the line's leading-edge indent so it tracks
     paragraph-content-relative coordinates — tab stops (also
     paragraph-content-relative) compare directly without a transform. */
-    let pre_alignment_leading_off = if matches!(cfg.base_direction, ShapingDirection::Rtl) {
-        cfg.indent_end_px
-    } else {
-        cfg.indent_start_px
-    };
+    /* Tab stops resolve in the LOGICAL frame: the pen measures reading-order
+    distance from the content's LEADING edge, and `tab_stops_px` are stored
+    content-edge-relative (0 = the margin, before any indent — Word's ruler
+    convention). The first glyph sits at the `<w:start>` (leading) indent, so
+    the pen base is `indent_start_px` in BOTH directions.
+
+    This pairs with the per-direction `leading_off` chosen below
+    (`indent_start` for LTR, `indent_end` for RTL) by a cancellation that is
+    load-bearing — DO NOT "simplify" the pen base back to `indent_end` for
+    RTL. For RTL Start alignment a logical position `q` maps to
+    `box_x = leading_off + content_width + pen_base − q`, and
+    `indent_end + (max_width − indent_start − indent_end) + indent_start
+    == max_width`, so the stop at content-relative `p` lands at
+    `box_x = max_width − p` regardless of how the start/end indents split.
+    The pre-fix code used `indent_end_px` as the RTL base, which only agreed
+    with `leading_off` when the indents were symmetric. */
+    let pre_alignment_leading_off = cfg.indent_start_px;
     for (line, _) in composed.iter_mut() {
         apply_tab_advances(line, cfg.text, cfg.tab_stops_px, pre_alignment_leading_off);
     }
@@ -381,48 +393,48 @@ fn compose_lines_with_width<'a>(
 /// width on a 12-pt body.
 const MIN_TAB_FILL_PX: f32 = 4.0;
 
-/// L2.1 (#6) — locator for a single tab glyph inside a [`LineBox`].
-/// `next_tab` is `None` when this is the last tab in the line, in
-/// which case the segment walks all the way to the line's end.
-#[derive(Debug, Clone, Copy)]
-struct TabPosition {
-    cur_run: usize,
-    cur_glyph: usize,
-    next_tab: Option<(usize, usize)>,
-}
-
-// Audit gap A.M3 / L2.1 (#6) — geometric tab-stop advance.
+// Audit gap A.M3 / L2.1 (#6) / RTL fix (issue #20, Left-tab) — geometric
+// tab-stop advance.
 //
-// Walks `line.runs` in visual order accumulating the pen position. The
-// pen starts at `leading_off_px` so it tracks paragraph-content-relative
-// coordinates from the leading edge; tab stops in `tab_stops_px` are
-// stored in the same frame and compare directly.
+// Tab stops are resolved in LOGICAL (reading) order, which is the only frame
+// in which a stop position is meaningful: a stop at `p` means "the content
+// that logically FOLLOWS the tab begins at distance `p` from the paragraph's
+// leading edge." For an LTR paragraph logical order equals visual
+// (physical-left-to-right) order, so a naive visual-order pen walk happened
+// to be correct. For an RTL paragraph the per-line BiDi reorder makes the
+// content sitting visually-BEFORE a tab the content that logically FOLLOWS
+// it; a visual-order pen therefore measured the wrong baseline and the Left
+// advance ballooned past the content width, ejecting the leading run off the
+// physical-left page edge (the "RTL tab explosion").
 //
-// When a glyph's source cluster points to a U+0009 TAB byte, the
-// advance is rewritten according to the matching stop's `TabKind`:
-//   * `Left`   — next glyph lands at the stop (`advance = stop - pen`).
-//   * `Center` — segment's midpoint lands at the stop.
-//   * `Right`  — segment's right edge lands at the stop.
-//   * `Decimal`— segment's first `.` or `,` character lands at the stop.
-//                Falls back to `Right` semantics when no separator is
-//                present.
+// This pass builds a logical-order index of every glyph (sorted by absolute
+// source cluster — clusters are paragraph-absolute and monotonic with
+// reading position, so the sort recovers logical order across BiDi runs) and
+// accumulates the pen in that order, starting at `leading_off_px` (the
+// leading `<w:start>` indent). When a glyph's source cluster points at a
+// U+0009 TAB the advance is rewritten per the matching stop's `TabKind`:
+//   * `Left`   — content after the tab starts at the stop.
+//   * `Center` — the following segment's midpoint lands at the stop.
+//   * `Right`  — the following segment's trailing edge lands at the stop.
+//   * `Decimal`— the following segment's first `.`/`,` lands at the stop
+//                (falls back to `Right` when the segment has no separator).
+// The "following segment" is measured by walking forward in LOGICAL order to
+// the next tab (or end of line). The renderer then lays the glyphs out in
+// visual order and the alignment offset is applied; because the advance was
+// computed against the logical pen, the logically-following run's leading
+// edge lands at the stop in BOTH directions (proof in the pen-base comment
+// of `layout_paragraph`).
 //
-// The non-Left kinds shape-then-place: the helper walks forward
-// (visual order) from the current tab to the next tab (or end of
-// line) to measure the segment's advance + decimal-separator offset
-// before computing the tab's fill. Grid-fallback stops are always
-// `Left`.
+// `line.width` is the post-adjustment extent (sum of every glyph advance,
+// which equals `pen − leading_off_px`) so downstream justify / alignment
+// math operates on visual width.
 //
-// `line.width` is updated to the post-adjustment line-local extent
-// (`pen - leading_off_px`) so downstream justify / alignment math
-// operates on visual width.
-//
-// Known limitations (tracked separately):
-//   * Center / End / Justify alignment + tabs: the whole line still
-//     center-shifts (Word-conformant). Tab stops within a Centered
-//     line therefore visually drift by the alignment offset.
-//   * RTL paragraphs: tab positions are treated LTR-style. See issue
-//     #20 for the directional mirror pass.
+// Known limitation (issue #20 — directional mirror): the Center / Right /
+// Decimal *anchor* alignment is correct for a contiguous logical block, but
+// when the following segment embeds an opposite-direction run (e.g. an LTR
+// decimal number inside an RTL paragraph) the interior anchor (`.`, midpoint)
+// does not yet mirror onto the correct visual side. Left tabs — the common
+// case and the one the RTL explosion bug hit — are fully correct.
 fn apply_tab_advances(
     line: &mut LineBox,
     para_text: &str,
@@ -433,110 +445,85 @@ fn apply_tab_advances(
         line.width = line_advance(&line.runs);
         return;
     }
-    /* Build a flat (run, glyph) index of every tab in the line so the
-    non-Left kinds can look up "the next tab past this one" in O(1)
-    without rewalking the run tree. Visual-order index. */
-    let tab_indices: Vec<(usize, usize)> = line
+    let bytes = para_text.as_bytes();
+    let is_tab = |abs_cluster: usize| bytes.get(abs_cluster).copied() == Some(b'\t');
+
+    /* Logical-order index of every glyph: `(run, glyph, absolute source
+    cluster byte)`, sorted ascending by the absolute cluster. The sort is
+    stable, so ligature glyphs that share a cluster keep their intra-run
+    (visual) order — only the cross-direction reordering is undone. */
+    let mut order: Vec<(usize, usize, usize)> = line
         .runs
         .iter()
         .enumerate()
         .flat_map(|(ri, run)| {
-            let source_start = run.source_range.start as usize;
-            let bytes = para_text.as_bytes();
-            run.glyphs.iter().enumerate().filter_map(move |(gi, g)| {
-                let cluster_byte = source_start + g.cluster as usize;
-                if bytes.get(cluster_byte).copied() == Some(b'\t') {
-                    Some((ri, gi))
-                } else {
-                    None
-                }
-            })
+            let base = run.source_range.start as usize;
+            run.glyphs
+                .iter()
+                .enumerate()
+                .map(move |(gi, g)| (ri, gi, base + g.cluster as usize))
         })
         .collect();
+    order.sort_by_key(|&(_, _, c)| c);
 
     let mut pen = leading_off_px;
-    let mut tab_cursor = 0usize;
-    for ri in 0..line.runs.len() {
-        for gi in 0..line.runs[ri].glyphs.len() {
-            let is_tab = tab_indices
-                .get(tab_cursor)
-                .is_some_and(|&(tri, tgi)| tri == ri && tgi == gi);
-            if is_tab {
-                let (stop_pos, stop_kind) = next_tab_stop_after(pen, tab_stops_px);
-                let pos = TabPosition {
-                    cur_run: ri,
-                    cur_glyph: gi,
-                    next_tab: tab_indices.get(tab_cursor + 1).copied(),
-                };
-                let advance = compute_tab_advance(pen, stop_pos, stop_kind, line, para_text, pos);
-                line.runs[ri].glyphs[gi].x_advance = advance;
-                tab_cursor += 1;
-            }
+    for k in 0..order.len() {
+        let (ri, gi, abs) = order[k];
+        if is_tab(abs) {
+            let (stop_pos, stop_kind) = next_tab_stop_after(pen, tab_stops_px);
+            let advance = compute_tab_advance(pen, stop_pos, stop_kind, line, &order, k, bytes);
+            line.runs[ri].glyphs[gi].x_advance = advance;
+            pen += advance;
+        } else {
             pen += line.runs[ri].glyphs[gi].x_advance;
         }
     }
     line.width = (pen - leading_off_px).max(0.0);
 }
 
-/// L2.1 (#6) — compute the `x_advance` for a tab glyph at line-local
-/// pen `pen` targeting stop `stop_pos` with geometric kind `stop_kind`.
-/// For non-`Left` kinds, walks forward through the glyph stream
-/// (between the current tab and `next_tab_idx`, or end-of-line) to
-/// measure the segment's natural advance and — for `Decimal` — the
-/// byte offset of the first `.` or `,` separator.
+/// L2.1 (#6) — compute the `x_advance` for the tab glyph at logical index
+/// `tab_k` (into `order`) sitting at logical pen `pen`, targeting `stop_pos`
+/// with geometric kind `stop_kind`. For non-`Left` kinds, walks forward in
+/// LOGICAL order (from `tab_k + 1` to the next tab, or end of line) to
+/// measure the following segment's advance and — for `Decimal` — the offset
+/// of its first `.`/`,` separator. `order` is the `(run, glyph, absolute
+/// cluster)` reading-order index built by [`apply_tab_advances`].
 fn compute_tab_advance(
     pen: f32,
     stop_pos: f32,
     stop_kind: TabKind,
     line: &LineBox,
-    para_text: &str,
-    pos: TabPosition,
+    order: &[(usize, usize, usize)],
+    tab_k: usize,
+    bytes: &[u8],
 ) -> f32 {
     if matches!(stop_kind, TabKind::Left) {
         return (stop_pos - pen).max(MIN_TAB_FILL_PX);
     }
 
-    let bytes = para_text.as_bytes();
     let mut segment_advance = 0.0_f32;
     let mut decimal_offset: Option<f32> = None;
-
-    /* Walk forward visual-order from the glyph AFTER the current tab,
-    summing advances until we hit the next tab (exclusive) or the end
-    of the line. */
-    let stop_at = |ri: usize, gi: usize| -> bool {
-        if let Some((nri, ngi)) = pos.next_tab {
-            ri == nri && gi == ngi
-        } else {
-            false
-        }
-    };
-
-    let mut started = false;
     let mut found_decimal = false;
-    'walk: for (ri, run) in line.runs.iter().enumerate() {
-        for (gi, g) in run.glyphs.iter().enumerate() {
-            /* Skip everything up to and including the current tab. */
-            if !started {
-                if ri == pos.cur_run && gi == pos.cur_glyph {
-                    started = true;
-                }
-                continue;
-            }
-            if stop_at(ri, gi) {
-                break 'walk;
-            }
-            /* `Decimal` records the cumulative advance up to (but not
-            including) the first `.` or `,` glyph. */
-            if !found_decimal && matches!(stop_kind, TabKind::Decimal) {
-                let cluster_byte = run.source_range.start as usize + g.cluster as usize;
-                let ch = bytes.get(cluster_byte).copied();
-                if ch == Some(b'.') || ch == Some(b',') {
-                    decimal_offset = Some(segment_advance);
-                    found_decimal = true;
-                }
-            }
-            segment_advance += g.x_advance;
+    /* Walk forward in LOGICAL order from the glyph after this tab, summing
+    advances until the next tab (exclusive) or the end of the line. Using
+    `order` rather than the raw run/glyph nesting is what makes multi-tab
+    RTL / mixed-bidi lines measure the correct logical segment (the
+    visually-next tab is the logically-PREVIOUS one in RTL). */
+    for &(ri, gi, abs) in &order[tab_k + 1..] {
+        if bytes.get(abs).copied() == Some(b'\t') {
+            break;
         }
+        let g = &line.runs[ri].glyphs[gi];
+        /* `Decimal` records the cumulative advance up to (but not including)
+        the first `.` or `,` glyph. */
+        if !found_decimal && matches!(stop_kind, TabKind::Decimal) {
+            let ch = bytes.get(abs).copied();
+            if ch == Some(b'.') || ch == Some(b',') {
+                decimal_offset = Some(segment_advance);
+                found_decimal = true;
+            }
+        }
+        segment_advance += g.x_advance;
     }
 
     let advance = match stop_kind {
@@ -1693,6 +1680,49 @@ mod tests {
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
         assert_close(tab_adv, MIN_TAB_FILL_PX, "overflow clamps to min fill");
+    }
+
+    #[test]
+    fn tab_left_resolves_in_logical_order_for_rtl_visual_runs() {
+        /* RTL line "A\tB": logical order is A(0), tab(1), B(2). After the
+        per-line BiDi reorder the glyphs are STORED in visual order
+        [B, tab, A] (clusters 2, 1, 0). The tab's fill must be computed
+        from the content LOGICALLY before it (A, width 10), NOT the content
+        visually before it (B, width 40). Pre-fix the visual-order pen used
+        B's width and the Left advance ballooned — the RTL tab explosion. */
+        let mut line = line_with_glyphs("A\tB", &[(2, 40.0), (1, 0.0), (0, 10.0)]);
+        let stops = [(100.0_f32, TabKind::Left)];
+        apply_tab_advances(&mut line, "A\tB", &stops, 0.0);
+
+        /* Tab glyph is at visual index 1. Logical pen at the tab = width of
+        A (10), so fill = 100 - 10 = 90 — NOT 100 - 40 = 60 (the old bug). */
+        let tab_adv = line.runs[0].glyphs[1].x_advance;
+        assert_close(
+            tab_adv,
+            90.0,
+            "RTL tab fills from the logical pen (A), not visual (B)",
+        );
+        /* line.width is the sum of advances (order-independent): 40+90+10. */
+        assert_close(line.width, 140.0, "line width is the post-fill extent");
+    }
+
+    #[test]
+    fn tab_right_measures_logical_following_segment_for_rtl() {
+        /* RTL line "A\tBC": logical A(0), tab(1), B(2), C(3); stored in
+        visual order [C, B, tab, A] (clusters 3, 2, 1, 0). A Right tab must
+        measure the LOGICALLY-following segment "BC" (20+20=40), not the
+        visually-following glyph A. fill = stop(100) - pen(10) - 40 = 50. */
+        let mut line = line_with_glyphs("A\tBC", &[(3, 20.0), (2, 20.0), (1, 0.0), (0, 10.0)]);
+        let stops = [(100.0_f32, TabKind::Right)];
+        apply_tab_advances(&mut line, "A\tBC", &stops, 0.0);
+
+        /* Tab glyph is at visual index 2. */
+        let tab_adv = line.runs[0].glyphs[2].x_advance;
+        assert_close(
+            tab_adv,
+            50.0,
+            "Right tab measures the logical-following segment BC",
+        );
     }
 
     #[test]

@@ -3106,6 +3106,15 @@ impl DocumentTree {
     /// `first_line_twips`; `first_line_pt < 0` populates
     /// `hanging_twips` with `|first_line_pt| * 20` (Word's mutually-
     /// exclusive `<w:firstLine>` vs `<w:hanging>` semantics).
+    ///
+    /// `start_pt` / `end_pt` may be **negative** — a negative `<w:start>` /
+    /// `<w:end>` is a Word/Google-Docs *outdent* that pulls the leading /
+    /// trailing edge into the page margin. ECMA-376 defines `w:start` /
+    /// `w:end` as `ST_SignedTwipsMeasure`, so negative twips round-trip
+    /// faithfully through the `.docx` writer. `first_line_pt` stays signed
+    /// only through the `firstLine` / `hanging` split — both of those are
+    /// `ST_TwipsMeasure` (unsigned), so the magnitude is always stored
+    /// non-negative.
     pub fn set_paragraph_indent(
         &self,
         start: LogicalPos,
@@ -3115,8 +3124,11 @@ impl DocumentTree {
         first_line_pt: f32,
     ) -> Self {
         let (start, end) = order_positions(start, end);
-        let start_twips = (start_pt.max(0.0) * 20.0).round() as i32;
-        let end_twips = (end_pt.max(0.0) * 20.0).round() as i32;
+        /* No `.max(0.0)` floor: negative start/end are first-class outdents
+        (Bug B — "the grey area"). The Ruler clamps the drag to the page
+        edge so the model never receives an outdent larger than the margin. */
+        let start_twips = (start_pt * 20.0).round() as i32;
+        let end_twips = (end_pt * 20.0).round() as i32;
         let (first_line_twips, hanging_twips) = if first_line_pt >= 0.0 {
             ((first_line_pt * 20.0).round() as i32, 0)
         } else {
@@ -6400,6 +6412,37 @@ mod tests {
         );
         /* outside the range — untouched */
         assert_eq!(d.nth_paragraph(2).unwrap().props.direction, None);
+    }
+
+    #[test]
+    fn set_paragraph_indent_allows_negative_outdent() {
+        /* Bug B — negative `<w:start>` / `<w:end>` are first-class outdents
+        (ECMA-376 ST_SignedTwipsMeasure). The `.max(0.0)` floor used to
+        clobber them to zero, making the grey-margin drag a no-op. */
+        let d = DocumentTree::from_paragraphs(["a".into(), "b".into()]);
+        let d = d.set_paragraph_indent(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            -18.0, // start: 18 pt outdent
+            -6.0,  // end: 6 pt outdent
+            -12.0, // first-line: negative ⇒ hanging
+        );
+        let ind = d.nth_paragraph(0).unwrap().props.indent;
+        assert_eq!(ind.start_twips, -360, "negative start survives (−18 pt)");
+        assert_eq!(ind.end_twips, -120, "negative end survives (−6 pt)");
+        /* first_line stays signed only through the firstLine/hanging split:
+        the magnitude is stored non-negative in `hanging_twips`. */
+        assert_eq!(ind.first_line_twips, 0);
+        assert_eq!(
+            ind.hanging_twips, 240,
+            "negative first-line ⇒ hanging (12 pt)"
+        );
     }
 
     #[test]
