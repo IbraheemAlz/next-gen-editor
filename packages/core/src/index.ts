@@ -16,7 +16,7 @@ export type { EditorSurfaceProps, EditorSurfaceHandle } from './EditorSurface';
 export { EngineProvider, useEngine } from './EngineProvider';
 export type { EngineProviderProps, EngineHandle } from './EngineProvider';
 
-export { createEditorCommands, STYLE_PRESETS } from './createEditorCommands';
+export { createEditorCommands, STYLE_PRESETS, emptyPatch } from './createEditorCommands';
 export type { EditorCommands, ParagraphStyleId } from './createEditorCommands';
 
 export { createEditorState } from './createEditorState';

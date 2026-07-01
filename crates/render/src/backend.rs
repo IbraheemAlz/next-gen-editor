@@ -40,10 +40,12 @@ impl RendererBackend {
 /// and skips the dirty-region clip optimisation. Selecting it here gives
 /// a 300×150-defaulted canvas with squashed unreadable text the moment
 /// content exceeds one page (the real-world Phase 6 multi-page bug). The
-/// Vello activation work is tracked as Backlog #4 / `BACKLOG.md` § Vello
-/// renderer; until that closes, Canvas2D is the right pick. The wgpu
-/// device probe is kept (commented inline) for documentation but no
-/// longer drives the return value.
+/// remaining Vello work (default promotion + a GPU-runner golden CI lane)
+/// is tracked as Backlog #4 / `BACKLOG.md` § Vello renderer. The wgpu
+/// device probe below **does** drive the return value: callers opt in per
+/// surface (the `?renderer=vello` harness and the SettingsMenu renderer
+/// switch route through here), and a worker without an acquirable WebGPU
+/// device falls back to Canvas2D.
 pub async fn detect_backend() -> RendererBackend {
     /* Confirm we are in a Worker scope — never touch `web_sys::window()`. */
     if js_sys::global()

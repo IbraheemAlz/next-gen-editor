@@ -12,9 +12,11 @@
  * `exactOptionalPropertyTypes: true` every field must be set explicitly,
  * so `emptyPatch()` provides the canonical zero state for `TextAttrsPatch`.
  *
- * Selection-aware formatting helpers (setBold, setUnderline, …) read the
- * current selection from an internal `createEditorState` subscription so
- * the call site stays one-liner. Pass an explicit `range` to override.
+ * Formatting helpers (setBold, setUnderline, …) omit `range` by default so
+ * the ENGINE binds the patch to its own live selection — the UI mirror is
+ * async and can be stale while a mutation is in flight. Paragraph / caret
+ * helpers still resolve from an internal `createEditorState` subscription.
+ * Pass an explicit `range` to override.
  */
 import { useEngine, type EngineHandle } from './EngineProvider';
 import { createEditorState, type EditorState } from './createEditorState';
@@ -90,6 +92,9 @@ export interface EditorCommands {
 
     /* Viewport */
     setZoom(scale: number): Promise<Event>;
+    /** Post-boot devicePixelRatio change — updates the device scale the
+     *  engine composes with the user zoom (`scale = device × zoom`). */
+    setDeviceScale(scale: number): Promise<Event>;
     setViewport(rect: Rect): Promise<Event>;
     expandLayout(targetY: number): Promise<Event>;
 
@@ -121,7 +126,7 @@ export interface EditorCommands {
     extendSelection(to: LogicalPos): Promise<Event>;
     moveCaret(direction: MoveDirection, extend?: boolean): Promise<Event>;
 
-    /* Formatting — `range` defaults to the current selection. */
+    /* Formatting — `range` defaults to the engine-owned live selection. */
     applyAttrs(attrs: Partial<TextAttrsPatch>, range?: LogicalRange): Promise<Event>;
     setBold(value: boolean, range?: LogicalRange): Promise<Event>;
     setItalic(value: boolean, range?: LogicalRange): Promise<Event>;
@@ -194,9 +199,8 @@ export interface EditorCommands {
     clearParagraphBorders(range?: LogicalRange): Promise<Event>;
 
     /* Lists (Sprint 5 UI Edition). `Off` clears `list_item` on every
-     * paragraph the range spans. `Bullet` / `Number` return
-     * `Event::Error` until the Core Engine numbering-synthesis path
-     * ships (tracked in the backlog). */
+     * paragraph the range spans; `Bullet` / `Number` run the engine's
+     * idempotent `numbering.xml` synthesis (Sprint 13 #12). */
     toggleList(kind: ListKind, range?: LogicalRange): Promise<Event>;
 
     /* Paragraph formatting (Sprint 6 UI Edition). Units are points. */
@@ -218,8 +222,9 @@ export interface EditorCommands {
      */
     setTabStops(stops: BridgeTabStop[], range?: LogicalRange): Promise<Event>;
 
-    /* Review (Sprint 7 UI Edition). `toggleTrackChanges` dispatches
-     * but the engine returns `Event::Error` until recording ships. */
+    /* Review (Sprint 7 UI Edition). `toggleTrackChanges` flips the
+     * engine's recording flag (Sprint 14 #14); the live state rides
+     * back on `SELECTION_CHANGED.is_tracking_changes`. */
     toggleTrackChanges(enabled: boolean): Promise<Event>;
     /**
      * Sprint 14 (#14) — stamp `author` + `date` on every subsequent
@@ -239,9 +244,10 @@ export interface EditorCommands {
     deleteComment(id: number): Promise<Event>;
     resolveComment(id: number, resolved: boolean): Promise<Event>;
 
-    /* Styles (Sprint 5 UI Edition — faux). Maps a style id to a preset
-     * `TextAttrsPatch` and dispatches `APPLY_FORMATTING` (does NOT
-     * write `<w:pStyle>`). See `STYLE_PRESETS` below for the table. */
+    /* Styles (Sprint 12 #11). Dispatches `APPLY_STYLE` — the engine
+     * sets `<w:pStyle>` and cascades the style's `<w:pPr>`. The
+     * `STYLE_PRESETS` table remains a UI-side fallback for documents
+     * that don't ship the picked style id. */
     applyStyle(styleId: ParagraphStyleId, range?: LogicalRange): Promise<Event>;
 
     /* Page setup (Sprint 4 UI Edition). All margin units are points. */
@@ -310,10 +316,15 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
         return sel.end;
     };
 
+    /* `undefined` range (never `null` — tsify renders `Option<T>` as
+     * `T | undefined`) makes the ENGINE resolve its authoritative live
+     * selection, so a stale UI mirror can never misbind formatting. The
+     * cast bridges the wasm-pack d.ts until it regenerates with
+     * `range: LogicalRange | undefined`. */
     const fmt = (patch: Partial<TextAttrsPatch>, range?: LogicalRange) =>
         dispatch({
             type: 'APPLY_FORMATTING',
-            range: currentRange(range),
+            range: range as LogicalRange,
             attrs: { ...emptyPatch(), ...patch },
         });
 
@@ -323,6 +334,7 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             dispatch({ type: 'REQUEST_PAINT', viewport, dirty }),
 
         setZoom: (scale) => dispatch({ type: 'SET_ZOOM', scale }),
+        setDeviceScale: (scale) => dispatch({ type: 'SET_DEVICE_SCALE', scale }),
         setViewport: (rect) => dispatch({ type: 'SET_VIEWPORT', rect }),
         expandLayout: (target_y) => dispatch({ type: 'EXPAND_LAYOUT', target_y }),
 
@@ -479,28 +491,32 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 end_pt,
                 first_line_pt,
             }),
-        /* Indent +/- buttons bump `start_pt` (the logical leading-edge
-         * indent — `<w:start>`) by a fixed step. `end_pt` and
-         * `first_line_pt` reset to 0 because the engine takes the
-         * whole `<w:ind>` block atomically; preserving them would
-         * require a SELECTION_CHANGED.section_geometry-style read-back
-         * (see backlog issue #10). */
-        increaseIndent: (step_pt = 36, range) =>
-            dispatch({
+        /* Indent +/- buttons step `start_pt` (the logical leading-edge
+         * indent — `<w:start>`) from the live read-back
+         * (`SELECTION_CHANGED.paragraph_indent`), clamped ≥ 0, and pass
+         * the other two `<w:ind>` fields through unchanged — the engine
+         * takes the whole block atomically (mirrors Ruler.tsx's
+         * commitDrag). */
+        increaseIndent: (step_pt = 36, range) => {
+            const ind = state.paragraphIndent();
+            return dispatch({
                 type: 'SET_PARAGRAPH_INDENT',
                 range: currentRange(range),
-                start_pt: step_pt,
-                end_pt: 0,
-                first_line_pt: 0,
-            }),
-        decreaseIndent: (_step_pt = 36, range) =>
-            dispatch({
+                start_pt: Math.max(0, ind.start_pt + step_pt),
+                end_pt: ind.end_pt,
+                first_line_pt: ind.first_line_pt,
+            });
+        },
+        decreaseIndent: (step_pt = 36, range) => {
+            const ind = state.paragraphIndent();
+            return dispatch({
                 type: 'SET_PARAGRAPH_INDENT',
                 range: currentRange(range),
-                start_pt: 0,
-                end_pt: 0,
-                first_line_pt: 0,
-            }),
+                start_pt: Math.max(0, ind.start_pt - step_pt),
+                end_pt: ind.end_pt,
+                first_line_pt: ind.first_line_pt,
+            });
+        },
         setLineSpacing: (multiplier, range) =>
             dispatch({
                 type: 'SET_LINE_SPACING',

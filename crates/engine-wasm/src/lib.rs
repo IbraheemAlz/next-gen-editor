@@ -54,9 +54,17 @@ struct RenderConfig {
     px_size: f32,
     line_height: f32,
     alignment: Alignment,
-    /// Device-pixel ratio. Layout + paint are scaled by this; `px_size` and
-    /// `line_height` stay logical (the toolbar + document model use them raw).
+    /// Effective device scale — always `base_scale × zoom`. Layout + paint
+    /// are scaled by this; `px_size` and `line_height` stay logical (the
+    /// toolbar + document model use them raw).
     scale: f32,
+    /// Boot device scale — `RenderPage.device_pixel_ratio` (the shell
+    /// passes `devicePixelRatio × 4/3`). Never touched by `SetZoom`;
+    /// keeping it separate is what lets zoom `1.0` restore the exact
+    /// boot rendering instead of clobbering DPI scaling.
+    base_scale: f32,
+    /// User zoom fraction set by `SetZoom`, clamped to `[0.25, 4.0]`.
+    zoom: f32,
 }
 
 /// Width of the rendered caret, in canvas device pixels.
@@ -294,8 +302,9 @@ pub struct Engine {
     /// Phase 7 — decoded inline-image cache keyed by archive relationship
     /// id. The TS shell decodes every `word/media/*` blob into an
     /// `ImageBitmap` after the document loads and installs the result
-    /// here via `Command::RegisterImage`. The Canvas2D backend looks each
-    /// painted inline image up here; a miss falls back to a placeholder.
+    /// here via the direct wasm method [`Engine::register_image`]. The
+    /// Canvas2D backend looks each painted inline image up here; a miss
+    /// falls back to a placeholder.
     image_cache: HashMap<String, web_sys::ImageBitmap>,
     /// Last `render_document` output dimensions, cached so the worker
     /// can post a synthetic `Painted` side-channel after every mutating
@@ -552,6 +561,7 @@ impl Engine {
                     author: def.author,
                     date: def.date,
                     text: def.paragraphs.join("\n"),
+                    resolved: def.resolved,
                     start_block: r.start.path.last_block_index().unwrap_or(0),
                     start_offset: r.start.offset,
                     end_block: r.end.path.last_block_index().unwrap_or(0),
@@ -594,6 +604,9 @@ struct CommentOut {
     author: String,
     date: String,
     text: String,
+    /// Sprint 9 — the `<w15:commentEx w15:done>` flag; the UI's
+    /// resolve/reopen toggle reads this to invert the state.
+    resolved: bool,
     start_block: u32,
     start_offset: u32,
     end_block: u32,
@@ -3675,6 +3688,7 @@ impl Engine {
                 align,
                 device_pixel_ratio,
             } => {
+                let base_scale = device_pixel_ratio.unwrap_or(1.0).max(1.0);
                 let cfg = RenderConfig {
                     font_id,
                     base_direction: match base_direction.to_ascii_uppercase().as_str() {
@@ -3689,7 +3703,9 @@ impl Engine {
                         "CENTER" => Alignment::Center,
                         _ => Alignment::Start,
                     },
-                    scale: device_pixel_ratio.unwrap_or(1.0).max(1.0),
+                    scale: base_scale,
+                    base_scale,
+                    zoom: 1.0,
                 };
                 self.render_page(text, cfg)
             }
@@ -3766,6 +3782,7 @@ impl Engine {
             // Sprint 3 (UI Edition) — wired now (Sprint 1 shipped the
             // ZoomControls component over a stubbed dispatch).
             Command::SetZoom { scale } => self.do_set_zoom(scale),
+            Command::SetDeviceScale { scale } => self.do_set_device_scale(scale),
             Command::RequestPaint { viewport, dirty } => self.do_request_paint(viewport, dirty),
             Command::ExpandLayout { target_y } => self.do_expand_layout(target_y),
             Command::UnloadFont { .. } => phase3_stub("UnloadFont"),
@@ -4073,7 +4090,29 @@ impl Engine {
         }
     }
 
-    fn apply_formatting(&mut self, range: BridgeLogicalRange, attrs: TextAttrsPatch) -> Event {
+    fn apply_formatting(
+        &mut self,
+        range: Option<BridgeLogicalRange>,
+        attrs: TextAttrsPatch,
+    ) -> Event {
+        /* `None` binds to the engine-owned live selection — mirroring
+        the interactive `InsertText` path — because the UI's mirrored
+        selection is async and can be stale when a mutation is still
+        in flight. An explicit range is a deliberate override. */
+        let range = match range {
+            Some(r) => r,
+            None => match self.selection.as_ref() {
+                Some(sel) => {
+                    let (start, end) = ordered(sel.anchor.clone(), sel.caret.clone());
+                    BridgeLogicalRange { start, end }
+                }
+                None => {
+                    return Event::Error {
+                        message: "ApplyFormatting: no range given and no active selection".into(),
+                    };
+                }
+            },
+        };
         let patch = SpanStyle {
             font_size: attrs.font_size,
             color: attrs.color.map(|c| [c.r, c.g, c.b, c.a]),
@@ -7033,15 +7072,40 @@ impl Engine {
         Event::DocumentSaved { bytes, size }
     }
 
-    /// Sprint 3 (UI Edition) — set the device-pixel scale and force
-    /// a full repaint. Clamped to `[0.25, 4.0]`; `RenderPage` must
-    /// have cached a `layout_cfg` first (a fresh engine before any
-    /// render has no scale to mutate — return a no-op
-    /// `selection_changed` so the caller still sees a reply).
-    fn do_set_zoom(&mut self, scale: f32) -> Event {
-        let scale = scale.clamp(0.25, 4.0);
+    /// Sprint 3 (UI Edition) — set the user zoom fraction and force
+    /// a full repaint. Clamped to `[0.25, 4.0]` and COMPOSED with the
+    /// boot `base_scale` (`scale = base_scale × zoom`) so zooming
+    /// never clobbers DPI scaling and zoom `1.0` restores the exact
+    /// boot rendering. `RenderPage` must have cached a `layout_cfg`
+    /// first (a fresh engine before any render has no scale to
+    /// mutate — return a no-op `selection_changed` so the caller
+    /// still sees a reply).
+    fn do_set_zoom(&mut self, zoom: f32) -> Event {
+        let zoom = zoom.clamp(0.25, 4.0);
         if let Some(cfg) = self.layout_cfg.as_mut() {
-            cfg.scale = scale;
+            cfg.zoom = zoom;
+            cfg.scale = cfg.base_scale * zoom;
+        } else {
+            return self.selection_changed();
+        }
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `SetDeviceScale` — post-boot devicePixelRatio change (monitor move
+    /// / browser zoom). Replaces the boot `base_scale` and recomposes
+    /// `scale = base_scale × zoom`, leaving the user zoom untouched —
+    /// the mirror image of `do_set_zoom`. The wider clamp admits real
+    /// device ratios (dpr up to ~6 × the 4/3 CSS-pt factor).
+    fn do_set_device_scale(&mut self, scale: f32) -> Event {
+        let base = scale.clamp(0.5, 8.0);
+        if let Some(cfg) = self.layout_cfg.as_mut() {
+            cfg.base_scale = base;
+            cfg.scale = base * cfg.zoom;
         } else {
             return self.selection_changed();
         }
@@ -7708,6 +7772,8 @@ mod tests {
             line_height: 24.0,
             alignment: Alignment::Start,
             scale: 1.0,
+            base_scale: 1.0,
+            zoom: 1.0,
         };
         let para = |text: &str| engine::Paragraph {
             text: text.to_string(),
@@ -8327,6 +8393,8 @@ mod tests {
             line_height: 16.0,
             alignment: Alignment::Start,
             scale: 1.0,
+            base_scale: 1.0,
+            zoom: 1.0,
         }
     }
 

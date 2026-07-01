@@ -133,8 +133,13 @@ pub enum Command {
         range: LogicalRange,
         text: String,
     },
+    /// Apply a character-formatting patch. `range: None` resolves to
+    /// the engine-owned live selection (the authoritative one — mirrors
+    /// `InsertText`'s caret handling), so a stale UI-side selection
+    /// mirror can never misbind formatting. Pass an explicit range only
+    /// for a genuine override.
     ApplyFormatting {
-        range: LogicalRange,
+        range: Option<LogicalRange>,
         attrs: TextAttrsPatch,
     },
     SplitParagraph {
@@ -186,6 +191,13 @@ pub enum Command {
         rect: Rect,
     },
     SetZoom {
+        scale: f32,
+    },
+    /// Post-boot devicePixelRatio change (monitor move / browser zoom).
+    /// Replaces the boot device scale (`devicePixelRatio × 4/3`) and
+    /// recomposes the effective scale with the user zoom untouched —
+    /// unlike `SetZoom`, which owns the user-zoom factor.
+    SetDeviceScale {
         scale: f32,
     },
     RequestPaint {
@@ -427,10 +439,11 @@ pub enum Command {
         orientation: PageOrientation,
     },
     /// Sprint 5 (UI Edition) — toggle list membership on every
-    /// paragraph the range spans. `Off` clears `list_item` (works
-    /// today); `Bullet` / `Number` return `Event::Error` until
-    /// `numbering.xml` synthesis ships (tracked in the project
-    /// backlog as a Core Engine task).
+    /// paragraph the range spans. `Off` clears `list_item`;
+    /// `Bullet` / `Number` run the idempotent `numbering.xml`
+    /// synthesis (`DocumentTree::toggle_list_on_range`, Sprint 13
+    /// #12) so repeated toggles reuse the existing AbstractNum /
+    /// Num templates.
     ToggleList {
         range: LogicalRange,
         kind: ListKind,
@@ -461,9 +474,10 @@ pub enum Command {
         color: Option<Color>,
     },
     /// Sprint 7 (UI Edition) — toggle the engine's tracked-changes
-    /// RECORDING flag. Currently returns `Event::Error` until the
-    /// recording infrastructure (gating every edit into
-    /// `<w:ins>`/`<w:del>`) ships — see project backlog.
+    /// RECORDING flag. Implemented in Sprint 14 (#14): while enabled,
+    /// every text-mutation handler gates its work into a tracked
+    /// revision (`<w:ins>`/`<w:del>`), and the live flag rides back
+    /// on `Event::SelectionChanged.is_tracking_changes`.
     ToggleTrackChanges {
         enabled: bool,
     },
@@ -522,9 +536,9 @@ pub enum Command {
         range: LogicalRange,
         style_id: Option<String>,
     },
-    /// Sprint 7 (UI Edition) — toggle the in-memory `resolved` flag
-    /// on a comment. NOT yet round-tripped to `commentsExtended.xml`
-    /// — see project backlog.
+    /// Sprint 7 (UI Edition) — toggle the `resolved` flag on a
+    /// comment. Round-trips through `word/commentsExtended.xml`
+    /// (Sprint 9 — `<w15:commentEx w15:done>`).
     ResolveComment {
         id: u32,
         resolved: bool,
