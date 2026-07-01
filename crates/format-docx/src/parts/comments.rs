@@ -86,11 +86,13 @@ pub fn parse_comments_xml(xml: &[u8]) -> Result<CommentDefinitions, DocxError> {
                                 author: std::mem::take(&mut cur_author),
                                 date: std::mem::take(&mut cur_date),
                                 paragraphs: std::mem::take(&mut cur_paras),
-                                /* `resolved` is filled in from a second
-                                 * pass over `word/commentsExtended.xml`
+                                /* `resolved` + `parent_id` are filled in
+                                 * from a second pass over
+                                 * `word/commentsExtended.xml`
                                  * (see `parse_comments_extended_xml`). */
                                 resolved: false,
                                 first_para_id: first_para_id.take(),
+                                parent_id: None,
                             },
                         );
                     }
@@ -116,22 +118,41 @@ pub fn parse_comments_xml(xml: &[u8]) -> Result<CommentDefinitions, DocxError> {
     Ok(out)
 }
 
+/// One `<w15:commentEx>` row from `word/commentsExtended.xml`.
+///
+/// Sprint 9 modelled `(paraId, done)`; issue #27 adds the optional
+/// `w15:paraIdParent` that threads a reply under its parent comment
+/// (the attribute names the parent comment's first-paragraph
+/// `w14:paraId`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentExEntry {
+    /// `w15:paraId` — first-paragraph id of the comment this row
+    /// describes; matched against `CommentDef.first_para_id`.
+    pub para_id: String,
+    /// `w15:done` — the resolved flag.
+    pub done: bool,
+    /// Issue #27 — `w15:paraIdParent`, present only on threaded
+    /// replies. Names the PARENT comment's first-paragraph paraId.
+    pub parent_para_id: Option<String>,
+}
+
 /// Sprint 9 — parse `word/commentsExtended.xml` (`w15`-namespace
 /// extension). One `<w15:commentEx w15:paraId="…" w15:done="…"/>` per
-/// extended-comment entry; we surface `(paraId, done)` so the archive
-/// reader can match each entry's paraId against the
-/// `CommentDef.first_para_id` captured from `word/comments.xml` and
-/// flip `CommentDef.resolved`.
+/// extended-comment entry; we surface [`CommentExEntry`] rows so the
+/// archive reader can match each entry's paraId against the
+/// `CommentDef.first_para_id` captured from `word/comments.xml`, flip
+/// `CommentDef.resolved`, and (issue #27) attach `parent_id` from
+/// `w15:paraIdParent`.
 ///
 /// Lenient: missing / unknown attributes are skipped without erroring
 /// (Word silently ignores entries it cannot parse, and we follow). The
 /// parser is `Result`-typed only because `quick_xml::Reader` returns a
 /// `Result` per event; no `unwrap()` in the body.
-pub fn parse_comments_extended_xml(xml: &[u8]) -> Result<Vec<(String, bool)>, DocxError> {
+pub fn parse_comments_extended_xml(xml: &[u8]) -> Result<Vec<CommentExEntry>, DocxError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
-    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut out: Vec<CommentExEntry> = Vec::new();
 
     loop {
         let evt = reader.read_event_into(&mut buf)?;
@@ -139,11 +160,17 @@ pub fn parse_comments_extended_xml(xml: &[u8]) -> Result<Vec<(String, bool)>, Do
             Event::Empty(e) | Event::Start(e) if e.name().as_ref() == b"w15:commentEx" => {
                 let mut para_id: Option<String> = None;
                 let mut done = false;
+                let mut parent_para_id: Option<String> = None;
                 for a in e.attributes().flatten() {
                     match a.key.as_ref() {
                         b"w15:paraId" => {
                             if let Ok(v) = a.unescape_value() {
                                 para_id = Some(v.into_owned());
+                            }
+                        }
+                        b"w15:paraIdParent" => {
+                            if let Ok(v) = a.unescape_value() {
+                                parent_para_id = Some(v.into_owned());
                             }
                         }
                         b"w15:done" => {
@@ -160,7 +187,11 @@ pub fn parse_comments_extended_xml(xml: &[u8]) -> Result<Vec<(String, bool)>, Do
                     }
                 }
                 if let Some(pid) = para_id {
-                    out.push((pid, done));
+                    out.push(CommentExEntry {
+                        para_id: pid,
+                        done,
+                        parent_para_id,
+                    });
                 }
             }
             Event::Eof => break,
@@ -177,10 +208,15 @@ pub fn parse_comments_extended_xml(xml: &[u8]) -> Result<Vec<(String, bool)>, Do
 /// their `resolved` state in-memory only — a known limitation tracked
 /// as Core Engine tech-debt.
 ///
-/// Returns `Some(bytes)` when at least one entry is emitted (resolved
-/// comments with a paraId); `None` when there is nothing to write (the
-/// caller should then preserve the original passthrough entry, or
-/// omit the part entirely on a fresh document).
+/// Issue #27 — entries whose `CommentDef.parent_id` names another
+/// comment additionally carry `w15:paraIdParent` (the parent's
+/// paraId, resolved through `first_para_id` or the minted-override
+/// map), which is how Word threads replies.
+///
+/// Returns `Some(bytes)` when at least one entry carries information
+/// (a resolved bit or a parent link); `None` when there is nothing to
+/// write (the caller should then preserve the original passthrough
+/// entry, or omit the part entirely on a fresh document).
 pub fn build_comments_extended_xml(
     defs: &std::collections::HashMap<u32, CommentDef>,
 ) -> Option<Vec<u8>> {
@@ -197,17 +233,29 @@ pub fn build_comments_extended_xml_with_overrides(
     defs: &std::collections::HashMap<u32, CommentDef>,
     overrides: &std::collections::HashMap<u32, String>,
 ) -> Option<Vec<u8>> {
-    let mut entries: Vec<(String, bool)> = defs
+    /* Resolve a comment id → its paraId, consulting the captured
+    `first_para_id` first, then the minted-override map. */
+    let para_id_of = |id: &u32| -> Option<String> {
+        match defs.get(id).and_then(|c| c.first_para_id.as_deref()) {
+            Some(s) => Some(s.to_string()),
+            None => overrides.get(id).cloned(),
+        }
+    };
+    let mut entries: Vec<(String, bool, Option<String>)> = defs
         .iter()
         .filter_map(|(id, c)| {
-            let pid = match c.first_para_id.as_deref() {
-                Some(s) => s.to_string(),
-                None => overrides.get(id)?.clone(),
-            };
-            Some((pid, c.resolved))
+            let pid = para_id_of(id)?;
+            /* Issue #27 — a reply also names its parent's paraId. A
+            parent whose paraId cannot be resolved degrades leniently
+            to an un-threaded entry (Word tolerates the omission). */
+            let parent_pid = c.parent_id.as_ref().and_then(para_id_of);
+            Some((pid, c.resolved, parent_pid))
         })
         .collect();
-    if entries.iter().all(|(_, done)| !*done) {
+    if entries
+        .iter()
+        .all(|(_, done, parent)| !*done && parent.is_none())
+    {
         return None;
     }
     /* Stable output — `defs` is a HashMap, so order otherwise depends
@@ -220,16 +268,12 @@ pub fn build_comments_extended_xml_with_overrides(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w15:commentsEx xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">",
     );
-    for (pid, done) in entries {
+    for (pid, done, parent_pid) in entries {
         s.push_str("<w15:commentEx w15:paraId=\"");
-        for ch in pid.chars() {
-            match ch {
-                '&' => s.push_str("&amp;"),
-                '<' => s.push_str("&lt;"),
-                '>' => s.push_str("&gt;"),
-                '"' => s.push_str("&quot;"),
-                other => s.push(other),
-            }
+        escape_attr(&mut s, &pid);
+        if let Some(pp) = parent_pid {
+            s.push_str("\" w15:paraIdParent=\"");
+            escape_attr(&mut s, &pp);
         }
         s.push_str("\" w15:done=\"");
         s.push_str(if done { "1" } else { "0" });
@@ -368,9 +412,48 @@ mod tests {
             </w15:commentsEx>";
         let entries = parse_comments_extended_xml(xml).expect("parses");
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], ("00000001".to_string(), true));
-        assert_eq!(entries[1], ("00000002".to_string(), false));
-        assert_eq!(entries[2], ("00000003".to_string(), false));
+        assert_eq!(
+            entries[0],
+            CommentExEntry {
+                para_id: "00000001".to_string(),
+                done: true,
+                parent_para_id: None,
+            }
+        );
+        assert_eq!(
+            entries[1],
+            CommentExEntry {
+                para_id: "00000002".to_string(),
+                done: false,
+                parent_para_id: None,
+            }
+        );
+        assert_eq!(
+            entries[2],
+            CommentExEntry {
+                para_id: "00000003".to_string(),
+                done: false,
+                parent_para_id: None,
+            }
+        );
+    }
+
+    /// Issue #27 — `w15:paraIdParent` threads a reply under its parent.
+    #[test]
+    fn extended_parser_picks_paraid_parent() {
+        let xml = b"<?xml version=\"1.0\"?>\
+            <w15:commentsEx xmlns:w15=\"x\">\
+              <w15:commentEx w15:paraId=\"AAAA0001\" w15:done=\"0\"/>\
+              <w15:commentEx w15:paraId=\"BBBB0002\" w15:paraIdParent=\"AAAA0001\" w15:done=\"0\"/>\
+            </w15:commentsEx>";
+        let entries = parse_comments_extended_xml(xml).expect("parses");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].parent_para_id, None);
+        assert_eq!(
+            entries[1].parent_para_id.as_deref(),
+            Some("AAAA0001"),
+            "reply row carries the parent paraId"
+        );
     }
 
     #[test]
@@ -414,8 +497,77 @@ mod tests {
         assert!(s.contains("w15:done=\"0\""));
         /* Round-trip: feed our own output back into the parser. */
         let back = parse_comments_extended_xml(&bytes).expect("re-parses");
-        let by_pid: std::collections::HashMap<_, _> = back.into_iter().collect();
+        let by_pid: std::collections::HashMap<_, _> =
+            back.into_iter().map(|e| (e.para_id, e.done)).collect();
         assert_eq!(by_pid.get("aaaa1111"), Some(&true));
         assert_eq!(by_pid.get("bbbb2222"), Some(&false));
+    }
+
+    /// Issue #27 — an UN-resolved reply must still force the extended
+    /// part out (the parent link is information worth writing), and
+    /// its row must carry `w15:paraIdParent`. Round-trips through our
+    /// own parser.
+    #[test]
+    fn extended_writer_emits_paraid_parent_for_reply() {
+        let mut defs: std::collections::HashMap<u32, CommentDef> = Default::default();
+        defs.insert(
+            1,
+            CommentDef {
+                first_para_id: Some("AAAA0001".into()),
+                resolved: false,
+                ..Default::default()
+            },
+        );
+        defs.insert(
+            2,
+            CommentDef {
+                first_para_id: Some("BBBB0002".into()),
+                resolved: false,
+                parent_id: Some(1),
+                ..Default::default()
+            },
+        );
+        let bytes = build_comments_extended_xml(&defs)
+            .expect("a thread exists — the part must be written even with no resolved bit");
+        let s = std::str::from_utf8(&bytes).expect("utf-8");
+        assert!(
+            s.contains("w15:paraId=\"BBBB0002\" w15:paraIdParent=\"AAAA0001\""),
+            "reply row threads under the parent: {s}"
+        );
+        assert!(
+            !s.contains("w15:paraId=\"AAAA0001\" w15:paraIdParent"),
+            "top-level row carries no paraIdParent: {s}"
+        );
+        let back = parse_comments_extended_xml(&bytes).expect("re-parses");
+        let reply = back
+            .iter()
+            .find(|e| e.para_id == "BBBB0002")
+            .expect("reply row");
+        assert_eq!(reply.parent_para_id.as_deref(), Some("AAAA0001"));
+    }
+
+    /// Issue #27 — a reply whose paraId comes from the minted-override
+    /// map (engine-minted thread on a fresh document) resolves both its
+    /// own and its parent's paraId through the overrides.
+    #[test]
+    fn extended_writer_resolves_parent_via_override_map() {
+        let mut defs: std::collections::HashMap<u32, CommentDef> = Default::default();
+        defs.insert(1, CommentDef::default());
+        defs.insert(
+            2,
+            CommentDef {
+                parent_id: Some(1),
+                ..Default::default()
+            },
+        );
+        let mut overrides: std::collections::HashMap<u32, String> = Default::default();
+        overrides.insert(1, "00000001".into());
+        overrides.insert(2, "00000003".into());
+        let bytes = build_comments_extended_xml_with_overrides(&defs, &overrides).expect("emitted");
+        let s = std::str::from_utf8(&bytes).expect("utf-8");
+        assert!(
+            s.contains("w15:paraId=\"00000003\" w15:paraIdParent=\"00000001\""),
+            "override-minted paraIds thread correctly: {s}"
+        );
     }
 }

@@ -274,20 +274,34 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     /* Sprint 9 — second pass: `word/commentsExtended.xml` carries the
     `w15:done` resolved bit, keyed by `w15:paraId`. Map each entry's
     paraId back to its owning `CommentDef` (via the `first_para_id`
-    we just captured) and flip `resolved`. Failures are silent — Word
-    treats a malformed extended part as "no resolved comments". */
+    we just captured) and flip `resolved`. Issue #27 — the same pass
+    resolves `w15:paraIdParent` (threaded replies) back to the parent
+    comment's `w:id` by inverting the first_para_id map. Failures are
+    silent — Word treats a malformed extended part as "no resolved
+    comments". */
     if let Some(bytes) = other_entries
         .iter()
         .find(|(n, _)| n == COMMENTS_EXTENDED_XML)
         .map(|(_, b)| b.as_slice())
         && let Ok(entries) = parse_comments_extended_xml(bytes)
     {
-        let lookup: std::collections::HashMap<String, bool> = entries.into_iter().collect();
+        let lookup: std::collections::HashMap<String, (bool, Option<String>)> = entries
+            .into_iter()
+            .map(|e| (e.para_id, (e.done, e.parent_para_id)))
+            .collect();
+        let id_by_para: std::collections::HashMap<String, u32> = document
+            .comment_defs
+            .iter()
+            .filter_map(|(id, c)| c.first_para_id.clone().map(|p| (p, *id)))
+            .collect();
         for c in document.comment_defs.values_mut() {
             if let Some(pid) = c.first_para_id.as_deref()
-                && let Some(done) = lookup.get(pid).copied()
+                && let Some((done, parent_pid)) = lookup.get(pid)
             {
-                c.resolved = done;
+                c.resolved = *done;
+                c.parent_id = parent_pid
+                    .as_deref()
+                    .and_then(|pp| id_by_para.get(pp).copied());
             }
         }
     }

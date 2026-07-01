@@ -169,6 +169,13 @@ pub struct CommentDef {
     /// `None` until the comments.xml writer learns to mint paraIds —
     /// tracked as Core Engine tech-debt.
     pub first_para_id: Option<String>,
+    /// Issue #27 — threaded replies. `Some(id)` marks this comment as
+    /// a reply to the comment with that `w:id`; `None` marks a
+    /// top-level comment. Round-trips through
+    /// `word/commentsExtended.xml` `<w15:commentEx w15:paraIdParent>`
+    /// (the reader maps the parent paraId back to its comment id via
+    /// `first_para_id`).
+    pub parent_id: Option<u32>,
 }
 
 /// Phase 8a — one `<w:commentRangeStart>` / `<w:commentRangeEnd>` overlay
@@ -3028,6 +3035,7 @@ impl DocumentTree {
                 resolved state survives only in-memory until the
                 comments.xml writer learns to mint paraIds. */
                 first_para_id: None,
+                parent_id: None,
             },
         );
         let mut comment_ranges = self.comment_ranges.clone();
@@ -3053,13 +3061,106 @@ impl DocumentTree {
         (doc, new_id)
     }
 
+    /// Issue #27 — append a threaded reply to an existing comment.
+    /// Mints the next `w:id` (max existing + 1, same discipline as
+    /// [`Self::insert_comment`]) and installs a `CommentDef` with
+    /// `parent_id = Some(parent_id)`. The reply's `CommentRange` is
+    /// CLONED from the parent's range (same `start` / `end`) — Word
+    /// anchors replies on the parent's span, and the snapshot loop
+    /// (which iterates `comment_ranges`) then surfaces the reply
+    /// without any special-casing. A parent that carries no range
+    /// (orphan def) still accepts the reply; no range is pushed in
+    /// that case, mirroring the parent's own anchor-less state.
+    ///
+    /// Returns `None` when `parent_id` names no existing comment —
+    /// the wasm layer maps that to `Event::Error`.
+    pub fn reply_to_comment(
+        &self,
+        parent_id: u32,
+        text: String,
+        author: String,
+        date: String,
+    ) -> Option<(Self, u32)> {
+        if !self.comment_defs.contains_key(&parent_id) {
+            return None;
+        }
+        let new_id = self
+            .comment_defs
+            .keys()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut comment_defs = self.comment_defs.clone();
+        comment_defs.insert(
+            new_id,
+            CommentDef {
+                author,
+                date,
+                paragraphs: vec![text],
+                resolved: false,
+                /* Engine-minted replies have no paraId yet — the
+                comments.xml writer mints one at save time. */
+                first_para_id: None,
+                parent_id: Some(parent_id),
+            },
+        );
+        let mut comment_ranges = self.comment_ranges.clone();
+        if let Some(parent_range) = self.comment_ranges.iter().find(|r| r.id == parent_id) {
+            comment_ranges.push(CommentRange {
+                id: new_id,
+                start: parent_range.start.clone(),
+                end: parent_range.end.clone(),
+            });
+        }
+        let doc = Self {
+            blocks: self.blocks.clone(),
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs,
+            comment_ranges,
+            settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
+            numbering: self.numbering.clone(),
+        };
+        Some((doc, new_id))
+    }
+
     /// Sprint 7 (UI Edition) — remove a comment by id from both
     /// `comment_defs` and `comment_ranges`.
+    ///
+    /// Issue #27 — deletion CASCADES through the reply thread: every
+    /// comment whose `parent_id` chain (walked transitively) reaches
+    /// the deleted id is removed too, along with its ranges. Deleting
+    /// a reply leaves its parent untouched.
     pub fn delete_comment(&self, id: u32) -> Self {
+        /* Transitive closure of the thread rooted at `id`. Fixpoint
+        loop — reply chains are short (Word nests one level, but a
+        chain of replies-to-replies still terminates because each
+        pass only ever adds ids). */
+        let mut doomed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        doomed.insert(id);
+        loop {
+            let before = doomed.len();
+            for (cid, def) in &self.comment_defs {
+                if let Some(pid) = def.parent_id
+                    && doomed.contains(&pid)
+                {
+                    doomed.insert(*cid);
+                }
+            }
+            if doomed.len() == before {
+                break;
+            }
+        }
         let mut comment_defs = self.comment_defs.clone();
-        comment_defs.remove(&id);
+        comment_defs.retain(|cid, _| !doomed.contains(cid));
         let mut comment_ranges = self.comment_ranges.clone();
-        comment_ranges.retain(|r| r.id != id);
+        comment_ranges.retain(|r| !doomed.contains(&r.id));
         Self {
             blocks: self.blocks.clone(),
             sections: self.sections.clone(),
@@ -7001,6 +7102,24 @@ mod tests {
     /// must NOT underflow the wire `u32` or be silently coerced to
     /// "insert after row 0". `insert_row(path, 0)` lands the new row
     /// at index 0; the original row shifts to index 1.
+    /// Issue #25 — `set_line_spacing` stores Word's Auto multiplier as
+    /// 240-ths twips on props AND direct_overrides; `<= 0` clears.
+    #[test]
+    fn set_line_spacing_stores_auto_multiplier_and_clears() {
+        let d = DocumentTree::from_text("hi");
+        let start = LogicalPos::new(BlockPath::top(0), 0);
+        let end = LogicalPos::new(BlockPath::top(0), 2);
+        let d = d.set_line_spacing(start.clone(), end.clone(), 1.15);
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.props.line_height, Some(LineHeight::Auto { twips: 276 }));
+        assert_eq!(
+            p.direct_overrides.line_height,
+            Some(LineHeight::Auto { twips: 276 })
+        );
+        let d = d.set_line_spacing(start, end, 0.0);
+        assert_eq!(d.blocks[0].as_paragraph().unwrap().props.line_height, None);
+    }
+
     #[test]
     fn insert_row_at_zero_prepends_no_underflow() {
         let d = DocumentTree::new().insert_table(BlockPath::top(0), 2, 2);
@@ -7201,5 +7320,92 @@ mod tests {
                 .as_paragraph()
                 .is_some_and(|p| p.text.is_empty())
         );
+    }
+
+    /* ---- issue #27: threaded comment replies ----------------------- */
+
+    /// Anchor a top-level comment on a non-trivial range so the reply's
+    /// cloned range is distinguishable from a default.
+    fn doc_with_comment() -> (DocumentTree, u32) {
+        let doc = DocumentTree::from_text("hello world");
+        doc.insert_comment(
+            LogicalPos::new(BlockPath::top(0), 2),
+            LogicalPos::new(BlockPath::top(0), 7),
+            "root comment".into(),
+            "Alice".into(),
+            "2026-07-01T00:00:00Z".into(),
+        )
+    }
+
+    #[test]
+    fn reply_to_comment_mints_id_sets_parent_and_clones_range() {
+        let (doc, parent) = doc_with_comment();
+        let (doc, reply) = doc
+            .reply_to_comment(
+                parent,
+                "reply body".into(),
+                "Bob".into(),
+                "2026-07-02T00:00:00Z".into(),
+            )
+            .expect("parent exists");
+        assert_eq!(reply, parent + 1, "next sequential id minted");
+        let def = doc.comment_defs.get(&reply).expect("reply def");
+        assert_eq!(def.parent_id, Some(parent));
+        assert_eq!(def.paragraphs, vec!["reply body".to_string()]);
+        assert_eq!(def.author, "Bob");
+        assert!(!def.resolved);
+        assert!(def.first_para_id.is_none());
+        /* The reply's range is a clone of the parent's span. */
+        let pr = doc
+            .comment_ranges
+            .iter()
+            .find(|r| r.id == parent)
+            .expect("parent range");
+        let rr = doc
+            .comment_ranges
+            .iter()
+            .find(|r| r.id == reply)
+            .expect("reply range");
+        assert_eq!(rr.start, pr.start);
+        assert_eq!(rr.end, pr.end);
+    }
+
+    #[test]
+    fn reply_to_unknown_parent_returns_none() {
+        let (doc, _parent) = doc_with_comment();
+        assert!(
+            doc.reply_to_comment(999, "x".into(), "Bob".into(), "d".into())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn delete_comment_cascades_to_transitive_replies() {
+        let (doc, parent) = doc_with_comment();
+        let (doc, reply) = doc
+            .reply_to_comment(parent, "reply".into(), "Bob".into(), "d".into())
+            .expect("parent exists");
+        let (doc, nested) = doc
+            .reply_to_comment(reply, "reply to reply".into(), "Carol".into(), "d".into())
+            .expect("reply exists");
+        assert_eq!(doc.comment_defs.len(), 3);
+        assert_eq!(doc.comment_ranges.len(), 3);
+        let doc = doc.delete_comment(parent);
+        assert!(doc.comment_defs.is_empty(), "cascade removed the thread");
+        assert!(doc.comment_ranges.is_empty());
+        let _ = nested;
+    }
+
+    #[test]
+    fn deleting_a_reply_leaves_the_parent() {
+        let (doc, parent) = doc_with_comment();
+        let (doc, reply) = doc
+            .reply_to_comment(parent, "reply".into(), "Bob".into(), "d".into())
+            .expect("parent exists");
+        let doc = doc.delete_comment(reply);
+        assert!(doc.comment_defs.contains_key(&parent));
+        assert!(!doc.comment_defs.contains_key(&reply));
+        assert!(doc.comment_ranges.iter().any(|r| r.id == parent));
+        assert!(!doc.comment_ranges.iter().any(|r| r.id == reply));
     }
 }

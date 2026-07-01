@@ -236,7 +236,7 @@
 |---|---|---|---|
 | **Comments snapshot** (read-only) | `Engine::comments_snapshot()` → `Vec<Comment>` (`lib.rs:478`) | Comments rail on right with anchored callouts | ✅ Wired (Sprints 1–8 UI Edition) — `CommentsRail.tsx` via `engine.commentsSnapshot()` |
 | **Insert comment** | No engine command yet | Right-click selection → "New comment" + toolbar Review → Comment | 🛑 Blocked — needs bridge addition |
-| **Reply to comment** | No command | Reply field on each comment thread | 🛑 Blocked |
+| **Reply to comment** | `Command::ReplyToComment` (`command.rs`, after `ResolveComment`) | Reply field on each comment thread | ✅ Wired (2026-07-02, issue #27) — `CommentsRail.tsx` groups the snapshot into threads on `parent_id` and posts replies via `cmd.replyToComment`; the engine anchors the reply on the parent's range, delete cascades over the thread, and threading round-trips through `word/commentsExtended.xml` `<w15:commentEx w15:paraIdParent>` |
 | **Resolve / delete comment** | `Command::ResolveComment` / `Command::DeleteComment` | `CommentsRail.tsx` per-comment row | ✅ Wired (Sprint 9) — `resolved` round-trips through `word/commentsExtended.xml` (`#15` closed) |
 | **Comment-anchor highlight in body** | Engine has range info | Coloured underline at comment range | 🛑 Blocked |
 

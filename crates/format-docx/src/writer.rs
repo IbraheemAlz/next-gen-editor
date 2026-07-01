@@ -1178,15 +1178,18 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
 
         /* L1.2 (#18) — synthesize `word/comments.xml` only when the
         archive carries no `comments.xml` AND the engine holds at least
-        one resolved comment with no captured paraId. The synthesis
-        path mints fresh `w14:paraId` / `w14:textId` values per `<w:p>`
-        so the matching `commentsExtended.xml` row can refer to them.
-        Existing Word-authored `comments.xml` is never overwritten —
-        the writer continues to ride the OPC passthrough. */
+        one comment that NEEDS the extended part but has no captured
+        paraId: a resolved comment, or (issue #27) a threaded reply —
+        both round-trip through `<w15:commentEx>` rows that key on
+        `w14:paraId`. The synthesis path mints fresh `w14:paraId` /
+        `w14:textId` values per `<w:p>` so the matching
+        `commentsExtended.xml` row can refer to them. Existing
+        Word-authored `comments.xml` is never overwritten — the writer
+        continues to ride the OPC passthrough. */
         let any_unminted_resolved = doc
             .comment_defs
             .values()
-            .any(|c| c.resolved && c.first_para_id.is_none());
+            .any(|c| (c.resolved || c.parent_id.is_some()) && c.first_para_id.is_none());
         let (comments_bytes, minted_paraids): (Option<Vec<u8>>, HashMap<u32, String>) =
             if any_unminted_resolved && !comments_already_present {
                 let (bytes, map) = build_comments_xml(&doc.comment_defs);
@@ -1196,11 +1199,16 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             };
 
         /* Sprint 9 — regenerate `word/commentsExtended.xml` only when
-        the document carries at least one resolved comment. Untouched
-        comments fall through the passthrough so unrelated documents
-        stay byte-identical. The mint map populates first_para_id for
+        the document carries at least one resolved comment or (issue
+        #27) at least one threaded reply. Untouched comments fall
+        through the passthrough so unrelated documents stay
+        byte-identical. The mint map populates first_para_id for
         engine-minted comments synthesized above. */
-        let extended_bytes = if doc.comment_defs.values().any(|c| c.resolved) {
+        let extended_bytes = if doc
+            .comment_defs
+            .values()
+            .any(|c| c.resolved || c.parent_id.is_some())
+        {
             if minted_paraids.is_empty() {
                 build_comments_extended_xml(&doc.comment_defs)
             } else {
@@ -3411,6 +3419,72 @@ mod tests {
         assert!(
             cdef.first_para_id.is_some(),
             "first_para_id was minted: {cdef:?}"
+        );
+    }
+
+    /// Issue #27 — a fresh document holding an engine-minted comment
+    /// plus a threaded reply must synthesize `comments.xml` +
+    /// `commentsExtended.xml` (even though NO comment is resolved —
+    /// the thread alone fires the gate) and carry the parent link
+    /// across a save → reopen round-trip via `w15:paraIdParent`.
+    #[test]
+    fn engine_minted_reply_round_trips_thread() {
+        use engine::{BlockPath, LogicalPos};
+        let pos = |o: u32| LogicalPos {
+            path: BlockPath::top(0),
+            offset: o,
+        };
+        let doc = DocumentTree::from_text("hello world");
+        let (doc, parent_id) = doc.insert_comment(
+            pos(0),
+            pos(5),
+            "root comment".into(),
+            "Alice".into(),
+            "2026-07-01T00:00:00Z".into(),
+        );
+        let (doc, reply_id) = doc
+            .reply_to_comment(
+                parent_id,
+                "reply body".into(),
+                "Bob".into(),
+                "2026-07-02T00:00:00Z".into(),
+            )
+            .expect("parent exists");
+        assert_ne!(parent_id, reply_id);
+
+        let bytes = build_minimal_docx(&doc).expect("build");
+
+        /* Both comment parts synthesized despite zero resolved bits. */
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip");
+        let names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
+        assert!(
+            names.contains(&"word/comments.xml".to_string()),
+            "thread fires the comments.xml synth gate: {names:?}"
+        );
+        assert!(
+            names.contains(&"word/commentsExtended.xml".to_string()),
+            "thread fires the commentsExtended.xml synth gate: {names:?}"
+        );
+
+        /* Reopen — the thread survives: same ids, parent link intact,
+        reply body + author preserved, paraIds minted for both. */
+        let reopened = read_docx(&bytes).expect("re-read");
+        let defs = &reopened.document.comment_defs;
+        assert_eq!(defs.len(), 2, "both defs round-tripped: {defs:?}");
+        let parent = defs.get(&parent_id).expect("parent def");
+        let reply = defs.get(&reply_id).expect("reply def");
+        assert_eq!(parent.parent_id, None, "root stays top-level");
+        assert_eq!(
+            reply.parent_id,
+            Some(parent_id),
+            "parent link survived the round-trip: {reply:?}"
+        );
+        assert_eq!(reply.paragraphs, vec!["reply body".to_string()]);
+        assert_eq!(reply.author, "Bob");
+        assert!(!reply.resolved);
+        assert!(
+            parent.first_para_id.is_some() && reply.first_para_id.is_some(),
+            "paraIds minted for both thread members"
         );
     }
 

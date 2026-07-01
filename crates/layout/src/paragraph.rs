@@ -59,6 +59,10 @@ pub struct ParagraphConfig<'a> {
     pub base_direction: ShapingDirection,
     pub max_width: f32,
     pub line_height: f32,
+    /// Issue #25 — `true` for `<w:spacing w:lineRule="exact">`: the line
+    /// box is exactly `line_height` tall and tall glyphs clip instead of
+    /// growing the envelope (Word "Exactly" spacing).
+    pub line_height_exact: bool,
     pub alignment: Alignment,
     /// `<w:ind w:start>` — distance every line is offset from the leading
     /// margin. In layout px (already DPR-scaled).
@@ -201,7 +205,8 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
     let mut lines: Vec<LineBox> = Vec::with_capacity(composed.len());
     let mut y = 0.0_f32;
     for (i, (mut line, _)) in composed.into_iter().enumerate() {
-        let (ascent, descent) = line_extents(&line, cfg.fonts, cfg.line_height);
+        let (ascent, descent) =
+            line_extents(&line, cfg.fonts, cfg.line_height, cfg.line_height_exact);
         /* First-line indent / hanging: hanging shifts the first line *back*
         toward the leading edge; firstLine shifts it *forward* into the body.
         Both already in layout px. Subsequent lines — soft-wrapped OR forced
@@ -377,6 +382,7 @@ fn compose_lines_with_width<'a>(
         base_direction: cfg.base_direction,
         max_width: content_width,
         line_height: cfg.line_height,
+        line_height_exact: cfg.line_height_exact,
         alignment: cfg.alignment,
         indent_start_px: 0.0,
         indent_end_px: 0.0,
@@ -650,7 +656,7 @@ fn next_tab_stop_after(pen_x: f32, custom: &[(f32, TabKind)]) -> (f32, TabKind) 
 ///
 /// Closes Issue #22 symptoms (1) and (2): top-padding clip + overlapping
 /// line wrap on massive `font_size`.
-fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32) -> (f32, f32) {
+fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32, exact: bool) -> (f32, f32) {
     let mut font_ascent = 0.0_f32;
     let mut font_descent = 0.0_f32;
     let mut inline_image_h = 0.0_f32;
@@ -682,6 +688,15 @@ fn line_extents(line: &LineBox, fonts: &FontStack, line_height: f32) -> (f32, f3
     `line_height` target alone clips the glyph into the previous line
     or the top margin. Take the max so the line box grows under massive
     font sizes; small sizes stay on the original Auto path. */
+    /* Issue #25 — Word "Exactly" spacing: the line box is precisely
+    `line_height` tall; tall glyphs and inline images clip into the band
+    instead of growing it. Baseline keeps the 82% rule so text inside
+    the band sits consistently. */
+    if exact {
+        let ascent = line_height * 0.82;
+        return (ascent, line_height - ascent);
+    }
+
     let glyph_envelope = font_ascent + font_descent;
     let inline_floor = inline_image_h + line_height * 0.18;
     let total = line_height.max(glyph_envelope).max(inline_floor);

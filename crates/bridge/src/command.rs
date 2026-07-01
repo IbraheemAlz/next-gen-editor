@@ -543,6 +543,17 @@ pub enum Command {
         id: u32,
         resolved: bool,
     },
+    /// Issue #27 — append a threaded reply to the comment with
+    /// `parent_id`. The reply is anchored to the parent's range (Word
+    /// anchors replies on the same span) and the engine mints the new
+    /// sequential `w:id`. Unknown `parent_id` → `Event::Error`.
+    /// Threading round-trips through `word/commentsExtended.xml`
+    /// (`<w15:commentEx w15:paraIdParent>`).
+    ReplyToComment {
+        parent_id: u32,
+        text: String,
+        author: String,
+    },
 }
 
 /// Wire shape for `engine::CellBorders` — per-edge strokes for one

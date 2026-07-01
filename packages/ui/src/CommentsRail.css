@@ -146,3 +146,55 @@
     color: var(--nge-color-danger);
     background: rgba(220, 38, 38, 0.06);
 }
+
+/* Issue #27 — threaded replies nested inside the parent card. */
+.nge-cm__replies {
+    margin: var(--nge-space-2) 0 0;
+    padding: 0 0 0 var(--nge-space-3);
+    list-style: none;
+    border-left: 2px solid rgba(202, 138, 4, 0.25);
+}
+
+.nge-cm__reply {
+    margin-top: var(--nge-space-2);
+}
+
+.nge-cm__reply:first-child {
+    margin-top: 0;
+}
+
+.nge-cm__avatar--reply {
+    width: 20px;
+    height: 20px;
+}
+
+.nge-cm__reply .nge-cm__text {
+    margin-bottom: 0;
+}
+
+.nge-cm__card--resolved .nge-cm__reply .nge-cm__text {
+    text-decoration: none;
+}
+
+.nge-cm__reply-draft {
+    display: flex;
+    flex-direction: column;
+    gap: var(--nge-space-1);
+    margin-top: var(--nge-space-2);
+}
+
+.nge-cm__reply-textarea {
+    padding: var(--nge-space-1) var(--nge-space-2);
+    background: var(--nge-color-bg);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    font: 500 var(--nge-font-size-xs)/1.4 var(--nge-font-ui);
+    color: var(--nge-color-text);
+    resize: vertical;
+}
+
+.nge-cm__reply-draft-actions {
+    display: flex;
+    gap: var(--nge-space-1);
+    justify-content: flex-end;
+}

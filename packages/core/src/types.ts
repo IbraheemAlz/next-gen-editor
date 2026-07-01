@@ -97,6 +97,11 @@ export interface CommentSnapshot {
     end_offset: number;
     /** Optional — implementations that pre-date Sprint 7 omit it. */
     resolved?: boolean;
+    /** Issue #27 — parent comment `w:id` when this row is a threaded
+     *  reply; `undefined` (or absent) on top-level comments. Round-
+     *  trips through `word/commentsExtended.xml`
+     *  `<w15:commentEx w15:paraIdParent>`. */
+    parent_id?: number;
 }
 
 /**

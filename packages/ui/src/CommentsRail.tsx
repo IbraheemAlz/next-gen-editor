@@ -5,11 +5,16 @@
  * Consumes `engine.commentsSnapshot()`. Same lifecycle pattern as
  * TrackChangesSidebar: initial fetch + refresh on document events.
  *
- * Resolve / Delete are wired end-to-end — each card dispatches
- * `Command::ResolveComment` / `Command::DeleteComment` and refreshes
- * the snapshot. Reply is the one remaining gap: the bridge has no
- * reply command, so no Reply button renders here (see the
- * `core-engine` GitHub issue tracking the comment-reply command).
+ * Resolve / Delete / Reply are all wired end-to-end. Resolve and
+ * Delete dispatch `Command::ResolveComment` / `Command::DeleteComment`
+ * (delete cascades over the whole reply thread engine-side). Reply
+ * (issue #27, closed by this change) dispatches
+ * `Command::ReplyToComment` — the engine anchors the reply on the
+ * parent's range, mints the id, and the thread round-trips through
+ * `word/commentsExtended.xml` `<w15:commentEx w15:paraIdParent>`.
+ * The rail groups snapshot rows into threads on `parent_id`
+ * (top-level = `parent_id` undefined/null) and renders replies
+ * indented inside the parent card, ordered by id.
  */
 import {
     createEffect,
@@ -28,6 +33,16 @@ import './CommentsRail.css';
 
 export interface CommentsRailProps {
     title?: string;
+    /** Author stamped on replies composed in the rail. Mirrors
+     *  `ReviewControlsProps.defaultAuthor`; falls back to the
+     *  engine's own `"You"` default. */
+    defaultAuthor?: string;
+}
+
+/** One top-level comment plus its replies (ordered by id). */
+interface CommentThread {
+    root: CommentSnapshot;
+    replies: CommentSnapshot[];
 }
 
 function fmtDate(iso: string): string {
@@ -47,11 +62,50 @@ function authorInitials(author: string): string {
     return parts.map((p) => p[0]?.toUpperCase() ?? '').join('') || '?';
 }
 
+/** Group flat snapshot rows into threads. Top-level rows key their
+ *  own thread; replies attach to their thread root (walking
+ *  `parent_id` transitively so replies-to-replies land in the same
+ *  flat list, Word-style). A reply whose parent is missing from the
+ *  snapshot is promoted to a top-level card rather than dropped. */
+function groupThreads(rows: CommentSnapshot[]): CommentThread[] {
+    const byId = new Map<number, CommentSnapshot>(rows.map((c) => [c.id, c]));
+    const rootOf = (c: CommentSnapshot): CommentSnapshot => {
+        let cur = c;
+        const seen = new Set<number>([c.id]);
+        while (cur.parent_id != null) {
+            const parent = byId.get(cur.parent_id);
+            if (!parent || seen.has(parent.id)) break;
+            seen.add(parent.id);
+            cur = parent;
+        }
+        return cur;
+    };
+    const threads = new Map<number, CommentThread>();
+    for (const c of rows) {
+        if (c.parent_id == null) threads.set(c.id, { root: c, replies: [] });
+    }
+    for (const c of rows) {
+        if (c.parent_id == null) continue;
+        const root = rootOf(c);
+        const t = threads.get(root.id);
+        if (t) t.replies.push(c);
+        else threads.set(c.id, { root: c, replies: [] });
+    }
+    for (const t of threads.values()) t.replies.sort((a, b) => a.id - b.id);
+    return [...threads.values()];
+}
+
 export const CommentsRail: Component<CommentsRailProps> = (props) => {
     const engine = useEngine();
     const cmd = createEditorCommands();
     const [comments, setComments] = createSignal<CommentSnapshot[]>([]);
     const [error, setError] = createSignal<string | null>(null);
+    /* Issue #27 — one reply draft open at a time, keyed by the
+     * top-level comment id it replies to. */
+    const [replyFor, setReplyFor] = createSignal<number | null>(null);
+    const [replyText, setReplyText] = createSignal('');
+
+    const threads = () => groupThreads(comments());
 
     const remove = async (id: number) => {
         await cmd.deleteComment(id);
@@ -59,6 +113,18 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
     };
     const toggleResolved = async (c: CommentSnapshot) => {
         await cmd.resolveComment(c.id, !c.resolved);
+        await refresh();
+    };
+    const toggleReplyDraft = (id: number) => {
+        setReplyText('');
+        setReplyFor((cur) => (cur === id ? null : id));
+    };
+    const submitReply = async (parentId: number) => {
+        const text = replyText().trim();
+        if (text === '') return;
+        await cmd.replyToComment(parentId, text, props.defaultAuthor ?? 'You');
+        setReplyText('');
+        setReplyFor(null);
         await refresh();
     };
 
@@ -97,61 +163,134 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                 <div class="nge-cm__error" role="alert">{error()}</div>
             </Show>
             <Show
-                when={comments().length > 0}
+                when={threads().length > 0}
                 fallback={
                     <div class="nge-cm__empty">No comments in this document.</div>
                 }
             >
                 <ul class="nge-cm__list">
-                    <For each={comments()}>
-                        {(c) => (
+                    <For each={threads()}>
+                        {(t) => (
                             <li
-                                class={`nge-cm__card ${c.resolved ? 'nge-cm__card--resolved' : ''}`}
-                                data-comment-id={c.id}
+                                class={`nge-cm__card ${t.root.resolved ? 'nge-cm__card--resolved' : ''}`}
+                                data-comment-id={t.root.id}
                             >
                                 <div class="nge-cm__card-head">
                                     <div
                                         class="nge-cm__avatar"
                                         aria-hidden="true"
-                                        title={c.author || 'Anonymous'}
+                                        title={t.root.author || 'Anonymous'}
                                     >
-                                        {authorInitials(c.author)}
+                                        {authorInitials(t.root.author)}
                                     </div>
                                     <div class="nge-cm__byline">
                                         <span class="nge-cm__author">
-                                            {c.author || 'Anonymous'}
+                                            {t.root.author || 'Anonymous'}
                                         </span>
-                                        <time class="nge-cm__date">{fmtDate(c.date)}</time>
+                                        <time class="nge-cm__date">{fmtDate(t.root.date)}</time>
                                     </div>
                                 </div>
-                                <p class="nge-cm__text">{c.text}</p>
+                                <p class="nge-cm__text">{t.root.text}</p>
                                 <div class="nge-cm__loc">
                                     <span>
-                                        block {c.start_block}:{c.start_offset}
+                                        block {t.root.start_block}:{t.root.start_offset}
                                         {' → '}
-                                        block {c.end_block}:{c.end_offset}
+                                        block {t.root.end_block}:{t.root.end_offset}
                                     </span>
                                 </div>
+                                <Show when={t.replies.length > 0}>
+                                    <ul class="nge-cm__replies">
+                                        <For each={t.replies}>
+                                            {(r) => (
+                                                <li
+                                                    class="nge-cm__reply"
+                                                    data-comment-id={r.id}
+                                                >
+                                                    <div class="nge-cm__card-head">
+                                                        <div
+                                                            class="nge-cm__avatar nge-cm__avatar--reply"
+                                                            aria-hidden="true"
+                                                            title={r.author || 'Anonymous'}
+                                                        >
+                                                            {authorInitials(r.author)}
+                                                        </div>
+                                                        <div class="nge-cm__byline">
+                                                            <span class="nge-cm__author">
+                                                                {r.author || 'Anonymous'}
+                                                            </span>
+                                                            <time class="nge-cm__date">
+                                                                {fmtDate(r.date)}
+                                                            </time>
+                                                        </div>
+                                                    </div>
+                                                    <p class="nge-cm__text">{r.text}</p>
+                                                </li>
+                                            )}
+                                        </For>
+                                    </ul>
+                                </Show>
                                 <div class="nge-cm__actions">
                                     <button
                                         class="nge-btn nge-cm__action"
                                         type="button"
-                                        aria-label={c.resolved ? 'Reopen comment' : 'Resolve comment'}
-                                        title={c.resolved ? 'Reopen' : 'Resolve'}
-                                        onClick={() => void toggleResolved(c)}
+                                        aria-label="Reply to comment"
+                                        aria-expanded={replyFor() === t.root.id}
+                                        title="Reply"
+                                        onClick={() => toggleReplyDraft(t.root.id)}
                                     >
-                                        {c.resolved ? '↺ Reopen' : '✓ Resolve'}
+                                        ↩ Reply
+                                    </button>
+                                    <button
+                                        class="nge-btn nge-cm__action"
+                                        type="button"
+                                        aria-label={t.root.resolved ? 'Reopen comment' : 'Resolve comment'}
+                                        title={t.root.resolved ? 'Reopen' : 'Resolve'}
+                                        onClick={() => void toggleResolved(t.root)}
+                                    >
+                                        {t.root.resolved ? '↺ Reopen' : '✓ Resolve'}
                                     </button>
                                     <button
                                         class="nge-btn nge-cm__action nge-cm__action--danger"
                                         type="button"
                                         aria-label="Delete comment"
-                                        title="Delete comment"
-                                        onClick={() => void remove(c.id)}
+                                        title="Delete comment (removes its replies too)"
+                                        onClick={() => void remove(t.root.id)}
                                     >
                                         🗑 Delete
                                     </button>
                                 </div>
+                                <Show when={replyFor() === t.root.id}>
+                                    <div
+                                        class="nge-cm__reply-draft"
+                                        role="form"
+                                        aria-label="Reply to comment"
+                                    >
+                                        <textarea
+                                            class="nge-cm__reply-textarea"
+                                            placeholder="Reply…"
+                                            rows={2}
+                                            value={replyText()}
+                                            onInput={(e) => setReplyText(e.currentTarget.value)}
+                                        />
+                                        <div class="nge-cm__reply-draft-actions">
+                                            <button
+                                                class="nge-btn nge-cm__action"
+                                                type="button"
+                                                onClick={() => toggleReplyDraft(t.root.id)}
+                                            >
+                                                Cancel
+                                            </button>
+                                            <button
+                                                class="nge-btn nge-btn--primary nge-cm__action"
+                                                type="button"
+                                                disabled={replyText().trim() === ''}
+                                                onClick={() => void submitReply(t.root.id)}
+                                            >
+                                                Reply
+                                            </button>
+                                        </div>
+                                    </div>
+                                </Show>
                             </li>
                         )}
                     </For>

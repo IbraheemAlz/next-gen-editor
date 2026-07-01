@@ -243,6 +243,17 @@ export interface EditorCommands {
     ): Promise<Event>;
     deleteComment(id: number): Promise<Event>;
     resolveComment(id: number, resolved: boolean): Promise<Event>;
+    /**
+     * Issue #27 — append a threaded reply to the comment with
+     * `parentId`. The engine anchors the reply on the parent's range
+     * and mints the new sequential id; an unknown parent returns
+     * `Event::Error`. Deleting the parent cascades over its replies.
+     */
+    replyToComment(
+        parentId: number,
+        text: string,
+        author: string,
+    ): Promise<Event>;
 
     /* Styles (Sprint 12 #11). Dispatches `APPLY_STYLE` — the engine
      * sets `<w:pStyle>` and cascades the style's `<w:pPr>`. The
@@ -554,6 +565,13 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
         deleteComment: (id) => dispatch({ type: 'DELETE_COMMENT', id }),
         resolveComment: (id, resolved) =>
             dispatch({ type: 'RESOLVE_COMMENT', id, resolved }),
+        replyToComment: (parentId, text, author) =>
+            dispatch({
+                type: 'REPLY_TO_COMMENT',
+                parent_id: parentId,
+                text,
+                author,
+            }),
         applyStyle: (styleId, range) =>
             dispatch({
                 type: 'APPLY_STYLE',

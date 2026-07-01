@@ -39,6 +39,9 @@ export interface CommentSnapshot {
     end_block: number;
     end_offset: number;
     resolved: boolean;
+    /** Issue #27 — parent comment `w:id` when this row is a threaded
+     *  reply; `undefined` on top-level comments. */
+    parent_id?: number;
 }
 
 /** Phase 8b — read-only snapshot row for revision tooltips. */

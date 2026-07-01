@@ -569,6 +569,7 @@ impl Engine {
                     date: def.date,
                     text: def.paragraphs.join("\n"),
                     resolved: def.resolved,
+                    parent_id: def.parent_id,
                     start_block: r.start.path.last_block_index().unwrap_or(0),
                     start_offset: r.start.offset,
                     end_block: r.end.path.last_block_index().unwrap_or(0),
@@ -617,6 +618,10 @@ struct CommentOut {
     /// Sprint 9 — the `<w15:commentEx w15:done>` flag; the UI's
     /// resolve/reopen toggle reads this to invert the state.
     resolved: bool,
+    /// Issue #27 — `Some(parent w:id)` marks this row as a threaded
+    /// reply; `None` (serialized `undefined`) marks a top-level
+    /// comment. The rail groups rows into threads on this field.
+    parent_id: Option<u32>,
     start_block: u32,
     start_offset: u32,
     end_block: u32,
@@ -1622,6 +1627,28 @@ fn twips_to_layout_px(twips: i32, scale: f32) -> f32 {
     (twips as f32) / 20.0 * scale
 }
 
+/// Issue #25 — resolve a paragraph's effective layout line height from
+/// its `<w:spacing w:line>` override. `None` inherits the config
+/// default; `Auto` is a 240-ths multiple of that default (Word's
+/// "Multiple" spacing — 1.0× ≡ the default, so unspaced documents
+/// render byte-identically); `Exact`/`AtLeast` are absolute twips.
+/// Returns `(px, exact)` — `exact` makes the line box clip instead of
+/// growing for tall glyphs.
+fn resolve_line_height(
+    line_height: Option<engine::LineHeight>,
+    cfg_line_height: f32,
+    scale: f32,
+) -> (f32, bool) {
+    match line_height {
+        None => (cfg_line_height * scale, false),
+        Some(engine::LineHeight::Auto { twips }) => {
+            (cfg_line_height * scale * (twips as f32 / 240.0), false)
+        }
+        Some(engine::LineHeight::Exact { twips }) => (twips_to_layout_px(twips, scale), true),
+        Some(engine::LineHeight::AtLeast { twips }) => (twips_to_layout_px(twips, scale), false),
+    }
+}
+
 /// Phase 8a — walk every body paragraph in document order, mirror the
 /// `InlineKind::FootnoteRef` id → display_number mapping the parser
 /// assigned, then lay out each referenced footnote's body paragraph(s)
@@ -1676,6 +1703,7 @@ fn build_footnote_bodies(
             base_direction: first_strong_direction(&combined).unwrap_or(cfg.base_direction),
             max_width: body_width,
             line_height: cfg.line_height * scale * 0.85,
+            line_height_exact: false,
             alignment: cfg.alignment,
             indent_start_px: 0.0,
             indent_end_px: 0.0,
@@ -1752,13 +1780,15 @@ fn build_header_footer_box(
             [0, 0, 0, 255],
         );
         let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&para.props, scale);
+        let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
         let mut p = layout_paragraph(ParagraphConfig {
             text: &para.text,
             fonts,
             spans: &spans,
             base_direction: resolve_base_direction(para, cfg),
             max_width: content_width,
-            line_height: cfg.line_height * scale,
+            line_height: lh_px,
+            line_height_exact: lh_exact,
             alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
             indent_start_px: ind_s,
             indent_end_px: ind_e,
@@ -2542,13 +2572,16 @@ fn layout_cell_blocks(
                 let spans = build_style_spans(p, cfg.px_size, [0, 0, 0, 255], scale);
                 let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&p.props, scale);
                 let tab_stops_px = tab_stops_to_layout_px(&p.props.tab_stops, scale);
+                let (lh_px, lh_exact) =
+                    resolve_line_height(p.props.line_height, cfg.line_height, scale);
                 let pcfg = ParagraphConfig {
                     text: &p.text,
                     fonts,
                     spans: &spans,
                     base_direction: resolve_base_direction(p, cfg),
                     max_width: content_width_px.max(1.0),
-                    line_height: cfg.line_height * scale,
+                    line_height: lh_px,
+                    line_height_exact: lh_exact,
                     alignment: p.props.alignment.map_or(cfg.alignment, layout_align),
                     indent_start_px: ind_s,
                     indent_end_px: ind_e,
@@ -3828,7 +3861,7 @@ impl Engine {
             Command::ExportPdf { conformance } => self.do_export_pdf(conformance),
             Command::CloseDocument => phase3_stub("CloseDocument"),
             Command::DeleteRange { range } => self.do_delete_range(range),
-            Command::ReplaceRange { .. } => phase3_stub("ReplaceRange"),
+            Command::ReplaceRange { range, text } => self.do_replace_range(range, text),
             Command::ApplyFormatting { range, attrs } => self.apply_formatting(range, attrs),
             Command::SplitParagraph { at } => self.do_split_paragraph(at),
             Command::MergeParagraph { .. } => phase3_stub("MergeParagraph"),
@@ -3990,6 +4023,11 @@ impl Engine {
             } => self.do_insert_comment(range, text, author),
             Command::DeleteComment { id } => self.do_delete_comment(id),
             Command::ResolveComment { id, resolved } => self.do_resolve_comment(id, resolved),
+            Command::ReplyToComment {
+                parent_id,
+                text,
+                author,
+            } => self.do_reply_to_comment(parent_id, text, author),
         }
     }
 
@@ -4655,13 +4693,16 @@ impl Engine {
                             let (ind_s, ind_e, ind_fl, ind_h) =
                                 props_to_layout_indents(&para.props, scale);
                             let tab_stops_px = tab_stops_to_layout_px(&para.props.tab_stops, scale);
+                            let (lh_px, lh_exact) =
+                                resolve_line_height(para.props.line_height, cfg.line_height, scale);
                             layout_paragraph(ParagraphConfig {
                                 text: &text,
                                 fonts: &font_stack,
                                 spans: &spans,
                                 base_direction: resolve_base_direction(para, &cfg),
                                 max_width: pag.column_width(),
-                                line_height: cfg.line_height * scale,
+                                line_height: lh_px,
+                                line_height_exact: lh_exact,
                                 alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
                                 indent_start_px: ind_s,
                                 indent_end_px: ind_e,
@@ -4689,13 +4730,19 @@ impl Engine {
                                 let (ind_s, ind_e, ind_fl, ind_h) =
                                     props_to_layout_indents(&para.props, scale);
                                 let inline_infos = build_inline_object_infos(para, &cfg, scale);
+                                let (lh_px, lh_exact) = resolve_line_height(
+                                    para.props.line_height,
+                                    cfg.line_height,
+                                    scale,
+                                );
                                 let para_cfg = ParagraphConfig {
                                     text: &para.text,
                                     fonts: &font_stack,
                                     spans: &spans,
                                     base_direction: resolve_base_direction(para, &cfg),
                                     max_width: pag.column_width(),
-                                    line_height: cfg.line_height * scale,
+                                    line_height: lh_px,
+                                    line_height_exact: lh_exact,
                                     alignment: para
                                         .props
                                         .alignment
@@ -6278,6 +6325,45 @@ impl Engine {
     }
 
     /// `Command::DeleteRange` — delete an explicit logical range.
+    /// `Command::ReplaceRange` — atomic delete + insert as ONE undo step
+    /// (issue #30). The range is explicit and authoritative (an
+    /// API-driven find-and-replace primitive), never resolved from the
+    /// live selection. Under track-changes the old text is marked
+    /// deleted and the new text marked inserted, mirroring the
+    /// interactive replace path. The caret lands after the inserted
+    /// text; sticky pending formatting is deliberately not applied
+    /// (this is not a typing path).
+    fn do_replace_range(&mut self, range: BridgeLogicalRange, text: String) -> Event {
+        let (start, end) = ordered(range.start, range.end);
+        let tracking = self.tracking_changes;
+        let author = self.review_author.clone();
+        let date = self.current_review_date();
+        let base = if start == end {
+            self.undo.current().clone()
+        } else if tracking {
+            self.undo.current().tracked_delete_range(
+                to_engine_pos(start.clone()),
+                to_engine_pos(end),
+                author.clone(),
+                date.clone(),
+            )
+        } else {
+            self.undo
+                .current()
+                .delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        };
+        let new_doc = if tracking {
+            base.tracked_insert_text(to_engine_pos(start.clone()), &text, author, date)
+        } else {
+            base.insert_text(to_engine_pos(start.clone()), &text)
+        };
+        let caret = BridgeLogicalPos {
+            path: start.path,
+            offset: start.offset + text.len() as u32,
+        };
+        self.commit_edit(new_doc, caret)
+    }
+
     /// Sprint 14 (#14) — when track-changes is on, mark the range as
     /// a `Delete` revision instead of removing text.
     fn do_delete_range(&mut self, range: BridgeLogicalRange) -> Event {
@@ -6877,6 +6963,33 @@ impl Engine {
                 "Comment reopened"
             },
         );
+        self.selection_changed()
+    }
+
+    /// `Command::ReplyToComment` (issue #27) — threaded reply anchored
+    /// to the parent comment's range. Mirrors `do_insert_comment`
+    /// (worker-thread ISO-8601 date stamp, undo push, full-cache
+    /// invalidation, polite announcement). An unknown parent maps the
+    /// engine's `None` to `Event::Error` instead of mutating the doc.
+    fn do_reply_to_comment(&mut self, parent_id: u32, text: String, author: String) -> Event {
+        let now = js_sys::Date::new_0().to_iso_string();
+        let date = now.as_string().unwrap_or_default();
+        let Some((new_doc, _new_id)) = self
+            .undo
+            .current()
+            .reply_to_comment(parent_id, text, author, date)
+        else {
+            return Event::Error {
+                message: format!("ReplyToComment: unknown parent comment id {parent_id}"),
+            };
+        };
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(AnnouncementPriority::Polite, "Reply added");
         self.selection_changed()
     }
 
@@ -8566,6 +8679,85 @@ mod tests {
         let mut faces: HashMap<String, Arc<LoadedFont>> = HashMap::new();
         faces.insert("test-latin".to_string(), Arc::new(font));
         FontStack::from_faces(faces, "test-latin")
+    }
+
+    /// Issue #25 — the per-paragraph line-height resolver maps each
+    /// `<w:spacing w:lineRule>` variant onto (px, exact-clip).
+    #[test]
+    fn resolve_line_height_maps_rules_to_px() {
+        assert_eq!(resolve_line_height(None, 26.0, 2.0), (52.0, false));
+        assert_eq!(
+            resolve_line_height(Some(engine::LineHeight::Auto { twips: 480 }), 26.0, 1.0),
+            (52.0, false),
+            "Auto 480 twips = 2.0x the config single height"
+        );
+        assert_eq!(
+            resolve_line_height(Some(engine::LineHeight::Exact { twips: 400 }), 26.0, 1.0),
+            (20.0, true),
+            "Exact 400 twips = 20 pt, clipping"
+        );
+        assert_eq!(
+            resolve_line_height(Some(engine::LineHeight::AtLeast { twips: 600 }), 26.0, 1.0),
+            (30.0, false),
+            "AtLeast 600 twips = 30 pt minimum"
+        );
+    }
+
+    /// Issue #25 — end-to-end through `layout_paragraph`: a 2.0x Auto
+    /// multiplier doubles the line pitch; Exact clips below the glyph
+    /// envelope instead of growing.
+    #[test]
+    fn line_spacing_changes_paragraph_height() {
+        let stack = test_font_stack();
+        let lay = |lh: f32, exact: bool| {
+            let spans = [StyleSpan {
+                start: 0,
+                end: 2,
+                px_size: 12.0,
+                color: [0, 0, 0, 255],
+                bold: false,
+                italic: false,
+                underline: engine::UnderlineStyle::None,
+                strike: false,
+                bg_color: None,
+                font_family: None,
+                caps_transform: false,
+                baseline_shift_px: 0.0,
+            }];
+            layout_paragraph(ParagraphConfig {
+                text: "hi",
+                fonts: &stack,
+                spans: &spans,
+                base_direction: ShapingDirection::Ltr,
+                max_width: 300.0,
+                line_height: lh,
+                line_height_exact: exact,
+                alignment: Alignment::Start,
+                indent_start_px: 0.0,
+                indent_end_px: 0.0,
+                first_line_indent_px: 0.0,
+                hanging_indent_px: 0.0,
+                marker_text: None,
+                px_size_for_marker: 12.0,
+                inline_objects: &[],
+                tab_stops_px: &[],
+            })
+            .size
+            .height
+        };
+        let single = lay(16.0, false);
+        let (dbl_px, dbl_exact) =
+            resolve_line_height(Some(engine::LineHeight::Auto { twips: 480 }), 16.0, 1.0);
+        let double = lay(dbl_px, dbl_exact);
+        assert!(
+            (double - single * 2.0).abs() < 0.5,
+            "2.0x multiplier must double the pitch: single {single}, double {double}"
+        );
+        let exact = lay(6.0, true);
+        assert!(
+            (exact - 6.0).abs() < 0.01,
+            "Exact spacing clips to the requested band: got {exact}"
+        );
     }
 
     fn autofit_test_cfg() -> RenderConfig {
