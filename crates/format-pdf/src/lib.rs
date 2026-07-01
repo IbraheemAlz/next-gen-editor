@@ -681,8 +681,14 @@ fn emit_table_shading(
             }
             let cell_x = row_x + cell.origin.x;
             let cell_y = row_y + cell.origin.y;
+            /* Content sits inside the resolved <w:tcMar> padding — the
+            frame rect above stays unpadded (fills cover the whole cell),
+            but nested content recurses from the padded origin, matching
+            render/scene.rs paint_table. */
+            let content_x = cell_x + cell.padding_left;
+            let content_y = cell_y + cell.padding_top;
             for inner in &cell.content {
-                emit_block_shading(content, page_h, cell_x, cell_y, inner);
+                emit_block_shading(content, page_h, content_x, content_y, inner);
             }
         }
     }
@@ -709,13 +715,19 @@ fn emit_table_text(
             }
             let cell_x = row_x + cell.origin.x;
             let cell_y = row_y + cell.origin.y;
+            /* Issue #31 — content origin is offset by the cell's resolved
+            <w:tcMar>/<w:tblCellMar> padding (boxes.rs contract: inner
+            origins are frame-relative, the consumer adds the padding),
+            exactly like render/scene.rs paint_table's content pass. */
+            let content_x = cell_x + cell.padding_left;
+            let content_y = cell_y + cell.padding_top;
             for inner in &cell.content {
                 match inner {
                     LayoutBlock::Paragraph(p) => {
-                        emit_paragraph_text(content, page_h, cell_x, cell_y, p, font_objs);
+                        emit_paragraph_text(content, page_h, content_x, content_y, p, font_objs);
                     }
                     LayoutBlock::Table(nested) => {
-                        emit_table_text(content, page_h, cell_x, cell_y, nested, font_objs);
+                        emit_table_text(content, page_h, content_x, content_y, nested, font_objs);
                     }
                 }
             }
@@ -767,9 +779,11 @@ fn emit_table_borders(
             stroke_border_edge(content, page_h, &cell.borders.right, cx1, cell_y, cx1, cy1);
             stroke_border_edge(content, page_h, &cell.borders.bottom, cell_x, cy1, cx1, cy1);
             /* Recurse — cell paragraphs + nested tables carry their own
-            borders. Same origins as `emit_table_text`. */
+            borders. Same padded content origins as `emit_table_text`. */
+            let content_x = cell_x + cell.padding_left;
+            let content_y = cell_y + cell.padding_top;
             for inner in &cell.content {
-                emit_block_borders(content, page_h, cell_x, cell_y, inner);
+                emit_block_borders(content, page_h, content_x, content_y, inner);
             }
         }
     }
@@ -1254,6 +1268,101 @@ mod tests {
         assert!(
             out.windows(10).any(|w| w == b"/FontFile2"),
             "cell paragraph must contribute its font to the embedded set"
+        );
+    }
+
+    /// Issue #31 — cell content in the exported PDF is offset by the
+    /// resolved `<w:tcMar>` padding, matching render/scene.rs. The padded
+    /// export's first glyph text matrix must sit exactly (+left) in x and
+    /// (−top) in PDF y relative to the zero-padding export.
+    #[test]
+    fn cell_padding_offsets_pdf_cell_content() {
+        fn first_tm_xy(content: &[u8]) -> (f32, f32) {
+            let s = String::from_utf8_lossy(content);
+            let tokens: Vec<&str> = s.split_whitespace().collect();
+            let idx = tokens.iter().position(|t| *t == "Tm").expect("Tm op");
+            (
+                tokens[idx - 2].parse().expect("Tm x operand"),
+                tokens[idx - 1].parse().expect("Tm y operand"),
+            )
+        }
+        fn table_page(stack: &FontStack, pad_left: f32, pad_top: f32) -> PageBox {
+            let para = layout_paragraph(ParagraphConfig {
+                text: "hi",
+                fonts: stack,
+                spans: &[plain_span("hi".len() as u32)],
+                base_direction: ShapingDirection::Ltr,
+                max_width: 200.0,
+                line_height: 22.0,
+                alignment: Alignment::Start,
+                indent_start_px: 0.0,
+                indent_end_px: 0.0,
+                first_line_indent_px: 0.0,
+                hanging_indent_px: 0.0,
+                marker_text: None,
+                px_size_for_marker: 22.0,
+                inline_objects: &[],
+                tab_stops_px: &[],
+            });
+            let cell = layout::TableCellBox {
+                origin: layout::Point { x: 0.0, y: 0.0 },
+                size: layout::Size {
+                    width: 200.0,
+                    height: 40.0,
+                },
+                grid_span: 1,
+                v_merge: engine::VMergeRole::None,
+                borders: engine::default_word_borders(),
+                shading: None,
+                content: vec![LayoutBlock::Paragraph(para)],
+                padding_left: pad_left,
+                padding_top: pad_top,
+                padding_right: 0.0,
+                padding_bottom: 0.0,
+            };
+            let row = layout::TableRowBox {
+                origin: layout::Point { x: 0.0, y: 0.0 },
+                size: layout::Size {
+                    width: 200.0,
+                    height: 40.0,
+                },
+                cells: vec![cell],
+                header: false,
+                cant_split: false,
+            };
+            let table = TableBox {
+                origin: layout::Point { x: 0.0, y: 100.0 },
+                size: layout::Size {
+                    width: 200.0,
+                    height: 40.0,
+                },
+                columns: vec![200.0],
+                rows: vec![row],
+                outer_borders: engine::default_word_borders(),
+            };
+            PageBox {
+                size: Size {
+                    width: 595.0,
+                    height: 842.0,
+                },
+                margins: Margins::uniform(72.0),
+                blocks: vec![LayoutBlock::Table(table)],
+                header: None,
+                footer: None,
+                footnotes: Vec::new(),
+            }
+        }
+        let stack = liberation_stack();
+        let fo = test_font_objs(&["liberation"]);
+        let (x0, y0) = first_tm_xy(&build_content(&table_page(&stack, 0.0, 0.0), &fo));
+        let (x1, y1) = first_tm_xy(&build_content(&table_page(&stack, 12.0, 8.0), &fo));
+        assert!(
+            (x1 - x0 - 12.0).abs() < 0.01,
+            "padding_left must inset cell text in x: unpadded {x0}, padded {x1}"
+        );
+        assert!(
+            (y0 - y1 - 8.0).abs() < 0.01,
+            "padding_top must lower cell text (smaller PDF y): unpadded {y0}, padded {y1}"
         );
     }
 
