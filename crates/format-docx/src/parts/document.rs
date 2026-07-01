@@ -139,7 +139,7 @@ fn parse_header_footer_role(v: Option<&str>) -> HeaderFooterRole {
 /// `parse_border_stroke` on `<w:top w:val w:sz w:color>`. Unknown
 /// edge names are silently ignored — defensive against future spec
 /// extensions.
-fn apply_pbdr_edge(
+pub(crate) fn apply_pbdr_edge(
     name: &[u8],
     e: &quick_xml::events::BytesStart,
     props: &mut engine::ParaProperties,
@@ -171,7 +171,7 @@ fn apply_pbdr_edge(
 /// `w:val` defaults to `left`; `w:pos` is twips (signed integer per
 /// spec). Returns `None` for malformed entries (missing pos) so they
 /// don't pollute the stop list with NaNs.
-fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine::TabStop> {
+pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine::TabStop> {
     use crate::schema::ct_rpr::attr_val;
     let pos_twips: i32 = attr_val(e, b"w:pos")?.trim().parse().ok()?;
     let kind = match attr_val(e, b"w:val").as_deref().map(str::trim) {

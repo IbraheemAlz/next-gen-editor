@@ -189,15 +189,18 @@ pub fn parse_table_bytes(
     Ok((grid, props, rows))
 }
 
-/// Cell paragraph parser (Phase 5 PR 2 minimal). Extracts the
-/// concatenated visible text + captures the raw `<w:p>` bytes for
-/// round-trip. Full pPr / rPr / numPr cascade inside cells deferred
-/// to Phase 5 PR 3 (a refactor of `parts::document::parse_document_xml`
-/// to share its run-aware loop with cell content).
+/// Cell paragraph parser. Extracts the concatenated visible text,
+/// routes direct `<w:pPr>` children through the shared `apply_ppr`
+/// surface (plus `pBdr` edges and `tabs` stops — issue #32), and
+/// captures the raw `<w:p>` bytes for round-trip. Run-level `<w:rPr>`
+/// spans inside cells are still deferred (a refactor of
+/// `parts::document::parse_document_xml` to share its run-aware loop).
 fn parse_cell_paragraph(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
 ) -> engine::Paragraph {
+    use crate::parts::document::{apply_pbdr_edge, parse_tab_stop};
+    use crate::schema::ct_ppr::apply_ppr;
     use crate::schema::ct_rpr::{apply_rpr, attr_val};
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
@@ -207,8 +210,11 @@ fn parse_cell_paragraph(
     let mut in_ppr = false;
     let mut in_rpr = false;
     let mut in_num_pr = false;
+    let mut in_pbdr = false;
+    let mut in_tabs = false;
     let mut p_style: Option<String> = None;
     let mut pmark_rpr = engine::SpanStyle::default();
+    let mut direct_ppr = engine::ParaProperties::default();
     let mut list_num_id: Option<u32> = None;
     let mut list_ilvl: Option<u8> = None;
     loop {
@@ -218,7 +224,12 @@ fn parse_cell_paragraph(
                 b"w:pPr" => in_ppr = true,
                 b"w:rPr" if in_ppr => in_rpr = true,
                 b"w:numPr" if in_ppr => in_num_pr = true,
+                b"w:pBdr" if in_ppr => in_pbdr = true,
+                b"w:tabs" if in_ppr => in_tabs = true,
                 n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
+                n if in_ppr && !in_rpr && !in_num_pr && !in_pbdr && !in_tabs => {
+                    apply_ppr(n, &e, &mut direct_ppr);
+                }
                 _ => {}
             },
             Ok(Event::Empty(e)) => match e.name().as_ref() {
@@ -230,6 +241,15 @@ fn parse_cell_paragraph(
                     list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.trim().parse().ok());
                 }
                 n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
+                n if in_ppr && in_pbdr => apply_pbdr_edge(n, &e, &mut direct_ppr),
+                n if in_ppr && in_tabs && n == b"w:tab" => {
+                    if let Some(stop) = parse_tab_stop(&e) {
+                        direct_ppr.tab_stops.push(stop);
+                    }
+                }
+                n if in_ppr && !in_rpr && !in_num_pr && !in_pbdr && !in_tabs => {
+                    apply_ppr(n, &e, &mut direct_ppr);
+                }
                 _ => {}
             },
             Ok(Event::End(e)) => match e.name().as_ref() {
@@ -237,6 +257,8 @@ fn parse_cell_paragraph(
                 b"w:pPr" => in_ppr = false,
                 b"w:rPr" => in_rpr = false,
                 b"w:numPr" => in_num_pr = false,
+                b"w:pBdr" => in_pbdr = false,
+                b"w:tabs" => in_tabs = false,
                 _ => {}
             },
             Ok(Event::Text(t)) if in_text => {
@@ -250,14 +272,12 @@ fn parse_cell_paragraph(
         buf.clear();
     }
     /* Audit gap A.M18 — resolve cell paragraph through the style cascade.
-    Doc defaults + pStyle chain + the paragraph-mark rPr all fold into
-    the effective `props`. List binding from a direct `<w:numPr>` wins
-    over the cascade-inherited `props.list_item`. */
-    let (props, _baseline) = resolver.resolve_paragraph(
-        p_style.as_deref(),
-        engine::ParaProperties::default(),
-        pmark_rpr,
-    );
+    Doc defaults + pStyle chain + direct pPr overrides + the
+    paragraph-mark rPr all fold into the effective `props`. List binding
+    from a direct `<w:numPr>` wins over the cascade-inherited
+    `props.list_item`. */
+    let (props, _baseline) =
+        resolver.resolve_paragraph(p_style.as_deref(), direct_ppr.clone(), pmark_rpr);
     let list_item = match (list_num_id, list_ilvl) {
         (Some(num_id), ilvl) => Some(engine::ListItem {
             num_id,
@@ -281,11 +301,10 @@ fn parse_cell_paragraph(
         hyperlinks: Vec::new(),
         revisions: Vec::new(),
         fields: Vec::new(),
-        /* Sprint 12: table-cell paragraphs ride the table's passthrough;
-         * style_id + direct_overrides default empty until a future
-         * sprint resolves style cascade through table cells. */
-        style_id: None,
-        direct_overrides: engine::ParaProperties::default(),
+        /* Issue #32: direct pPr overrides now survive for the style
+         * re-application machinery, mirroring body paragraphs. */
+        style_id: p_style,
+        direct_overrides: direct_ppr,
     }
 }
 
@@ -612,6 +631,33 @@ mod tests {
         assert_eq!(top.style, BorderStyle::Double);
         assert_eq!(top.size_eighth_pt, 12);
         assert_eq!(top.color, Some([0xFF, 0x00, 0x00, 0xFF]));
+    }
+
+    /// Issue #32 — direct `<w:pPr>` children on cell paragraphs route
+    /// through the shared `apply_ppr` surface (plus `pBdr` edges and
+    /// `tabs` stops) instead of being dropped on the floor.
+    #[test]
+    fn cell_paragraph_reads_direct_ppr() {
+        let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:pPr><w:jc w:val="center"/><w:ind w:start="720"/><w:bidi/><w:shd w:val="clear" w:fill="FFEB78"/><w:pBdr><w:top w:val="single" w:sz="8"/></w:pBdr><w:tabs><w:tab w:val="left" w:pos="1440"/></w:tabs></w:pPr><w:r><w:t>styled</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let (_, _, rows) =
+            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
+        let para = rows[0].cells[0].blocks[0]
+            .as_paragraph()
+            .expect("cell paragraph");
+        assert_eq!(para.props.alignment, Some(engine::Alignment::Center));
+        assert_eq!(para.props.indent.start_twips, 720);
+        assert_eq!(para.props.direction, Some(engine::TextDirection::Rtl));
+        assert_eq!(para.props.shading, Some([0xFF, 0xEB, 0x78, 0xFF]));
+        assert!(
+            para.props.borders.as_ref().is_some_and(|b| b.top.is_some()),
+            "pBdr top edge must survive"
+        );
+        assert_eq!(para.props.tab_stops.len(), 1);
+        assert_eq!(
+            para.direct_overrides.alignment,
+            Some(engine::Alignment::Center),
+            "direct overrides must be preserved for style re-application"
+        );
     }
 
     #[test]
