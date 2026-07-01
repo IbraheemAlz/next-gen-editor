@@ -38,7 +38,9 @@
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use layout::{LayoutBlock, PageBox, ParagraphBox, TableBox, VisualRun};
-use pdf_writer::types::{CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, UnicodeCmap};
+use pdf_writer::types::{
+    CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, TextRenderingMode, UnicodeCmap,
+};
 use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -68,6 +70,10 @@ const XMP_PACKET: &str = concat!(
     "</x:xmpmeta>\n",
     "<?xpacket end=\"r\"?>",
 );
+
+/// Shear factor for faux italic — mirrors `render::synth::SHEAR` (~12.4°)
+/// so the PDF oblique matches the canvas raster synthesis.
+const FAUX_ITALIC_SHEAR: f32 = 0.22;
 
 /// Conformance target for [`export_pdf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +120,11 @@ pub fn export_pdf(
     let mut used: Vec<&str> = Vec::new();
     for page in pages {
         for_each_paragraph(&page.blocks, &mut |para| {
+            if let Some(marker) = &para.marker
+                && !used.contains(&marker.run.font.as_str())
+            {
+                used.push(marker.run.font.as_str());
+            }
             for line in &para.lines {
                 for run in &line.runs {
                     if !used.contains(&run.font.as_str()) {
@@ -256,10 +267,12 @@ pub fn export_pdf(
 /// Three passes per page so the text state machine and the graphics state
 /// machine don't collide:
 ///
-/// 1. **Shading.** Cell `<w:shd>` fills as `re` / `f` outside any text block.
-/// 2. **Text.** Single `BT`/`ET` envelope; every paragraph (top-level + cell)
-///    emits its glyphs via an absolute text matrix.
-/// 3. **Borders.** Cell + table-outer strokes as `re` / `S` paths.
+/// 1. **Shading.** Cell `<w:shd>` + paragraph `<w:pPr><w:shd>` fills as
+///    `re` / `f` outside any text block.
+/// 2. **Text.** Per paragraph: run highlight (`bg_color`) rects, then a
+///    `BT`/`ET` block placing glyphs via an absolute text matrix, then
+///    underline / strike decoration fills over the glyphs.
+/// 3. **Borders.** Cell + table-outer + paragraph `<w:pBdr>` strokes.
 ///
 /// The order mirrors `crates/render/src/scene.rs::paint_table` so PDF and
 /// Canvas2D agree on layering: shading sits behind content, borders sit on
@@ -270,16 +283,13 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
     let content_y = page.margins.top;
     let mut content = Content::new();
 
-    /* Pass 1 — cell shading. */
+    /* Pass 1 — cell + paragraph shading. */
     for block in &page.blocks {
-        if let LayoutBlock::Table(t) = block {
-            emit_table_shading(&mut content, page_h, content_x, content_y, t);
-        }
+        emit_block_shading(&mut content, page_h, content_x, content_y, block);
     }
 
-    /* Pass 2 — every paragraph's glyphs (top-level + cell content),
-    in document order. */
-    content.begin_text();
+    /* Pass 2 — every paragraph's highlights + glyphs + decorations
+    (top-level + cell content), in document order. */
     for block in &page.blocks {
         match block {
             LayoutBlock::Paragraph(p) => {
@@ -290,22 +300,98 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
             }
         }
     }
-    content.end_text();
 
-    /* Pass 3 — cell + table-outer borders. */
+    /* Pass 3 — cell + table-outer + paragraph borders. */
     for block in &page.blocks {
-        if let LayoutBlock::Table(t) = block {
-            emit_table_borders(&mut content, page_h, content_x, content_y, t);
-        }
+        emit_block_borders(&mut content, page_h, content_x, content_y, block);
     }
 
     content.finish().to_vec()
+}
+
+/// Pass 1 dispatcher — shading fills for one block (recurses into cells).
+fn emit_block_shading(
+    content: &mut Content,
+    page_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    block: &LayoutBlock,
+) {
+    match block {
+        LayoutBlock::Paragraph(p) => emit_paragraph_shading(content, page_h, origin_x, origin_y, p),
+        LayoutBlock::Table(t) => emit_table_shading(content, page_h, origin_x, origin_y, t),
+    }
+}
+
+/// Pass 3 dispatcher — border strokes for one block (recurses into cells).
+fn emit_block_borders(
+    content: &mut Content,
+    page_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    block: &LayoutBlock,
+) {
+    match block {
+        LayoutBlock::Paragraph(p) => emit_paragraph_borders(content, page_h, origin_x, origin_y, p),
+        LayoutBlock::Table(t) => emit_table_borders(content, page_h, origin_x, origin_y, t),
+    }
+}
+
+/// Pass 1 (paragraph) — `<w:pPr><w:shd>` fill behind the paragraph's
+/// bounding rect. Mirrors `render/scene.rs::paint_paragraph`'s shading
+/// fill; borders + glyphs draw on top in the later passes.
+fn emit_paragraph_shading(
+    content: &mut Content,
+    page_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    para: &ParagraphBox,
+) {
+    let Some([r, g, b, _]) = para.shading else {
+        return;
+    };
+    let para_x = origin_x + para.origin.x;
+    let para_y = origin_y + para.origin.y;
+    let pdf_y = page_h - (para_y + para.size.height);
+    content.set_fill_rgb(
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+    );
+    content.rect(para_x, pdf_y, para.size.width, para.size.height);
+    content.fill_nonzero();
+}
+
+/// Pass 3 (paragraph) — `<w:pPr><w:pBdr>` strokes at the paragraph's
+/// bounding rect, reusing the cell-border edge primitive.
+fn emit_paragraph_borders(
+    content: &mut Content,
+    page_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    para: &ParagraphBox,
+) {
+    let Some(b) = para.borders.as_ref() else {
+        return;
+    };
+    let x0 = origin_x + para.origin.x;
+    let y0 = origin_y + para.origin.y;
+    let x1 = x0 + para.size.width;
+    let y1 = y0 + para.size.height;
+    stroke_border_edge(content, page_h, &b.top, x0, y0, x1, y0);
+    stroke_border_edge(content, page_h, &b.left, x0, y0, x0, y1);
+    stroke_border_edge(content, page_h, &b.right, x1, y0, x1, y1);
+    stroke_border_edge(content, page_h, &b.bottom, x0, y1, x1, y1);
 }
 
 /// Emit text for one `ParagraphBox`. `origin_x` / `origin_y` are the
 /// containing block's origin in absolute layout-px (top-left); the
 /// paragraph's own origin is added on top. PDF y is bottom-up — every
 /// glyph's y inverts via `page_h - layout_y`.
+///
+/// Three sub-passes mirror `render/scene.rs::paint_paragraph` layering:
+/// run highlight rects first (behind the glyphs), then the marker + line
+/// glyphs in one `BT`/`ET` block, then underline / strike fills on top.
 fn emit_paragraph_text(
     content: &mut Content,
     page_h: f32,
@@ -316,30 +402,232 @@ fn emit_paragraph_text(
 ) {
     let para_x = origin_x + para.origin.x;
     let para_y = origin_y + para.origin.y;
+
+    /* Background highlights — a run's `bg_color` fills the line's full
+    height across the run's advance so adjacent highlights tile. */
+    for line in &para.lines {
+        let line_x = para_x + line.origin.x;
+        let line_top = para_y + line.origin.y;
+        let mut pen = 0.0_f32;
+        for run in &line.runs {
+            let advance = run_advance(run);
+            if let Some([r, g, b, _]) = run.attrs.bg_color
+                && advance > 0.0
+            {
+                content.set_fill_rgb(
+                    f32::from(r) / 255.0,
+                    f32::from(g) / 255.0,
+                    f32::from(b) / 255.0,
+                );
+                content.rect(
+                    line_x + pen,
+                    page_h - (line_top + line.height),
+                    advance,
+                    line.height,
+                );
+                content.fill_nonzero();
+            }
+            pen += advance;
+        }
+    }
+
+    content.begin_text();
+    /* List marker — its own gutter run, baseline-aligned with the first
+    line (mirrors `render/scene.rs::paint_paragraph`). */
+    if let Some(marker) = &para.marker {
+        let m_x = para_x + marker.origin.x;
+        let m_baseline = para_y + marker.origin.y + marker.baseline;
+        show_run(content, page_h, &marker.run, m_x, m_baseline, font_objs);
+    }
     for line in &para.lines {
         let line_x = para_x + line.origin.x;
         /* Layout-space baseline — distance down from the page top. */
         let baseline = para_y + line.origin.y + line.baseline;
         let mut pen = 0.0_f32;
         for run in &line.runs {
-            let Some((_, fo)) = font_objs.iter().find(|(id, _)| id == &run.font) else {
+            pen += show_run(content, page_h, run, line_x + pen, baseline, font_objs);
+        }
+    }
+    content.end_text();
+
+    /* Decoration fills — over the glyphs, same metrics as
+    `render/scene.rs` (underline just below the baseline, strike centred
+    ~a quarter em above it, thickness scaling with the px size). Both
+    anchor to the line baseline, not the shifted run baseline. */
+    for line in &para.lines {
+        let line_x = para_x + line.origin.x;
+        let baseline = para_y + line.origin.y + line.baseline;
+        let mut pen = 0.0_f32;
+        for run in &line.runs {
+            let advance = run_advance(run);
+            let x0 = line_x + pen;
+            let x1 = x0 + advance;
+            pen += advance;
+            let underline_visible = run.attrs.underline.is_visible();
+            if (!underline_visible && !run.attrs.strike) || x1 <= x0 {
                 continue;
-            };
+            }
+            let px = run.attrs.px_size;
+            let thickness = (px * 0.06).max(1.0);
             let [r, g, b, _] = run.attrs.color;
-            content.set_font(Name(fo.resource.as_bytes()), run.attrs.px_size);
             content.set_fill_rgb(
                 f32::from(r) / 255.0,
                 f32::from(g) / 255.0,
                 f32::from(b) / 255.0,
             );
-            for glyph in &run.glyphs {
-                let gx = line_x + pen + glyph.x_offset;
-                /* Invert the y axis: PDF origin is bottom-left. */
-                let gy = page_h - (baseline - glyph.y_offset);
-                content.set_text_matrix([1.0, 0.0, 0.0, 1.0, gx, gy]);
-                let id = glyph.id;
-                content.show(Str(&[(id >> 8) as u8, (id & 0xff) as u8]));
-                pen += glyph.x_advance;
+            if underline_visible {
+                let top = baseline + px * 0.10;
+                emit_underline_pattern(
+                    content,
+                    page_h,
+                    run.attrs.underline,
+                    x0,
+                    x1,
+                    top,
+                    thickness,
+                );
+            }
+            if run.attrs.strike {
+                let mid = baseline - px * 0.25;
+                fill_decoration_rect(content, page_h, x0, x1, mid - thickness / 2.0, thickness);
+            }
+        }
+    }
+}
+
+/// Total advance of a run's glyphs — the run's x-extent on its line.
+fn run_advance(run: &VisualRun) -> f32 {
+    run.glyphs.iter().map(|g| g.x_advance).sum()
+}
+
+/// Show one run's glyphs inside an open text object. `run_x` is the run's
+/// absolute pen start; `baseline` the layout-space line baseline. Returns
+/// the run's total advance so the caller's pen stays in sync even when the
+/// run's font is missing from `font_objs`.
+fn show_run(
+    content: &mut Content,
+    page_h: f32,
+    run: &VisualRun,
+    run_x: f32,
+    baseline: f32,
+    font_objs: &[(String, FontObj)],
+) -> f32 {
+    let Some((_, fo)) = font_objs.iter().find(|(id, _)| id == &run.font) else {
+        return run_advance(run);
+    };
+    let [r, g, b, _] = run.attrs.color;
+    content.set_font(Name(fo.resource.as_bytes()), run.attrs.px_size);
+    content.set_fill_rgb(
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+    );
+    if run.attrs.faux_bold {
+        /* Faux bold — fill + stroke (`2 Tr`). The stroke width mirrors
+        `render::synth::embolden`: its dilation radius is px_size / 22,
+        and a centred stroke of that width adds the same total ink. */
+        content.set_stroke_rgb(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        );
+        content.set_line_width((run.attrs.px_size / 22.0).max(0.25));
+        content.set_text_rendering_mode(TextRenderingMode::FillStroke);
+    }
+    let shear = if run.attrs.faux_italic {
+        FAUX_ITALIC_SHEAR
+    } else {
+        0.0
+    };
+    let mut pen = 0.0_f32;
+    for glyph in &run.glyphs {
+        let gx = run_x + pen + glyph.x_offset;
+        /* Invert the y axis: PDF origin is bottom-left. `<w:vertAlign>`
+        baseline shift lifts (positive) / drops (negative) the run. */
+        let gy = page_h - (baseline - glyph.y_offset - run.attrs.baseline_shift_px);
+        content.set_text_matrix([1.0, 0.0, shear, 1.0, gx, gy]);
+        let id = glyph.id;
+        content.show(Str(&[(id >> 8) as u8, (id & 0xff) as u8]));
+        pen += glyph.x_advance;
+    }
+    if run.attrs.faux_bold {
+        /* Text state persists across BT/ET — restore fill-only. */
+        content.set_text_rendering_mode(TextRenderingMode::Fill);
+    }
+    pen
+}
+
+/// Fill one decoration rectangle given its layout-space top edge. The
+/// current fill colour is the run's text colour, set by the caller.
+fn fill_decoration_rect(
+    content: &mut Content,
+    page_h: f32,
+    x0: f32,
+    x1: f32,
+    top: f32,
+    thickness: f32,
+) {
+    if x1 <= x0 {
+        return;
+    }
+    content.rect(x0, page_h - (top + thickness), x1 - x0, thickness);
+    content.fill_nonzero();
+}
+
+/// Emit the underline rectangles for a single `(x0..x1, top)` span —
+/// the PDF twin of `render/scene.rs::push_underline_pattern`, with the
+/// same pattern math (all multiples of `thickness`) so PDF and canvas
+/// agree on the dotted / dashed / wavy approximations.
+fn emit_underline_pattern(
+    content: &mut Content,
+    page_h: f32,
+    style: engine::UnderlineStyle,
+    x0: f32,
+    x1: f32,
+    top: f32,
+    thickness: f32,
+) {
+    use engine::UnderlineStyle::*;
+    match style {
+        None => {}
+        Single => fill_decoration_rect(content, page_h, x0, x1, top, thickness),
+        Double => {
+            fill_decoration_rect(content, page_h, x0, x1, top, thickness);
+            fill_decoration_rect(content, page_h, x0, x1, top + thickness * 2.0, thickness);
+        }
+        Dotted => {
+            let pitch = (thickness * 2.0).max(2.0);
+            let mut x = x0;
+            while x < x1 {
+                let end = (x + thickness).min(x1);
+                fill_decoration_rect(content, page_h, x, end, top, thickness);
+                x += pitch;
+            }
+        }
+        Dashed => {
+            let dash = (thickness * 4.0).max(3.0);
+            let gap = dash;
+            let mut x = x0;
+            while x < x1 {
+                let end = (x + dash).min(x1);
+                fill_decoration_rect(content, page_h, x, end, top, thickness);
+                x += dash + gap;
+            }
+        }
+        Wavy => {
+            /* Sawtooth: tile pairs of short rects on alternating rows.
+            Period = `4 * thickness`; each half-period is one short rect. */
+            let half = (thickness * 2.0).max(2.0);
+            let top_band = top - thickness;
+            let bottom_band = top + thickness;
+            let mut x = x0;
+            let mut up = true;
+            while x < x1 {
+                let end = (x + half).min(x1);
+                let band_top = if up { top_band } else { bottom_band };
+                fill_decoration_rect(content, page_h, x, end, band_top, thickness);
+                up = !up;
+                x += half;
             }
         }
     }
@@ -380,6 +668,22 @@ fn emit_table_shading(
             );
             content.rect(cell_x, pdf_y, cell.size.width, cell.size.height);
             content.fill_nonzero();
+        }
+    }
+    /* Recurse — cell paragraphs + nested tables carry their own shading.
+    Same origins as `emit_table_text` so fills align with the glyphs. */
+    for row in &t.rows {
+        let row_x = tx + row.origin.x;
+        let row_y = ty + row.origin.y;
+        for cell in &row.cells {
+            if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                continue;
+            }
+            let cell_x = row_x + cell.origin.x;
+            let cell_y = row_y + cell.origin.y;
+            for inner in &cell.content {
+                emit_block_shading(content, page_h, cell_x, cell_y, inner);
+            }
         }
     }
 }
@@ -462,6 +766,11 @@ fn emit_table_borders(
             );
             stroke_border_edge(content, page_h, &cell.borders.right, cx1, cell_y, cx1, cy1);
             stroke_border_edge(content, page_h, &cell.borders.bottom, cell_x, cy1, cx1, cy1);
+            /* Recurse — cell paragraphs + nested tables carry their own
+            borders. Same origins as `emit_table_text`. */
+            for inner in &cell.content {
+                emit_block_borders(content, page_h, cell_x, cell_y, inner);
+            }
         }
     }
     let tx1 = tx + t.size.width;
@@ -714,16 +1023,19 @@ fn fnv1a64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use layout::{Margins, ParagraphConfig, Size, StyleSpan, layout_paragraph};
+    use layout::{
+        Margins, MarkerBox, ParagraphConfig, Point, PositionedGlyph, Size, StyleSpan, TextAttrs,
+        layout_paragraph,
+    };
     use std::collections::HashSet;
     use std::sync::Arc;
     use text_pipeline::{Alignment, ShapingDirection};
 
-    /// Lay out "Hello world" on an A4 page with the bundled Liberation face.
-    fn hello_page(stack: &FontStack) -> PageBox {
-        let spans = [StyleSpan {
+    /// One full-coverage plain span at 18 px — tests override fields as needed.
+    fn plain_span(len: u32) -> StyleSpan {
+        StyleSpan {
             start: 0,
-            end: 11,
+            end: len,
             px_size: 18.0,
             color: [0, 0, 0, 255],
             bold: false,
@@ -734,21 +1046,30 @@ mod tests {
             font_family: None,
             caps_transform: false,
             baseline_shift_px: 0.0,
-        }];
+        }
+    }
+
+    /// Lay out `text` (one paragraph, optional list marker) on an A4 page.
+    fn page_with(
+        stack: &FontStack,
+        text: &str,
+        spans: &[StyleSpan],
+        marker: Option<&str>,
+    ) -> PageBox {
         let mut para = layout_paragraph(ParagraphConfig {
-            text: "Hello world",
+            text,
             fonts: stack,
-            spans: &spans,
+            spans,
             base_direction: ShapingDirection::Ltr,
             max_width: 451.0,
             line_height: 26.0,
             alignment: Alignment::Start,
-            indent_start_px: 0.0,
+            indent_start_px: if marker.is_some() { 36.0 } else { 0.0 },
             indent_end_px: 0.0,
             first_line_indent_px: 0.0,
             hanging_indent_px: 0.0,
-            marker_text: None,
-            px_size_for_marker: 26.0,
+            marker_text: marker.map(str::to_string),
+            px_size_for_marker: 18.0,
             inline_objects: &[],
             tab_stops_px: &[],
         });
@@ -767,6 +1088,37 @@ mod tests {
             footer: None,
             footnotes: Vec::new(),
         }
+    }
+
+    /// Lay out "Hello world" on an A4 page with the bundled Liberation face.
+    fn hello_page(stack: &FontStack) -> PageBox {
+        page_with(stack, "Hello world", &[plain_span(11)], None)
+    }
+
+    /// Font-resource table for driving `build_content` directly — the object
+    /// refs are dummies; only `resource` reaches the content stream.
+    fn test_font_objs(ids: &[&str]) -> Vec<(String, FontObj)> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let base = (i * 5) as i32;
+                (
+                    (*id).to_string(),
+                    FontObj {
+                        type0: Ref::new(base + 1),
+                        cid: Ref::new(base + 2),
+                        descriptor: Ref::new(base + 3),
+                        file: Ref::new(base + 4),
+                        to_unicode: Ref::new(base + 5),
+                        resource: format!("F{i}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
     }
 
     fn liberation_stack() -> FontStack {
@@ -1033,5 +1385,217 @@ mod tests {
         for ch in "Helo wrd".chars() {
             assert!(covered.contains(&ch), "ToUnicode map missing {ch:?}");
         }
+    }
+
+    /// List markers ("1.", "•") must reach the content stream as glyph
+    /// shows — a numbered list exported without them silently loses the
+    /// numbering.
+    #[test]
+    fn list_marker_glyphs_reach_the_content_stream() {
+        let stack = liberation_stack();
+        let marked = page_with(&stack, "item", &[plain_span(4)], Some("1."));
+        let plain = page_with(&stack, "item", &[plain_span(4)], None);
+        assert!(
+            marked.blocks[0]
+                .as_paragraph()
+                .expect("paragraph block")
+                .marker
+                .is_some(),
+            "layout must produce a marker box"
+        );
+        let fo = test_font_objs(&["liberation"]);
+        let shows = |c: &[u8]| c.windows(4).filter(|w| w == b" Tj\n").count();
+        let with_marker = shows(&build_content(&marked, &fo));
+        let without = shows(&build_content(&plain, &fo));
+        assert!(
+            with_marker > without,
+            "marker glyphs must add shows: {with_marker} vs {without}"
+        );
+    }
+
+    /// The used-font collection must see the marker run — a marker-only
+    /// paragraph (no line runs) still embeds its font.
+    #[test]
+    fn marker_font_reaches_the_embedded_set() {
+        let stack = liberation_stack();
+        let run = VisualRun {
+            glyphs: vec![PositionedGlyph {
+                id: 20,
+                cluster: 0,
+                x_advance: 10.0,
+                y_advance: 0.0,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                synthetic: false,
+                inline_image_rel_id: None,
+                inline_footnote_marker: None,
+                inline_object_height: 0.0,
+            }],
+            font: "liberation".to_string(),
+            direction: ShapingDirection::Ltr,
+            source_range: 0..0,
+            attrs: TextAttrs {
+                px_size: 18.0,
+                color: [0, 0, 0, 255],
+                faux_bold: false,
+                faux_italic: false,
+                underline: engine::UnderlineStyle::None,
+                strike: false,
+                bg_color: None,
+                baseline_shift_px: 0.0,
+            },
+        };
+        let para = ParagraphBox {
+            origin: Point { x: 36.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 26.0,
+            },
+            lines: vec![],
+            direction: ShapingDirection::Ltr,
+            marker: Some(MarkerBox {
+                origin: Point { x: -20.0, y: 0.0 },
+                baseline: 14.0,
+                run,
+                width: 10.0,
+            }),
+            source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
+            fields: vec![],
+            page_break_after_line: vec![],
+            borders: None,
+            shading: None,
+        };
+        let page = PageBox {
+            size: Size {
+                width: 595.0,
+                height: 842.0,
+            },
+            margins: Margins::uniform(72.0),
+            blocks: vec![LayoutBlock::Paragraph(para)],
+            header: None,
+            footer: None,
+            footnotes: Vec::new(),
+        };
+        let mut out = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &[],
+            PdfProfile::Plain,
+            &mut out,
+        )
+        .expect("export marker-only paragraph");
+        assert!(
+            out.windows(10).any(|w| w == b"/FontFile2"),
+            "marker run must contribute its font to the embedded set"
+        );
+    }
+
+    /// Bold/italic on a regular-only stack resolve to faux synthesis; the
+    /// PDF mirrors the canvas via `2 Tr` (fill+stroke) and a sheared Tm.
+    #[test]
+    fn faux_bold_italic_reach_the_content_stream() {
+        let stack = liberation_stack();
+        let mut span = plain_span(11);
+        span.bold = true;
+        span.italic = true;
+        let page = page_with(&stack, "Hello world", &[span], None);
+        let attrs = page.blocks[0]
+            .as_paragraph()
+            .expect("paragraph block")
+            .lines[0]
+            .runs[0]
+            .attrs;
+        assert!(
+            attrs.faux_bold && attrs.faux_italic,
+            "regular-only stack must resolve to faux synthesis"
+        );
+        let content = build_content(&page, &test_font_objs(&["liberation"]));
+        assert!(
+            find(&content, b"2 Tr\n").is_some(),
+            "faux bold must set fill+stroke text rendering mode"
+        );
+        assert!(
+            find(&content, b"0 Tr\n").is_some(),
+            "text rendering mode must reset to fill after the run"
+        );
+        assert!(
+            find(&content, b"1 0 0.22 1 ").is_some(),
+            "faux italic must shear the text matrix"
+        );
+    }
+
+    /// Highlight fills sit behind the `BT`/`ET` block; underline + strike
+    /// fills follow it — the same layering as `render/scene.rs`.
+    #[test]
+    fn decorations_render_highlight_underline_strike() {
+        let stack = liberation_stack();
+        let mut span = plain_span(11);
+        span.underline = engine::UnderlineStyle::Single;
+        span.strike = true;
+        span.bg_color = Some([0xFF, 0xEB, 0x78, 0xFF]);
+        let page = page_with(&stack, "Hello world", &[span], None);
+        let content = build_content(&page, &test_font_objs(&["liberation"]));
+        let bt = find(&content, b"BT\n").expect("text block");
+        let et = find(&content, b"ET\n").expect("text block end");
+        let first_rect = find(&content, b" re\n").expect("highlight rect");
+        assert!(
+            first_rect < bt,
+            "bg highlight must be filled before the text block"
+        );
+        assert!(
+            find(&content[et..], b" re\n").is_some(),
+            "underline/strike fills must follow the text block"
+        );
+        let rects = content.windows(4).filter(|w| w == b" re\n").count();
+        assert!(
+            rects >= 3,
+            "highlight + underline + strike need three fills, got {rects}"
+        );
+    }
+
+    /// `<w:vertAlign>` — a positive `baseline_shift_px` lifts the glyphs,
+    /// i.e. a *larger* y in PDF's bottom-up space.
+    #[test]
+    fn baseline_shift_lifts_superscript_glyphs() {
+        fn first_tm_y(content: &[u8]) -> f32 {
+            let s = String::from_utf8_lossy(content);
+            let tokens: Vec<&str> = s.split_whitespace().collect();
+            let idx = tokens.iter().position(|t| *t == "Tm").expect("Tm op");
+            tokens[idx - 1].parse().expect("Tm y operand")
+        }
+        let stack = liberation_stack();
+        let mut shifted_span = plain_span(11);
+        shifted_span.baseline_shift_px = 5.0;
+        let base = page_with(&stack, "Hello world", &[plain_span(11)], None);
+        let shifted = page_with(&stack, "Hello world", &[shifted_span], None);
+        let fo = test_font_objs(&["liberation"]);
+        let y_base = first_tm_y(&build_content(&base, &fo));
+        let y_shift = first_tm_y(&build_content(&shifted, &fo));
+        assert!(
+            (y_shift - y_base - 5.0).abs() < 0.01,
+            "positive shift must lift the glyph in PDF space: base {y_base}, shifted {y_shift}"
+        );
+    }
+
+    /// `<w:pPr><w:shd>` fills behind the text; `<w:pBdr>` strokes after it.
+    #[test]
+    fn paragraph_shading_and_borders_are_emitted() {
+        let stack = liberation_stack();
+        let mut page = page_with(&stack, "Hello world", &[plain_span(11)], None);
+        let LayoutBlock::Paragraph(para) = &mut page.blocks[0] else {
+            unreachable!("fixture emits one paragraph block");
+        };
+        para.shading = Some([0xE8, 0xF0, 0xFF, 0xFF]);
+        para.borders = Some(engine::default_word_borders());
+        let content = build_content(&page, &test_font_objs(&["liberation"]));
+        let bt = find(&content, b"BT\n").expect("text block");
+        let rect = find(&content, b" re\n").expect("shading rect");
+        assert!(rect < bt, "paragraph shading must fill behind the text");
+        let et = find(&content, b"ET\n").expect("text block end");
+        assert!(
+            find(&content[et..], b"\nS").is_some(),
+            "paragraph borders must stroke after the text"
+        );
     }
 }
