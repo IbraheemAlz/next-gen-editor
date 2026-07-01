@@ -22,6 +22,28 @@ import type {
 } from '../engine/types';
 import { topPos } from '../engine/types';
 
+/* ——— Shared page-geometry constants ———
+ * ONE source of truth for the pointer path, the per-page overlays, and
+ * the layout-config dispatches, so their math can never disagree. Page
+ * tops derived from these are uniform-A4 approximations — exact
+ * per-section geometry (landscape / custom page sizes) needs
+ * engine-reported page tops and is tracked separately. */
+
+/** A4 page height in layout pt — engine `PageGeometry::a4()`. */
+export const PAGE_H_PT = 841.9;
+/** Inter-page gap in layout pt — engine `render::scene::PAGE_GAP_PT`. */
+export const PAGE_GAP_PT = 48;
+/** Print → screen DPI conversion: 1 pt (engine) = 1/72 inch; 1 CSS px =
+ *  1/96 inch; so `screen_dpi_scale = 96 / 72 = 4 / 3`. Multiplied into
+ *  the engine's `device_pixel_ratio` so an A4 page renders at the same
+ *  physical size as Word / Google Docs at 100% zoom. */
+export const SCREEN_DPI_SCALE = 4 / 3;
+/** Exact page height in CSS px (841.9 × 4/3 = 1122.533…). NOT the rounded
+ *  1123 — a 0.467 px/page error compounds to over half a line by page 30. */
+export const PAGE_H_CSS = PAGE_H_PT * SCREEN_DPI_SCALE;
+/** Inter-page gap in CSS px (48 × 4/3 = 64) — matches the `.editor-pages` gap. */
+export const PAGE_GAP_CSS = PAGE_GAP_PT * SCREEN_DPI_SCALE;
+
 /** The current selection: its logical range plus rendered rectangles. */
 export interface SelectionView {
     range: LogicalRange;
@@ -103,6 +125,10 @@ export function createEngineStore(client: EngineClient) {
        the document-info UI strip. */
     const [documentHeight, setDocumentHeight] = createSignal(0);
     const [pageCount, setPageCount] = createSignal(1);
+    /* Audit gap C.H1 — `true` once the lazy paginator has laid out every
+       block; gates the shell's scroll-driven EXPAND_LAYOUT dispatches
+       (an expand past a fully-laid-out tail would repaint for nothing). */
+    const [isFullLayout, setIsFullLayout] = createSignal(false);
     let nodes: A11yNode[] = [];
     let announced = false;
 
@@ -137,6 +163,7 @@ export function createEngineStore(client: EngineClient) {
                through here. */
             setDocumentHeight(ev.document_height);
             setPageCount(ev.page_count);
+            setIsFullLayout(ev.is_full_layout);
         } else if (ev.type === 'ACCESSIBILITY_TREE_DELTA') {
             /* Mirror the patch stream into the local `nodes` array so the
                Table panel sees the same view the reconciler renders. */
@@ -199,6 +226,7 @@ export function createEngineStore(client: EngineClient) {
         selectionKind,
         documentHeight,
         pageCount,
+        isFullLayout,
     };
 }
 

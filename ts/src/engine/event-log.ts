@@ -2,7 +2,8 @@
  * §10). Native IndexedDB; no external dependency.
  *
  * One origin-scoped database `engine-log` with three object stores:
- *   - commands  (keyPath "seq") — every dispatched command, in order
+ *   - commands  (keyPath "seq") — replay-relevant commands, in order; rows
+ *                 at/before a pruned snapshot are dropped with it
  *   - snapshots (keyPath "seq") — periodic engine snapshots; pruned to 3
  *   - meta      (keyPath "id")  — bookkeeping (which document is logged) */
 import type { Command } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
@@ -71,10 +72,18 @@ function getDb(): Promise<IDBDatabase> {
     return fresh;
 }
 
-/** Open the event log and record which document it belongs to. */
+/** Open the event log for a fresh session: record which document it belongs
+ *  to and drop every row a previous session left behind. `logSequence`
+ *  restarts at 0 per worker boot, so surviving stale rows would be upserted
+ *  over piecemeal and leak another session's commands into the next recovery
+ *  tail. Crash recovery WITHIN a session never re-opens the log (the RECOVER
+ *  path resumes the sequence past what is persisted), so this clear cannot
+ *  eat a live session's history. */
 export async function openEventLog(documentId: string): Promise<void> {
     const db = await getDb();
-    const tx = db.transaction('meta', 'readwrite');
+    const tx = db.transaction(['commands', 'snapshots', 'meta'], 'readwrite');
+    tx.objectStore('commands').clear();
+    tx.objectStore('snapshots').clear();
     tx.objectStore('meta').put({ id: 'document', documentId, openedAt: Date.now() });
     await txDone(tx);
 }
@@ -91,7 +100,7 @@ export async function appendCommand(seq: number, cmd: Command): Promise<void> {
 /** Persist an engine snapshot, pruning all but the newest `SNAPSHOTS_KEPT`. */
 export async function persistSnapshot(seq: number, bytes: Uint8Array): Promise<void> {
     const db = await getDb();
-    const tx = db.transaction('snapshots', 'readwrite');
+    const tx = db.transaction(['snapshots', 'commands'], 'readwrite');
     const store = tx.objectStore('snapshots');
     const row: SnapshotRow = { seq, bytes };
     store.put(row);
@@ -100,8 +109,18 @@ export async function persistSnapshot(seq: number, bytes: Uint8Array): Promise<v
        issued synchronously inside onsuccess to stay within this transaction. */
     const keysReq = store.getAllKeys();
     keysReq.onsuccess = () => {
-        for (const key of keysReq.result.slice(0, -SNAPSHOTS_KEPT)) {
+        const pruned = keysReq.result.slice(0, -SNAPSHOTS_KEPT);
+        for (const key of pruned) {
             store.delete(key);
+        }
+        /* Command rows at or before a pruned snapshot's seq are only
+           reachable by replaying from that (now deleted) snapshot — every
+           retained snapshot's tail starts strictly after its own seq — so
+           drop them in the same transaction. Bounds the commands store to
+           roughly SNAPSHOTS_KEPT × SNAPSHOT_EVERY rows. */
+        const newestPruned = pruned.at(-1);
+        if (newestPruned !== undefined) {
+            tx.objectStore('commands').delete(IDBKeyRange.upperBound(newestPruned));
         }
     };
     await txDone(tx);

@@ -11,9 +11,7 @@
  * `pageIdx × (PAGE_H_CSS + PAGE_GAP_CSS)`. */
 import { Show } from 'solid-js';
 import type { EngineStore } from '../state/engine-store';
-
-const PAGE_H_CSS = 1123;
-const PAGE_GAP_CSS = 64;
+import { PAGE_GAP_CSS, PAGE_H_CSS } from '../state/engine-store';
 
 export function CaretOverlay(props: { store: EngineStore; pageIdx?: number }) {
     const idx = () => props.pageIdx ?? 0;

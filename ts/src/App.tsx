@@ -14,7 +14,7 @@ import { SdkShelf } from './sdk-bridge';
 import { AccessibilityTree } from './components/AccessibilityTree';
 import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
-import { createEngineStore } from './state/engine-store';
+import { createEngineStore, SCREEN_DPI_SCALE } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
 import { attachDragDrop } from './input/dnd';
 import { createFontRegistry, type FontRegistry } from '@nge/core';
@@ -23,13 +23,6 @@ import { topPos } from './engine/types';
 import './styles/editor.css';
 import './styles/caret.css';
 import './styles/a11y.css';
-
-/** Print → screen DPI conversion: 1 pt (engine) = 1/72 inch; 1 CSS px = 1/96
- *  inch; so `screen_dpi_scale = 96 / 72 = 4 / 3 ≈ 1.333`. Multiplied into
- *  the engine's `device_pixel_ratio` so an A4 page renders at the same
- *  physical size as Word / Google Docs at 100% zoom. Phase 6c bug-fix
- *  follow-up — pre-fix the 595 × 842 page rendered tiny at ~75% zoom. */
-const SCREEN_DPI_SCALE = 4 / 3;
 
 /** Load the minimal default font set + seed a blank A4 page. Runs on boot
  *  AND crash recovery, so it must (re)establish fonts from scratch each
@@ -138,6 +131,34 @@ export function App() {
     /* §10 D4.10 — drop a .docx anywhere on the page to load it. */
     onMount(() => onCleanup(attachDragDrop(client)));
 
+    /* Engine scale follows monitor / browser-zoom DPR changes. A
+       `matchMedia('(resolution: …dppx)')` query fires exactly once when
+       the DPR leaves the queried value, so the listener re-chains onto a
+       fresh query after every change. `SET_DEVICE_SCALE` swaps the boot
+       device scale while preserving the user zoom (`SET_ZOOM` owns that
+       factor) and repaints WITHOUT resetting the document
+       (re-dispatching `RENDER_PAGE` would wipe user content). Skipped
+       while booting — recovery's `setupEngine` re-seeds the live DPR. */
+    onMount(() => {
+        let mq: MediaQueryList | undefined;
+        const onDprChange = (): void => {
+            rearm();
+            if (!booting()) {
+                void client.dispatch({
+                    type: 'SET_DEVICE_SCALE',
+                    scale: window.devicePixelRatio * SCREEN_DPI_SCALE,
+                });
+            }
+        };
+        const rearm = (): void => {
+            mq?.removeEventListener('change', onDprChange);
+            mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+            mq.addEventListener('change', onDprChange);
+        };
+        rearm();
+        onCleanup(() => mq?.removeEventListener('change', onDprChange));
+    });
+
     /* Runs once EditorCanvas has handed the engine its surface (init/recover). */
     const onReady = async (generation: number, initMs: number): Promise<void> => {
         if (generation === 0) {
@@ -200,11 +221,22 @@ export function App() {
                             <CaretOverlay store={store} pageIdx={0} />
                             <HiddenInput client={client} store={store} />
                         </div>
-                        <For each={Array.from({ length: Math.max(0, store.pageCount() - 1) }, (_, i) => i + 1)}>
-                            {(idx) => (
-                                <ExtraPageCanvas client={client} store={store} pageIdx={idx} />
-                            )}
-                        </For>
+                        {/* Extra pages live under a `booting` boundary: a
+                            crash flips `booting` true, disposing them; the
+                            completed recovery flips it back, remounting
+                            fresh <canvas> elements whose surfaces
+                            re-register with the RESPAWNED worker. The old
+                            surfaces died with the trapped worker, and a
+                            consumed OffscreenCanvas cannot be
+                            re-transferred — plus `registerPageCanvas` must
+                            not race the async `recover()` respawn. */}
+                        <Show when={!booting()}>
+                            <For each={Array.from({ length: Math.max(0, store.pageCount() - 1) }, (_, i) => i + 1)}>
+                                {(idx) => (
+                                    <ExtraPageCanvas client={client} store={store} pageIdx={idx} />
+                                )}
+                            </For>
+                        </Show>
                     </div>
                 </div>
             </SdkShelf>

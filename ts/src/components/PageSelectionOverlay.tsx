@@ -15,11 +15,7 @@
  * positioning math aligns with hit-test routing. */
 import { For } from 'solid-js';
 import type { EngineStore } from '../state/engine-store';
-
-/** A4 page height at 96 DPI (engine `841.9 pt × 4/3 ≈ 1123 CSS px`). */
-const PAGE_H_CSS = 1123;
-/** Inter-page CSS gap — matches engine `PAGE_GAP_PT = 48 pt × 4/3 = 64 CSS px`. */
-const PAGE_GAP_CSS = 64;
+import { PAGE_GAP_CSS, PAGE_H_CSS } from '../state/engine-store';
 
 export function PageSelectionOverlay(props: { store: EngineStore; pageIdx: number }) {
     const pageTopCss = () => props.pageIdx * (PAGE_H_CSS + PAGE_GAP_CSS);

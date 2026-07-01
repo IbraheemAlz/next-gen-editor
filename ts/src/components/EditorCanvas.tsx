@@ -13,6 +13,7 @@ import { createEffect, onCleanup, onMount } from 'solid-js';
 import { attachPointer } from '../input/pointer';
 import type { EngineClient } from '../engine/engine-client';
 import type { EngineStore } from '../state/engine-store';
+import { PAGE_H_PT, SCREEN_DPI_SCALE } from '../state/engine-store';
 
 export interface EditorCanvasProps {
     client: EngineClient;
@@ -31,6 +32,7 @@ export function EditorCanvas(props: EditorCanvasProps) {
     let canvasRef: HTMLCanvasElement | undefined;
     let resizeObserver: ResizeObserver | undefined;
     let detachPointer: (() => void) | undefined;
+    let detachViewport: (() => void) | undefined;
 
     onMount(async () => {
         const canvas = canvasRef!;
@@ -53,18 +55,62 @@ export function EditorCanvas(props: EditorCanvasProps) {
 
         await props.onReady(props.generation, initMs);
 
-        /* Viewport resize → engine. `SET_VIEWPORT` is still an engine-side
-           stub (engine-wasm `phase3_stub`); the dispatch lands with the
-           scroll/viewport work. The observer is wired now so the plumbing
-           is in place. */
-        resizeObserver = new ResizeObserver(() => {
-            /* TODO: dispatch SET_VIEWPORT once the engine implements it. */
-        });
-        resizeObserver.observe(canvas);
+        /* Audit gap C.H1 — feed the engine's lazy-layout band. Scroll +
+           viewport-resize ticks are rAF-coalesced into a `SET_VIEWPORT`
+           carrying the visible rect in document-relative device px
+           (origin = this page-0 canvas's top-left). When the visible
+           bottom nears the laid-out tail, `EXPAND_LAYOUT` forces a paint
+           that extends the band — its `target_y` is layout pt at
+           scale = 1 (the engine multiplies by its own scale). */
+        const scroller = canvas.closest('.editor-viewport');
+        let rafId = 0;
+        let expandedToPt = 0;
+        const pushViewport = (): void => {
+            rafId = 0;
+            if (!scroller) return;
+            const dpr = window.devicePixelRatio || 1;
+            const r = canvas.getBoundingClientRect();
+            const v = scroller.getBoundingClientRect();
+            const rect = {
+                x: (v.left - r.left) * dpr,
+                y: (v.top - r.top) * dpr,
+                w: scroller.clientWidth * dpr,
+                h: scroller.clientHeight * dpr,
+            };
+            void props.client.dispatch({ type: 'SET_VIEWPORT', rect });
+            const scale = dpr * SCREEN_DPI_SCALE;
+            const laidOutPt = props.store.documentHeight() / scale;
+            const bottomPt = (rect.y + rect.h) / scale;
+            const targetPt = bottomPt + 2 * PAGE_H_PT;
+            /* Skip when the paginator already exhausted every block, laid
+               out past the buffered target, or an equal-or-deeper expand
+               is in flight — a redundant EXPAND_LAYOUT still repaints. */
+            if (
+                !props.store.isFullLayout() &&
+                bottomPt + PAGE_H_PT > laidOutPt &&
+                targetPt > laidOutPt &&
+                targetPt > expandedToPt
+            ) {
+                expandedToPt = targetPt;
+                void props.client.dispatch({ type: 'EXPAND_LAYOUT', target_y: targetPt });
+            }
+        };
+        const schedule = (): void => {
+            if (rafId === 0) rafId = requestAnimationFrame(pushViewport);
+        };
+        scroller?.addEventListener('scroll', schedule, { passive: true });
+        resizeObserver = new ResizeObserver(schedule);
+        resizeObserver.observe(scroller ?? canvas);
+        schedule();
+        detachViewport = () => {
+            if (rafId !== 0) cancelAnimationFrame(rafId);
+            scroller?.removeEventListener('scroll', schedule);
+        };
 
         /* §7 — pointer → engine hit-testing. Pointer events still fire on a
            canvas whose drawing surface has been transferred to the worker.
-           Phase 6c — page 0; clicks dispatch `HIT_TEST_IN_PAGE { page: 0 }`. */
+           Phase 6c — page 0; clicks dispatch
+           `HIT_TEST_IN_PAGE { page: 0, at: local }`. */
         detachPointer = attachPointer(canvas, props.client, 0);
     });
 
@@ -83,6 +129,7 @@ export function EditorCanvas(props: EditorCanvasProps) {
 
     onCleanup(() => {
         resizeObserver?.disconnect();
+        detachViewport?.();
         detachPointer?.();
     });
 

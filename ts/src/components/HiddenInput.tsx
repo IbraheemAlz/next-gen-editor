@@ -6,8 +6,15 @@
  * (pointer-events:none). `beforeinput` is captured and mapped to engine
  * commands; the textarea itself never accumulates text. */
 import { createEffect, onCleanup, onMount } from 'solid-js';
+import { emptyPatch } from '@nge/core';
 import type { EngineClient } from '../engine/engine-client';
-import type { Command, LogicalPos, MoveDirection } from '../engine/types';
+import type {
+    Command,
+    LogicalPos,
+    MoveDirection,
+    TextAttrs,
+    TextAttrsPatch,
+} from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
 import { copy, cut, paste } from '../input/clipboard';
 
@@ -226,7 +233,33 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
                native `paste` ClipboardEvent. */
             e.preventDefault();
             void paste(props.client, true);
+        } else if (e.code === 'KeyB' && !e.shiftKey) {
+            e.preventDefault();
+            toggleFormat((a) => ({ bold: !a.bold }));
+        } else if (e.code === 'KeyI' && !e.shiftKey) {
+            e.preventDefault();
+            toggleFormat((a) => ({ italic: !a.italic }));
+        } else if (e.code === 'KeyU' && !e.shiftKey) {
+            e.preventDefault();
+            toggleFormat((a) => ({
+                underline: a.underline === 'None' ? 'Single' : 'None',
+            }));
         }
+    };
+
+    /* Ctrl/Cmd+B/I/U — toggle relative to the engine-reported caret attrs.
+       `range: undefined` binds the patch to the engine-owned live selection
+       (never the async UI mirror), matching the facade helpers. */
+    const toggleFormat = (
+        patch: (a: TextAttrs) => Partial<TextAttrsPatch>,
+    ): void => {
+        const attrs = props.store.attrsAtCaret();
+        if (!attrs) return;
+        void props.client.dispatch({
+            type: 'APPLY_FORMATTING',
+            range: undefined,
+            attrs: { ...emptyPatch(), ...patch(attrs) },
+        });
     };
 
     /* §12 — clipboard. The native copy/cut/paste events fire inside a

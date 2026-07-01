@@ -92,6 +92,16 @@ let logSequence = 0;
 let lastSnapshotAt = 0;
 const SNAPSHOT_EVERY = 200;
 
+/* Highest `version` seen on a real `Painted` event — synthetic paint-dims
+   broadcasts reuse it so `paintVersion` consumers never see a reset to 0. */
+let lastPaintVersion = 0;
+
+function notePaintVersion(evt: Event): void {
+    if (evt.type === 'PAINTED' && evt.version > lastPaintVersion) {
+        lastPaintVersion = evt.version;
+    }
+}
+
 /**
  * Serial command queue.
  *
@@ -634,6 +644,34 @@ function mutatesDocument(cmd: Command): boolean {
     }
 }
 
+/**
+ * Whether a successfully dispatched command belongs in the durable event
+ * log. Recovery replays the tail through `dispatch`, so anything that moves
+ * engine state a later logged command depends on must be kept — document
+ * mutations (see `mutatesDocument`), selection/caret moves (caret-relative
+ * edits like `INSERT_TEXT` at `undefined` replay wrong without them),
+ * composition, font loads, and view state. Pure read-back queries are
+ * skipped: they replay as no-ops, and the per-pointermove `HIT_TEST` alone
+ * would grow the commands store without bound. `PING` stays logged — the
+ * D2.6 exit gate (e2e/event-log-replay.spec.ts) drives the sequence with it.
+ */
+function shouldLogCommand(cmd: Command): boolean {
+    switch (cmd.type) {
+        case 'HIT_TEST':
+        case 'HIT_TEST_IN_PAGE':
+        case 'REQUEST_PAINT':
+        case 'REQUEST_ACCESSIBILITY_DELTA':
+        case 'GET_SELECTION_AS_CLIPBOARD':
+        case 'REQUEST_STATS':
+        case 'SAVE_DOCX':
+        case 'SAVE_DOCUMENT':
+        case 'EXPORT_PDF':
+            return false;
+        default:
+            return true;
+    }
+}
+
 async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
     if (!engine) {
         self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
@@ -643,11 +681,14 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         const t0 = performance.now();
         const evt = await dispatch(msg.cmd);
         const elapsed = performance.now() - t0;
+        notePaintVersion(evt);
         self.postMessage({ id: msg.id, ok: true, evt, elapsed });
         /* D2.8 backpressure (PHASE_2_BRIDGE_MEMORY.md §12 risk 5): persist to
            the event log OFF the critical path. The RPC response is already
            sent, so event-log latency never throttles command throughput. */
-        logCommand(msg.cmd);
+        if (shouldLogCommand(msg.cmd)) {
+            logCommand(msg.cmd);
+        }
         /* Phase 7 — after `OPEN_DOCUMENT`, enumerate the engine's parsed
            inline-image media blobs, decode each into an `ImageBitmap` via
            the browser's native pipeline, and register the result back on
@@ -691,15 +732,22 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
 function broadcastPaintDims(): void {
     if (!engine) return;
     try {
-        const dims = engine.paint_dims() as { document_height: number; page_count: number };
+        const dims = engine.paint_dims() as {
+            document_height: number;
+            page_count: number;
+            estimated_document_height: number;
+            is_full_layout: boolean;
+        };
         self.postMessage({
             evt: {
                 type: 'PAINTED',
                 dirty: { x: 0, y: 0, w: 0, h: 0 },
-                version: 0,
+                version: lastPaintVersion,
                 paint_ms: 0,
                 document_height: dims.document_height,
                 page_count: dims.page_count,
+                is_full_layout: dims.is_full_layout,
+                estimated_document_height: dims.estimated_document_height,
             },
         });
     } catch (e: unknown) {
@@ -809,7 +857,10 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
                 type: 'REQUEST_PAINT',
                 viewport: { x: 0, y: 0, w: 0, h: 0 },
                 dirty: undefined,
-            }).then((evt) => self.postMessage({ evt }));
+            }).then((evt) => {
+                notePaintVersion(evt);
+                self.postMessage({ evt });
+            });
         } catch (e: unknown) {
             replyError(msg.id, e);
         }

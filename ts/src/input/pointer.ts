@@ -2,22 +2,12 @@
  *
  * The engine owns hit-testing; the UI only forwards device-pixel coordinates.
  * pointerdown places the caret, drag extends the selection, double-click
- * selects a word. Each gesture round-trips through HIT_TEST then a selection
- * command; the engine answers with SELECTION_CHANGED, which engine-store
- * fans out to the overlays. */
+ * selects a word. Each gesture round-trips through HIT_TEST_IN_PAGE then a
+ * selection command; the engine answers with SELECTION_CHANGED, which
+ * engine-store fans out to the overlays. */
 import type { EngineClient } from '../engine/engine-client';
 import type { Point } from '../engine/types';
-
-/* Phase 6c — multi-canvas drag math constants. The pointer handler
-   converts canvas-local pointer coords to document-absolute engine
-   device-px so a drag that leaves the originally-clicked canvas (the
-   `setPointerCapture` target) still resolves to the right glyph on
-   whichever page the cursor visits. The conversion adds this canvas's
-   page-top offset in engine device px, computed from the engine's
-   constants below. */
-const PAGE_H_PT = 841.9; // A4 height in layout pt (engine `PageGeometry::a4()`).
-const PAGE_GAP_PT = 48; // Engine `render::scene::PAGE_GAP_PT`.
-const SCREEN_DPI_SCALE = 4 / 3; // 96 / 72 — `App.tsx::SCREEN_DPI_SCALE`.
+import { PAGE_GAP_PT, PAGE_H_PT, SCREEN_DPI_SCALE } from '../state/engine-store';
 
 /**
  * Wire pointer listeners on `canvas` for one page in the multi-canvas DOM
@@ -25,10 +15,10 @@ const SCREEN_DPI_SCALE = 4 / 3; // 96 / 72 — `App.tsx::SCREEN_DPI_SCALE`.
  * events still fire on a `<canvas>` whose drawing surface has been
  * transferred to the worker, so this is safe to attach post-transfer.
  *
- * `pageIdx` is the canvas's page index — used to convert
- * canvas-local pointer coords to document-absolute engine device-px,
- * so `setPointerCapture` drags that cross page boundaries still
- * resolve to the right glyph on whichever page the cursor visits.
+ * `pageIdx` is the canvas's page index. Hit-tests ship the click in this
+ * page's LOCAL device-pixel coords via `HIT_TEST_IN_PAGE`; the engine adds
+ * the page's REAL accumulated top offset (per-section landscape / custom
+ * page sizes included), so the TS side does no page-height math at all.
  */
 export function attachPointer(
     canvas: HTMLCanvasElement,
@@ -43,27 +33,37 @@ export function attachPointer(
        time it resolves is dropped. */
     let gesture = 0;
 
-    /* Client coords → DOCUMENT-ABSOLUTE engine device pixels. Adding
-       this canvas's page-top offset means a `setPointerCapture` drag
-       that wanders onto a neighbouring canvas (or even past the last
-       page) still resolves the correct glyph — `e.clientY - r.top`
-       legitimately exceeds the canvas height when the cursor is below
-       this canvas, and that's exactly the engine-space Y of the line
-       below. Multiplied by `dpr` to lift into engine device px;
-       `pageIdx × (page_h + gap) × scale` shifts to absolute. */
-    const toGlobal = (e: PointerEvent | MouseEvent): Point => {
+    /* Client coords → this page's LOCAL engine device pixels (origin at
+       the page's top-left). `HIT_TEST_IN_PAGE` adds the page's real
+       accumulated top offset engine-side. `e.clientY - r.top`
+       legitimately exceeds the canvas height (or goes negative) when a
+       `setPointerCapture` drag wanders onto a neighbouring canvas — the
+       overshoot maps onto the adjacent page because the CSS inter-page
+       gap mirrors the engine's `PAGE_GAP_PT`. */
+    const toLocal = (e: PointerEvent | MouseEvent): Point => {
         const r = canvas.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
-        const scale = dpr * SCREEN_DPI_SCALE;
-        const pageOffsetY = pageIdx * (PAGE_H_PT + PAGE_GAP_PT) * scale;
         return {
             x: (e.clientX - r.left) * dpr,
-            y: (e.clientY - r.top) * dpr + pageOffsetY,
+            y: (e.clientY - r.top) * dpr,
         };
     };
 
+    /* Client coords → DOCUMENT-ABSOLUTE engine device pixels, only for
+       the gesture commands that have no page-local bridge variant
+       (`SELECT_WORD_AT` / `SELECT_PARAGRAPH_AT` / `SELECT_CELL_AT`).
+       The page-top offset is the shared uniform-A4 approximation from
+       engine-store — exact for portrait-A4 documents; per-section page
+       heights are tracked separately. */
+    const toGlobal = (e: PointerEvent | MouseEvent): Point => {
+        const local = toLocal(e);
+        const dpr = window.devicePixelRatio || 1;
+        const pageOffsetY = pageIdx * (PAGE_H_PT + PAGE_GAP_PT) * dpr * SCREEN_DPI_SCALE;
+        return { x: local.x, y: local.y + pageOffsetY };
+    };
+
     const placeCaret = async (at: Point, g: number): Promise<void> => {
-        const hit = await client.dispatch({ type: 'HIT_TEST', at });
+        const hit = await client.dispatch({ type: 'HIT_TEST_IN_PAGE', page: pageIdx, at });
         if (g !== gesture || hit.type !== 'HIT_RESULT') return;
         await client.dispatch({
             type: 'SET_SELECTION',
@@ -73,7 +73,7 @@ export function attachPointer(
     };
 
     const extendTo = async (at: Point, g: number): Promise<void> => {
-        const hit = await client.dispatch({ type: 'HIT_TEST', at });
+        const hit = await client.dispatch({ type: 'HIT_TEST_IN_PAGE', page: pageIdx, at });
         if (g !== gesture || hit.type !== 'HIT_RESULT') return;
         await client.dispatch({ type: 'EXTEND_SELECTION', to: hit.pos, modifier: 'None' });
     };
@@ -86,15 +86,15 @@ export function attachPointer(
            put, caret jumps to the hit position) instead of resetting
            it. UX_BEHAVIOR_SPEC §IV.7. */
         if (e.shiftKey) {
-            void extendTo(toGlobal(e), gesture);
+            void extendTo(toLocal(e), gesture);
             return;
         }
-        void placeCaret(toGlobal(e), gesture);
+        void placeCaret(toLocal(e), gesture);
     };
 
     const onPointerMove = (e: PointerEvent): void => {
         if (!dragging) return;
-        void extendTo(toGlobal(e), gesture);
+        void extendTo(toLocal(e), gesture);
     };
 
     const onPointerUp = (e: PointerEvent): void => {

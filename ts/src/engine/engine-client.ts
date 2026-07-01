@@ -38,6 +38,7 @@ export interface CommentSnapshot {
     start_offset: number;
     end_block: number;
     end_offset: number;
+    resolved: boolean;
 }
 
 /** Phase 8b — read-only snapshot row for revision tooltips. */
@@ -77,6 +78,12 @@ export class EngineClient {
     }
 
     private spawn(): void {
+        /* Requests addressed to the previous worker can never be answered —
+           settle them before the fresh worker takes over the id space. */
+        for (const resolve of this.pending.values()) {
+            resolve({ ok: false, error: 'engine worker respawned; request abandoned' });
+        }
+        this.pending.clear();
         this.worker = new Worker(new URL('./engine.worker.ts', import.meta.url), {
             type: 'module',
         });
@@ -86,6 +93,7 @@ export class EngineClient {
 
     async init(canvas: OffscreenCanvas): Promise<void> {
         const r = await this.send({ type: 'INIT', canvas, documentId: this.documentId }, [canvas]);
+        if (!r.ok) throw new Error(r.error);
         this.workerIsolated = r.crossOriginIsolated === true;
         this.activeRenderer = r.renderer ?? 'canvas2d';
     }
@@ -107,18 +115,24 @@ export class EngineClient {
      * brand-new OffscreenCanvas — the trapped surface is gone.
      */
     async recover(canvas: OffscreenCanvas): Promise<void> {
-        try {
-            const { snapshot, log, snapshotSeq, lastSeq } = await loadLatestEventLog(
-                this.documentId,
-            );
-            this.spawn();
-            await this.send({ type: 'RECOVER', canvas, snapshot, log, snapshotSeq, lastSeq }, [
-                canvas,
-                snapshot.buffer as ArrayBuffer,
-            ]);
-        } finally {
-            this.recovering = false;
-        }
+        /* An event-log read failure (IndexedDB rejection / corruption) must
+           not strand a dead client — respawn with an empty log instead. */
+        const { snapshot, log, snapshotSeq, lastSeq } = await loadLatestEventLog(
+            this.documentId,
+        ).catch((e: unknown): { snapshot: Uint8Array; log: Command[]; snapshotSeq: number; lastSeq: number } => {
+            console.error('event log unreadable; recovering with an empty log', e);
+            return { snapshot: new Uint8Array(0), log: [], snapshotSeq: 0, lastSeq: 0 };
+        });
+        this.spawn();
+        /* Clear the guard BEFORE awaiting the reply: if the RECOVER replay
+           itself traps, handle() runs onTrap() synchronously — ahead of this
+           await's continuation — and must re-fire onCrash, not drop it. */
+        this.recovering = false;
+        const r = await this.send({ type: 'RECOVER', canvas, snapshot, log, snapshotSeq, lastSeq }, [
+            canvas,
+            snapshot.buffer as ArrayBuffer,
+        ]);
+        if (!r.ok) throw new Error(r.error);
     }
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {
@@ -195,10 +209,19 @@ export class EngineClient {
      */
     forceTrap(): void {
         this.worker.terminate();
-        this.onTrap();
+        this.onTrap('forced trap (test hook)');
     }
 
     private send(payload: any, transfer: Transferable[] = []) {
+        if (this.recovering) {
+            /* The worker is dead and the respawn has not completed yet — a
+               postMessage would hang forever. Settle immediately instead. */
+            return Promise.resolve<WorkerReply>({
+                ok: false,
+                error: 'engine worker trapped; recovery in progress',
+                trap: true,
+            });
+        }
         return new Promise<WorkerReply>(
             (resolve) => {
                 const id = this.nextId++;
@@ -215,12 +238,14 @@ export class EngineClient {
             cb(msg);
         }
         if (msg.evt) this.subscribers.forEach((s) => s(msg.evt));
-        if (msg.trap) this.onTrap();
+        if (msg.trap) {
+            this.onTrap(typeof msg.error === 'string' ? msg.error : 'engine worker trapped');
+        }
     }
 
     private onWorkerError(e: ErrorEvent): void {
         console.error('worker error', e);
-        this.onTrap();
+        this.onTrap(e.message || 'worker error');
     }
 
     /**
@@ -230,13 +255,18 @@ export class EngineClient {
      * drops a duplicate report (the worker posts `{ trap: true }` and may
      * also fire `onerror`); `recover()` clears it.
      */
-    private onTrap(): void {
+    private onTrap(stack: string): void {
         if (this.recovering) return;
         this.recovering = true;
         for (const resolve of this.pending.values()) {
             resolve({ ok: false, error: 'engine worker trapped; recovering', trap: true });
         }
         this.pending.clear();
+        /* The worker dies before it can emit `Event::Trap` itself, so
+           synthesize the bridge-shaped event (crates/bridge/src/event.rs) —
+           subscribers (TrapOverlay, telemetry ENGINE_TRAP) see the crash. */
+        const trapEvt: Event = { type: 'TRAP', stack };
+        this.subscribers.forEach((s) => s(trapEvt));
         this.onCrash();
     }
 }
