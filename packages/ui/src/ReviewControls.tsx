@@ -8,6 +8,10 @@
  * changes toggle issued by macro, undo, or another tab stays in
  * sync. New Comment + Accept/Reject All controls keep their Sprint 7
  * behaviour.
+ *
+ * The author input also feeds `Command::SetReviewIdentity`, so
+ * tracked revisions carry the typed author instead of the engine's
+ * "You" default.
  */
 import {
     createEffect,
@@ -45,6 +49,13 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
 
     const ready = () => state.selection() !== undefined;
 
+    /* Propagate the author input to the engine review identity so
+     * tracked revisions stop being stamped with the "You" default.
+     * Empty date keeps the engine's per-mutation date stamping. */
+    createEffect(() => {
+        void cmd.setReviewIdentity(commentAuthor(), '');
+    });
+
     /* Sprint 14 (#14) — dispatch + let the engine's
      * SelectionChanged reply drive the visual active state.
      * `tracking()` reads `state.isTrackingChanges()` so the toggle
@@ -52,6 +63,11 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
     const onToggleTracking = async () => {
         const next = !tracking();
         try {
+            if (next) {
+                /* Guarantee the identity lands before recording starts —
+                 * the worker queue serializes it ahead of the toggle. */
+                await cmd.setReviewIdentity(commentAuthor(), '');
+            }
             await cmd.toggleTrackChanges(next);
         } catch (e) {
             setError(String(e));

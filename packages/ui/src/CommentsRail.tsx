@@ -1,13 +1,15 @@
 /**
- * CommentsRail — read-only callout column listing every `<w:comment>`
- * the engine has parsed from the loaded `.docx`.
+ * CommentsRail — callout column listing every `<w:comment>` the
+ * engine has parsed from the loaded `.docx`.
  *
  * Consumes `engine.commentsSnapshot()`. Same lifecycle pattern as
  * TrackChangesSidebar: initial fetch + refresh on document events.
  *
- * Reply / Resolve / Delete buttons are intentionally absent — those
- * commands do not yet exist on the bridge. Once added, they land
- * here without rework.
+ * Resolve / Delete are wired end-to-end — each card dispatches
+ * `Command::ResolveComment` / `Command::DeleteComment` and refreshes
+ * the snapshot. Reply is the one remaining gap: the bridge has no
+ * reply command, so no Reply button renders here (see the
+ * `core-engine` GitHub issue tracking the comment-reply command).
  */
 import {
     createEffect,

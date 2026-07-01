@@ -40,7 +40,7 @@ export const SuperSubButtons: Component = () => {
                 aria-label="Superscript"
                 aria-pressed={isSuper()}
                 data-active={isSuper()}
-                title="Superscript (Ctrl+Shift+=)"
+                title="Superscript"
                 onClick={() => void toggleSuper()}
             >
                 X<sup>2</sup>
@@ -51,7 +51,7 @@ export const SuperSubButtons: Component = () => {
                 aria-label="Subscript"
                 aria-pressed={isSub()}
                 data-active={isSub()}
-                title="Subscript (Ctrl+=)"
+                title="Subscript"
                 onClick={() => void toggleSub()}
             >
                 X<sub>2</sub>
