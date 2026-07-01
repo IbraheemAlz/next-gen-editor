@@ -44,6 +44,23 @@ export const PAGE_H_CSS = PAGE_H_PT * SCREEN_DPI_SCALE;
 /** Inter-page gap in CSS px (48 × 4/3 = 64) — matches the `.editor-pages` gap. */
 export const PAGE_GAP_CSS = PAGE_GAP_PT * SCREEN_DPI_SCALE;
 
+/* Issue #26 — engine-reported per-page geometry (device px, from the
+ * `Painted` event). The signal drives the reactive overlays; the
+ * module-level mirror lets the non-reactive pointer path read the
+ * latest tops at event time without threading the store through
+ * `attachPointer`. */
+export interface PageGeometry {
+    tops: number[];
+    heights: number[];
+}
+let latestPageTops: number[] | null = null;
+
+/** Device-px top of page `idx` from the last paginated paint, or `null`
+ *  before one lands (callers fall back to the uniform constants). */
+export function enginePageTopDevice(idx: number): number | null {
+    return latestPageTops?.[idx] ?? null;
+}
+
 /** The current selection: its logical range plus rendered rectangles. */
 export interface SelectionView {
     range: LogicalRange;
@@ -129,6 +146,7 @@ export function createEngineStore(client: EngineClient) {
        block; gates the shell's scroll-driven EXPAND_LAYOUT dispatches
        (an expand past a fully-laid-out tail would repaint for nothing). */
     const [isFullLayout, setIsFullLayout] = createSignal(false);
+    const [pageGeometry, setPageGeometry] = createSignal<PageGeometry | null>(null);
     let nodes: A11yNode[] = [];
     let announced = false;
 
@@ -164,6 +182,12 @@ export function createEngineStore(client: EngineClient) {
             setDocumentHeight(ev.document_height);
             setPageCount(ev.page_count);
             setIsFullLayout(ev.is_full_layout);
+            /* Issue #26 — harness paths bypass pagination and emit empty
+               arrays; keep the last real geometry in that case. */
+            if (ev.page_tops.length > 0) {
+                latestPageTops = ev.page_tops;
+                setPageGeometry({ tops: ev.page_tops, heights: ev.page_heights });
+            }
         } else if (ev.type === 'ACCESSIBILITY_TREE_DELTA') {
             /* Mirror the patch stream into the local `nodes` array so the
                Table panel sees the same view the reconciler renders. */
@@ -227,6 +251,20 @@ export function createEngineStore(client: EngineClient) {
         documentHeight,
         pageCount,
         isFullLayout,
+        pageGeometry,
+        /** CSS-px top of page `idx` — engine-exact once a paginated paint
+         *  reported geometry; uniform-A4 fallback before that. */
+        pageTopCss: (idx: number): number => {
+            const top = pageGeometry()?.tops[idx];
+            return top !== undefined
+                ? top / (window.devicePixelRatio || 1)
+                : idx * (PAGE_H_CSS + PAGE_GAP_CSS);
+        },
+        /** CSS-px height of page `idx` — same fallback rules. */
+        pageHeightCss: (idx: number): number => {
+            const h = pageGeometry()?.heights[idx];
+            return h !== undefined ? h / (window.devicePixelRatio || 1) : PAGE_H_CSS;
+        },
     };
 }
 

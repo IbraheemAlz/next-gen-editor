@@ -7,7 +7,12 @@
  * engine-store fans out to the overlays. */
 import type { EngineClient } from '../engine/engine-client';
 import type { Point } from '../engine/types';
-import { PAGE_GAP_PT, PAGE_H_PT, SCREEN_DPI_SCALE } from '../state/engine-store';
+import {
+    PAGE_GAP_PT,
+    PAGE_H_PT,
+    SCREEN_DPI_SCALE,
+    enginePageTopDevice,
+} from '../state/engine-store';
 
 /**
  * Wire pointer listeners on `canvas` for one page in the multi-canvas DOM
@@ -58,7 +63,11 @@ export function attachPointer(
     const toGlobal = (e: PointerEvent | MouseEvent): Point => {
         const local = toLocal(e);
         const dpr = window.devicePixelRatio || 1;
-        const pageOffsetY = pageIdx * (PAGE_H_PT + PAGE_GAP_PT) * dpr * SCREEN_DPI_SCALE;
+        /* Engine-reported page top (device px, exact under mixed
+           orientations — issue #26); uniform-A4 fallback pre-paint. */
+        const pageOffsetY =
+            enginePageTopDevice(pageIdx) ??
+            pageIdx * (PAGE_H_PT + PAGE_GAP_PT) * dpr * SCREEN_DPI_SCALE;
         return { x: local.x, y: local.y + pageOffsetY };
     };
 

@@ -10,16 +10,15 @@
  * engine's flat rect list to the rects whose engine-Y falls inside
  * THIS page's range, then re-positions them in the page's LOCAL
  * coordinate space. Engine rect.y comes from the store already
- * converted to CSS px; `pageTopCss` is `pageIdx × (PAGE_H_CSS +
- * GAP_CSS)`, matching the engine's `PAGE_GAP_PT × scale` so the
- * positioning math aligns with hit-test routing. */
+ * converted to CSS px; the page top comes from the store's
+ * engine-reported geometry (issue #26) so mixed-orientation sections
+ * position exactly; uniform-A4 fallback before the first paint. */
 import { For } from 'solid-js';
 import type { EngineStore } from '../state/engine-store';
-import { PAGE_GAP_CSS, PAGE_H_CSS } from '../state/engine-store';
 
 export function PageSelectionOverlay(props: { store: EngineStore; pageIdx: number }) {
-    const pageTopCss = () => props.pageIdx * (PAGE_H_CSS + PAGE_GAP_CSS);
-    const pageBottomCss = () => pageTopCss() + PAGE_H_CSS;
+    const pageTopCss = () => props.store.pageTopCss(props.pageIdx);
+    const pageBottomCss = () => pageTopCss() + props.store.pageHeightCss(props.pageIdx);
 
     const visibleRects = () => {
         const top = pageTopCss();

@@ -33,6 +33,7 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
         testCase === 'tab-stops-center-kind-ltr' ||
         testCase === 'tab-stops-right-kind-ltr' ||
         testCase === 'tab-stops-decimal-kind-ltr' ||
+        testCase === 'table-merges' ||
         testCase === 'autofit-long-url-overflow'
     ) {
         return { w: 595, h: 842 };

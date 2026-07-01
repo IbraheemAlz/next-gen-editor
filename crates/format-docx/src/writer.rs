@@ -3094,6 +3094,33 @@ mod tests {
         );
     }
 
+    /// Tables epic — a rectangular merge survives the regenerate path:
+    /// the writer emits `<w:gridSpan>`/`<w:vMerge>` in Word's collapsed
+    /// shape and the reader reproduces the same model.
+    #[test]
+    fn regenerated_merged_table_round_trips_spans() {
+        let doc =
+            engine::DocumentTree::from_text("hello").insert_table(engine::BlockPath::top(1), 3, 3);
+        let doc = doc.merge_cells(engine::BlockPath::top(1), 0, 0, 1, 1);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("re-read");
+        let t = parsed.document.blocks[1].as_table().expect("table");
+        assert_eq!(t.grid.len(), 3, "grid template survives");
+        assert_eq!(t.rows[0].cells.len(), 2, "top row collapsed");
+        assert_eq!(t.rows[0].cells[0].props.grid_span, 2);
+        assert_eq!(
+            t.rows[0].cells[0].props.v_merge,
+            engine::VMergeRole::Restart
+        );
+        assert_eq!(t.rows[1].cells.len(), 2, "continuation row collapsed");
+        assert_eq!(t.rows[1].cells[0].props.grid_span, 2);
+        assert_eq!(
+            t.rows[1].cells[0].props.v_merge,
+            engine::VMergeRole::Continue
+        );
+        assert_eq!(t.rows[2].cells.len(), 3, "row below the merge intact");
+    }
+
     #[test]
     fn round_trip_arabic() {
         let doc = DocumentTree::from_text("السلام عليكم ورحمة الله");

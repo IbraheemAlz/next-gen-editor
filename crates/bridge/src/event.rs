@@ -124,6 +124,17 @@ pub enum Event {
         /// once `is_full_layout` is `true`. Drives the scrollbar so it
         /// never jumps as background layout fills in the tail.
         estimated_document_height: f32,
+        /// Issue #26 — absolute top offset of every laid-out page in
+        /// document device px (page 0 sits at `0.0`; each next top adds
+        /// the previous page's real height + the inter-page gap).
+        /// Overlays and pointer math consume these instead of assuming
+        /// uniform A4-portrait pages, so mixed-orientation sections
+        /// stop drifting. Empty for harness paths that bypass
+        /// pagination.
+        page_tops: Vec<f32>,
+        /// Issue #26 — per-page heights in device px, index-aligned
+        /// with `page_tops`.
+        page_heights: Vec<f32>,
     },
 
     /* Selection */

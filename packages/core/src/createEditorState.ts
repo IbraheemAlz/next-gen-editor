@@ -62,6 +62,14 @@ export interface EditorState {
     paintVersion: Accessor<number>;
     /** Estimated full document height (lazy layout) in pt. */
     estimatedDocumentHeight: Accessor<number>;
+    /**
+     * Issue #26 — absolute per-page top offsets + heights in document
+     * device px, index-aligned, straight from the paginator. Empty
+     * arrays until the first paginated paint. Exact under
+     * mixed-orientation sections — consumers must not derive page tops
+     * from uniform page-size constants.
+     */
+    pageGeometry: Accessor<{ tops: number[]; heights: number[] }>;
     /** Active renderer reported by the worker at INIT. */
     renderer: Accessor<string>;
     /**
@@ -119,6 +127,10 @@ export function createEditorState(): EditorState {
     const [lastPaintMs, setLastPaintMs] = createSignal(0);
     const [paintVersion, setPaintVersion] = createSignal(0);
     const [estimatedDocumentHeight, setEstimatedDocumentHeight] = createSignal(0);
+    const [pageGeometry, setPageGeometry] = createSignal<{
+        tops: number[];
+        heights: number[];
+    }>({ tops: [], heights: [] });
     const [renderer] = createSignal(engine.renderer);
     const [sectionGeometry, setSectionGeometry] =
         createSignal<BridgeSectionGeometry | undefined>(undefined);
@@ -169,6 +181,9 @@ export function createEditorState(): EditorState {
                 setLastPaintMs(evt.paint_ms);
                 setPaintVersion(evt.version);
                 setEstimatedDocumentHeight(evt.estimated_document_height);
+                if (evt.page_tops.length > 0) {
+                    setPageGeometry({ tops: evt.page_tops, heights: evt.page_heights });
+                }
                 break;
             }
             default:
@@ -193,6 +208,7 @@ export function createEditorState(): EditorState {
         lastPaintMs,
         paintVersion,
         estimatedDocumentHeight,
+        pageGeometry,
         renderer,
         sectionGeometry,
         cellProperties,

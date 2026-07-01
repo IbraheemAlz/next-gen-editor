@@ -194,12 +194,17 @@ struct LazyLayoutInfo {
 /// command. Carries `estimated_document_height` + `is_full_layout` so
 /// the TS shell's scrollbar resizes against the virtual estimate, not
 /// just the laid-out tail.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct LastPaintDims {
     document_height: f32,
     page_count: u32,
     estimated_document_height: f32,
     is_full_layout: bool,
+    /// Issue #26 — per-page absolute tops + heights (device px),
+    /// re-broadcast on synthetic `Painted`s so overlays stay exact
+    /// between real paints.
+    page_tops: Vec<f32>,
+    page_heights: Vec<f32>,
 }
 
 /// A candidate caret position on a line — an absolute x (canvas device px)
@@ -489,12 +494,14 @@ impl Engine {
     /// multi-page documents grow + scroll instead of getting squashed
     /// vertically into a single A4 box.
     pub fn paint_dims(&self) -> Result<JsValue, JsValue> {
-        let dims = self.last_paint_dims;
+        let dims = self.last_paint_dims.clone();
         serde_wasm_bindgen::to_value(&PaintDimsOut {
             document_height: dims.document_height,
             page_count: dims.page_count,
             estimated_document_height: dims.estimated_document_height,
             is_full_layout: dims.is_full_layout,
+            page_tops: dims.page_tops,
+            page_heights: dims.page_heights,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -586,6 +593,9 @@ struct PaintDimsOut {
     /// body block, `false` while a viewport-cull budget is still
     /// holding back the tail.
     is_full_layout: bool,
+    /// Issue #26 — per-page absolute tops + heights in device px.
+    page_tops: Vec<f32>,
+    page_heights: Vec<f32>,
 }
 
 #[derive(::serde::Serialize)]
@@ -748,38 +758,55 @@ fn cell_tab_step(
         return caret.clone();
     };
     let n_rows = table.rows.len() as u32;
-    let n_cols = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0) as u32;
-    if n_rows == 0 || n_cols == 0 {
+    if n_rows == 0 || table.rows.iter().all(|r| r.cells.is_empty()) {
         return caret.clone();
     }
-    let (next_r, next_c) = if forward {
-        if c + 1 < n_cols {
-            (r, c + 1)
-        } else if r + 1 < n_rows {
-            (r + 1, 0)
-        } else {
-            /* Last cell + forward → append a fresh row and land on its
-            first cell (Word default). */
-            /* Append a row at the end: `at = n_rows` lands after the
-             * current last row under the post-hotfix signature. */
-            let new_doc = undo
-                .current()
-                .insert_row(bridge_to_engine_path(table_path.clone()), n_rows as usize);
-            undo.push(new_doc);
-            (n_rows, 0)
-        }
-    } else if c > 0 {
-        (r, c - 1)
-    } else if r > 0 {
-        let cols_at = undo
-            .current()
+    /* Row-aware traversal over CELL indices (merged rows carry fewer
+    cells than the table has grid columns), skipping vMerge-Continue
+    landing spots — Word tabs through visible cells only. */
+    let row_cols = |undo: &UndoStack, rr: u32| -> u32 {
+        undo.current()
             .table_at_path(&engine_table)
-            .and_then(|t| t.rows.get((r - 1) as usize))
+            .and_then(|t| t.rows.get(rr as usize))
             .map(|row| row.cells.len() as u32)
-            .unwrap_or(n_cols);
-        (r - 1, cols_at.saturating_sub(1))
-    } else {
-        return caret.clone();
+            .unwrap_or(0)
+    };
+    let is_continue = |undo: &UndoStack, rr: u32, cc: u32| -> bool {
+        undo.current()
+            .table_at_path(&engine_table)
+            .and_then(|t| t.rows.get(rr as usize))
+            .and_then(|row| row.cells.get(cc as usize))
+            .is_some_and(|cell| matches!(cell.props.v_merge, engine::VMergeRole::Continue))
+    };
+    let (mut rr, mut cc) = (r, c);
+    let (next_r, next_c) = loop {
+        if forward {
+            if cc + 1 < row_cols(undo, rr) {
+                cc += 1;
+            } else if rr + 1 < n_rows {
+                rr += 1;
+                cc = 0;
+            } else {
+                /* Last cell + forward → append a fresh row and land on
+                its first cell (Word default). `at = n_rows` lands after
+                the current last row under the post-hotfix signature. */
+                let new_doc = undo
+                    .current()
+                    .insert_row(bridge_to_engine_path(table_path.clone()), n_rows as usize);
+                undo.push(new_doc);
+                break (n_rows, 0);
+            }
+        } else if cc > 0 {
+            cc -= 1;
+        } else if rr > 0 {
+            rr -= 1;
+            cc = row_cols(undo, rr).saturating_sub(1);
+        } else {
+            return caret.clone();
+        }
+        if !is_continue(undo, rr, cc) {
+            break (rr, cc);
+        }
     };
     /* Address the first paragraph of the destination cell. */
     let mut steps = table_path.steps.clone();
@@ -3184,6 +3211,46 @@ fn cell_block_count(doc: &DocumentTree, cell_prefix: &EngineBlockPath) -> Option
     Some(cell.blocks.len())
 }
 
+/// `(start, end)` positions spanning the ENTIRE content of the cell the
+/// path descends into (first paragraph offset 0 → last paragraph byte
+/// length). `None` when the path is not inside a table cell. Shared by
+/// quadruple-click cell selection and Word's Tab-selects-cell semantics.
+fn cell_content_span(
+    doc: &DocumentTree,
+    path: &BridgeBlockPath,
+) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
+    if !matches!(path.steps.get(1), Some(BridgePathStep::Cell { .. })) {
+        return None;
+    }
+    let cell_prefix: Vec<BridgePathStep> = path.steps.iter().take(2).cloned().collect();
+    let engine_prefix = bridge_to_engine_path(BridgeBlockPath {
+        steps: cell_prefix.clone(),
+    });
+    let cell_blocks = cell_block_count(doc, &engine_prefix)?;
+    let last_block_idx = cell_blocks.saturating_sub(1) as u32;
+    let mut start_steps = cell_prefix.clone();
+    start_steps.push(BridgePathStep::Block { idx: 0 });
+    let mut end_steps = cell_prefix;
+    end_steps.push(BridgePathStep::Block {
+        idx: last_block_idx,
+    });
+    let end_path = BridgeBlockPath { steps: end_steps };
+    let end_engine = bridge_to_engine_path(end_path.clone());
+    let end_len = doc
+        .paragraph_at_path(&end_engine)
+        .map_or(0, |p| p.text.len() as u32);
+    Some((
+        BridgeLogicalPos {
+            path: BridgeBlockPath { steps: start_steps },
+            offset: 0,
+        },
+        BridgeLogicalPos {
+            path: end_path,
+            offset: end_len,
+        },
+    ))
+}
+
 fn doc_paragraph_paths(doc: &DocumentTree) -> Vec<EngineBlockPath> {
     let mut out: Vec<EngineBlockPath> = Vec::new();
     let mut prefix: Vec<EnginePathStep> = Vec::new();
@@ -4811,6 +4878,17 @@ impl Engine {
         } else {
             document_height + (info.remaining_blocks as f32) * AVG_BLOCK_HEIGHT_PT * scale
         };
+        /* Issue #26 — accumulate the exact per-page top offsets the
+        geometry walk uses, so overlays and pointer math stop deriving
+        them from uniform-A4 constants. */
+        let mut page_tops = Vec::with_capacity(pages.len());
+        let mut page_heights = Vec::with_capacity(pages.len());
+        let mut top_acc = 0.0f32;
+        for page in &pages {
+            page_tops.push(top_acc);
+            page_heights.push(page.size.height);
+            top_acc += page.size.height + gap;
+        }
         let stats = RenderStats {
             page_width,
             page_height,
@@ -4820,6 +4898,8 @@ impl Engine {
             is_full_layout: info.is_full_layout,
             estimated_document_height,
             page_count: pages.len() as u32,
+            page_tops,
+            page_heights,
         };
 
         /* Vello path: encode the whole display list and present it over
@@ -4843,6 +4923,8 @@ impl Engine {
                 page_count: stats.page_count,
                 estimated_document_height: stats.estimated_document_height,
                 is_full_layout: stats.is_full_layout,
+                page_tops: stats.page_tops.clone(),
+                page_heights: stats.page_heights.clone(),
             };
             return Ok(stats);
         }
@@ -4895,6 +4977,8 @@ impl Engine {
             page_count: stats.page_count,
             estimated_document_height: stats.estimated_document_height,
             is_full_layout: stats.is_full_layout,
+            page_tops: stats.page_tops.clone(),
+            page_heights: stats.page_heights.clone(),
         };
         Ok(stats)
     }
@@ -4978,7 +5062,7 @@ impl Engine {
         if bottom_pt > self.lazy_layout.min_target_y {
             self.lazy_layout.min_target_y = bottom_pt;
         }
-        let dims = self.last_paint_dims;
+        let dims = self.last_paint_dims.clone();
         Event::Painted {
             dirty: BridgeRect {
                 x: 0.0,
@@ -4992,6 +5076,8 @@ impl Engine {
             page_count: dims.page_count,
             is_full_layout: dims.is_full_layout,
             estimated_document_height: dims.estimated_document_height,
+            page_tops: dims.page_tops,
+            page_heights: dims.page_heights,
         }
     }
 
@@ -5045,6 +5131,8 @@ impl Engine {
             page_count: stats.page_count,
             is_full_layout: stats.is_full_layout,
             estimated_document_height: stats.estimated_document_height,
+            page_tops: stats.page_tops,
+            page_heights: stats.page_heights,
         }
     }
 
@@ -5292,39 +5380,15 @@ impl Engine {
             return self.do_select_all();
         }
         /* Cell address = first two steps of the hit's path
-        (`Block(t_idx)` + `Cell{r,c}`). Build start / end paths by
-        appending `Block(0)` for the first cell-paragraph and
-        `Block(last_idx)` for the last. */
-        let cell_prefix: Vec<BridgePathStep> = hit.path.steps.iter().take(2).cloned().collect();
-        let doc = self.undo.current();
-        /* Resolve the cell's block list to know how many paragraphs
-        live inside it. */
-        let engine_prefix = bridge_to_engine_path(BridgeBlockPath {
-            steps: cell_prefix.clone(),
-        });
-        let cell_blocks = cell_block_count(doc, &engine_prefix).unwrap_or(1);
-        let last_block_idx = cell_blocks.saturating_sub(1) as u32;
-        let mut start_steps = cell_prefix.clone();
-        start_steps.push(BridgePathStep::Block { idx: 0 });
-        let mut end_steps = cell_prefix;
-        end_steps.push(BridgePathStep::Block {
-            idx: last_block_idx,
-        });
-        let end_path = BridgeBlockPath { steps: end_steps };
-        let end_engine = bridge_to_engine_path(end_path.clone());
-        let end_len = doc
-            .paragraph_at_path(&end_engine)
-            .map_or(0, |p| p.text.len() as u32);
+        (`Block(t_idx)` + `Cell{r,c}`); `cell_content_span` builds the
+        first-paragraph → last-paragraph span. */
+        let Some((start, end)) = cell_content_span(self.undo.current(), &hit.path) else {
+            return self.do_select_all();
+        };
         self.pending_format = None;
         self.selection = Some(SelectionState {
-            anchor: BridgeLogicalPos {
-                path: BridgeBlockPath { steps: start_steps },
-                offset: 0,
-            },
-            caret: BridgeLogicalPos {
-                path: end_path,
-                offset: end_len,
-            },
+            anchor: start,
+            caret: end,
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
@@ -5620,6 +5684,28 @@ impl Engine {
             }
         };
         let new_caret = clamp_pos(self.undo.current(), new_caret);
+        /* Word parity — Tab/Shift+Tab don't just move the caret: they
+        select the destination cell's ENTIRE content (which collapses
+        naturally in a freshly-appended empty row). No-op steps
+        (outside a table, Shift+Tab in the first cell) keep plain
+        caret semantics. Read the doc fresh — `cell_tab_step` may have
+        just appended a row. */
+        if matches!(direction, MoveDirection::NextCell | MoveDirection::PrevCell)
+            && !extend
+            && new_caret != sel.caret
+            && let Some((start, end)) = cell_content_span(self.undo.current(), &new_caret.path)
+        {
+            self.pending_format = None;
+            self.caret_affinity = new_affinity;
+            let kind = derive_selection_kind(&start, &end);
+            self.selection = Some(SelectionState {
+                anchor: start,
+                caret: end,
+                ideal_x: None,
+                kind,
+            });
+            return self.selection_changed();
+        }
         self.pending_format = None;
         let anchor = if extend {
             sel.anchor.clone()
@@ -7530,6 +7616,9 @@ struct RenderStats {
     /// reads this, so it always shrinks (never grows) as background
     /// completion fills in.
     estimated_document_height: f32,
+    /// Issue #26 — absolute per-page tops + heights in device px.
+    page_tops: Vec<f32>,
+    page_heights: Vec<f32>,
 }
 
 #[cfg(test)]
@@ -7700,6 +7789,100 @@ mod tests {
             panic!("expected Cell step");
         };
         assert_eq!(col, 2, "click in C3 must land in column 2, not 0");
+    }
+
+    /// Tables epic — Tab traversal is row-aware over cell indices,
+    /// skips vMerge continuations, and appends a fresh full-width row
+    /// from the last cell (Word parity).
+    #[test]
+    fn tab_walks_cells_skips_continuations_and_appends_row() {
+        let cell_pos = |r: u32, c: u32| BridgeLogicalPos {
+            path: BridgeBlockPath {
+                steps: vec![
+                    BridgePathStep::Block { idx: 1 },
+                    BridgePathStep::Cell { row: r, col: c },
+                    BridgePathStep::Block { idx: 0 },
+                ],
+            },
+            offset: 0,
+        };
+        let cell_of_pos = |p: &BridgeLogicalPos| match p.path.steps[1] {
+            BridgePathStep::Cell { row, col } => (row, col),
+            _ => panic!("expected cell step"),
+        };
+        /* 2×2 with column 0 vertically merged: row-1 cell-0 is Continue. */
+        let doc = engine::DocumentTree::from_text("hi")
+            .insert_table(EngineBlockPath::top(1), 2, 2)
+            .merge_cells(EngineBlockPath::top(1), 0, 0, 1, 0);
+        let mut undo = UndoStack::new(doc, 16);
+        let s1 = cell_tab_step(&mut undo, &cell_pos(0, 0), true);
+        assert_eq!(cell_of_pos(&s1), (0, 1));
+        /* Forward wrap to row 1 — cell 0 is a Continue, skip to (1,1). */
+        let s2 = cell_tab_step(&mut undo, &s1, true);
+        assert_eq!(cell_of_pos(&s2), (1, 1));
+        /* Last cell + forward appends a full-width row, lands on (2,0). */
+        let s3 = cell_tab_step(&mut undo, &s2, true);
+        assert_eq!(cell_of_pos(&s3), (2, 0));
+        let t = undo.current().blocks[1].as_table().unwrap();
+        assert_eq!(t.rows.len(), 3, "Tab in the last cell appends a row");
+        assert_eq!(t.rows[2].cells.len(), 2, "appended row is full grid width");
+        /* Backward from (1,1) skips the Continue at (1,0) → (0,1). */
+        let b = cell_tab_step(&mut undo, &s2, false);
+        assert_eq!(cell_of_pos(&b), (0, 1));
+        /* Backward from the very first cell is a no-op. */
+        let stay = cell_tab_step(&mut undo, &cell_pos(0, 0), false);
+        assert_eq!(cell_of_pos(&stay), (0, 0));
+    }
+
+    /// Tables epic — `cell_content_span` spans first → last paragraph
+    /// of the addressed cell; `None` outside tables.
+    #[test]
+    fn cell_content_span_covers_cell_and_rejects_body() {
+        let doc = engine::DocumentTree::from_text("hi").insert_table(EngineBlockPath::top(1), 1, 1);
+        let path = BridgeBlockPath {
+            steps: vec![
+                BridgePathStep::Block { idx: 1 },
+                BridgePathStep::Cell { row: 0, col: 0 },
+                BridgePathStep::Block { idx: 0 },
+            ],
+        };
+        let (start, end) = cell_content_span(&doc, &path).expect("span");
+        assert_eq!(start.offset, 0);
+        assert_eq!(end.offset, 0, "default cell holds one empty paragraph");
+        assert_eq!(start.path.steps.len(), 3);
+        assert!(cell_content_span(&doc, &BridgeBlockPath::top(0)).is_none());
+    }
+
+    /// Tables epic — anchor and caret in different cells of the same
+    /// table promote the selection to a TABLE_CELLS rectangle.
+    #[test]
+    fn cross_cell_endpoints_promote_to_table_cells() {
+        let pos = |r: u32, c: u32| BridgeLogicalPos {
+            path: BridgeBlockPath {
+                steps: vec![
+                    BridgePathStep::Block { idx: 1 },
+                    BridgePathStep::Cell { row: r, col: c },
+                    BridgePathStep::Block { idx: 0 },
+                ],
+            },
+            offset: 0,
+        };
+        match derive_selection_kind(&pos(0, 0), &pos(1, 1)) {
+            SelectionKind::TableCells {
+                from_row,
+                from_col,
+                to_row,
+                to_col,
+                ..
+            } => {
+                assert_eq!((from_row, from_col, to_row, to_col), (0, 0, 1, 1));
+            }
+            SelectionKind::Linear => panic!("cross-cell endpoints must promote"),
+        }
+        assert!(matches!(
+            derive_selection_kind(&pos(0, 0), &pos(0, 0)),
+            SelectionKind::Linear
+        ));
     }
 
     /// Backlog #2 — a synthetic glyph (an injected Kashida Tatweel) advances

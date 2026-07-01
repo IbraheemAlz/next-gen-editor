@@ -300,6 +300,77 @@ async function handleInit(msg: InitMsg): Promise<void> {
             break;
         }
 
+        case 'table-merges': {
+            /* Tables epic — a 3×3 grid with a 2×2 rectangular merge
+               (gridSpan + vMerge in Word's collapsed shape) plus text in
+               the merged cell, a neighbour, and a below-merge cell, so
+               the golden pins span widths, continuation-row skipping,
+               and border/edge alignment around merges. */
+            const cellPos = (r: number, c: number) => ({
+                path: {
+                    steps: [
+                        { kind: 'BLOCK', idx: 1 },
+                        { kind: 'CELL', row: r, col: c },
+                        { kind: 'BLOCK', idx: 0 },
+                    ],
+                },
+                offset: 0,
+            });
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'Merged tables',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 18,
+                line_height: 26,
+                align: 'START',
+            } as Command);
+            await dispatch({
+                type: 'INSERT_TABLE',
+                at: { steps: [{ kind: 'BLOCK', idx: 1 }] },
+                rows: 3,
+                cols: 3,
+            } as Command);
+            await dispatch({
+                type: 'MERGE_CELLS',
+                table_path: { steps: [{ kind: 'BLOCK', idx: 1 }] },
+                from_row: 0,
+                from_col: 0,
+                to_row: 1,
+                to_col: 1,
+            } as Command);
+            /* The engine owns the selection: after the first insert the
+               live caret wins over the `at` hint, so each cell hop needs
+               an explicit SET_SELECTION (the invariant the interactive
+               shell relies on — CLAUDE.md Phase 4). */
+            const selectCell = async (r: number, c: number) => {
+                await dispatch({
+                    type: 'SET_SELECTION',
+                    range: { start: cellPos(r, c), end: cellPos(r, c) },
+                    caret: cellPos(r, c),
+                } as Command);
+            };
+            await selectCell(0, 0);
+            await dispatch({
+                type: 'INSERT_TEXT',
+                at: cellPos(0, 0),
+                text: 'merged 2×2',
+            } as Command);
+            await selectCell(0, 1);
+            await dispatch({
+                type: 'INSERT_TEXT',
+                at: cellPos(0, 1),
+                text: 'C3',
+            } as Command);
+            await selectCell(2, 1);
+            paintEvt = await dispatch({
+                type: 'INSERT_TEXT',
+                at: cellPos(2, 1),
+                text: 'below',
+            } as Command);
+            break;
+        }
+
         case 'rich-text': {
             /* Rich text: a plain RenderPage, then ApplyFormatting spans of
                colour + size over mixed Arabic/English. The 44px size span
@@ -737,6 +808,8 @@ function broadcastPaintDims(): void {
             page_count: number;
             estimated_document_height: number;
             is_full_layout: boolean;
+            page_tops: number[];
+            page_heights: number[];
         };
         self.postMessage({
             evt: {
@@ -748,6 +821,8 @@ function broadcastPaintDims(): void {
                 page_count: dims.page_count,
                 is_full_layout: dims.is_full_layout,
                 estimated_document_height: dims.estimated_document_height,
+                page_tops: dims.page_tops,
+                page_heights: dims.page_heights,
             },
         });
     } catch (e: unknown) {

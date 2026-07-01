@@ -4419,11 +4419,14 @@ impl DocumentTree {
     /// performs no signed arithmetic of its own.
     pub fn insert_row(&self, table_path: BlockPath, at: usize) -> Self {
         self.mutate_table(table_path, |t| {
-            let cols = t
-                .rows
-                .first()
-                .map(|r| r.cells.len())
-                .unwrap_or_else(|| t.grid.len().max(1));
+            /* Prefer the grid width: a merged first row has FEWER cells
+            than the table has logical columns, and a fresh row must
+            always come in unmerged at full width (Word behaviour). */
+            let cols = if t.grid.is_empty() {
+                t.rows.first().map(|r| r.cells.len()).unwrap_or(1)
+            } else {
+                t.grid.len()
+            };
             let new_row = TableRow {
                 props: RowProperties::default(),
                 cells: (0..cols).map(|_| default_table_cell()).collect(),
@@ -4529,28 +4532,81 @@ impl DocumentTree {
                     }
                 }
             }
-            /* Vertical: every cell in the column range on rows r0+1..=r1
-            becomes `Continue`. We don't shift cells; the rendering layer
-            already skips `Continue` cells. */
+            /* Vertical: rows r0+1..=r1 collapse to Word's on-disk shape —
+            ONE cell per continuation row spanning the merged columns
+            (`gridSpan = span`, `vMerge` continue), horizontal partners
+            physically removed exactly like the top row. Anything else
+            double-counts grid columns in the layout cursor walk and
+            diverges from what the .docx reader produces for the same
+            merge authored in Word. */
             for r in (r0 + 1)..=r1.min(rcount - 1) {
                 let row = &mut t.rows[r as usize];
-                for c in c0..=c1.min(row.cells.len() as u32 - 1) {
-                    if let Some(cell) = row.cells.get_mut(c as usize) {
-                        cell.props.v_merge = VMergeRole::Continue;
-                        cell.props.grid_span = span.max(1);
+                if (c0 as usize) >= row.cells.len() {
+                    continue;
+                }
+                row.cells[c0 as usize].props.v_merge = VMergeRole::Continue;
+                row.cells[c0 as usize].props.grid_span = span.max(1);
+                let drop_count = (c1.min(row.cells.len() as u32 - 1) - c0) as usize;
+                for _ in 0..drop_count {
+                    if (c0 as usize + 1) < row.cells.len() {
+                        row.cells.remove(c0 as usize + 1);
                     }
                 }
             }
         })
     }
 
+    /// Inverse of [`merge_cells`]: reset the owner's spans and physically
+    /// restore the horizontally-merged-away partner cells (fresh default
+    /// cells — Word keeps the merged content in the first cell), then walk
+    /// the vertical continuation run below the owner and restore each of
+    /// those rows the same way. Continuation cells are matched by their
+    /// starting *grid column* (cursor walk over per-row `grid_span`s), not
+    /// by cell index — preceding cells in a row may themselves span.
     pub fn split_cell(&self, table_path: BlockPath, row: u32, col: u32) -> Self {
+        fn restore_row(row: &mut TableRow, idx: usize, span: usize) {
+            row.cells[idx].props.grid_span = 1;
+            row.cells[idx].props.v_merge = VMergeRole::None;
+            for k in 0..span.saturating_sub(1) {
+                row.cells.insert(idx + 1 + k, default_table_cell());
+            }
+        }
+        /* Cell index in `row` whose starting grid column == `grid_col`. */
+        fn cell_at_grid_col(row: &TableRow, grid_col: usize) -> Option<usize> {
+            let mut cursor = 0usize;
+            for (i, c) in row.cells.iter().enumerate() {
+                match cursor.cmp(&grid_col) {
+                    std::cmp::Ordering::Equal => return Some(i),
+                    std::cmp::Ordering::Greater => return None,
+                    std::cmp::Ordering::Less => cursor += c.props.grid_span.max(1) as usize,
+                }
+            }
+            None
+        }
         self.mutate_table(table_path, |t| {
-            if let Some(r) = t.rows.get_mut(row as usize)
-                && let Some(cell) = r.cells.get_mut(col as usize)
-            {
-                cell.props.grid_span = 1;
-                cell.props.v_merge = VMergeRole::None;
+            let Some(owner_row) = t.rows.get(row as usize) else {
+                return;
+            };
+            let Some(owner) = owner_row.cells.get(col as usize) else {
+                return;
+            };
+            let span = owner.props.grid_span.max(1) as usize;
+            let was_restart = matches!(owner.props.v_merge, VMergeRole::Restart);
+            let owner_grid_col: usize = owner_row.cells[..col as usize]
+                .iter()
+                .map(|c| c.props.grid_span.max(1) as usize)
+                .sum();
+            restore_row(&mut t.rows[row as usize], col as usize, span);
+            if was_restart {
+                for r in (row as usize + 1)..t.rows.len() {
+                    let Some(i) = cell_at_grid_col(&t.rows[r], owner_grid_col) else {
+                        break;
+                    };
+                    if !matches!(t.rows[r].cells[i].props.v_merge, VMergeRole::Continue) {
+                        break;
+                    }
+                    restore_row(&mut t.rows[r], i, span);
+                }
             }
         })
     }
@@ -7012,6 +7068,73 @@ mod tests {
         assert_eq!(t.rows[0].cells[0].props.v_merge, VMergeRole::Restart);
         assert_eq!(t.rows[1].cells[0].props.v_merge, VMergeRole::Continue);
         assert_eq!(t.rows[2].cells[0].props.v_merge, VMergeRole::Continue);
+    }
+
+    /// A rectangular merge must produce Word's on-disk shape: every
+    /// member row collapses to ONE spanning cell (partners physically
+    /// removed), so per-row grid-column accounting stays exact for
+    /// cells to the right of the merge.
+    #[test]
+    fn merge_cells_rectangular_collapses_continuation_rows() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 3, 3);
+        let d = d.merge_cells(BlockPath::top(1), 0, 0, 1, 1);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells.len(), 2, "top row collapses 3 → 2 cells");
+        assert_eq!(t.rows[0].cells[0].props.grid_span, 2);
+        assert_eq!(t.rows[0].cells[0].props.v_merge, VMergeRole::Restart);
+        assert_eq!(t.rows[0].cells[1].props.grid_span.max(1), 1);
+        assert_eq!(
+            t.rows[1].cells.len(),
+            2,
+            "continuation row collapses 3 → 2 cells"
+        );
+        assert_eq!(t.rows[1].cells[0].props.grid_span, 2);
+        assert_eq!(t.rows[1].cells[0].props.v_merge, VMergeRole::Continue);
+        assert_eq!(
+            t.rows[1].cells[1].props.v_merge,
+            VMergeRole::None,
+            "cell right of the merge is untouched"
+        );
+        assert_eq!(t.rows[2].cells.len(), 3, "row below the merge untouched");
+    }
+
+    /// `split_cell` is the true inverse of `merge_cells`: it restores
+    /// the horizontally-removed partners in the owner row AND in every
+    /// vertical continuation row, matched by starting grid column.
+    #[test]
+    fn split_cell_restores_merged_partners() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 3, 3);
+        let d = d.merge_cells(BlockPath::top(1), 0, 0, 1, 1);
+        let d = d.split_cell(BlockPath::top(1), 0, 0);
+        let t = d.blocks[1].as_table().unwrap();
+        for (r, row) in t.rows.iter().enumerate() {
+            assert_eq!(row.cells.len(), 3, "row {r} must be back to 3 cells");
+            for (c, cell) in row.cells.iter().enumerate() {
+                assert_eq!(cell.props.grid_span.max(1), 1, "cell {r},{c} span reset");
+                assert_eq!(
+                    cell.props.v_merge,
+                    VMergeRole::None,
+                    "cell {r},{c} vMerge cleared"
+                );
+            }
+        }
+    }
+
+    /// Horizontal-only merge + split round-trips the row shape.
+    #[test]
+    fn split_cell_restores_horizontal_only_merge() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 1, 3);
+        let d = d.merge_cells(BlockPath::top(1), 0, 0, 0, 2);
+        assert_eq!(d.blocks[1].as_table().unwrap().rows[0].cells.len(), 1);
+        let d = d.split_cell(BlockPath::top(1), 0, 0);
+        let t = d.blocks[1].as_table().unwrap();
+        assert_eq!(t.rows[0].cells.len(), 3);
+        assert!(
+            t.rows[0]
+                .cells
+                .iter()
+                .all(|c| c.props.grid_span.max(1) == 1 && c.props.v_merge == VMergeRole::None)
+        );
     }
 
     #[test]
