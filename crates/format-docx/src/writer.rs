@@ -284,7 +284,7 @@ fn jc_val(a: Alignment) -> &'static str {
 /// Emit `<w:pPr>` for `props`, or nothing when it is the default — a default
 /// `ParaProperties` must produce an empty pPr to keep the Phase 1 plain
 /// fixtures byte-stable. Children follow the CT_PPr schema order: keepNext,
-/// keepLines, pageBreakBefore, spacing, ind, jc, bidi.
+/// keepLines, pageBreakBefore, spacing, shd, ind, jc, bidi.
 ///
 /// Sprint 12 (#11) — `style_id` is `Some` when the paragraph references a
 /// `<w:style>` entry. Emitted as the FIRST `<w:pPr>` child per OOXML
@@ -377,6 +377,14 @@ fn emit_ppr(
             out.push_str(&format!(" w:line=\"{line}\" w:lineRule=\"{rule}\""));
         }
         out.push_str("/>");
+    }
+    /* Paragraph shading mirrors the rPr / tcPr `<w:shd>` emitters: the
+    arbitrary RGB rides `w:fill` with a `clear` pattern; alpha has no
+    OOXML slot. */
+    if let Some([r, g, b, _]) = props.shading {
+        out.push_str(&format!(
+            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
+        ));
     }
     let ind = &props.indent;
     if ind.start_twips != 0
@@ -2583,7 +2591,7 @@ mod tests {
             borders: None,
             tab_stops: Vec::new(),
             list_item: None,
-            shading: None,
+            shading: Some([0x33, 0x66, 0x99, 0xFF]),
         };
         let para = Paragraph {
             text: "hello world".into(),
@@ -2604,6 +2612,40 @@ mod tests {
         let bytes = build_minimal_docx(&doc).expect("build");
         let parsed = read_docx(&bytes).expect("read");
         assert_eq!(parsed.document.nth_paragraph(0).unwrap().props, props);
+    }
+
+    #[test]
+    fn round_trip_paragraph_shading() {
+        let para = Paragraph {
+            text: "shaded".into(),
+            spans: Vec::new(),
+            props: ParaProperties {
+                shading: Some([0xA5, 0xD6, 0xA7, 0xFF]),
+                ..Default::default()
+            },
+            list_item: None,
+            resolved_marker: None,
+            dirty: false,
+            source_xml: None,
+            inline_objects: Vec::new(),
+            hyperlinks: Vec::new(),
+            revisions: Vec::new(),
+            fields: Vec::new(),
+            style_id: None,
+            direct_overrides: engine::ParaProperties::default(),
+        };
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let xml = build_document_xml(&doc);
+        assert!(
+            xml.contains("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"A5D6A7\"/>"),
+            "pPr must carry the shading fill; xml={xml}"
+        );
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("read");
+        assert_eq!(
+            parsed.document.nth_paragraph(0).unwrap().props.shading,
+            Some([0xA5, 0xD6, 0xA7, 0xFF])
+        );
     }
 
     #[test]
@@ -2629,6 +2671,7 @@ mod tests {
                 keep_next: true,
                 keep_lines: true,
                 page_break_before: true,
+                shading: Some([0xFF, 0xEE, 0xDD, 0xFF]),
                 ..Default::default()
             },
             list_item: None,
@@ -2649,6 +2692,7 @@ mod tests {
             "<w:keepLines/>",
             "<w:pageBreakBefore/>",
             "<w:spacing",
+            "<w:shd",
             "<w:ind",
             "<w:jc",
             "<w:bidi",

@@ -3,12 +3,13 @@
 //! Folds one `<w:pPr>` child element into an accumulating `ParaProperties`.
 //! Phase 2 covers `<w:jc>`, `<w:ind>`, `<w:spacing>`, `<w:bidi>`,
 //! `<w:keepNext>`, `<w:keepLines>`, `<w:pageBreakBefore>`. Later phases
-//! grow the surface: `<w:pStyle>` (Phase 3), `<w:numPr>` (Phase 4),
-//! `<w:pBdr>` / `<w:shd>` / `<w:tabs>` (later).
+//! grew the surface: `<w:pStyle>` (Phase 3), `<w:numPr>` (Phase 4),
+//! `<w:shd>` (fill → `shading`); `<w:pBdr>` / `<w:tabs>` fold in
+//! `parts::document`.
 //!
 //! Twip values land in the engine model verbatim; layout converts to px.
 
-use crate::schema::ct_rpr::{attr_val, toggle_on};
+use crate::schema::ct_rpr::{attr_val, parse_hex_color, toggle_on};
 use engine::{Alignment, Indent, LineHeight, ParaProperties, Spacing, TextDirection};
 use quick_xml::events::BytesStart;
 
@@ -92,6 +93,11 @@ pub fn apply_ppr(name: &[u8], e: &BytesStart, props: &mut ParaProperties) {
             } else {
                 TextDirection::Ltr
             });
+        }
+        b"w:shd" => {
+            /* `w:fill="auto"` / malformed hex → `None` (shading cleared),
+            matching the cell `<w:tcPr><w:shd>` path. */
+            props.shading = attr_val(e, b"w:fill").and_then(|v| parse_hex_color(&v));
         }
         b"w:keepNext" => props.keep_next = toggle_on(e),
         b"w:keepLines" => props.keep_lines = toggle_on(e),
@@ -187,6 +193,19 @@ mod tests {
     fn bidi_explicit_off() {
         let p = parse_ppr(br#"<w:pPr><w:bidi w:val="false"/></w:pPr>"#);
         assert_eq!(p.direction, Some(TextDirection::Ltr));
+    }
+
+    #[test]
+    fn shd_fill_parses_into_shading() {
+        let p =
+            parse_ppr(br#"<w:pPr><w:shd w:val="clear" w:color="auto" w:fill="A5D6A7"/></w:pPr>"#);
+        assert_eq!(p.shading, Some([0xA5, 0xD6, 0xA7, 255]));
+    }
+
+    #[test]
+    fn shd_fill_auto_clears_shading() {
+        let p = parse_ppr(br#"<w:pPr><w:shd w:val="clear" w:fill="auto"/></w:pPr>"#);
+        assert_eq!(p.shading, None);
     }
 
     #[test]
