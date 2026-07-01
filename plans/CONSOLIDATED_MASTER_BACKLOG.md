@@ -1,11 +1,15 @@
 # Consolidated Master Backlog
 
+> **DEPRECATED (2026-07-02).** This snapshot is historical context only.
+> The authoritative deferred-scope list is [`BACKLOG.md`](BACKLOG.md);
+> actionable gaps are tracked as GitHub Issues (labels `core-engine` /
+> `ui` / `enhancement` / `tech-debt`). Do not add new items here.
+
 **Generated:** 2026-05-25 (post Phase 5.5).
-**Supersedes (as the active source of truth):** `BACKLOG.md`,
-`UX_BEHAVIOR_SPEC.md`, `ECMA_376_COMPLIANCE_AUDIT.md`,
-`DEFERRED_FEATURES_TRACKER.md`, `MASTER_PLAN.md` §10 Open decisions.
-Those files stay as historical context; this file is the single
-prioritized worklist.
+**Superseded at generation time (as the then-active source of truth):**
+`BACKLOG.md`, `UX_BEHAVIOR_SPEC.md`, `ECMA_376_COMPLIANCE_AUDIT.md`,
+`DEFERRED_FEATURES_TRACKER.md`, `MASTER_PLAN.md` §10 Open decisions —
+an authority arrangement reverted by the 2026-07 audit (see banner).
 
 **Convention.** Severity follows the audit's production-impact rubric:
 `High` = breaks rendering or destroys user data, `Medium` = visible drift

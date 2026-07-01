@@ -1,8 +1,8 @@
 # UI_SURFACE_MAPPING.md — Engine ↔ UI Coverage Audit
 
-> **Status:** Engine is feature-complete through Consolidated Sprints 1–8 and Phase-5 Backlog Sprints 1–12 (`v0.5.0-beta.3`). The TypeScript shell exposes **~48 of 57** bridge commands; many high-value engine capabilities have **zero** discoverable UI affordance, blocking manual QA. This document inventories every engine feature, the bridge surface that drives it, the UI component required to exercise it manually, and the current QA status.
+> **Status:** Engine is feature-complete through Consolidated Sprints 1–8, Phase-5 Backlog Sprints 1–12, and the UI Edition sprints (`v0.6.0-beta.2` lineage). The original audit's "many high-value engine capabilities have zero discoverable UI affordance" verdict is resolved: the Sprints 1–8 (UI Edition) shelf wave landed the `packages/ui/` components (see the 2026-07-02 appendix note), leaving only genuinely engine-less rows blocked. This document inventories every engine feature, the bridge surface that drives it, the UI component required to exercise it manually, and the current QA status.
 >
-> **Authoritative sources:** `crates/bridge/src/{command,event,common,telemetry}.rs`, `crates/engine-wasm/src/lib.rs`, `ts/src/components/`, `ts/src/input/`, `BACKLOG.md`, and the git history for Sprints 1–8.
+> **Authoritative sources:** `crates/bridge/src/{command,event,common,telemetry}.rs`, `crates/engine-wasm/src/lib.rs`, `packages/ui/src/`, `packages/core/src/`, `ts/src/components/`, `ts/src/input/`, `BACKLOG.md`, and the git history for Sprints 1–8.
 >
 > **Legend — QA Status:**
 > - ✅ **Wired** — UI affordance exists; manual QA possible end-to-end.
@@ -44,10 +44,10 @@
 | **Bold** | `Command::ApplyFormatting { patch.bold }` | Toolbar Bold button + `Ctrl/Cmd+B` shortcut | ✅ Wired (`Toolbar.tsx:152`) |
 | **Italic** | `Command::ApplyFormatting { patch.italic }` | Toolbar Italic button + `Ctrl/Cmd+I` shortcut | ✅ Wired (`Toolbar.tsx:152`) |
 | **Underline (single)** | `Command::ApplyFormatting { patch.underline: Single }` | Toolbar Underline button + `Ctrl/Cmd+U` shortcut | ✅ Wired |
-| **Underline (Double / Dotted / Dashed / Wavy)** | `Command::ApplyFormatting` w/ `UnderlineStyle::{Double,Dotted,Dashed,Wavy}` | Toolbar Underline **dropdown** (chevron beside U) → style picker | 🛑 Blocked — only `Single` exposed; engine enum supports five styles (`common.rs:174`) |
+| **Underline (Double / Dotted / Dashed / Wavy)** | `Command::ApplyFormatting` w/ `UnderlineStyle::{Double,Dotted,Dashed,Wavy}` | Toolbar Underline **dropdown** (chevron beside U) → style picker | ✅ Wired (Sprints 1–8 UI Edition) — `UnderlineStyleDropdown.tsx` |
 | **Strikethrough** | `Command::ApplyFormatting { patch.strike }` | Toolbar Strikethrough button + `Alt+Shift+5` | ✅ Wired |
-| **Superscript / Subscript** | `Command::ApplyFormatting` w/ `VerticalScript::{Superscript,Subscript}` | Toolbar `X²` / `X₂` buttons + `Ctrl+Shift+=` / `Ctrl+=` shortcuts | 🛑 Blocked — engine ships render (Sprint 1/5), no UI; `TextAttrsPatch` needs `vertical_script` field added or routed via existing patch shape |
-| **All-Caps / Small-Caps transform** | Engine renders caps from `SpanStyle` flag (Sprint 1) | Toolbar `Aa` toggle + dropdown (All / Small) | 🛑 Blocked — render path lives; no patch field on `TextAttrsPatch` (`command.rs:434`) — needs bridge extension |
+| **Superscript / Subscript** | `Command::ApplyFormatting` w/ `VerticalScript::{Superscript,Subscript}` | Toolbar `X²` / `X₂` buttons + `Ctrl+Shift+=` / `Ctrl+=` shortcuts | ✅ Wired (Sprints 1–8 UI Edition) — `SuperSubButtons.tsx` via `cmd.setVerticalScript` |
+| **All-Caps / Small-Caps transform** | `Command::ApplyFormatting { patch.caps / patch.small_caps }` | Toolbar `Aa` toggle + dropdown (All / Small) | ✅ Wired — `CapsButtons.tsx`; `TextAttrsPatch` grew `caps` + `small_caps` fields (`command.rs:665`) |
 | **Font family (per-run)** | `Command::ApplyFormatting { patch.font_family }` | Toolbar Font Family picker (combobox over loaded faces) | ✅ Wired (FontFamilyPicker, Sprint 6) |
 | **Font size (pt)** | `Command::ApplyFormatting { patch.font_size }` | Toolbar Font Size combobox (8–72 pt + free input) | ✅ Wired |
 | **Foreground colour** | `Command::ApplyFormatting { patch.color }` | Toolbar Colour swatch + colour-picker popover | ✅ Wired |
@@ -68,7 +68,7 @@
 | **Auto-direction (first-strong, UAX-#9 P2/P3)** | Engine auto-detects on insert (Sprint 5) | Dev HUD indicator showing detected direction; no user control | 🕳 Latent |
 | **Paragraph borders** (`<w:pPr><w:pBdr>`) | Rendered from style; no `Command::SetParagraphBorders` yet | Toolbar Borders dropdown (Top/Bottom/Left/Right/All/None + style/colour/width) | 🛑 Blocked — render shipped Sprint 5; no edit command on bridge |
 | **Paragraph shading / background** | No `Command::SetParagraphShading` yet | Toolbar Paragraph background swatch | 🛑 Blocked — engine has no command |
-| **Indentation** (Left / Right / FirstLine / Hanging) | No `Command::SetParagraphIndent` yet | Toolbar Indent +/− buttons + ruler drag handles | 🛑 Blocked — model preserves on round-trip; no command |
+| **Indentation** (Left / Right / FirstLine / Hanging) | `Command::SetParagraphIndent` (Sprint 11) | Toolbar Indent +/− buttons + ruler drag handles | ✅ Wired (Sprint 11) — `Ruler.tsx` drag handles (§4); toolbar +/− buttons still absent |
 | **Line height** (single / 1.5 / double / custom multiple / exact pt) | Engine renders from style cascade (Sprint 5) | Toolbar Line-spacing dropdown | 🛑 Blocked — no command |
 | **Space before / after paragraph** | Engine renders from style | Paragraph properties dialog (right rail) | 🛑 Blocked |
 | **Keep with next / Keep together / Page break before** | `cantSplit` plumbed Sprint 6; no `keepNext` command yet | Paragraph properties dialog | 🛑 Blocked |
@@ -94,8 +94,8 @@
 
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
-| **Tab character round-trip** | Sprint 1 preserved `\t` in model | None — typing `Tab` inserts via `beforeinput` | ⚠️ Partial — `Tab` key currently navigates table cells only; outside tables it should insert `\t` |
-| **Geometric tab stops** (Left / Center / Right / Decimal / Clear) | `Command::SetTabStops` + `Event::SelectionChanged.tab_stops` (Sprint 11) | `Ruler.tsx` — L/C/R/D markers, click cycles kind, drag moves, drag-off removes | ✅ Wired (Sprint 11) — authoring works; render of Center/Right/Decimal still **deferred** (`#13` closed) |
+| **Tab character round-trip** | Sprint 1 preserved `\t` in model | None — typing `Tab` inserts via key handler | ✅ Wired — `Tab` inserts `\t` in body text; inside tables it navigates cells (`HiddenInput.tsx:164`) |
+| **Geometric tab stops** (Left / Center / Right / Decimal / Clear) | `Command::SetTabStops` + `Event::SelectionChanged.tab_stops` (Sprint 11) | `Ruler.tsx` — L/C/R/D markers, click cycles kind, drag moves, drag-off removes | ✅ Wired (Sprint 11, `#13` closed) — authoring **and** rendering: Center/Right/Decimal render, incl. BiDi interior-anchor mirroring (`#20` closed) |
 | **First-line indent ruler handle** | `Command::SetParagraphIndent` + Ruler (Sprint 11) | `Ruler.tsx` first-line ▽ marker at leading edge | ✅ Wired (Sprint 11, `#13` closed) |
 | **Hanging indent ruler handle** | `Command::SetParagraphIndent` (negative `first_line_pt`) + Ruler (Sprint 11) | `Ruler.tsx` left-indent △ marker | ✅ Wired (Sprint 11, `#13` closed) |
 
@@ -105,7 +105,7 @@
 
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
-| **Page break (hard)** | No `Command::InsertPageBreak` yet | Toolbar Insert → Page Break + `Ctrl+Enter` shortcut | 🛑 Blocked — high-value gap; preserved on `.docx` round-trip but cannot author |
+| **Page break (hard)** | `Command::InsertPageBreak` (`command.rs:402`) | Toolbar Insert → Page Break + `Ctrl+Enter` shortcut | ✅ Wired — `LayoutControls.tsx:75` via `cmd.insertPageBreak` |
 | **Section break (next page / continuous)** | Continuous `<w:type>` ships Sprint 7; no insertion command | Toolbar Layout → Breaks dropdown | 🛑 Blocked |
 | **Multi-column layout (snake flow)** | Per-section geometry resolved (Sprint 2); no `Command::SetColumns` | Toolbar Layout → Columns dropdown (1/2/3/Custom) | 🛑 Blocked — engine renders perfectly; cannot author |
 | **Column gutter / equal-width toggle** | Resolved from section properties | Columns dialog (right rail) | 🛑 Blocked |
@@ -146,7 +146,7 @@
 
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
-| **Insert image from file** | `Command::InsertImage { blob: ImageBlob, fit }` | Toolbar Insert → Image button → file picker | 🛑 Blocked — engine command lives; no UI button (drag-drop loads whole DOCX, not images) |
+| **Insert image from file** | `Command::InsertImage { blob: ImageBlob, fit }` | Toolbar Insert → Image button → file picker | ✅ Wired (Sprints 1–8 UI Edition) — `InsertImageButton.tsx` via `cmd.insertImageAtCaret` |
 | **Image fit modes** (`Original` / `FitWidth` / `FitPage`) | `ImageFit` enum (`command.rs:455`) | Right-click image → Fit submenu | 🛑 Blocked |
 | **Image resize / reposition** | No commands yet | Selection handles around image | 🛑 Blocked — model surface missing |
 | **Inline-image registration** (`register_image`) | `Engine::register_image(rel_id, ImageBitmap)` | Auto on `LoadDocx` — driven by `media_entries()` enumeration | ✅ Wired (worker bridge) |
@@ -221,10 +221,10 @@
 
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
-| **Revisions snapshot** (read-only) | `Engine::revisions_snapshot()` → `Vec<Revision>` (`lib.rs:450`) | "Review" sidebar listing each `<w:ins>` / `<w:del>` / `<w:rPrChange>` with author + timestamp | 🛑 Blocked — engine exposes full list; **zero UI** — high-value gap for QA |
+| **Revisions snapshot** (read-only) | `Engine::revisions_snapshot()` → `Vec<Revision>` (`lib.rs:450`) | "Review" sidebar listing each `<w:ins>` / `<w:del>` / `<w:rPrChange>` with author + timestamp | ✅ Wired (Sprints 1–8 UI Edition) — `TrackChangesSidebar.tsx` |
 | **Show/hide markup** | No engine command | Toolbar Review → "Display for Review" dropdown (Final / All Markup / No Markup / Original) | 🛑 Blocked |
-| **Accept / Reject revision** | No engine command yet | Per-revision Accept ✓ / Reject ✗ buttons in sidebar | 🛑 Blocked — needs bridge addition |
-| **Accept All / Reject All** | No engine command | Toolbar Review buttons | 🛑 Blocked |
+| **Accept / Reject revision** | `Command::AcceptRevision` / `Command::RejectRevision` (`command.rs:480,487`) | Per-revision Accept ✓ / Reject ✗ buttons in sidebar | ✅ Wired — `TrackChangesSidebar.tsx:53,57` via `cmd.acceptRevision` / `cmd.rejectRevision` |
+| **Accept All / Reject All** | Same commands, iterated over the snapshot | Toolbar Review buttons | ✅ Wired — `ReviewControls.tsx:87,98` |
 | **Track-changes toggle** | `Command::ToggleTrackChanges` + `Event::SelectionChanged.is_tracking_changes` (Sprint 14) | `ReviewControls.tsx` Track toggle (binds to engine state, no local UI signal) | ✅ Wired (Sprint 14) — every InsertText / DeleteRange / DeleteAtCaret / ApplyFormatting gates into `<w:ins>` / `<w:del>` / `<w:rPrChange>` revisions; boundary math preserves invariants (`#14` closed) |
 | **Author / colour assignment** | Engine preserves on round-trip | Settings → user identity (already in `.docx` model) | 🕳 Latent |
 
@@ -234,7 +234,7 @@
 
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
-| **Comments snapshot** (read-only) | `Engine::comments_snapshot()` → `Vec<Comment>` (`lib.rs:478`) | Comments rail on right with anchored callouts | 🛑 Blocked — engine exposes full list; **zero UI** — high-value gap |
+| **Comments snapshot** (read-only) | `Engine::comments_snapshot()` → `Vec<Comment>` (`lib.rs:478`) | Comments rail on right with anchored callouts | ✅ Wired (Sprints 1–8 UI Edition) — `CommentsRail.tsx` via `engine.commentsSnapshot()` |
 | **Insert comment** | No engine command yet | Right-click selection → "New comment" + toolbar Review → Comment | 🛑 Blocked — needs bridge addition |
 | **Reply to comment** | No command | Reply field on each comment thread | 🛑 Blocked |
 | **Resolve / delete comment** | `Command::ResolveComment` / `Command::DeleteComment` | `CommentsRail.tsx` per-comment row | ✅ Wired (Sprint 9) — `resolved` round-trips through `word/commentsExtended.xml` (`#15` closed) |
@@ -258,13 +258,13 @@
 
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
-| **Open `.docx` (file picker)** | `Command::OpenDocument { bytes, format: Docx }` | Toolbar File → Open button | 🛑 Blocked — only drag-and-drop entrypoint exists (`input/dnd.ts:10`) |
+| **Open `.docx` (file picker)** | `Command::OpenDocument { bytes, format: Docx }` | Toolbar File → Open button | ✅ Wired (Sprints 1–8 UI Edition) — `FileMenu.tsx` Open → file picker |
 | **Open `.docx` (drag-and-drop)** | Same | `input/dnd.ts:10` | ✅ Wired |
-| **Save `.docx`** | `Command::SaveDocument { format: Docx }` / legacy `Command::SaveDocx` | Toolbar File → Save + `Ctrl/Cmd+S` shortcut | ⚠️ Partial — toolbar wired (`Toolbar.tsx:90`); **no keyboard shortcut** |
+| **Save `.docx`** | `Command::SaveDocument { format: Docx }` / legacy `Command::SaveDocx` | Toolbar File → Save + `Ctrl/Cmd+S` shortcut | ✅ Wired — `FileMenu.tsx` Save entry + `Ctrl/Cmd+S` binding |
 | **Export plain text** | `DocFormat::PlainText` (`common.rs:156`) | Toolbar File → Export → Plain Text | ✅ Wired (Sprint 9) — `engine::DocumentTree::to_plain_text` (`#9` closed) |
 | **Export HTML** | `DocFormat::Html` | Toolbar File → Export → HTML | ✅ Wired (Sprint 9) — `crates/format-html::to_html` (`#9` closed) |
-| **Export PDF (`PdfProfile::A1b`)** | `Command::ExportPdf { conformance }` | Toolbar Export PDF button | ✅ Wired (`Toolbar.tsx:70`) — only `A1b` selected; user can't choose conformance |
-| **Export PDF (`A2u`, `X3`)** | `PdfConformance` enum supports both (`command.rs:425`) | Export dialog with conformance dropdown | 🛑 Blocked — enum values unused |
+| **Export PDF (`PdfProfile::A1b`)** | `Command::ExportPdf { conformance }` | Toolbar Export PDF button | ✅ Wired — `FileMenu.tsx` conformance picker (A1b engine-real) |
+| **Export PDF (`A2u`, `X3`)** | `PdfConformance` enum supports both (`command.rs:425`) | Export dialog with conformance dropdown | 🛑 Blocked (engine) — `FileMenu.tsx` picker lists both, gated "Engine pending"; `do_export_pdf` falls back to `PdfProfile::Plain` |
 | **Close document** | `Command::CloseDocument` | Toolbar File → Close + `Ctrl/Cmd+W` | 🛑 Blocked — no UI; one-doc-per-tab assumed |
 | **Recent files** | None | Toolbar File → Recent list (IndexedDB-backed) | 🛑 Blocked |
 | **New empty document** | Auto on first mount (`App.tsx:55`) | Toolbar File → New + `Ctrl/Cmd+N` | 🛑 Blocked — no explicit affordance |
@@ -278,11 +278,11 @@
 
 | Engine Feature | WASM Command / API | Required UI Component | QA Status |
 |---|---|---|---|
-| **Set zoom** | `Command::SetZoom { scale }` | Status-bar Zoom dropdown (50/75/100/125/150/200/Fit) + `Ctrl+/-/0` shortcuts + pinch gesture | 🛑 Blocked — engine command exists; **no UI** — high-value low-hanging fruit |
-| **Set viewport** (record visible band) | `Command::SetViewport { rect }` | Scroll handler emits on scroll/resize | 🛑 Blocked — comment `TODO` at `EditorCanvas.tsx:61`; needed for culling |
+| **Set zoom** | `Command::SetZoom { scale }` | Status-bar Zoom dropdown (50/75/100/125/150/200/Fit) + `Ctrl+/-/0` shortcuts + pinch gesture | ✅ Wired (Sprints 1–8 UI Edition) — `ZoomControls.tsx:45` via `cmd.setZoom` |
+| **Set viewport** (record visible band) | `Command::SetViewport { rect }` | Scroll handler emits on scroll/resize | ✅ Wired — `EditorCanvas.tsx:80` dispatches rAF-coalesced `SET_VIEWPORT` on scroll/resize (drives lazy pagination) |
 | **Expand layout (lazy)** | `Command::ExpandLayout { target_y }` | Scroll handler + `Ctrl+End` | ✅ Wired |
 | **Request paint (clipped)** | `Command::RequestPaint { rect }` | Auto from `DirtyTracker`; manual debug button useful | ✅ Wired (auto-path) |
-| **Request stats** | `Command::RequestStats` → `Event::Stats { EngineStats }` | Dev HUD overlay (WASM heap, undo depth, glyph cache, paint ms) | ⚠️ Partial — polled `App.tsx:98` but rendered nowhere visible |
+| **Request stats** | `Command::RequestStats` → `Event::Stats { EngineStats }` | Dev HUD overlay (WASM heap, undo depth, glyph cache, paint ms) | ✅ Wired (Sprints 1–8 UI Edition) — `DevHud.tsx` polls while visible + renders the payload |
 | **Animation tick** | `Command::Tick` | rAF loop for caret blink / overlay animation | ⚠️ Partial — wired internally; no user-tunable cadence |
 
 ---
@@ -308,12 +308,12 @@
 | **Dispose** | `Command::Dispose` | Auto on page unload | ✅ Wired |
 | **Recover (after trap)** | `Command::Recover` | Crash overlay → "Reload" button | ⚠️ Partial — worker traps reconnect, but recovery is **stub** (event-log snapshots empty placeholders) |
 | **Ping / Pong (liveness)** | `Command::Ping` / `Event::Pong` | Test harness only | ✅ Wired (harness path) |
-| **Backend detect** (`vello` vs `canvas2d`) | `detect_backend()` (`lib.rs:573`) | Settings → "Renderer: Canvas2D \| Vello (experimental)" toggle | 🛑 Blocked — engine detects; no UI choice (Vello reachable only via fresh INIT) |
+| **Backend detect** (`vello` vs `canvas2d`) | `detect_backend()` (`lib.rs:573`) | Settings → "Renderer: Canvas2D \| Vello (experimental)" toggle | ✅ Wired — `SettingsMenu.tsx` renderer switch (reloads with `?renderer=`; choice is baked at INIT) |
 | **Engine capabilities** | `EngineCapabilities` struct (`event.rs:254`) — `simd`, `shared_array_buffer`, formats list | About dialog | 🛑 Blocked |
-| **Engine stats** | `EngineStats` (`event.rs:263`) — heap, undo depth, glyph cache, paint ms | Dev HUD overlay | 🛑 Blocked — polled but unrendered |
+| **Engine stats** | `EngineStats` (`event.rs:263`) — heap, undo depth, glyph cache, paint ms | Dev HUD overlay | ✅ Wired (Sprints 1–8 UI Edition) — `DevHud.tsx` |
 | **Telemetry batch** | `TelemetryEvent` / `TelemetryBatch` (`telemetry.rs`) — D5.7 mock transport | None (mock `console.log` transport for MVP) | 🕳 Mock — collector exists, no live UI |
 | **Error toast** | `Event::Error { message }` | Toast component on error events | 🛑 Blocked — events fire, no visible toast surface |
-| **Trap overlay** | `Event::Trap` | Full-screen modal with stack + Reload | ⚠️ Partial — `EngineClient.onTrap` callback exists; `App.tsx` only remounts canvas (no user-visible overlay) |
+| **Trap overlay** | `Event::Trap` | Full-screen modal with stack + Reload | ✅ Wired (Sprints 1–8 UI Edition) — `TrapOverlay.tsx` (Portal modal) |
 
 ---
 
@@ -346,12 +346,13 @@
 
 # Cross-Reference: Commands Without UI Consumers
 
-Bridge commands whose UI dispatch count is **zero** (from grep of `ts/src/`):
+Bridge commands whose UI dispatch count is **zero** (from grep of
+`packages/ui/src/`, `packages/core/src/` and `ts/src/`; updated 2026-07-02):
 
 | Command | Status |
 |---|---|
-| `Command::SetZoom` | 🛑 No UI |
-| `Command::SetViewport` | 🛑 `TODO` at `EditorCanvas.tsx:61` |
+| `Command::SetZoom` | ✅ Wired — `ZoomControls.tsx:45` |
+| `Command::SetViewport` | ✅ Wired — `EditorCanvas.tsx:80` scroll/resize handler |
 | `Command::Tick` | ⚠️ Internal only |
 | `Command::UnloadFont` | 🛑 No UI |
 | `Command::CloseDocument` | 🛑 No UI |
@@ -360,11 +361,11 @@ Commands with **partial** UI (engine surface broader than UI exposes):
 
 | Command | Gap |
 |---|---|
-| `Command::ApplyFormatting` | `UnderlineStyle::{Double,Dotted,Dashed,Wavy}` unreachable; no `vertical_script` field; no `caps`/`smallCaps`/`clear` |
-| `Command::ExportPdf` | Only `A1b` selectable; `A2u`/`X3` enum variants unused |
-| `Command::OpenDocument` | Only via drag-drop; no file-picker entry |
-| `Command::InsertImage` | Engine ready; no UI trigger at all |
-| `Command::SaveDocument` / `Command::SaveDocx` | Toolbar button only; no `Ctrl/Cmd+S` shortcut |
+| `Command::ApplyFormatting` | ✅ Closed — underline styles, `vertical_script`, `caps`/`small_caps` all reachable (`UnderlineStyleDropdown`, `SuperSubButtons`, `CapsButtons`); a `clear`-formatting affordance is still absent |
+| `Command::ExportPdf` | `FileMenu.tsx` conformance picker ships; `A2u`/`X3` gated "Engine pending" (`do_export_pdf` falls back to Plain) |
+| `Command::OpenDocument` | ✅ Closed — `FileMenu.tsx` file picker + drag-drop |
+| `Command::InsertImage` | ✅ Closed — `InsertImageButton.tsx` |
+| `Command::SaveDocument` / `Command::SaveDocx` | ✅ Closed — `FileMenu.tsx` + `Ctrl/Cmd+S` |
 | `Command::SetCellBorders` | Sets all 4 edges identically; no per-edge picker |
 | `Command::PasteHtml` / `Command::PastePlain` | Wired; rich-`.docx` fragment paste path not yet exercised in `.docx → .docx` clipboard tests |
 
@@ -372,10 +373,10 @@ Engine APIs without **any** UI consumer:
 
 | API (lib.rs) | Status |
 |---|---|
-| `Engine::revisions_snapshot()` | 🛑 No UI |
-| `Engine::comments_snapshot()` | 🛑 No UI |
+| `Engine::revisions_snapshot()` | ✅ Wired — `TrackChangesSidebar.tsx` / `ReviewControls.tsx` |
+| `Engine::comments_snapshot()` | ✅ Wired — `CommentsRail.tsx` |
 | `Engine::media_entries()` | ⚠️ Internal only (used during `LoadDocx`) |
-| `Engine::with_vello()` / `detect_backend()` | 🛑 No user-facing renderer choice |
+| `Engine::with_vello()` / `detect_backend()` | ✅ Wired — `SettingsMenu.tsx` renderer switch |
 
 Bridge **events** without UI handlers:
 
@@ -397,7 +398,7 @@ Bridge **events** without UI handlers:
 - **Engine surface (`#[wasm_bindgen]`):** `new`, `with_vello`, `dispatch`, `media_entries`, `register_image`, `set_page_canvas`, `paint_dims`, `revisions_snapshot`, `comments_snapshot`, plus free `detect_backend` (`engine-wasm/src/lib.rs:235–573`).
 - **UI dispatchers (current):** `Toolbar.tsx`, `HiddenInput.tsx`, `TablePanel.tsx`, `input/{pointer,clipboard,dnd}.ts`, `engine/{engine-client,engine.worker}.ts`, `App.tsx`.
 
-**Coverage summary:** **48 / 57** bridge commands have at least one UI dispatch site; **9** are fully blocked. **8 / 25** events have no UI consumer at all. Two read-only engine snapshots (`revisions_snapshot`, `comments_snapshot`) representing significant `.docx` semantic content have **zero** UI rendering. These gaps are the primary obstacle to systematic manual QA against the current engine.
+**Coverage summary (original audit — superseded, see the 2026-07-02 note):** the **48 / 57** command coverage and the "zero UI rendering" verdict on `revisions_snapshot` / `comments_snapshot` described the pre-SDK-split shell. After the Sprints 1–8 (UI Edition) wave and its follow-ups, both snapshots render (`TrackChangesSidebar.tsx`, `CommentsRail.tsx`) and the remaining 🛑 rows are those whose **engine** half is genuinely missing (markup display modes, headers / footers, field authoring, multi-column authoring, list outline tooling) — systematic manual QA is no longer UI-blocked.
 
 **Sprint 9 (closed `#9`, `#15`).** Three rows flipped 🛑 Blocked → ✅ Wired:
 section 13 *Resolve / delete comment* (`Command::ResolveComment` /
@@ -464,3 +465,31 @@ revisions. `ReviewControls` Track toggle binds to
 instead of carrying local Solid state. WASM 5.96 → 5.97 MiB (+12
 KiB). Cross-paragraph tracked-delete, FormatChange-reject restoring
 prev_attrs, and mixed-overlap deletes stay v1 limitations.
+
+**Sprints 1–8 (UI Edition) + follow-ups — retroactive doc sync
+(2026-07-02).** The shelf wave (commit `747796b`, cut
+`v0.6.0-beta.2`) shipped §19's entire low-hanging-fruit list and
+more, but the rows above were never flipped; this note records the
+sync. Rows flipped 🛑/⚠️ → ✅ Wired: §1 *Underline dropdown*
+(`UnderlineStyleDropdown.tsx`), *Super/Subscript*
+(`SuperSubButtons.tsx`), *All-/Small-Caps* (`CapsButtons.tsx` —
+`TextAttrsPatch` grew `caps` + `small_caps`); §2 *Indentation*
+(resolving the self-contradiction with §4 —
+`Command::SetParagraphIndent` shipped in Sprint 11); §4 *Tab
+character* (`Tab` inserts `\t` in body text, `HiddenInput.tsx:164`);
+§5 *Page break* (`LayoutControls.tsx:75`); §7 *Insert image*
+(`InsertImageButton.tsx`); §12 *Revisions snapshot* +
+*Accept / Reject* + *Accept All / Reject All*
+(`TrackChangesSidebar.tsx`, `ReviewControls.tsx` —
+`Command::AcceptRevision` / `RejectRevision` landed on the bridge);
+§13 *Comments snapshot* (`CommentsRail.tsx`); §15 *Open (file
+picker)*, *Save + `Ctrl/Cmd+S`*, *PDF conformance picker*
+(`FileMenu.tsx` — `A2u`/`X3` stay engine-gated behind the "Engine
+pending" badge); §16 *Set zoom* (`ZoomControls.tsx`), *Set viewport*
+(`EditorCanvas.tsx:80`), *Request stats* (`DevHud.tsx`); §18
+*Backend detect* (`SettingsMenu.tsx`), *Engine stats* (`DevHud.tsx`),
+*Trap overlay* (`TrapOverlay.tsx`). The Sprint 11 caveat is also
+resolved: Center / Right / Decimal tab stops now **render**,
+including BiDi interior-anchor mirroring (closes `#20`). The
+cross-reference tables and coverage summary above were updated in
+place; the per-sprint notes above are left as historical record.

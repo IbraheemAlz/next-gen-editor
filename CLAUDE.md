@@ -2,7 +2,7 @@
 
 Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–4. Don't relitigate without a measurement that contradicts it.
 
-**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**. Twelve post-`beta.1` backlog / tech-debt sprints then closed the bulk of [`BACKLOG.md`](plans/BACKLOG.md) — rich-text decorations + faces (with faux bold / italic on both Canvas2D and Vello), Kashida ink, incremental relayout, typography, `.docx` interoperability, the Vello/WebGPU activation, fine-grained accessibility deltas, the inline IME preview, and the core arrow-key / multi-click / select-all navigation layer; the cut is now `v0.5.0-beta.3`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
+**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**. Twelve post-`beta.1` backlog / tech-debt sprints then closed the bulk of [`BACKLOG.md`](plans/BACKLOG.md) — rich-text decorations + faces (with faux bold / italic on both Canvas2D and Vello), Kashida ink, incremental relayout, typography, `.docx` interoperability, the Vello/WebGPU activation, fine-grained accessibility deltas, the inline IME preview, and the core arrow-key / multi-click / select-all navigation layer (cut `v0.5.0-beta.3`). The "Monaco Standard" SDK split (`packages/`) and the Sprint 1–14 (UI Edition) waves followed — the `@nge/ui` shelf (zoom, images, revisions, comments, page setup, ruler, Dev HUD) plus viewport-culled lazy pagination (`LazyLayoutState` + `Command::ExpandLayout`, audit gap C.H1); the cut is now `v0.6.0-beta.2`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
 
 ---
 
@@ -97,7 +97,7 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **Rich text** — `engine::Paragraph` carries `Vec<StyleRun>` style spans; `Command::ApplyFormatting` applies font-size + colour, plus bold/italic/underline **flags** stored on `SpanStyle` in Phase 4 (rendering of bold/italic faces + underline strokes deferred — BACKLOG.md).
 - **PDF export** (`format-pdf`, D3.7): box tree → single-page PDF, Y-axis inverted, full `Type0`/`CIDFontType2` font embedding. Not PDF/A-1b — see `BACKLOG.md`.
 - **DirtyTracker** (`render/dirty.rs`, D3.8): bounding-rect invalidation; `render_canvas2d` clips fills/strokes and culls off-region glyph runs (`put_image_data` ignores the canvas clip).
-- **Vello/WebGPU** plumbed and reachable via `Engine::init_vello`, but Canvas2D stays the active renderer.
+- **Vello/WebGPU** is runtime-activated: the worker probes `detect_backend()` at INIT and boots `Engine::with_vello` when a WebGPU adapter is acquirable; Canvas2D is the fallback and the CI / golden-farm default (no GPU in dev/CI).
 
 ## Phase 4 — headless UI shell
 
@@ -305,13 +305,18 @@ formatting, rich clipboard + the `.docx` `<w:rPr>` round-trip, PDF
 `FlateDecode` + `/ToUnicode`, fine-grained accessibility deltas, the
 Vello/WebGPU render-path activation, the inline IME composition preview, and
 core keyboard navigation (arrow keys with ideal-x, Shift-extend, `Ctrl/Cmd+A`,
-triple-click paragraph selection). The cut is `v0.5.0-beta.3`.
+triple-click paragraph selection) — cut `v0.5.0-beta.3`. The SDK split and the
+Sprint 1–14 (UI Edition) waves then shipped the `@nge/ui` shelf and
+viewport-culled lazy pagination (`LazyLayoutState` + `Command::ExpandLayout`,
+audit gap C.H1) — closing BACKLOG #13. The cut is `v0.6.0-beta.2`.
 
-Still open in [`BACKLOG.md`](plans/BACKLOG.md): PDF `/W` widths + font subsetting and
-PDF/A-2 / PDF/X (#3); Vello as the *default* renderer plus its GPU-runner
-golden suite (#4 — GitHub issue #1); IME `target_range` sub-segment styling
-(#8 — GitHub issue #2); stable per-paragraph accessibility ids (#10); and
-viewport culling for a sub-budget cold open (#13).
+Still open in [`BACKLOG.md`](plans/BACKLOG.md): PDF font subsetting and
+PDF/A-2 / PDF/X (#3 — the `/W` width array now ships); Vello as the *default*
+renderer (#4 — the harness has a `--renderer vello` mode with committed
+`golden/vello/` goldens, and runtime activation is verified on real GPU
+hardware, closing GitHub issue #1; the remaining gap is a GPU CI runner +
+default promotion); IME `target_range` sub-segment styling (#8 — GitHub
+issue #2); and stable per-paragraph accessibility ids (#10).
 
 Phase 5 → MVP hand-off:
 
@@ -325,4 +330,4 @@ Phase 5 → MVP hand-off:
   D5.7 telemetry pipeline is wired and will carry real numbers once they are.
 - Remaining for the MVP `v0.1.0`: D5.6 (external security audit), D5.9
   (operator runbook), D5.10 (Arabic typography sign-off), then the §10 exit
-  gate. `v0.5.0-beta.3` is the engineering-complete beta.
+  gate. `v0.6.0-beta.2` is the engineering-complete beta.

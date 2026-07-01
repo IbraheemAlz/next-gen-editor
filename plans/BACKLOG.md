@@ -7,9 +7,9 @@ None of these are regressions — they are known, bounded follow-ups.
 ## Shipped in Phase 5 backlog sprints
 
 Items completed after the `v0.5.0-beta.1` cut, in the continuous
-backlog-sprint phase — sprints 1–11, released as `v0.5.0-beta.2`. Each stays
-in its numbered section below — annotated **✅ Shipped** — so the
-cross-references between items keep resolving.
+backlog-sprint phase — sprints 1–11 released as `v0.5.0-beta.2`, sprint 12 as
+`v0.5.0-beta.3`. Each stays in its numbered section below — annotated
+**✅ Shipped** — so the cross-references between items keep resolving.
 
 - **Sprint 1 (2026-05-22)** — Pending (sticky) formatting (item 11, complete);
   paragraph alignment (item 9 — the `AlignmentPicker` half; per-span font
@@ -23,7 +23,7 @@ cross-references between items keep resolving.
 - **Sprint 4 (2026-05-22)** — Incremental relayout (item 13): paragraph
   layout caching, an O(N) line breaker, and a cached parsed font face. The
   50-page open dropped ~22 s → ~4.7 s and insert p95 ~27 ms → ~8 ms;
-  sub-budget cold open still needs viewport culling.
+  viewport culling for the cold open followed post-`beta.3` (see item 13).
 - **Sprint 5 (2026-05-22)** — Dynamic line height (item 5, complete);
   first-strong paragraph auto-direction (item 6 — a UI override toggle is
   still deferred).
@@ -130,12 +130,17 @@ source tree — CLAUDE.md's no-blobs rule holds without an exception.
   the four Arabic positional forms all map back to one base letter — so
   `pdftotext` / `mutool` extract real Unicode, not glyph-id gibberish.
 
+**✅ Shipped (post-`beta.3`):** the `/W` glyph-width array. Each CID font
+dictionary now carries the font program's own `hmtx` advances in 1000-em units
+(`cid.widths().consecutive(0, face.widths_em1000())`) — PDF/A-1b §6.3.5
+requires `/W` to match the embedded font. Glyph *positioning* still rides
+explicit per-glyph text matrices by design: our `x_advance` carries
+justification + Kashida adjustments the font's intrinsic widths do not.
+
 **Deferred:**
 
-- **`/W` glyph widths + font subsetting.** Glyph advances still ride the
-  content stream's per-glyph text matrices rather than a `/W` array, and the
-  whole font embeds rather than just the used glyphs. Subsetting would shrink
-  the output further.
+- **Font subsetting.** The whole font still embeds rather than just the used
+  glyphs. Subsetting would shrink the output further.
 - **PDF/A-2 / PDF/X.** `PdfConformance::A2u` and `X3` currently fall back to a
   plain PDF; only `A1b` is implemented.
 
@@ -152,26 +157,33 @@ context, then the engine is built via `Engine::with_vello` (WebGPU) or
 the engine holds. The **canvas context conflict** is resolved by construction —
 the `OffscreenCanvas` is handed to exactly one of `getContext("2d")` (inside
 `Engine::new`) or `wgpu` (inside `VelloRenderer::new`), decided once and never
-revisited. Canvas2D stays the default and is byte-for-byte untouched: Vello is
-chosen only on a fresh interactive INIT; crash recovery and the visual-diff
-`?test=` harness both stay on Canvas2D. The old `init_vello` DCE-retention root
-is gone — superseded by the real path.
+revisited. Canvas2D is the fallback and is byte-for-byte untouched: Vello is
+chosen on a fresh interactive INIT when a WebGPU adapter is acquirable; the
+visual-diff `?test=` harness stays Canvas2D-locked *by default* (opt-in below).
+The old `init_vello` DCE-retention root is gone — superseded by the real path.
+
+**✅ Shipped (post-`beta.3`) — golden suite + runtime verification:**
+
+- **Vello golden suite.** The `?test=` harness grew a Vello mode:
+  `tools/visual-diff/run.mjs --renderer vello` switches the golden dir to
+  `golden/vello/` and appends `?renderer=vello` to the harness URL (the worker
+  INIT then boots `Engine::with_vello`, failing closed to a visible mismatch
+  when no adapter exists). A committed Vello corpus (a4-justified-mixed,
+  docx-round-trip, editing-arabic, rich-text) lives under
+  `tools/visual-diff/golden/vello/` at the ~0.5 % tolerance
+  (PHASE_3_RENDER_RTL.md §2, D3.4).
+- **Runtime verification — GitHub issue #1, closed.** Verified end-to-end on a
+  real discrete-GPU machine (Chrome, WebGPU enabled): `detect_backend()` now
+  picks Vello whenever a WebGPU adapter + device is acquirable, and the Vello
+  goldens pass. The dev/CI environment still has no WebGPU, so
+  `detect_backend()` resolves to `canvas2d` there.
 
 **Still deferred — #4 stays open until Vello is the *default*:**
 
-- **Separate golden suite.** Vello (GPU compute) rasterizes glyphs differently
-  from Canvas2D (Skia); the 0.000 %-diff goldens will not match a Vello render.
-  A Vello-specific corpus under `tools/visual-diff/golden/vello/` at ~0.5 %
-  tolerance (PHASE_3_RENDER_RTL.md §2, D3.4) is required — generated and run on
-  a **GPU CI runner**, since the `?test=` harness has no Vello mode and this
-  environment has no WebGPU.
-- **Runtime verification.** WebGPU in a Web Worker with `OffscreenCanvas` is
-  still unverified — no WebGPU adapter is available in the dev/CI environment,
-  so `detect_backend()` resolves to `canvas2d` here. The activation path
-  compiles and is reachable; confirming a real GPU frame needs WebGPU-capable
-  hardware.
-- **Promoting Vello to default.** Canvas2D stays the default until the Vello
-  golden suite is green on a GPU runner.
+- **GPU CI runner.** The Vello golden farm can only run on GPU hardware — CI
+  cannot exercise it continuously until a GPU runner exists.
+- **Promoting Vello to default.** Canvas2D stays the fallback and the CI /
+  golden-farm default until the Vello suite is green on a GPU runner.
 
 ## 5. Line height — dynamic from run metrics
 
@@ -195,9 +207,13 @@ and direction-relative alignment then follow per paragraph, so an English
 paragraph below an Arabic one aligns left while the Arabic aligns right,
 automatically.
 
-**Still deferred:** a UI / keyboard toggle to override the auto-detected
-direction; `Event::SelectionChanged.direction` still reports the document
-direction rather than the caret paragraph's.
+**✅ Shipped (post-`beta.3` follow-up).** `Command::SetParagraphDirection`
+sets an explicit per-paragraph override (`<w:bidi>`) over a range — a real
+edit (undo + reflow) — dispatched from the `AlignmentButtons` LTR / RTL
+toggle in `@nge/ui`. `Event::SelectionChanged` now also carries
+`paragraph_direction`: the caret paragraph's *effective* direction (the
+explicit override if set, else the auto-detected one; `None` over a
+mixed-direction selection, so the toggle renders indeterminate).
 
 ## 7. Selection rendering — discontinuous BiDi rectangles
 
@@ -254,8 +270,9 @@ still ignore them (item 1 above). Size + colour render immediately.
   absolute Left/Center/Right/Justify buttons onto the engine's
   direction-relative model via the document base direction.
 - **✅ Per-span font family — shipped (Phase 5 sprint 6).** `engine::SpanStyle`
-  carries a `font_family: Option<FontFamily>` (an enum, so `SpanStyle` stays
-  `Copy`); `Command::ApplyFormatting` sets it, and `FontStack::resolve` takes
+  carries a `font_family: Option<FontFamily>` (then a closed enum; since
+  widened to a string-backed `Custom` variant — GitHub issue #23, closed);
+  `Command::ApplyFormatting` sets it, and `FontStack::resolve` takes
   a family override that wins over the script default when that face is
   loaded. `App.tsx` loads three families (Amiri, Liberation Sans, Noto Naskh
   Arabic) and the toolbar `FontFamilyPicker` dispatches the change.
@@ -340,13 +357,16 @@ open from ~22 s to ~4.7 s and insert-char p95 from ~27 ms to ~8 ms:
   load instead of re-parsing the whole font file on every `shape_text` call —
   this was the dominant cold-open cost.
 
-**Still deferred:** a *cold* open is still ~4.7 s — over the §6 2.5 s budget —
-because all 1000 paragraphs are genuinely laid out once (the cache is empty on
-the first open). Driving the cold open under budget needs **viewport
-culling**: laying out only the visible page and deferring the rest. That is a
-larger architectural change than caching — `build_page`, hit-testing and the
-`PageBox` contract all assume a whole-document layout — so `tools/perf/run.mjs`
-keeps the open-doc metric out of its `--strict` gate until then.
+**✅ Viewport-culled lazy pagination — shipped (post-`beta.3`, audit gap
+C.H1).** `build_page` no longer lays out the whole document eagerly: layout
+stops past a cull budget beyond the viewport band (`LazyLayoutState` in
+`engine-wasm`). `Command::SetViewport` records the visible band (rAF-coalesced
+from the shell's scroll / resize handler), `Command::ExpandLayout { target_y }`
+flows further pages on scroll / `Ctrl+End`, and a running virtual-height
+estimate keeps the scrollbar stable, converging to the real height as
+`ExpandLayout` calls fill in. One residue: `tools/perf/run.mjs` still reports
+the open-doc metric outside its `--strict` gate — re-gating it is a
+harness-side follow-up now that the cold open is cull-bounded.
 
 ## 14. Core navigation & selection — the "missing basics"
 

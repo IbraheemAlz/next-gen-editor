@@ -168,7 +168,6 @@ only; no implementation details.
 
 - Discontinuous + cross-container selection
 - Multi-line IME composition with CJK candidate popup (manual QA)
-- RTL tab anchoring (LTR-style today)
 - Modifying a style's definition (assigning existing styles only)
 - Creating brand-new user-defined styles
 - Character-only styles (`<w:rStyle>`)

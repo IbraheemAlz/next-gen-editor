@@ -142,9 +142,12 @@ When unsure, copy the existing shape:
   `CommentsRail.tsx`.
 - **Modal dialog:** `Dialog.tsx` (the primitive) +
   `CellPropertiesDialog.tsx`, `PageSetupDialog.tsx`.
-- **Engine-pending pattern:** `ListButtons.tsx` (Bullet/Number badges),
-  `FileMenu.tsx` (HTML / Plain Text export entries), `ReviewControls.tsx`
-  (Track Changes toggle).
+- **Engine-pending pattern:** the inline snippet in "Honest UX" above is
+  the canonical shape; the live instance is the gated PDF/A-2u / PDF/X-3
+  export entries in `FileMenu.tsx` (`do_export_pdf` still falls back to
+  `PdfProfile::Plain`). The former references — `ListButtons.tsx`,
+  the `FileMenu.tsx` HTML / Plain Text entries, the `ReviewControls.tsx`
+  Track toggle — were fully un-gated once their engine halves shipped.
 - **Pinned bottom strip:** `StatusBar.tsx`.
 - **Crash overlay via Portal:** `TrapOverlay.tsx`.
 
