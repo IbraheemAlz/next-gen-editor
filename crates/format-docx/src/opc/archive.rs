@@ -227,6 +227,7 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     AFTER `from_blocks_with_sections` rebuilds since those rebuild
     constructors otherwise zero the field. */
     document.style_defaults = style_table.defaults.para.clone();
+    document.style_run_defaults = style_table.defaults.run.clone();
     for (id, def) in &style_table.by_id {
         if !matches!(def.kind, crate::parts::styles::StyleKind::Paragraph) {
             continue;

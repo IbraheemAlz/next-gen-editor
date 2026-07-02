@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * PDF/A-1b validation harness — Phase 5 D5.4.
+ * PDF conformance validation harness — Phase 5 D5.4 (+ issue #28 flavours).
  *
  * Drives the real engine (in its Web Worker, exactly as a user would) to export
- * each corpus document to PDF, then validates the output against the PDF/A-1b
- * archival profile with veraPDF.
+ * each corpus document to PDF, then validates the output against the selected
+ * conformance profile: PDF/A-1b, PDF/A-2u or PDF/X-3.
  *
  * Usage:
  *   node run.mjs                              — validate tests/corpus/tier-a
  *   node run.mjs --corpus tier-a --profile 1b — explicit corpus + profile
+ *   node run.mjs --profile 2u                 — PDF/A-2u flavour
+ *   node run.mjs --profile x3                 — PDF/X-3 (structural check only)
  *   node run.mjs --strict                     — fail if veraPDF is unavailable
  *
  * Requires the Vite dev server (`pnpm dev`, http://localhost:5173). Override
@@ -16,9 +18,11 @@
  * (channel:'chrome') — no 150 MB chromium download.
  *
  * veraPDF is optional locally: when it is not on PATH the harness still exports
- * every PDF and runs an in-process structural check for the PDF/A-1b markers,
+ * every PDF and runs an in-process structural check for the profile's markers,
  * but external conformance is reported as skipped (a hard failure under
- * --strict, which the release pipeline uses).
+ * --strict, which the release pipeline uses). veraPDF validates PDF/A only —
+ * it has no PDF/X flavour, so `--profile x3` always stops at the structural
+ * check and says so.
  *
  * When the corpus directory holds no .docx fixtures the harness falls back to
  * exporting the editor's seeded document, so it always produces at least one
@@ -43,14 +47,25 @@ const profile = argValue('--profile', '1b');
 const strict = hasFlag('--strict');
 const serverUrl = process.env.URL ?? 'http://localhost:5173';
 
-/* Engine conformance value per veraPDF flavour. Only PDF/A-1b is implemented
-   in crates/format-pdf today; other flavours are intentionally rejected. */
-const CONFORMANCE_FOR_PROFILE = { '1b': 'A1b' };
-const conformance = CONFORMANCE_FOR_PROFILE[profile];
-if (!conformance) {
-    console.error(`[pdf-validate] unsupported --profile '${profile}'; only '1b' is implemented`);
+/* Engine `PdfConformance` value per harness profile (issue #28 added the
+   PDF/A-2u + PDF/X-3 targets). `veraFlavour` is the veraPDF `--flavour`
+   argument; null means veraPDF cannot validate the profile (it is a PDF/A +
+   PDF/UA validator — no PDF/X flavour exists) and the structural check is
+   the harness's last word. */
+const PROFILES = {
+    '1b': { conformance: 'A1b', veraFlavour: '1b' },
+    '2u': { conformance: 'A2u', veraFlavour: '2u' },
+    'x3': { conformance: 'X3', veraFlavour: null },
+};
+const profileSpec = PROFILES[profile];
+if (!profileSpec) {
+    console.error(
+        `[pdf-validate] unsupported --profile '${profile}'; ` +
+            `expected one of: ${Object.keys(PROFILES).join(', ')}`,
+    );
     process.exit(2);
 }
+const { conformance, veraFlavour } = profileSpec;
 
 const OUT_DIR = join(REPO, 'tmp', 'pdf-validate');
 mkdirSync(OUT_DIR, { recursive: true });
@@ -148,21 +163,50 @@ if (!exported.length) {
 
 /* ---- Structural self-check (runs with or without veraPDF) ------------- */
 
-/* The PDF/A-1b structures crates/format-pdf must emit. This is a cheap sanity
-   gate — it confirms the markers exist; veraPDF is the authority on whether
-   they are correct. */
+/* The per-profile structures crates/format-pdf must emit. This is a cheap
+   sanity gate — it confirms the markers exist; veraPDF (where it supports the
+   flavour) is the authority on whether they are correct. */
 function structuralMarkers(pdf) {
     const body = pdf.toString('latin1');
-    return {
-        'PDF 1.4 header': body.startsWith('%PDF-1.4'),
+    const common = {
         'OutputIntent': body.includes('/OutputIntent'),
-        'GTS_PDFA1 subtype': body.includes('GTS_PDFA1'),
         'embedded ICC profile': body.includes('/DestOutputProfile') && body.includes('acsp'),
-        'XMP pdfaid:part': body.includes('pdfaid:part>1'),
-        'XMP pdfaid:conformance': body.includes('pdfaid:conformance>B'),
         'document /ID': body.includes('/ID'),
         'EOF marker': body.trimEnd().endsWith('%%EOF'),
     };
+    switch (profile) {
+        case '1b':
+            return {
+                'PDF 1.4 header': body.startsWith('%PDF-1.4'),
+                'GTS_PDFA1 subtype': body.includes('GTS_PDFA1'),
+                'XMP pdfaid:part': body.includes('pdfaid:part>1'),
+                'XMP pdfaid:conformance': body.includes('pdfaid:conformance>B'),
+                ...common,
+            };
+        case '2u':
+            return {
+                'PDF 1.7 header': body.startsWith('%PDF-1.7'),
+                'GTS_PDFA1 subtype': body.includes('GTS_PDFA1'),
+                'XMP pdfaid:part': body.includes('pdfaid:part>2'),
+                'XMP pdfaid:conformance': body.includes('pdfaid:conformance>U'),
+                'ToUnicode CMaps': body.includes('/ToUnicode'),
+                ...common,
+            };
+        case 'x3':
+            return {
+                'PDF 1.4 header': body.startsWith('%PDF-1.4'),
+                'GTS_PDFX subtype': body.includes('/S /GTS_PDFX'),
+                'GTS_PDFXVersion': body.includes('PDF/X-3:2003'),
+                'Info /Title': body.includes('/Title'),
+                'Info /Trapped': body.includes('/Trapped /False'),
+                'Info dates': body.includes('/CreationDate') && body.includes('/ModDate'),
+                'per-page TrimBox': body.includes('/TrimBox'),
+                ...common,
+            };
+        /* Unreachable — PROFILES gates the flag upfront. */
+        default:
+            return common;
+    }
 }
 
 let structuralOk = true;
@@ -177,7 +221,7 @@ for (const doc of exported) {
     } else {
         console.log(
             `[pdf-validate] ${doc.name}: structural PASS ` +
-                `(${Object.keys(markers).length}/${Object.keys(markers).length} PDF/A-1b markers)`,
+                `(${Object.keys(markers).length}/${Object.keys(markers).length} '${profile}' markers)`,
         );
     }
 }
@@ -192,6 +236,14 @@ function findVeraPdf() {
     return null;
 }
 
+if (veraFlavour === null) {
+    console.log(
+        `[pdf-validate] veraPDF has no '${profile}' flavour (it validates PDF/A + ` +
+            'PDF/UA only) — the structural check above is the final result.',
+    );
+    process.exit(structuralOk ? 0 : 1);
+}
+
 const veraPdf = findVeraPdf();
 if (!veraPdf) {
     console.warn('[pdf-validate] veraPDF not found on PATH — external validation skipped.');
@@ -203,12 +255,12 @@ if (!veraPdf) {
     process.exit(structuralOk ? 0 : 1);
 }
 
-console.log(`[pdf-validate] validating with ${veraPdf} --flavour ${profile}`);
+console.log(`[pdf-validate] validating with ${veraPdf} --flavour ${veraFlavour}`);
 let veraOk = true;
 for (const doc of exported) {
     const run = spawnSync(
         veraPdf,
-        ['--flavour', profile, '--format', 'text', doc.path],
+        ['--flavour', veraFlavour, '--format', 'text', doc.path],
         { encoding: 'utf8' },
     );
     const report = `${run.stdout ?? ''}${run.stderr ?? ''}`.trim();

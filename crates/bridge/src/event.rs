@@ -11,6 +11,12 @@ use crate::common::{
 
 /// An event emitted by the engine. Serialized internally-tagged
 /// (`{ "type": "PAINTED", ... }`).
+///
+/// `SelectionChanged` carries the whole toolbar read-back surface and
+/// dwarfs the other variants; events are transient, one-at-a-time RPC
+/// payloads, so the size skew is irrelevant (same stance as
+/// `engine::Block`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -149,6 +155,10 @@ pub enum Event {
         /// unaffected; `attrs_at_caret` carries the pending overlay instead.
         /// Drives the toolbar's alignment picker (Backlog #9, #11).
         paragraph_alignment: Alignment,
+        /// Issue #29 — the caret paragraph's `<w:pStyle>` id, `None`
+        /// when detached. Drives the StylesDropdown active indicator so
+        /// it reads back truthfully instead of trusting its last click.
+        paragraph_style_id: Option<String>,
         /// Undo/redo availability — every interactive edit emits this event,
         /// so the toolbar stays reactive without polling (Phase 4 §11).
         can_undo: bool,

@@ -264,7 +264,7 @@
 | **Export plain text** | `DocFormat::PlainText` (`common.rs:156`) | Toolbar File → Export → Plain Text | ✅ Wired (Sprint 9) — `engine::DocumentTree::to_plain_text` (`#9` closed) |
 | **Export HTML** | `DocFormat::Html` | Toolbar File → Export → HTML | ✅ Wired (Sprint 9) — `crates/format-html::to_html` (`#9` closed) |
 | **Export PDF (`PdfProfile::A1b`)** | `Command::ExportPdf { conformance }` | Toolbar Export PDF button | ✅ Wired — `FileMenu.tsx` conformance picker (A1b engine-real) |
-| **Export PDF (`A2u`, `X3`)** | `PdfConformance` enum supports both (`command.rs:425`) | Export dialog with conformance dropdown | 🛑 Blocked (engine) — `FileMenu.tsx` picker lists both, gated "Engine pending"; `do_export_pdf` falls back to `PdfProfile::Plain` |
+| **Export PDF (`A2u`, `X3`)** | `PdfConformance` enum supports both (`command.rs:425`) | Export dialog with conformance dropdown | ✅ Wired (issue #28, 2026-07-02) — `PdfProfile::A2u` / `X3` are engine-real; `do_export_pdf` maps 1:1, badges removed |
 | **Close document** | `Command::CloseDocument` | Toolbar File → Close + `Ctrl/Cmd+W` | 🛑 Blocked — no UI; one-doc-per-tab assumed |
 | **Recent files** | None | Toolbar File → Recent list (IndexedDB-backed) | 🛑 Blocked |
 | **New empty document** | Auto on first mount (`App.tsx:55`) | Toolbar File → New + `Ctrl/Cmd+N` | 🛑 Blocked — no explicit affordance |
@@ -362,7 +362,7 @@ Commands with **partial** UI (engine surface broader than UI exposes):
 | Command | Gap |
 |---|---|
 | `Command::ApplyFormatting` | ✅ Closed — underline styles, `vertical_script`, `caps`/`small_caps` all reachable (`UnderlineStyleDropdown`, `SuperSubButtons`, `CapsButtons`); a `clear`-formatting affordance is still absent |
-| `Command::ExportPdf` | `FileMenu.tsx` conformance picker ships; `A2u`/`X3` gated "Engine pending" (`do_export_pdf` falls back to Plain) |
+| `Command::ExportPdf` | ✅ Closed (issue #28) — conformance picker ships with `A1b`/`A2u`/`X3` all engine-real |
 | `Command::OpenDocument` | ✅ Closed — `FileMenu.tsx` file picker + drag-drop |
 | `Command::InsertImage` | ✅ Closed — `InsertImageButton.tsx` |
 | `Command::SaveDocument` / `Command::SaveDocx` | ✅ Closed — `FileMenu.tsx` + `Ctrl/Cmd+S` |
@@ -484,8 +484,8 @@ character* (`Tab` inserts `\t` in body text, `HiddenInput.tsx:164`);
 `Command::AcceptRevision` / `RejectRevision` landed on the bridge);
 §13 *Comments snapshot* (`CommentsRail.tsx`); §15 *Open (file
 picker)*, *Save + `Ctrl/Cmd+S`*, *PDF conformance picker*
-(`FileMenu.tsx` — `A2u`/`X3` stay engine-gated behind the "Engine
-pending" badge); §16 *Set zoom* (`ZoomControls.tsx`), *Set viewport*
+(`FileMenu.tsx` — `A1b`/`A2u`/`X3` all engine-real since issue #28);
+§16 *Set zoom* (`ZoomControls.tsx`), *Set viewport*
 (`EditorCanvas.tsx:80`), *Request stats* (`DevHud.tsx`); §18
 *Backend detect* (`SettingsMenu.tsx`), *Engine stats* (`DevHud.tsx`),
 *Trap overlay* (`TrapOverlay.tsx`). The Sprint 11 caveat is also

@@ -1,0 +1,122 @@
+/*
+ * StyleEditDialog — sibling stylesheet (issue #21 §5).
+ *
+ * Also carries the launch-affordance rules for the per-row ✎ edit
+ * button that StylesDropdown renders (`.nge-styles__row` /
+ * `.nge-styles__edit`) — the dialog and its launcher ship as one
+ * feature unit, and this file is imported by StyleEditDialog.tsx
+ * which StylesDropdown mounts.
+ */
+
+/* --- dialog fields ------------------------------------------------ */
+
+.nge-style-edit__check {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: var(--nge-color-primary);
+    cursor: pointer;
+}
+
+.nge-style-edit__state {
+    color: var(--nge-color-text-muted);
+    font-size: var(--nge-font-size-xs);
+}
+
+.nge-style-edit__reset {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 6px;
+    border: none;
+    border-radius: var(--nge-radius-sm);
+    background: transparent;
+    color: var(--nge-color-text-muted);
+    font-size: var(--nge-font-size-sm);
+    cursor: pointer;
+}
+
+.nge-style-edit__reset:hover,
+.nge-style-edit__reset:focus-visible {
+    background: var(--nge-color-surface-alt);
+    color: var(--nge-color-text);
+    outline: none;
+}
+
+.nge-style-edit__size {
+    max-width: 160px;
+}
+
+.nge-style-edit__swatches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--nge-space-1);
+}
+
+.nge-style-edit__swatch {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    cursor: pointer;
+}
+
+.nge-style-edit__swatch[data-active="true"] {
+    outline: 2px solid var(--nge-color-primary);
+    outline-offset: 1px;
+}
+
+.nge-style-edit__swatch:focus-visible {
+    outline: 2px solid var(--nge-color-primary);
+    outline-offset: 1px;
+}
+
+.nge-style-edit__error {
+    color: var(--nge-color-danger);
+}
+
+/* --- launcher rows in StylesDropdown's menu ----------------------- */
+
+.nge-styles__row {
+    display: flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+}
+
+.nge-styles__row .nge-styles__item {
+    flex: 1;
+}
+
+.nge-styles__edit {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    min-height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: var(--nge-radius-sm);
+    background: transparent;
+    color: var(--nge-color-text-muted);
+    font-size: var(--nge-font-size-sm);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity var(--nge-transition-fast),
+                background var(--nge-transition-fast);
+}
+
+/* Reveal on pointer hover over the row, or keyboard focus anywhere
+ * inside it (Tab reaches the button even while transparent). */
+.nge-styles__row:hover .nge-styles__edit,
+.nge-styles__row:focus-within .nge-styles__edit {
+    opacity: 1;
+}
+
+.nge-styles__edit:hover,
+.nge-styles__edit:focus-visible {
+    background: var(--nge-color-surface-alt);
+    color: var(--nge-color-text);
+    opacity: 1;
+}

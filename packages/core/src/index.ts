@@ -83,4 +83,7 @@ export type {
     BridgeTabStop,
     BridgeTabKind,
     BridgeIndent,
+    BridgeStyleProperties,
+    BridgeSpanStylePatch,
+    BridgeParaPropertiesPatch,
 } from './types';

@@ -948,17 +948,18 @@ pub fn parse_document_xml(
                         if start == end {
                             continue;
                         }
-                        /* Run cascade: paragraph baseline (doc defaults + pStyle
-                        chain) + paragraph-mark rPr is already baked into the
-                        baseline below per-paragraph; here we only fold the
-                        character style chain + direct rPr. */
-                        let (_, baseline) = resolver.resolve_paragraph(
-                            p_style_id.as_deref(),
-                            direct_ppr.clone(),
-                            pmark_rpr.clone(),
-                        );
+                        /* Issue #29 — spans carry only what the STYLE TABLE
+                        cannot re-derive: paragraph-mark rPr + character-style
+                        chain + direct rPr. The docDefaults <w:rPr> and the
+                        pStyle-chain <w:rPr> are deliberately NOT baked here —
+                        the engine folds them at span-materialize time
+                        (`build_style_spans`), which is what lets ModifyStyle
+                        re-cascade loaded documents and stops dirty-paragraph
+                        saves from writing style-derived props as direct
+                        formatting. Final precedence is unchanged:
+                        defaults → pStyle chain → pmark → rStyle → direct. */
                         let style = resolver.resolve_run(
-                            baseline,
+                            pmark_rpr.clone(),
                             r_style_id.as_deref(),
                             direct_rpr.clone(),
                         );

@@ -5,7 +5,7 @@
 
 use crate::error::DocxError;
 use crate::opc::archive::{
-    COMMENTS_EXTENDED_XML, COMMENTS_XML, DOC_XML, DocxArchive, NUMBERING_XML, RELS_XML,
+    COMMENTS_EXTENDED_XML, COMMENTS_XML, DOC_XML, DocxArchive, NUMBERING_XML, RELS_XML, STYLES_XML,
 };
 use crate::parts::comments::{
     build_comments_extended_xml, build_comments_extended_xml_with_overrides, build_comments_xml,
@@ -289,6 +289,45 @@ fn jc_val(a: Alignment) -> &'static str {
 /// Sprint 12 (#11) — `style_id` is `Some` when the paragraph references a
 /// `<w:style>` entry. Emitted as the FIRST `<w:pPr>` child per OOXML
 /// schema order (CT_PPrBase: `<w:pStyle>` before everything else).
+/// Issue #21 — serialize the engine's style table back to
+/// `word/styles.xml`. Called only when `DocumentTree.styles_dirty`
+/// (a `ModifyStyle` ran); untouched documents ride the byte-identical
+/// passthrough. Paragraph styles only — matching the reader's mirror
+/// scope. Deterministic id order so identical tables emit identical
+/// bytes.
+pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
+    let mut out = String::with_capacity(1024);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+    out.push_str(
+        "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+    );
+    out.push_str("<w:docDefaults><w:rPrDefault>");
+    emit_rpr(&doc.style_run_defaults, &mut out);
+    out.push_str("</w:rPrDefault><w:pPrDefault>");
+    emit_ppr(&doc.style_defaults, None, None, &mut out);
+    out.push_str("</w:pPrDefault></w:docDefaults>");
+    let mut ids: Vec<&String> = doc.styles.keys().collect();
+    ids.sort();
+    for id in ids {
+        let def = &doc.styles[id];
+        out.push_str("<w:style w:type=\"paragraph\" w:styleId=\"");
+        push_escaped_attr(id, &mut out);
+        out.push_str("\"><w:name w:val=\"");
+        push_escaped_attr(&def.name, &mut out);
+        out.push_str("\"/>");
+        if let Some(parent) = &def.based_on {
+            out.push_str("<w:basedOn w:val=\"");
+            push_escaped_attr(parent, &mut out);
+            out.push_str("\"/>");
+        }
+        emit_ppr(&def.para, None, None, &mut out);
+        emit_rpr(&def.run, &mut out);
+        out.push_str("</w:style>");
+    }
+    out.push_str("</w:styles>");
+    out.into_bytes()
+}
+
 fn emit_ppr(
     props: &ParaProperties,
     style_id: Option<&str>,
@@ -1228,6 +1267,15 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         } else {
             None
         };
+        /* Issue #21 — `ModifyStyle` flips `styles_dirty`; regenerate
+        `word/styles.xml` from the in-memory table. Same discipline as
+        numbering: untouched documents pass the part through verbatim. */
+        let styles_bytes: Option<Vec<u8>> = if doc.styles_dirty {
+            Some(build_styles_xml(doc))
+        } else {
+            None
+        };
+        let styles_already_present = archive.other_entries.iter().any(|(n, _)| n == STYLES_XML);
         let numbering_already_present = archive
             .other_entries
             .iter()
@@ -1262,6 +1310,10 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                 zip.write_all(new_bytes)?;
             } else if name == NUMBERING_XML
                 && let Some(new_bytes) = numbering_bytes.as_deref()
+            {
+                zip.write_all(new_bytes)?;
+            } else if name == STYLES_XML
+                && let Some(new_bytes) = styles_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
             } else if name == "[Content_Types].xml" && (synth_comments || synth_extended) {
@@ -1321,6 +1373,14 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         /* Sprint 13 (#12) — append numbering.xml if synthesized fresh
         on a document that never had one. Per Sprint 13 v1, no
         Content_Types Override / rels synth; Word tolerates this. */
+        /* Issue #21 — styles.xml is effectively always present in real
+        documents; when a ModifyStyle ran on a synthesized doc that
+        never had one, append it (same Sprint-13-v1 no-OPC-synth
+        stance as numbering: Word tolerates the missing Override). */
+        if !styles_already_present && let Some(new_bytes) = styles_bytes.as_deref() {
+            zip.start_file(STYLES_XML, opts)?;
+            zip.write_all(new_bytes)?;
+        }
         if !numbering_already_present && let Some(new_bytes) = numbering_bytes.as_deref() {
             zip.start_file(NUMBERING_XML, opts)?;
             zip.write_all(new_bytes)?;
@@ -2779,12 +2839,17 @@ mod tests {
         let parsed = read_docx(&bytes).expect("read");
         let p = &parsed.document.nth_paragraph(0).unwrap();
         assert_eq!(p.text, "hello cascade");
-        /* Single run, covering the whole text, with the cascaded style:
-        bold (from BaseStyle) + italic (from ChildStyle). */
-        assert_eq!(p.spans.len(), 1, "expected one resolved run span");
-        assert_eq!((p.spans[0].start, p.spans[0].end), (0, 13));
-        assert_eq!(p.spans[0].style.bold, Some(true), "BaseStyle bold");
-        assert_eq!(p.spans[0].style.italic, Some(true), "ChildStyle italic");
+        /* Issue #29 — style-derived run props are NOT baked into spans;
+        the engine folds them at span-materialize time so ModifyStyle
+        can re-cascade. A run with zero direct formatting stores no
+        span; the cascade lives on the style table. */
+        assert!(p.spans.is_empty(), "no direct formatting → no spans");
+        assert_eq!(p.style_id.as_deref(), Some("ChildStyle"));
+        let run = parsed
+            .document
+            .resolve_style_run_cascade(p.style_id.as_deref());
+        assert_eq!(run.bold, Some(true), "BaseStyle bold");
+        assert_eq!(run.italic, Some(true), "ChildStyle italic");
     }
 
     #[test]
@@ -2816,6 +2881,38 @@ mod tests {
         );
     }
 
+    /// Issue #21 — ModifyStyle regenerates `word/styles.xml`; the
+    /// mutated definition survives save → reopen and re-cascades.
+    #[test]
+    fn modify_style_round_trips_through_styles_xml() {
+        let bytes = build_style_cascade_docx();
+        let archive = read_docx(&bytes).expect("read");
+        let doc = archive.document.modify_style(
+            "BaseStyle",
+            None,
+            Some(engine::SpanStyle {
+                font_size: Some(20.0),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        assert!(doc.styles_dirty);
+        let saved = write_docx(&archive, &doc).expect("write");
+        let reparsed = read_docx(&saved).expect("re-read");
+        let run = reparsed
+            .document
+            .resolve_style_run_cascade(Some("ChildStyle"));
+        assert_eq!(run.bold, Some(true), "BaseStyle bold survives");
+        assert_eq!(run.italic, Some(true), "ChildStyle italic survives");
+        assert_eq!(
+            run.font_size,
+            Some(20.0),
+            "the ModifyStyle size edit round-trips through styles.xml"
+        );
+        assert!(!reparsed.document.styles_dirty, "fresh reads start clean");
+    }
+
     #[test]
     fn edit_falls_back_to_serialized_model() {
         let bytes = build_style_cascade_docx();
@@ -2832,8 +2929,9 @@ mod tests {
         assert!(p.dirty, "edit must flip dirty=true");
         assert!(p.source_xml.is_none(), "edit must drop source_xml");
 
-        /* Save → document.xml regenerates (no pStyle ref, but the cascaded
-        style spans are emitted as direct rPr). */
+        /* Save → document.xml regenerates with the `<w:pStyle>` reference
+        intact and NO style-derived direct rPr (issue #29: the cascade
+        stays on styles.xml, exactly like Word writes it). */
         let saved = write_docx(&archive, &edited).expect("write");
         let saved_doc_xml = {
             let mut z = zip::ZipArchive::new(Cursor::new(&saved)).unwrap();
@@ -2843,18 +2941,23 @@ mod tests {
             s
         };
         assert!(saved_doc_xml.contains("hello EDITED cascade"));
-        /* Re-read: cascade is gone (regenerated doc.xml carries direct
-        rPr instead of `<w:pStyle>`); but styles.xml still rides
-        passthrough, so the StyleTable is still populated — the bold+italic
-        span survives as direct formatting on the regenerated run. */
+        assert!(
+            saved_doc_xml.contains("<w:pStyle w:val=\"ChildStyle\"/>"),
+            "regenerated paragraph keeps its style reference"
+        );
+        /* Re-read: styles.xml rode passthrough, the pStyle ref survived,
+        so the cascade still resolves bold+italic via the style table —
+        higher fidelity than the pre-#29 bake, which collapsed the
+        cascade into direct formatting on save. */
         let reparsed = read_docx(&saved).expect("re-read");
         let q = &reparsed.document.nth_paragraph(0).unwrap();
         assert_eq!(q.text, "hello EDITED cascade");
-        assert!(
-            q.spans
-                .iter()
-                .any(|s| s.style.bold == Some(true) && s.style.italic == Some(true))
-        );
+        assert_eq!(q.style_id.as_deref(), Some("ChildStyle"));
+        let run = reparsed
+            .document
+            .resolve_style_run_cascade(q.style_id.as_deref());
+        assert_eq!(run.bold, Some(true));
+        assert_eq!(run.italic, Some(true));
     }
 
     /* ---- Phase 4: numbering + list markers ------------------------- */

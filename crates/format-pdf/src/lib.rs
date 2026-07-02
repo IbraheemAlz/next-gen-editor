@@ -26,6 +26,35 @@
 //! pulls it in from `OUT_DIR` with `include_bytes!`. Nothing binary lands in
 //! the source tree, and the build stays hermetic — no network fetch.
 //!
+//! # PDF/A-2u
+//!
+//! [`PdfProfile::A2u`] targets ISO 19005-2 conformance level U: the same
+//! sRGB `OutputIntent` + document `/ID` machinery as A-1b, a PDF 1.7 header
+//! (PDF/A-2 is based on ISO 32000-1), and an XMP packet claiming
+//! `pdfaid:part` 2 / `pdfaid:conformance` U. Level U's defining requirement —
+//! every text string maps to Unicode — is carried by the `/ToUnicode` CMaps
+//! every profile already emits. Level A tagging is out of scope, as for A-1.
+//!
+//! # PDF/X-3
+//!
+//! [`PdfProfile::X3`] targets PDF/X-3:2003 (ISO 15930-6): a PDF 1.4 header,
+//! an `OutputIntent` with subtype `GTS_PDFX`, an Info dictionary carrying
+//! `/Title`, `/GTS_PDFXVersion (PDF/X-3:2003)`, `/Trapped /False` and
+//! creation/modification dates, a `/TrimBox` on every page (equal to the
+//! MediaBox — this document model has no bleed, and X-3 forbids inventing a
+//! BleedBox that lies), and a matching XMP packet. Honest deviations from a
+//! strict print workflow:
+//!
+//! - The output condition is `Custom` with the synthesized sRGB ICC profile
+//!   as `DestOutputProfile` — X-3 explicitly allows device-independent
+//!   (ICC-characterized) data, but a real print shop would substitute a
+//!   measured CMYK printing condition (e.g. FOGRA39).
+//! - `/CreationDate`, `/ModDate` and the XMP dates are a **fixed, documented
+//!   timestamp** (`X3_DATE_XMP`) so exports stay byte-deterministic
+//!   (reproducible-build convention); they do not reflect wall-clock time.
+//! - `/Title` is a fixed string (`X3_TITLE`) — the export API carries no
+//!   document title today.
+//!
 //! # Stream compression & text extraction
 //!
 //! Content streams and the embedded `FontFile2` programs are zlib-compressed
@@ -39,9 +68,10 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use layout::{LayoutBlock, PageBox, ParagraphBox, TableBox, VisualRun};
 use pdf_writer::types::{
-    CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, TextRenderingMode, UnicodeCmap,
+    CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, TextRenderingMode, TrappingStatus,
+    UnicodeCmap,
 };
-use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
+use pdf_writer::{Content, Date, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use text_pipeline::{FontStack, LoadedFont};
@@ -50,26 +80,94 @@ use text_pipeline::{FontStack, LoadedFont};
 /// `build.rs` — see this module's docs for why it is generated, not vendored.
 const SRGB_ICC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/srgb-v2-micro.icc"));
 
-/// XMP metadata packet for a PDF/A-1b document. The `pdfaid` keys are the
+/// XMP metadata packet for a PDF/A document. The `pdfaid` keys are the
 /// conformance claim veraPDF checks; no Info dictionary is written, so there is
-/// nothing this must be kept consistent with (ISO 19005-1 §6.7.3).
-const XMP_PACKET: &str = concat!(
-    "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
-    "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n",
-    " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
-    "  <rdf:Description rdf:about=\"\"\n",
-    "    xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"\n",
-    "    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n",
-    "    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">\n",
-    "   <pdfaid:part>1</pdfaid:part>\n",
-    "   <pdfaid:conformance>B</pdfaid:conformance>\n",
-    "   <dc:format>application/pdf</dc:format>\n",
-    "   <xmp:CreatorTool>next-gen-editor</xmp:CreatorTool>\n",
-    "  </rdf:Description>\n",
-    " </rdf:RDF>\n",
-    "</x:xmpmeta>\n",
-    "<?xpacket end=\"r\"?>",
-);
+/// nothing this must be kept consistent with (ISO 19005-1 §6.7.3 / 19005-2
+/// §6.6.4). `part` / `conformance` are `1`/`B` for A-1b and `2`/`U` for A-2u —
+/// the packet bytes for `(1, 'B')` are identical to the pre-A2u constant, so
+/// the A-1b output stays byte-stable.
+fn pdfa_xmp(part: u8, conformance: char) -> String {
+    format!(
+        concat!(
+            "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n",
+            " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
+            "  <rdf:Description rdf:about=\"\"\n",
+            "    xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"\n",
+            "    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n",
+            "    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">\n",
+            "   <pdfaid:part>{part}</pdfaid:part>\n",
+            "   <pdfaid:conformance>{conformance}</pdfaid:conformance>\n",
+            "   <dc:format>application/pdf</dc:format>\n",
+            "   <xmp:CreatorTool>next-gen-editor</xmp:CreatorTool>\n",
+            "  </rdf:Description>\n",
+            " </rdf:RDF>\n",
+            "</x:xmpmeta>\n",
+            "<?xpacket end=\"r\"?>",
+        ),
+        part = part,
+        conformance = conformance,
+    )
+}
+
+/// `/Title` for the PDF/X-3 Info dictionary — the export API carries no
+/// document title, so a fixed honest placeholder keeps the required key
+/// present *and* the output byte-deterministic.
+const X3_TITLE: &str = "next-gen-editor document";
+
+/// The fixed timestamp PDF/X-3 output stamps into `/CreationDate`, `/ModDate`
+/// and the XMP dates. X-3 *requires* both date keys, but a wall-clock value
+/// would break the byte-determinism the document `/ID` and the stability
+/// tests guarantee — so, per the reproducible-build convention, the date is a
+/// documented constant, not the real export time.
+const X3_DATE_XMP: &str = "2026-01-01T00:00:00+00:00";
+
+/// [`X3_DATE_XMP`] in `pdf_writer::Date` form (`D:20260101000000+00'00`).
+fn x3_date() -> Date {
+    Date::new(2026)
+        .month(1)
+        .day(1)
+        .hour(0)
+        .minute(0)
+        .second(0)
+        .utc_offset_hour(0)
+}
+
+/// XMP metadata packet for a PDF/X-3 document, kept consistent with the Info
+/// dictionary (`dc:title` ↔ `/Title`, `pdfxid:GTS_PDFXVersion` ↔
+/// `/GTS_PDFXVersion`, `pdf:Trapped` ↔ `/Trapped`, dates ↔
+/// `/CreationDate` + `/ModDate`).
+fn x3_xmp() -> String {
+    format!(
+        concat!(
+            "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n",
+            " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
+            "  <rdf:Description rdf:about=\"\"\n",
+            "    xmlns:pdfxid=\"http://www.npes.org/pdfx/ns/id/\"\n",
+            "    xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\"\n",
+            "    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n",
+            "    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">\n",
+            "   <pdfxid:GTS_PDFXVersion>PDF/X-3:2003</pdfxid:GTS_PDFXVersion>\n",
+            "   <pdf:Trapped>False</pdf:Trapped>\n",
+            "   <dc:format>application/pdf</dc:format>\n",
+            "   <dc:title>\n",
+            "    <rdf:Alt>\n",
+            "     <rdf:li xml:lang=\"x-default\">{title}</rdf:li>\n",
+            "    </rdf:Alt>\n",
+            "   </dc:title>\n",
+            "   <xmp:CreatorTool>next-gen-editor</xmp:CreatorTool>\n",
+            "   <xmp:CreateDate>{date}</xmp:CreateDate>\n",
+            "   <xmp:ModifyDate>{date}</xmp:ModifyDate>\n",
+            "  </rdf:Description>\n",
+            " </rdf:RDF>\n",
+            "</x:xmpmeta>\n",
+            "<?xpacket end=\"r\"?>",
+        ),
+        title = X3_TITLE,
+        date = X3_DATE_XMP,
+    )
+}
 
 /// Shear factor for faux italic — mirrors `render::synth::SHEAR` (~12.4°)
 /// so the PDF oblique matches the canvas raster synthesis.
@@ -84,6 +182,19 @@ pub enum PdfProfile {
     /// `OutputIntent`, an XMP metadata packet and a document `/ID` on top of
     /// the full font embedding the plain path already produces.
     A1b,
+    /// PDF/A-2u (ISO 19005-2 level U): the A-1b structures with a PDF 1.7
+    /// header and an XMP claim of `pdfaid:part` 2 / `pdfaid:conformance` U.
+    /// Level U's Unicode-mapping requirement rides on the `/ToUnicode` CMaps
+    /// every profile ships; level A tagging remains out of scope.
+    A2u,
+    /// PDF/X-3:2003 (ISO 15930-6): PDF 1.4, a `GTS_PDFX` `OutputIntent`
+    /// (`Custom` condition backed by the synthesized sRGB ICC profile — X-3
+    /// permits ICC-characterized RGB data), an Info dictionary with `/Title`,
+    /// `/GTS_PDFXVersion`, `/Trapped /False` and fixed deterministic dates,
+    /// and `/TrimBox` = MediaBox on every page (no bleed in this document
+    /// model, so no BleedBox is invented). See the module docs for the honest
+    /// deviations from a real print-shop workflow.
+    X3,
 }
 
 /// The five indirect objects + resource name an embedded font occupies.
@@ -106,7 +217,7 @@ struct FontObj {
 /// glyph clusters against that table, so a paragraph split across pages
 /// (head + tail) gets the same `/ToUnicode` mapping on both halves
 /// (their `source_paragraph_id` is identical). `profile` selects plain
-/// output or PDF/A-1b conformance.
+/// output or one of the PDF/A-1b, PDF/A-2u, PDF/X-3 conformance targets.
 pub fn export_pdf(
     pages: &[PageBox],
     fonts: &FontStack,
@@ -114,7 +225,11 @@ pub fn export_pdf(
     profile: PdfProfile,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let pdfa = profile == PdfProfile::A1b;
+    let pdfa = matches!(profile, PdfProfile::A1b | PdfProfile::A2u);
+    let pdfx = profile == PdfProfile::X3;
+    /* Every conformance target shares the ICC output intent, the XMP
+    metadata stream and the deterministic document `/ID`. */
+    let conformant = pdfa || pdfx;
 
     /* Distinct fonts referenced by every page, in first-seen order. */
     let mut used: Vec<&str> = Vec::new();
@@ -136,8 +251,12 @@ pub fn export_pdf(
     }
 
     let mut pdf = Pdf::new();
-    if pdfa {
-        pdf.set_version(1, 4);
+    match profile {
+        PdfProfile::Plain => {}
+        /* PDF/A-1 is based on PDF 1.4; PDF/X-3:2003 likewise. */
+        PdfProfile::A1b | PdfProfile::X3 => pdf.set_version(1, 4),
+        /* PDF/A-2 is based on ISO 32000-1 (PDF 1.7). */
+        PdfProfile::A2u => pdf.set_version(1, 7),
     }
 
     let mut next = 1_i32;
@@ -167,8 +286,11 @@ pub fn export_pdf(
             )
         })
         .collect();
-    let icc_id = if pdfa { Some(alloc()) } else { None };
-    let metadata_id = if pdfa { Some(alloc()) } else { None };
+    let icc_id = if conformant { Some(alloc()) } else { None };
+    let metadata_id = if conformant { Some(alloc()) } else { None };
+    /* X-3 alone requires an Info dictionary (`/Title`, `/GTS_PDFXVersion`,
+    `/Trapped`, dates); PDF/A deliberately writes none — see `pdfa_xmp`. */
+    let info_id = if pdfx { Some(alloc()) } else { None };
 
     /* Build every page's content stream first — the digest in PDF/A `/ID`
     is keyed on the concatenated uncompressed content so split exports
@@ -177,7 +299,7 @@ pub fn export_pdf(
         .iter()
         .map(|page| build_content(page, &font_objs))
         .collect();
-    if pdfa {
+    if conformant {
         let mut hash_in: Vec<u8> = Vec::new();
         for c in &contents {
             hash_in.extend_from_slice(c);
@@ -194,17 +316,30 @@ pub fn export_pdf(
     {
         let mut catalog = pdf.catalog(catalog_id);
         catalog.pages(pages_id);
-        if pdfa {
-            catalog.metadata(metadata_id.expect("metadata id allocated for A1b"));
+        if conformant {
+            catalog.metadata(metadata_id.expect("metadata id allocated for conformance"));
             let mut intents = catalog.output_intents();
             let mut intent = intents.push();
-            intent
-                .subtype(OutputIntentSubtype::PDFA)
-                .output_condition_identifier(TextStr("sRGB IEC61966-2.1"))
-                .output_condition(TextStr("sRGB IEC61966-2.1"))
-                .registry_name(TextStr("http://www.color.org"))
-                .info(TextStr("sRGB IEC61966-2.1"))
-                .dest_output_profile(icc_id.expect("icc id allocated for A1b"));
+            if pdfa {
+                /* GTS_PDFA1 is the subtype for every PDF/A part (1–4). */
+                intent
+                    .subtype(OutputIntentSubtype::PDFA)
+                    .output_condition_identifier(TextStr("sRGB IEC61966-2.1"))
+                    .output_condition(TextStr("sRGB IEC61966-2.1"))
+                    .registry_name(TextStr("http://www.color.org"))
+                    .info(TextStr("sRGB IEC61966-2.1"))
+                    .dest_output_profile(icc_id.expect("icc id allocated for conformance"));
+            } else {
+                /* X-3: no registered printing condition — `Custom` with the
+                embedded sRGB profile as the characterization. `/Info` is
+                mandatory when the identifier names no registry entry. */
+                intent
+                    .subtype(OutputIntentSubtype::PDFX)
+                    .output_condition_identifier(TextStr("Custom"))
+                    .output_condition(TextStr("sRGB IEC61966-2.1"))
+                    .info(TextStr("sRGB IEC61966-2.1"))
+                    .dest_output_profile(icc_id.expect("icc id allocated for conformance"));
+            }
         }
     }
 
@@ -223,6 +358,12 @@ pub fn export_pdf(
         let mut p = pdf.page(*page_id);
         p.parent(pages_id);
         p.media_box(media);
+        if pdfx {
+            /* X-3 §6.1: every page carries a TrimBox (or ArtBox). TrimBox is
+            not inheritable, so it goes on each page — equal to the MediaBox
+            because this document model has no bleed. */
+            p.trim_box(media);
+        }
         p.contents(*content_id);
         let mut resources = p.resources();
         let mut font_dict = resources.fonts();
@@ -245,12 +386,30 @@ pub fn export_pdf(
             .filter(Filter::FlateDecode);
     }
 
-    if pdfa {
-        pdf.icc_profile(icc_id.expect("icc id allocated for A1b"), SRGB_ICC)
+    if let Some(info_id) = info_id {
+        /* X-3 Info dictionary — every key mirrored into the XMP packet so
+        the two stay consistent. The dates are the fixed deterministic
+        timestamp; see `X3_DATE_XMP`. */
+        let mut info = pdf.document_info(info_id);
+        info.title(TextStr(X3_TITLE));
+        info.creation_date(x3_date());
+        info.modified_date(x3_date());
+        info.trapped(TrappingStatus::NotTrapped);
+        info.pair(Name(b"GTS_PDFXVersion"), TextStr("PDF/X-3:2003"));
+    }
+
+    if conformant {
+        pdf.icc_profile(icc_id.expect("icc id allocated for conformance"), SRGB_ICC)
             .n(3);
+        let xmp = match profile {
+            PdfProfile::A1b => pdfa_xmp(1, 'B'),
+            PdfProfile::A2u => pdfa_xmp(2, 'U'),
+            PdfProfile::X3 => x3_xmp(),
+            PdfProfile::Plain => unreachable!("Plain writes no metadata stream"),
+        };
         pdf.metadata(
-            metadata_id.expect("metadata id allocated for A1b"),
-            XMP_PACKET.as_bytes(),
+            metadata_id.expect("metadata id allocated for conformance"),
+            xmp.as_bytes(),
         );
     }
 
@@ -1448,6 +1607,143 @@ mod tests {
         )
         .expect("export b");
         assert_eq!(a, b, "A1b export must be byte-stable for identical input");
+    }
+
+    #[test]
+    fn exports_pdfa2u_compliance_markers() {
+        let stack = liberation_stack();
+        let page = hello_page(&stack);
+
+        let mut out = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::A2u,
+            &mut out,
+        )
+        .expect("export A2u");
+
+        let has = |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+        assert!(out.starts_with(b"%PDF-1.7"), "PDF/A-2 must declare PDF 1.7");
+        assert!(has(b"/OutputIntent"), "missing output intent");
+        assert!(
+            has(b"GTS_PDFA1"),
+            "missing PDF/A output intent subtype (GTS_PDFA1 covers parts 1-4)"
+        );
+        assert!(has(b"/DestOutputProfile"), "missing embedded ICC reference");
+        assert!(has(b"acsp"), "ICC profile signature absent from stream");
+        assert!(has(b"/Metadata"), "missing XMP metadata stream");
+        assert!(has(b"pdfaid:part>2"), "missing pdfaid:part 2");
+        assert!(has(b"pdfaid:conformance>U"), "missing pdfaid:conformance U");
+        assert!(has(b"/ID"), "missing trailer document id");
+        assert!(has(b"/FontFile2"), "font not embedded");
+        assert!(
+            has(b"/ToUnicode"),
+            "level U requires the text-to-Unicode mapping"
+        );
+        assert!(out.ends_with(b"%%EOF"), "missing EOF marker");
+    }
+
+    #[test]
+    fn a2u_export_is_byte_stable() {
+        let stack = liberation_stack();
+        let page = hello_page(&stack);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::A2u,
+            &mut a,
+        )
+        .expect("export a");
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::A2u,
+            &mut b,
+        )
+        .expect("export b");
+        assert_eq!(a, b, "A2u export must be byte-stable for identical input");
+    }
+
+    #[test]
+    fn exports_pdfx3_markers() {
+        let stack = liberation_stack();
+        let page = hello_page(&stack);
+
+        let mut out = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::X3,
+            &mut out,
+        )
+        .expect("export X3");
+
+        let has = |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            out.starts_with(b"%PDF-1.4"),
+            "PDF/X-3:2003 must declare PDF 1.4"
+        );
+        assert!(has(b"/OutputIntent"), "missing output intent");
+        assert!(
+            has(b"/S /GTS_PDFX"),
+            "output intent subtype must be GTS_PDFX"
+        );
+        assert!(
+            has(b"/OutputConditionIdentifier"),
+            "missing output condition identifier"
+        );
+        assert!(has(b"/DestOutputProfile"), "missing embedded ICC reference");
+        assert!(has(b"acsp"), "ICC profile signature absent from stream");
+        assert!(
+            has(b"GTS_PDFXVersion"),
+            "missing GTS_PDFXVersion in the Info dictionary"
+        );
+        assert!(has(b"PDF/X-3:2003"), "missing PDF/X version string");
+        assert!(has(b"/Title"), "X-3 requires /Title in the Info dictionary");
+        assert!(has(b"/CreationDate"), "X-3 requires /CreationDate");
+        assert!(has(b"/ModDate"), "X-3 requires /ModDate");
+        assert!(
+            has(b"/Trapped /False"),
+            "X-3 requires an explicit trapped state"
+        );
+        assert!(has(b"/TrimBox"), "X-3 requires a TrimBox on every page");
+        assert!(has(b"/ID"), "missing trailer document id");
+        assert!(has(b"/FontFile2"), "font not embedded");
+        assert!(
+            has(b"pdfxid:GTS_PDFXVersion"),
+            "XMP must mirror the Info dict's PDF/X version claim"
+        );
+        assert!(out.ends_with(b"%%EOF"), "missing EOF marker");
+    }
+
+    /// The X-3 TrimBox rides on every page and equals the MediaBox — the
+    /// non-X profiles must not grow one.
+    #[test]
+    fn trim_box_is_x3_only() {
+        let stack = liberation_stack();
+        let page = hello_page(&stack);
+        for profile in [PdfProfile::Plain, PdfProfile::A1b, PdfProfile::A2u] {
+            let mut out = Vec::new();
+            export_pdf(
+                std::slice::from_ref(&page),
+                &stack,
+                &["Hello world"],
+                profile,
+                &mut out,
+            )
+            .expect("export");
+            assert!(
+                !out.windows(8).any(|w| w == b"/TrimBox"),
+                "{profile:?} must not emit a TrimBox"
+            );
+        }
     }
 
     #[test]

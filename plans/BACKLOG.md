@@ -137,12 +137,20 @@ requires `/W` to match the embedded font. Glyph *positioning* still rides
 explicit per-glyph text matrices by design: our `x_advance` carries
 justification + Kashida adjustments the font's intrinsic widths do not.
 
+**✅ Shipped (issue #28, 2026-07-02):** real PDF/A-2u + PDF/X-3 targets.
+`PdfProfile::A2u` (PDF 1.7 header, `pdfaid:part` 2 / conformance U XMP) is
+veraPDF-validated as PDF/A-2u; `PdfProfile::X3` emits PDF/X-3:2003 — a
+`GTS_PDFX` output intent over the synthesized sRGB ICC, an Info dict with
+`/Title` + `/GTS_PDFXVersion` + `/Trapped` + fixed deterministic dates, and a
+per-page `/TrimBox` (veraPDF ships no PDF/X flavour, so
+`tools/pdf-validate --profile x3` stops at the structural check).
+`do_export_pdf` maps all three `PdfConformance` values 1:1 — the Plain
+fallback and the FileMenu "Engine pending" badges are gone.
+
 **Deferred:**
 
 - **Font subsetting.** The whole font still embeds rather than just the used
   glyphs. Subsetting would shrink the output further.
-- **PDF/A-2 / PDF/X.** `PdfConformance::A2u` and `X3` currently fall back to a
-  plain PDF; only `A1b` is implemented.
 
 ## 4. Vello (WebGPU) render path
 

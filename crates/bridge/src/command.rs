@@ -554,6 +554,14 @@ pub enum Command {
         text: String,
         author: String,
     },
+
+    /// Issue #21 — mutate an existing style DEFINITION and re-cascade
+    /// every dependent paragraph (assignment stays `ApplyStyle`).
+    /// Unknown `style_id` replies `Event::Error`.
+    ModifyStyle {
+        style_id: String,
+        properties: BridgeStyleProperties,
+    },
 }
 
 /// Wire shape for `engine::CellBorders` — per-edge strokes for one
@@ -670,6 +678,55 @@ pub enum PdfConformance {
 }
 
 /// A sparse patch of inline text attributes — `None` fields are left
+/// Issue #21 — patch for a style's `<w:pPr>` half. A pragmatic subset
+/// of the paragraph surface (alignment / direction / line spacing /
+/// indents / shading); borders, tab stops and numbering stay
+/// per-paragraph concerns. `None` preserves the current value.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+pub struct BridgeParaPropertiesPatch {
+    pub alignment: Option<Alignment>,
+    pub direction: Option<Direction>,
+    /// Word "Multiple" line spacing; `1.0` = single.
+    pub line_spacing_multiplier: Option<f32>,
+    pub indent_start_pt: Option<f32>,
+    pub indent_end_pt: Option<f32>,
+    /// Positive = first-line indent, negative = hanging.
+    pub first_line_pt: Option<f32>,
+    pub shading: Option<Color>,
+}
+
+/// Issue #21 — patch for a style's `<w:rPr>` half (engine `SpanStyle`
+/// mirror). `None` preserves.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+pub struct BridgeSpanStylePatch {
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<UnderlineStyle>,
+    pub strike: Option<bool>,
+    pub font_size: Option<f32>,
+    pub color: Option<Color>,
+    pub bg_color: Option<Color>,
+    pub font_family: Option<String>,
+    pub caps: Option<bool>,
+    pub small_caps: Option<bool>,
+}
+
+/// Issue #21 — the `ModifyStyle` payload. `based_on` re-parents when
+/// `Some`; `clear_based_on: Some(true)` detaches the parent (two fields
+/// because three states matter and `Option<Option<T>>` has no stable
+/// JSON encoding through tsify); both absent leaves the parent alone.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+pub struct BridgeStyleProperties {
+    pub para_props: Option<BridgeParaPropertiesPatch>,
+    pub run_props: Option<BridgeSpanStylePatch>,
+    pub based_on: Option<String>,
+    pub clear_based_on: Option<bool>,
+    pub display_name: Option<String>,
+}
+
 /// unchanged. The resolved counterpart is [`crate::TextAttrs`].
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
 pub struct TextAttrsPatch {

@@ -43,6 +43,7 @@ import type {
     InsertSide,
     PageOrientation,
     ListKind,
+    BridgeStyleProperties,
 } from './types';
 
 /** Sprint 12 (#11) — paragraph style id. The engine now models real
@@ -260,6 +261,10 @@ export interface EditorCommands {
      * `STYLE_PRESETS` table remains a UI-side fallback for documents
      * that don't ship the picked style id. */
     applyStyle(styleId: ParagraphStyleId, range?: LogicalRange): Promise<Event>;
+    /** Issue #21 — mutate an existing style DEFINITION (assignment is
+     *  `applyStyle`); the engine re-cascades every dependent paragraph
+     *  and regenerates styles.xml on the next save. */
+    modifyStyle(styleId: ParagraphStyleId, properties: BridgeStyleProperties): Promise<Event>;
 
     /* Page setup (Sprint 4 UI Edition). All margin units are points. */
     setPageMargins(
@@ -578,6 +583,8 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 range: currentRange(range),
                 style_id: styleId,
             }),
+        modifyStyle: (styleId, properties) =>
+            dispatch({ type: 'MODIFY_STYLE', style_id: styleId, properties }),
 
         setPageMargins: (at, top_pt, right_pt, bottom_pt, left_pt) =>
             dispatch({

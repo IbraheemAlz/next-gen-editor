@@ -74,6 +74,10 @@
     min-height: 38px;
 }
 
+/* Engine-pending pattern chips — no FileMenu entry is gated today (the
+   PDF/A-2u / PDF/X-3 entries were un-gated by issue #28, 2026-07), but the
+   classes stay as the canonical Honest-UX shape for future gated entries.
+   See .claude/rules/sdk-architecture.md "Honest UX". */
 .nge-fm__item--disabled {
     color: var(--nge-color-text-muted);
     cursor: not-allowed;

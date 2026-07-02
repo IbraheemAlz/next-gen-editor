@@ -116,6 +116,15 @@ pub struct DocumentTree {
     /// resolver merges `defaults → style chain → direct_overrides`
     /// in document order.
     pub style_defaults: ParaProperties,
+    /// Issue #29 — `<w:docDefaults><w:rPrDefault>` run properties. The
+    /// base of the run cascade: `style_run_defaults → pStyle-chain
+    /// <w:rPr> → direct span formatting`, folded at span-materialize
+    /// time (engine-wasm `build_style_spans`), never baked into spans.
+    pub style_run_defaults: SpanStyle,
+    /// Issue #21 — flips when `modify_style` mutates the style table so
+    /// the `.docx` writer regenerates `word/styles.xml` (mirror of
+    /// `NumberingDefinitions.dirty`). Never set by reads.
+    pub styles_dirty: bool,
     /// Sprint 13 (#12) — in-memory mirror of `word/numbering.xml`.
     /// Drives marker resolution + the synthesis path the
     /// `Command::ToggleList { Bullet | Number }` handler invokes.
@@ -1837,6 +1846,8 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            style_run_defaults: SpanStyle::default(),
+            styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
         }
     }
@@ -1871,6 +1882,8 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            style_run_defaults: SpanStyle::default(),
+            styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
         }
     }
@@ -1907,6 +1920,8 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            style_run_defaults: SpanStyle::default(),
+            styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
         }
     }
@@ -1930,6 +1945,8 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            style_run_defaults: SpanStyle::default(),
+            styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
         }
     }
@@ -1953,6 +1970,8 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            style_run_defaults: SpanStyle::default(),
+            styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
         }
     }
@@ -1993,6 +2012,8 @@ impl DocumentTree {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            style_run_defaults: SpanStyle::default(),
+            styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
         }
     }
@@ -2526,6 +2547,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2597,6 +2620,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2635,6 +2660,8 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                style_run_defaults: self.style_run_defaults.clone(),
+                styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
             };
         }
@@ -2678,6 +2705,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2729,6 +2758,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2757,6 +2788,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2804,6 +2837,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2857,6 +2892,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2901,6 +2938,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2927,6 +2966,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -2999,6 +3040,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3056,6 +3099,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         };
         (doc, new_id)
@@ -3125,6 +3170,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         };
         Some((doc, new_id))
@@ -3173,6 +3220,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3197,6 +3246,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3274,6 +3325,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3306,6 +3359,14 @@ impl DocumentTree {
             out = out.clone().merged_with(def.para.clone());
         }
         out
+    }
+
+    /// Issue #29 — the RUN half of the cascade: fold
+    /// `style_run_defaults → pStyle chain <w:rPr>` (root → leaf) into
+    /// the `SpanStyle` a run inherits before its direct formatting.
+    /// Same cycle / depth guards as [`Self::resolve_style_cascade`].
+    pub fn resolve_style_run_cascade(&self, style_id: Option<&str>) -> SpanStyle {
+        resolve_run_cascade(&self.styles, &self.style_run_defaults, style_id)
     }
 
     /// Sprint 12 (#11) — apply `style_id` to every paragraph the range
@@ -3355,6 +3416,89 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
+            numbering: self.numbering.clone(),
+        }
+    }
+
+    /// Issue #21 — mutate an existing style definition in-place and
+    /// re-cascade every styled paragraph (body + table cells). Patch
+    /// semantics: `None` leaves a half untouched; `Some(patch)` folds
+    /// over the current definition via `merged_with`. `based_on` is the
+    /// three-state knob (leave / clear / re-parent). Direct overrides
+    /// survive verbatim — the #11 re-application discipline. Flips
+    /// `styles_dirty` so the writer regenerates `word/styles.xml`.
+    /// Unknown `style_id` is a no-op clone.
+    pub fn modify_style(
+        &self,
+        style_id: &str,
+        para_patch: Option<ParaProperties>,
+        run_patch: Option<SpanStyle>,
+        based_on: Option<Option<String>>,
+        display_name: Option<String>,
+    ) -> Self {
+        if !self.styles.contains_key(style_id) {
+            return self.clone();
+        }
+        let mut styles = self.styles.clone();
+        if let Some(def) = styles.get_mut(style_id) {
+            if let Some(pp) = para_patch {
+                def.para = def.para.clone().merged_with(pp);
+            }
+            if let Some(rp) = run_patch {
+                def.run = def.run.clone().merged_with(rp);
+            }
+            if let Some(b) = based_on {
+                def.based_on = b;
+            }
+            if let Some(n) = display_name {
+                def.name = n;
+            }
+        }
+        /* Re-resolve every paragraph's cascaded para props against the
+        mutated table (the run half folds at span-materialize time, so
+        it re-cascades for free). Recomputing unstyled paragraphs too
+        is a harmless idempotent fold — cheaper than chain-membership
+        bookkeeping and immune to basedOn re-parenting edge cases. */
+        fn recompute_block(
+            b: &mut Block,
+            styles: &std::collections::HashMap<String, ParagraphStyle>,
+            defaults: &ParaProperties,
+        ) {
+            match b {
+                Block::Paragraph(p) => recompute_paragraph_props(p, styles, defaults),
+                Block::Table(t) => {
+                    for row in &mut t.rows {
+                        for cell in &mut row.cells {
+                            for cb in &mut cell.blocks {
+                                recompute_block(cb, styles, defaults);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut blocks = self.blocks.clone();
+        for i in 0..blocks.len() {
+            let mut b = blocks[i].clone();
+            recompute_block(&mut b, &styles, &self.style_defaults);
+            blocks.set(i, b);
+        }
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+            styles,
+            style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: true,
             numbering: self.numbering.clone(),
         }
     }
@@ -3401,6 +3545,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3450,6 +3596,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3496,6 +3644,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3569,6 +3719,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: next_numbering,
         }
     }
@@ -3609,6 +3761,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3658,6 +3812,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3704,6 +3860,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3816,6 +3974,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3862,6 +4022,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3892,6 +4054,8 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                style_run_defaults: self.style_run_defaults.clone(),
+                styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
             };
         }
@@ -3949,6 +4113,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -3972,6 +4138,8 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                style_run_defaults: self.style_run_defaults.clone(),
+                styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
             };
         }
@@ -3993,6 +4161,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -4133,6 +4303,8 @@ impl DocumentTree {
                     settings: self.settings.clone(),
                     styles: self.styles.clone(),
                     style_defaults: self.style_defaults.clone(),
+                    style_run_defaults: self.style_run_defaults.clone(),
+                    styles_dirty: self.styles_dirty,
                     numbering: self.numbering.clone(),
                 },
                 caret,
@@ -4172,6 +4344,8 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                style_run_defaults: self.style_run_defaults.clone(),
+                styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
             },
             caret,
@@ -4339,6 +4513,8 @@ impl DocumentTree {
                 settings: self.settings.clone(),
                 styles: self.styles.clone(),
                 style_defaults: self.style_defaults.clone(),
+                style_run_defaults: self.style_run_defaults.clone(),
+                styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
             },
             caret,
@@ -4479,6 +4655,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -4505,6 +4683,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -4780,6 +4960,8 @@ impl DocumentTree {
             settings: self.settings.clone(),
             styles: self.styles.clone(),
             style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
     }
@@ -4895,6 +5077,37 @@ pub const MAX_STYLE_CHAIN: usize = 10;
 /// paragraph from its `style_id` cascade ∪ `direct_overrides`.
 /// `style_defaults` is the document's `<w:docDefaults>` snapshot
 /// (sits at the bottom of every cascade).
+/// Issue #29 — free-fn form of [`DocumentTree::resolve_style_run_cascade`]
+/// for callers holding only the style table (span materialization in
+/// engine-wasm). Same cycle / depth guards as the para half.
+pub fn resolve_run_cascade(
+    styles: &std::collections::HashMap<String, ParagraphStyle>,
+    run_defaults: &SpanStyle,
+    style_id: Option<&str>,
+) -> SpanStyle {
+    let mut out = run_defaults.clone();
+    let Some(leaf) = style_id else {
+        return out;
+    };
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut chain: Vec<&ParagraphStyle> = Vec::new();
+    let mut current: Option<&str> = Some(leaf);
+    while let Some(id) = current {
+        if chain.len() >= MAX_STYLE_CHAIN || !visited.insert(id) {
+            break;
+        }
+        let Some(def) = styles.get(id) else {
+            break;
+        };
+        chain.push(def);
+        current = def.based_on.as_deref();
+    }
+    for def in chain.iter().rev() {
+        out = out.merged_with(def.run.clone());
+    }
+    out
+}
+
 pub fn recompute_paragraph_props(
     para: &mut Paragraph,
     styles: &std::collections::HashMap<String, ParagraphStyle>,
@@ -5633,6 +5846,86 @@ mod tests {
     }
 
     /* ---- Sprint 12 (#11): style cascade + shadow direct_overrides --- */
+
+    /// Issue #21 — ModifyStyle mutates the definition and re-cascades
+    /// every dependent paragraph, preserving direct overrides; #29 —
+    /// the run half resolves through the chain.
+    #[test]
+    fn modify_style_recascades_and_flips_dirty() {
+        let d = doc_with_heading_style();
+        let start = LogicalPos::new(BlockPath::top(0), 0);
+        let end = LogicalPos::new(BlockPath::top(0), 5);
+        let d = d.set_paragraph_style(start, end, Some("Heading1".into()));
+        assert_eq!(
+            d.blocks[0].as_paragraph().unwrap().props.alignment,
+            Some(Alignment::Center)
+        );
+        assert!(!d.styles_dirty, "reads never flip the writer gate");
+        let d = d.modify_style(
+            "Heading1",
+            Some(ParaProperties {
+                alignment: Some(Alignment::End),
+                ..Default::default()
+            }),
+            Some(SpanStyle {
+                bold: Some(true),
+                font_size: Some(16.0),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        assert!(d.styles_dirty, "ModifyStyle must arm styles.xml regen");
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(
+            p.props.alignment,
+            Some(Alignment::End),
+            "dependent paragraph re-cascaded"
+        );
+        let run = d.resolve_style_run_cascade(Some("Heading1"));
+        assert_eq!(run.bold, Some(true));
+        assert_eq!(run.font_size, Some(16.0));
+        /* Unknown ids are a no-op clone. */
+        let same = d.modify_style("Nope", None, None, None, None);
+        assert_eq!(same.styles.len(), d.styles.len());
+    }
+
+    /// Issue #21 — a direct override survives a style mutation (the #11
+    /// re-application discipline).
+    #[test]
+    fn modify_style_preserves_direct_overrides() {
+        let d = doc_with_heading_style();
+        let start = LogicalPos::new(BlockPath::top(0), 0);
+        let end = LogicalPos::new(BlockPath::top(0), 5);
+        let d = d.set_paragraph_style(start.clone(), end.clone(), Some("Heading1".into()));
+        /* User sets an explicit alignment on top of the style. */
+        let mut d = d;
+        {
+            let mut blocks = d.blocks.clone();
+            let mut b = blocks[0].clone();
+            if let Block::Paragraph(p) = &mut b {
+                p.direct_overrides.alignment = Some(Alignment::Justify);
+                recompute_paragraph_props(p, &d.styles, &d.style_defaults);
+            }
+            blocks.set(0, b);
+            d.blocks = blocks;
+        }
+        let d = d.modify_style(
+            "Heading1",
+            Some(ParaProperties {
+                alignment: Some(Alignment::End),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            d.blocks[0].as_paragraph().unwrap().props.alignment,
+            Some(Alignment::Justify),
+            "direct override outranks the mutated style"
+        );
+    }
 
     fn doc_with_heading_style() -> DocumentTree {
         let mut d = DocumentTree::from_text("hello");
@@ -7279,6 +7572,8 @@ mod tests {
             settings: DocumentSettings::default(),
             styles: std::collections::HashMap::new(),
             style_defaults: ParaProperties::default(),
+            style_run_defaults: SpanStyle::default(),
+            styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));

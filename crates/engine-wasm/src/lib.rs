@@ -8,8 +8,8 @@ use bridge::{
     A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRow, A11yRun, A11yTable, A11yTree,
     Alignment as BridgeAlignment, AnnouncementPriority, BlockPath as BridgeBlockPath,
     BridgeBorderStroke, BridgeBorderStyle, BridgeCellProperties, BridgeIndent,
-    BridgeSectionGeometry, Color, Command, Direction, DocFormat, EngineStats, Event,
-    FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
+    BridgeSectionGeometry, BridgeStyleProperties, Color, Command, Direction, DocFormat,
+    EngineStats, Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
     LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, MoveDirection,
     PageOrientation as BridgePageOrientation, PathStep as BridgePathStep, PdfConformance,
     Point as BridgePoint, Rect as BridgeRect, SelectionKind, TextAttrs, TextAttrsPatch,
@@ -1269,8 +1269,32 @@ fn build_inline_object_infos(
         .collect()
 }
 
+/// Issue #29 — the slice of the style table span materialization needs
+/// to fold the run cascade (`docDefaults <w:rPr> → pStyle chain`) under
+/// each span's direct formatting. `Copy` so it threads through the
+/// layout call chain without borrow gymnastics.
+#[derive(Clone, Copy)]
+struct StyleContext<'a> {
+    styles: &'a std::collections::HashMap<String, engine::ParagraphStyle>,
+    run_defaults: &'a engine::SpanStyle,
+}
+
+impl StyleContext<'_> {
+    fn of(doc: &engine::DocumentTree) -> StyleContext<'_> {
+        StyleContext {
+            styles: &doc.styles,
+            run_defaults: &doc.style_run_defaults,
+        }
+    }
+
+    fn run_base(&self, style_id: Option<&str>) -> engine::SpanStyle {
+        engine::resolve_run_cascade(self.styles, self.run_defaults, style_id)
+    }
+}
+
 fn build_style_spans(
     para: &engine::Paragraph,
+    sctx: StyleContext,
     default_size: f32,
     default_color: [u8; 4],
     scale: f32,
@@ -1278,33 +1302,15 @@ fn build_style_spans(
     let len = para.text.len() as u32;
     let mut spans: Vec<StyleSpan> = Vec::new();
     let mut cursor = 0_u32;
-    /* A default-styled gap span — covers text between or outside style runs. */
-    let gap = |start: u32, end: u32| StyleSpan {
-        start,
-        end,
-        px_size: default_size * scale,
-        color: default_color,
-        bold: false,
-        italic: false,
-        underline: engine::UnderlineStyle::None,
-        strike: false,
-        bg_color: None,
-        font_family: None,
-        caps_transform: false,
-        baseline_shift_px: 0.0,
-    };
-    for run in &para.spans {
-        if run.start > cursor {
-            spans.push(gap(cursor, run.start));
-        }
-        /* Audit gap A.M1 — `<w:vertAlign>` shrinks the run to ~65 % of
-        its nominal pt size and shifts the baseline. Word's super /
-        subscript both shrink to ~58 %; bump to 65 % so the result
-        stays readable at 12 pt body sizes. Superscript lifts by 33 %
-        of the *base* px (positive in the run's pen-Y space); subscript
-        drops by 15 % (sticks closer to baseline by convention). */
-        let raw_base_px = run.style.font_size.unwrap_or(default_size) * scale;
-        let vert = run.style.vert_align.unwrap_or(engine::VertAlign::Baseline);
+    /* Issue #29 — the run-cascade base for this paragraph. Direct span
+    formatting folds over it; gap (unstyled) text renders it as-is, so
+    a Heading 1 with zero direct formatting picks up the style's bold /
+    size. Unstyled paragraphs resolve to the doc-default rPr, which is
+    empty in fresh documents — byte-identical to the old flat gap. */
+    let run_base = sctx.run_base(para.style_id.as_deref());
+    let emit = |style: &engine::SpanStyle, start: u32, end: u32, out: &mut Vec<StyleSpan>| {
+        let raw_base_px = style.font_size.unwrap_or(default_size) * scale;
+        let vert = style.vert_align.unwrap_or(engine::VertAlign::Baseline);
         let (px_factor, shift_factor) = match vert {
             engine::VertAlign::Baseline => (1.0_f32, 0.0_f32),
             engine::VertAlign::Superscript => (0.65, 0.33),
@@ -1313,17 +1319,16 @@ fn build_style_spans(
         let base_px = (raw_base_px * px_factor).max(1.0);
         let baseline_shift_px = raw_base_px * shift_factor;
         let template = StyleSpan {
-            start: run.start,
-            end: run.end,
+            start,
+            end,
             px_size: base_px,
-            color: run.style.color.unwrap_or(default_color),
-            bold: run.style.bold.unwrap_or(false),
-            italic: run.style.italic.unwrap_or(false),
-            underline: run.style.underline.unwrap_or(engine::UnderlineStyle::None),
-            strike: run.style.strike.unwrap_or(false),
-            bg_color: run.style.bg_color,
-            font_family: run
-                .style
+            color: style.color.unwrap_or(default_color),
+            bold: style.bold.unwrap_or(false),
+            italic: style.italic.unwrap_or(false),
+            underline: style.underline.unwrap_or(engine::UnderlineStyle::None),
+            strike: style.strike.unwrap_or(false),
+            bg_color: style.bg_color,
+            font_family: style
                 .font_family
                 .as_ref()
                 .map(font_family_id)
@@ -1331,11 +1336,18 @@ fn build_style_spans(
             caps_transform: false,
             baseline_shift_px,
         };
-        push_caps_spans(&para.text, &run.style, &template, base_px, &mut spans);
+        push_caps_spans(&para.text, style, &template, base_px, out);
+    };
+    for run in &para.spans {
+        if run.start > cursor {
+            emit(&run_base, cursor, run.start, &mut spans);
+        }
+        let effective = run_base.clone().merged_with(run.style.clone());
+        emit(&effective, run.start, run.end, &mut spans);
         cursor = run.end;
     }
     if cursor < len {
-        spans.push(gap(cursor, len));
+        emit(&run_base, cursor, len, &mut spans);
     }
     spans
 }
@@ -1439,12 +1451,13 @@ fn push_caps_spans(
 /// the text it is being typed into.
 fn composition_layout_spans(
     para: &engine::Paragraph,
+    sctx: StyleContext,
     off: u32,
     comp_len: u32,
     default_size: f32,
     scale: f32,
 ) -> Vec<StyleSpan> {
-    let base = build_style_spans(para, default_size, [0, 0, 0, 255], scale);
+    let base = build_style_spans(para, sctx, default_size, [0, 0, 0, 255], scale);
     let mut out: Vec<StyleSpan> = Vec::with_capacity(base.len() + 2);
     for s in base {
         if s.end <= off {
@@ -1503,10 +1516,26 @@ fn paragraph_layout_key(
     cfg: &RenderConfig,
     scale: f32,
     max_width_px: f32,
+    sctx: StyleContext,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     para.text.hash(&mut h);
+    /* Issue #29/#21 — the resolved run-cascade base feeds span
+    materialization, so two style-table states must never collide on a
+    key (ModifyStyle also clears the cache, but the key is the belt to
+    that suspender). */
+    let run_base = sctx.run_base(para.style_id.as_deref());
+    run_base.font_size.map(f32::to_bits).hash(&mut h);
+    run_base.color.hash(&mut h);
+    run_base.bold.hash(&mut h);
+    run_base.italic.hash(&mut h);
+    format!("{:?}", run_base.underline).hash(&mut h);
+    run_base.strike.hash(&mut h);
+    run_base.bg_color.hash(&mut h);
+    run_base.raw_font_family.hash(&mut h);
+    run_base.caps.hash(&mut h);
+    run_base.small_caps.hash(&mut h);
     /* Audit gap A.H2 — the cache key now folds the laid-out max width
     in. Same paragraph laid out at page-wide vs column-narrow widths
     produces different line breaks; without the mix-in a doc that
@@ -1763,6 +1792,7 @@ fn build_header_footer_box(
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
+    sctx: StyleContext,
 ) -> Option<layout::HeaderFooterBox> {
     if paragraphs.iter().all(|p| p.text.is_empty()) {
         return None;
@@ -1772,7 +1802,7 @@ fn build_header_footer_box(
     for para in paragraphs {
         let spans = apply_revision_overlay(
             apply_hyperlink_overlay(
-                build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale),
+                build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
                 &para.hyperlinks,
                 [0, 0, 0, 255],
             ),
@@ -1991,6 +2021,7 @@ fn layout_table_box(
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
+    sctx: StyleContext,
 ) -> TableBox {
     /* Column widths in device px. Decision tree:
     - `<w:tblLayout w:type="fixed"/>` AND grid present → use grid as-is.
@@ -2015,7 +2046,7 @@ fn layout_table_box(
     cell layout result from the measure pass as the layout (no second
     layout call for unchanged column widths). */
     if matches!(table.props.layout, engine::TableLayout::Autofit) {
-        columns = autofit_distribute(table, available_width_px, fonts, cfg, scale, &columns);
+        columns = autofit_distribute(table, available_width_px, fonts, cfg, scale, &columns, sctx);
     }
 
     let mut rows_out: Vec<TableRowBox> = Vec::with_capacity(table.rows.len());
@@ -2052,7 +2083,8 @@ fn layout_table_box(
             let pad_left = twips_to_layout_px(eff.left_twips, scale);
             let pad_right = twips_to_layout_px(eff.right_twips, scale);
             let content_width = (cell_width - pad_left - pad_right).max(0.0);
-            let inner_blocks = layout_cell_blocks(&cell.blocks, content_width, fonts, cfg, scale);
+            let inner_blocks =
+                layout_cell_blocks(&cell.blocks, content_width, fonts, cfg, scale, sctx);
             let content_height: f32 = inner_blocks.iter().map(|b| b.size().height).sum();
             /* `VMergeRole::Continue` cells contribute zero — the matching
             `Restart` cell visually owns the merged region. */
@@ -2205,6 +2237,7 @@ fn autofit_distribute(
     cfg: &RenderConfig,
     scale: f32,
     grid_hint: &[f32],
+    sctx: StyleContext,
 ) -> Vec<f32> {
     /* Number of columns: max(grid, max row's cell-count). The grid
     might be empty; cells might over-/under-shoot it; take the union. */
@@ -2247,7 +2280,7 @@ fn autofit_distribute(
             let pad = twips_to_layout_px(eff.left_twips + eff.right_twips, scale);
             /* Lay out at the probe width — max line width across all
             paragraphs is the natural fit. */
-            let inner = layout_cell_blocks(&cell.blocks, probe_width, fonts, cfg, scale);
+            let inner = layout_cell_blocks(&cell.blocks, probe_width, fonts, cfg, scale, sctx);
             let natural_content_w = block_max_width(&inner);
             let cell_natural = natural_content_w + pad;
             let share = cell_natural / span as f32;
@@ -2263,7 +2296,7 @@ fn autofit_distribute(
             longest atom that cannot be split. Padding is folded into
             the floor on the same basis as the natural measure. */
             let (cell_min_content, _cell_max_content) =
-                measure_unbreakable_width(&cell.blocks, fonts, cfg, scale);
+                measure_unbreakable_width(&cell.blocks, sctx, fonts, cfg, scale);
             let min_share = (cell_min_content + pad) / span as f32;
             for i in 0..span {
                 let ci = col_cursor + i;
@@ -2385,6 +2418,7 @@ fn autofit_distribute(
 /// the natural-width measurement.
 fn measure_unbreakable_width(
     blocks: &[engine::Block],
+    sctx: StyleContext,
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
@@ -2408,7 +2442,7 @@ fn measure_unbreakable_width(
                 inner table against width = 1.0 so its own
                 `autofit_distribute` lands in the CASE 1 overflow path
                 (returns col_floor verbatim). */
-                let sub_widths = autofit_distribute(t, 1.0, fonts, cfg, scale, &[]);
+                let sub_widths = autofit_distribute(t, 1.0, fonts, cfg, scale, &[], sctx);
                 let sub_sum: f32 = sub_widths.iter().sum();
                 if sub_sum > min_content {
                     min_content = sub_sum;
@@ -2563,13 +2597,14 @@ fn layout_cell_blocks(
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
+    sctx: StyleContext,
 ) -> Vec<LayoutBlock> {
     let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
     for b in blocks {
         let mut lb = match b {
             engine::Block::Paragraph(p) => {
-                let spans = build_style_spans(p, cfg.px_size, [0, 0, 0, 255], scale);
+                let spans = build_style_spans(p, sctx, cfg.px_size, [0, 0, 0, 255], scale);
                 let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&p.props, scale);
                 let tab_stops_px = tab_stops_to_layout_px(&p.props.tab_stops, scale);
                 let (lh_px, lh_exact) =
@@ -2594,9 +2629,14 @@ fn layout_cell_blocks(
                 };
                 LayoutBlock::Paragraph(layout_paragraph(pcfg))
             }
-            engine::Block::Table(t) => {
-                LayoutBlock::Table(layout_table_box(t, content_width_px, fonts, cfg, scale))
-            }
+            engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
+                t,
+                content_width_px,
+                fonts,
+                cfg,
+                scale,
+                sctx,
+            )),
         };
         let mut o = lb.origin();
         o.y = y;
@@ -3998,6 +4038,10 @@ impl Engine {
             } => self.do_set_paragraph_indent(range, start_pt, end_pt, first_line_pt),
             Command::SetTabStops { range, stops } => self.do_set_tab_stops(range, stops),
             Command::ApplyStyle { range, style_id } => self.do_apply_style(range, style_id),
+            Command::ModifyStyle {
+                style_id,
+                properties,
+            } => self.do_modify_style(style_id, properties),
             Command::SetLineSpacing { range, multiplier } => {
                 self.do_set_line_spacing(range, multiplier)
             }
@@ -4467,6 +4511,7 @@ impl Engine {
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
         let doc = self.undo.current().clone();
+        let sctx = StyleContext::of(&doc);
         let mut cache = self.layout_cache.borrow_mut();
         let composition = if with_composition {
             self.composition.as_ref()
@@ -4562,7 +4607,7 @@ impl Engine {
                             table: &std::collections::HashMap<String, Vec<engine::Paragraph>>|
              -> Option<layout::HeaderFooterBox> {
                 let rid = slot?;
-                build_header_footer_box(table.get(rid)?, content_w, &font_stack, &cfg, scale)
+                build_header_footer_box(table.get(rid)?, content_w, &font_stack, &cfg, scale, sctx)
             };
             let headers = layout::HeaderBands {
                 default: lay_band(section.header_refs.default.as_ref(), &doc.headers),
@@ -4655,7 +4700,7 @@ impl Engine {
                 match block {
                     engine::Block::Table(t) => {
                         let mut tb =
-                            layout_table_box(t, pag.column_width(), &font_stack, &cfg, scale);
+                            layout_table_box(t, pag.column_width(), &font_stack, &cfg, scale, sctx);
                         assign_source_ids_table(&mut tb, &mut next_para_id);
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Table(tb), 0.0, 0.0);
@@ -4679,6 +4724,7 @@ impl Engine {
                                 apply_hyperlink_overlay(
                                     composition_layout_spans(
                                         para,
+                                        sctx,
                                         off as u32,
                                         c.text.len() as u32,
                                         cfg.px_size,
@@ -4714,13 +4760,20 @@ impl Engine {
                                 tab_stops_px: &tab_stops_px,
                             })
                         } else {
-                            let key = paragraph_layout_key(para, &cfg, scale, pag.column_width());
+                            let key =
+                                paragraph_layout_key(para, &cfg, scale, pag.column_width(), sctx);
                             if let Some(cached) = cache.get(&key) {
                                 cached.clone()
                             } else {
                                 let spans = apply_revision_overlay(
                                     apply_hyperlink_overlay(
-                                        build_style_spans(para, cfg.px_size, [0, 0, 0, 255], scale),
+                                        build_style_spans(
+                                            para,
+                                            sctx,
+                                            cfg.px_size,
+                                            [0, 0, 0, 255],
+                                            scale,
+                                        ),
                                         &para.hyperlinks,
                                         [0, 0, 0, 255],
                                     ),
@@ -5033,9 +5086,9 @@ impl Engine {
     /// Export the current document to a single-page PDF (D3.7). Always laid
     /// out at scale `1.0` — PDF user space is logical points, never device px.
     ///
-    /// `conformance` selects the output profile (D5.4): `A1b` emits a
-    /// PDF/A-1b-conformant file; the unimplemented `A2u` / `X3` targets fall
-    /// back to a plain PDF.
+    /// `conformance` selects the output profile (D5.4 / issue #28): `A1b`
+    /// emits PDF/A-1b, `A2u` emits PDF/A-2u, `X3` emits PDF/X-3:2003 —
+    /// each maps 1:1 onto its `format_pdf::PdfProfile`.
     fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
         /* `false` — a PDF export is the committed document, never the
         in-progress IME composition. */
@@ -5047,7 +5100,8 @@ impl Engine {
         };
         let profile = match conformance {
             PdfConformance::A1b => format_pdf::PdfProfile::A1b,
-            PdfConformance::A2u | PdfConformance::X3 => format_pdf::PdfProfile::Plain,
+            PdfConformance::A2u => format_pdf::PdfProfile::A2u,
+            PdfConformance::X3 => format_pdf::PdfProfile::X3,
         };
         /* Phase 6 — `para_texts` is a flat per-document table indexed by
         `ParagraphBox::source_paragraph_id`. The walk order matches the
@@ -5837,6 +5891,11 @@ impl Engine {
             selection reports the document's own attributes (Backlog #11). */
             attrs_at_caret: self.attrs_at(probe, start == end),
             paragraph_alignment: self.paragraph_alignment_at(&sel.caret.path),
+            paragraph_style_id: self
+                .undo
+                .current()
+                .paragraph_at_path(&bridge_to_engine_path(sel.caret.path.clone()))
+                .and_then(|p| p.style_id.clone()),
             can_undo: self.undo.can_undo(),
             can_redo: self.undo.can_redo(),
             selection_kind: sel.kind.clone(),
@@ -6196,11 +6255,17 @@ impl Engine {
     /// previews what the next keystroke will adopt (Backlog #11).
     fn attrs_at(&self, pos: BridgeLogicalPos, apply_pending: bool) -> TextAttrs {
         let engine_path = bridge_to_engine_path(pos.path.clone());
-        let mut style = self
-            .undo
-            .current()
+        /* Issue #29 — fold the paragraph's style-chain run base UNDER
+        the direct span style so the toolbar reads the same cascaded
+        values the renderer paints (Heading 1 reports bold even with
+        zero direct formatting). */
+        let doc = self.undo.current();
+        let mut style = doc
             .paragraph_at_path(&engine_path)
-            .map_or(SpanStyle::default(), |p| p.style_at(pos.offset));
+            .map_or_else(SpanStyle::default, |p| {
+                doc.resolve_style_run_cascade(p.style_id.as_deref())
+                    .merged_with(p.style_at(pos.offset))
+            });
         if apply_pending && let Some(pending) = self.pending_format.as_ref() {
             style = style.merged_with(pending.clone());
         }
@@ -7078,6 +7143,89 @@ impl Engine {
             None => "Cleared paragraph style".to_string(),
         };
         self.announce(AnnouncementPriority::Polite, label);
+        self.selection_changed()
+    }
+
+    /// Issue #21 — mutate a style definition and re-cascade. Mirrors
+    /// `do_apply_style`'s invalidation discipline.
+    fn do_modify_style(&mut self, style_id: String, props: BridgeStyleProperties) -> Event {
+        if !self.undo.current().styles.contains_key(&style_id) {
+            return Event::Error {
+                message: format!("ModifyStyle: unknown style id {style_id}"),
+            };
+        }
+        let para_patch = props.para_props.map(|p| {
+            let mut out = engine::ParaProperties {
+                alignment: p.alignment.map(engine_align),
+                direction: p.direction.map(|d| match d {
+                    Direction::Ltr => engine::TextDirection::Ltr,
+                    Direction::Rtl => engine::TextDirection::Rtl,
+                }),
+                shading: p.shading.map(|c| [c.r, c.g, c.b, c.a]),
+                ..Default::default()
+            };
+            if let Some(m) = p.line_spacing_multiplier
+                && m > 0.0
+            {
+                out.line_height = Some(engine::LineHeight::Auto {
+                    twips: (m * 240.0).round() as i32,
+                });
+            }
+            if let Some(v) = p.indent_start_pt {
+                out.indent.start_twips = (v * 20.0).round() as i32;
+            }
+            if let Some(v) = p.indent_end_pt {
+                out.indent.end_twips = (v * 20.0).round() as i32;
+            }
+            if let Some(v) = p.first_line_pt {
+                if v >= 0.0 {
+                    out.indent.first_line_twips = (v * 20.0).round() as i32;
+                } else {
+                    out.indent.hanging_twips = (-v * 20.0).round() as i32;
+                }
+            }
+            out
+        });
+        let run_patch = props.run_props.map(|r| engine::SpanStyle {
+            bold: r.bold,
+            italic: r.italic,
+            underline: r.underline.map(bridge_to_engine_underline),
+            strike: r.strike,
+            font_size: r.font_size,
+            color: r.color.map(|c| [c.r, c.g, c.b, c.a]),
+            bg_color: r.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
+            font_family: r
+                .font_family
+                .as_deref()
+                .and_then(engine::FontFamily::from_id),
+            caps: r.caps,
+            small_caps: r.small_caps,
+            vert_align: None,
+            raw_font_family: r.font_family,
+            font_theme: None,
+        });
+        let based_on = if props.clear_based_on == Some(true) {
+            Some(None)
+        } else {
+            props.based_on.map(Some)
+        };
+        let new_doc = self.undo.current().modify_style(
+            &style_id,
+            para_patch,
+            run_patch,
+            based_on,
+            props.display_name,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(
+            AnnouncementPriority::Polite,
+            format!("Style {style_id} updated"),
+        );
         self.selection_changed()
     }
 
@@ -8089,32 +8237,32 @@ mod tests {
         let a = para("hello world");
         /* Identical content + config -> identical key. */
         assert_eq!(
-            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
-            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0, empty_sctx()),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0, empty_sctx()),
         );
         /* Different text -> different key. */
         assert_ne!(
-            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
-            paragraph_layout_key(&para("hello there"), &cfg, 1.0, 451.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0, empty_sctx()),
+            paragraph_layout_key(&para("hello there"), &cfg, 1.0, 451.0, empty_sctx()),
         );
         /* A paragraph alignment override -> different key. */
         let mut centered = para("hello world");
         centered.props.alignment = Some(EngineAlignment::Center);
         assert_ne!(
-            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
-            paragraph_layout_key(&centered, &cfg, 1.0, 451.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0, empty_sctx()),
+            paragraph_layout_key(&centered, &cfg, 1.0, 451.0, empty_sctx()),
         );
         /* A different device scale -> different key. */
         assert_ne!(
-            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
-            paragraph_layout_key(&a, &cfg, 2.0, 451.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0, empty_sctx()),
+            paragraph_layout_key(&a, &cfg, 2.0, 451.0, empty_sctx()),
         );
         /* Audit gap A.H2 — a different `max_width` (e.g. swapping a
         single-column body for a 2-column section that halves the
         layout width) must miss the cache. */
         assert_ne!(
-            paragraph_layout_key(&a, &cfg, 1.0, 451.0),
-            paragraph_layout_key(&a, &cfg, 1.0, 220.0),
+            paragraph_layout_key(&a, &cfg, 1.0, 451.0, empty_sctx()),
+            paragraph_layout_key(&a, &cfg, 1.0, 220.0, empty_sctx()),
         );
     }
 
@@ -8233,7 +8381,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
-        let spans = composition_layout_spans(&p, 3, 3, 16.0, 1.0);
+        let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
         assert_eq!(spans.len(), 3, "split + composition span");
         assert_eq!((spans[0].start, spans[0].end), (0, 3));
         assert!(!spans[0].underline.is_visible());
@@ -8265,7 +8413,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
         };
-        let spans = composition_layout_spans(&p, 3, 2, 16.0, 1.0);
+        let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
         assert_eq!((spans[0].start, spans[0].end), (0, 3));
         assert_eq!((spans[1].start, spans[1].end), (3, 5));
@@ -8672,6 +8820,73 @@ mod tests {
 
     /* ---------- L2.2 (#7) table autofit min-content ---------- */
 
+    /// Issue #29 — an empty style table for tests that don't exercise
+    /// the run cascade (leaked so the borrows are 'static).
+    fn empty_sctx() -> StyleContext<'static> {
+        StyleContext {
+            styles: Box::leak(Box::default()),
+            run_defaults: Box::leak(Box::default()),
+        }
+    }
+
+    /// Issue #29 — `build_style_spans` folds the pStyle-chain `<w:rPr>`
+    /// under direct formatting; unstyled gap text inherits it wholesale.
+    #[test]
+    fn style_run_cascade_folds_into_materialized_spans() {
+        let mut styles: std::collections::HashMap<String, engine::ParagraphStyle> =
+            std::collections::HashMap::new();
+        styles.insert(
+            "Heading1".into(),
+            engine::ParagraphStyle {
+                id: "Heading1".into(),
+                name: "Heading 1".into(),
+                based_on: None,
+                para: engine::ParaProperties::default(),
+                run: engine::SpanStyle {
+                    bold: Some(true),
+                    font_size: Some(16.0),
+                    ..Default::default()
+                },
+            },
+        );
+        let run_defaults = engine::SpanStyle::default();
+        let sctx = StyleContext {
+            styles: &styles,
+            run_defaults: &run_defaults,
+        };
+        let mut para = engine::Paragraph {
+            text: "hello world".into(),
+            ..Default::default()
+        };
+        para.style_id = Some("Heading1".into());
+        /* Direct italic on "hello" only. */
+        para.spans.push(engine::StyleRun {
+            start: 0,
+            end: 5,
+            style: engine::SpanStyle {
+                italic: Some(true),
+                ..Default::default()
+            },
+        });
+        let spans = build_style_spans(&para, sctx, 12.0, [0, 0, 0, 255], 1.0);
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].bold && spans[0].italic, "direct folds OVER style");
+        assert!((spans[0].px_size - 16.0).abs() < 0.01, "style size applies");
+        assert!(
+            spans[1].bold && !spans[1].italic,
+            "gap text takes the style run"
+        );
+        assert!((spans[1].px_size - 16.0).abs() < 0.01);
+        /* attrs parity: the layout key must see the style table too. */
+        let cfg = autofit_test_cfg();
+        let plain = empty_sctx();
+        assert_ne!(
+            paragraph_layout_key(&para, &cfg, 1.0, 451.0, sctx),
+            paragraph_layout_key(&para, &cfg, 1.0, 451.0, plain),
+            "two style-table states must not collide on a cache key"
+        );
+    }
+
     fn test_font_stack() -> FontStack {
         use std::sync::Arc;
         let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
@@ -8824,11 +9039,16 @@ mod tests {
 
         /* Narrow viewport — well under the token's pixel width. */
         let available = 80.0_f32;
-        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[]);
+        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[], empty_sctx());
 
         assert_eq!(widths.len(), 1);
-        let (cell_min, _cell_max) =
-            measure_unbreakable_width(&table.rows[0].cells[0].blocks, &fonts, &cfg, 1.0);
+        let (cell_min, _cell_max) = measure_unbreakable_width(
+            &table.rows[0].cells[0].blocks,
+            empty_sctx(),
+            &fonts,
+            &cfg,
+            1.0,
+        );
         assert!(
             cell_min > available,
             "test fixture sanity: the long token's min_content ({cell_min}) \
@@ -8864,11 +9084,16 @@ mod tests {
         /* Wide-enough viewport that the token's min_content alone fits
         plus some room for column 1. */
         let available = 600.0_f32;
-        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[]);
+        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[], empty_sctx());
 
         assert_eq!(widths.len(), 2);
-        let (col0_min, _) =
-            measure_unbreakable_width(&table.rows[0].cells[0].blocks, &fonts, &cfg, 1.0);
+        let (col0_min, _) = measure_unbreakable_width(
+            &table.rows[0].cells[0].blocks,
+            empty_sctx(),
+            &fonts,
+            &cfg,
+            1.0,
+        );
         assert!(
             widths[0] >= col0_min - 0.5,
             "col0 must respect token min_content {col0_min}; got {}",
@@ -8949,7 +9174,7 @@ mod tests {
             cell_with_text("City"),
         ]);
         let available = 600.0_f32;
-        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[]);
+        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[], empty_sctx());
 
         assert_eq!(widths.len(), 3);
         let sum: f32 = widths.iter().sum();

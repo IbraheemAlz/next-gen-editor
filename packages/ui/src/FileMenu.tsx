@@ -7,10 +7,10 @@
  *   - **Open** → hidden file input → `Command::OpenDocument { format: Docx }`.
  *   - **Save** → `Command::SaveDocument { format: Docx }`. Bound to
  *     `Ctrl/Cmd+S` globally.
- *   - **Export PDF** → `Command::ExportPdf { conformance }`. Only `A1b`
- *     is engine-real; `A2u` / `X3` fall back to `PdfProfile::Plain` in
- *     `do_export_pdf`, so those entries render disabled with the amber
- *     "Engine pending" badge (BACKLOG #3 — PDF/A-2 / PDF/X).
+ *   - **Export PDF** → `Command::ExportPdf { conformance }`. All three
+ *     conformance targets are engine-real: `A1b` → PDF/A-1b, `A2u` →
+ *     PDF/A-2u, `X3` → PDF/X-3:2003 (issue #28 closed the former
+ *     `PdfProfile::Plain` fallback that kept A2u / X3 gated).
  *   - **Export HTML / Plain Text** → `Command::SaveDocument { format }`
  *     with `html` / `plain_text`. Sprint 9 wired the engine
  *     serializers (`crates/format-html` + `DocumentTree::to_plain_text`);
@@ -36,18 +36,14 @@ import {
 } from '@nge/core';
 import './FileMenu.css';
 
-/* `pending` — do_export_pdf maps the conformance to PdfProfile::Plain
- * (a silently wrong result), so the entry must gate itself per the
- * Honest UX rule. BACKLOG #3. */
 const PDF_CONFORMANCES: {
     value: PdfConformance;
     label: string;
     hint: string;
-    pending: boolean;
 }[] = [
-    { value: 'A1b', label: 'PDF/A-1b', hint: 'Archival (default)', pending: false },
-    { value: 'A2u', label: 'PDF/A-2u', hint: 'Archival, Unicode', pending: true },
-    { value: 'X3', label: 'PDF/X-3', hint: 'Print-ready', pending: true },
+    { value: 'A1b', label: 'PDF/A-1b', hint: 'Archival (default)' },
+    { value: 'A2u', label: 'PDF/A-2u', hint: 'Archival, Unicode' },
+    { value: 'X3', label: 'PDF/X-3', hint: 'Print-ready' },
 ];
 
 export interface FileMenuProps {
@@ -261,24 +257,14 @@ export const FileMenu: Component<FileMenuProps> = (props) => {
                                                 {PDF_CONFORMANCES.map((c) => (
                                                     <li role="none">
                                                         <button
-                                                            class={`nge-fm__item nge-fm__item--stacked${
-                                                                c.pending ? ' nge-fm__item--disabled' : ''
-                                                            }`}
+                                                            class="nge-fm__item nge-fm__item--stacked"
                                                             type="button"
                                                             role="menuitem"
-                                                            disabled={c.pending}
-                                                            title={
-                                                                c.pending
-                                                                    ? `${c.label}: engine pending (exports a plain PDF today) — see backlog #3`
-                                                                    : c.hint
-                                                            }
+                                                            title={c.hint}
                                                             onClick={() => void onExportPdf(c.value)}
                                                         >
                                                             <span class="nge-fm__label">{c.label}</span>
                                                             <span class="nge-fm__hint">{c.hint}</span>
-                                                            <Show when={c.pending}>
-                                                                <span class="nge-fm__badge">Engine pending</span>
-                                                            </Show>
                                                         </button>
                                                     </li>
                                                 ))}

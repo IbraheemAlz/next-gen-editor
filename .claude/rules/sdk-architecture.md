@@ -143,11 +143,13 @@ When unsure, copy the existing shape:
 - **Modal dialog:** `Dialog.tsx` (the primitive) +
   `CellPropertiesDialog.tsx`, `PageSetupDialog.tsx`.
 - **Engine-pending pattern:** the inline snippet in "Honest UX" above is
-  the canonical shape; the live instance is the gated PDF/A-2u / PDF/X-3
-  export entries in `FileMenu.tsx` (`do_export_pdf` still falls back to
-  `PdfProfile::Plain`). The former references — `ListButtons.tsx`,
-  the `FileMenu.tsx` HTML / Plain Text entries, the `ReviewControls.tsx`
-  Track toggle — were fully un-gated once their engine halves shipped.
+  the **only** canonical reference — no live gated instance remains. The
+  last one, the PDF/A-2u / PDF/X-3 export entries in `FileMenu.tsx`, was
+  un-gated 2026-07-02 when issue #28 shipped the real `PdfProfile::A2u` /
+  `PdfProfile::X3` targets (before that, `ListButtons.tsx`, the
+  `FileMenu.tsx` HTML / Plain Text entries, and the `ReviewControls.tsx`
+  Track toggle were un-gated the same way). The pattern CSS chip survives
+  in `FileMenu.css` for the next gated entry.
 - **Pinned bottom strip:** `StatusBar.tsx`.
 - **Crash overlay via Portal:** `TrapOverlay.tsx`.
 

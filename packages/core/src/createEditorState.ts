@@ -50,6 +50,10 @@ export interface EditorState {
     paragraphDirection: Accessor<Direction | undefined>;
     /** Selection kind — linear span or rectangular table-cell block. */
     selectionKind: Accessor<SelectionKind | undefined>;
+    /** Issue #29 — the caret paragraph's style id (`<w:pStyle>`), for a
+     *  truthful StylesDropdown active indicator. `undefined` when
+     *  detached or before the first SELECTION_CHANGED. */
+    paragraphStyleId: Accessor<string | undefined>;
     /** Undo availability. */
     canUndo: Accessor<boolean>;
     /** Redo availability. */
@@ -121,6 +125,7 @@ export function createEditorState(): EditorState {
     const [paragraphAlignment, setParagraphAlignment] = createSignal<Alignment | undefined>(undefined);
     const [paragraphDirection, setParagraphDirection] = createSignal<Direction | undefined>(undefined);
     const [selectionKind, setSelectionKind] = createSignal<SelectionKind | undefined>(undefined);
+    const [paragraphStyleId, setParagraphStyleId] = createSignal<string | undefined>(undefined);
     const [canUndo, setCanUndo] = createSignal(false);
     const [canRedo, setCanRedo] = createSignal(false);
     const [stats, setStats] = createSignal<EngineStats | undefined>(undefined);
@@ -152,6 +157,7 @@ export function createEditorState(): EditorState {
                 setParagraphAlignment(evt.paragraph_alignment);
                 setParagraphDirection(evt.paragraph_direction);
                 setSelectionKind(evt.selection_kind);
+                setParagraphStyleId(evt.paragraph_style_id);
                 setCanUndo(evt.can_undo);
                 setCanRedo(evt.can_redo);
                 setSectionGeometry(evt.section_geometry);
@@ -202,6 +208,7 @@ export function createEditorState(): EditorState {
         paragraphAlignment,
         paragraphDirection,
         selectionKind,
+        paragraphStyleId,
         canUndo,
         canRedo,
         stats,
