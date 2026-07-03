@@ -1993,38 +1993,42 @@ fn props_to_layout_indents(props: &engine::ParaProperties, scale: f32) -> (f32, 
     )
 }
 
-/// Issue #50 — the indents that actually reach `layout_paragraph`. A direct
-/// `<w:ind>` wins wholesale; otherwise a list paragraph falls back to its
-/// numbering level's indent (`resolved_list_indent`, stamped by the marker
-/// resolver next to `resolved_marker`). Without the fallback an
-/// interactively-toggled list lays out at indent 0 and `build_marker`'s
-/// clamp paints the bullet underneath the first text glyph — the invisible
-/// marker of issue #50.
+/// Issue #50 / #58 — per-slot merge of a paragraph's direct `<w:ind>` over
+/// its resolved numbering-level indent (`resolved_list_indent`, stamped by
+/// the marker resolver next to `resolved_marker`), in twips. A direct
+/// `<w:ind>` attribute wins over the level's, but a PARTIAL direct indent
+/// (a ruler end-indent drag writes `{0, E, 0, 0}`; a docx pPr may carry only
+/// `w:ind w:end`) must not strip the level's start/hanging wholesale — that
+/// re-creates the issue-#50 invisible-marker collapse this fallback exists
+/// to fix. "Set" is approximated as non-zero, the same flat-struct
+/// trade-off documented on `ParaProperties::merged_with`. `firstLine`/
+/// `hanging` merge as a pair (mutually exclusive in OOXML — one side being
+/// set shadows both of the level's).
 ///
 /// The level indent is authored leading-edge-relative (OOXML logical
-/// start), so for an RTL paragraph it lands on the `indent_end_px` slot —
-/// that is the slot `layout_paragraph` reads the leading offset from when
-/// the base direction is RTL.
-fn effective_layout_indents(
+/// start), so for an RTL paragraph it lands on the end slot before the
+/// merge — that is the slot `layout_paragraph` reads the leading offset
+/// from when the base direction is RTL; a direct indent keeps the legacy
+/// slot convention untouched.
+///
+/// Shared by [`effective_layout_indents`] (layout, converts to px) and
+/// `indent_for_caret` (the Ruler read-back, converts to pt) so the two can
+/// never diverge again — issue #58 was exactly that divergence, where the
+/// Ruler read raw `props.indent` and reported 0 for a toggled list whose
+/// rendered text was visibly indented.
+fn effective_indent_twips(
     para: &engine::Paragraph,
     base_direction: ShapingDirection,
-    scale: f32,
-) -> (f32, f32, f32, f32) {
+) -> (i32, i32, i32, i32) {
     let d = para.props.indent;
     let Some(li) = para.resolved_list_indent else {
-        return props_to_layout_indents(&para.props, scale);
+        return (
+            d.start_twips,
+            d.end_twips,
+            d.first_line_twips,
+            d.hanging_twips,
+        );
     };
-    /* Per-slot merge — a direct `<w:ind>` attribute wins over the level's,
-    but a PARTIAL direct indent (a ruler end-indent drag writes
-    `{0, E, 0, 0}`; a docx pPr may carry only `w:ind w:end`) must not
-    strip the level's start/hanging wholesale — that re-creates the exact
-    issue-#50 invisible-marker collapse this fallback exists to fix.
-    "Set" is approximated as non-zero, the same flat-struct trade-off
-    documented on `ParaProperties::merged_with`. `firstLine`/`hanging`
-    merge as a pair (mutually exclusive in OOXML — one side being set
-    shadows both of the level's). The level indent is leading-edge
-    relative, so its start/end swap slots for RTL before the merge; a
-    direct indent keeps the legacy slot convention untouched. */
     let (li_start_slot, li_end_slot) = match base_direction {
         ShapingDirection::Rtl => (li.end_twips, li.start_twips),
         ShapingDirection::Ltr => (li.start_twips, li.end_twips),
@@ -2044,6 +2048,22 @@ fn effective_layout_indents(
     } else {
         (li.first_line_twips, li.hanging_twips)
     };
+    (s, e, fl, hang)
+}
+
+/// Issue #50 — the indents that actually reach `layout_paragraph`. Without
+/// the numbering-level fallback an interactively-toggled list lays out at
+/// indent 0 and `build_marker`'s clamp paints the bullet underneath the
+/// first text glyph — the invisible marker of issue #50.
+fn effective_layout_indents(
+    para: &engine::Paragraph,
+    base_direction: ShapingDirection,
+    scale: f32,
+) -> (f32, f32, f32, f32) {
+    if para.resolved_list_indent.is_none() {
+        return props_to_layout_indents(&para.props, scale);
+    }
+    let (s, e, fl, hang) = effective_indent_twips(para, base_direction);
     (
         twips_to_layout_px(s, scale),
         twips_to_layout_px(e, scale),
@@ -6000,19 +6020,29 @@ impl Engine {
     /// pt value (`> 0` first-line, `< 0` hanging), matching
     /// `Command::SetParagraphIndent`'s convention so a Ruler drag
     /// round-trips without re-deriving the sign.
+    ///
+    /// Issue #58 — this used to read raw `para.props.indent` directly, so
+    /// a toggled list (whose indent lives in `resolved_list_indent`, not
+    /// `props.indent`) read back as all-zero even though the paragraph
+    /// visibly rendered indented. Routes through the same per-slot merge
+    /// [`effective_layout_indents`] uses so the Ruler can never lie about
+    /// what was actually painted. `paragraph_direction_at` resolves the
+    /// same base-direction precedence `effective_layout_indents`' RTL
+    /// slot-swap depends on.
     fn indent_for_caret(&self, path: &BridgeBlockPath) -> BridgeIndent {
         let engine_path = bridge_path_to_engine(path);
         let Some(para) = self.undo.current().paragraph_at_path(&engine_path) else {
             return BridgeIndent::default();
         };
-        let ind = &para.props.indent;
+        let base_direction = self.paragraph_direction_at(path);
+        let (s, e, fl, hang) = effective_indent_twips(para, base_direction);
         /* twips → pt (20 twips = 1 pt). first_line/hanging are mutually
         exclusive in OOXML; at most one is non-zero, so the difference
         recovers the signed offset. */
         BridgeIndent {
-            start_pt: ind.start_twips as f32 / 20.0,
-            end_pt: ind.end_twips as f32 / 20.0,
-            first_line_pt: (ind.first_line_twips - ind.hanging_twips) as f32 / 20.0,
+            start_pt: s as f32 / 20.0,
+            end_pt: e as f32 / 20.0,
+            first_line_pt: (fl - hang) as f32 / 20.0,
         }
     }
 
@@ -9260,6 +9290,82 @@ mod tests {
         assert_eq!(
             effective_layout_indents(&para, ShapingDirection::Ltr, 1.0),
             (36.0, 0.0, 0.0, 12.0)
+        );
+    }
+
+    /// Issue #58 — the Ruler read-back (`indent_for_caret`) must never
+    /// diverge from what `effective_layout_indents` actually paints. A
+    /// toggled bullet-list paragraph has all-zero `props.indent` but a real
+    /// `resolved_list_indent`; before this fix the Ruler reported 0/0 for a
+    /// paragraph visibly indented 36pt with an 18pt hanging gutter.
+    #[test]
+    fn indent_for_caret_falls_back_to_list_level() {
+        fn test_engine(para: engine::Paragraph) -> Engine {
+            let mut doc = DocumentTree::from_text("item");
+            doc.blocks[0] = engine::Block::Paragraph(para);
+            Engine {
+                page_ctxs: Vec::new(),
+                ctx: None,
+                fonts: HashMap::new(),
+                undo: UndoStack::new(doc, 8),
+                layout_cfg: None,
+                atlas: GlyphAtlas::new(),
+                vello: None,
+                dirty: DirtyTracker::new(),
+                selection: None,
+                composition: None,
+                pending_format: None,
+                layout_cache: new_layout_cache(),
+                a11y_cache: None,
+                image_cache: HashMap::new(),
+                last_paint_dims: LastPaintDims::default(),
+                lazy_layout: LazyLayoutState::default(),
+                caret_affinity: CaretAffinity::default(),
+                pending_announcements: Vec::new(),
+                tracking_changes: false,
+                review_author: "You".to_string(),
+                review_date: String::new(),
+            }
+        }
+
+        let mut para = engine::Paragraph {
+            text: "item".into(),
+            ..Default::default()
+        };
+        para.resolved_list_indent = Some(engine::Indent {
+            start_twips: 720,
+            end_twips: 0,
+            first_line_twips: 0,
+            hanging_twips: 360,
+        });
+        let path = BridgeBlockPath::top(0);
+        let e = test_engine(para.clone());
+        let ind = e.indent_for_caret(&path);
+        assert_eq!(ind.start_pt, 36.0);
+        assert_eq!(ind.end_pt, 0.0);
+        assert_eq!(
+            ind.first_line_pt, -18.0,
+            "a level hanging indent reads back as a negative first_line_pt"
+        );
+
+        /* a partial direct end-indent (a ruler end-drag writes {0, E, 0, 0})
+        must not strip the level's start indent + hanging gutter from the
+        read-back — the same per-slot merge invariant `effective_layout_indents`
+        protects (issue #50). */
+        para.props.indent = engine::Indent {
+            end_twips: 720,
+            ..Default::default()
+        };
+        let e = test_engine(para);
+        let ind = e.indent_for_caret(&path);
+        assert_eq!(
+            ind.start_pt, 36.0,
+            "level start must survive a partial direct end-indent"
+        );
+        assert_eq!(ind.end_pt, 36.0);
+        assert_eq!(
+            ind.first_line_pt, -18.0,
+            "level hanging must survive a partial direct end-indent"
         );
     }
 

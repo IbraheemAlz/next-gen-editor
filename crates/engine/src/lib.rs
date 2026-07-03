@@ -1348,12 +1348,20 @@ impl Paragraph {
             resolved_list_indent: self.resolved_list_indent,
             dirty: true,
             source_xml: None,
-            inline_objects: Vec::new(),
-            hyperlinks: Vec::new(),
-            revisions: Vec::new(),
-            fields: Vec::new(),
-            style_id: None,
-            direct_overrides: ParaProperties::default(),
+            /* Issue #56 — `apply_style` never touches `text`, so every byte
+            offset these overlays anchor to (hyperlink spans, tracked-change
+            revisions, field ranges, inline objects) stays valid, and
+            `style_id` / `direct_overrides` aren't offset-anchored at all.
+            Clearing them here silently stripped a paragraph's hyperlinks,
+            revisions, and `<w:pStyle>` binding the moment ANY character
+            formatting was applied. Contrast `delete_text` / `split_at` /
+            `concat` below, which clear because the offsets genuinely shift. */
+            inline_objects: self.inline_objects.clone(),
+            hyperlinks: self.hyperlinks.clone(),
+            revisions: self.revisions.clone(),
+            fields: self.fields.clone(),
+            style_id: self.style_id.clone(),
+            direct_overrides: self.direct_overrides.clone(),
         }
     }
 
@@ -1439,6 +1447,11 @@ impl Paragraph {
             resolved_list_indent: self.resolved_list_indent,
             dirty: true,
             source_xml: None,
+            /* Unlike `apply_style` (issue #56), THIS rebuild changes `text` —
+            every stashed byte offset (hyperlink spans, revision ranges,
+            field anchors) would dangle across the deleted range. Clearing
+            these overlays is a known, deliberately out-of-scope limitation
+            (offset remapping is a separate, larger task), not an oversight. */
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
@@ -1470,6 +1483,10 @@ impl Paragraph {
                 });
             }
         }
+        /* Splitting shifts every offset in the right half to be relative to
+        `at` — the same "offsets genuinely shift" class as `delete_text`
+        (see its comment). Overlay-dropping here is the same deliberately
+        out-of-scope limitation, not an oversight (issue #56). */
         (
             Paragraph {
                 text: self.text[..at as usize].to_owned(),
@@ -1521,6 +1538,12 @@ impl Paragraph {
                 style: run.style.clone(),
             });
         }
+        /* Concatenation shifts `other`'s offsets right by `self`'s length —
+        the same "offsets genuinely shift" class as `delete_text` (see its
+        comment). Overlay-dropping here is the same deliberately
+        out-of-scope limitation, not an oversight (issue #56); the merged
+        paragraph also has two candidate `style_id`s to reconcile, which
+        offset remapping would need to resolve anyway. */
         Paragraph {
             text,
             spans,
@@ -6450,6 +6473,107 @@ mod tests {
                     ..Default::default()
                 },
             }
+        );
+    }
+
+    /// Issue #56 — applying character formatting must never drop a
+    /// hyperlink overlay AND its tracked-change revisions; `apply_style`
+    /// doesn't touch `text`, so both overlays' byte ranges are still valid
+    /// after the patch (the epic's manual-QA scenario: a hyperlink +
+    /// Track Changes revision surviving a style apply).
+    #[test]
+    fn apply_style_preserves_hyperlink_overlay() {
+        let mut doc = DocumentTree::from_text("hello world");
+        let mut para = doc.nth_paragraph(0).unwrap().clone();
+        para.hyperlinks.push(Hyperlink {
+            start: 0,
+            end: 5,
+            target: "https://example.com".to_string(),
+        });
+        para.revisions.push(Revision {
+            start: 6,
+            end: 11,
+            kind: RevisionKind::Insert,
+            author: "Reviewer".to_string(),
+            date: "2026-01-01T00:00:00Z".to_string(),
+            id: Some(1),
+            prev_attrs: None,
+        });
+        doc.blocks[0] = Block::Paragraph(para);
+
+        let doc = doc.apply_style(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        let revisions = &doc.nth_paragraph(0).unwrap().revisions;
+        assert_eq!(
+            revisions.len(),
+            1,
+            "tracked-change revision must survive a style apply"
+        );
+        assert_eq!(revisions[0].author, "Reviewer");
+        let hyperlinks = &doc.nth_paragraph(0).unwrap().hyperlinks;
+        assert_eq!(hyperlinks.len(), 1, "hyperlink must survive a style apply");
+        assert_eq!(hyperlinks[0].target, "https://example.com");
+    }
+
+    /// Issue #56 — a `style_id`-bound paragraph must keep its `<w:pStyle>`
+    /// binding after direct formatting, and the cascade must still resolve
+    /// through it (pins the #29 cascade path against regressing here).
+    #[test]
+    fn apply_style_preserves_style_id_and_cascade_still_resolves() {
+        let mut doc = DocumentTree::from_text("hello world");
+        doc.styles.insert(
+            "Heading1".to_string(),
+            ParagraphStyle {
+                id: "Heading1".to_string(),
+                name: "Heading 1".to_string(),
+                based_on: None,
+                para: ParaProperties {
+                    alignment: Some(Alignment::Center),
+                    ..Default::default()
+                },
+                run: SpanStyle::default(),
+            },
+        );
+        let mut para = doc.nth_paragraph(0).unwrap().clone();
+        para.style_id = Some("Heading1".to_string());
+        doc.blocks[0] = Block::Paragraph(para);
+
+        let doc = doc.apply_style(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        let style_id = doc.nth_paragraph(0).unwrap().style_id.clone();
+        assert_eq!(
+            style_id.as_deref(),
+            Some("Heading1"),
+            "style_id must survive a style apply"
+        );
+        assert_eq!(
+            doc.resolve_style_cascade(style_id.as_deref()).alignment,
+            Some(Alignment::Center),
+            "the cascade must still resolve through the preserved style_id"
         );
     }
 

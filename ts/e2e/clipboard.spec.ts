@@ -33,18 +33,24 @@ async function focusHiddenInput(page: Page): Promise<void> {
     await page.locator('textarea[data-nge-hidden-input]').focus();
 }
 
-/** Any unhandled rejection from the clipboard path (the stubbed
- *  NotAllowedError or the typed ClipboardWriteError). A known,
- *  pre-existing boot race unrelated to clipboard ("engine not
- *  initialized", documented in `ts/src/sdk-bridge.tsx`) can also fire
- *  an unhandled rejection — the filter keeps this spec pinned to the
- *  issue #48 contract: the CLIPBOARD rejection is always observed. */
-async function clipboardRejections(page: Page): Promise<string[]> {
-    const all = await page.evaluate(
-        () => (window as any).__unhandledRejections as string[],
-    );
-    return all.filter((r) => /clipboard|notallowed|not focused/i.test(r));
+/** Every unhandled promise rejection recorded since `BLOCK_CLIPBOARD_INIT`
+ *  (or `RECORD_REJECTIONS_INIT`) installed its listener. Issue #55 fixed
+ *  the one pre-existing source of boot-time noise ("engine not
+ *  initialized" from `ReviewControls`'s pre-INIT dispatch) — this no
+ *  longer needs to filter down to clipboard-only reasons; ANY rejection
+ *  here is a bug. */
+async function unhandledRejections(page: Page): Promise<string[]> {
+    return page.evaluate(() => (window as any).__unhandledRejections as string[]);
 }
+
+/** Install just the `unhandledrejection` recorder, without stubbing the
+ *  clipboard — for specs that assert boot cleanliness on its own. */
+const RECORD_REJECTIONS_INIT = (): void => {
+    (window as any).__unhandledRejections = [];
+    window.addEventListener('unhandledrejection', (e) => {
+        (window as any).__unhandledRejections.push(String(e.reason));
+    });
+};
 
 /** Stub both clipboard write tiers to reject like a focus-lapsed document,
  *  and record any unhandled promise rejections to a window global. Must run
@@ -99,7 +105,7 @@ test('a blocked clipboard write shows a visible error banner and no unhandled re
     await expect(banner).toContainText('Copy failed');
 
     /* The rejection must be OBSERVED (caught + surfaced), never silent. */
-    expect(await clipboardRejections(page)).toEqual([]);
+    expect(await unhandledRejections(page)).toEqual([]);
 });
 
 test('cut with a blocked clipboard write deletes nothing (write-before-delete)', async ({
@@ -129,5 +135,21 @@ test('cut with a blocked clipboard write deletes nothing (write-before-delete)',
     /* The boot seed survived too — nothing in the selection was lost. */
     expect(plain).toContain('Hello world');
 
-    expect(await clipboardRejections(page)).toEqual([]);
+    expect(await unhandledRejections(page)).toEqual([]);
+});
+
+/* Issue #55 — a pre-INIT dispatch (`ReviewControls`'s review-identity
+ * effect, which mounts unconditionally in the always-on toolbar row)
+ * rejected with "engine not initialized" before the worker finished
+ * `Command::Init`, and the rejection was void-discarded — an unhandled
+ * promise rejection on every cold boot, unrelated to clipboard. */
+test('booting the editor records zero unhandled promise rejections', async ({ page }) => {
+    await page.addInitScript(RECORD_REJECTIONS_INIT);
+    await boot(page);
+    /* Settle past the boot sequence's own async tail (font loads, the
+       first SELECTION_CHANGED, stats polling's first tick) — `__paintIdle`
+       flips before every post-INIT effect has necessarily run. */
+    await page.waitForTimeout(2_000);
+
+    expect(await unhandledRejections(page)).toEqual([]);
 });

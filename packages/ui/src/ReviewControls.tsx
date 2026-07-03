@@ -52,9 +52,23 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
 
     /* Propagate the author input to the engine review identity so
      * tracked revisions stop being stamped with the "You" default.
-     * Empty date keeps the engine's per-mutation date stamping. */
+     * Empty date keeps the engine's per-mutation date stamping.
+     *
+     * Issue #55 — gated on `ready()` (the engine has emitted its first
+     * SELECTION_CHANGED). This effect used to dispatch unconditionally on
+     * mount — ReviewControls sits in the always-mounted toolbar row, so it
+     * fired before `Command::Init` resolved, rejecting with "engine not
+     * initialized"; void-discarded, that surfaced as an unhandled promise
+     * rejection on every single boot. `ready()` tracks `state.selection()`,
+     * which only becomes defined post-INIT, so the effect naturally
+     * re-fires once the engine comes up. The `.catch` is a backstop for a
+     * later, genuinely failed identity push (e.g. mid-flight worker
+     * respawn) — never let this dispatch go unobserved again. */
     createEffect(() => {
-        void cmd.setReviewIdentity(commentAuthor(), '');
+        if (!ready()) return;
+        void cmd.setReviewIdentity(commentAuthor(), '').catch((e: unknown) => {
+            console.error('setReviewIdentity failed', e);
+        });
     });
 
     /* Sprint 14 (#14) — dispatch + let the engine's
