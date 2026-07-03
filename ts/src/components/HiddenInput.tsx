@@ -58,17 +58,40 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     });
 
     const focus = (): void => ref?.focus();
+
+    /* Focus stewardship (issues #35/#49). A canvas click blurs focus to
+       <body> via the mousedown default, so the textarea re-grabs it on
+       pointerup — but it must never steal focus from a control the user
+       is actually interacting with. Skip the re-grab when the pointerup
+       lands on (or inside) a focus-owning surface: form controls, their
+       labels, editable regions, and open dialogs/popovers. Plain buttons
+       are deliberately NOT exempt — after a toolbar button click (Bold,
+       alignment, …) typing must continue into the document, which is
+       exactly the re-grab; buttons inside dialogs are covered by the
+       [role="dialog"] ancestor test. */
+    const FOCUS_SINK =
+        'input, textarea, select, option, label, ' +
+        '[contenteditable="true"], [role="dialog"], .nge-dialog-overlay';
+    const onPointerUp = (e: PointerEvent): void => {
+        const t = e.target;
+        if (t instanceof Element && t.closest(FOCUS_SINK)) return;
+        focus();
+    };
+    /* On window re-focus the browser restores the pre-blur activeElement
+       (possibly a dialog field) — only re-grab when nothing else holds
+       focus, otherwise the restore is immediately undone. */
+    const onWindowFocus = (): void => {
+        const a = document.activeElement;
+        if (!a || a === document.body || a === ref) focus();
+    };
     onMount(() => {
         focus();
-        /* A canvas click blurs focus to <body> via the mousedown default —
-           re-grab it on pointerup (which fires after that) and when the
-           window regains focus. */
-        document.addEventListener('pointerup', focus);
-        window.addEventListener('focus', focus);
+        document.addEventListener('pointerup', onPointerUp);
+        window.addEventListener('focus', onWindowFocus);
     });
     onCleanup(() => {
-        document.removeEventListener('pointerup', focus);
-        window.removeEventListener('focus', focus);
+        document.removeEventListener('pointerup', onPointerUp);
+        window.removeEventListener('focus', onWindowFocus);
     });
 
     const onCompositionStart = (): void => {
@@ -290,6 +313,12 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
                buffer (cleared on every keystroke). `aria-label` gives
                AT a one-word identifier instead of "edit, blank". */
             aria-label="editor input"
+            /* Focus hand-back hook — `@nge/ui`'s focusEditorInput()
+               (Ruler drag-end, Dialog close, comment-draft close) targets
+               `textarea[data-nge-hidden-input]` to return typing focus to
+               the document. The SDK's EditorSurface exposes the same hook
+               as `#nge-hidden-input`. */
+            data-nge-hidden-input=""
             tabindex="-1"
             autocomplete="off"
             autocapitalize="off"

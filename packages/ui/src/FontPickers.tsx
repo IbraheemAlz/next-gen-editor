@@ -21,6 +21,7 @@ import {
     createEditorState,
     useFontRegistry,
 } from '@nge/core';
+import { focusEditorInput } from './focus';
 import './FontPickers.css';
 
 const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72];
@@ -91,6 +92,16 @@ export const FontPickers: Component = () => {
                 value={currentSize()}
                 title="Font size in points"
                 onChange={(e) => void applySize(parseInt(e.currentTarget.value, 10))}
+                onKeyDown={(e) => {
+                    /* Enter commits and returns focus to the document
+                       (Word behaviour). blur() fires the change handler
+                       above exactly once — no duplicate dispatch. */
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        e.currentTarget.blur();
+                        focusEditorInput();
+                    }
+                }}
                 list="nge-font-sizes"
             />
             <datalist id="nge-font-sizes">

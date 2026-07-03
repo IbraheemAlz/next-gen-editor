@@ -25,6 +25,7 @@ import {
     createEditorState,
     useEngine,
 } from '@nge/core';
+import { focusEditorInput } from './focus';
 import './ReviewControls.css';
 
 export interface ReviewControlsProps {
@@ -93,11 +94,26 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
         onCleanup(unsub);
     });
 
+    /* Draft focus lifecycle (issue #35). Opening the draft moves focus
+       into its textarea so typing lands in the comment, never the
+       document; closing (cancel, Escape, or submit) hands focus back to
+       the editor so typing resumes in the document. */
+    let draftTextarea: HTMLTextAreaElement | undefined;
+    createEffect(() => {
+        if (commentDraftOpen()) draftTextarea?.focus();
+    });
+    const closeDraft = () => {
+        setCommentDraftOpen(false);
+        setCommentText('');
+        focusEditorInput();
+    };
+
     const submitComment = async () => {
         if (!ready() || commentText().trim() === '') return;
         await cmd.insertComment(commentText().trim(), commentAuthor());
         setCommentText('');
         setCommentDraftOpen(false);
+        focusEditorInput();
     };
 
     const acceptAll = async () => {
@@ -170,7 +186,14 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
             </button>
 
             <Show when={commentDraftOpen()}>
-                <div class="nge-review__draft" role="dialog" aria-label="New comment">
+                <div
+                    class="nge-review__draft"
+                    role="dialog"
+                    aria-label="New comment"
+                    onKeyDown={(e) => {
+                        if (e.key === 'Escape') closeDraft();
+                    }}
+                >
                     <input
                         class="nge-review__input"
                         type="text"
@@ -179,6 +202,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                         onInput={(e) => setCommentAuthor(e.currentTarget.value)}
                     />
                     <textarea
+                        ref={draftTextarea}
                         class="nge-review__textarea"
                         placeholder="Comment text…"
                         value={commentText()}
@@ -189,10 +213,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                         <button
                             class="nge-btn"
                             type="button"
-                            onClick={() => {
-                                setCommentDraftOpen(false);
-                                setCommentText('');
-                            }}
+                            onClick={closeDraft}
                         >
                             Cancel
                         </button>

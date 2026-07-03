@@ -119,6 +119,16 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
         setReplyText('');
         setReplyFor((cur) => (cur === id ? null : id));
     };
+
+    /* Focus the reply textarea only on an actual open (issue #35
+     * family). A creation-time ref would also re-fire when refresh()
+     * rebuilds the referentially-keyed thread list and remounts an
+     * open draft — yanking focus from wherever the user put it. The
+     * effect runs post-render, so the textarea ref is connected. */
+    let replyTextareaEl: HTMLTextAreaElement | undefined;
+    createEffect(() => {
+        if (replyFor() !== null) replyTextareaEl?.focus();
+    });
     const submitReply = async (parentId: number) => {
         const text = replyText().trim();
         if (text === '') return;
@@ -266,6 +276,7 @@ export const CommentsRail: Component<CommentsRailProps> = (props) => {
                                         aria-label="Reply to comment"
                                     >
                                         <textarea
+                                            ref={(el) => (replyTextareaEl = el)}
                                             class="nge-cm__reply-textarea"
                                             placeholder="Reply…"
                                             rows={2}

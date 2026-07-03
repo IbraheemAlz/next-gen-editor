@@ -23,6 +23,7 @@ import {
     type Component,
 } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
+import { focusEditorInput } from './focus';
 import './ColorPickers.css';
 
 const TEXT_SWATCHES: string[] = [
@@ -142,16 +143,23 @@ export const ColorPickers: Component = () => {
         return c ? rgbToHex(c) : lastHighlightHex();
     };
 
+    /* Every close path hands focus back to the editor (issues #35/#49).
+       The popover is role="dialog", so the hidden input's pointerup
+       re-grab deliberately skips clicks inside it — without an explicit
+       hand-back, picking a swatch (or committing the hex input) unmounts
+       the popover with the focused node and strands focus on <body>. */
     const pickText = async (hex: string) => {
         if (!ready()) return;
         const rgb = hexToRgb(hex);
         if (!rgb) return;
         setOpenTextPicker(false);
+        focusEditorInput();
         await cmd.setColor(rgb[0], rgb[1], rgb[2]);
     };
     const clearText = async () => {
         if (!ready()) return;
         setOpenTextPicker(false);
+        focusEditorInput();
         await cmd.setColor(0, 0, 0);
     };
     const pickHighlight = async (hex: string) => {
@@ -160,11 +168,13 @@ export const ColorPickers: Component = () => {
         if (!rgb) return;
         setLastHighlightHex(hex);
         setOpenHighlightPicker(false);
+        focusEditorInput();
         await cmd.setHighlight(rgb[0], rgb[1], rgb[2]);
     };
     const clearHighlight = async () => {
         if (!ready()) return;
         setOpenHighlightPicker(false);
+        focusEditorInput();
         await cmd.setHighlight(0, 0, 0, 0);
     };
 

@@ -9,6 +9,8 @@
  * Every component below applies its own per-component stylesheet via a
  * sibling .css import — no consumer wiring needed beyond the theme.
  */
+export { focusEditorInput } from './focus';
+
 export { DevHud } from './DevHud';
 export type { DevHudProps } from './DevHud';
 

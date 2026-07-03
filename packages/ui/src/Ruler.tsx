@@ -55,6 +55,7 @@ import {
     type BridgeTabKind,
     type BridgeTabStop,
 } from '@nge/core';
+import { focusEditorInput } from './focus';
 import './Ruler.css';
 
 const PT_PER_INCH = 72;
@@ -570,12 +571,7 @@ export const Ruler: Component<RulerProps> = (props) => {
 
     /* Reset focus to whatever owned it before the drag — the canvas
      * input must keep focus so typing continues into the document. */
-    const restoreFocus = () => {
-        const ta = document.querySelector<HTMLTextAreaElement>(
-            '#nge-hidden-input, textarea[data-nge-hidden-input]',
-        );
-        ta?.focus();
-    };
+    const restoreFocus = () => focusEditorInput();
 
     return (
         <div

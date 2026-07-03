@@ -12,6 +12,7 @@ import {
     PAGE_H_PT,
     SCREEN_DPI_SCALE,
     enginePageTopDevice,
+    selectionViewForPointer,
 } from '../state/engine-store';
 
 /**
@@ -88,6 +89,41 @@ export function attachPointer(
     };
 
     const onPointerDown = (e: PointerEvent): void => {
+        /* Non-primary buttons never start a drag (issue #36) — treating a
+           right-click like a left-click collapsed the active TABLE_CELLS
+           selection before TableContextMenu could read it, leaving "Merge
+           cells" permanently disabled. Word semantics for the right
+           button: a press INSIDE the active selection (or anywhere while
+           a TABLE_CELLS selection is live — its rects cover only the text
+           runs, so point-in-rect underreports cell coverage) preserves
+           the selection for the context menu; a press OUTSIDE a linear
+           selection moves the caret so menu actions never target a stale
+           far-away position. Middle clicks are ignored entirely. Touch
+           and pen contacts report button 0, so both still place the
+           caret. */
+        if (e.button !== 0) {
+            if (e.button === 2) {
+                const sel = selectionViewForPointer();
+                if (sel.kind.kind !== 'TABLE_CELLS') {
+                    const dpr = window.devicePixelRatio || 1;
+                    const g = toGlobal(e);
+                    const cx = g.x / dpr;
+                    const cy = g.y / dpr;
+                    const inside = sel.rects.some(
+                        (r) =>
+                            cx >= r.x &&
+                            cx <= r.x + r.w &&
+                            cy >= r.y &&
+                            cy <= r.y + r.h,
+                    );
+                    if (!inside) {
+                        gesture += 1;
+                        void placeCaret(toLocal(e), gesture);
+                    }
+                }
+            }
+            return;
+        }
         canvas.setPointerCapture(e.pointerId);
         dragging = true;
         gesture += 1;

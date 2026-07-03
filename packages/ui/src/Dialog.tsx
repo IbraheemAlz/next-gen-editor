@@ -22,7 +22,14 @@ import {
     type ParentComponent,
 } from 'solid-js';
 import { Portal } from 'solid-js/web';
+import { focusEditorInput } from './focus';
 import './Dialog.css';
+
+/* Everything a Tab press can land on inside the dialog chrome. */
+const FOCUSABLE =
+    'a[href], button:not([disabled]), input:not([disabled]), ' +
+    'select:not([disabled]), textarea:not([disabled]), ' +
+    '[tabindex]:not([tabindex="-1"])';
 
 export interface DialogProps {
     open: boolean;
@@ -41,6 +48,57 @@ export interface DialogProps {
 }
 
 export const Dialog: ParentComponent<DialogProps> = (props) => {
+    let dialogEl: HTMLDivElement | undefined;
+
+    /* Focus trap (issues #35/#49). While open: seed focus into the body's
+       `autofocus` element (or the first focusable), keep Tab cycling
+       inside the chrome, and hand focus back on close — to whatever held
+       it before opening (normally the editor's hidden textarea), with
+       `focusEditorInput()` as the fallback when that element is gone. */
+    createEffect(() => {
+        if (!props.open) return;
+        const prev =
+            document.activeElement instanceof HTMLElement
+                ? document.activeElement
+                : null;
+        /* The effect runs post-render, so the Portal DOM exists. Prefer
+           the body's first control — seeding on the header's × close
+           button is technically valid but useless for keyboard-first
+           entry into forms like Page Setup. */
+        const seed =
+            dialogEl?.querySelector<HTMLElement>('[autofocus]') ??
+            dialogEl?.querySelector<HTMLElement>(
+                `.nge-dialog__body :is(${FOCUSABLE})`,
+            ) ??
+            dialogEl?.querySelector<HTMLElement>(FOCUSABLE);
+        seed?.focus();
+
+        const onTab = (e: KeyboardEvent) => {
+            if (e.key !== 'Tab' || !dialogEl) return;
+            const items = Array.from(
+                dialogEl.querySelectorAll<HTMLElement>(FOCUSABLE),
+            ).filter((el) => el.offsetParent !== null);
+            const first = items[0];
+            const last = items[items.length - 1];
+            if (!first || !last) return;
+            const active = document.activeElement;
+            const inside = active instanceof Node && dialogEl.contains(active);
+            if (e.shiftKey && (active === first || !inside)) {
+                e.preventDefault();
+                last.focus();
+            } else if (!e.shiftKey && (active === last || !inside)) {
+                e.preventDefault();
+                first.focus();
+            }
+        };
+        window.addEventListener('keydown', onTab);
+        onCleanup(() => {
+            window.removeEventListener('keydown', onTab);
+            if (prev?.isConnected) prev.focus();
+            else focusEditorInput();
+        });
+    });
+
     /* ESC handler. Bound only while the dialog is open. */
     createEffect(() => {
         if (!props.open) return;
@@ -86,6 +144,7 @@ export const Dialog: ParentComponent<DialogProps> = (props) => {
                     onMouseDown={onBackdropMouseDown}
                 >
                     <div
+                        ref={dialogEl}
                         class={`nge-dialog ${sizeClass()}`}
                         role="dialog"
                         aria-modal="true"

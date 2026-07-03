@@ -61,6 +61,22 @@ export function enginePageTopDevice(idx: number): number | null {
     return latestPageTops?.[idx] ?? null;
 }
 
+/* Issue #36 — same module-level-mirror pattern for the selection view:
+ * the pointer path decides on right-click whether the press lands inside
+ * the active selection (preserve it for the context menu) or outside
+ * (move the caret, Word semantics) without threading the store through
+ * `attachPointer`. Rects are CSS px, document-absolute. */
+let latestSelectionView: { rects: Rect[]; kind: SelectionKind } = {
+    rects: [],
+    kind: { kind: 'LINEAR' },
+};
+
+/** Latest selection rects + kind from `SELECTION_CHANGED`, for the
+ *  non-reactive pointer path. */
+export function selectionViewForPointer(): { rects: Rect[]; kind: SelectionKind } {
+    return latestSelectionView;
+}
+
 /** The current selection: its logical range plus rendered rectangles. */
 export interface SelectionView {
     range: LogicalRange;
@@ -159,11 +175,13 @@ export function createEngineStore(client: EngineClient) {
     client.subscribe((ev: Event) => {
         if (ev.type === 'SELECTION_CHANGED') {
             const dpr = window.devicePixelRatio || 1;
+            const cssRects = ev.rects.map((r) => toCssRect(r, dpr));
+            latestSelectionView = { rects: cssRects, kind: ev.selection_kind };
             setCaret(toCssRect(ev.caret, dpr));
             setCaretLogical(ev.range.end);
             setSelection({
                 range: ev.range,
-                rects: ev.rects.map((r) => toCssRect(r, dpr)),
+                rects: cssRects,
             });
             setAttrsAtCaret(ev.attrs_at_caret);
             setAttrsMixed(ev.attrs_mixed);
