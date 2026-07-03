@@ -98,6 +98,26 @@
     font: 15px / 1.5 system-ui, sans-serif;
 }
 
+/* Issue #48 — transient UI-error banner (clipboard failures and other
+   browser-API errors that never reach the engine's Event::Error path).
+   Fixed top-center, above the boot overlay (z 100) and the stats strip. */
+.ui-error-banner {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    /* above every @nge/ui layer (--nge-z-overlay 900 / popover 1000 /
+       hud 1100) — an error must never hide behind an open dialog */
+    z-index: 1200;
+    max-width: min(90vw, 560px);
+    padding: 8px 14px;
+    background: #b91c1c;
+    color: #fff;
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    font: 13px / 1.5 system-ui, sans-serif;
+}
+
 /* Phase 4 §8 — one rectangle of the selection highlight. */
 .selection-rect {
     position: absolute;

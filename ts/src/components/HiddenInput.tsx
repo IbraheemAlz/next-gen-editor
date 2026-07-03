@@ -16,7 +16,7 @@ import type {
     TextAttrsPatch,
 } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
-import { copy, cut, paste } from '../input/clipboard';
+import { ClipboardWriteError, copy, cut, paste } from '../input/clipboard';
 
 /** Map a non-composition `InputEvent` to an engine command. */
 function mapInputEventToCommand(e: InputEvent, caret: LogicalPos): Command | null {
@@ -287,14 +287,40 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
 
     /* §12 — clipboard. The native copy/cut/paste events fire inside a
        user-gesture context, which the async navigator.clipboard API requires;
-       preventDefault stops the textarea acting on its own (empty) content. */
+       preventDefault stops the textarea acting on its own (empty) content.
+
+       Issue #48 — copy/cut can reject (`ClipboardWriteError`) when the
+       browser blocks every write tier; the rejection MUST be observed
+       and surfaced, never `void`-discarded. On a failed cut nothing was
+       deleted (write-before-delete invariant in `input/clipboard.ts`). */
     const onCopy = (e: ClipboardEvent): void => {
         e.preventDefault();
-        void copy(props.client);
+        copy(props.client).catch((err: unknown) => {
+            /* Only a ClipboardWriteError means the BROWSER blocked the
+               write — anything else is an engine/dispatch failure and
+               must not be blamed on clipboard permissions. */
+            props.store.setUiError(
+                err instanceof ClipboardWriteError
+                    ? 'Copy failed — the browser blocked clipboard access. ' +
+                          'Click the document and try again.'
+                    : 'Copy failed — the editor could not read the selection.',
+            );
+        });
     };
     const onCut = (e: ClipboardEvent): void => {
         e.preventDefault();
-        void cut(props.client);
+        cut(props.client).catch((err: unknown) => {
+            /* ClipboardWriteError ⇒ the write was blocked and the delete
+               was skipped (write-before-delete), so "nothing was deleted"
+               is a guarantee. Any other rejection may have come from the
+               DELETE dispatch AFTER a successful write — stay vague. */
+            props.store.setUiError(
+                err instanceof ClipboardWriteError
+                    ? 'Cut failed — the browser blocked clipboard access. ' +
+                          'Nothing was deleted; click the document and try again.'
+                    : 'Cut failed — an editor error occurred.',
+            );
+        });
     };
     const onPaste = (e: ClipboardEvent): void => {
         e.preventDefault();

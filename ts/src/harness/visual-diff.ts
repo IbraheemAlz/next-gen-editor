@@ -34,7 +34,9 @@ function canvasSizeForCase(testCase: string): { w: number; h: number } {
         testCase === 'tab-stops-right-kind-ltr' ||
         testCase === 'tab-stops-decimal-kind-ltr' ||
         testCase === 'table-merges' ||
-        testCase === 'autofit-long-url-overflow'
+        testCase === 'autofit-long-url-overflow' ||
+        testCase === 'list-bullet-numbered' ||
+        testCase === 'rich-text-caps'
     ) {
         return { w: 595, h: 842 };
     }

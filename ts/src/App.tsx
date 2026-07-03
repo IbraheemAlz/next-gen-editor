@@ -4,7 +4,7 @@
  * drives crash recovery, and mirrors the `window.__*` hooks the Phase 2
  * exit-gate e2e specs depend on. Document state lives in the engine (§9) —
  * App holds only UI signals. */
-import { createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
 import { EditorCanvas } from './components/EditorCanvas';
 import { ExtraPageCanvas } from './components/ExtraPageCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
@@ -14,7 +14,7 @@ import { SdkShelf } from './sdk-bridge';
 import { AccessibilityTree } from './components/AccessibilityTree';
 import { Announcements } from './components/Announcements';
 import { EngineClient } from './engine/engine-client';
-import { createEngineStore, SCREEN_DPI_SCALE } from './state/engine-store';
+import { createEngineStore, SCREEN_DPI_SCALE, type EngineStore } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
 import { attachDragDrop } from './input/dnd';
 import { createFontRegistry, type FontRegistry } from '@nge/core';
@@ -97,6 +97,32 @@ function startStatsPolling(client: EngineClient): void {
 
     void poll();
     setInterval(() => void poll(), 5000);
+}
+
+/** Issue #48 — transient visible banner for UI-side failures (e.g. a
+ *  blocked clipboard write) that never reach the engine's `Event::Error`
+ *  path. Auto-dismisses after 6 s (the FileMenu error-banner pattern);
+ *  a newer error resets the timer. The matching assertive screen-reader
+ *  announcement is piped by `store.setUiError` itself. */
+function UiErrorBanner(props: { store: EngineStore }) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    createEffect(() => {
+        const msg = props.store.uiError();
+        if (timer !== undefined) clearTimeout(timer);
+        if (msg !== null) {
+            timer = setTimeout(() => props.store.setUiError(null), 6000);
+        }
+    });
+    onCleanup(() => {
+        if (timer !== undefined) clearTimeout(timer);
+    });
+    return (
+        <Show when={props.store.uiError()}>
+            <div class="ui-error-banner" role="alert">
+                {props.store.uiError()}
+            </div>
+        </Show>
+    );
 }
 
 export function App() {
@@ -242,6 +268,7 @@ export function App() {
             </SdkShelf>
             <AccessibilityTree client={client} />
             <Announcements store={store} />
+            <UiErrorBanner store={store} />
             <Show when={booting()}>
                 <div class="boot-overlay">Loading editor…</div>
             </Show>

@@ -82,6 +82,12 @@ fn resolve_markers_inner(paragraphs: &mut [&mut Paragraph], defs: &NumberingDefi
         }
 
         para.resolved_marker = render_marker(num_id, ilvl, defs, &counters);
+        /* Issue #50 — geometry rides along with the marker: the level's
+        `<w:ind>` is the layout fallback when the paragraph carries no
+        direct indent, mirroring `engine::numbering::resolve_markers_in_place`
+        so docx-opened lists and interactively-toggled lists share the
+        same marker/indent contract. */
+        para.resolved_list_indent = defs.level_for(num_id, ilvl).map(|l| l.indent);
     }
 }
 

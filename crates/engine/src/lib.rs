@@ -1233,6 +1233,13 @@ pub struct Paragraph {
     /// paragraphs and for list paragraphs whose `num_id` resolves to no
     /// definition (defensive — Word tolerates dangling numIds).
     pub resolved_marker: Option<String>,
+    /// Issue #50 — the numbering level's `<w:ind>` (`LvlDef.indent`),
+    /// stamped by the marker resolver alongside [`Self::resolved_marker`].
+    /// Transient render geometry: the layout boundary falls back to it when
+    /// the paragraph carries no direct indent, so interactively-toggled
+    /// lists indent without mutating `props`. The `.docx` writer never
+    /// serializes it — level indents already live in `numbering.xml`.
+    pub resolved_list_indent: Option<Indent>,
     /// Phase 3 passthrough optimisation. `false` on load; flips to `true` the
     /// first time any engine mutation produces a derived paragraph. The writer
     /// emits `source_xml` verbatim when this is `false` and ignores it
@@ -1338,6 +1345,7 @@ impl Paragraph {
             props: self.props.clone(),
             list_item: self.list_item,
             resolved_marker: self.resolved_marker.clone(),
+            resolved_list_indent: self.resolved_list_indent,
             dirty: true,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -1428,6 +1436,7 @@ impl Paragraph {
             props: self.props.clone(),
             list_item: self.list_item,
             resolved_marker: self.resolved_marker.clone(),
+            resolved_list_indent: self.resolved_list_indent,
             dirty: true,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -1468,6 +1477,7 @@ impl Paragraph {
                 props: self.props.clone(),
                 list_item: self.list_item,
                 resolved_marker: self.resolved_marker.clone(),
+                resolved_list_indent: self.resolved_list_indent,
                 dirty: true,
                 source_xml: None,
                 inline_objects: Vec::new(),
@@ -1483,6 +1493,7 @@ impl Paragraph {
                 props: self.props.clone(),
                 list_item: self.list_item,
                 resolved_marker: self.resolved_marker.clone(),
+                resolved_list_indent: self.resolved_list_indent,
                 dirty: true,
                 source_xml: None,
                 inline_objects: Vec::new(),
@@ -1516,6 +1527,7 @@ impl Paragraph {
             props: self.props.clone(),
             list_item: self.list_item,
             resolved_marker: self.resolved_marker.clone(),
+            resolved_list_indent: self.resolved_list_indent,
             dirty: true,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -1859,6 +1871,7 @@ impl DocumentTree {
             props: ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -1896,6 +1909,7 @@ impl DocumentTree {
                 props: ParaProperties::default(),
                 list_item: None,
                 resolved_marker: None,
+                resolved_list_indent: None,
                 dirty: false,
                 source_xml: None,
                 inline_objects: Vec::new(),
@@ -2637,6 +2651,7 @@ impl DocumentTree {
                 props: ParaProperties::default(),
                 list_item: None,
                 resolved_marker: None,
+                resolved_list_indent: None,
                 dirty: true,
                 source_xml: None,
                 inline_objects: Vec::new(),
@@ -3648,6 +3663,47 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #50 — re-stamp `resolved_marker` / `resolved_list_indent`
+    /// across the top-level paragraphs after a structural mutation
+    /// (split / merge / splice). `Paragraph::split_at` / `concat` clone
+    /// the stamped fields onto both outputs, so without a refresh an
+    /// Enter inside a numbered list shows the head's marker twice
+    /// instead of renumbering the tail. Cheap early-out when the
+    /// document carries no list paragraphs.
+    fn with_list_markers_refreshed(mut self) -> Self {
+        let has_lists = self
+            .blocks
+            .iter()
+            .any(|b| b.as_paragraph().is_some_and(|p| p.list_item.is_some()));
+        if !has_lists {
+            return self;
+        }
+        /* Two passes so `im::Vector` structural sharing survives the hot
+        edit path: compute the expected stamps immutably, then path-copy
+        ONLY the paragraphs whose stamps actually changed. An Enter inside
+        a bullet list changes nothing ("•" stays "•"); a numbered-list
+        edit touches only the renumbered tail — a blanket `iter_mut()`
+        would thaw every chunk of the shared tree (and un-share every
+        UndoStack snapshot) on each split/merge/paste. */
+        let (para_indices, items): (Vec<usize>, Vec<Option<ListItem>>) = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, b)| b.as_paragraph().map(|p| (idx, p.list_item)))
+            .unzip();
+        let expected = numbering::compute_markers(&items, &self.numbering);
+        for (idx, (marker, indent)) in para_indices.into_iter().zip(expected) {
+            let stale = self.blocks[idx]
+                .as_paragraph()
+                .is_some_and(|p| p.resolved_marker != marker || p.resolved_list_indent != indent);
+            if stale && let Some(p) = self.blocks.get_mut(idx).and_then(|b| b.as_paragraph_mut()) {
+                p.resolved_marker = marker;
+                p.resolved_list_indent = indent;
+            }
+        }
+        self
+    }
+
     /// Sprint 5 (UI Edition) — clear `list_item` on every paragraph
     /// the range spans. The engine has no numbering synthesizer
     /// today, so this is the only list mutation that is safe to
@@ -3739,12 +3795,14 @@ impl DocumentTree {
                 let _ = mutate_paragraph_in_top(&mut blocks, &child_path, |para| {
                     para.list_item = None;
                     para.resolved_marker = None;
+                    para.resolved_list_indent = None;
                 });
             }
         } else {
             let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
                 para.list_item = None;
                 para.resolved_marker = None;
+                para.resolved_list_indent = None;
             });
         }
         Self {
@@ -3763,6 +3821,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
+        .with_list_markers_refreshed()
     }
 
     /// Sprint 4 (UI Edition) — set `<w:pgMar>` (top/right/bottom/left
@@ -4115,6 +4174,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
+        .with_list_markers_refreshed()
     }
 
     /// Split the paragraph at `at`, the break falling between the two halves.
@@ -4163,6 +4223,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
         }
+        .with_list_markers_refreshed()
     }
 
     /// Insert `text` at `at`, splitting it into separate paragraphs on every
@@ -4304,7 +4365,8 @@ impl DocumentTree {
                     style_run_defaults: self.style_run_defaults.clone(),
                     styles_dirty: self.styles_dirty,
                     numbering: self.numbering.clone(),
-                },
+                }
+                .with_list_markers_refreshed(),
                 caret,
             );
         }
@@ -4345,7 +4407,8 @@ impl DocumentTree {
                 style_run_defaults: self.style_run_defaults.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
-            },
+            }
+            .with_list_markers_refreshed(),
             caret,
         )
     }
@@ -4514,7 +4577,8 @@ impl DocumentTree {
                 style_run_defaults: self.style_run_defaults.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
-            },
+            }
+            .with_list_markers_refreshed(),
             caret,
         )
     }
@@ -6479,6 +6543,7 @@ mod tests {
             props: ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -6504,6 +6569,7 @@ mod tests {
             props: ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -6526,6 +6592,7 @@ mod tests {
             props: ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -6626,6 +6693,7 @@ mod tests {
             props: ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -6662,6 +6730,7 @@ mod tests {
             props: ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -7155,6 +7224,7 @@ mod tests {
             props: ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -7197,6 +7267,7 @@ mod tests {
             props: ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -7238,6 +7309,7 @@ mod tests {
                 props: ParaProperties::default(),
                 list_item: None,
                 resolved_marker: None,
+                resolved_list_indent: None,
                 dirty: false,
                 source_xml: None,
                 inline_objects: Vec::new(),
@@ -7257,6 +7329,7 @@ mod tests {
                 props: ParaProperties::default(),
                 list_item: None,
                 resolved_marker: None,
+                resolved_list_indent: None,
                 dirty: false,
                 source_xml: None,
                 inline_objects: Vec::new(),
@@ -7409,6 +7482,103 @@ mod tests {
         );
         let d = d.set_line_spacing(start, end, 0.0);
         assert_eq!(d.blocks[0].as_paragraph().unwrap().props.line_height, None);
+    }
+
+    /// Issue #50 — ToggleList must stamp BOTH the marker text and the
+    /// numbering level's indent; the indent is what layout consumes to
+    /// park the bullet in the hanging gutter instead of underneath the
+    /// first text glyph.
+    #[test]
+    fn toggle_list_stamps_marker_and_level_indent() {
+        let d = DocumentTree::from_text("alpha");
+        let pos = LogicalPos::new(BlockPath::top(0), 0);
+        let d = d.toggle_list_on_range(pos.clone(), pos, numbering::ListSynthesisKind::Bullet);
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.resolved_marker.as_deref(), Some("\u{2022}"));
+        assert_eq!(
+            p.resolved_list_indent,
+            Some(Indent {
+                start_twips: 720,
+                end_twips: 0,
+                first_line_twips: 0,
+                hanging_twips: 360,
+            }),
+            "level-0 stock indent must ride along with the marker"
+        );
+    }
+
+    /// Issue #50 — Enter inside a numbered list renumbers the tail;
+    /// `Paragraph::split_at` alone clones "1." onto both halves.
+    #[test]
+    fn split_inside_numbered_list_renumbers_the_tail() {
+        let d = DocumentTree::from_text("onetwo");
+        let start = LogicalPos::new(BlockPath::top(0), 0);
+        let end = LogicalPos::new(BlockPath::top(0), 6);
+        let d = d.toggle_list_on_range(start, end, numbering::ListSynthesisKind::Number);
+        assert_eq!(
+            d.blocks[0]
+                .as_paragraph()
+                .unwrap()
+                .resolved_marker
+                .as_deref(),
+            Some("1.")
+        );
+        let d = d.split_paragraph(LogicalPos::new(BlockPath::top(0), 3));
+        let markers: Vec<Option<&str>> = d
+            .blocks
+            .iter()
+            .filter_map(|b| b.as_paragraph())
+            .map(|p| p.resolved_marker.as_deref())
+            .collect();
+        assert_eq!(
+            markers,
+            vec![Some("1."), Some("2.")],
+            "split must renumber, not duplicate the head's marker"
+        );
+    }
+
+    /// Issue #50 — merging across the break (delete_range) and clearing
+    /// list membership both re-resolve the remaining markers.
+    #[test]
+    fn merge_and_clear_renumber_following_list_items() {
+        /* three numbered paragraphs: one / two / three */
+        let d = DocumentTree::from_text("one");
+        let d = d.split_paragraph(LogicalPos::new(BlockPath::top(0), 3));
+        let d = d.insert_text(LogicalPos::new(BlockPath::top(1), 0), "two");
+        let d = d.split_paragraph(LogicalPos::new(BlockPath::top(1), 3));
+        let d = d.insert_text(LogicalPos::new(BlockPath::top(2), 0), "three");
+        let start = LogicalPos::new(BlockPath::top(0), 0);
+        let end = LogicalPos::new(BlockPath::top(2), 5);
+        let d = d.toggle_list_on_range(start, end, numbering::ListSynthesisKind::Number);
+        /* delete across the first paragraph break — "one" and "two"
+        merge; the survivors renumber 1. / 2. */
+        let d = d.delete_range(
+            LogicalPos::new(BlockPath::top(0), 3),
+            LogicalPos::new(BlockPath::top(1), 0),
+        );
+        let markers: Vec<Option<String>> = d
+            .blocks
+            .iter()
+            .filter_map(|b| b.as_paragraph())
+            .map(|p| p.resolved_marker.clone())
+            .collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].as_deref(), Some("1."));
+        assert_eq!(markers[1].as_deref(), Some("2."));
+        /* clearing the first item renumbers the rest from 1. */
+        let p0 = LogicalPos::new(BlockPath::top(0), 0);
+        let d = d.clear_list_item_on_range(p0.clone(), p0);
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert!(p.resolved_marker.is_none() && p.resolved_list_indent.is_none());
+        assert_eq!(
+            d.blocks[1]
+                .as_paragraph()
+                .unwrap()
+                .resolved_marker
+                .as_deref(),
+            Some("1."),
+            "the surviving list item restarts at 1."
+        );
     }
 
     #[test]

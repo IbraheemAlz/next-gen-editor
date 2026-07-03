@@ -291,6 +291,7 @@ fn parse_cell_paragraph(
         props,
         list_item,
         resolved_marker: None,
+        resolved_list_indent: None,
         /* Cell paragraphs ride their parent table's passthrough — the
         cell's raw `<w:p>` bytes are inside `Table.source_xml`. We don't
         store a per-paragraph `source_xml` here because PR 2 always

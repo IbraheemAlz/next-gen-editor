@@ -1590,6 +1590,23 @@ fn paragraph_layout_key(
     para.props.indent.end_twips.hash(&mut h);
     para.props.indent.first_line_twips.hash(&mut h);
     para.props.indent.hanging_twips.hash(&mut h);
+    /* Issue #50 — the marker text and the numbering level's indent are
+    layout inputs now (`marker_text` + `effective_layout_indents`). Without
+    them a cross-paragraph renumber (Enter inside a numbered list) or an
+    indent-bearing ToggleList would serve a stale cached `ParagraphBox` —
+    `do_toggle_list`'s cache clear masks the toggle itself, but not edits
+    that renumber OTHER paragraphs. */
+    para.resolved_marker.hash(&mut h);
+    match para.resolved_list_indent {
+        None => 0u8.hash(&mut h),
+        Some(li) => {
+            1u8.hash(&mut h);
+            li.start_twips.hash(&mut h);
+            li.end_twips.hash(&mut h);
+            li.first_line_twips.hash(&mut h);
+            li.hanging_twips.hash(&mut h);
+        }
+    }
     match para.props.line_height {
         None => 0u8.hash(&mut h),
         Some(engine::LineHeight::Auto { twips }) => {
@@ -1810,13 +1827,14 @@ fn build_header_footer_box(
             &para.revisions,
             [0, 0, 0, 255],
         );
-        let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&para.props, scale);
+        let base_direction = resolve_base_direction(para, cfg);
+        let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
         let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
         let mut p = layout_paragraph(ParagraphConfig {
             text: &para.text,
             fonts,
             spans: &spans,
-            base_direction: resolve_base_direction(para, cfg),
+            base_direction,
             max_width: content_width,
             line_height: lh_px,
             line_height_exact: lh_exact,
@@ -1972,6 +1990,65 @@ fn props_to_layout_indents(props: &engine::ParaProperties, scale: f32) -> (f32, 
         twips_to_layout_px(props.indent.end_twips, scale),
         twips_to_layout_px(props.indent.first_line_twips, scale),
         twips_to_layout_px(props.indent.hanging_twips, scale),
+    )
+}
+
+/// Issue #50 — the indents that actually reach `layout_paragraph`. A direct
+/// `<w:ind>` wins wholesale; otherwise a list paragraph falls back to its
+/// numbering level's indent (`resolved_list_indent`, stamped by the marker
+/// resolver next to `resolved_marker`). Without the fallback an
+/// interactively-toggled list lays out at indent 0 and `build_marker`'s
+/// clamp paints the bullet underneath the first text glyph — the invisible
+/// marker of issue #50.
+///
+/// The level indent is authored leading-edge-relative (OOXML logical
+/// start), so for an RTL paragraph it lands on the `indent_end_px` slot —
+/// that is the slot `layout_paragraph` reads the leading offset from when
+/// the base direction is RTL.
+fn effective_layout_indents(
+    para: &engine::Paragraph,
+    base_direction: ShapingDirection,
+    scale: f32,
+) -> (f32, f32, f32, f32) {
+    let d = para.props.indent;
+    let Some(li) = para.resolved_list_indent else {
+        return props_to_layout_indents(&para.props, scale);
+    };
+    /* Per-slot merge — a direct `<w:ind>` attribute wins over the level's,
+    but a PARTIAL direct indent (a ruler end-indent drag writes
+    `{0, E, 0, 0}`; a docx pPr may carry only `w:ind w:end`) must not
+    strip the level's start/hanging wholesale — that re-creates the exact
+    issue-#50 invisible-marker collapse this fallback exists to fix.
+    "Set" is approximated as non-zero, the same flat-struct trade-off
+    documented on `ParaProperties::merged_with`. `firstLine`/`hanging`
+    merge as a pair (mutually exclusive in OOXML — one side being set
+    shadows both of the level's). The level indent is leading-edge
+    relative, so its start/end swap slots for RTL before the merge; a
+    direct indent keeps the legacy slot convention untouched. */
+    let (li_start_slot, li_end_slot) = match base_direction {
+        ShapingDirection::Rtl => (li.end_twips, li.start_twips),
+        ShapingDirection::Ltr => (li.start_twips, li.end_twips),
+    };
+    let s = if d.start_twips != 0 {
+        d.start_twips
+    } else {
+        li_start_slot
+    };
+    let e = if d.end_twips != 0 {
+        d.end_twips
+    } else {
+        li_end_slot
+    };
+    let (fl, hang) = if d.first_line_twips != 0 || d.hanging_twips != 0 {
+        (d.first_line_twips, d.hanging_twips)
+    } else {
+        (li.first_line_twips, li.hanging_twips)
+    };
+    (
+        twips_to_layout_px(s, scale),
+        twips_to_layout_px(e, scale),
+        twips_to_layout_px(fl, scale),
+        twips_to_layout_px(hang, scale),
     )
 }
 
@@ -2606,7 +2683,9 @@ fn layout_cell_blocks(
         let mut lb = match b {
             engine::Block::Paragraph(p) => {
                 let spans = build_style_spans(p, sctx, cfg.px_size, [0, 0, 0, 255], scale);
-                let (ind_s, ind_e, ind_fl, ind_h) = props_to_layout_indents(&p.props, scale);
+                let base_direction = resolve_base_direction(p, cfg);
+                let (ind_s, ind_e, ind_fl, ind_h) =
+                    effective_layout_indents(p, base_direction, scale);
                 let tab_stops_px = tab_stops_to_layout_px(&p.props.tab_stops, scale);
                 let (lh_px, lh_exact) =
                     resolve_line_height(p.props.line_height, cfg.line_height, scale);
@@ -2614,7 +2693,7 @@ fn layout_cell_blocks(
                     text: &p.text,
                     fonts,
                     spans: &spans,
-                    base_direction: resolve_base_direction(p, cfg),
+                    base_direction,
                     max_width: content_width_px.max(1.0),
                     line_height: lh_px,
                     line_height_exact: lh_exact,
@@ -4737,8 +4816,9 @@ impl Engine {
                                 &para.revisions,
                                 [0, 0, 0, 255],
                             );
+                            let base_direction = resolve_base_direction(para, &cfg);
                             let (ind_s, ind_e, ind_fl, ind_h) =
-                                props_to_layout_indents(&para.props, scale);
+                                effective_layout_indents(para, base_direction, scale);
                             let tab_stops_px = tab_stops_to_layout_px(&para.props.tab_stops, scale);
                             let (lh_px, lh_exact) =
                                 resolve_line_height(para.props.line_height, cfg.line_height, scale);
@@ -4746,7 +4826,7 @@ impl Engine {
                                 text: &text,
                                 fonts: &font_stack,
                                 spans: &spans,
-                                base_direction: resolve_base_direction(para, &cfg),
+                                base_direction,
                                 max_width: pag.column_width(),
                                 line_height: lh_px,
                                 line_height_exact: lh_exact,
@@ -4781,8 +4861,9 @@ impl Engine {
                                     &para.revisions,
                                     [0, 0, 0, 255],
                                 );
+                                let base_direction = resolve_base_direction(para, &cfg);
                                 let (ind_s, ind_e, ind_fl, ind_h) =
-                                    props_to_layout_indents(&para.props, scale);
+                                    effective_layout_indents(para, base_direction, scale);
                                 let inline_infos = build_inline_object_infos(para, &cfg, scale);
                                 let (lh_px, lh_exact) = resolve_line_height(
                                     para.props.line_height,
@@ -4793,7 +4874,7 @@ impl Engine {
                                     text: &para.text,
                                     fonts: &font_stack,
                                     spans: &spans,
-                                    base_direction: resolve_base_direction(para, &cfg),
+                                    base_direction,
                                     max_width: pag.column_width(),
                                     line_height: lh_px,
                                     line_height_exact: lh_exact,
@@ -8226,6 +8307,7 @@ mod tests {
             props: engine::ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -8372,6 +8454,7 @@ mod tests {
             props: engine::ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -8405,6 +8488,7 @@ mod tests {
             props: engine::ParaProperties::default(),
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),
@@ -8976,6 +9060,266 @@ mod tests {
         );
     }
 
+    fn full_span(end: u32) -> StyleSpan {
+        StyleSpan {
+            start: 0,
+            end,
+            px_size: 12.0,
+            color: [0, 0, 0, 255],
+            bold: false,
+            italic: false,
+            underline: engine::UnderlineStyle::None,
+            strike: false,
+            bg_color: None,
+            font_family: None,
+            caps_transform: false,
+            baseline_shift_px: 0.0,
+        }
+    }
+
+    /// Issue #50 — end-to-end marker geometry through `layout_paragraph`:
+    /// with the stock list indent (start 36 pt, hanging 18 pt at scale 1)
+    /// the bullet parks in the hanging gutter and every text line sits at
+    /// the start indent. The pre-#50 regression laid both at x = 0 — the
+    /// marker painted underneath the first glyph, i.e. invisible.
+    #[test]
+    fn list_marker_lands_in_the_hanging_gutter() {
+        let stack = test_font_stack();
+        let text = "hello bullet list";
+        let spans = [full_span(text.len() as u32)];
+        let para = layout_paragraph(ParagraphConfig {
+            text,
+            fonts: &stack,
+            spans: &spans,
+            base_direction: ShapingDirection::Ltr,
+            max_width: 300.0,
+            line_height: 16.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 36.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 18.0,
+            marker_text: Some("\u{2022}".to_string()),
+            px_size_for_marker: 12.0,
+            inline_objects: &[],
+            tab_stops_px: &[],
+        });
+        let marker = para.marker.as_ref().expect("marker box");
+        assert!(
+            (marker.origin.x - 18.0).abs() < 0.01,
+            "marker leading edge sits at start - hanging: got {}",
+            marker.origin.x
+        );
+        assert!(
+            marker.run.glyphs.iter().any(|g| g.id != 0),
+            "bullet must map to a real glyph"
+        );
+        assert!(
+            (para.lines[0].origin.x - 36.0).abs() < 0.01,
+            "first text line must NOT outdent under the marker: got {}",
+            para.lines[0].origin.x
+        );
+    }
+
+    /// Issue #50 review follow-up — a marker WIDER than the hanging gutter
+    /// ("viii." deep in a roman list) must shift away from the text instead
+    /// of bleeding under the first glyph; the text lines stay pinned at the
+    /// start indent.
+    #[test]
+    fn oversized_marker_shifts_out_of_the_text_zone() {
+        let stack = test_font_stack();
+        let text = "item";
+        let spans = [full_span(text.len() as u32)];
+        let para = layout_paragraph(ParagraphConfig {
+            text,
+            fonts: &stack,
+            spans: &spans,
+            base_direction: ShapingDirection::Ltr,
+            max_width: 300.0,
+            line_height: 16.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 36.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 18.0,
+            marker_text: Some("viii.".to_string()),
+            px_size_for_marker: 16.0,
+            inline_objects: &[],
+            tab_stops_px: &[],
+        });
+        let marker = para.marker.as_ref().expect("marker box");
+        assert!(
+            marker.width > 18.0,
+            "precondition: this marker must overflow the 18 px gutter (got {})",
+            marker.width
+        );
+        assert!(
+            marker.origin.x + marker.width <= 36.0 - 16.0 * 0.125 + 0.01,
+            "marker trailing edge must clear the text start: origin {} width {}",
+            marker.origin.x,
+            marker.width
+        );
+        assert!(
+            (para.lines[0].origin.x - 36.0).abs() < 0.01,
+            "text stays pinned at the start indent"
+        );
+    }
+
+    /// Issue #50 — RTL mirror: the marker parks in the RIGHT hanging
+    /// gutter, inside the paragraph box. Pre-#50, a zero leading indent
+    /// ejected it past `max_width` into the margin.
+    #[test]
+    fn rtl_list_marker_mirrors_into_right_gutter() {
+        let stack = test_font_stack();
+        let text = "hello";
+        let spans = [full_span(text.len() as u32)];
+        let para = layout_paragraph(ParagraphConfig {
+            text,
+            fonts: &stack,
+            spans: &spans,
+            base_direction: ShapingDirection::Rtl,
+            max_width: 300.0,
+            line_height: 16.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            /* leading (right) inset for RTL */
+            indent_end_px: 36.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 18.0,
+            marker_text: Some("\u{2022}".to_string()),
+            px_size_for_marker: 12.0,
+            inline_objects: &[],
+            tab_stops_px: &[],
+        });
+        let marker = para.marker.as_ref().expect("marker box");
+        let trailing_edge = marker.origin.x + marker.width;
+        assert!(
+            (trailing_edge - (300.0 - 18.0)).abs() < 0.01,
+            "marker leading (right) edge sits at max_width - (start - hanging): got {trailing_edge}"
+        );
+        assert!(
+            marker.origin.x + marker.width <= 300.0,
+            "marker must stay inside the paragraph box"
+        );
+    }
+
+    /// Issue #50 — `effective_layout_indents`: the numbering level's
+    /// indent applies only when the paragraph carries no direct `<w:ind>`,
+    /// and it is leading-edge-relative (RTL reads the leading offset from
+    /// the end slot).
+    #[test]
+    fn effective_indents_fall_back_to_list_level() {
+        let mut para = engine::Paragraph {
+            text: "x".into(),
+            ..Default::default()
+        };
+        para.resolved_list_indent = Some(engine::Indent {
+            start_twips: 720,
+            end_twips: 0,
+            first_line_twips: 0,
+            hanging_twips: 360,
+        });
+        assert_eq!(
+            effective_layout_indents(&para, ShapingDirection::Ltr, 1.0),
+            (36.0, 0.0, 0.0, 18.0)
+        );
+        assert_eq!(
+            effective_layout_indents(&para, ShapingDirection::Rtl, 1.0),
+            (0.0, 36.0, 0.0, 18.0),
+            "RTL reads the leading offset from the end slot"
+        );
+        /* direct <w:ind> start wins per-slot; the level's hanging gutter
+        survives (Word's per-attribute w:ind cascade) */
+        para.props.indent = engine::Indent {
+            start_twips: 1440,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_layout_indents(&para, ShapingDirection::Ltr, 1.0),
+            (72.0, 0.0, 0.0, 18.0)
+        );
+        /* a PARTIAL direct indent (ruler end-drag writes {0, E, 0, 0})
+        must not strip the level's start indent + gutter — the issue-#50
+        invisible-marker collapse */
+        para.props.indent = engine::Indent {
+            end_twips: 720,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_layout_indents(&para, ShapingDirection::Ltr, 1.0),
+            (36.0, 36.0, 0.0, 18.0)
+        );
+        /* a direct hanging shadows the level's firstLine/hanging PAIR */
+        para.props.indent = engine::Indent {
+            hanging_twips: 240,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_layout_indents(&para, ShapingDirection::Ltr, 1.0),
+            (36.0, 0.0, 0.0, 12.0)
+        );
+    }
+
+    /// Issue #50 — the layout-cache key must see the marker text and the
+    /// stamped level indent: a cross-paragraph renumber ("1." -> "2.")
+    /// changes painted output without touching text or props.
+    #[test]
+    fn paragraph_layout_key_sees_marker_and_list_indent() {
+        let cfg = autofit_test_cfg();
+        let mut para = engine::Paragraph {
+            text: "item".into(),
+            ..Default::default()
+        };
+        let k_plain = paragraph_layout_key(&para, &cfg, 1.0, 300.0, empty_sctx());
+        para.resolved_marker = Some("1.".into());
+        let k1 = paragraph_layout_key(&para, &cfg, 1.0, 300.0, empty_sctx());
+        para.resolved_marker = Some("2.".into());
+        let k2 = paragraph_layout_key(&para, &cfg, 1.0, 300.0, empty_sctx());
+        para.resolved_list_indent = Some(engine::Indent {
+            start_twips: 720,
+            end_twips: 0,
+            first_line_twips: 0,
+            hanging_twips: 360,
+        });
+        let k3 = paragraph_layout_key(&para, &cfg, 1.0, 300.0, empty_sctx());
+        assert_ne!(k_plain, k1);
+        assert_ne!(k1, k2, "renumbered marker must miss the cache");
+        assert_ne!(k2, k3, "level indent must be part of the key");
+    }
+
+    /// Issue #37 — the ApplyFormatting caps patch reaches layout: applying
+    /// `caps` over an existing range materializes `caps_transform` spans
+    /// AND moves the paragraph off its old layout-cache key. The reported
+    /// interactive symptom traced to conditions outside the code path
+    /// (collapsed-caret pending arm / stale wasm artifact); this test pins
+    /// the seam so the chain stays verified.
+    #[test]
+    fn caps_patch_reaches_layout_spans_and_cache_key() {
+        let cfg = autofit_test_cfg();
+        let para = engine::Paragraph {
+            text: "hello".into(),
+            ..Default::default()
+        };
+        let k_before = paragraph_layout_key(&para, &cfg, 1.0, 300.0, empty_sctx());
+        let before = build_style_spans(&para, empty_sctx(), 12.0, [0, 0, 0, 255], 1.0);
+        assert!(before.iter().all(|s| !s.caps_transform));
+        let patch = engine::SpanStyle {
+            caps: Some(true),
+            ..Default::default()
+        };
+        let capped = para.apply_style(0, 5, patch);
+        let spans = build_style_spans(&capped, empty_sctx(), 12.0, [0, 0, 0, 255], 1.0);
+        assert!(
+            !spans.is_empty() && spans.iter().any(|s| s.caps_transform),
+            "caps must materialize as caps_transform spans"
+        );
+        let k_after = paragraph_layout_key(&capped, &cfg, 1.0, 300.0, empty_sctx());
+        assert_ne!(k_before, k_after, "caps flip must miss the layout cache");
+    }
+
     fn autofit_test_cfg() -> RenderConfig {
         RenderConfig {
             font_id: "test-latin".to_string(),
@@ -8998,6 +9342,7 @@ mod tests {
                 props: engine::ParaProperties::default(),
                 list_item: None,
                 resolved_marker: None,
+                resolved_list_indent: None,
                 dirty: false,
                 source_xml: None,
                 inline_objects: Vec::new(),

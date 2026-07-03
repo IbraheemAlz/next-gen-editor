@@ -62,6 +62,8 @@ const VIEWPORTS = {
     'tab-stops-decimal-kind-ltr': { width: 595, height: 842 },
     'table-merges': { width: 595, height: 842 },
     'autofit-long-url-overflow': { width: 595, height: 842 },
+    'list-bullet-numbered': { width: 595, height: 842 },
+    'rich-text-caps': { width: 595, height: 842 },
 };
 function viewportFor(name) {
     if (process.env.VIEWPORT) {

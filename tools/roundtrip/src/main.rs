@@ -477,6 +477,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             props,
             list_item: None,
             resolved_marker: None,
+            resolved_list_indent: None,
             dirty: false,
             source_xml: None,
             inline_objects: Vec::new(),

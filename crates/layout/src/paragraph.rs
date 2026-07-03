@@ -196,6 +196,19 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         (cfg.indent_start_px, cfg.indent_end_px)
     };
 
+    /* Issue #50 — a list paragraph's `<w:hanging>` is the MARKER's gutter,
+    not a first-text-line outdent: Word renders the marker inline at
+    `start − hanging` and tabs the body text to `start`. Our marker is a
+    side-car box (`build_marker`), so every text line must sit at the start
+    indent — outdenting the first line would slide it underneath the marker
+    glyph. Non-list paragraphs keep the classic hanging behaviour. */
+    let has_marker = cfg.marker_text.as_deref().is_some_and(|t| !t.is_empty());
+    let hanging_for_lines = if has_marker {
+        0.0
+    } else {
+        cfg.hanging_indent_px
+    };
+
     /* Position each line within the paragraph. `origin.y` stacks by the
     accumulated height of preceding lines; each line's height is its own max
     ascent + max descent over its runs (Backlog #5 — dynamic line height), so
@@ -212,8 +225,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         Both already in layout px. Subsequent lines — soft-wrapped OR forced
         by a soft break (Shift+Enter) — hug `leading_off` (the Golden Rule;
         see `first_line_offset_px`). */
-        let first_line_extra =
-            first_line_offset_px(i, cfg.first_line_indent_px, cfg.hanging_indent_px);
+        let first_line_extra = first_line_offset_px(i, cfg.first_line_indent_px, hanging_for_lines);
         let inner_origin = alignment_origin_x(
             line.width,
             (content_width - first_line_extra).max(0.0),
@@ -332,11 +344,32 @@ fn build_marker(
     em-fraction so the marker doesn't kiss the first glyph. */
     let gap = cfg.px_size_for_marker * 0.5;
     let rtl = matches!(direction, ShapingDirection::Rtl);
-    /* LTR: marker sits to the left of the first line's leading edge, with
-    its trailing edge at `leading_off - gap`. RTL: mirror — marker sits to
-    the right, leading edge at `max_width - leading_off + gap`. */
+    /* Issue #50 — when the paragraph carries a hanging gutter, the marker's
+    LEADING edge sits at `start − hanging` (Word's inline-marker position);
+    the text lines all sit at the start indent, so marker and body cannot
+    collide. Without a gutter, fall back to hugging the first line's leading
+    edge with a fixed em-fraction gap (the pre-#50 behaviour: LTR trailing
+    edge at `leading_off − gap`; RTL leading edge at
+    `max_width − leading_off + gap`). */
+    let gutter = cfg.hanging_indent_px;
+    /* Overflow guard — a marker wider than the gutter ("viii.", "100.")
+    would bleed past the text's leading edge; text lines cannot move (they
+    are pinned at the start indent), so the marker shifts AWAY from the
+    text instead, keeping a small air gap. `min_gap` is an eighth of an em
+    so the common stock case (18 pt gutter, "1." at body size) keeps its
+    Word-exact `start − hanging` position untouched. */
+    let min_gap = cfg.px_size_for_marker * 0.125;
     let origin_x = if rtl {
-        cfg.max_width - leading_off + gap
+        if gutter > 0.0 {
+            (cfg.max_width - leading_off + gutter - width)
+                .max(cfg.max_width - leading_off + min_gap)
+        } else {
+            cfg.max_width - leading_off + gap
+        }
+    } else if gutter > 0.0 {
+        (leading_off - gutter)
+            .min(leading_off - width - min_gap)
+            .max(0.0)
     } else {
         (leading_off - gap - width).max(0.0)
     };

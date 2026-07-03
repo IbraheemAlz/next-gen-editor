@@ -1023,6 +1023,7 @@ pub fn parse_document_xml(
                             /* Resolver fills this in a second pass once the full
                             doc order is known (see `opc::archive::read_docx`). */
                             resolved_marker: None,
+                            resolved_list_indent: None,
                             dirty: false,
                             source_xml,
                             inline_objects: std::mem::take(&mut para_inline_objects),

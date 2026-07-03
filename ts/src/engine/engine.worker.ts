@@ -438,6 +438,93 @@ async function handleInit(msg: InitMsg): Promise<void> {
             break;
         }
 
+        case 'list-bullet-numbered': {
+            /* Issue #50 — interactive-path lists: TOGGLE_LIST must produce a
+               VISIBLE marker in the hanging gutter plus the stock level
+               indent (start 36 pt / hanging 18 pt). Two bullet items (the
+               second long enough to wrap, pinning the wrapped-lines-hug-
+               the-start-indent rule) and two numbered items pin both
+               synthesis kinds. */
+            const pos = (idx: number, offset: number) => ({
+                path: { steps: [{ kind: 'BLOCK', idx }] },
+                offset,
+            });
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'First bullet item',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 18,
+                line_height: 26,
+                align: 'START',
+            } as Command);
+            await dispatch({ type: 'SPLIT_PARAGRAPH', at: pos(0, 17) } as Command);
+            await dispatch({
+                type: 'INSERT_TEXT',
+                at: pos(1, 0),
+                text:
+                    'Second bullet item stretched with enough trailing words ' +
+                    'that the line wraps and proves wrapped lines hug the ' +
+                    'start indent instead of the gutter',
+            } as Command);
+            await dispatch({ type: 'SPLIT_PARAGRAPH', at: pos(1, 143) } as Command);
+            await dispatch({
+                type: 'INSERT_TEXT',
+                at: pos(2, 0),
+                text: 'Numbered item one',
+            } as Command);
+            await dispatch({ type: 'SPLIT_PARAGRAPH', at: pos(2, 17) } as Command);
+            await dispatch({
+                type: 'INSERT_TEXT',
+                at: pos(3, 0),
+                text: 'Numbered item two',
+            } as Command);
+            await dispatch({
+                type: 'TOGGLE_LIST',
+                range: { start: pos(0, 0), end: pos(1, 0) },
+                kind: 'Bullet',
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'TOGGLE_LIST',
+                range: { start: pos(2, 0), end: pos(3, 0) },
+                kind: 'Number',
+            } as Command);
+            break;
+        }
+
+        case 'rich-text-caps': {
+            /* Issue #37 — <w:caps>/<w:smallCaps> display transform: the
+               middle word renders ALL-CAPS, the last word renders in
+               0.8x small caps; the leading word stays untouched as the
+               control. The document model keeps the original text. */
+            await dispatch({
+                type: 'RENDER_PAGE',
+                text: 'plain allcaps smallcaps',
+                font_id: LATIN_ID,
+                base_direction: 'LTR',
+                px_size: 26,
+                line_height: 40,
+                align: 'START',
+            } as Command);
+            await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: {
+                    start: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 6 },
+                    end: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 13 },
+                },
+                attrs: { caps: true },
+            } as Command);
+            paintEvt = await dispatch({
+                type: 'APPLY_FORMATTING',
+                range: {
+                    start: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 14 },
+                    end: { path: { steps: [{ kind: 'BLOCK', idx: 0 }] }, offset: 23 },
+                },
+                attrs: { small_caps: true },
+            } as Command);
+            break;
+        }
+
         case 'tab-stops-center-kind-ltr': {
             /* L2.1 (#6) — Center tab kind at 250 pt. Segment "City"
                sits to the right of a TAB; its midpoint lands at

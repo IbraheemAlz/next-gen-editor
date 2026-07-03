@@ -142,6 +142,21 @@ export function createEngineStore(client: EngineClient) {
        emits this priority only for errors / blocked actions; the UI
        interrupts the screen reader instead of waiting for a pause. */
     const [assertiveAnnouncement, setAssertiveAnnouncement] = createSignal('');
+    /* Issue #48 — UI-side (non-engine) failure channel. Browser-API
+       failures (e.g. a clipboard write blocked by lost focus or
+       permissions) never produce an `Event::Error` — the engine was
+       never involved — so the shell needs its own signal for the
+       visible error banner. Setting a message also re-emits it on the
+       assertive live region (mirroring the `Event::Error` handling
+       below) so screen readers hear it; clearing (`null`) is silent. */
+    /* `equals: false` so a REPEATED identical failure still re-arms the
+       banner's 6 s dismiss timer (createSignal's default === comparator
+       would swallow the second set as a no-op). No assertive live-region
+       mirror here: the visible banner itself carries role="alert", so a
+       second pipe would announce every error twice to screen readers. */
+    const [uiError, setUiError] = createSignal<string | null>(null, {
+        equals: false,
+    });
     /* Mirror of every table in the document — extracted from the a11y
        delta stream so the Table panel can list/target tables by
        BlockPath::top(block_index). The current paragraph-flat
@@ -264,6 +279,8 @@ export function createEngineStore(client: EngineClient) {
         paragraphDirection,
         announcement,
         assertiveAnnouncement,
+        uiError,
+        setUiError,
         tables,
         selectionKind,
         documentHeight,

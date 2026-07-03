@@ -445,32 +445,59 @@ pub fn resolve_markers_in_place(
     paragraphs: &mut [&mut crate::Paragraph],
     defs: &NumberingDefinitions,
 ) {
+    let items: Vec<Option<crate::ListItem>> = paragraphs.iter().map(|p| p.list_item).collect();
+    let expected = compute_markers(&items, defs);
+    for (para, (marker, indent)) in paragraphs.iter_mut().zip(expected) {
+        para.resolved_marker = marker;
+        para.resolved_list_indent = indent;
+    }
+}
+
+/// Issue #50 — pure marker/indent computation for a document-ordered
+/// sequence of paragraph list bindings. Returns one `(marker, indent)`
+/// pair per input item (`(None, None)` for non-list items). Shared by
+/// [`resolve_markers_in_place`] (stamps unconditionally on an owned
+/// slice) and `DocumentTree::with_list_markers_refreshed` (diff-applies
+/// so untouched paragraphs keep their `im::Vector` structural sharing).
+///
+/// The level's `<w:ind>` (start + hanging gutter) rides along with the
+/// marker text: that geometry is what separates a visible, indented
+/// list from a bullet glyph painted under the first text glyph. Layout
+/// falls back to it when the paragraph carries no direct indent.
+pub fn compute_markers(
+    items: &[Option<crate::ListItem>],
+    defs: &NumberingDefinitions,
+) -> Vec<(Option<String>, Option<Indent>)> {
     let mut counters: HashMap<(u32, u8), i32> = HashMap::new();
     let mut max_seen_ilvl: HashMap<u32, u8> = HashMap::new();
-    for para in paragraphs.iter_mut() {
-        let Some(li) = para.list_item else {
-            para.resolved_marker = None;
-            continue;
-        };
-        let crate::ListItem { num_id, ilvl } = li;
-        if let Some(&max) = max_seen_ilvl.get(&num_id) {
-            for deeper in (ilvl + 1)..=max {
-                counters.remove(&(num_id, deeper));
+    items
+        .iter()
+        .map(|item| {
+            let Some(crate::ListItem { num_id, ilvl }) = *item else {
+                return (None, None);
+            };
+            if let Some(&max) = max_seen_ilvl.get(&num_id) {
+                for deeper in (ilvl + 1)..=max {
+                    counters.remove(&(num_id, deeper));
+                }
             }
-        }
-        max_seen_ilvl
-            .entry(num_id)
-            .and_modify(|m| *m = (*m).max(ilvl))
-            .or_insert(ilvl);
-        match counters.get_mut(&(num_id, ilvl)) {
-            Some(c) => *c += 1,
-            None => {
-                let start = defs.start_for(num_id, ilvl).unwrap_or(1);
-                counters.insert((num_id, ilvl), start);
+            max_seen_ilvl
+                .entry(num_id)
+                .and_modify(|m| *m = (*m).max(ilvl))
+                .or_insert(ilvl);
+            match counters.get_mut(&(num_id, ilvl)) {
+                Some(c) => *c += 1,
+                None => {
+                    let start = defs.start_for(num_id, ilvl).unwrap_or(1);
+                    counters.insert((num_id, ilvl), start);
+                }
             }
-        }
-        para.resolved_marker = render_marker(defs, num_id, ilvl, &counters);
-    }
+            (
+                render_marker(defs, num_id, ilvl, &counters),
+                defs.level_for(num_id, ilvl).map(|l| l.indent),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
