@@ -150,10 +150,8 @@ pub struct ParagraphStyle {
     /// `<w:pPr>` overrides this style contributes (folded onto the
     /// root-most ancestor's already-folded baseline).
     pub para: ParaProperties,
-    /// `<w:rPr>` overrides this style contributes — Sprint 12 carries
-    /// the data but does not yet apply it to spans (per-paragraph
-    /// run cascade is the same problem with a wider blast radius;
-    /// see CORE_SPRINTS_PLAN.md "out of scope").
+    /// `<w:rPr>` overrides this style contributes — applied to spans
+    /// during cascade resolution since issue #29 (closed).
     pub run: SpanStyle,
 }
 

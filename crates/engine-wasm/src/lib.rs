@@ -91,7 +91,8 @@ struct SelectionState {
 
 /// An in-progress IME composition (PHASE_4_HEADLESS_UI.md §6). Tracked
 /// between `BeginComposition` and `EndComposition`; the latest `text` is
-/// committed on a committing end. No on-canvas preview — see BACKLOG.md.
+/// committed on a committing end. The on-canvas inline preview shipped in
+/// Phase 5 sprint 11 (`composition_layout_spans`).
 #[derive(Clone)]
 struct CompositionState {
     at: BridgeLogicalPos,
@@ -3875,9 +3876,9 @@ impl Engine {
             Command::Tick { .. } => phase3_stub("Tick"),
             // Sprint 3 (UI Edition) — Document I/O. OpenDocument /
             // SaveDocument route to the existing legacy load/save_docx
-            // pipelines for the Docx format. PlainText + HTML report a
-            // clear "not yet implemented" error (tracked in the project
-            // backlog as a Core Engine task; see UI_SURFACE_MAPPING.md).
+            // pipelines for the Docx format. PlainText + HTML export via
+            // crates/format-html and DocumentTree::to_plain_text (closed
+            // issue #9).
             Command::OpenDocument {
                 bytes,
                 format,

@@ -24,8 +24,8 @@ No `iframe`s, no vendored binary blobs — the engine is built from source.
 > `@nge/ui`) with tables, images, lists, styles, zoom, page setup, track
 > changes and comments in the default UI. This is a **beta** — the external
 > security audit, operator runbook and Arabic typography sign-off are still
-> pending. Roadmap in [`MASTER_PLAN.md`](plans/MASTER_PLAN.md); deferred scope in
-> [`BACKLOG.md`](plans/BACKLOG.md).
+> pending. Roadmap in [`MASTER_PLAN.md`](plans/MASTER_PLAN.md); deferred scope
+> and open work tracked in [GitHub Issues](../../issues).
 
 ## Live demo
 
@@ -163,10 +163,10 @@ tools/
   shape-regression/  rustybuzz output snapshots
   roundtrip/      .docx open → edit → save → byte-diff harness
 fuzz/             cargo-fuzz crate — .docx reader + RPC command targets
-plans/            planning + design docs (roadmap, phases, backlogs, specs)
+plans/            planning + design docs (roadmap, phases, specs) — open work
+                  and deferred scope are tracked in GitHub Issues, not here
   MASTER_PLAN.md    macro architecture + 5-phase roadmap
   PHASE_*.md        per-phase execution plans
-  BACKLOG.md        deferred scope + technical debt
 ```
 
 ## Roadmap
@@ -184,9 +184,9 @@ See [`MASTER_PLAN.md`](plans/MASTER_PLAN.md) and the `PHASE_*.md` documents.
 
 ## Known limitations
 
-- PDF export embeds each used font whole — font subsetting is deferred, and
-  the PDF/A-2u / PDF/X-3 profiles fall back to plain PDF (the export dialog
-  gates them) — see [`BACKLOG.md`](plans/BACKLOG.md).
+- PDF export embeds each used font whole — font subsetting is deferred
+  (tracked in GitHub Issues). PDF/A-2u and PDF/X-3 conformance are fully
+  shipped (issue #28, closed), not a fallback.
 - Vello / WebGPU activates when an adapter is available and its golden suite
   is committed, but Canvas2D remains the fallback and the CI default until a
   GPU CI runner can keep the Vello goldens green.

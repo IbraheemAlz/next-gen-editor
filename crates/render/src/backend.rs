@@ -41,7 +41,7 @@ impl RendererBackend {
 /// a 300×150-defaulted canvas with squashed unreadable text the moment
 /// content exceeds one page (the real-world Phase 6 multi-page bug). The
 /// remaining Vello work (default promotion + a GPU-runner golden CI lane)
-/// is tracked as Backlog #4 / `BACKLOG.md` § Vello renderer. The wgpu
+/// is tracked in GitHub Issues (issue #1). The wgpu
 /// device probe below **does** drive the return value: callers opt in per
 /// surface (the `?renderer=vello` harness and the SettingsMenu renderer
 /// switch route through here), and a worker without an acquirable WebGPU

@@ -490,7 +490,7 @@ edit command in the bridge.
 Math (`<m:oMath>`), SmartArt, embedded charts, OLE objects, custom XML,
 content controls (`<w:sdt>`), forms protection, password-protected
 documents, and the Part 4 "Transitional" tag set. These land on demand,
-each as its own mini-RFC, and are tracked in `BACKLOG.md` rather than
+each as its own mini-RFC, and are tracked in GitHub Issues rather than
 this roadmap.
 
 ---

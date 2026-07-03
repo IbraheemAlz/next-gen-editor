@@ -1,6 +1,6 @@
 ---
 name: gh-issue-logger
-description: File a well-formed GitHub issue for tech debt, missing core engine work, or pragmatic UI workarounds before concluding the current turn. Enforces title format, label discipline, and cross-references to plans/UI_SURFACE_MAPPING.md.
+description: File a well-formed GitHub issue for tech debt, missing core engine work, or pragmatic UI workarounds before concluding the current turn. Enforces title format, label discipline, and cross-references to related GitHub issues. GitHub Issues is this repo's single source of truth for backlog/roadmap tracking — do not reference or recreate local markdown backlog files.
 allowed-tools: Bash
 user-invocable: true
 ---
@@ -81,8 +81,8 @@ pub struct X { ... }
 <Bulleted list>. Explicitly enumerate what is NOT this issue.
 Prevents scope creep when someone picks it up.
 
-cc plans/UI_SURFACE_MAPPING.md §N (<section name>), Sprint X (UI Edition)
-   <ComponentName>
+cc #<related-issue-number> if this overlaps or supersedes existing tracked
+   work — check `gh issue list --search "<keyword>"` first.
 ```
 
 ## Labels (required)
@@ -148,7 +148,7 @@ pending" badge.
 - <related feature> — separate enhancement
 - <related feature> — Phase N work
 
-cc plans/UI_SURFACE_MAPPING.md §N, Sprint X (UI Edition) <Component>
+cc #<related-issue-number> if applicable
 EOF
 )" \
   --label "core-engine,enhancement"
@@ -180,7 +180,6 @@ new issue, not be force-fit into an existing one.
 - Reference "TODO comments" or "see this commit" — issues must
   stand alone with the architecture + scope visible to a reader
   who has never touched the code.
-- Skip the cross-reference to `plans/UI_SURFACE_MAPPING.md` when it
-  applies — that doc is the authoritative status map.
 - File a duplicate. Run `gh issue list --search "<keyword>"`
-  first if you suspect overlap.
+  first if you suspect overlap — GitHub Issues is this repo's single
+  source of truth for status, not a local markdown file.

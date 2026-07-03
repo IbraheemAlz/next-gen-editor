@@ -2,7 +2,28 @@
 
 Booting into this repo? Read this first. Everything below is a learned-the-hard-way invariant from Phases 1–4. Don't relitigate without a measurement that contradicts it.
 
-**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**. Twelve post-`beta.1` backlog / tech-debt sprints then closed the bulk of [`BACKLOG.md`](plans/BACKLOG.md) — rich-text decorations + faces (with faux bold / italic on both Canvas2D and Vello), Kashida ink, incremental relayout, typography, `.docx` interoperability, the Vello/WebGPU activation, fine-grained accessibility deltas, the inline IME preview, and the core arrow-key / multi-click / select-all navigation layer (cut `v0.5.0-beta.3`). The "Monaco Standard" SDK split (`packages/`) and the Sprint 1–14 (UI Edition) waves followed — the `@nge/ui` shelf (zoom, images, revisions, comments, page setup, ruler, Dev HUD) plus viewport-culled lazy pagination (`LazyLayoutState` + `Command::ExpandLayout`, audit gap C.H1); the cut is now `v0.6.0-beta.2`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
+## Project management: GitHub Issues is the single source of truth
+
+**GitHub Issues is the absolute single source of truth for all project
+management** — bugs, missing features, and technical debt. Do not create,
+maintain, or read local markdown files for backlogs, roadmaps, or missing
+features. Rely exclusively on the `gh` CLI (`gh issue list`, `gh issue
+create`, `gh issue view`) for querying and creating tasks.
+
+This repo used to carry a set of hand-maintained backlog/tracker docs under
+`plans/` (`BACKLOG.md`, `CONSOLIDATED_MASTER_BACKLOG.md`,
+`UI_SURFACE_MAPPING.md`, `DEFERRED_FEATURES_TRACKER.md`,
+`LEGACY_BACKLOG_PLAN.md`, `CORE_SPRINTS_PLAN.md`, `SUPPORTED_FEATURES.md`).
+These were deleted (2026-07-03) and their content migrated to GitHub Issues
+to stop tracking from fragmenting across the repo and the issue tracker.
+The historical narrative below (phase-by-phase what-shipped-when) is kept
+because it's project history, not an open backlog — but any *currently
+open* gap belongs in `gh issue list`, not a new markdown file. The
+remaining `plans/*.md` docs (`PHASE_*.md`, `MASTER_PLAN.md`,
+`OOXML_ROADMAP.md`, `UX_BEHAVIOR_SPEC.md`, `ECMA_376_COMPLIANCE_AUDIT.md`)
+are architecture/spec/behavior references, not backlogs, and stay.
+
+**Phase status:** Phases 1 (PoC), 2 (worker bridge + memory), 3 (canvas rendering + native RTL), and 4 (headless UI shell — Solid.js, pointer + IME input, accessibility) are **complete**. Phase 5 (`PHASE_5_HARDENING_RELEASE.md`) — the **engineering** deliverables (D5.1–D5.5 QA harnesses + fuzzing, D5.7 telemetry, D5.8 release pipeline) are **complete**. Twelve post-`beta.1` backlog / tech-debt sprints then closed the bulk of the old backlog doc (since migrated to GitHub Issues) — rich-text decorations + faces (with faux bold / italic on both Canvas2D and Vello), Kashida ink, incremental relayout, typography, `.docx` interoperability, the Vello/WebGPU activation, fine-grained accessibility deltas, the inline IME preview, and the core arrow-key / multi-click / select-all navigation layer (cut `v0.5.0-beta.3`). The "Monaco Standard" SDK split (`packages/`) and the Sprint 1–14 (UI Edition) waves followed — the `@nge/ui` shelf (zoom, images, revisions, comments, page setup, ruler, Dev HUD) plus viewport-culled lazy pagination (`LazyLayoutState` + `Command::ExpandLayout`); the cut is now `v0.6.0-beta.2`. D5.6 (external security audit), D5.9 (operator runbook) and D5.10 (Arabic typography sign-off) are human / external deliverables still pending — this is a **beta**, not the final MVP.
 
 ---
 
@@ -94,8 +115,8 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **ICU 2.x** — `icu_segmenter` / `icu_properties` bumped 1.5 → 2.2; `LineSegmenter::new_auto` now takes `LineBreakOptions`.
 - **Priority-band Kashida** (`text-pipeline/justify_kashida.rs`): candidates from Unicode `Joining_Type`, scored into Microsoft P1–P5 bands; one Kashida per word at its best stroke. Width is an `x_advance` bump, not yet a `U+0640` tatweel glyph.
 - **FontStack** (`text-pipeline/fonts.rs`, §13.A): per-script font fallback. `build_line` segments runs by BiDi level × script × style span.
-- **Rich text** — `engine::Paragraph` carries `Vec<StyleRun>` style spans; `Command::ApplyFormatting` applies font-size + colour, plus bold/italic/underline **flags** stored on `SpanStyle` in Phase 4 (rendering of bold/italic faces + underline strokes deferred — BACKLOG.md).
-- **PDF export** (`format-pdf`, D3.7): box tree → single-page PDF, Y-axis inverted, full `Type0`/`CIDFontType2` font embedding. Not PDF/A-1b — see `BACKLOG.md`.
+- **Rich text** — `engine::Paragraph` carries `Vec<StyleRun>` style spans; `Command::ApplyFormatting` applies font-size + colour, plus bold/italic/underline **flags** stored on `SpanStyle` in Phase 4 (rendering of bold/italic faces + underline strokes was deferred at the time — shipped later, see "Where the deferred work landed" below).
+- **PDF export** (`format-pdf`, D3.7): box tree → single-page PDF, Y-axis inverted, full `Type0`/`CIDFontType2` font embedding. Not PDF/A-1b at the time — strict PDF/A-1b shipped later (D5.4, see below).
 - **DirtyTracker** (`render/dirty.rs`, D3.8): bounding-rect invalidation; `render_canvas2d` clips fills/strokes and culls off-region glyph runs (`put_image_data` ignores the canvas clip).
 - **Vello/WebGPU** is runtime-activated: the worker probes `detect_backend()` at INIT and boots `Engine::with_vello` when a WebGPU adapter is acquirable; Canvas2D is the fallback and the CI / golden-farm default (no GPU in dev/CI).
 
@@ -104,9 +125,9 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **Solid.js shell.** `ts/src/index.tsx` is the entry: a `?test=<case>` query routes to the preserved visual-diff harness and never mounts Solid; otherwise it mounts `App.tsx`. Built with `vite-plugin-solid`. `ts/src/` is split into `engine/`, `components/`, `input/`, `state/`, `styles/`, `harness/`.
 - **`EditorCanvas`** (`components/EditorCanvas.tsx`) owns the `<canvas>` and `transferControlToOffscreen()`s it once. Crash recovery is a Solid remount: `App` bumps a `canvasGen` signal, `<For each={[canvasGen()]}>` disposes the dead `<canvas>` and mounts a fresh one. The canvas carries **no `tabindex`** — a focusable canvas steals focus from the hidden textarea.
 - **The engine owns the selection.** It holds `selection` (anchor + caret) and `composition` state; every interactive edit is caret-relative, advances the engine caret, and emits `SelectionChanged`. The worker queue serializes commands, so a stale UI-side caret never misplaces text — fast typing and async clipboard stay correct. This is *the* invariant that makes the UI race-free.
-- **Hit-testing** (`engine-wasm`): `document_geometry` flattens the box tree into per-line `CaretSlot`s (absolute x ↔ source byte), inverting the renderer's coordinate walk. pixel→logical, logical→caret-rect, and selection rects all go through it. Selection rects are per-line bounding boxes (discontinuous BiDi → BACKLOG).
-- **`HiddenInput`** (`components/HiddenInput.tsx`): the `<textarea>` is the OS text-input citizen. `beforeinput` → engine commands; IME via `Begin`/`Update`/`EndComposition`, committed on end, with an inline underlined on-canvas preview during composition (Backlog #8); native `copy`/`cut`/`paste` events → the async `navigator.clipboard`. It tracks the caret so IME popups anchor, and refocuses on `pointerup` — a canvas click blurs focus to `<body>` first.
-- **Caret / selection / a11y are DOM overlays**, not canvas-drawn — `CaretOverlay`, `SelectionOverlay`, and a visually-hidden `AccessibilityTree` (`role="document"`, one `<p dir>` per paragraph, `<span>` per style run; the browser's UAX-#9 handles BiDi for the screen reader). The worker broadcasts an `AccessibilityTreeDelta` (changed-paragraph patches) after every doc mutation (Backlog #10). Engine geometry is device-px; overlays divide by `devicePixelRatio`.
+- **Hit-testing** (`engine-wasm`): `document_geometry` flattens the box tree into per-line `CaretSlot`s (absolute x ↔ source byte), inverting the renderer's coordinate walk. pixel→logical, logical→caret-rect, and selection rects all go through it. Selection rects are per-line bounding boxes at the time (discontinuous BiDi rects shipped later, see "Where the deferred work landed" below).
+- **`HiddenInput`** (`components/HiddenInput.tsx`): the `<textarea>` is the OS text-input citizen. `beforeinput` → engine commands; IME via `Begin`/`Update`/`EndComposition`, committed on end, with an inline underlined on-canvas preview during composition (shipped in Phase 5, see below); native `copy`/`cut`/`paste` events → the async `navigator.clipboard`. It tracks the caret so IME popups anchor, and refocuses on `pointerup` — a canvas click blurs focus to `<body>` first.
+- **Caret / selection / a11y are DOM overlays**, not canvas-drawn — `CaretOverlay`, `SelectionOverlay`, and a visually-hidden `AccessibilityTree` (`role="document"`, one `<p dir>` per paragraph, `<span>` per style run; the browser's UAX-#9 handles BiDi for the screen reader). The worker broadcasts an `AccessibilityTreeDelta` (changed-paragraph patches) after every doc mutation (fine-grained deltas shipped in Phase 5, see below). Engine geometry is device-px; overlays divide by `devicePixelRatio`.
 - **Schema growth (additive).** Phase 4 added the `HitTest`, `SelectWordAt`, `DeleteAtCaret`, `RequestAccessibilityTree`, `GetSelectionAsClipboard`, `PastePlain` commands; the `HitResult` and `ClipboardPayload` events; the `Point` type; and `can_undo`/`can_redo` on `SelectionChanged`. The dead `AccessibilityTreeChanged` + `A11yDelta`/`A11yNode` were repurposed (the event now carries `A11yTree`) — done only because they had zero consumers.
 
 ## Phase 5 — hardening, QA harnesses, telemetry, release
@@ -126,7 +147,7 @@ D5.10 are external/human sign-offs, not code.
 - **Performance harness (D5.3).** `tools/perf/run.mjs` measures cold start,
   insert-char p95 (one-page seeded doc) and open-50p-doc against §6 tier
   budgets. `--strict` gates cold start + insert p95; open-doc is reported but
-  **ungated** — it is bounded by the deferred incremental relayout (BACKLOG).
+  **ungated** — it was bounded by incremental relayout, which shipped in Phase 5 (see "Where the deferred work landed" below).
 - **PDF/A-1b (D5.4).** `format-pdf` emits true PDF/A-1b for `PdfProfile::A1b`;
   `crates/format-pdf/build.rs` synthesizes the sRGB ICC profile — no binary
   blob in the tree. `tools/pdf-validate` is the veraPDF harness.
@@ -297,26 +318,26 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 
 Phases 1–4 are complete; Phase 5's engineering deliverables shipped at
 `v0.5.0-beta.1`. Twelve post-`beta.1` backlog sprints then closed the bulk of
-[`BACKLOG.md`](plans/BACKLOG.md) — rich-text decorations + bold/italic faces (with
-the Vello path now applying the same faux synthesis as Canvas2D), tatweel-
-glyph Kashida, incremental relayout, dynamic line height, paragraph auto-
-direction, discontinuous BiDi selection rects, the toolbar pickers, pending
-formatting, rich clipboard + the `.docx` `<w:rPr>` round-trip, PDF
-`FlateDecode` + `/ToUnicode`, fine-grained accessibility deltas, the
-Vello/WebGPU render-path activation, the inline IME composition preview, and
-core keyboard navigation (arrow keys with ideal-x, Shift-extend, `Ctrl/Cmd+A`,
-triple-click paragraph selection) — cut `v0.5.0-beta.3`. The SDK split and the
-Sprint 1–14 (UI Edition) waves then shipped the `@nge/ui` shelf and
-viewport-culled lazy pagination (`LazyLayoutState` + `Command::ExpandLayout`,
-audit gap C.H1) — closing BACKLOG #13. The cut is `v0.6.0-beta.2`.
+the old backlog (now migrated to GitHub Issues) — rich-text decorations +
+bold/italic faces (with the Vello path now applying the same faux synthesis
+as Canvas2D), tatweel-glyph Kashida, incremental relayout, dynamic line
+height, paragraph auto-direction, discontinuous BiDi selection rects, the
+toolbar pickers, pending formatting, rich clipboard + the `.docx` `<w:rPr>`
+round-trip, PDF `FlateDecode` + `/ToUnicode`, fine-grained accessibility
+deltas, the Vello/WebGPU render-path activation, the inline IME composition
+preview, and core keyboard navigation (arrow keys with ideal-x, Shift-extend,
+`Ctrl/Cmd+A`, triple-click paragraph selection) — cut `v0.5.0-beta.3`. The
+SDK split and the Sprint 1–14 (UI Edition) waves then shipped the `@nge/ui`
+shelf and viewport-culled lazy pagination (`LazyLayoutState` +
+`Command::ExpandLayout`). The cut is `v0.6.0-beta.2`. PDF/A-2u and PDF/X-3
+conformance shipped after that (GitHub issue #28, closed).
 
-Still open in [`BACKLOG.md`](plans/BACKLOG.md): PDF font subsetting and
-PDF/A-2 / PDF/X (#3 — the `/W` width array now ships); Vello as the *default*
-renderer (#4 — the harness has a `--renderer vello` mode with committed
-`golden/vello/` goldens, and runtime activation is verified on real GPU
-hardware, closing GitHub issue #1; the remaining gap is a GPU CI runner +
-default promotion); IME `target_range` sub-segment styling (#8 — GitHub
-issue #2); and stable per-paragraph accessibility ids (#10).
+Still open, tracked in `gh issue list`: PDF font subsetting; Vello as the
+*default* renderer (issue #1 — the harness has a `--renderer vello` mode
+with committed `golden/vello/` goldens, and runtime activation is verified
+on real GPU hardware; the remaining gap is a GPU CI runner + default
+promotion); IME `target_range` sub-segment styling (issue #2); and stable
+per-paragraph accessibility ids.
 
 Phase 5 → MVP hand-off:
 

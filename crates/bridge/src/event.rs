@@ -262,8 +262,8 @@ pub enum Event {
     },
 
     /// Reply to `Command::GetSelectionAsClipboard` — the selection as
-    /// clipboard MIME payloads. `html` / `docx_fragment` stay empty until
-    /// rich clipboard generation lands (see BACKLOG.md).
+    /// clipboard MIME payloads (`html` / `docx_fragment` populated since
+    /// Phase 5 sprint 7's rich-clipboard work).
     ClipboardPayload {
         plain: String,
         html: String,
