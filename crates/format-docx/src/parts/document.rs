@@ -945,6 +945,18 @@ pub fn parse_document_xml(
                         let start = para_text.len() as u32;
                         para_text.push_str(&run_text);
                         let end = para_text.len() as u32;
+                        /* Issue #59 — clear immediately, not deferred to the
+                        next `<w:r>` Start (`run_text.clear()` above). Every
+                        paragraph-level wrapper that opens/closes AROUND
+                        runs rather than inside one — `<w:hyperlink>`,
+                        `<w:ins>`/`<w:del>`, `<w:commentRangeStart>`/`End` —
+                        reads `para_text.len() + run_text.len()` at a moment
+                        when no run is open, expecting that sum to equal
+                        `para_text.len()` alone. Leaving the just-flushed
+                        text sitting in `run_text` until the NEXT run's
+                        Start event shifted every one of those byte ranges
+                        by the length of whichever run most recently closed. */
+                        run_text.clear();
                         if start == end {
                             continue;
                         }

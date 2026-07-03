@@ -13,9 +13,9 @@ use crate::parts::comments::{
 use crate::parts::numbering::build_numbering_xml;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
-    FontFamily, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph, Revision,
-    RevisionKind, RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection, UnderlineStyle,
-    VMergeRole,
+    FontFamily, Hyperlink, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph,
+    Revision, RevisionKind, RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection,
+    UnderlineStyle, VMergeRole,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -47,6 +47,19 @@ const DOC_XML_HEADER_WITH_DRAWING: &str = concat!(
 );
 const DOC_XML_FOOTER: &str = "<w:sectPr/></w:body></w:document>";
 
+/// Issue #60 — header for documents that carry a `<w:hyperlink r:id>` but
+/// no inline images: needs `xmlns:r` (which `<w:hyperlink>`'s `r:id`
+/// attribute requires a binding for) without the DrawingML/picture
+/// namespaces `DOC_XML_HEADER_WITH_DRAWING` adds for images specifically.
+const DOC_XML_HEADER_WITH_RELS: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    "\n",
+    r#"<w:document "#,
+    r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+    r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
+    "<w:body>",
+);
+
 /// `true` when any paragraph in the doc (including those inside table
 /// cells) carries an inline image — the writer picks the expanded
 /// namespace header so the emitted `<w:drawing>` resolves.
@@ -72,6 +85,33 @@ fn doc_has_inline_images(doc: &DocumentTree) -> bool {
             row.cells
                 .iter()
                 .any(|cell| any_image_in_blocks(&cell.blocks))
+        }),
+    })
+}
+
+/// Issue #60 — `true` when any paragraph carries a hyperlink, DIRTY or
+/// NOT: a clean paragraph's hyperlink still rides its original `r:id`
+/// through the `source_xml` passthrough, and that raw XML is spliced
+/// under OUR freshly-built root `<w:document>` element, so the root must
+/// declare `xmlns:r` regardless of which paragraphs are actually being
+/// regenerated this save.
+fn doc_has_hyperlinks(doc: &DocumentTree) -> bool {
+    fn any_in_cell_blocks(blocks: &[Block]) -> bool {
+        blocks.iter().any(|b| match b {
+            Block::Paragraph(p) => !p.hyperlinks.is_empty(),
+            Block::Table(t) => t.rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .any(|cell| any_in_cell_blocks(&cell.blocks))
+            }),
+        })
+    }
+    doc.blocks.iter().any(|b| match b {
+        Block::Paragraph(p) => !p.hyperlinks.is_empty(),
+        Block::Table(t) => t.rows.iter().any(|row| {
+            row.cells
+                .iter()
+                .any(|cell| any_in_cell_blocks(&cell.blocks))
         }),
     })
 }
@@ -474,7 +514,11 @@ fn emit_ppr(
 /// round-trip harness's plain fixtures see no drift. A styled paragraph
 /// emits one `<w:r>` per maximal (range, style) segment, the default-styled
 /// gaps included.
-fn serialize_paragraph(para: &Paragraph, out: &mut String) {
+fn serialize_paragraph(
+    para: &Paragraph,
+    out: &mut String,
+    hyperlink_rel_map: &HashMap<String, String>,
+) {
     out.push_str("<w:p>");
     emit_ppr(&para.props, para.style_id.as_deref(), para.list_item, out);
     /* `<w:br>` (Phase 2 audit, gap A.12) lives as U+2028 / U+000C in
@@ -489,11 +533,12 @@ fn serialize_paragraph(para: &Paragraph, out: &mut String) {
         && para.inline_objects.is_empty()
         && para.revisions.is_empty()
         && para.fields.is_empty()
+        && para.hyperlinks.is_empty()
         && !has_break
     {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
-        emit_styled_runs_with_objects(para, out);
+        emit_styled_runs_with_objects(para, out, hyperlink_rel_map);
     }
     out.push_str("</w:p>");
 }
@@ -533,7 +578,11 @@ fn serialize_paragraph(para: &Paragraph, out: &mut String) {
 ///
 /// At end-of-text every still-open revision flushes its close in
 /// stack-LIFO order.
-fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
+fn emit_styled_runs_with_objects(
+    para: &Paragraph,
+    out: &mut String,
+    hyperlink_rel_map: &HashMap<String, String>,
+) {
     let len = para.text.len();
 
     /* Cut-point set: paragraph bounds, every span edge, every inline
@@ -554,6 +603,10 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
     for r in &para.revisions {
         cuts.insert((r.start as usize).min(len));
         cuts.insert((r.end as usize).min(len));
+    }
+    for h in &para.hyperlinks {
+        cuts.insert((h.start as usize).min(len));
+        cuts.insert((h.end as usize).min(len));
     }
     for f in &para.fields {
         cuts.insert((f.start as usize).min(len));
@@ -605,6 +658,15 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
         .collect();
     sorted_revs.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
 
+    /* Issue #60 — hyperlinks sorted the same way as revisions. Nesting
+    model: hyperlinks wrap revisions (`<w:hyperlink><w:ins>...` when a
+    tracked change happens to land inside a hyperlinked range), so the
+    hyperlink open emits *before* the revision open at any shared
+    boundary and the hyperlink close emits *after* the revision close —
+    the reverse of the field/revision relationship above. */
+    let mut sorted_hyperlinks: Vec<&Hyperlink> = para.hyperlinks.iter().collect();
+    sorted_hyperlinks.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+
     /* Fields sorted the same way. Nesting model: revisions wrap fields
     (i.e. `<w:ins><w:r><w:fldChar/></w:r></w:ins>`), so the field
     open emits *after* the revision open at any shared boundary and
@@ -631,6 +693,7 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
 
     let mut rev_stack: Vec<&Revision> = Vec::new();
     let mut field_stack: Vec<&Field> = Vec::new();
+    let mut hyperlink_stack: Vec<&Hyperlink> = Vec::new();
     let mut next_fallback_id: u32 = 1;
 
     for win in cuts.windows(2) {
@@ -658,6 +721,36 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
                 rev_stack.pop();
             } else {
                 break;
+            }
+        }
+        /* Close any hyperlinks ending at or before `lo` — hyperlinks are
+        the outermost wrapper, so their close comes after every revision
+        close above. */
+        while let Some(top) = hyperlink_stack.last() {
+            if (top.end as usize) <= lo {
+                out.push_str("</w:hyperlink>");
+                hyperlink_stack.pop();
+            } else {
+                break;
+            }
+        }
+        /* Open any hyperlinks that should be active at `lo`. A target the
+        pre-pass didn't find a rel id for (should not happen — the pre-pass
+        walks the same `dirty` paragraphs this function is called for —
+        but defensive rather than emitting a dangling `r:id`) is skipped:
+        the run(s) still emit as plain text rather than a broken link. */
+        for h in &sorted_hyperlinks {
+            let hs = h.start as usize;
+            let he = h.end as usize;
+            if hs <= lo
+                && he > lo
+                && !hyperlink_stack
+                    .iter()
+                    .any(|x| std::ptr::eq(*x as *const _, *h as *const _))
+                && let Some(rid) = hyperlink_rel_map.get(&h.target)
+            {
+                out.push_str(&format!("<w:hyperlink r:id=\"{rid}\">"));
+                hyperlink_stack.push(h);
             }
         }
         /* Open any revisions that should be active at `lo` but are not
@@ -716,12 +809,16 @@ fn emit_styled_runs_with_objects(para: &Paragraph, out: &mut String) {
     }
 
     /* Drain whatever is still open. Field epilogues fire before
-    revision closes (field wrappers nest inside revision wrappers). */
+    revision closes (field wrappers nest inside revision wrappers), and
+    hyperlinks — the outermost wrapper — drain last. */
     while let Some(_top) = field_stack.pop() {
         emit_field_epilogue(out);
     }
     while let Some(top) = rev_stack.pop() {
         emit_revision_close(top.kind, out);
+    }
+    while hyperlink_stack.pop().is_some() {
+        out.push_str("</w:hyperlink>");
     }
 }
 
@@ -850,7 +947,7 @@ fn emit_image_drawing(rel_id: &str, width_emu: i64, height_emu: i64, out: &mut S
 /// byte-stable on round-trip: paragraphs the user didn't touch carry
 /// their original `<w:pStyle>` / `<w:rsidR>` / `<w:proofErr>` markup
 /// unmodified.
-fn emit_paragraph(para: &Paragraph, out: &mut String) {
+fn emit_paragraph(para: &Paragraph, out: &mut String, hyperlink_rel_map: &HashMap<String, String>) {
     if !para.dirty
         && let Some(raw) = &para.source_xml
     {
@@ -860,10 +957,10 @@ fn emit_paragraph(para: &Paragraph, out: &mut String) {
         bytes aren't UTF-8. */
         match std::str::from_utf8(raw) {
             Ok(s) => out.push_str(s),
-            Err(_) => serialize_paragraph(para, out),
+            Err(_) => serialize_paragraph(para, out, hyperlink_rel_map),
         }
     } else {
-        serialize_paragraph(para, out);
+        serialize_paragraph(para, out, hyperlink_rel_map);
     }
 }
 
@@ -871,14 +968,14 @@ fn emit_paragraph(para: &Paragraph, out: &mut String) {
 /// `emit_paragraph` passthrough optimisation; `Block::Table` rides its
 /// own opaque passthrough (`source_xml` if clean, else a stub —
 /// regenerate-from-rows lands in Phase 5 PR 2).
-fn emit_block(block: &Block, out: &mut String) {
+fn emit_block(block: &Block, out: &mut String, hyperlink_rel_map: &HashMap<String, String>) {
     match block {
-        Block::Paragraph(p) => emit_paragraph(p, out),
-        Block::Table(t) => emit_table(t, out),
+        Block::Paragraph(p) => emit_paragraph(p, out, hyperlink_rel_map),
+        Block::Table(t) => emit_table(t, out, hyperlink_rel_map),
     }
 }
 
-fn emit_table(t: &Table, out: &mut String) {
+fn emit_table(t: &Table, out: &mut String, hyperlink_rel_map: &HashMap<String, String>) {
     if !t.dirty
         && let Some(raw) = &t.source_xml
     {
@@ -893,7 +990,7 @@ fn emit_table(t: &Table, out: &mut String) {
             Err(_) => { /* fall through to regenerate */ }
         }
     }
-    regenerate_table(t, out);
+    regenerate_table(t, out, hyperlink_rel_map);
 }
 
 /// Phase 5 PR 3 — full table regeneration. Emits `<w:tbl>` with
@@ -901,7 +998,7 @@ fn emit_table(t: &Table, out: &mut String) {
 /// with `<w:trPr>` and `<w:tc>` cells carrying `<w:tcPr>` (gridSpan,
 /// vMerge, tcW, shd, tcBorders, vAlign) and nested block content via
 /// `emit_block` for true recursion.
-fn regenerate_table(t: &Table, out: &mut String) {
+fn regenerate_table(t: &Table, out: &mut String, hyperlink_rel_map: &HashMap<String, String>) {
     out.push_str("<w:tbl>");
     emit_tbl_pr(&t.props, out);
     /* `<w:tblGrid>` — one `<w:gridCol w:w="…"/>` per template column. */
@@ -913,7 +1010,7 @@ fn regenerate_table(t: &Table, out: &mut String) {
         out.push_str("</w:tblGrid>");
     }
     for row in &t.rows {
-        emit_table_row(row, out);
+        emit_table_row(row, out, hyperlink_rel_map);
     }
     out.push_str("</w:tbl>");
 }
@@ -962,11 +1059,11 @@ fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
     out.push_str("</w:tblPr>");
 }
 
-fn emit_table_row(row: &TableRow, out: &mut String) {
+fn emit_table_row(row: &TableRow, out: &mut String, hyperlink_rel_map: &HashMap<String, String>) {
     out.push_str("<w:tr>");
     emit_tr_pr(&row.props, out);
     for cell in &row.cells {
-        emit_table_cell(cell, out);
+        emit_table_cell(cell, out, hyperlink_rel_map);
     }
     out.push_str("</w:tr>");
 }
@@ -996,7 +1093,11 @@ fn emit_tr_pr(props: &engine::RowProperties, out: &mut String) {
     out.push_str("</w:trPr>");
 }
 
-fn emit_table_cell(cell: &TableCell, out: &mut String) {
+fn emit_table_cell(
+    cell: &TableCell,
+    out: &mut String,
+    hyperlink_rel_map: &HashMap<String, String>,
+) {
     out.push_str("<w:tc>");
     emit_tc_pr(&cell.props, out);
     /* A cell must contain at least one paragraph (Word repair dialog
@@ -1006,7 +1107,7 @@ fn emit_table_cell(cell: &TableCell, out: &mut String) {
         out.push_str("<w:p/>");
     } else {
         for block in &cell.blocks {
-            emit_block(block, out);
+            emit_block(block, out, hyperlink_rel_map);
         }
     }
     out.push_str("</w:tc>");
@@ -1115,15 +1216,17 @@ fn emit_border_edge(elem: &str, edge: &Option<BorderStroke>, out: &mut String) {
     out.push_str(&format!("<{elem}{attrs}/>"));
 }
 
-fn build_document_xml(doc: &DocumentTree) -> String {
+fn build_document_xml(doc: &DocumentTree, hyperlink_rel_map: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(2048);
     if doc_has_inline_images(doc) {
         out.push_str(DOC_XML_HEADER_WITH_DRAWING);
+    } else if doc_has_hyperlinks(doc) {
+        out.push_str(DOC_XML_HEADER_WITH_RELS);
     } else {
         out.push_str(DOC_XML_HEADER);
     }
     for block in &doc.blocks {
-        emit_block(block, &mut out);
+        emit_block(block, &mut out, hyperlink_rel_map);
     }
     /* Audit gap A.H2 / A.M11 / A.M12 — trailing body-level `<w:sectPr/>`
     carries the last section's column / page-numbering / section-type
@@ -1289,6 +1392,28 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         let synth_comments = comments_bytes.is_some();
         let synth_extended = !extended_already_present && extended_bytes.is_some();
 
+        /* Issue #60 — resolve every dirty paragraph's hyperlinks to an
+        `r:id`, reserving the id range `synth_comments`/`synth_extended`
+        are about to consume from the SAME rels part so neither minting
+        pass can collide with the other. */
+        let rels_entry = archive.other_entries.iter().find(|(n, _)| n == RELS_XML);
+        let rels_already_present = rels_entry.is_some();
+        let existing_rels_str: Option<&str> =
+            rels_entry.and_then(|(_, b)| std::str::from_utf8(b).ok());
+        let existing_rels = existing_rels_str
+            .and_then(|xml| crate::opc::relationships::parse_relationships(xml.as_bytes()).ok())
+            .unwrap_or_default();
+        let mut hyperlink_next = existing_rels_str.map(next_rel_id).unwrap_or(1);
+        if synth_comments {
+            hyperlink_next += 1;
+        }
+        if synth_extended {
+            hyperlink_next += 1;
+        }
+        let (hyperlink_rid_by_target, new_hyperlink_rel_entries) =
+            hyperlink_rel_map(doc, &existing_rels, hyperlink_next);
+        let needs_hyperlink_rels_splice = !new_hyperlink_rel_entries.is_empty();
+
         /* Write sibling entries verbatim, in original order — except
         for parts we have a regenerated copy for (replace in-place).
         `[Content_Types].xml` and `word/_rels/document.xml.rels` may
@@ -1340,14 +1465,21 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                     };
                 }
                 zip.write_all(patched.as_bytes())?;
-            } else if name == RELS_XML && (synth_comments || synth_extended) {
+            } else if name == RELS_XML
+                && (synth_comments || synth_extended || needs_hyperlink_rels_splice)
+            {
                 let raw = std::str::from_utf8(bytes)?;
                 let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
                 let mut next = next_rel_id(&patched);
                 if synth_comments {
                     let rid = format!("rId{next}");
-                    let new =
-                        inject_doc_rel(&patched, &rid, COMMENTS_REL_TYPE, COMMENTS_REL_TARGET);
+                    let new = inject_doc_rel(
+                        &patched,
+                        &rid,
+                        COMMENTS_REL_TYPE,
+                        COMMENTS_REL_TARGET,
+                        None,
+                    );
                     if let Cow::Owned(s) = new {
                         patched = Cow::Owned(s);
                         next += 1;
@@ -1360,7 +1492,19 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                         &rid,
                         COMMENTS_EXT_REL_TYPE,
                         COMMENTS_EXT_REL_TARGET,
+                        None,
                     );
+                    if let Cow::Owned(s) = new {
+                        patched = Cow::Owned(s);
+                    }
+                }
+                /* Issue #60 — splice one `<Relationship TargetMode="External">`
+                row per freshly-minted hyperlink target. `hyperlink_rel_map`
+                already excluded targets that matched an existing rels entry,
+                so every pair here is genuinely new. */
+                for (rid, target) in &new_hyperlink_rel_entries {
+                    let new =
+                        inject_doc_rel(&patched, rid, HYPERLINK_REL_TYPE, target, Some("External"));
                     if let Cow::Owned(s) = new {
                         patched = Cow::Owned(s);
                     }
@@ -1397,10 +1541,33 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             zip.start_file(COMMENTS_EXTENDED_XML, opts)?;
             zip.write_all(new_bytes)?;
         }
+        /* Issue #60 — a document with zero prior relationships (no
+        `word/_rels/document.xml.rels` archive entry at all) but a fresh
+        dirty hyperlink needs the part created from scratch; the entries
+        loop above only patches an EXISTING part. Same no-OPC-synth
+        stance as numbering/styles above: no `[Content_Types].xml`
+        Override is needed for a `.rels` part itself (it rides the
+        `Default Extension="rels"` catch-all every archive already
+        carries). */
+        if !rels_already_present && needs_hyperlink_rels_splice {
+            let mut fresh = String::with_capacity(256);
+            fresh.push_str(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n",
+            );
+            for (rid, target) in &new_hyperlink_rel_entries {
+                fresh.push_str(&format!(
+                    "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL_TYPE}\" Target=\"{target}\" TargetMode=\"External\"/>\n"
+                ));
+            }
+            fresh.push_str("</Relationships>");
+            zip.start_file(RELS_XML, opts)?;
+            zip.write_all(fresh.as_bytes())?;
+        }
 
         /* Write the regenerated document.xml. */
         zip.start_file(DOC_XML, opts)?;
-        let xml = build_document_xml(doc);
+        let xml = build_document_xml(doc, &hyperlink_rid_by_target);
         zip.write_all(xml.as_bytes())?;
 
         zip.finish()?;
@@ -1539,6 +1706,9 @@ const COMMENTS_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
 const COMMENTS_EXT_REL_TYPE: &str =
     "http://schemas.microsoft.com/office/2011/relationships/commentsExtended";
+/// Issue #60 — rel-type IRI for an external `<w:hyperlink r:id>` target.
+const HYPERLINK_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
 const COMMENTS_PART_NAME: &str = "/word/comments.xml";
 const COMMENTS_EXT_PART_NAME: &str = "/word/commentsExtended.xml";
 const COMMENTS_REL_TARGET: &str = "comments.xml";
@@ -1591,11 +1761,15 @@ fn next_rel_id(rels_xml: &str) -> u32 {
 /// `word/_rels/document.xml.rels`. Skips when any existing row already
 /// points at `target` (regardless of its rId). Returns the rId actually
 /// used (caller-allocated when injected, the existing one otherwise).
+/// `target_mode`: `Some("External")` for issue #60's hyperlink rows
+/// (an absolute URL target, not an internal part); `None` for internal
+/// targets (comments, commentsExtended) that omit the attribute entirely.
 fn inject_doc_rel<'a>(
     rels_xml: &'a str,
     rel_id: &str,
     rel_type: &str,
     target: &str,
+    target_mode: Option<&str>,
 ) -> Cow<'a, str> {
     let target_needle = format!("Target=\"{target}\"");
     if rels_xml.contains(&target_needle) {
@@ -1607,10 +1781,95 @@ fn inject_doc_rel<'a>(
     let mut out = String::with_capacity(rels_xml.len() + 256);
     out.push_str(&rels_xml[..close_idx]);
     out.push_str(&format!(
-        "<Relationship Id=\"{rel_id}\" Type=\"{rel_type}\" Target=\"{target}\"/>\n"
+        "<Relationship Id=\"{rel_id}\" Type=\"{rel_type}\" Target=\"{target}\""
     ));
+    if let Some(mode) = target_mode {
+        out.push_str(&format!(" TargetMode=\"{mode}\""));
+    }
+    out.push_str("/>\n");
     out.push_str(&rels_xml[close_idx..]);
     Cow::Owned(out)
+}
+
+/// Issue #60 — every hyperlink target belonging to a paragraph the
+/// writer is about to REGENERATE (`dirty`, walked recursively through
+/// table cells). A clean/passthrough paragraph keeps its original
+/// `<w:hyperlink r:id>` untouched inside its verbatim `source_xml`, so it
+/// never needs an entry here — only what THIS save actually re-derives
+/// from the `Paragraph.hyperlinks` overlay (which carries the resolved
+/// target URL, not the original rId) needs a fresh-or-reused id resolved.
+fn collect_dirty_hyperlink_targets(doc: &DocumentTree) -> Vec<String> {
+    fn walk_cell_blocks(blocks: &[Block], out: &mut Vec<String>) {
+        for b in blocks {
+            match b {
+                Block::Paragraph(p) if p.dirty => {
+                    out.extend(p.hyperlinks.iter().map(|h| h.target.clone()));
+                }
+                Block::Paragraph(_) => {}
+                Block::Table(t) => {
+                    for row in &t.rows {
+                        for cell in &row.cells {
+                            walk_cell_blocks(&cell.blocks, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for b in &doc.blocks {
+        match b {
+            Block::Paragraph(p) if p.dirty => {
+                out.extend(p.hyperlinks.iter().map(|h| h.target.clone()));
+            }
+            Block::Paragraph(_) => {}
+            Block::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        walk_cell_blocks(&cell.blocks, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Issue #60 — resolve every dirty-paragraph hyperlink target to an
+/// `r:id`: reuse an existing rels entry whose `Target` already matches
+/// (mirrors `inject_doc_rel`'s own dedup-by-target), else mint the next
+/// unused sequential id starting from `next` (the caller has already
+/// reserved whatever ids `synth_comments`/`synth_extended` are about to
+/// consume from the same rels part, so minting here can never collide
+/// with theirs). Returns the full lookup map (fed to `build_document_xml`
+/// for emission) plus the subset of `(rid, target)` pairs that are
+/// genuinely NEW and must be spliced into the rels part.
+fn hyperlink_rel_map(
+    doc: &DocumentTree,
+    existing: &crate::opc::relationships::Relationships,
+    mut next: u32,
+) -> (HashMap<String, String>, Vec<(String, String)>) {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut new_entries: Vec<(String, String)> = Vec::new();
+    for target in collect_dirty_hyperlink_targets(doc) {
+        if map.contains_key(&target) {
+            continue;
+        }
+        if let Some(rid) = existing
+            .items
+            .iter()
+            .find(|r| r.target == target)
+            .map(|r| r.id.clone())
+        {
+            map.insert(target, rid);
+        } else {
+            let rid = format!("rId{next}");
+            next += 1;
+            new_entries.push((rid.clone(), target.clone()));
+            map.insert(target, rid);
+        }
+    }
+    (map, new_entries)
 }
 
 #[cfg(test)]
@@ -1937,7 +2196,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
-        let xml = build_document_xml(&doc);
+        let xml = build_document_xml(&doc, &HashMap::new());
         /* Insertion: `<w:ins>` with attrs wraps a `<w:r>` carrying
         "hello " inside a `<w:t>` (live text). */
         assert!(
@@ -1996,6 +2255,349 @@ mod tests {
         assert_eq!(p.revisions[0].id, Some(42));
         assert_eq!(p.revisions[0].kind, RevisionKind::Insert);
         assert_eq!(p.revisions[0].author, "A");
+    }
+
+    /// Issue #59 test helper — zip up a minimal `.docx` from just a
+    /// `word/document.xml` body (+ optional `word/_rels/document.xml.rels`,
+    /// needed whenever the body carries a `<w:hyperlink r:id>` — the
+    /// archive resolver drops any hyperlink whose rId isn't in the rels
+    /// map).
+    fn zip_minimal_docx(document_xml: &str, doc_rels: Option<&str>) -> Vec<u8> {
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            zip.start_file("[Content_Types].xml", opts).unwrap();
+            zip.write_all(content_types.as_bytes()).unwrap();
+            zip.start_file("_rels/.rels", opts).unwrap();
+            zip.write_all(DOT_RELS_XML.as_bytes()).unwrap();
+            if let Some(rels) = doc_rels {
+                zip.start_file("word/_rels/document.xml.rels", opts)
+                    .unwrap();
+                zip.write_all(rels.as_bytes()).unwrap();
+            }
+            zip.start_file("word/document.xml", opts).unwrap();
+            zip.write_all(document_xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    const HYPERLINK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org" TargetMode="External"/>
+</Relationships>"#;
+
+    const DOC_XML_NS: &str = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#;
+
+    /// Issue #59 — a hyperlink preceded by a plain-text run in the same
+    /// paragraph must parse to its OWN byte range, not one shifted by the
+    /// preceding run's length. This is the exact repro that surfaced the
+    /// bug: `run_text` was only cleared on the NEXT `<w:r>` Start, so both
+    /// `<w:hyperlink>`'s open and close reads saw stale leftover text from
+    /// whichever run had most recently flushed.
+    #[test]
+    fn hyperlink_preceded_by_run_gets_correct_byte_range() {
+        let document_xml = format!(
+            "{DOC_XML_NS}<w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">Visit our </w:t></w:r>\
+             <w:hyperlink r:id=\"rId2\"><w:r><w:t xml:space=\"preserve\">website</w:t></w:r></w:hyperlink>\
+             <w:r><w:t xml:space=\"preserve\"> for details</w:t></w:r>\
+             </w:p><w:sectPr/></w:body></w:document>"
+        );
+        let buf = zip_minimal_docx(&document_xml, Some(HYPERLINK_RELS));
+        let parsed = read_docx(&buf).expect("read");
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "Visit our website for details");
+        assert_eq!(p.hyperlinks.len(), 1);
+        assert_eq!(p.hyperlinks[0].start, 10);
+        assert_eq!(p.hyperlinks[0].end, 17);
+        assert_eq!(&p.text[10..17], "website");
+        assert_eq!(p.hyperlinks[0].target, "https://example.com");
+    }
+
+    /// Issue #59 — a hyperlink as the paragraph's very first element (no
+    /// preceding run to go stale) must keep working exactly as before.
+    #[test]
+    fn hyperlink_as_first_element_gets_correct_byte_range() {
+        let document_xml = format!(
+            "{DOC_XML_NS}<w:body><w:p>\
+             <w:hyperlink r:id=\"rId2\"><w:r><w:t xml:space=\"preserve\">Home</w:t></w:r></w:hyperlink>\
+             <w:r><w:t xml:space=\"preserve\"> page</w:t></w:r>\
+             </w:p><w:sectPr/></w:body></w:document>"
+        );
+        let buf = zip_minimal_docx(&document_xml, Some(HYPERLINK_RELS));
+        let parsed = read_docx(&buf).expect("read");
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "Home page");
+        assert_eq!(p.hyperlinks.len(), 1);
+        assert_eq!(p.hyperlinks[0].start, 0);
+        assert_eq!(p.hyperlinks[0].end, 4);
+    }
+
+    /// Issue #59 — two independent hyperlinks in the same paragraph each
+    /// get their own correct range; the second must not inherit drift
+    /// from the first.
+    #[test]
+    fn two_hyperlinks_in_one_paragraph_each_get_correct_ranges() {
+        let document_xml = format!(
+            "{DOC_XML_NS}<w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">See </w:t></w:r>\
+             <w:hyperlink r:id=\"rId2\"><w:r><w:t xml:space=\"preserve\">Alpha</w:t></w:r></w:hyperlink>\
+             <w:r><w:t xml:space=\"preserve\"> and </w:t></w:r>\
+             <w:hyperlink r:id=\"rId3\"><w:r><w:t xml:space=\"preserve\">Beta</w:t></w:r></w:hyperlink>\
+             <w:r><w:t xml:space=\"preserve\">.</w:t></w:r>\
+             </w:p><w:sectPr/></w:body></w:document>"
+        );
+        let buf = zip_minimal_docx(&document_xml, Some(HYPERLINK_RELS));
+        let parsed = read_docx(&buf).expect("read");
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "See Alpha and Beta.");
+        assert_eq!(p.hyperlinks.len(), 2);
+        assert_eq!((p.hyperlinks[0].start, p.hyperlinks[0].end), (4, 9));
+        assert_eq!(&p.text[4..9], "Alpha");
+        assert_eq!(p.hyperlinks[0].target, "https://example.com");
+        assert_eq!((p.hyperlinks[1].start, p.hyperlinks[1].end), (14, 18));
+        assert_eq!(&p.text[14..18], "Beta");
+        assert_eq!(p.hyperlinks[1].target, "https://example.org");
+    }
+
+    /// Issue #59 (blast radius) — `<w:ins>` is the SAME class of
+    /// paragraph-level wrapper as `<w:hyperlink>` (opens before / closes
+    /// after its child run rather than living inside one), so it was
+    /// exposed to the identical stale-`run_text` bug. A revision preceded
+    /// by a plain-text run must anchor to its own range.
+    #[test]
+    fn revision_preceded_by_run_gets_correct_byte_range() {
+        let document_xml = format!(
+            "{DOC_XML_NS}<w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">hello </w:t></w:r>\
+             <w:ins w:id=\"1\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\">\
+             <w:r><w:t xml:space=\"preserve\">world</w:t></w:r></w:ins>\
+             </w:p><w:sectPr/></w:body></w:document>"
+        );
+        let buf = zip_minimal_docx(&document_xml, None);
+        let parsed = read_docx(&buf).expect("read");
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "hello world");
+        assert_eq!(p.revisions.len(), 1);
+        assert_eq!(p.revisions[0].start, 6);
+        assert_eq!(p.revisions[0].end, 11);
+    }
+
+    /// Issue #59 (blast radius) — `<w:commentRangeStart>`/`End` are also
+    /// paragraph-level siblings, not run-internal; same stale-window bug.
+    ///
+    /// Exercises `parse_document_xml` directly rather than the full
+    /// `read_docx` archive pipeline: `DocxArchive::read_docx`'s hyperlink-
+    /// resolution pass unconditionally rebuilds the tree via
+    /// `DocumentTree::from_blocks_with_sections`, which zeroes
+    /// `comment_ranges` (a separate, pre-existing bug — filed
+    /// independently). The byte-offset fix this test pins lives entirely
+    /// inside the streaming parser, so testing at that layer isolates it
+    /// from the unrelated data-loss bug one layer up.
+    #[test]
+    fn comment_range_preceded_by_run_gets_correct_byte_range() {
+        let document_xml = format!(
+            "{DOC_XML_NS}<w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">hello </w:t></w:r>\
+             <w:commentRangeStart w:id=\"1\"/>\
+             <w:r><w:t xml:space=\"preserve\">world</w:t></w:r>\
+             <w:commentRangeEnd w:id=\"1\"/>\
+             </w:p><w:sectPr/></w:body></w:document>"
+        );
+        let style_table = crate::parts::styles::StyleTable::default();
+        let resolver = crate::style_resolver::StyleResolver::new(&style_table);
+        let parsed = crate::parts::document::parse_document_xml(document_xml.as_bytes(), &resolver)
+            .expect("parse");
+        assert_eq!(parsed.comment_ranges.len(), 1);
+        let r = &parsed.comment_ranges[0];
+        assert_eq!(r.start.offset, 6);
+        assert_eq!(r.end.offset, 11);
+    }
+
+    /// Issue #60 — the epic's own manual-QA scenario: load a `.docx` with
+    /// a hyperlink, dirty the paragraph via `apply_style` (bold), save,
+    /// and reopen. The hyperlink must survive the ACTUAL SAVE — not just
+    /// the in-memory model #56 already fixed. This exercises the common
+    /// real-world path: the hyperlink's `rId` already exists in the
+    /// original rels (that's how it was read in the first place), so the
+    /// writer REUSES it rather than minting a new one.
+    #[test]
+    fn hyperlink_survives_dirty_paragraph_save_and_reload() {
+        let document_xml = format!(
+            "{DOC_XML_NS}<w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">Visit our </w:t></w:r>\
+             <w:hyperlink r:id=\"rId2\"><w:r><w:t xml:space=\"preserve\">website</w:t></w:r></w:hyperlink>\
+             <w:r><w:t xml:space=\"preserve\"> for details</w:t></w:r>\
+             </w:p><w:sectPr/></w:body></w:document>"
+        );
+        let buf = zip_minimal_docx(&document_xml, Some(HYPERLINK_RELS));
+        let archive = read_docx(&buf).expect("read");
+        assert_eq!(
+            archive.document.nth_paragraph(0).unwrap().hyperlinks.len(),
+            1
+        );
+
+        /* Bold the whole paragraph — dirties it. Issue #56 already
+        guarantees the in-memory hyperlink survives this; this test is
+        about what happens AFTER, at save time. */
+        let full_len = archive.document.nth_paragraph(0).unwrap().text.len() as u32;
+        let edited = archive.document.apply_style(
+            engine::LogicalPos {
+                path: engine::BlockPath::top(0),
+                offset: 0,
+            },
+            engine::LogicalPos {
+                path: engine::BlockPath::top(0),
+                offset: full_len,
+            },
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        let edited_para = edited.nth_paragraph(0).unwrap();
+        assert!(edited_para.dirty, "apply_style must dirty the paragraph");
+        assert_eq!(edited_para.hyperlinks.len(), 1);
+
+        let saved = write_docx(&archive, &edited).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        let reopened_para = reopened.document.nth_paragraph(0).unwrap();
+        assert_eq!(reopened_para.text, "Visit our website for details");
+        assert_eq!(
+            reopened_para.hyperlinks.len(),
+            1,
+            "the hyperlink must survive the actual save, not just the in-memory model"
+        );
+        assert_eq!(
+            &reopened_para.text[reopened_para.hyperlinks[0].start as usize
+                ..reopened_para.hyperlinks[0].end as usize],
+            "website"
+        );
+        assert_eq!(reopened_para.hyperlinks[0].target, "https://example.com");
+
+        /* The reused rId2 relationship is still the ONLY entry for that
+        target — no spurious duplicate was minted for an id that already
+        resolved correctly. */
+        let rels_bytes = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == RELS_XML)
+            .map(|(_, b)| b.clone())
+            .expect("rels present");
+        let rels_str = String::from_utf8(rels_bytes).unwrap();
+        assert_eq!(
+            rels_str.matches("Target=\"https://example.com\"").count(),
+            1,
+            "reusing the existing rId must not duplicate its relationship entry"
+        );
+    }
+
+    /// Issue #60 — when NO existing rels entry already points at the
+    /// hyperlink's target (the fresh-mint path — e.g. a document built
+    /// without any relationships yet), the writer must mint a new
+    /// sequential `rId`, splice a `<Relationship TargetMode="External">`
+    /// row for it, and the saved paragraph's `<w:hyperlink r:id>` must
+    /// reference that exact id.
+    #[test]
+    fn hyperlink_with_no_existing_rel_mints_a_fresh_one() {
+        let mut para = Paragraph {
+            text: "Visit our website for details".into(),
+            ..Default::default()
+        };
+        para.hyperlinks.push(Hyperlink {
+            start: 10,
+            end: 17,
+            target: "https://fresh-example.com".to_string(),
+        });
+        para.dirty = true;
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let archive = DocxArchive {
+            other_entries: Vec::new(),
+            document: doc.clone(),
+        };
+
+        let saved = write_docx(&archive, &doc).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        let reopened_para = reopened.document.nth_paragraph(0).unwrap();
+        assert_eq!(reopened_para.hyperlinks.len(), 1);
+        assert_eq!(
+            reopened_para.hyperlinks[0].target,
+            "https://fresh-example.com"
+        );
+
+        let rels_bytes = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == RELS_XML)
+            .map(|(_, b)| b.clone())
+            .expect("a fresh rels part must be created");
+        let rels_str = String::from_utf8(rels_bytes).unwrap();
+        assert!(rels_str.contains(HYPERLINK_REL_TYPE));
+        assert!(rels_str.contains("TargetMode=\"External\""));
+        assert!(rels_str.contains("Target=\"https://fresh-example.com\""));
+    }
+
+    /// Issue #60 — the sibling of the fresh-mint test above: an EXISTING
+    /// `word/_rels/document.xml.rels` with unrelated entries (none
+    /// matching the hyperlink's target) must get the new relationship
+    /// SPLICED in (the entries-loop branch), not just appended when the
+    /// whole part is missing (the post-loop branch the previous test
+    /// covers). The pre-existing entry must survive untouched.
+    #[test]
+    fn hyperlink_mints_fresh_rel_into_an_existing_non_matching_rels_file() {
+        let existing_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+        let mut para = Paragraph {
+            text: "Visit our website for details".into(),
+            ..Default::default()
+        };
+        para.hyperlinks.push(Hyperlink {
+            start: 10,
+            end: 17,
+            target: "https://fresh-example.com".to_string(),
+        });
+        para.dirty = true;
+        let doc = DocumentTree::from_rich_paragraphs([para]);
+        let archive = DocxArchive {
+            other_entries: vec![(RELS_XML.to_string(), existing_rels.as_bytes().to_vec())],
+            document: doc.clone(),
+        };
+
+        let saved = write_docx(&archive, &doc).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        assert_eq!(
+            reopened.document.nth_paragraph(0).unwrap().hyperlinks[0].target,
+            "https://fresh-example.com"
+        );
+
+        let rels_bytes = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == RELS_XML)
+            .map(|(_, b)| b.clone())
+            .expect("rels present");
+        let rels_str = String::from_utf8(rels_bytes).unwrap();
+        assert!(
+            rels_str.contains("Target=\"styles.xml\""),
+            "the pre-existing unrelated relationship must survive: {rels_str}"
+        );
+        assert!(rels_str.contains("Target=\"https://fresh-example.com\""));
+        assert!(rels_str.contains("TargetMode=\"External\""));
+        /* The freshly-minted id must not collide with the pre-existing rId1. */
+        assert!(!rels_str.contains("Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\""));
     }
 
     #[test]
@@ -2235,7 +2837,7 @@ mod tests {
             p.dirty = true;
             p.source_xml = None;
         }
-        let xml = build_document_xml(&owned);
+        let xml = build_document_xml(&owned, &HashMap::new());
         assert!(
             xml.contains("<w:r><w:br/></w:r>"),
             "line break run missing: {xml}"
@@ -2351,7 +2953,7 @@ mod tests {
                 t.source_xml = None;
             }
         }
-        let xml = build_document_xml(&owned);
+        let xml = build_document_xml(&owned, &HashMap::new());
         assert!(
             xml.contains("<w:tblCellMar>"),
             "tblCellMar missing on regenerate: {xml}"
@@ -2502,7 +3104,7 @@ mod tests {
             p.dirty = true;
             p.source_xml = None;
         }
-        let xml = build_document_xml(&owned_doc);
+        let xml = build_document_xml(&owned_doc, &HashMap::new());
         assert!(
             xml.contains("<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>"),
             "writer must emit begin fldChar: {xml}"
@@ -2625,7 +3227,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
-        let xml = build_document_xml(&doc);
+        let xml = build_document_xml(&doc, &HashMap::new());
         /* Fallback ids start at 1; an attribute-less revision still gets
         the bare `w:id="1"` attribute. */
         assert!(
@@ -2639,7 +3241,7 @@ mod tests {
         /* A span-free paragraph must serialize without a <w:rPr> so the
         round-trip harness's plain fixtures stay byte-stable. */
         let doc = DocumentTree::from_text("plain text");
-        let xml = build_document_xml(&doc);
+        let xml = build_document_xml(&doc, &HashMap::new());
         assert!(!xml.contains("<w:rPr>"));
         assert!(!xml.contains("<w:pPr>"));
         assert!(xml.contains("<w:p><w:r><w:t xml:space=\"preserve\">plain text</w:t></w:r></w:p>"));
@@ -2713,7 +3315,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
-        let xml = build_document_xml(&doc);
+        let xml = build_document_xml(&doc, &HashMap::new());
         assert!(
             xml.contains("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"A5D6A7\"/>"),
             "pPr must carry the shading fill; xml={xml}"
@@ -2764,7 +3366,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
         };
-        let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]));
+        let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
         let order = [
             "<w:keepNext/>",
@@ -3692,7 +4294,7 @@ mod tests {
             <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
             <Relationship Id=\"rId99\" Type=\"foo\" Target=\"comments.xml\"/>\
             </Relationships>";
-        let after = inject_doc_rel(rels, "rId500", COMMENTS_REL_TYPE, COMMENTS_REL_TARGET);
+        let after = inject_doc_rel(rels, "rId500", COMMENTS_REL_TYPE, COMMENTS_REL_TARGET, None);
         assert!(
             matches!(after, Cow::Borrowed(_)),
             "no-op when target present"

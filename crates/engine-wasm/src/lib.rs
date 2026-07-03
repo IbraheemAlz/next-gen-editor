@@ -9426,6 +9426,40 @@ mod tests {
         assert_ne!(k_before, k_after, "caps flip must miss the layout cache");
     }
 
+    /// Issue #59/#60 live-QA seam — a paragraph with no other formatting
+    /// (the common "plain hyperlink" case: `build_style_spans` still
+    /// contributes exactly one gap-fill span covering the whole
+    /// paragraph) must still get its hyperlink range split out and
+    /// overlaid with the blue/underline style. Pins the exact rendering
+    /// path `read_docx`-loaded hyperlinks go through, verified live in a
+    /// real Chrome session against the #59 fixture.
+    #[test]
+    fn plain_hyperlink_still_renders_blue_underline_span() {
+        let mut para = engine::Paragraph {
+            text: "Visit our website for details".into(),
+            ..Default::default()
+        };
+        para.hyperlinks.push(engine::Hyperlink {
+            start: 10,
+            end: 17,
+            target: "https://example.com".to_string(),
+        });
+
+        let base_spans = build_style_spans(&para, empty_sctx(), 24.0, [0, 0, 0, 255], 1.0);
+        assert_eq!(
+            base_spans.len(),
+            1,
+            "an unstyled paragraph still gets one gap-fill span for apply_hyperlink_overlay to split"
+        );
+        let overlaid = apply_hyperlink_overlay(base_spans, &para.hyperlinks, [0, 0, 0, 255]);
+        let linked_span = overlaid
+            .iter()
+            .find(|s| s.start == 10 && s.end == 17)
+            .expect("must have a span exactly covering the hyperlink range");
+        assert_eq!(linked_span.underline, engine::UnderlineStyle::Single);
+        assert_eq!(linked_span.color, HYPERLINK_BLUE);
+    }
+
     fn autofit_test_cfg() -> RenderConfig {
         RenderConfig {
             font_id: "test-latin".to_string(),
