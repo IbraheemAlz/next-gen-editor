@@ -98,6 +98,18 @@ export function EditorCanvas(props: EditorCanvasProps) {
         const schedule = (): void => {
             if (rafId === 0) rafId = requestAnimationFrame(pushViewport);
         };
+        /* Issue #51 — the engine restarts its lazy band at the cold-open
+           target on a document swap, so this monotone high-water mark
+           must restart too. Left stale (doc A scrolled deep, then doc B
+           opened), the `targetPt > expandedToPt` guard above would
+           suppress every scroll-driven EXPAND_LAYOUT for doc B in a
+           browse-only session, truncating it at the cold-open band. */
+        const unsubDocSwap = props.client.subscribe((evt) => {
+            if (evt.type === 'DOCUMENT_LOADED') {
+                expandedToPt = 0;
+                schedule();
+            }
+        });
         scroller?.addEventListener('scroll', schedule, { passive: true });
         resizeObserver = new ResizeObserver(schedule);
         resizeObserver.observe(scroller ?? canvas);
@@ -105,6 +117,7 @@ export function EditorCanvas(props: EditorCanvasProps) {
         detachViewport = () => {
             if (rafId !== 0) cancelAnimationFrame(rafId);
             scroller?.removeEventListener('scroll', schedule);
+            unsubDocSwap();
         };
 
         /* §7 — pointer → engine hit-testing. Pointer events still fire on a

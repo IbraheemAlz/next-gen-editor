@@ -172,6 +172,12 @@ export function createEngineStore(client: EngineClient) {
        so the browser scrollbar exposes every page. `pageCount` drives
        the document-info UI strip. */
     const [documentHeight, setDocumentHeight] = createSignal(0);
+    /* Issue #51 — virtual scroll range. With the viewport cull actually
+       firing, `documentHeight` covers only the laid-out band; the
+       engine's per-paint estimate (real band + avg-height fudge per
+       unlaid block) is what the scroller must expose, or the user can
+       never scroll INTO the unlaid tail to trigger EXPAND_LAYOUT. */
+    const [estimatedDocumentHeight, setEstimatedDocumentHeight] = createSignal(0);
     const [pageCount, setPageCount] = createSignal(1);
     /* Audit gap C.H1 — `true` once the lazy paginator has laid out every
        block; gates the shell's scroll-driven EXPAND_LAYOUT dispatches
@@ -213,6 +219,7 @@ export function createEngineStore(client: EngineClient) {
                them. Edits that grow / shrink the page count flow
                through here. */
             setDocumentHeight(ev.document_height);
+            setEstimatedDocumentHeight(ev.estimated_document_height);
             setPageCount(ev.page_count);
             setIsFullLayout(ev.is_full_layout);
             /* Issue #26 — harness paths bypass pagination and emit empty
@@ -284,6 +291,7 @@ export function createEngineStore(client: EngineClient) {
         tables,
         selectionKind,
         documentHeight,
+        estimatedDocumentHeight,
         pageCount,
         isFullLayout,
         pageGeometry,

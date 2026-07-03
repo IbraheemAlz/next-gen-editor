@@ -107,9 +107,10 @@ struct CompositionState {
 ///
 /// `min_target_y` is the high-water mark of how deep the paginator has
 /// been *asked* to lay out — `build_pages` keeps emitting pages while
-/// the running document height is below it (plus a buffer). Every edit
-/// resets it back to the initial cold-open target so an unrelated paint
-/// doesn't re-pay for the whole doc.
+/// the running document height is below it (plus a buffer). It only
+/// ever rises within one document's session; a document swap
+/// (`load_docx_bytes`) and crash recovery restart it at the cold-open
+/// band so the new doc's first paint is bounded.
 #[derive(Clone, Copy)]
 struct LazyLayoutState {
     viewport_y: f32,
@@ -181,6 +182,7 @@ fn lazy_runway(viewport_h_pt: f32, scale: f32) -> f32 {
 /// shell knows (a) whether more pages may materialize via
 /// `ExpandLayout`, and (b) the running virtual-height estimate that
 /// drives the scrollbar's backing store.
+#[derive(Clone, Copy)]
 struct LazyLayoutInfo {
     /// `true` when every body block was consumed; `false` when the
     /// viewport-cull budget halted the paginator early.
@@ -188,6 +190,37 @@ struct LazyLayoutInfo {
     /// Number of top-level blocks across the doc that have not yet
     /// been processed (paragraph or table). Drives the height estimate.
     remaining_blocks: u32,
+}
+
+/// Issue #34/#51 — memo of the most recent `build_pages` output. Every
+/// interactive command used to run TWO identical band layouts (the
+/// auto-repaint, then `selection_changed → document_geometry`), and a
+/// pointer click ran up to three. The memo hands the second and third
+/// consumers the first run's boxes.
+///
+/// Validity is (document revision, scale, cull target, live-composition
+/// flag). The revision comes from [`UndoStack::revision`] — the single
+/// chokepoint every document mutation passes through. The two states
+/// the revision cannot see are handled explicitly: swapping the whole
+/// stack (`load_docx_bytes` / `do_recover` / `RenderPage` seed) and
+/// non-document layout inputs (font set, IME composition text) call
+/// [`Engine::invalidate_layout_snapshot`] directly.
+///
+/// Memory: holds one laid-out band (a few pages in the lazy steady
+/// state) — the same boxes `build_pages` was already allocating per
+/// call, now retained between commands instead of rebuilt.
+struct LayoutSnapshot {
+    doc_revision: u64,
+    scale_bits: u32,
+    target_bits: Option<u32>,
+    /// `lazy_layout.viewport_h` feeds the cull budget via `lazy_runway`,
+    /// so a viewport resize must miss the memo like any other layout
+    /// input change.
+    viewport_h_bits: u32,
+    composition_active: bool,
+    pages: Vec<PageBox>,
+    page_paths: Vec<Vec<EngineBlockPath>>,
+    info: LazyLayoutInfo,
 }
 
 /// Cached dimensions from the most recent `render_document`, replayed by
@@ -299,6 +332,10 @@ pub struct Engine {
     /// changed paragraph; the rest are clones shifted by a Y delta. `RefCell`
     /// because `build_page` populates it behind a `&self` borrow.
     layout_cache: RefCell<LruCache<u64, ParagraphBox>>,
+    /// Issue #34/#51 — memo of the last `build_pages` run (see
+    /// [`LayoutSnapshot`]). `RefCell` because `document_geometry` and
+    /// friends populate it behind `&self`.
+    layout_snapshot: RefCell<Option<LayoutSnapshot>>,
     /// Last accessibility tree broadcast to the UI (Backlog #10).
     /// `build_a11y_delta` diffs the freshly built tree against this so a
     /// keystroke emits only the changed paragraph. `None` until the first
@@ -398,6 +435,7 @@ fn assemble_engine(
         composition: None,
         pending_format: None,
         layout_cache: new_layout_cache(),
+        layout_snapshot: RefCell::new(None),
         a11y_cache: None,
         image_cache: HashMap::new(),
         last_paint_dims: LastPaintDims::default(),
@@ -2120,6 +2158,7 @@ fn layout_table_box(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
 ) -> TableBox {
     /* Column widths in device px. Decision tree:
     - `<w:tblLayout w:type="fixed"/>` AND grid present → use grid as-is.
@@ -2144,7 +2183,16 @@ fn layout_table_box(
     cell layout result from the measure pass as the layout (no second
     layout call for unchanged column widths). */
     if matches!(table.props.layout, engine::TableLayout::Autofit) {
-        columns = autofit_distribute(table, available_width_px, fonts, cfg, scale, &columns, sctx);
+        columns = autofit_distribute(
+            table,
+            available_width_px,
+            fonts,
+            cfg,
+            scale,
+            &columns,
+            sctx,
+            cache,
+        );
     }
 
     let mut rows_out: Vec<TableRowBox> = Vec::with_capacity(table.rows.len());
@@ -2182,7 +2230,7 @@ fn layout_table_box(
             let pad_right = twips_to_layout_px(eff.right_twips, scale);
             let content_width = (cell_width - pad_left - pad_right).max(0.0);
             let inner_blocks =
-                layout_cell_blocks(&cell.blocks, content_width, fonts, cfg, scale, sctx);
+                layout_cell_blocks(&cell.blocks, content_width, fonts, cfg, scale, sctx, cache);
             let content_height: f32 = inner_blocks.iter().map(|b| b.size().height).sum();
             /* `VMergeRole::Continue` cells contribute zero — the matching
             `Restart` cell visually owns the merged region. */
@@ -2328,6 +2376,7 @@ fn layout_table_box(
 /// grid table for autofit. Bounded for typical tables; infinite-loop
 /// risk in the iterative shrink is zero because each iteration pins
 /// strictly more columns or terminates.
+#[allow(clippy::too_many_arguments)]
 fn autofit_distribute(
     table: &engine::Table,
     available_width_px: f32,
@@ -2336,6 +2385,7 @@ fn autofit_distribute(
     scale: f32,
     grid_hint: &[f32],
     sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
 ) -> Vec<f32> {
     /* Number of columns: max(grid, max row's cell-count). The grid
     might be empty; cells might over-/under-shoot it; take the union. */
@@ -2378,7 +2428,8 @@ fn autofit_distribute(
             let pad = twips_to_layout_px(eff.left_twips + eff.right_twips, scale);
             /* Lay out at the probe width — max line width across all
             paragraphs is the natural fit. */
-            let inner = layout_cell_blocks(&cell.blocks, probe_width, fonts, cfg, scale, sctx);
+            let inner =
+                layout_cell_blocks(&cell.blocks, probe_width, fonts, cfg, scale, sctx, cache);
             let natural_content_w = block_max_width(&inner);
             let cell_natural = natural_content_w + pad;
             let share = cell_natural / span as f32;
@@ -2394,7 +2445,7 @@ fn autofit_distribute(
             longest atom that cannot be split. Padding is folded into
             the floor on the same basis as the natural measure. */
             let (cell_min_content, _cell_max_content) =
-                measure_unbreakable_width(&cell.blocks, sctx, fonts, cfg, scale);
+                measure_unbreakable_width(&cell.blocks, sctx, fonts, cfg, scale, cache);
             let min_share = (cell_min_content + pad) / span as f32;
             for i in 0..span {
                 let ci = col_cursor + i;
@@ -2520,6 +2571,7 @@ fn measure_unbreakable_width(
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
+    cache: &mut LruCache<u64, ParagraphBox>,
 ) -> (f32, f32) {
     let mut min_content = 0.0_f32;
     let mut max_content = 0.0_f32;
@@ -2540,7 +2592,7 @@ fn measure_unbreakable_width(
                 inner table against width = 1.0 so its own
                 `autofit_distribute` lands in the CASE 1 overflow path
                 (returns col_floor verbatim). */
-                let sub_widths = autofit_distribute(t, 1.0, fonts, cfg, scale, &[], sctx);
+                let sub_widths = autofit_distribute(t, 1.0, fonts, cfg, scale, &[], sctx, cache);
                 let sub_sum: f32 = sub_widths.iter().sum();
                 if sub_sum > min_content {
                     min_content = sub_sum;
@@ -2689,6 +2741,63 @@ fn accumulate_vmerge_heights(rows: &mut [TableRowBox]) {
     }
 }
 
+/// Issue #51/#34 — the one shared, LRU-backed paragraph layout used by
+/// both the body-block arm of `build_pages` and every table cell. Cells
+/// previously bypassed the cache entirely (re-shaped on every paint —
+/// with autofit's multi-pass measurement, ~3× per paint) and also
+/// skipped the hyperlink / revision overlays and inline objects the
+/// body path applies; routing both arms through here fixes the cost and
+/// the parity gap in one move, and makes the cache key semantics
+/// identical for every consumer.
+fn layout_paragraph_cached(
+    para: &engine::Paragraph,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    max_width: f32,
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+) -> ParagraphBox {
+    let key = paragraph_layout_key(para, cfg, scale, max_width, sctx);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    let spans = apply_revision_overlay(
+        apply_hyperlink_overlay(
+            build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
+            &para.hyperlinks,
+            [0, 0, 0, 255],
+        ),
+        &para.revisions,
+        [0, 0, 0, 255],
+    );
+    let base_direction = resolve_base_direction(para, cfg);
+    let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
+    let inline_infos = build_inline_object_infos(para, cfg, scale);
+    let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    let para_cfg = ParagraphConfig {
+        text: &para.text,
+        fonts,
+        spans: &spans,
+        base_direction,
+        max_width,
+        line_height: lh_px,
+        line_height_exact: lh_exact,
+        alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+        indent_start_px: ind_s,
+        indent_end_px: ind_e,
+        first_line_indent_px: ind_fl,
+        hanging_indent_px: ind_h,
+        marker_text: para.resolved_marker.clone(),
+        px_size_for_marker: cfg.px_size * scale,
+        inline_objects: &inline_infos,
+        tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+    };
+    let laid = layout_paragraph(para_cfg);
+    cache.put(key, laid.clone());
+    laid
+}
+
 fn layout_cell_blocks(
     blocks: &[engine::Block],
     content_width_px: f32,
@@ -2696,39 +2805,21 @@ fn layout_cell_blocks(
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
 ) -> Vec<LayoutBlock> {
     let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
     for b in blocks {
         let mut lb = match b {
-            engine::Block::Paragraph(p) => {
-                let spans = build_style_spans(p, sctx, cfg.px_size, [0, 0, 0, 255], scale);
-                let base_direction = resolve_base_direction(p, cfg);
-                let (ind_s, ind_e, ind_fl, ind_h) =
-                    effective_layout_indents(p, base_direction, scale);
-                let tab_stops_px = tab_stops_to_layout_px(&p.props.tab_stops, scale);
-                let (lh_px, lh_exact) =
-                    resolve_line_height(p.props.line_height, cfg.line_height, scale);
-                let pcfg = ParagraphConfig {
-                    text: &p.text,
-                    fonts,
-                    spans: &spans,
-                    base_direction,
-                    max_width: content_width_px.max(1.0),
-                    line_height: lh_px,
-                    line_height_exact: lh_exact,
-                    alignment: p.props.alignment.map_or(cfg.alignment, layout_align),
-                    indent_start_px: ind_s,
-                    indent_end_px: ind_e,
-                    first_line_indent_px: ind_fl,
-                    hanging_indent_px: ind_h,
-                    marker_text: p.resolved_marker.clone(),
-                    px_size_for_marker: cfg.px_size * scale,
-                    inline_objects: &[],
-                    tab_stops_px: &tab_stops_px,
-                };
-                LayoutBlock::Paragraph(layout_paragraph(pcfg))
-            }
+            engine::Block::Paragraph(p) => LayoutBlock::Paragraph(layout_paragraph_cached(
+                p,
+                fonts,
+                cfg,
+                scale,
+                content_width_px.max(1.0),
+                sctx,
+                cache,
+            )),
             engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
                 t,
                 content_width_px,
@@ -2736,6 +2827,7 @@ fn layout_cell_blocks(
                 cfg,
                 scale,
                 sctx,
+                cache,
             )),
         };
         let mut o = lb.origin();
@@ -3896,6 +3988,7 @@ impl Engine {
                     self.fonts.insert(id.clone(), Arc::new(font));
                     /* The font set feeds layout; stale boxes must not survive. */
                     self.layout_cache.get_mut().clear();
+                    self.invalidate_layout_snapshot();
                     Event::FontLoaded {
                         id,
                         metrics: bridge_metrics,
@@ -3950,13 +4043,19 @@ impl Engine {
                 self.render_page(text, cfg)
             }
 
-            Command::InsertText { at, text } => match at {
-                /* A set `at` is the interactive caret path — selection-aware,
-                emits SelectionChanged. `None` is the Phase-1 harness path
-                (append at end-of-document, emits TextInserted). */
-                Some(p) => self.do_insert_text_interactive(p, text),
-                None => self.insert_text(None, text),
-            },
+            Command::InsertText { at, text } => {
+                /* Issue #53 — `None` resolves to the engine's LIVE
+                caret, which the serialized queue guarantees reflects
+                any `PlaceCaretAtPoint`/`SetSelection` posted before
+                this insert. An explicit `at` stays honoured for the
+                harness / API callers, and `None` with no selection at
+                all keeps the Phase-1 contract (append at end of
+                document, emits TextInserted). */
+                match self.resolve_interactive_insert_at(at) {
+                    Some(p) => self.do_insert_text_interactive(p, text),
+                    None => self.insert_text(None, text),
+                }
+            }
             Command::Undo => self.do_undo(),
             Command::Redo => self.do_redo(),
 
@@ -4031,6 +4130,7 @@ impl Engine {
             // Phase 4 — PHASE_4_HEADLESS_UI.md §7. Additive pointer commands.
             Command::HitTest { at } => self.do_hit_test(at),
             Command::HitTestInPage { page, at } => self.do_hit_test_in_page(page, at),
+            Command::PlaceCaretAtPoint { page, at } => self.do_place_caret_at_point(page, at),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
             Command::SelectParagraphAt { at } => self.do_select_paragraph_at(at),
             Command::SelectCellAt { at } => self.do_select_cell_at(at),
@@ -4306,8 +4406,20 @@ impl Engine {
     fn render_page(&mut self, text: String, cfg: RenderConfig) -> Event {
         self.undo = UndoStack::new(DocumentTree::from_text(&text), 100);
         self.layout_cfg = Some(cfg);
-        /* New document + config — drop every cached paragraph layout. */
+        /* A RenderPage reset is a fresh document; a surviving selection
+        or IME preview from the previous session would be load-bearing
+        for the issue-#53 live-caret insert path (and could splice
+        preview text into the new doc). The interactive boot dispatches
+        its own SET_SELECTION right after; the Phase-1 harness relies on
+        selection being None so `InsertText { at: None }` keeps the
+        legacy append contract. */
+        self.selection = None;
+        self.composition = None;
+        /* New document + config — drop every cached paragraph layout.
+        The fresh stack restarts revision at 0, so the memo must drop
+        explicitly too. */
         self.layout_cache.get_mut().clear();
+        self.invalidate_layout_snapshot();
 
         let stats = match self.render_document(None) {
             Ok(s) => s,
@@ -4493,6 +4605,7 @@ impl Engine {
         self.composition = None;
         self.pending_format = None;
         self.layout_cache = new_layout_cache();
+        self.invalidate_layout_snapshot();
         self.a11y_cache = None;
         self.image_cache.clear();
         self.last_paint_dims = LastPaintDims::default();
@@ -4542,15 +4655,62 @@ impl Engine {
         })
     }
 
-    fn maybe_repaint(&mut self) {
-        let _ = self.render_document(None);
-    }
-
     fn maybe_repaint_result(&mut self) -> Result<(), Box<Event>> {
         if self.layout_cfg.is_none() {
             return Ok(());
         }
         self.render_document(None).map(|_| ())
+    }
+
+    /// Issue #34/#51 — drop the layout memo. Needed only where the
+    /// [`UndoStack::revision`] chokepoint cannot see the change: a
+    /// whole-stack swap (revision restarts at 0), a font-set change, or
+    /// an IME composition update (preview text lives outside the doc).
+    fn invalidate_layout_snapshot(&self) {
+        self.layout_snapshot.replace(None);
+    }
+
+    /// Ensure [`Engine::layout_snapshot`] holds a `build_pages` run for
+    /// exactly (current doc revision, `scale`, `target_y`, live
+    /// composition). On return the snapshot is populated; callers
+    /// `borrow()` it. Consecutive consumers inside one command (paint →
+    /// geometry → probes) hit the memo instead of re-laying the band.
+    fn ensure_layout_snapshot(
+        &self,
+        scale: f32,
+        with_composition: bool,
+        target_y: Option<f32>,
+    ) -> Result<(), Box<Event>> {
+        let composition_active = with_composition && self.composition.is_some();
+        let doc_revision = self.undo.revision();
+        let scale_bits = scale.to_bits();
+        let target_bits = target_y.map(f32::to_bits);
+        let viewport_h_bits = self.lazy_layout.viewport_h.to_bits();
+        {
+            let snap = self.layout_snapshot.borrow();
+            if let Some(s) = snap.as_ref()
+                && s.doc_revision == doc_revision
+                && s.scale_bits == scale_bits
+                && s.target_bits == target_bits
+                && s.viewport_h_bits == viewport_h_bits
+                && s.composition_active == composition_active
+            {
+                return Ok(());
+            }
+        }
+        let (pages, _fonts, page_paths, info) =
+            self.build_pages(scale, with_composition, target_y)?;
+        *self.layout_snapshot.borrow_mut() = Some(LayoutSnapshot {
+            doc_revision,
+            scale_bits,
+            target_bits,
+            viewport_h_bits,
+            composition_active,
+            pages,
+            page_paths,
+            info,
+        });
+        Ok(())
     }
 
     /// The device-pixel ratio the page is currently laid out + painted at.
@@ -4785,7 +4945,18 @@ impl Engine {
                 boundary, which is enough granularity for typical
                 docs (50 pages × ~20 paragraphs each = 1000 boundaries). */
                 if let Some(budget) = cull_budget {
-                    let pag_h = paginator.as_ref().map_or(0.0, |p| p.cursor_y());
+                    /* The paginator finalises overflow pages INTERNALLY
+                    (they only reach `emitted_pages` at a section break),
+                    and `cursor_y` resets to the top of each new page — so
+                    the committed height must count the paginator's own
+                    finalised pages too. Without them a single-section
+                    document never trips the budget and "lazy" layout
+                    quietly lays out every page (the #51 hang). */
+                    let pag_h = paginator.as_ref().map_or(0.0, |p| {
+                        p.emitted_pages_height()
+                            + p.page_count_emitted() as f32 * gap
+                            + p.cursor_y()
+                    });
                     if height_so_far(&emitted_pages, pag_h) >= budget {
                         culled = true;
                         break 'outer;
@@ -4799,8 +4970,15 @@ impl Engine {
 
                 match block {
                     engine::Block::Table(t) => {
-                        let mut tb =
-                            layout_table_box(t, pag.column_width(), &font_stack, &cfg, scale, sctx);
+                        let mut tb = layout_table_box(
+                            t,
+                            pag.column_width(),
+                            &font_stack,
+                            &cfg,
+                            scale,
+                            sctx,
+                            &mut cache,
+                        );
                         assign_source_ids_table(&mut tb, &mut next_para_id);
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Table(tb), 0.0, 0.0);
@@ -4861,63 +5039,17 @@ impl Engine {
                                 tab_stops_px: &tab_stops_px,
                             })
                         } else {
-                            let key =
-                                paragraph_layout_key(para, &cfg, scale, pag.column_width(), sctx);
-                            if let Some(cached) = cache.get(&key) {
-                                cached.clone()
-                            } else {
-                                let spans = apply_revision_overlay(
-                                    apply_hyperlink_overlay(
-                                        build_style_spans(
-                                            para,
-                                            sctx,
-                                            cfg.px_size,
-                                            [0, 0, 0, 255],
-                                            scale,
-                                        ),
-                                        &para.hyperlinks,
-                                        [0, 0, 0, 255],
-                                    ),
-                                    &para.revisions,
-                                    [0, 0, 0, 255],
-                                );
-                                let base_direction = resolve_base_direction(para, &cfg);
-                                let (ind_s, ind_e, ind_fl, ind_h) =
-                                    effective_layout_indents(para, base_direction, scale);
-                                let inline_infos = build_inline_object_infos(para, &cfg, scale);
-                                let (lh_px, lh_exact) = resolve_line_height(
-                                    para.props.line_height,
-                                    cfg.line_height,
-                                    scale,
-                                );
-                                let para_cfg = ParagraphConfig {
-                                    text: &para.text,
-                                    fonts: &font_stack,
-                                    spans: &spans,
-                                    base_direction,
-                                    max_width: pag.column_width(),
-                                    line_height: lh_px,
-                                    line_height_exact: lh_exact,
-                                    alignment: para
-                                        .props
-                                        .alignment
-                                        .map_or(cfg.alignment, layout_align),
-                                    indent_start_px: ind_s,
-                                    indent_end_px: ind_e,
-                                    first_line_indent_px: ind_fl,
-                                    hanging_indent_px: ind_h,
-                                    marker_text: para.resolved_marker.clone(),
-                                    px_size_for_marker: cfg.px_size * scale,
-                                    inline_objects: &inline_infos,
-                                    tab_stops_px: &tab_stops_to_layout_px(
-                                        &para.props.tab_stops,
-                                        scale,
-                                    ),
-                                };
-                                let laid = layout_paragraph(para_cfg);
-                                cache.put(key, laid.clone());
-                                laid
-                            }
+                            /* Issue #51/#34 — same shared LRU-backed
+                            layout the table cells use. */
+                            layout_paragraph_cached(
+                                para,
+                                &font_stack,
+                                &cfg,
+                                scale,
+                                pag.column_width(),
+                                sctx,
+                                &mut cache,
+                            )
                         };
                         let before_px = twips_to_layout_px(para.props.spacing.before_twips, scale);
                         let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
@@ -5030,14 +5162,22 @@ impl Engine {
         paint. Audit gap C.H1 — `target_y` comes from `lazy_layout`
         (high-water mark the TS shell has asked us to cover). The
         running estimate the scrollbar reads adds an
-        `AVG_BLOCK_HEIGHT_PT` fudge per skipped block on top. */
+        `AVG_BLOCK_HEIGHT_PT` fudge per skipped block on top.
+        Issue #34 — the band layout comes from the shared snapshot; the
+        `selection_changed → document_geometry` that follows every
+        mutation then reuses these exact boxes instead of re-laying. */
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
-        let (pages, _font_stack, _box_paths, info) =
-            self.build_pages(self.scale(), true, target_y)?;
+        self.ensure_layout_snapshot(self.scale(), true, target_y)?;
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell
+            .as_ref()
+            .expect("ensure_layout_snapshot populated the memo");
+        let pages = &snap.pages;
+        let info = snap.info;
 
         let mut line_count: u32 = 0;
         let mut glyph_count: u32 = 0;
-        for page in &pages {
+        for page in pages {
             for p in page.blocks.iter().filter_map(LayoutBlock::as_paragraph) {
                 line_count += p.lines.len() as u32;
                 for line in &p.lines {
@@ -5052,7 +5192,7 @@ impl Engine {
         inter-page gap so a section / overflow break is visible. */
         let scale = self.scale();
         let gap = render::scene::PAGE_GAP_PT * scale;
-        let scene = render::scene::build_document_scene(&pages, gap);
+        let scene = render::scene::build_document_scene(pages, gap);
         /* Stats report the first page's dimensions for back-compat; the
         `page_count` / total document height live alongside `paint_ms` in
         the `Painted` event so the TS shell can resize the canvas to fit
@@ -5086,7 +5226,7 @@ impl Engine {
         let mut page_tops = Vec::with_capacity(pages.len());
         let mut page_heights = Vec::with_capacity(pages.len());
         let mut top_acc = 0.0f32;
-        for page in &pages {
+        for page in pages {
             page_tops.push(top_acc);
             page_heights.push(page.size.height);
             top_acc += page.size.height + gap;
@@ -5109,6 +5249,10 @@ impl Engine {
         `GlyphAtlas` stays untouched. Clipped partial repaint is not wired on
         this path yet — Vello redraws the full scene each frame. */
         if let Some(vr) = self.vello.as_mut() {
+            /* Issue #54 — keep the WebGPU surface sized to the page-0
+            target instead of freezing it at INIT-time dimensions; a
+            DPR / zoom change otherwise renders cropped forever. */
+            vr.resize(page_width.round() as u32, page_height.round() as u32);
             let fonts = &self.fonts;
             vr.render(&scene, |id| {
                 fonts
@@ -5353,7 +5497,17 @@ impl Engine {
         shell has requested; `do_hit_test_in_page` and the keyboard
         navigation helpers bump it ahead of calling this. */
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
-        let (pages, _fonts, page_paths, _info) = self.build_pages(self.scale(), false, target_y)?;
+        /* Issue #34 — reuse the auto-repaint's boxes when the doc /
+        scale / band haven't changed since (`false` and `true`
+        composition modes produce identical spans while no composition
+        is live, and the snapshot key folds that in). */
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell
+            .as_ref()
+            .expect("ensure_layout_snapshot populated the memo");
+        let pages = &snap.pages;
+        let page_paths = &snap.page_paths;
         let gap = render::scene::PAGE_GAP_PT * self.scale();
         let mut geom: Vec<LineGeom> = Vec::new();
         let mut page_top: f32 = 0.0;
@@ -5427,33 +5581,94 @@ impl Engine {
     /// same geometry walker. Lets the multi-canvas TS shell route
     /// pointer events from N independent `<canvas>` elements without
     /// any TS-side offset math.
-    fn do_hit_test_in_page(&self, page_idx: u32, at: BridgePoint) -> Event {
+    fn do_hit_test_in_page(&mut self, page_idx: u32, at: BridgePoint) -> Event {
         let scale = self.scale();
         let gap = render::scene::PAGE_GAP_PT * scale;
-        /* Audit gap C.H1 — hit-test guardrail. A click on page N where N
-        is beyond the laid-out tail must force the paginator to extend.
-        `target_y = None` requests a full layout; cheaper paths exist
-        (lay out to just-past-page-N) but the click is a user
-        interaction whose latency budget is generous, and full layout
-        also primes the cache for the next paint. */
-        let (pages, _, _, _info) = match self.build_pages(scale, false, None) {
-            Ok(v) => v,
-            Err(e) => return *e,
-        };
-        let mut page_top: f32 = 0.0;
-        for (i, page) in pages.iter().enumerate() {
-            if i as u32 == page_idx {
-                break;
+        /* Issue #34/#51 — this used to request a FULL document layout
+        (`target_y = None`) on every click and every drag pointermove,
+        which on a long document re-shaped everything the cull had
+        skipped. The clicked page's `<canvas>` only exists because a
+        previous paint laid that page out, so the culled band already
+        covers it in the normal case; when it doesn't (band shrank
+        after a zoom change), extend the band to just past the clicked
+        page instead of laying out the world. */
+        let page_top_in_band = |snap: &LayoutSnapshot| -> Option<f32> {
+            if (page_idx as usize) >= snap.pages.len() {
+                return None;
             }
-            page_top += page.size.height + gap;
+            let mut top = 0.0f32;
+            for page in snap.pages.iter().take(page_idx as usize) {
+                top += page.size.height + gap;
+            }
+            Some(top)
+        };
+        let target_y = Some(self.lazy_layout.min_target_y * scale);
+        if let Err(e) = self.ensure_layout_snapshot(scale, false, target_y) {
+            return *e;
         }
-        let global_y = at.y + page_top;
+        let mut page_top = {
+            let snap_cell = self.layout_snapshot.borrow();
+            page_top_in_band(snap_cell.as_ref().expect("snapshot populated"))
+        };
+        if page_top.is_none() {
+            let assumed_pt = (page_idx as f32 + 1.0)
+                * (engine::PageGeometry::a4().height + render::scene::PAGE_GAP_PT);
+            if assumed_pt > self.lazy_layout.min_target_y {
+                self.lazy_layout.min_target_y = assumed_pt;
+            }
+            let target_y = Some(self.lazy_layout.min_target_y * scale);
+            if let Err(e) = self.ensure_layout_snapshot(scale, false, target_y) {
+                return *e;
+            }
+            let snap_cell = self.layout_snapshot.borrow();
+            let snap = snap_cell.as_ref().expect("snapshot populated");
+            /* Still short (non-A4 geometry taller than assumed): clamp
+            to the last laid page rather than hit-testing thin air. */
+            page_top = Some(page_top_in_band(snap).unwrap_or_else(|| {
+                let mut top = 0.0f32;
+                let all_but_last = snap.pages.len().saturating_sub(1);
+                for page in snap.pages.iter().take(all_but_last) {
+                    top += page.size.height + gap;
+                }
+                top
+            }));
+        }
+        let global_y = at.y + page_top.unwrap_or(0.0);
         match self.document_geometry() {
             Ok(geom) => Event::HitResult {
                 pos: hit_test_geom(&geom, at.x, global_y),
             },
             Err(e) => *e,
         }
+    }
+
+    /// Issue #53 — where an interactive `InsertText { at: None }`
+    /// lands: the explicit position wins, else the live caret, else
+    /// `None` (the Phase-1 append-at-end contract).
+    fn resolve_interactive_insert_at(
+        &self,
+        at: Option<BridgeLogicalPos>,
+    ) -> Option<BridgeLogicalPos> {
+        at.or_else(|| self.selection.as_ref().map(|s| s.caret.clone()))
+    }
+
+    /// Issue #53 — `Command::PlaceCaretAtPoint`: hit-test + collapsed
+    /// selection in ONE dispatch. The shell posts this synchronously at
+    /// pointerdown (no awaited round-trip in between), so every
+    /// keystroke that enters the serialized queue after the click is
+    /// guaranteed to execute against the just-clicked caret.
+    fn do_place_caret_at_point(&mut self, page_idx: u32, at: BridgePoint) -> Event {
+        let pos = match self.do_hit_test_in_page(page_idx, at) {
+            Event::HitResult { pos } => pos,
+            other => return other,
+        };
+        self.do_set_selection(
+            BridgeLogicalRange {
+                start: pos.clone(),
+                end: pos.clone(),
+            },
+            pos,
+        )
     }
 
     /// `Command::SetSelection` — set the selection to `range`, caret at `caret`.
@@ -6722,6 +6937,9 @@ impl Engine {
             at: at.clone(),
             text: String::new(),
         });
+        /* The preview text lives outside the document, so the layout
+        memo's revision key cannot see it change. */
+        self.invalidate_layout_snapshot();
         Event::CompositionUpdated {
             at,
             text: String::new(),
@@ -6746,6 +6964,10 @@ impl Engine {
             at: at.clone(),
             text: text.clone(),
         });
+        /* The preview text changed but the doc revision did not — drop
+        the layout memo or the repaint would reuse the previous
+        composition's boxes. */
+        self.invalidate_layout_snapshot();
         /* Backlog #8: repaint so the inline composition preview tracks the
         latest composed text. */
         let _ = self.render_document(None);
@@ -6759,6 +6981,7 @@ impl Engine {
     /// `Command::EndComposition` — commit the tracked composed text (when
     /// `commit`), inserting it at the composition start.
     fn do_end_composition(&mut self, commit: bool) -> Event {
+        self.invalidate_layout_snapshot();
         match self.composition.take() {
             Some(c) if commit && !c.text.is_empty() => {
                 self.do_insert_text_interactive(c.at, c.text)
@@ -7486,9 +7709,45 @@ impl Engine {
                     ideal_x: None,
                     kind: SelectionKind::Linear,
                 });
+                /* Issue #51 — a document swap invalidates every piece of
+                per-document state, not just the layout cache. Leaving
+                `lazy_layout` alone carried the previous doc's scroll
+                high-water mark into the new doc, so the first paint laid
+                out from page 1 down to wherever the OLD document was
+                scrolled. Keep `viewport_h` (a property of the canvas,
+                not the document) so `lazy_runway` stays calibrated, but
+                restart the band at the top. Stale `composition` /
+                `pending_format` could splice preview text or styling
+                into the new doc; stale `image_cache` bitmaps collide on
+                reused rel ids (`rId4` exists in most .docx files);
+                a stale `a11y_cache` would diff against the old tree.
+                (do_recover resets the same set for the same reason.) */
+                self.lazy_layout = LazyLayoutState {
+                    viewport_y: 0.0,
+                    viewport_h: self.lazy_layout.viewport_h,
+                    min_target_y: INITIAL_COLD_OPEN_BUDGET_PT.max(self.lazy_layout.viewport_h),
+                };
+                self.composition = None;
+                self.pending_format = None;
+                self.caret_affinity = CaretAffinity::default();
+                self.a11y_cache = None;
+                self.image_cache.clear();
+                self.last_paint_dims = LastPaintDims::default();
                 self.layout_cache.get_mut().clear();
+                /* A fresh UndoStack restarts revision at 0, which the
+                memo key cannot distinguish from the old stack's 0. */
+                self.invalidate_layout_snapshot();
                 self.dirty.invalidate(full_page_rect(self.scale()));
-                self.maybe_repaint();
+                /* Issue #51/#54 — this was the only repaint in the file
+                that DISCARDED its Result. A failed post-load paint
+                (missing font, backend error) previously returned
+                `DocumentLoaded` anyway, leaving every canvas showing the
+                previous document while the status bar reported the new
+                one. Surface the error; the document itself is loaded,
+                and the shell decides how to present the failure. */
+                if let Err(e) = self.maybe_repaint_result() {
+                    return *e;
+                }
                 Event::DocumentLoaded { paragraph_count }
             }
             Err(e) => Event::Error {
@@ -8016,6 +8275,7 @@ mod tests {
             composition: None,
             pending_format: None,
             layout_cache: new_layout_cache(),
+            layout_snapshot: RefCell::new(None),
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -8033,6 +8293,41 @@ mod tests {
             .expect("dispatch should succeed");
         let evt: Event = serde_wasm_bindgen::from_value(evt_js).expect("decode event");
         assert!(matches!(evt, Event::Pong), "expected Pong, got {evt:?}");
+    }
+
+    /// Issue #53 — the acceptance shape: SET_SELECTION followed by
+    /// INSERT_TEXT{at: None} through the real dispatch path must insert
+    /// at the JUST-SET caret (the serialized queue means "posted after"
+    /// = "executes after", and None reads the live caret).
+    #[wasm_bindgen_test]
+    async fn set_selection_then_insert_none_lands_at_new_caret() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        let set = serde_wasm_bindgen::to_value(&Command::SetSelection {
+            range: BridgeLogicalRange {
+                start: bpos_top(0, 5),
+                end: bpos_top(0, 5),
+            },
+            caret: bpos_top(0, 5),
+        })
+        .expect("encode set-selection");
+        engine.dispatch(set).await.expect("set selection");
+
+        let ins = serde_wasm_bindgen::to_value(&Command::InsertText {
+            at: None,
+            text: "X".to_string(),
+        })
+        .expect("encode insert");
+        let evt_js = engine.dispatch(ins).await.expect("insert");
+        let evt: Event = serde_wasm_bindgen::from_value(evt_js).expect("decode event");
+        assert!(
+            matches!(evt, Event::SelectionChanged { .. }),
+            "live-caret insert replies SelectionChanged, got {evt:?}"
+        );
+        assert_eq!(
+            engine.undo.current().paragraph_text(0),
+            Some("helloX world"),
+            "insert must land at the just-set caret, not append at the end"
+        );
     }
 
     /// Backlog #7 — a line with one LTR run and one RTL run; a selection
@@ -8713,6 +9008,7 @@ mod tests {
             composition: None,
             pending_format: None,
             layout_cache: new_layout_cache(),
+            layout_snapshot: RefCell::new(None),
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -8759,6 +9055,7 @@ mod tests {
             composition: None,
             pending_format: None,
             layout_cache: new_layout_cache(),
+            layout_snapshot: RefCell::new(None),
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -8796,6 +9093,7 @@ mod tests {
             composition: None,
             pending_format: None,
             layout_cache: new_layout_cache(),
+            layout_snapshot: RefCell::new(None),
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -8910,6 +9208,7 @@ mod tests {
             composition: None,
             pending_format: None,
             layout_cache: new_layout_cache(),
+            layout_snapshot: RefCell::new(None),
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -9316,6 +9615,7 @@ mod tests {
                 composition: None,
                 pending_format: None,
                 layout_cache: new_layout_cache(),
+                layout_snapshot: RefCell::new(None),
                 a11y_cache: None,
                 image_cache: HashMap::new(),
                 last_paint_dims: LastPaintDims::default(),
@@ -9525,7 +9825,17 @@ mod tests {
 
         /* Narrow viewport — well under the token's pixel width. */
         let available = 80.0_f32;
-        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[], empty_sctx());
+        let mut cache = new_layout_cache();
+        let widths = autofit_distribute(
+            &table,
+            available,
+            &fonts,
+            &cfg,
+            1.0,
+            &[],
+            empty_sctx(),
+            cache.get_mut(),
+        );
 
         assert_eq!(widths.len(), 1);
         let (cell_min, _cell_max) = measure_unbreakable_width(
@@ -9534,6 +9844,7 @@ mod tests {
             &fonts,
             &cfg,
             1.0,
+            cache.get_mut(),
         );
         assert!(
             cell_min > available,
@@ -9570,7 +9881,17 @@ mod tests {
         /* Wide-enough viewport that the token's min_content alone fits
         plus some room for column 1. */
         let available = 600.0_f32;
-        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[], empty_sctx());
+        let mut cache = new_layout_cache();
+        let widths = autofit_distribute(
+            &table,
+            available,
+            &fonts,
+            &cfg,
+            1.0,
+            &[],
+            empty_sctx(),
+            cache.get_mut(),
+        );
 
         assert_eq!(widths.len(), 2);
         let (col0_min, _) = measure_unbreakable_width(
@@ -9579,6 +9900,7 @@ mod tests {
             &fonts,
             &cfg,
             1.0,
+            cache.get_mut(),
         );
         assert!(
             widths[0] >= col0_min - 0.5,
@@ -9660,7 +9982,17 @@ mod tests {
             cell_with_text("City"),
         ]);
         let available = 600.0_f32;
-        let widths = autofit_distribute(&table, available, &fonts, &cfg, 1.0, &[], empty_sctx());
+        let mut cache = new_layout_cache();
+        let widths = autofit_distribute(
+            &table,
+            available,
+            &fonts,
+            &cfg,
+            1.0,
+            &[],
+            empty_sctx(),
+            cache.get_mut(),
+        );
 
         assert_eq!(widths.len(), 3);
         let sum: f32 = widths.iter().sum();
@@ -9672,6 +10004,372 @@ mod tests {
         is the trivial floor case (column already >= floor). */
         for &w in &widths {
             assert!(w > 30.0, "every column expands above MIN_COL_WIDTH_PT");
+        }
+    }
+
+    /// Issue #51 — the viewport cull must actually stop the paginator on a
+    /// long single-section document. Before the fix, the budget check only
+    /// counted pages flushed at SECTION boundaries plus the within-page
+    /// cursor, so a single-section 116-page doc laid out in full on every
+    /// "lazy" paint (and the shell then mounted 100+ page canvases).
+    #[test]
+    fn viewport_cull_stops_single_section_layout() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
+        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let engine = test_engine_with_doc(archive.document);
+
+        /* A ~2-page band must NOT lay out the whole document. The runway
+        slack admits a few pages past the target, but two dozen means the
+        cull is broken again. */
+        let (pages, _, _, info) = engine
+            .build_pages(2.0, false, Some(2000.0))
+            .expect("band layout");
+        assert!(
+            !info.is_full_layout,
+            "a 2000px band over a 116-page doc must report a culled layout"
+        );
+        assert!(
+            pages.len() < 24,
+            "band layout leaked to {} pages — cull not firing",
+            pages.len()
+        );
+        assert!(
+            info.remaining_blocks > 0,
+            "culled layout must report unprocessed blocks for the scrollbar estimate"
+        );
+
+        /* target_y = None stays the historical lay-everything contract
+        (PDF export, explicit full expands). */
+        let (all_pages, _, _, full_info) =
+            engine.build_pages(2.0, false, None).expect("full layout");
+        assert!(full_info.is_full_layout);
+        assert!(
+            all_pages.len() > 100,
+            "full layout of the 50p fixture spans 100+ pages, got {}",
+            all_pages.len()
+        );
+    }
+
+    /// Issue #51 — opening a document must not inherit the previous
+    /// document's lazy-layout high-water mark (or its composition /
+    /// caret state): a deep scroll in doc A would otherwise force doc
+    /// B's first paint to lay out from page 1 to A's scroll depth.
+    #[test]
+    fn load_docx_resets_per_document_state() {
+        let doc = DocumentTree::from_text("fresh document body");
+        let bytes = build_minimal_docx(&doc).expect("serialize fixture");
+
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("old doc"));
+        engine.lazy_layout.min_target_y = 250_000.0;
+        engine.lazy_layout.viewport_y = 240_000.0;
+        engine.lazy_layout.viewport_h = 900.0;
+        engine.composition = Some(CompositionState {
+            at: bpos_top(0, 0),
+            text: "stale ime preview".to_string(),
+        });
+
+        let evt = engine.load_docx_bytes(&bytes, "test");
+        assert!(
+            matches!(evt, Event::DocumentLoaded { .. }),
+            "load must succeed, got {evt:?}"
+        );
+        assert!(engine.composition.is_none(), "stale composition must drop");
+        assert_eq!(
+            engine.lazy_layout.viewport_y, 0.0,
+            "band restarts at the document top"
+        );
+        assert_eq!(
+            engine.lazy_layout.viewport_h, 900.0,
+            "viewport height is a canvas property and survives the swap"
+        );
+        let expected = INITIAL_COLD_OPEN_BUDGET_PT.max(900.0);
+        assert!(
+            (engine.lazy_layout.min_target_y - expected).abs() < 0.5,
+            "min_target_y restarts at the cold-open band, got {}",
+            engine.lazy_layout.min_target_y
+        );
+    }
+
+    /// Issue #53 — the interactive insert resolution ladder: explicit
+    /// `at` > live caret > legacy append (None).
+    #[test]
+    fn insert_at_resolution_prefers_live_caret_over_none() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        /* Live caret at (0,5) — a click just landed there. */
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 5),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        assert_eq!(
+            engine.resolve_interactive_insert_at(None),
+            Some(bpos_top(0, 5)),
+            "None must resolve to the engine's live caret"
+        );
+        assert_eq!(
+            engine.resolve_interactive_insert_at(Some(bpos_top(0, 2))),
+            Some(bpos_top(0, 2)),
+            "an explicit at is honoured verbatim"
+        );
+        /* Interactive insert through the resolved caret really lands
+        there and advances the engine caret. */
+        let evt = engine.do_insert_text_interactive(bpos_top(0, 5), "X".to_string());
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        assert_eq!(
+            engine.undo.current().paragraph_text(0),
+            Some("helloX world")
+        );
+
+        /* No selection at all → the Phase-1 append contract survives. */
+        engine.selection = None;
+        assert_eq!(engine.resolve_interactive_insert_at(None), None);
+    }
+
+    /// Issue #53 — `PlaceCaretAtPoint` = hit-test + collapsed selection
+    /// in one command, so the shell can post it synchronously at
+    /// pointerdown and rely on queue order alone.
+    #[test]
+    fn place_caret_at_point_sets_collapsed_selection() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello wide world"));
+        let evt = engine.do_place_caret_at_point(
+            0,
+            BridgePoint {
+                /* Well inside the first line's text band. */
+                x: engine
+                    .undo
+                    .current()
+                    .paragraph_text(0)
+                    .map_or(0.0, |_| 300.0),
+                y: 130.0,
+            },
+        );
+        let Event::SelectionChanged { range, .. } = evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        assert_eq!(range.start, range.end, "placement collapses the selection");
+        let sel = engine.selection.as_ref().expect("selection installed");
+        assert_eq!(sel.anchor, sel.caret);
+        assert_eq!(sel.caret, range.start, "engine caret matches the reply");
+        assert!(
+            sel.caret.offset > 0,
+            "a mid-line x must not land at offset 0 (hit-test really ran)"
+        );
+    }
+
+    /// Issue #51/#34 — table cell paragraphs must ride the layout LRU.
+    /// Before the fix, `layout_cell_blocks` called `layout_paragraph`
+    /// raw, so every paint re-shaped every cell (×3 with autofit's
+    /// probe passes). Two identical builds must produce identical
+    /// geometry with zero new cache entries on the second run.
+    #[test]
+    fn table_cells_ride_the_layout_cache() {
+        let mut doc = DocumentTree::from_text("intro paragraph");
+        doc.blocks
+            .push_back(engine::Block::Table(one_row_table(vec![
+                cell_with_text("alpha beta gamma"),
+                cell_with_text("delta"),
+                cell_with_text("epsilon zeta eta theta"),
+            ])));
+        let engine = test_engine_with_doc(doc);
+
+        let (p1, _, _, _) = engine
+            .build_pages(2.0, false, None)
+            .expect("first table build");
+        let after_first = engine.layout_cache.borrow().len();
+        assert!(
+            after_first > 3,
+            "cell paragraphs must populate the cache (got {after_first} entries)"
+        );
+        engine.invalidate_layout_snapshot();
+        let (p2, _, _, _) = engine
+            .build_pages(2.0, false, None)
+            .expect("second table build");
+        let after_second = engine.layout_cache.borrow().len();
+        assert_eq!(
+            after_first, after_second,
+            "an unchanged doc must not mint new cache entries on repaint"
+        );
+        assert_eq!(p1.len(), p2.len());
+        assert!(
+            (p1[0].size.height - p2[0].size.height).abs() < 0.01,
+            "cache-hit geometry must be identical"
+        );
+    }
+
+    /// Shared scaffold: a native Engine over `doc` with a real Latin font
+    /// and a cached layout config, mirroring the interactive boot state.
+    fn test_engine_with_doc(doc: DocumentTree) -> Engine {
+        let bytes_font = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font =
+            LoadedFont::parse("test-latin".to_string(), bytes_font).expect("parse test font");
+        let mut fonts: HashMap<String, Arc<LoadedFont>> = HashMap::new();
+        fonts.insert("test-latin".to_string(), Arc::new(font));
+        Engine {
+            page_ctxs: Vec::new(),
+            ctx: None,
+            fonts,
+            undo: UndoStack::new(doc, 100),
+            layout_cfg: Some(RenderConfig {
+                font_id: "test-latin".to_string(),
+                base_direction: ShapingDirection::Ltr,
+                px_size: 16.0,
+                line_height: 26.0,
+                alignment: Alignment::Start,
+                scale: 2.0,
+                base_scale: 2.0,
+                zoom: 1.0,
+            }),
+            atlas: GlyphAtlas::new(),
+            vello: None,
+            dirty: DirtyTracker::new(),
+            selection: Some(SelectionState {
+                anchor: bpos_top(0, 0),
+                caret: bpos_top(0, 0),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            composition: None,
+            pending_format: None,
+            layout_cache: new_layout_cache(),
+            layout_snapshot: RefCell::new(None),
+            a11y_cache: None,
+            image_cache: HashMap::new(),
+            last_paint_dims: LastPaintDims::default(),
+            lazy_layout: LazyLayoutState::default(),
+            caret_affinity: CaretAffinity::default(),
+            pending_announcements: Vec::new(),
+            tracking_changes: false,
+            review_author: "You".to_string(),
+            /* Non-empty so `current_review_date` never reaches
+            `js_sys::Date`, which panics on native targets. */
+            review_date: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Manual profiling harness for the #51/#34 perf overhaul. Run with:
+    /// `cargo test -p engine-wasm --release profile_50p -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual profiling harness, not a correctness gate"]
+    fn profile_50p_layout() {
+        use std::time::Instant;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
+        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+
+        let t0 = Instant::now();
+        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        eprintln!("read_docx:                {:?}", t0.elapsed());
+        eprintln!(
+            "blocks: {}  paragraphs: {}",
+            archive.document.blocks.len(),
+            archive.document.paragraph_count()
+        );
+
+        let mut engine = test_engine_with_doc(archive.document);
+
+        let doc = engine.undo.current().clone();
+        let t = Instant::now();
+        let sctx = StyleContext::of(&doc);
+        eprintln!("StyleContext::of:         {:?}", t.elapsed());
+        let _ = sctx;
+
+        let t = Instant::now();
+        let (pages, _, _, info) = engine
+            .build_pages(2.0, false, None)
+            .expect("full layout (cold)");
+        eprintln!(
+            "build_pages FULL (cold):  {:?}  ({} pages, full={})",
+            t.elapsed(),
+            pages.len(),
+            info.is_full_layout
+        );
+
+        let t = Instant::now();
+        let (pages, _, _, _) = engine
+            .build_pages(2.0, false, None)
+            .expect("full layout (warm)");
+        eprintln!(
+            "build_pages FULL (warm):  {:?}  ({} pages)",
+            t.elapsed(),
+            pages.len()
+        );
+
+        engine.layout_cache = new_layout_cache();
+        let t = Instant::now();
+        let (pages, _, _, info) = engine
+            .build_pages(2.0, false, Some(2000.0))
+            .expect("band layout (cold)");
+        eprintln!(
+            "build_pages 2000px (cold):{:?}  ({} pages, full={})",
+            t.elapsed(),
+            pages.len(),
+            info.is_full_layout
+        );
+
+        let t = Instant::now();
+        let geom = engine.document_geometry().expect("document_geometry");
+        eprintln!(
+            "document_geometry (warm): {:?}  ({} lines)",
+            t.elapsed(),
+            geom.len()
+        );
+
+        let t = Instant::now();
+        let evt = engine.selection_changed();
+        eprintln!("selection_changed (warm): {:?}", t.elapsed());
+        let _ = evt;
+
+        let t = Instant::now();
+        let wc = engine.undo.current().word_count();
+        eprintln!(
+            "word_count:               {:?}  ({} words)",
+            t.elapsed(),
+            wc
+        );
+
+        let t = Instant::now();
+        let cc = engine.undo.current().character_count();
+        eprintln!(
+            "character_count:          {:?}  ({} chars)",
+            t.elapsed(),
+            cc
+        );
+
+        /* #34 shape — one interactive insert on the warm 50p doc. No canvases
+        are registered, so this measures layout + scene build + geometry +
+        probes, excluding the actual blit. */
+        for i in 0..3 {
+            let t = Instant::now();
+            let evt = engine.do_insert_text_interactive(bpos_top(0, 0), "x".to_string());
+            eprintln!("insert cycle 50p #{i}:      {:?}", t.elapsed());
+            assert!(
+                matches!(evt, Event::SelectionChanged { .. }),
+                "insert must succeed"
+            );
+        }
+
+        /* #34 shape — the tools/perf benchmark uses a ONE-page seeded doc. */
+        engine.undo = UndoStack::new(
+            DocumentTree::from_text("The quick brown fox jumps over the lazy dog."),
+            100,
+        );
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        engine.layout_cache = new_layout_cache();
+        engine.lazy_layout = LazyLayoutState::default();
+        for i in 0..5 {
+            let t = Instant::now();
+            let evt = engine.do_insert_text_interactive(bpos_top(0, i), "x".to_string());
+            eprintln!("insert cycle 1p  #{i}:      {:?}", t.elapsed());
+            assert!(
+                matches!(evt, Event::SelectionChanged { .. }),
+                "insert must succeed"
+            );
         }
     }
 }

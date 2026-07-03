@@ -5701,6 +5701,14 @@ pub struct UndoStack {
     cursor: usize,
     /// Maximum snapshots retained (oldest are dropped on overflow).
     cap: usize,
+    /// Monotone counter bumped by every operation that changes which
+    /// document `current()` returns (`push` / `undo` / `redo` /
+    /// `replace_current`). Consumers use it as a cheap cache key for
+    /// derived state (the engine's layout snapshot) — two equal
+    /// revisions on the SAME stack guarantee an identical `current()`.
+    /// A fresh stack restarts at 0, so callers that swap stacks must
+    /// invalidate their caches explicitly.
+    revision: u64,
 }
 
 impl UndoStack {
@@ -5709,6 +5717,7 @@ impl UndoStack {
             snapshots: vec![initial],
             cursor: 0,
             cap,
+            revision: 0,
         }
     }
 
@@ -5716,8 +5725,15 @@ impl UndoStack {
         &self.snapshots[self.cursor]
     }
 
+    /// See the `revision` field: bumped on every mutation of the
+    /// current document; stable across read-only access.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn replace_current(&mut self, doc: DocumentTree) {
         self.snapshots[self.cursor] = doc;
+        self.revision += 1;
     }
 
     pub fn push(&mut self, doc: DocumentTree) {
@@ -5732,6 +5748,7 @@ impl UndoStack {
             self.snapshots.remove(0);
             self.cursor = self.cursor.saturating_sub(1);
         }
+        self.revision += 1;
     }
 
     pub fn undo(&mut self) -> bool {
@@ -5739,6 +5756,7 @@ impl UndoStack {
             return false;
         }
         self.cursor -= 1;
+        self.revision += 1;
         true
     }
 
@@ -5747,6 +5765,7 @@ impl UndoStack {
             return false;
         }
         self.cursor += 1;
+        self.revision += 1;
         true
     }
 

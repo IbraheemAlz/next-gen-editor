@@ -366,8 +366,10 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
         /* U+2028 LINE SEPARATOR — the engine's `insert_text` splices it into
          * the paragraph's text run (no block split), and the layout engine
          * forces a line break on it (see `paragraph.rs` `soft_break_segments`). */
-        insertSoftBreak: (at) =>
-            dispatch({ type: 'INSERT_TEXT', at: at ?? currentCaret(), text: '\u2028' }),
+        /* Issue #53 — an omitted `at` goes to the wire as `undefined`
+         * (= the engine's LIVE caret), not the SDK's async selection
+         * mirror, so a soft break racing a caret placement stays put. */
+        insertSoftBreak: (at) => dispatch({ type: 'INSERT_TEXT', at, text: '\u2028' }),
 
         selectAll: () => dispatch({ type: 'SELECT_ALL' }),
         setSelection: (range, caret) => dispatch({ type: 'SET_SELECTION', range, caret }),

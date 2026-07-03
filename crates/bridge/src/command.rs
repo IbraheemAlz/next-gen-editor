@@ -63,7 +63,12 @@ pub enum Command {
         device_pixel_ratio: Option<f32>,
     },
 
-    /// Insert `text` into the in-engine document. `at == None` appends.
+    /// Insert `text` into the in-engine document. `at == None` inserts
+    /// at the engine's LIVE caret (issue #53 — interactive typing
+    /// passes `None` so a keystroke racing a click's hit-test can
+    /// never land at a stale UI-side position); when no selection
+    /// exists (the Phase-1 harness), `None` keeps the historical
+    /// append-at-end contract and emits `TextInserted`.
     InsertText {
         at: Option<LogicalPos>,
         text: String,
@@ -242,6 +247,18 @@ pub enum Command {
     /// independent `<canvas>` elements without any offset math of its
     /// own. Replies with `Event::HitResult` like `HitTest`.
     HitTestInPage {
+        page: u32,
+        at: Point,
+    },
+
+    /// Issue #53 — single-hop caret placement: hit-test the page-local
+    /// pixel AND set the collapsed selection in ONE serialized dispatch,
+    /// replying with `Event::SelectionChanged`. Replaces the shell's
+    /// two-hop `HitTestInPage` → `SetSelection` for plain clicks: the
+    /// awaited round-trip between those two opened a window where a
+    /// fast keystroke's `InsertText` entered the worker queue ahead of
+    /// the `SetSelection` and executed against the stale caret.
+    PlaceCaretAtPoint {
         page: u32,
         at: Point,
     },

@@ -375,6 +375,16 @@ impl Paginator {
         self.pages.len()
     }
 
+    /// Total height of the pages already finalised inside this paginator
+    /// (excluding the in-progress page). The viewport cull sums this with
+    /// [`Self::cursor_y`] to know how much document height the current
+    /// section has really committed — `cursor_y` alone resets at every
+    /// page break, so without this term a single-section document never
+    /// trips the cull budget no matter how many pages it has flushed.
+    pub fn emitted_pages_height(&self) -> f32 {
+        self.pages.iter().map(|p| p.size.height).sum()
+    }
+
     pub fn content_width(&self) -> f32 {
         self.geometry.width - self.geometry.margins.left - self.geometry.margins.right
     }

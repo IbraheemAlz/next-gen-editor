@@ -32,11 +32,12 @@ export function attachPointer(
     pageIdx: number = 0,
 ): () => void {
     let dragging = false;
-    /* Bumped on every new gesture. HIT_TEST is async, so the SET_SELECTION
-       it feeds can land out of order — a double-click's two single-click
-       SET_SELECTIONs would otherwise resolve after the SELECT_WORD_AT and
-       clobber the word selection. A hit-test whose gesture is stale by the
-       time it resolves is dropped. */
+    /* Bumped on every new gesture. Still needed for the DRAG path
+       (extendTo), which stays two-hop: its HIT_TEST is async, so the
+       EXTEND_SELECTION it feeds can land out of order; a hit-test whose
+       gesture is stale by the time it resolves is dropped. Plain-click
+       placement no longer needs this — PLACE_CARET_AT_POINT is a single
+       synchronously-posted command ordered by the worker queue itself. */
     let gesture = 0;
 
     /* Client coords → this page's LOCAL engine device pixels (origin at
@@ -72,14 +73,21 @@ export function attachPointer(
         return { x: local.x, y: local.y + pageOffsetY };
     };
 
-    const placeCaret = async (at: Point, g: number): Promise<void> => {
-        const hit = await client.dispatch({ type: 'HIT_TEST_IN_PAGE', page: pageIdx, at });
-        if (g !== gesture || hit.type !== 'HIT_RESULT') return;
-        await client.dispatch({
-            type: 'SET_SELECTION',
-            range: { start: hit.pos, end: hit.pos },
-            caret: hit.pos,
-        });
+    /* Issue #53 — single-hop caret placement, posted SYNCHRONOUSLY (no
+       await between the pointer event and the dispatch). The engine
+       hit-tests AND sets the collapsed selection inside ONE serialized
+       command, so a keystroke fired <5 ms after the click still enters
+       the worker queue AFTER it and inserts at the clicked position.
+       The old two-hop HIT_TEST_IN_PAGE → SET_SELECTION needed the
+       gesture-staleness guard here; single-hop placements are ordered
+       by the queue itself (two single clicks always resolve before the
+       dblclick's SELECT_WORD_AT that follows them). */
+    const placeCaret = (at: Point): void => {
+        void client
+            .dispatch({ type: 'PLACE_CARET_AT_POINT', page: pageIdx, at })
+            .catch((e: unknown) => {
+                console.error('placeCaret failed', e);
+            });
     };
 
     const extendTo = async (at: Point, g: number): Promise<void> => {
@@ -118,7 +126,7 @@ export function attachPointer(
                     );
                     if (!inside) {
                         gesture += 1;
-                        void placeCaret(toLocal(e), gesture);
+                        placeCaret(toLocal(e));
                     }
                 }
             }
@@ -134,7 +142,7 @@ export function attachPointer(
             void extendTo(toLocal(e), gesture);
             return;
         }
-        void placeCaret(toLocal(e), gesture);
+        placeCaret(toLocal(e));
     };
 
     const onPointerMove = (e: PointerEvent): void => {

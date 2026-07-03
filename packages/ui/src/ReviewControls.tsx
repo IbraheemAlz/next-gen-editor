@@ -15,6 +15,7 @@
  */
 import {
     createEffect,
+    createMemo,
     createSignal,
     onCleanup,
     Show,
@@ -48,7 +49,15 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
         props.defaultAuthor ?? 'You',
     );
 
-    const ready = () => state.selection() !== undefined;
+    /* Issue #34/#51 follow-on — `createMemo`, NOT a plain closure. The
+     * identity-push effect below reads this; a raw
+     * `state.selection() !== undefined` closure re-notifies on EVERY
+     * selection update, and `setReviewIdentity`'s reply is itself a
+     * SELECTION_CHANGED — a self-sustaining dispatch storm that
+     * throttled every real command behind it (found while chasing the
+     * insert-latency regression). A boolean memo only notifies its
+     * readers when the VALUE flips (false → true, once per boot). */
+    const ready = createMemo(() => state.selection() !== undefined);
 
     /* Propagate the author input to the engine review identity so
      * tracked revisions stop being stamped with the "You" default.

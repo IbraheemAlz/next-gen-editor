@@ -184,8 +184,34 @@ impl VelloRenderer {
         })
     }
 
+    /// Reconfigure the surface for a new target size. No-op when the
+    /// size already matches (or is degenerate). Issue #54 follow-on:
+    /// the surface used to be frozen at its INIT-time dimensions, so a
+    /// post-boot DPR / zoom change rendered cropped into a stale-sized
+    /// surface with no way back.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        if self.surface.config.width == width && self.surface.config.height == height {
+            return;
+        }
+        self.context
+            .resize_surface(&mut self.surface, width, height);
+    }
+
     /// Encode `list` into the scene, render it to the intermediate texture, and
     /// blit the result onto the surface.
+    ///
+    /// Issue #54 — a dropped present is NOT an error. wgpu documents
+    /// `Timeout` / `Occluded` as "skip this frame and try again" and
+    /// `Outdated` / `Lost` as "reconfigure and retry"; the old code
+    /// collapsed all four into a hard `Err`. On the WebGPU backend
+    /// surface acquisition effectively always succeeds (the compositor
+    /// drops frames downstream instead), so these arms mostly harden a
+    /// future native/desktop embedding — the shell's post-boot-overlay
+    /// settle repaint in `App.tsx` is the fix that makes the FIRST
+    /// visible frame reliable in the browser.
     pub fn render(
         &mut self,
         list: &DisplayList,
@@ -214,7 +240,27 @@ impl VelloRenderer {
         let surface_texture = match self.surface.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(tex)
             | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
-            _ => return Err("get_current_texture failed".to_string()),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                /* Skip the present; the scene rendered fine and the
+                next paint (the shell schedules a post-boot settle
+                repaint) presents it. */
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                /* Reconfigure the surface (NOT `resize_surface` — that
+                would recreate the intermediate target texture and
+                throw away the frame just rendered into it) and retry
+                once; still not presentable → skip, next paint retries. */
+                self.context.configure_surface(&self.surface);
+                match self.surface.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(tex)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
+                    _ => return Ok(()),
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err("get_current_texture: validation error".to_string());
+            }
         };
         let target_view = surface_texture
             .texture

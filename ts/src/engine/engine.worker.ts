@@ -124,6 +124,33 @@ function enqueue<T>(task: () => Promise<T>): Promise<T> {
     return run;
 }
 
+/* Issue #51 — one repaint per REGISTER_PAGE_CANVAS burst, not one per
+   page. The setTimeout(0) hop lets every registration message already
+   sitting in the event loop enqueue first; the flag resets when the
+   repaint task STARTS, so a registration landing after that point
+   schedules a fresh repaint and never misses its canvas. */
+let pageCanvasRepaintQueued = false;
+function schedulePageCanvasRepaint(): void {
+    if (pageCanvasRepaintQueued) return;
+    pageCanvasRepaintQueued = true;
+    setTimeout(() => {
+        void enqueue(async () => {
+            pageCanvasRepaintQueued = false;
+            try {
+                const evt = await dispatch({
+                    type: 'REQUEST_PAINT',
+                    viewport: { x: 0, y: 0, w: 0, h: 0 },
+                    dirty: undefined,
+                });
+                notePaintVersion(evt);
+                self.postMessage({ evt });
+            } catch (e: unknown) {
+                console.error('[worker] page-canvas repaint failed', e);
+            }
+        });
+    }, 0);
+}
+
 async function fetchBytes(url: string): Promise<Uint8Array> {
     const r = await fetch(url);
     if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
@@ -292,6 +319,21 @@ async function handleInit(msg: InitMsg): Promise<void> {
                 } as Command);
                 self.postMessage({ type: 'DOCX_RESULT', step: 'load', event: reloaded });
             }
+            /* Issue #53 made `at: undefined` = "at the live caret", and
+               LOAD_DOCX seats the caret at (0,0) — an implicit-append
+               here would silently PREPEND (caught as a 0.211% golden
+               drift). Say what the case means: place the caret at the
+               end of the reloaded text, then insert. */
+            const endOfText = new TextEncoder().encode('افتح، عدِّل، احفظ.').length;
+            const endPos = {
+                path: { steps: [{ kind: 'BLOCK', idx: 0 }] },
+                offset: endOfText,
+            };
+            await dispatch({
+                type: 'SET_SELECTION',
+                range: { start: endPos, end: endPos },
+                caret: endPos,
+            } as Command);
             paintEvt = await dispatch({
                 type: 'INSERT_TEXT',
                 at: undefined,
@@ -989,58 +1031,74 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
 
     /* Phase 8a — `GET_COMMENTS`: side-channel call into the engine's
        `comments_snapshot()` wasm method. Not a `Command` (the snapshot
-       is read-only document metadata, not an event-log mutation). */
+       is read-only document metadata, not an event-log mutation).
+       Issue #51 — routed through the serial queue: even a `&self` wasm
+       call aliases the engine while an in-flight `&mut self` dispatch
+       future is parked at an await, and wasm-bindgen panics with
+       "recursive use of an object". */
     if (msg.type === 'GET_COMMENTS') {
-        if (!engine) {
-            self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
-            return;
-        }
-        try {
-            const snapshot = engine.comments_snapshot();
-            self.postMessage({ id: msg.id, ok: true, comments: snapshot });
-        } catch (e: unknown) {
-            replyError(msg.id, e);
-        }
+        void enqueue(async () => {
+            if (!engine) {
+                self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
+                return;
+            }
+            try {
+                const snapshot = engine.comments_snapshot();
+                self.postMessage({ id: msg.id, ok: true, comments: snapshot });
+            } catch (e: unknown) {
+                replyError(msg.id, e);
+            }
+        });
         return;
     }
 
     /* Phase 6c — multi-canvas registration. Engine's `set_page_canvas`
        transfers the OffscreenCanvas to a per-page slot; the next paint
-       fills it. */
+       fills it.
+
+       Issue #51 — two hardening moves over the original shape:
+       1. The registration AND its follow-up repaint ride the serial
+          queue (the old `void dispatch(...)` bypassed it — overlapping
+          an in-flight command triggers wasm-bindgen's "recursive use
+          of an object" panic, and a catch-less rejection wedged the
+          worker silently).
+       2. The repaint is COALESCED: opening a multi-page document
+          mounts one canvas per page, and one full repaint per
+          registration was O(pages²) page paints. A macrotask-deferred
+          flag folds each registration burst into a single repaint. */
     if (msg.type === 'REGISTER_PAGE_CANVAS') {
-        if (!engine) {
-            self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
-            return;
-        }
-        try {
-            engine.set_page_canvas(msg.idx, msg.canvas);
-            self.postMessage({ id: msg.id, ok: true });
-            void dispatch({
-                type: 'REQUEST_PAINT',
-                viewport: { x: 0, y: 0, w: 0, h: 0 },
-                dirty: undefined,
-            }).then((evt) => {
-                notePaintVersion(evt);
-                self.postMessage({ evt });
-            });
-        } catch (e: unknown) {
-            replyError(msg.id, e);
-        }
+        void enqueue(async () => {
+            if (!engine) {
+                self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
+                return;
+            }
+            try {
+                engine.set_page_canvas(msg.idx, msg.canvas);
+                self.postMessage({ id: msg.id, ok: true });
+            } catch (e: unknown) {
+                replyError(msg.id, e);
+                return;
+            }
+            schedulePageCanvasRepaint();
+        });
         return;
     }
 
-    /* Phase 8b — revisions side-channel mirror of `GET_COMMENTS`. */
+    /* Phase 8b — revisions side-channel mirror of `GET_COMMENTS`;
+       queued for the same aliasing reason. */
     if (msg.type === 'GET_REVISIONS') {
-        if (!engine) {
-            self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
-            return;
-        }
-        try {
-            const snapshot = engine.revisions_snapshot();
-            self.postMessage({ id: msg.id, ok: true, revisions: snapshot });
-        } catch (e: unknown) {
-            replyError(msg.id, e);
-        }
+        void enqueue(async () => {
+            if (!engine) {
+                self.postMessage({ id: msg.id, ok: false, error: 'engine not initialized' });
+                return;
+            }
+            try {
+                const snapshot = engine.revisions_snapshot();
+                self.postMessage({ id: msg.id, ok: true, revisions: snapshot });
+            } catch (e: unknown) {
+                replyError(msg.id, e);
+            }
+        });
         return;
     }
 

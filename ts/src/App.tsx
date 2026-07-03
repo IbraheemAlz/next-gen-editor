@@ -37,7 +37,7 @@ async function setupEngine(client: EngineClient, fonts: FontRegistry): Promise<v
     /* `defaults[0]` is the manifest's seed/primary face (dual-script Amiri
        so the mixed RTL seed text shapes from one face). */
     const seedFont = fonts.defaults()[0] ?? 'amiri';
-    await client.dispatch({
+    const seedPaint = await client.dispatch({
         type: 'RENDER_PAGE',
         /* Seed mixed Arabic/English so the pointer + selection overlays have
            BiDi text to hit-test against. */
@@ -59,6 +59,12 @@ async function setupEngine(client: EngineClient, fonts: FontRegistry): Promise<v
            right coordinate space without any extra math. */
         device_pixel_ratio: window.devicePixelRatio * SCREEN_DPI_SCALE,
     });
+    /* Issue #54 — the boot paint's result event was previously
+       discarded unchecked, so a failed first frame (`vello paint: …`)
+       left a blank canvas with zero console evidence. */
+    if (seedPaint.type === 'ERROR') {
+        console.error('[boot] seed paint failed:', seedPaint.message);
+    }
     /* Seed a collapsed caret at the document start so the hidden input has a
        position to insert at before the first pointer click. */
     await client.dispatch({
@@ -131,6 +137,7 @@ export function App() {
     const [canvasGen, setCanvasGen] = createSignal(0);
     const [booting, setBooting] = createSignal(true);
     let firstReady = true;
+    let viewportEl: HTMLDivElement | undefined;
 
     /* EngineClient.onTrap calls this after rejecting in-flight requests.
        Bumping the generation remounts EditorCanvas → fresh canvas → recover(). */
@@ -143,6 +150,19 @@ export function App() {
     const dispatch = (cmd: Command): Promise<Event> => client.dispatch(cmd);
     window.__engineClient = client;
     window.__dispatch = dispatch;
+
+    /* Issue #51 — the engine restarts its lazy-layout band at the top on
+       a document swap; mirror it DOM-side, or the first SET_VIEWPORT
+       after open would re-bump the band straight back to the OLD
+       document's scroll depth and lay all of that out again. */
+    createEffect(() => {
+        const unsub = client.subscribe((evt) => {
+            if (evt.type === 'DOCUMENT_LOADED' && viewportEl) {
+                viewportEl.scrollTop = 0;
+            }
+        });
+        onCleanup(unsub);
+    });
 
     /* Data-driven font registry — single instance shared by the boot
        sequence (loadDefaults) and the toolbar (JIT ensureFont) so a font
@@ -194,6 +214,30 @@ export function App() {
         }
         await setupEngine(client, fontRegistry);
         setBooting(false);
+        /* Issue #54 — the boot paint presents while the opaque
+           `.boot-overlay` still covers the canvas, and WebGPU may
+           legitimately drop an occluded frame (wgpu documents
+           Occluded/Timeout as "skip and try again"); nothing else
+           repainted until the first mutation. Present one settle frame
+           AFTER the overlay is gone, so `__paintIdle` means "a frame
+           was presented unoccluded" on both renderers. */
+        /* Timeout-raced: Chrome throttles rAF in hidden tabs, and boot
+           must not stall until the tab is foregrounded. */
+        await new Promise<void>((r) => {
+            const fallback = setTimeout(r, 250);
+            requestAnimationFrame(() => {
+                clearTimeout(fallback);
+                r();
+            });
+        });
+        const settle = await client.dispatch({
+            type: 'REQUEST_PAINT',
+            viewport: { x: 0, y: 0, w: 0, h: 0 },
+            dirty: undefined,
+        });
+        if (settle.type === 'ERROR') {
+            console.error('[boot] settle repaint failed:', settle.message);
+        }
         window.__paintIdle = true;
         if (generation > 0) {
             window.__recovered = true;
@@ -221,7 +265,7 @@ export function App() {
                 fontRegistry={fontRegistry}
                 engineReady={() => !booting()}
             >
-                <div class="editor-viewport">
+                <div class="editor-viewport" ref={viewportEl}>
                     {/* Phase 6c multi-canvas DOM — one `.editor-page` per
                         paginated page. Page 0 hosts the boot canvas (the
                         engine's INIT surface + selection / caret overlays
@@ -231,7 +275,26 @@ export function App() {
                         `engine.set_page_canvas`. DevTools sees each
                         page as its own DOM node — no more single 30 k-px
                         canvas hitting Safari's 4 k limit. */}
-                    <div class="editor-pages">
+                    {/* Issue #51 — virtual scroll range. Mounted pages
+                        cover only the laid-out band; the min-height
+                        spacer from the engine's running estimate lets
+                        the user scroll INTO the unlaid tail, which is
+                        what triggers the scroll-driven EXPAND_LAYOUT.
+                        The estimate converges to the real height as
+                        layout fills in (it can adjust in either
+                        direction — AVG_BLOCK_HEIGHT_PT is a fudge).
+                        Device px → CSS px via dpr. */}
+                    <div
+                        class="editor-pages"
+                        style={{
+                            'min-height': `${
+                                Math.max(
+                                    store.estimatedDocumentHeight(),
+                                    store.documentHeight(),
+                                ) / (window.devicePixelRatio || 1)
+                            }px`,
+                        }}
+                    >
                         <div class="editor-page" data-page-index="0">
                             <For each={[canvasGen()]}>
                                 {(generation) => (

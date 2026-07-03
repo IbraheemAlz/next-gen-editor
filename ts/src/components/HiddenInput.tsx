@@ -22,7 +22,12 @@ import { ClipboardWriteError, copy, cut, paste } from '../input/clipboard';
 function mapInputEventToCommand(e: InputEvent, caret: LogicalPos): Command | null {
     switch (e.inputType) {
         case 'insertText':
-            return e.data ? { type: 'INSERT_TEXT', at: caret, text: e.data } : null;
+            /* Issue #53 — `at: undefined` = "at the engine's live
+               caret". The UI-side mirror only updates when
+               SELECTION_CHANGED lands, so a keystroke racing a click's
+               caret placement would otherwise carry the previous
+               position into the queue. */
+            return e.data ? { type: 'INSERT_TEXT', at: undefined, text: e.data } : null;
         /* A <textarea> fires `insertLineBreak` for Enter; Shift+Enter is
            intercepted earlier in `onKeyDown` (soft break) and never reaches
            here. `insertParagraph` is contenteditable semantics. The document
@@ -197,10 +202,11 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
             } else if (caret && !e.shiftKey) {
                 /* Body paragraph → insert a tab character. Shift+Tab in body
                    has no outdent command yet, so it is a no-op (it still
-                   preventDefaults to avoid focus loss). */
+                   preventDefaults to avoid focus loss). Issue #53 —
+                   engine-live caret, not the async UI mirror. */
                 void props.client.dispatch({
                     type: 'INSERT_TEXT',
-                    at: caret,
+                    at: undefined,
                     text: '\t',
                 });
             }
@@ -226,9 +232,10 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
             e.preventDefault();
             const caret = props.store.caretLogical();
             if (caret) {
+                /* Issue #53 — engine-live caret, not the async mirror. */
                 void props.client.dispatch({
                     type: 'INSERT_TEXT',
-                    at: caret,
+                    at: undefined,
                     text: '\u2028',
                 });
             }
