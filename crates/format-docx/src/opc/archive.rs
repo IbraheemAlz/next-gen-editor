@@ -90,6 +90,15 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     };
     let resolver = StyleResolver::new(&style_table);
     let mut document = parse_document_xml(&xml, &resolver)?;
+    /* Issue #61 — both rebuild passes below reconstruct the tree via
+    `DocumentTree::from_blocks_with_sections`, which hardcodes
+    `comment_ranges: Vec::new()` (it has no parameter for it, unlike
+    `sections`/`headers`/`footers`, which those call sites explicitly
+    take out and restore). Capture the parser's original comment ranges
+    once, up front, and restore them after every rebuild has run —
+    nothing between here and the restoration below reads or mutates
+    `comment_ranges`, so this is a pure carry-through. */
+    let comment_ranges = std::mem::take(&mut document.comment_ranges);
 
     /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
     numbering resolver. Second pass over the parsed paragraphs fills each
@@ -219,6 +228,8 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     document = DocumentTree::from_blocks_with_sections(blocks, sections)
         .with_header_footer_parts(headers, footers);
     document.media = media;
+    /* Issue #61 — restore the comment ranges the rebuilds above dropped. */
+    document.comment_ranges = comment_ranges;
 
     /* Sprint 12 (#11) — mirror the `StyleTable` into the engine model
     so the live editor can apply / re-resolve styles without the

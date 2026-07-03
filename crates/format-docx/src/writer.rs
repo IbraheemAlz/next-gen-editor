@@ -2397,14 +2397,14 @@ mod tests {
     /// Issue #59 (blast radius) — `<w:commentRangeStart>`/`End` are also
     /// paragraph-level siblings, not run-internal; same stale-window bug.
     ///
-    /// Exercises `parse_document_xml` directly rather than the full
-    /// `read_docx` archive pipeline: `DocxArchive::read_docx`'s hyperlink-
-    /// resolution pass unconditionally rebuilds the tree via
-    /// `DocumentTree::from_blocks_with_sections`, which zeroes
-    /// `comment_ranges` (a separate, pre-existing bug — filed
-    /// independently). The byte-offset fix this test pins lives entirely
-    /// inside the streaming parser, so testing at that layer isolates it
-    /// from the unrelated data-loss bug one layer up.
+    /// Issue #61 — this now goes through the FULL `read_docx` archive
+    /// pipeline (not `parse_document_xml` directly): `read_docx`'s
+    /// hyperlink-resolution pass unconditionally rebuilds the tree via
+    /// `DocumentTree::from_blocks_with_sections`, which used to zero
+    /// `comment_ranges` on every single document regardless of whether it
+    /// had hyperlinks or numbering. Exercising the real entry point here
+    /// pins both fixes together: the byte offsets AND that the range
+    /// actually survives to the caller.
     #[test]
     fn comment_range_preceded_by_run_gets_correct_byte_range() {
         let document_xml = format!(
@@ -2415,14 +2415,45 @@ mod tests {
              <w:commentRangeEnd w:id=\"1\"/>\
              </w:p><w:sectPr/></w:body></w:document>"
         );
-        let style_table = crate::parts::styles::StyleTable::default();
-        let resolver = crate::style_resolver::StyleResolver::new(&style_table);
-        let parsed = crate::parts::document::parse_document_xml(document_xml.as_bytes(), &resolver)
-            .expect("parse");
-        assert_eq!(parsed.comment_ranges.len(), 1);
-        let r = &parsed.comment_ranges[0];
+        let buf = zip_minimal_docx(&document_xml, None);
+        let parsed = read_docx(&buf).expect("read");
+        assert_eq!(
+            parsed.document.comment_ranges.len(),
+            1,
+            "comment range must survive the full read_docx rebuild pipeline"
+        );
+        let r = &parsed.document.comment_ranges[0];
         assert_eq!(r.start.offset, 6);
         assert_eq!(r.end.offset, 11);
+    }
+
+    /// Issue #61 — the hyperlink-resolution rebuild inside `read_docx`
+    /// runs UNCONDITIONALLY (every document goes through it, whether or
+    /// not it has hyperlinks), so a comment range must survive even in a
+    /// document that has neither hyperlinks nor numbering — the exact
+    /// "nothing else is going on" case that first exposed the bug: the
+    /// clobber wasn't gated on any feature actually being used.
+    #[test]
+    fn comment_ranges_survive_read_docx_with_no_hyperlinks_or_numbering() {
+        let document_xml = format!(
+            "{DOC_XML_NS}<w:body><w:p>\
+             <w:commentRangeStart w:id=\"7\"/>\
+             <w:r><w:t xml:space=\"preserve\">plain text, nothing else going on</w:t></w:r>\
+             <w:commentRangeEnd w:id=\"7\"/>\
+             </w:p><w:sectPr/></w:body></w:document>"
+        );
+        let buf = zip_minimal_docx(&document_xml, None);
+        let parsed = read_docx(&buf).expect("read");
+        assert_eq!(parsed.document.comment_ranges.len(), 1);
+        assert_eq!(parsed.document.comment_ranges[0].start.offset, 0);
+        assert_eq!(parsed.document.comment_ranges[0].end.offset, 33);
+        /* Sanity: this document also round-trips through the writer
+        without the comment range causing any drift (comment_ranges is
+        read-only metadata today; nothing in the writer emits
+        <w:commentRangeStart/End>, so a re-save is unaffected). */
+        let resaved = write_docx(&parsed, &parsed.document).expect("write");
+        let reread = read_docx(&resaved).expect("re-read");
+        assert_eq!(reread.document.comment_ranges.len(), 1);
     }
 
     /// Issue #60 — the epic's own manual-QA scenario: load a `.docx` with
