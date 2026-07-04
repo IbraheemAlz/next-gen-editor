@@ -58,6 +58,14 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
      * insert-latency regression). A boolean memo only notifies its
      * readers when the VALUE flips (false → true, once per boot). */
     const ready = createMemo(() => state.selection() !== undefined);
+    /* Phase 3 (#39) — `Command::ToggleTrackChanges`, `AcceptRevision`,
+     * and `RejectRevision` are all engine-gated while a header/footer
+     * story is active (track-changes toggles are on the story
+     * blocklist). Disable rather than let the engine's silent
+     * `Event::Error` be the only signal. */
+    const inStory = () => state.editingStory() !== undefined;
+    const gatedTitle = (label: string) =>
+        inStory() ? 'Not available while editing a header or footer' : label;
 
     /* Propagate the author input to the engine review identity so
      * tracked revisions stop being stamped with the "You" default.
@@ -85,6 +93,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
      * `tracking()` reads `state.isTrackingChanges()` so the toggle
      * lights up only when the engine confirms recording is on. */
     const onToggleTracking = async () => {
+        if (inStory()) return;
         const next = !tracking();
         try {
             if (next) {
@@ -140,7 +149,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
     };
 
     const acceptAll = async () => {
-        if (!engine.revisionsSnapshot) return;
+        if (inStory() || !engine.revisionsSnapshot) return;
         const rows = await engine.revisionsSnapshot();
         /* Walk in reverse document order so earlier-row mutations
          * don't shift later rows' byte offsets. */
@@ -151,7 +160,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
     };
 
     const rejectAll = async () => {
-        if (!engine.revisionsSnapshot) return;
+        if (inStory() || !engine.revisionsSnapshot) return;
         const rows = await engine.revisionsSnapshot();
         for (let i = rows.length - 1; i >= 0; i--) {
             const r = rows[i]!;
@@ -167,7 +176,10 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 aria-label="Track changes"
                 aria-pressed={tracking()}
                 data-active={tracking()}
-                title={tracking() ? 'Track Changes — recording' : 'Track Changes — off'}
+                title={gatedTitle(
+                    tracking() ? 'Track Changes — recording' : 'Track Changes — off',
+                )}
+                disabled={inStory()}
                 onClick={() => void onToggleTracking()}
             >
                 <span aria-hidden="true">⌖</span>
@@ -178,8 +190,8 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="New comment"
-                title="New comment on selected range"
-                disabled={!ready()}
+                title={gatedTitle('New comment on selected range')}
+                disabled={!ready() || inStory()}
                 onClick={() => setCommentDraftOpen((v) => !v)}
             >
                 <span aria-hidden="true">💬</span>
@@ -190,7 +202,8 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="Accept all revisions"
-                title="Accept all tracked changes"
+                title={gatedTitle('Accept all tracked changes')}
+                disabled={inStory()}
                 onClick={() => void acceptAll()}
             >
                 <span aria-hidden="true">✓✓</span>
@@ -201,7 +214,8 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 class="nge-btn nge-review__btn"
                 type="button"
                 aria-label="Reject all revisions"
-                title="Reject all tracked changes"
+                title={gatedTitle('Reject all tracked changes')}
+                disabled={inStory()}
                 onClick={() => void rejectAll()}
             >
                 <span aria-hidden="true">✗✗</span>

@@ -942,6 +942,11 @@ impl Paginator {
             blocks,
             header,
             footer,
+            /* Phase 3 (#39) — carried forward so the renderer + story
+            hit-testing place bands from the document's real
+            `<w:pgMar w:header/w:footer>` instead of a margin fraction. */
+            header_offset: self.geometry.header_offset,
+            footer_offset: self.geometry.footer_offset,
             footnotes,
         });
 

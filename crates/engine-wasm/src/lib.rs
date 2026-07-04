@@ -12,8 +12,8 @@ use bridge::{
     EngineStats, Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
     LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, MoveDirection,
     PageOrientation as BridgePageOrientation, PathStep as BridgePathStep, PdfConformance,
-    Point as BridgePoint, Rect as BridgeRect, SelectionKind, TextAttrs, TextAttrsPatch,
-    UnderlineStyle, VerticalScript,
+    Point as BridgePoint, Rect as BridgeRect, SectionBreakKind, SelectionKind, TextAttrs,
+    TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{
     Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
@@ -239,6 +239,10 @@ struct LastPaintDims {
     /// between real paints.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Phase 3 (#39) — per-page top/bottom margins (device px) for the
+    /// shell's header/footer double-click zone gate.
+    page_margin_tops: Vec<f32>,
+    page_margin_bottoms: Vec<f32>,
 }
 
 /// A candidate caret position on a line — an absolute x (canvas device px)
@@ -258,6 +262,33 @@ enum CaretAffinity {
     #[default]
     LeadingX,
     TrailingX,
+}
+
+/// Phase 3 (#39) — which content story caret-relative commands address.
+/// While a header/footer story is active, `SelectionState` paths are
+/// STORY-relative (`Block(i)` = the story's i-th paragraph), the
+/// geometry pipeline projects onto the anchor page's band, and every
+/// document mutation routes through the story adapter
+/// (`commit_story_edit`) instead of the body tree.
+#[derive(Clone, PartialEq, Eq, Default)]
+enum StoryTarget {
+    #[default]
+    Body,
+    Header {
+        /// Relationship id of the part being edited.
+        rid: String,
+        /// Anchor page (0-based) — where caret/selection geometry lives.
+        page: u32,
+        /// A top-level block index inside the OWNING section, kept so
+        /// section-scoped reads (`section_geometry_for_caret`) can
+        /// resolve the section while selection paths are story-rooted.
+        section_block: u32,
+    },
+    Footer {
+        rid: String,
+        page: u32,
+        section_block: u32,
+    },
 }
 
 /// One laid-out line flattened for pointer hit-testing and caret/selection
@@ -336,6 +367,20 @@ pub struct Engine {
     /// [`LayoutSnapshot`]). `RefCell` because `document_geometry` and
     /// friends populate it behind `&self`.
     layout_snapshot: RefCell<Option<LayoutSnapshot>>,
+    /// Phase 3 (#40) — revision-keyed memo of the derived
+    /// `effective_sections()` table. Sections now derive from paragraph
+    /// markers by walking the block list, and the lookup sits on the
+    /// per-keystroke `SelectionChanged` path
+    /// (`section_for_block_cached`), so cache by undo revision — same
+    /// pattern as `layout_snapshot`, cleared at the same out-of-band
+    /// chokepoint (`invalidate_layout_snapshot`).
+    sections_memo: RefCell<Option<(u64, Vec<engine::Section>)>>,
+    /// Phase 3 (#39) — the active content story. `Body` outside
+    /// header/footer editing.
+    active_story: StoryTarget,
+    /// Phase 3 (#39) — the body selection captured on
+    /// `EnterHeaderFooter`, restored (clamped) on `ExitHeaderFooter`.
+    stashed_body_selection: Option<SelectionState>,
     /// Last accessibility tree broadcast to the UI (Backlog #10).
     /// `build_a11y_delta` diffs the freshly built tree against this so a
     /// keystroke emits only the changed paragraph. `None` until the first
@@ -436,6 +481,9 @@ fn assemble_engine(
         pending_format: None,
         layout_cache: new_layout_cache(),
         layout_snapshot: RefCell::new(None),
+        sections_memo: RefCell::new(None),
+        active_story: StoryTarget::Body,
+        stashed_body_selection: None,
         a11y_cache: None,
         image_cache: HashMap::new(),
         last_paint_dims: LastPaintDims::default(),
@@ -542,6 +590,8 @@ impl Engine {
             page_tops: dims.page_tops,
             page_heights: dims.page_heights,
             image_count: self.undo.current().count_inline_images(),
+            page_margin_tops: dims.page_margin_tops,
+            page_margin_bottoms: dims.page_margin_bottoms,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -640,6 +690,10 @@ struct PaintDimsOut {
     /// Issue #44 — inline-image count, so the broadcast PAINTED can gate
     /// the shell's `GetImageRects` refresh (mirrors `Event::Painted`).
     image_count: u32,
+    /// Phase 3 (#39) — per-page margins for the shell's header/footer
+    /// zone gate (mirrors `Event::Painted`).
+    page_margin_tops: Vec<f32>,
+    page_margin_bottoms: Vec<f32>,
 }
 
 #[derive(::serde::Serialize)]
@@ -4065,8 +4119,113 @@ fn diff_a11y(prev: &[A11yNode], next: &[A11yNode]) -> Vec<A11yPatch> {
     patches
 }
 
+/// Bridge `TextAttrsPatch` → engine `SpanStyle`. Shared by the body
+/// `ApplyFormatting` handler and the Phase 3 (#39) story twin.
+fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
+    SpanStyle {
+        font_size: attrs.font_size,
+        color: attrs.color.map(|c| [c.r, c.g, c.b, c.a]),
+        bold: attrs.bold,
+        italic: attrs.italic,
+        /* Bridge → engine underline variant mapping (1:1 by name). */
+        underline: attrs.underline.map(bridge_to_engine_underline),
+        strike: attrs.strike,
+        bg_color: attrs.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
+        font_family: attrs.font_family.as_deref().and_then(parse_font_family),
+        /* Audit gap A.H3 — closed: `TextAttrsPatch` now carries
+        `caps` / `small_caps` so the toolbar's Caps controls
+        round-trip through the same `ApplyFormatting` path as
+        bold / italic. */
+        caps: attrs.caps,
+        small_caps: attrs.small_caps,
+        /* Audit gap A.M1 — `<w:vertAlign>` toggles map from the
+        existing `script: Option<VerticalScript>` patch field. The
+        bridge enum's `Normal` variant ⇒ explicit `Baseline`
+        (defeats an inherited super/subscript from the style chain). */
+        vert_align: attrs.script.map(|s| match s {
+            bridge::VerticalScript::Superscript => engine::VertAlign::Superscript,
+            bridge::VerticalScript::Subscript => engine::VertAlign::Subscript,
+            bridge::VerticalScript::Normal => engine::VertAlign::Baseline,
+        }),
+        /* Audit gap A.M2 — interactive toolbar doesn't surface
+        raw-font / theme overrides yet; the open-font path is
+        file-round-trip only. */
+        raw_font_family: None,
+        font_theme: None,
+    }
+}
+
 impl Engine {
+    /// Phase 3 (#39) — story-mode command firewall. While a
+    /// header/footer story is active, commands split three ways:
+    /// - STORY-SCOPED (typing, deletes, splits, formatting, plain
+    ///   paste, selection/caret/hit-test) — handled by their normal
+    ///   arms; the handlers themselves branch into the story twins,
+    ///   and the geometry + selection-doc adapters re-root the rest.
+    /// - GLOBAL (paint, viewport, zoom, stats, undo/redo, save/export,
+    ///   fonts, a11y, enter/exit) — fall through unchanged.
+    /// - EVERYTHING ELSE (tables, images, comments, hyperlinks,
+    ///   sections, page setup, styles, lists, track-changes, IME
+    ///   composition, rich clipboard) — rejected loudly. The UI
+    ///   disables these controls in story mode (Honest UX); this is
+    ///   the engine-side backstop, never the primary affordance.
+    ///
+    /// Returns `Some(Event::Error)` for a rejected command; `None`
+    /// lets `apply`'s normal dispatch proceed. Document loads exit the
+    /// story first (their ground is being torn away) and proceed.
+    fn story_gate(&mut self, cmd: &Command) -> Option<Event> {
+        if !self.story_active() {
+            return None;
+        }
+        match cmd {
+            Command::Ping
+            | Command::LoadFont { .. }
+            | Command::InsertText { .. }
+            | Command::DeleteAtCaret { .. }
+            | Command::SplitParagraph { .. }
+            | Command::ApplyFormatting { .. }
+            | Command::PastePlain { .. }
+            | Command::SetSelection { .. }
+            | Command::ExtendSelection { .. }
+            | Command::SelectAll
+            | Command::SelectWordAt { .. }
+            | Command::SelectParagraphAt { .. }
+            | Command::MoveCaret { .. }
+            | Command::HitTest { .. }
+            | Command::HitTestInPage { .. }
+            | Command::PlaceCaretAtPoint { .. }
+            | Command::Undo
+            | Command::Redo
+            | Command::SetViewport { .. }
+            | Command::SetZoom { .. }
+            | Command::SetDeviceScale { .. }
+            | Command::RequestPaint { .. }
+            | Command::ExpandLayout { .. }
+            | Command::RequestStats
+            | Command::RequestAccessibilityDelta
+            | Command::SaveDocx
+            | Command::SaveDocument { .. }
+            | Command::ExportPdf { .. }
+            | Command::EnterHeaderFooter { .. }
+            | Command::ExitHeaderFooter => None,
+            /* Loading a document tears the story's ground away —
+            exit first, then handle normally. */
+            Command::LoadDocx { .. } | Command::OpenDocument { .. } => {
+                self.exit_story_to_body();
+                None
+            }
+            _ => Some(Event::Error {
+                message: "This action isn't available while editing a header or footer \
+                          — exit the header/footer first."
+                    .into(),
+            }),
+        }
+    }
+
     async fn apply(&mut self, cmd: Command) -> Event {
+        if let Some(rejected) = self.story_gate(&cmd) {
+            return rejected;
+        }
         match cmd {
             Command::Ping => Event::Pong,
 
@@ -4310,6 +4469,9 @@ impl Engine {
                 gutter_pt,
             } => self.do_set_columns(at, count, gutter_pt),
             Command::InsertPageBreak { at } => self.do_insert_page_break(at),
+            Command::InsertSectionBreak { at, kind } => self.do_insert_section_break(at, kind),
+            Command::EnterHeaderFooter { page, area } => self.do_enter_header_footer(page, area),
+            Command::ExitHeaderFooter => self.do_exit_header_footer(),
             Command::SetParagraphBorders { range, borders } => {
                 self.do_set_paragraph_borders(range, borders)
             }
@@ -4560,6 +4722,9 @@ impl Engine {
         range: Option<BridgeLogicalRange>,
         attrs: TextAttrsPatch,
     ) -> Event {
+        if self.story_active() {
+            return self.story_apply_formatting(range, attrs);
+        }
         /* `None` binds to the engine-owned live selection — mirroring
         the interactive `InsertText` path — because the UI's mirrored
         selection is async and can be stale when a mutation is still
@@ -4578,37 +4743,7 @@ impl Engine {
                 }
             },
         };
-        let patch = SpanStyle {
-            font_size: attrs.font_size,
-            color: attrs.color.map(|c| [c.r, c.g, c.b, c.a]),
-            bold: attrs.bold,
-            italic: attrs.italic,
-            /* Bridge → engine underline variant mapping (1:1 by name). */
-            underline: attrs.underline.map(bridge_to_engine_underline),
-            strike: attrs.strike,
-            bg_color: attrs.bg_color.map(|c| [c.r, c.g, c.b, c.a]),
-            font_family: attrs.font_family.as_deref().and_then(parse_font_family),
-            /* Audit gap A.H3 — closed: `TextAttrsPatch` now carries
-            `caps` / `small_caps` so the toolbar's Caps controls
-            round-trip through the same `ApplyFormatting` path as
-            bold / italic. */
-            caps: attrs.caps,
-            small_caps: attrs.small_caps,
-            /* Audit gap A.M1 — `<w:vertAlign>` toggles map from the
-            existing `script: Option<VerticalScript>` patch field. The
-            bridge enum's `Normal` variant ⇒ explicit `Baseline`
-            (defeats an inherited super/subscript from the style chain). */
-            vert_align: attrs.script.map(|s| match s {
-                bridge::VerticalScript::Superscript => engine::VertAlign::Superscript,
-                bridge::VerticalScript::Subscript => engine::VertAlign::Subscript,
-                bridge::VerticalScript::Normal => engine::VertAlign::Baseline,
-            }),
-            /* Audit gap A.M2 — interactive toolbar doesn't surface
-            raw-font / theme overrides yet; the open-font path is
-            file-round-trip only. */
-            raw_font_family: None,
-            font_theme: None,
-        };
+        let patch = patch_to_span_style(&attrs);
         /* Sticky formatting (Backlog #11): a collapsed caret has no text to
         style. Rather than push a no-op edit, arm the patch as the pending
         style — the next interactive InsertText overlays it onto the typed
@@ -4674,11 +4809,36 @@ impl Engine {
 
     fn do_undo(&mut self) -> Event {
         self.undo.undo();
+        self.story_validity_guard();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
         }
         self.after_history_change()
+    }
+
+    /// Phase 3 (#39) — an undo/redo can remove the active story's part
+    /// (e.g. undoing past materialize-on-enter) or shrink its paragraph
+    /// list under the selection. Exit to body in the first case; clamp
+    /// the story selection in the second.
+    fn story_validity_guard(&mut self) {
+        if !self.story_active() {
+            return;
+        }
+        match self.story_paras() {
+            None => self.exit_story_to_body(),
+            Some(_) => {
+                if let Some(sel) = self.selection.clone() {
+                    let clamped = self.with_selection_doc(|d| SelectionState {
+                        anchor: clamp_pos(d, sel.anchor),
+                        caret: clamp_pos(d, sel.caret),
+                        ideal_x: None,
+                        kind: sel.kind,
+                    });
+                    self.selection = Some(clamped);
+                }
+            }
+        }
     }
 
     /// Issue #22 — warm crash recovery. The worker has already been
@@ -4720,6 +4880,9 @@ impl Engine {
         self.review_author = "You".to_string();
         self.review_date = String::new();
         self.dirty = DirtyTracker::new();
+        /* Phase 3 (#39) — recovery lands in body mode. */
+        self.active_story = StoryTarget::Body;
+        self.stashed_body_selection = None;
         Event::Recovered {
             applied_commands: 0,
         }
@@ -4727,6 +4890,7 @@ impl Engine {
 
     fn do_redo(&mut self) -> Event {
         self.undo.redo();
+        self.story_validity_guard();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -4772,6 +4936,12 @@ impl Engine {
     /// an IME composition update (preview text lives outside the doc).
     fn invalidate_layout_snapshot(&self) {
         self.layout_snapshot.replace(None);
+        /* Phase 3 (#40) — the derived-sections memo shares the layout
+        snapshot's staleness model exactly: revision-keyed, plus the
+        same out-of-band invalidation chokepoints (stack swap resets
+        the revision counter, which could collide with a cached
+        entry). */
+        self.sections_memo.replace(None);
     }
 
     /// Ensure [`Engine::layout_snapshot`] holds a `build_pages` run for
@@ -5222,6 +5392,8 @@ impl Engine {
                 blocks: Vec::new(),
                 header: None,
                 footer: None,
+                header_offset: default_geom.header_offset,
+                footer_offset: default_geom.footer_offset,
                 footnotes: Vec::new(),
             });
             emitted_paths.push(Vec::new());
@@ -5255,6 +5427,8 @@ impl Engine {
             blocks: Vec::new(),
             header: None,
             footer: None,
+            header_offset: 0.0,
+            footer_offset: 0.0,
             footnotes: Vec::new(),
         });
         let p0 = paths.drain(..).next().unwrap_or_default();
@@ -5329,10 +5503,17 @@ impl Engine {
         them from uniform-A4 constants. */
         let mut page_tops = Vec::with_capacity(pages.len());
         let mut page_heights = Vec::with_capacity(pages.len());
+        let mut page_margin_tops = Vec::with_capacity(pages.len());
+        let mut page_margin_bottoms = Vec::with_capacity(pages.len());
         let mut top_acc = 0.0f32;
         for page in pages {
             page_tops.push(top_acc);
             page_heights.push(page.size.height);
+            /* Phase 3 (#39) — per-page margins for the shell's
+            header/footer zone gate; exact under mixed-geometry
+            sections. */
+            page_margin_tops.push(page.margins.top);
+            page_margin_bottoms.push(page.margins.bottom);
             top_acc += page.size.height + gap;
         }
         let stats = RenderStats {
@@ -5346,6 +5527,8 @@ impl Engine {
             page_count: pages.len() as u32,
             page_tops,
             page_heights,
+            page_margin_tops,
+            page_margin_bottoms,
         };
 
         /* Vello path: encode the whole display list and present it over
@@ -5375,6 +5558,8 @@ impl Engine {
                 is_full_layout: stats.is_full_layout,
                 page_tops: stats.page_tops.clone(),
                 page_heights: stats.page_heights.clone(),
+                page_margin_tops: stats.page_margin_tops.clone(),
+                page_margin_bottoms: stats.page_margin_bottoms.clone(),
             };
             return Ok(stats);
         }
@@ -5429,6 +5614,8 @@ impl Engine {
             is_full_layout: stats.is_full_layout,
             page_tops: stats.page_tops.clone(),
             page_heights: stats.page_heights.clone(),
+            page_margin_tops: stats.page_margin_tops.clone(),
+            page_margin_bottoms: stats.page_margin_bottoms.clone(),
         };
         Ok(stats)
     }
@@ -5530,6 +5717,8 @@ impl Engine {
             page_tops: dims.page_tops,
             page_heights: dims.page_heights,
             image_count: self.undo.current().count_inline_images(),
+            page_margin_tops: dims.page_margin_tops,
+            page_margin_bottoms: dims.page_margin_bottoms,
         }
     }
 
@@ -5586,15 +5775,151 @@ impl Engine {
             page_tops: stats.page_tops,
             page_heights: stats.page_heights,
             image_count: self.undo.current().count_inline_images(),
+            page_margin_tops: stats.page_margin_tops,
+            page_margin_bottoms: stats.page_margin_bottoms,
         }
+    }
+
+    /* ===========================================================
+    Phase 3 (#39) — the story adapter. While a header/footer story
+    is active, selection paths are story-rooted; these helpers give
+    every existing consumer a story-shaped view without touching the
+    body machinery.
+    =========================================================== */
+
+    fn story_active(&self) -> bool {
+        !matches!(self.active_story, StoryTarget::Body)
+    }
+
+    /// The active story's paragraphs (cloned), or `None` in body mode /
+    /// when the part vanished (undo past materialize-on-enter).
+    fn story_paras(&self) -> Option<Vec<engine::Paragraph>> {
+        let doc = self.undo.current();
+        match &self.active_story {
+            StoryTarget::Body => None,
+            StoryTarget::Header { rid, .. } => doc.headers.get(rid).cloned(),
+            StoryTarget::Footer { rid, .. } => doc.footers.get(rid).cloned(),
+        }
+    }
+
+    /// Build the synthetic story-rooted tree the existing pure
+    /// `DocumentTree` mutators + text lookups run against. Clone set per
+    /// the Phase 3 design review: styles / style_defaults /
+    /// style_run_defaults / numbering MUST ride along (cascade + marker
+    /// resolution read them); media / footnotes / comments stay empty
+    /// (cheap + irrelevant — story commands touching them are gated).
+    fn story_doc(&self) -> Option<DocumentTree> {
+        let paras = self.story_paras()?;
+        let real = self.undo.current();
+        let mut tree = DocumentTree::from_rich_paragraphs(paras);
+        tree.styles = real.styles.clone();
+        tree.style_defaults = real.style_defaults.clone();
+        tree.style_run_defaults = real.style_run_defaults.clone();
+        tree.numbering = real.numbering.clone();
+        Some(tree)
+    }
+
+    /// Run `f` against the document the CURRENT SELECTION's paths
+    /// address: the real tree in body mode, the synthetic story tree in
+    /// story mode. Every read helper that resolves `sel.caret.path` to
+    /// a paragraph goes through here so story paths can never
+    /// mis-resolve against body blocks.
+    fn with_selection_doc<R>(&self, f: impl FnOnce(&DocumentTree) -> R) -> R {
+        match self.story_doc() {
+            Some(t) => f(&t),
+            None => f(self.undo.current()),
+        }
+    }
+
+    /// Owned variant for callers that need to hold the tree across
+    /// mutation steps (`do_move_caret`'s word-steps).
+    fn selection_doc(&self) -> DocumentTree {
+        self.with_selection_doc(|d| d.clone())
+    }
+
+    /// Wire shape of the active story for `SelectionChanged`.
+    fn bridge_story_ref(&self) -> Option<bridge::BridgeStoryRef> {
+        match &self.active_story {
+            StoryTarget::Body => None,
+            StoryTarget::Header { rid, page, .. } => Some(bridge::BridgeStoryRef {
+                area: bridge::HeaderFooterArea::Header,
+                rid: rid.clone(),
+                page: *page,
+            }),
+            StoryTarget::Footer { rid, page, .. } => Some(bridge::BridgeStoryRef {
+                area: bridge::HeaderFooterArea::Footer,
+                rid: rid.clone(),
+                page: *page,
+            }),
+        }
+    }
+
+    /// Story-mode line geometry: the anchor page's band paragraphs
+    /// flattened into the same `LineGeom` shape body geometry produces,
+    /// at absolute page coordinates. Band placement comes from
+    /// `PageBox::header_band_top` / `footer_band_top` — the SAME
+    /// methods `render::scene` paints with, so caret geometry and
+    /// pixels cannot diverge. Paths are story-rooted (`Block(i)`).
+    fn story_geometry(&self, page_idx: u32, header: bool) -> Result<Vec<LineGeom>, Box<Event>> {
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell
+            .as_ref()
+            .expect("ensure_layout_snapshot populated the memo");
+        let pages = &snap.pages;
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let mut page_top = 0.0_f32;
+        let mut geom: Vec<LineGeom> = Vec::new();
+        let idx = (page_idx as usize).min(pages.len().saturating_sub(1));
+        for page in pages.iter().take(idx) {
+            page_top += page.size.height + gap;
+        }
+        let Some(page) = pages.get(idx) else {
+            return Ok(geom);
+        };
+        let band = if header { &page.header } else { &page.footer };
+        let Some(band) = band else {
+            return Ok(geom);
+        };
+        let content_x = page.margins.left;
+        let content_w = page.size.width - page.margins.left - page.margins.right;
+        let band_top = page_top
+            + if header {
+                page.header_band_top()
+            } else {
+                page.footer_band_top()
+            };
+        for (i, para_box) in band.paragraphs.iter().enumerate() {
+            collect_paragraph_line_geom(
+                para_box,
+                content_x,
+                band_top,
+                content_x,
+                content_w,
+                &BridgeBlockPath {
+                    steps: vec![BridgePathStep::Block { idx: i as u32 }],
+                },
+                &mut geom,
+            );
+        }
+        Ok(geom)
     }
 
     /// Flatten the current document into per-line hit-test geometry. PR 4:
     /// recurses into table cells so a click inside a cell maps to a
     /// `BlockPath` ending at the cell's paragraph (`[Block(t), Cell{r,c},
-    /// Block(p)]`). Re-lays out the document on every call — cheap for the
-    /// single-page PoC; cache when editing lands.
+    /// Block(p)]`).
     fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
+        /* Phase 3 (#39) — in story mode every geometry consumer
+        (hit-test, caret rect, selection rects, arrow walks) sees the
+        band's lines instead of the body's; combined with
+        `with_selection_doc` this is the whole read-side adapter. */
+        match &self.active_story {
+            StoryTarget::Header { page, .. } => return self.story_geometry(*page, true),
+            StoryTarget::Footer { page, .. } => return self.story_geometry(*page, false),
+            StoryTarget::Body => {}
+        }
         /* `false` — hit-test + caret geometry run on committed document
         offsets, which `self.selection` is also expressed in. Audit gap
         C.H1 — geometry queries that need to resolve a deep caret /
@@ -5914,11 +6239,10 @@ impl Engine {
         };
         let hit = hit_test_geom(&geom, at.x, at.y);
         let engine_path = bridge_to_engine_path(hit.path.clone());
-        let (lo, hi) = self
-            .undo
-            .current()
-            .paragraph_at_path(&engine_path)
-            .map_or((hit.offset, hit.offset), |p| p.word_bounds(hit.offset));
+        let (lo, hi) = self.with_selection_doc(|d| {
+            d.paragraph_at_path(&engine_path)
+                .map_or((hit.offset, hit.offset), |p| p.word_bounds(hit.offset))
+        });
         self.pending_format = None;
         self.selection = Some(SelectionState {
             anchor: BridgeLogicalPos {
@@ -5945,11 +6269,10 @@ impl Engine {
         };
         let hit = hit_test_geom(&geom, at.x, at.y);
         let engine_path = bridge_to_engine_path(hit.path.clone());
-        let len = self
-            .undo
-            .current()
-            .paragraph_at_path(&engine_path)
-            .map_or(0, |p| p.text.len() as u32);
+        let len = self.with_selection_doc(|d| {
+            d.paragraph_at_path(&engine_path)
+                .map_or(0, |p| p.text.len() as u32)
+        });
         self.pending_format = None;
         self.selection = Some(SelectionState {
             anchor: BridgeLogicalPos {
@@ -6037,7 +6360,9 @@ impl Engine {
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
-        let doc = self.undo.current().clone();
+        /* Phase 3 (#39) — story-aware document view; word-steps + doc-end
+        must walk the story's paragraphs, not the body's. */
+        let doc = self.selection_doc();
         /* UAX #9 visual-arrow mapping (UX_BEHAVIOR_SPEC §III.1).
         Plain Left/Right are SPATIAL — they consult LineGeom slot x's
         to find the visual neighbour, so a caret inside an Arabic word
@@ -6104,14 +6429,20 @@ impl Engine {
                     None,
                 )
             }
-            MoveDirection::NextCell | MoveDirection::PrevCell => (
-                cell_tab_step(
-                    &mut self.undo,
-                    &sel.caret,
-                    direction == MoveDirection::NextCell,
-                ),
-                None,
-            ),
+            MoveDirection::NextCell | MoveDirection::PrevCell => {
+                if self.story_active() {
+                    /* No tables inside stories — Tab is a no-op. */
+                    return self.selection_changed();
+                }
+                (
+                    cell_tab_step(
+                        &mut self.undo,
+                        &sel.caret,
+                        direction == MoveDirection::NextCell,
+                    ),
+                    None,
+                )
+            }
             MoveDirection::Up | MoveDirection::Down => {
                 let geom = match self.document_geometry() {
                     Ok(g) => g,
@@ -6395,11 +6726,10 @@ impl Engine {
             selection reports the document's own attributes (Backlog #11). */
             attrs_at_caret: self.attrs_at(probe, start == end),
             paragraph_alignment: self.paragraph_alignment_at(&sel.caret.path),
-            paragraph_style_id: self
-                .undo
-                .current()
-                .paragraph_at_path(&bridge_to_engine_path(sel.caret.path.clone()))
-                .and_then(|p| p.style_id.clone()),
+            paragraph_style_id: self.with_selection_doc(|d| {
+                d.paragraph_at_path(&bridge_to_engine_path(sel.caret.path.clone()))
+                    .and_then(|p| p.style_id.clone())
+            }),
             can_undo: self.undo.can_undo(),
             can_redo: self.undo.can_redo(),
             selection_kind: sel.kind.clone(),
@@ -6413,6 +6743,7 @@ impl Engine {
             undo_depth: self.undo.depth(),
             list_ilvl: self.list_ilvl_for_caret(&sel.caret.path),
             paragraph_borders: self.paragraph_borders_for_caret(&sel.caret.path),
+            editing_story: self.bridge_story_ref(),
         }
     }
 
@@ -6422,11 +6753,14 @@ impl Engine {
     /// instead of falling back to tab-char insertion.
     fn list_ilvl_for_caret(&self, path: &BridgeBlockPath) -> Option<u8> {
         let engine_path = bridge_path_to_engine(path);
-        self.undo
-            .current()
-            .paragraph_at_path(&engine_path)?
-            .list_item
-            .map(|item| item.ilvl)
+        /* Phase 3 (#39) — `with_selection_doc` re-roots the lookup into
+        the active story so a story path can never mis-resolve against
+        a body block (same discipline for every caret-path read below). */
+        self.with_selection_doc(|d| {
+            d.paragraph_at_path(&engine_path)
+                .and_then(|p| p.list_item)
+                .map(|item| item.ilvl)
+        })
     }
 
     /// Sprint 15 (#13) — extract the paragraph-under-caret's
@@ -6449,19 +6783,21 @@ impl Engine {
     /// slot-swap depends on.
     fn indent_for_caret(&self, path: &BridgeBlockPath) -> BridgeIndent {
         let engine_path = bridge_path_to_engine(path);
-        let Some(para) = self.undo.current().paragraph_at_path(&engine_path) else {
-            return BridgeIndent::default();
-        };
         let base_direction = self.paragraph_direction_at(path);
-        let (s, e, fl, hang) = effective_indent_twips(para, base_direction);
-        /* twips → pt (20 twips = 1 pt). first_line/hanging are mutually
-        exclusive in OOXML; at most one is non-zero, so the difference
-        recovers the signed offset. */
-        BridgeIndent {
-            start_pt: s as f32 / 20.0,
-            end_pt: e as f32 / 20.0,
-            first_line_pt: (fl - hang) as f32 / 20.0,
-        }
+        self.with_selection_doc(|d| {
+            let Some(para) = d.paragraph_at_path(&engine_path) else {
+                return BridgeIndent::default();
+            };
+            let (s, e, fl, hang) = effective_indent_twips(para, base_direction);
+            /* twips → pt (20 twips = 1 pt). first_line/hanging are mutually
+            exclusive in OOXML; at most one is non-zero, so the difference
+            recovers the signed offset. */
+            BridgeIndent {
+                start_pt: s as f32 / 20.0,
+                end_pt: e as f32 / 20.0,
+                first_line_pt: (fl - hang) as f32 / 20.0,
+            }
+        })
     }
 
     /// Sprint 11 (#13) — extract the paragraph-under-caret's
@@ -6470,23 +6806,61 @@ impl Engine {
     /// has no custom tabs (Ruler renders the default grid).
     fn tab_stops_for_caret(&self, path: &BridgeBlockPath) -> Vec<bridge::BridgeTabStop> {
         let engine_path = bridge_path_to_engine(path);
-        let Some(para) = self.undo.current().paragraph_at_path(&engine_path) else {
-            return Vec::new();
-        };
-        para.props
-            .tab_stops
-            .iter()
-            .map(|s| bridge::BridgeTabStop {
-                position_pt: s.position_pt,
-                kind: match s.kind {
-                    engine::TabKind::Left => bridge::BridgeTabKind::Left,
-                    engine::TabKind::Center => bridge::BridgeTabKind::Center,
-                    engine::TabKind::Right => bridge::BridgeTabKind::Right,
-                    engine::TabKind::Decimal => bridge::BridgeTabKind::Decimal,
-                    engine::TabKind::Clear => bridge::BridgeTabKind::Clear,
-                },
-            })
-            .collect()
+        self.with_selection_doc(|d| {
+            let Some(para) = d.paragraph_at_path(&engine_path) else {
+                return Vec::new();
+            };
+            para.props
+                .tab_stops
+                .iter()
+                .map(|s| bridge::BridgeTabStop {
+                    position_pt: s.position_pt,
+                    kind: match s.kind {
+                        engine::TabKind::Left => bridge::BridgeTabKind::Left,
+                        engine::TabKind::Center => bridge::BridgeTabKind::Center,
+                        engine::TabKind::Right => bridge::BridgeTabKind::Right,
+                        engine::TabKind::Decimal => bridge::BridgeTabKind::Decimal,
+                        engine::TabKind::Clear => bridge::BridgeTabKind::Clear,
+                    },
+                })
+                .collect()
+        })
+    }
+
+    /// Phase 3 (#40) — run `f` against the revision-keyed derived
+    /// sections table ([`Engine::sections_memo`]). The underlying
+    /// `effective_sections()` derive walks every top-level block, and
+    /// its consumers sit on the per-keystroke `SelectionChanged` path —
+    /// so amortize to a slice scan against the memo, rebuilt only when
+    /// the undo revision moves.
+    fn with_cached_sections<R>(&self, f: impl FnOnce(&[engine::Section]) -> R) -> R {
+        let revision = self.undo.revision();
+        {
+            let memo = self.sections_memo.borrow();
+            if let Some((rev, sections)) = memo.as_ref()
+                && *rev == revision
+            {
+                return f(sections);
+            }
+        }
+        let sections = self.undo.current().effective_sections();
+        let out = f(&sections);
+        *self.sections_memo.borrow_mut() = Some((revision, sections));
+        out
+    }
+
+    /// Phase 3 (#40) — `DocumentTree::section_for_block` through the
+    /// memo. Falls back to the trailing section for a beyond-the-end
+    /// index, mirroring the engine helper's body_section fallthrough.
+    fn section_for_block_cached(&self, block_idx: u32) -> engine::Section {
+        self.with_cached_sections(|sections| {
+            sections
+                .iter()
+                .find(|s| s.start_block <= block_idx && block_idx < s.end_block)
+                .or_else(|| sections.last())
+                .cloned()
+                .unwrap_or_default()
+        })
     }
 
     /// Sprint 10 — resolve the section that covers the caret's
@@ -6494,12 +6868,28 @@ impl Engine {
     /// Returns `None` for an empty path (the caret can't sit nowhere
     /// in a valid selection, but the helper is defensive).
     fn section_geometry_for_caret(&self, path: &BridgeBlockPath) -> Option<BridgeSectionGeometry> {
-        let top_idx = match path.steps.first()? {
-            BridgePathStep::Block { idx } => *idx,
-            BridgePathStep::Cell { .. } => return None,
+        /* Phase 3 (#39) — a story caret's path is story-rooted and says
+        nothing about body sections; the owning section was resolved at
+        EnterHeaderFooter time. */
+        let top_idx = match &self.active_story {
+            StoryTarget::Header { section_block, .. }
+            | StoryTarget::Footer { section_block, .. } => *section_block,
+            StoryTarget::Body => match path.steps.first()? {
+                BridgePathStep::Block { idx } => *idx,
+                BridgePathStep::Cell { .. } => return None,
+            },
         };
-        let doc = self.undo.current();
-        let section = doc.section_for_block(top_idx);
+        let (section, section_index, section_count) = self.with_cached_sections(|sections| {
+            let idx = sections
+                .iter()
+                .position(|s| s.start_block <= top_idx && top_idx < s.end_block)
+                .unwrap_or(sections.len().saturating_sub(1));
+            (
+                sections.get(idx).cloned().unwrap_or_default(),
+                idx as u32,
+                sections.len() as u32,
+            )
+        });
         let geo = section.geometry;
         let orientation = if geo.width > geo.height {
             BridgePageOrientation::Landscape
@@ -6516,6 +6906,8 @@ impl Engine {
             orientation,
             columns: u32::from(section.columns.count.max(1)),
             column_gutter_pt: section.columns.gutter_pt,
+            section_index,
+            section_count,
         })
     }
 
@@ -6536,11 +6928,13 @@ impl Engine {
     /// it reflects the live document instead of a local optimistic guess.
     fn paragraph_borders_for_caret(&self, path: &BridgeBlockPath) -> Option<BridgeCellBorders> {
         let engine_path = bridge_path_to_engine(path);
-        let para = self.undo.current().paragraph_at_path(&engine_path)?;
-        para.props
-            .borders
-            .as_ref()
-            .map(|b| engine_borders_to_bridge(Some(b)))
+        self.with_selection_doc(|d| {
+            let para = d.paragraph_at_path(&engine_path)?;
+            para.props
+                .borders
+                .as_ref()
+                .map(|b| engine_borders_to_bridge(Some(b)))
+        })
     }
 
     /// Compute the per-flag "mixed across the selection" bitmap. A
@@ -6561,7 +6955,9 @@ impl Engine {
         if start == end {
             return bridge::AttrsMixed::default();
         }
-        let doc = self.undo.current();
+        /* Phase 3 (#39) — story-aware: paths resolve against the story
+        tree while a header/footer is being edited. */
+        let doc = &self.selection_doc();
         /* Track each flag's first observation; flip to `Some(true)` for
         mixed when a later sample disagrees. `None` until the first
         sample is recorded. */
@@ -6630,12 +7026,11 @@ impl Engine {
     /// config default.
     fn paragraph_alignment_at(&self, path: &BridgeBlockPath) -> BridgeAlignment {
         let engine_path = bridge_to_engine_path(path.clone());
-        let stored = self
-            .undo
-            .current()
-            .paragraph_at_path(&engine_path)
-            .and_then(|p| p.props.alignment)
-            .map(layout_align);
+        let stored = self.with_selection_doc(|d| {
+            d.paragraph_at_path(&engine_path)
+                .and_then(|p| p.props.alignment)
+                .map(layout_align)
+        });
         let default = self
             .layout_cfg
             .as_ref()
@@ -6713,22 +7108,22 @@ impl Engine {
     ///    always carry a config once `render_document` has run).
     fn paragraph_direction_at(&self, path: &BridgeBlockPath) -> ShapingDirection {
         let engine_path = bridge_to_engine_path(path.clone());
-        let para = self.undo.current().paragraph_at_path(&engine_path);
-        if let Some(p) = para {
+        let resolved = self.with_selection_doc(|d| {
+            let p = d.paragraph_at_path(&engine_path)?;
             if let Some(dir) = p.props.direction {
-                return match dir {
+                return Some(match dir {
                     engine::TextDirection::Ltr => ShapingDirection::Ltr,
                     engine::TextDirection::Rtl => ShapingDirection::Rtl,
-                };
+                });
             }
-            if let Some(d) = first_strong_direction(&p.text) {
-                return d;
-            }
-        }
-        self.layout_cfg
-            .as_ref()
-            .map(|c| c.base_direction)
-            .unwrap_or(ShapingDirection::Ltr)
+            first_strong_direction(&p.text)
+        });
+        resolved.unwrap_or_else(|| {
+            self.layout_cfg
+                .as_ref()
+                .map(|c| c.base_direction)
+                .unwrap_or(ShapingDirection::Ltr)
+        })
     }
 
     /// Tri-state paragraph direction across the selection: `Some(dir)`
@@ -6758,7 +7153,7 @@ impl Engine {
         if head != tail {
             return None;
         }
-        let doc = self.undo.current();
+        let doc = &self.selection_doc();
         let engine_start = bridge_to_engine_path(start.path.clone());
         let engine_end = bridge_to_engine_path(end.path.clone());
         for path in doc_paragraph_paths_between(doc, &engine_start, &engine_end) {
@@ -6780,11 +7175,10 @@ impl Engine {
             return start.clone();
         }
         let engine_path = bridge_to_engine_path(start.path.clone());
-        let prev = self
-            .undo
-            .current()
-            .paragraph_at_path(&engine_path)
-            .map_or(start.offset, |p| p.prev_offset(start.offset));
+        let prev = self.with_selection_doc(|d| {
+            d.paragraph_at_path(&engine_path)
+                .map_or(start.offset, |p| p.prev_offset(start.offset))
+        });
         BridgeLogicalPos {
             path: start.path.clone(),
             offset: prev,
@@ -6801,14 +7195,14 @@ impl Engine {
         /* Issue #29 — fold the paragraph's style-chain run base UNDER
         the direct span style so the toolbar reads the same cascaded
         values the renderer paints (Heading 1 reports bold even with
-        zero direct formatting). */
-        let doc = self.undo.current();
-        let mut style = doc
-            .paragraph_at_path(&engine_path)
-            .map_or_else(SpanStyle::default, |p| {
-                doc.resolve_style_run_cascade(p.style_id.as_deref())
-                    .merged_with(p.style_at(pos.offset))
-            });
+        zero direct formatting). Phase 3 (#39) — story-aware doc. */
+        let mut style = self.with_selection_doc(|doc| {
+            doc.paragraph_at_path(&engine_path)
+                .map_or_else(SpanStyle::default, |p| {
+                    doc.resolve_style_run_cascade(p.style_id.as_deref())
+                        .merged_with(p.style_at(pos.offset))
+                })
+        });
         if apply_pending && let Some(pending) = self.pending_format.as_ref() {
             style = style.merged_with(pending.clone());
         }
@@ -6871,9 +7265,427 @@ impl Engine {
         self.selection_changed()
     }
 
+    /* ===========================================================
+    Phase 3 (#39) — story mutation path. Each handler mirrors its
+    body twin MINUS track-changes + sticky pending formatting (both
+    gated out of stories in v1): mutate the synthetic story tree
+    with the existing pure `DocumentTree` fns, then merge the
+    paragraphs back into the real tree's part map as ONE undo push.
+    =========================================================== */
+
+    /// Merge a mutated story tree back into the real document: extract
+    /// its paragraphs into the active part (marking it dirty for the
+    /// writer), push ONE undo snapshot, collapse the caret, repaint.
+    fn commit_story_edit(&mut self, mutated: &DocumentTree, caret: BridgeLogicalPos) -> Event {
+        let (rid, is_header) = match &self.active_story {
+            StoryTarget::Header { rid, .. } => (rid.clone(), true),
+            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+            StoryTarget::Body => {
+                return Event::Error {
+                    message: "commit_story_edit outside a story".into(),
+                };
+            }
+        };
+        let mut paras: Vec<engine::Paragraph> = mutated
+            .blocks
+            .iter()
+            .filter_map(|b| b.as_paragraph().cloned())
+            .collect();
+        if paras.is_empty() {
+            /* The band always keeps one paragraph so the caret has a
+            home and the part stays a valid `<w:hdr>/<w:ftr>`. */
+            paras.push(engine::Paragraph::default());
+        }
+        let real = self.undo.current();
+        let new_real = if is_header {
+            real.with_updated_header_part(&rid, paras)
+        } else {
+            real.with_updated_footer_part(&rid, paras)
+        };
+        self.undo.push(new_real);
+        let caret = self.with_selection_doc(|d| clamp_pos(d, caret));
+        self.caret_affinity = CaretAffinity::default();
+        self.selection = Some(SelectionState {
+            anchor: caret.clone(),
+            caret,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// Story `InsertText` — plain (untracked, no sticky format) insert.
+    fn story_insert_text(&mut self, at: BridgeLogicalPos, text: String) -> Event {
+        let sel = self.selection.clone().unwrap_or(SelectionState {
+            anchor: at.clone(),
+            caret: at,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        let Some(temp) = self.story_doc() else {
+            return self.story_vanished();
+        };
+        let base = if start == end {
+            temp
+        } else {
+            temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        };
+        let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
+        let caret = BridgeLogicalPos {
+            path: start.path,
+            offset: start.offset + text.len() as u32,
+        };
+        self.commit_story_edit(&new_doc, caret)
+    }
+
+    /// Story `SplitParagraph` — Enter inside a band.
+    fn story_split_paragraph(&mut self, at: BridgeLogicalPos) -> Event {
+        let Some(temp) = self.story_doc() else {
+            return self.story_vanished();
+        };
+        let (base, split_at) = match self.selection.clone() {
+            Some(s) => {
+                let (start, end) = ordered(s.anchor, s.caret);
+                let doc = if start == end {
+                    temp
+                } else {
+                    temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+                };
+                (doc, start)
+            }
+            None => (temp, at),
+        };
+        let new_doc = base.split_paragraph(to_engine_pos(split_at.clone()));
+        let next_path = engine::bump_last_block_index(&bridge_to_engine_path(split_at.path));
+        let caret = BridgeLogicalPos {
+            path: engine_to_bridge_path(next_path),
+            offset: 0,
+        };
+        self.commit_story_edit(&new_doc, caret)
+    }
+
+    /// Story `DeleteAtCaret` — selection delete, or one grapheme/word
+    /// step; paragraph-edge deletes merge via `delete_range`'s
+    /// cross-paragraph semantics.
+    fn story_delete_at_caret(&mut self, forward: bool, by_word: bool) -> Event {
+        let Some(sel) = self.selection.clone() else {
+            return Event::Error {
+                message: "DeleteAtCaret: no active selection".into(),
+            };
+        };
+        let Some(temp) = self.story_doc() else {
+            return self.story_vanished();
+        };
+        let (start, end) = ordered(sel.anchor, sel.caret.clone());
+        if start != end {
+            let new_doc = temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end));
+            return self.commit_story_edit(&new_doc, start);
+        }
+        let caret = sel.caret;
+        let epath = bridge_to_engine_path(caret.path.clone());
+        let Some(para) = temp.paragraph_at_path(&epath) else {
+            return self.selection_changed();
+        };
+        let top_idx = caret.path.steps.first().map_or(0, |s| match s {
+            BridgePathStep::Block { idx } => *idx,
+            BridgePathStep::Cell { .. } => 0,
+        });
+        let (del_start, del_end): (BridgeLogicalPos, BridgeLogicalPos) = if forward {
+            if caret.offset < para.text.len() as u32 {
+                let next = if by_word {
+                    para.word_bounds(caret.offset).1
+                } else {
+                    para.next_offset(caret.offset)
+                };
+                (caret.clone(), bpos_top(top_idx, next))
+            } else if (top_idx as usize + 1) < temp.blocks.len() {
+                /* Forward-delete at paragraph end: merge with the next. */
+                (caret.clone(), bpos_top(top_idx + 1, 0))
+            } else {
+                return self.selection_changed();
+            }
+        } else if caret.offset > 0 {
+            let prev = if by_word {
+                para.word_bounds(caret.offset.saturating_sub(1)).0
+            } else {
+                para.prev_offset(caret.offset)
+            };
+            (bpos_top(top_idx, prev), caret.clone())
+        } else if top_idx > 0 {
+            /* Backspace at paragraph start: merge with the previous. */
+            let prev_len = temp
+                .paragraph_at_path(&EngineBlockPath::top(top_idx - 1))
+                .map_or(0, |p| p.text.len() as u32);
+            (bpos_top(top_idx - 1, prev_len), caret.clone())
+        } else {
+            return self.selection_changed();
+        };
+        let new_doc = temp.delete_range(to_engine_pos(del_start.clone()), to_engine_pos(del_end));
+        self.commit_story_edit(&new_doc, del_start)
+    }
+
+    /// Story `ApplyFormatting` — span patch over the selection (or the
+    /// explicit range). Collapsed carets are a no-op in v1: sticky
+    /// pending formatting stays a body-only feature for now.
+    fn story_apply_formatting(
+        &mut self,
+        range: Option<BridgeLogicalRange>,
+        patch: TextAttrsPatch,
+    ) -> Event {
+        let (start, end) = match range {
+            Some(r) => ordered(r.start, r.end),
+            None => match self.selection.clone() {
+                Some(s) => ordered(s.anchor, s.caret),
+                None => return self.selection_changed(),
+            },
+        };
+        if start == end {
+            return self.selection_changed();
+        }
+        let Some(temp) = self.story_doc() else {
+            return self.story_vanished();
+        };
+        let style = patch_to_span_style(&patch);
+        let new_doc = temp.apply_style(
+            to_engine_pos(start.clone()),
+            to_engine_pos(end.clone()),
+            style,
+        );
+        /* Keep the selection (a formatting change should not collapse
+        it) — commit manually rather than through commit_story_edit. */
+        let (rid, is_header) = match &self.active_story {
+            StoryTarget::Header { rid, .. } => (rid.clone(), true),
+            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+            StoryTarget::Body => unreachable!("guarded by caller"),
+        };
+        let mut paras: Vec<engine::Paragraph> = new_doc
+            .blocks
+            .iter()
+            .filter_map(|b| b.as_paragraph().cloned())
+            .collect();
+        if paras.is_empty() {
+            paras.push(engine::Paragraph::default());
+        }
+        let real = self.undo.current();
+        let new_real = if is_header {
+            real.with_updated_header_part(&rid, paras)
+        } else {
+            real.with_updated_footer_part(&rid, paras)
+        };
+        self.undo.push(new_real);
+        self.selection = Some(SelectionState {
+            anchor: start,
+            caret: end,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// Story `PastePlain` — multiline plain-text paste into the band.
+    fn story_paste_plain(&mut self, text: String) -> Event {
+        let Some(sel) = self.selection.clone() else {
+            return Event::Error {
+                message: "PastePlain: no active selection".into(),
+            };
+        };
+        let Some(temp) = self.story_doc() else {
+            return self.story_vanished();
+        };
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        let base = if start == end {
+            temp
+        } else {
+            temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
+        };
+        let (new_doc, caret_pos) = base.insert_multiline(to_engine_pos(start), &text);
+        let caret = BridgeLogicalPos {
+            path: engine_to_bridge_path(caret_pos.path),
+            offset: caret_pos.offset,
+        };
+        self.commit_story_edit(&new_doc, caret)
+    }
+
+    /// The active story's part disappeared out from under us (an undo
+    /// past materialize-on-enter). Drop back to body editing.
+    fn story_vanished(&mut self) -> Event {
+        self.exit_story_to_body();
+        self.selection_changed()
+    }
+
+    /// Shared exit: restore + clamp the stashed body selection.
+    fn exit_story_to_body(&mut self) {
+        self.active_story = StoryTarget::Body;
+        let doc = self.undo.current();
+        let restored = self.stashed_body_selection.take().map(|s| SelectionState {
+            anchor: clamp_pos(doc, s.anchor),
+            caret: clamp_pos(doc, s.caret),
+            ideal_x: None,
+            kind: s.kind,
+        });
+        self.selection = restored.or_else(|| {
+            Some(SelectionState {
+                anchor: bpos_top(0, 0),
+                caret: bpos_top(0, 0),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            })
+        });
+        self.caret_affinity = CaretAffinity::default();
+    }
+
+    /// `Command::EnterHeaderFooter` (Phase 3, #39) — activate story
+    /// editing for the section owning page `page`. Guarantees the
+    /// section OWNS a private part before the caret lands:
+    ///
+    /// - no part referenced → MATERIALIZE an empty one (Word also
+    ///   creates the part + dirties the document on header entry);
+    /// - referenced part shared with another section → FORK a copy for
+    ///   this section only (the v1 stand-in for Word's Link-to-Previous
+    ///   toggle; documented deviation, tracked as a follow-up).
+    ///
+    /// Either mutation is ONE undo entry; entering an already-private
+    /// part mutates nothing.
+    fn do_enter_header_footer(&mut self, page: u32, area: bridge::HeaderFooterArea) -> Event {
+        let is_header = matches!(area, bridge::HeaderFooterArea::Header);
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        if let Err(e) = self.ensure_layout_snapshot(self.scale(), false, target_y) {
+            return *e;
+        }
+        /* Resolve the section owning `page`: the first laid-out block
+        on (or after) that page. Blank section-lead pages fall through
+        to the next page's first block; a fully-empty tail falls back
+        to block 0. */
+        let section_block: u32 = {
+            let snap_cell = self.layout_snapshot.borrow();
+            let snap = snap_cell
+                .as_ref()
+                .expect("ensure_layout_snapshot populated the memo");
+            snap.page_paths
+                .iter()
+                .skip(page as usize)
+                .find_map(|paths| paths.first())
+                .and_then(|p| p.last_block_index())
+                .unwrap_or(0)
+        };
+        let section = self.section_for_block_cached(section_block);
+        let refs = if is_header {
+            &section.header_refs
+        } else {
+            &section.footer_refs
+        };
+        let existing = refs.default.clone();
+        let shared = existing.as_ref().is_some_and(|rid| {
+            self.with_cached_sections(|sections| {
+                sections
+                    .iter()
+                    .filter(|s| {
+                        let r = if is_header {
+                            &s.header_refs
+                        } else {
+                            &s.footer_refs
+                        };
+                        [&r.default, &r.first, &r.even]
+                            .into_iter()
+                            .any(|slot| slot.as_deref() == Some(rid.as_str()))
+                    })
+                    .count()
+                    > 1
+            })
+        });
+        let doc = self.undo.current();
+        let sect_pos = EnginePos {
+            path: EngineBlockPath::top(section.start_block),
+            offset: 0,
+        };
+        let rid = match (existing, shared) {
+            (Some(rid), false) => rid,
+            (maybe_shared, _) => {
+                /* Materialize (None) or fork (Some + shared). */
+                let new_rid = doc.fresh_hf_rid();
+                let seed = maybe_shared
+                    .as_ref()
+                    .and_then(|old| {
+                        if is_header {
+                            doc.headers.get(old).cloned()
+                        } else {
+                            doc.footers.get(old).cloned()
+                        }
+                    })
+                    .unwrap_or_else(|| vec![engine::Paragraph::default()]);
+                let with_part = if is_header {
+                    doc.with_updated_header_part(&new_rid, seed)
+                } else {
+                    doc.with_updated_footer_part(&new_rid, seed)
+                };
+                let with_ref =
+                    with_part.set_section_hf_default_ref_at(sect_pos, is_header, &new_rid);
+                self.undo.push(with_ref);
+                self.dirty.invalidate(full_page_rect(self.scale()));
+                new_rid
+            }
+        };
+        self.stashed_body_selection = self.selection.clone();
+        self.active_story = if is_header {
+            StoryTarget::Header {
+                rid,
+                page,
+                section_block,
+            }
+        } else {
+            StoryTarget::Footer {
+                rid,
+                page,
+                section_block,
+            }
+        };
+        self.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.caret_affinity = CaretAffinity::default();
+        self.pending_format = None;
+        self.announce(
+            AnnouncementPriority::Polite,
+            if is_header {
+                "Editing header"
+            } else {
+                "Editing footer"
+            },
+        );
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::ExitHeaderFooter` (Phase 3, #39).
+    fn do_exit_header_footer(&mut self) -> Event {
+        if !self.story_active() {
+            return self.selection_changed();
+        }
+        self.exit_story_to_body();
+        self.announce(AnnouncementPriority::Polite, "Returned to document body");
+        self.selection_changed()
+    }
+
     /// Interactive `InsertText` — replace any non-empty selection with `text`,
     /// then place the caret after it.
     fn do_insert_text_interactive(&mut self, at: BridgeLogicalPos, text: String) -> Event {
+        if self.story_active() {
+            return self.story_insert_text(at, text);
+        }
         let sel = self.selection.clone().unwrap_or(SelectionState {
             anchor: at.clone(),
             caret: at,
@@ -6999,6 +7811,9 @@ impl Engine {
     /// `Command::SplitParagraph` — break the paragraph at the caret (replacing
     /// any non-empty selection first); the caret moves to the new paragraph.
     fn do_split_paragraph(&mut self, at: BridgeLogicalPos) -> Event {
+        if self.story_active() {
+            return self.story_split_paragraph(at);
+        }
         let (base, split_at) = match self.selection.clone() {
             Some(s) => {
                 let (start, end) = ordered(s.anchor, s.caret);
@@ -7025,6 +7840,9 @@ impl Engine {
     /// `Command::DeleteAtCaret` — delete the selection if non-empty, else one
     /// grapheme (or word) in the `forward` direction from the caret.
     fn do_delete_at_caret(&mut self, forward: bool, by_word: bool) -> Event {
+        if self.story_active() {
+            return self.story_delete_at_caret(forward, by_word);
+        }
         let Some(sel) = self.selection.clone() else {
             return Event::Error {
                 message: "DeleteAtCaret: no active selection".into(),
@@ -7323,6 +8141,9 @@ impl Engine {
     /// caret-relative path (so it still picks up any pending sticky style).
     fn do_paste_plain(&mut self, text: String) -> Event {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.story_active() {
+            return self.story_paste_plain(normalized);
+        }
         let at = self
             .selection
             .as_ref()
@@ -8199,6 +9020,44 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// `Command::InsertSectionBreak` (Phase 3, #40) — split the caret
+    /// paragraph into two sections via
+    /// [`DocumentTree::insert_section_break_at`]. The caret lands at
+    /// the start of the second section's first paragraph (Word
+    /// behavior). Rejected inside table cells — an interior sectPr is
+    /// a body-level paragraph property, and the UI disables the Breaks
+    /// menu there (Honest UX: the error is the backstop, not the
+    /// affordance).
+    fn do_insert_section_break(&mut self, at: BridgeLogicalPos, kind: SectionBreakKind) -> Event {
+        if at.path.steps.len() != 1 {
+            return Event::Error {
+                message: "InsertSectionBreak: section breaks inside table cells are not supported"
+                    .into(),
+            };
+        }
+        let engine_kind = match kind {
+            SectionBreakKind::NextPage => engine::SectionType::NextPage,
+            SectionBreakKind::Continuous => engine::SectionType::Continuous,
+        };
+        let new_doc = self
+            .undo
+            .current()
+            .insert_section_break_at(to_engine_pos(at.clone()), engine_kind);
+        let next_path = engine::bump_last_block_index(&bridge_to_engine_path(at.path));
+        let caret = BridgeLogicalPos {
+            path: engine_to_bridge_path(next_path),
+            offset: 0,
+        };
+        self.announce(
+            AnnouncementPriority::Polite,
+            match kind {
+                SectionBreakKind::NextPage => "Section break (next page) inserted",
+                SectionBreakKind::Continuous => "Section break (continuous) inserted",
+            },
+        );
+        self.commit_edit(new_doc, caret)
+    }
+
     /// `Command::SetParagraphBorders` (Sprint 2 UI Edition) — set
     /// `<w:pPr><w:pBdr>` on every paragraph the range spans. Reuses
     /// [`bridge_to_engine_borders`] from the cell-border path; an
@@ -8520,6 +9379,11 @@ struct RenderStats {
     /// Issue #26 — absolute per-page tops + heights in device px.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Phase 3 (#39) — per-page top/bottom margins in device px,
+    /// index-aligned with `page_tops`; the shell's header/footer
+    /// double-click zone gate.
+    page_margin_tops: Vec<f32>,
+    page_margin_bottoms: Vec<f32>,
 }
 
 #[cfg(test)]
@@ -8545,6 +9409,9 @@ mod tests {
             pending_format: None,
             layout_cache: new_layout_cache(),
             layout_snapshot: RefCell::new(None),
+            sections_memo: RefCell::new(None),
+            active_story: StoryTarget::Body,
+            stashed_body_selection: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -8910,6 +9777,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -9057,6 +9925,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -9091,6 +9960,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -9278,6 +10148,9 @@ mod tests {
             pending_format: None,
             layout_cache: new_layout_cache(),
             layout_snapshot: RefCell::new(None),
+            sections_memo: RefCell::new(None),
+            active_story: StoryTarget::Body,
+            stashed_body_selection: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -9325,6 +10198,9 @@ mod tests {
             pending_format: None,
             layout_cache: new_layout_cache(),
             layout_snapshot: RefCell::new(None),
+            sections_memo: RefCell::new(None),
+            active_story: StoryTarget::Body,
+            stashed_body_selection: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -9363,6 +10239,9 @@ mod tests {
             pending_format: None,
             layout_cache: new_layout_cache(),
             layout_snapshot: RefCell::new(None),
+            sections_memo: RefCell::new(None),
+            active_story: StoryTarget::Body,
+            stashed_body_selection: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -9478,6 +10357,9 @@ mod tests {
             pending_format: None,
             layout_cache: new_layout_cache(),
             layout_snapshot: RefCell::new(None),
+            sections_memo: RefCell::new(None),
+            active_story: StoryTarget::Body,
+            stashed_body_selection: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -10010,6 +10892,9 @@ mod tests {
                 pending_format: None,
                 layout_cache: new_layout_cache(),
                 layout_snapshot: RefCell::new(None),
+                sections_memo: RefCell::new(None),
+                active_story: StoryTarget::Body,
+                stashed_body_selection: None,
                 a11y_cache: None,
                 image_cache: HashMap::new(),
                 last_paint_dims: LastPaintDims::default(),
@@ -10185,6 +11070,7 @@ mod tests {
                 fields: Vec::new(),
                 style_id: None,
                 direct_overrides: engine::ParaProperties::default(),
+                section_end: None,
             })],
         }
     }
@@ -10733,6 +11619,249 @@ mod tests {
         );
     }
 
+    #[test]
+    fn insert_section_break_dispatch_reports_two_sections() {
+        /* Phase 3 (#40) — end-to-end through the command handler: the
+        break lands, the caret moves into the second section, and
+        SelectionChanged's section_geometry carries index 1 of 2. */
+        let doc = DocumentTree::from_text("hello world");
+        let mut engine = test_engine_with_doc(doc);
+        let evt = engine.do_insert_section_break(bpos_top(0, 5), SectionBreakKind::NextPage);
+        let Event::SelectionChanged {
+            caret: _,
+            section_geometry: Some(geom),
+            ..
+        } = evt
+        else {
+            panic!("expected SelectionChanged with section_geometry, got {evt:?}");
+        };
+        assert_eq!(geom.section_count, 2);
+        assert_eq!(geom.section_index, 1, "caret starts the second section");
+        assert_eq!(engine.undo.current().effective_sections().len(), 2);
+        /* One undo entry reverts the whole break. */
+        assert!(engine.undo.can_undo());
+        let _ = engine.undo.undo();
+        assert_eq!(engine.undo.current().effective_sections().len(), 1);
+    }
+
+    #[test]
+    fn insert_section_break_in_cell_is_an_error() {
+        let mut doc = DocumentTree::from_text("body");
+        doc.blocks.push_back(engine::Block::Table(engine::Table {
+            grid: vec![2000],
+            props: engine::TableProperties::default(),
+            rows: vec![engine::TableRow {
+                props: engine::RowProperties::default(),
+                cells: vec![engine::TableCell {
+                    props: engine::CellProperties::default(),
+                    blocks: vec![engine::Block::Paragraph(engine::Paragraph {
+                        text: "cell".into(),
+                        ..Default::default()
+                    })],
+                }],
+            }],
+            dirty: true,
+            source_xml: None,
+        }));
+        let mut engine = test_engine_with_doc(doc);
+        let cell_path = BridgeBlockPath {
+            steps: vec![
+                BridgePathStep::Block { idx: 1 },
+                BridgePathStep::Cell { row: 0, col: 0 },
+                BridgePathStep::Block { idx: 0 },
+            ],
+        };
+        let evt = engine.do_insert_section_break(
+            BridgeLogicalPos {
+                path: cell_path,
+                offset: 0,
+            },
+            SectionBreakKind::Continuous,
+        );
+        assert!(matches!(evt, Event::Error { .. }));
+        assert_eq!(engine.undo.current().effective_sections().len(), 1);
+    }
+
+    /* ================================================================
+    Phase 3 (#39) — header/footer story editing.
+    ================================================================ */
+
+    #[test]
+    fn enter_header_materializes_a_part_and_reroots_typing() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("body text"));
+        let evt = engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        let Event::SelectionChanged {
+            editing_story: Some(story),
+            ..
+        } = &evt
+        else {
+            panic!("expected story-mode SelectionChanged, got {evt:?}");
+        };
+        assert!(matches!(story.area, bridge::HeaderFooterArea::Header));
+        assert_eq!(story.rid, "ngeHf1");
+        let doc = engine.undo.current();
+        assert!(doc.headers.contains_key("ngeHf1"), "part materialized");
+        assert!(doc.hf_dirty.headers.contains("ngeHf1"), "part marked dirty");
+        assert_eq!(
+            doc.effective_sections()[0].header_refs.default.as_deref(),
+            Some("ngeHf1"),
+            "section now references the fresh part"
+        );
+        /* Typing lands in the STORY, not the body. */
+        let evt = engine.do_insert_text_interactive(bpos_top(0, 0), "Header A".into());
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let doc = engine.undo.current();
+        assert_eq!(doc.headers["ngeHf1"][0].text, "Header A");
+        assert_eq!(
+            doc.paragraph_text(0),
+            Some("body text"),
+            "body untouched by story typing"
+        );
+        /* Exit restores body editing. */
+        let evt = engine.do_exit_header_footer();
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("expected SelectionChanged");
+        };
+        assert!(editing_story.is_none());
+    }
+
+    #[test]
+    fn header_a_header_b_epic_scenario() {
+        /* The Phase 3 validation core: section break → Header A on
+        page 1, Header B on page 2, independent parts. */
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        let evt = engine.do_insert_section_break(bpos_top(0, 5), SectionBreakKind::NextPage);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+
+        let evt = engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        engine.do_insert_text_interactive(bpos_top(0, 0), "Header A".into());
+        engine.do_exit_header_footer();
+
+        let evt = engine.do_enter_header_footer(1, bridge::HeaderFooterArea::Header);
+        let Event::SelectionChanged {
+            editing_story: Some(story),
+            ..
+        } = &evt
+        else {
+            panic!("expected story mode on page 1, got {evt:?}");
+        };
+        assert_ne!(story.rid, "ngeHf1", "section 2 owns a DIFFERENT part");
+        let rid_b = story.rid.clone();
+        engine.do_insert_text_interactive(bpos_top(0, 0), "Header B".into());
+        engine.do_exit_header_footer();
+
+        let doc = engine.undo.current();
+        assert_eq!(doc.headers["ngeHf1"][0].text, "Header A");
+        assert_eq!(doc.headers[&rid_b][0].text, "Header B");
+        let sections = doc.effective_sections();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(
+            sections[0].header_refs.default.as_deref(),
+            Some("ngeHf1"),
+            "section 1 → Header A's part"
+        );
+        assert_eq!(
+            sections[1].header_refs.default.as_deref(),
+            Some(rid_b.as_str()),
+            "section 2 → Header B's part"
+        );
+        /* And the laid-out pages carry DIFFERENT header bands. */
+        engine
+            .ensure_layout_snapshot(engine.scale(), false, None)
+            .expect("layout");
+        let snap = engine.layout_snapshot.borrow();
+        let pages = &snap.as_ref().unwrap().pages;
+        assert!(pages.len() >= 2, "next-page break yields two pages");
+        assert!(pages[0].header.is_some(), "page 1 paints a header band");
+        assert!(pages[1].header.is_some(), "page 2 paints a header band");
+    }
+
+    #[test]
+    fn entering_a_shared_header_forks_it() {
+        /* Header FIRST, then break (which copies refs) → both sections
+        share one part. Entering page 2's header must fork a private
+        copy seeded with the shared content, leaving section 1 alone. */
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        engine.do_insert_text_interactive(bpos_top(0, 0), "Shared".into());
+        engine.do_exit_header_footer();
+        engine.do_insert_section_break(bpos_top(0, 5), SectionBreakKind::NextPage);
+
+        let evt = engine.do_enter_header_footer(1, bridge::HeaderFooterArea::Header);
+        let Event::SelectionChanged {
+            editing_story: Some(story),
+            ..
+        } = &evt
+        else {
+            panic!("expected story mode, got {evt:?}");
+        };
+        assert_ne!(story.rid, "ngeHf1", "shared part must fork on enter");
+        let doc = engine.undo.current();
+        assert_eq!(
+            doc.headers[&story.rid][0].text, "Shared",
+            "fork seeds from the shared content"
+        );
+        /* Edit the fork (story caret parked at the band start by
+        enter — move it to the end first); the original stays. */
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 6),
+            caret: bpos_top(0, 6),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        engine.do_insert_text_interactive(bpos_top(0, 6), " B".into());
+        let doc = engine.undo.current();
+        assert_eq!(doc.headers[&story.rid][0].text, "Shared B");
+        assert_eq!(doc.headers["ngeHf1"][0].text, "Shared");
+    }
+
+    #[test]
+    fn story_undo_past_materialize_falls_back_to_body() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("body"));
+        engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        assert!(engine.story_active());
+        /* One undo reverts the materialize push; the story's part is
+        gone and the guard must exit story mode. */
+        let evt = engine.do_undo();
+        assert!(!engine.story_active(), "guard exited the vanished story");
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        assert!(engine.undo.current().headers.is_empty());
+    }
+
+    #[test]
+    fn story_firewall_rejects_non_story_commands() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("body"));
+        engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Footer);
+        let rejected = engine.story_gate(&Command::InsertPageBreak { at: bpos_top(0, 0) });
+        assert!(matches!(rejected, Some(Event::Error { .. })));
+        let allowed = engine.story_gate(&Command::InsertText {
+            at: None,
+            text: "x".into(),
+        });
+        assert!(allowed.is_none());
+        engine.do_exit_header_footer();
+        let body_mode = engine.story_gate(&Command::InsertPageBreak { at: bpos_top(0, 0) });
+        assert!(body_mode.is_none(), "firewall inert in body mode");
+    }
+
+    #[test]
+    fn story_enter_exit_restores_body_selection() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("body text"));
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 2),
+            caret: bpos_top(0, 7),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        let sel = engine.selection.clone().unwrap();
+        assert_eq!(sel.caret.offset, 0, "story caret starts at band origin");
+        engine.do_exit_header_footer();
+        let sel = engine.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (2, 7));
+    }
+
     /// Shared scaffold: a native Engine over `doc` with a real Latin font
     /// and a cached layout config, mirroring the interactive boot state.
     fn test_engine_with_doc(doc: DocumentTree) -> Engine {
@@ -10769,6 +11898,9 @@ mod tests {
             pending_format: None,
             layout_cache: new_layout_cache(),
             layout_snapshot: RefCell::new(None),
+            sections_memo: RefCell::new(None),
+            active_story: StoryTarget::Body,
+            stashed_body_selection: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),

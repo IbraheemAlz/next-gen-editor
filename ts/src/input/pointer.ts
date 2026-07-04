@@ -11,7 +11,9 @@ import {
     PAGE_GAP_PT,
     PAGE_H_PT,
     SCREEN_DPI_SCALE,
+    editingStoryForPointer,
     enginePageTopDevice,
+    headerFooterZoneAt,
     selectImageByPoint,
     selectionViewForPointer,
 } from '../state/engine-store';
@@ -133,6 +135,34 @@ export function attachPointer(
             }
             return;
         }
+        /* Phase 3 (#39) — header/footer zone gate, BEFORE any caret
+           placement (mirrors the image-hit early-return below): a press
+           in a vertical margin band must not clobber the body caret the
+           engine is about to stash on EnterHeaderFooter (the dblclick's
+           two constituent single-clicks land here first). Rules:
+           - body mode + press in a band → swallow (dblclick enters);
+           - story mode + press in the ACTIVE story's own band on its
+             anchor page → fall through (caret placement inside the
+             band; the engine clamps to the story);
+           - story mode + press anywhere else → swallow (dblclick
+             switches band or exits — single clicks are inert, Word
+             semantics for the dimmed body). */
+        {
+            const local = toLocal(e);
+            const zone = headerFooterZoneAt(pageIdx, local.y);
+            const story = editingStoryForPointer();
+            if (story) {
+                const inOwnBand =
+                    zone === story.area && pageIdx === story.page;
+                if (!inOwnBand) {
+                    gesture += 1;
+                    return;
+                }
+            } else if (zone !== null) {
+                gesture += 1;
+                return;
+            }
+        }
         /* Issue #44 — a primary press on an inline image body selects
            the image (showing resize handles) instead of placing a caret
            or starting a text drag. Presses on the handles themselves
@@ -140,8 +170,9 @@ export function attachPointer(
            consume the event. `selectImageByPoint` also CLEARS a prior
            image selection when the click misses every image, so a normal
            text click deselects. Coordinates are document-absolute CSS
-           px, matching the stored image rects. */
-        {
+           px, matching the stored image rects. Skipped in story mode —
+           body images are unreachable behind the dim. */
+        if (!editingStoryForPointer()) {
             const dpr = window.devicePixelRatio || 1;
             const gCss = toGlobal(e);
             if (selectImageByPoint(gCss.x / dpr, gCss.y / dpr)) {
@@ -178,6 +209,31 @@ export function attachPointer(
         /* Bump past the two single-clicks' in-flight hit-tests so their
            SET_SELECTIONs are dropped and the word selection survives. */
         gesture += 1;
+        /* Phase 3 (#39) — double-click routing (the Word affordance):
+           - a band while NOT already editing that exact band+page →
+             ENTER_HEADER_FOOTER for this page's section;
+           - the body content area while a story is active → exit;
+           - the ACTIVE band → fall through to word selection (the
+             critic-flagged hijack: in-band dblclick must keep its
+             editing affordance). */
+        const zone = headerFooterZoneAt(pageIdx, toLocal(e).y);
+        const story = editingStoryForPointer();
+        const inOwnBand =
+            story !== undefined && zone === story.area && pageIdx === story.page;
+        if (zone !== null && !inOwnBand) {
+            void client
+                .dispatch({ type: 'ENTER_HEADER_FOOTER', page: pageIdx, area: zone })
+                .catch((err: unknown) => {
+                    console.error('enterHeaderFooter failed', err);
+                });
+            return;
+        }
+        if (story && zone === null) {
+            void client.dispatch({ type: 'EXIT_HEADER_FOOTER' }).catch((err: unknown) => {
+                console.error('exitHeaderFooter failed', err);
+            });
+            return;
+        }
         void client.dispatch({ type: 'SELECT_WORD_AT', at: toGlobal(e) });
     };
 

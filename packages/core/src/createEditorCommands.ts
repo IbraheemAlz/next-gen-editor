@@ -42,6 +42,8 @@ import type {
     BridgeTabStop,
     InsertSide,
     PageOrientation,
+    SectionBreakKind,
+    HeaderFooterArea,
     ListKind,
     BridgeStyleProperties,
 } from './types';
@@ -206,6 +208,20 @@ export interface EditorCommands {
     setColumns(at: LogicalPos, count: number, gutterPt: number): Promise<Event>;
     setColumnsAtCaret(count: number, gutterPt?: number): Promise<Event>;
     insertPageBreak(at?: LogicalPos): Promise<Event>;
+    /** Phase 3 (#40) — insert a REAL section break (splits the caret
+     *  paragraph into two sections; the following section begins per
+     *  `kind`). Distinct from `insertPageBreak`, which only flips a
+     *  paragraph render hint. The engine rejects table-cell carets with
+     *  `Event::Error` — the Breaks menu disables those entries. */
+    insertSectionBreak(kind: SectionBreakKind, at?: LogicalPos): Promise<Event>;
+    /** Phase 3 (#39) — enter header/footer editing for the section that
+     *  owns `page` (0-based). The engine guarantees the section owns a
+     *  private part (materialize/fork on enter) and re-roots the
+     *  selection into the story; `state.editingStory()` flips truthy. */
+    enterHeaderFooter(page: number, area: HeaderFooterArea): Promise<Event>;
+    /** Phase 3 (#39) — leave header/footer editing; the stashed body
+     *  selection is restored (clamped). */
+    exitHeaderFooter(): Promise<Event>;
     setParagraphBorders(
         borders: BridgeCellBorders,
         range?: LogicalRange,
@@ -510,6 +526,15 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             }),
         insertPageBreak: (at) =>
             dispatch({ type: 'INSERT_PAGE_BREAK', at: at ?? currentCaret() }),
+        insertSectionBreak: (kind, at) =>
+            dispatch({
+                type: 'INSERT_SECTION_BREAK',
+                at: at ?? currentCaret(),
+                kind,
+            }),
+        enterHeaderFooter: (page, area) =>
+            dispatch({ type: 'ENTER_HEADER_FOOTER', page, area }),
+        exitHeaderFooter: () => dispatch({ type: 'EXIT_HEADER_FOOTER' }),
         setParagraphBorders: (borders, range) =>
             dispatch({
                 type: 'SET_PARAGRAPH_BORDERS',

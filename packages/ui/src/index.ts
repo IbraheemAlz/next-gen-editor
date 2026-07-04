@@ -78,5 +78,6 @@ export { ColorPickers } from './ColorPickers';
 export { AlignmentButtons } from './AlignmentButtons';
 export { InsertTableButton } from './InsertTableButton';
 export type { InsertTableButtonProps } from './InsertTableButton';
+export { HeaderFooterButtons } from './HeaderFooterButtons';
 export { HistoryButtons } from './HistoryButtons';
 export { CapsButtons } from './CapsButtons';

@@ -19,6 +19,8 @@ export type {
     BridgeBorderStroke,
     BridgeBorderStyle,
     BridgeCellBorders,
+    BridgeStoryRef,
+    HeaderFooterArea,
     ClientCapabilities,
     Color,
     Command,

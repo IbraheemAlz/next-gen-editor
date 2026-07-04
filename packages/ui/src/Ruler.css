@@ -24,6 +24,15 @@
     color: var(--nge-color-text-muted, #666);
 }
 
+/* Phase 3 (#39) — header/footer story mode gates the drag-commit
+ * handlers (`Command::SetParagraphIndent` / `SetTabStops` are both
+ * engine-rejected while a story is active); dim the whole ruler so the
+ * disabled affordance is visible rather than a silent no-op drag. */
+.nge-ruler[data-story-disabled='true'] {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
 /* Absolutely positioned so its `left` (set inline from the measured page
  * offset) pins the 0-mark over the paper's left edge; `width` (also inline)
  * matches the page width in pt-derived px. */

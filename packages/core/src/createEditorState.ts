@@ -21,6 +21,7 @@ import type {
     Alignment,
     AttrsMixed,
     BridgeCellBorders,
+    BridgeStoryRef,
     BridgeCellProperties,
     BridgeIndent,
     BridgeSectionGeometry,
@@ -120,6 +121,16 @@ export interface EditorState {
      * how `cellProperties` feeds the cell border editor).
      */
     paragraphBorders: Accessor<BridgeCellBorders | undefined>;
+    /**
+     * Phase 3 (#39) — the active header/footer story, or `undefined` in
+     * body mode. While set, the engine re-roots every caret-relative
+     * command into the story; the shell dims the body, outlines the
+     * band on the anchor page, and controls whose commands are gated
+     * in story mode disable themselves on this accessor (Honest UX —
+     * the engine's `Event::Error` backstop is invisible to sighted
+     * users by design).
+     */
+    editingStory: Accessor<BridgeStoryRef | undefined>;
 }
 
 export function createEditorState(): EditorState {
@@ -155,6 +166,8 @@ export function createEditorState(): EditorState {
     const [isTrackingChanges, setIsTrackingChanges] = createSignal(false);
     const [paragraphBorders, setParagraphBorders] =
         createSignal<BridgeCellBorders | undefined>(undefined);
+    const [editingStory, setEditingStory] =
+        createSignal<BridgeStoryRef | undefined>(undefined);
 
     const unsubscribe = engine.subscribe((evt: Event) => {
         switch (evt.type) {
@@ -176,6 +189,7 @@ export function createEditorState(): EditorState {
                 setParagraphIndent(evt.paragraph_indent ?? ZERO_INDENT);
                 setIsTrackingChanges(evt.is_tracking_changes);
                 setParagraphBorders(evt.paragraph_borders);
+                setEditingStory(evt.editing_story);
                 break;
             }
             case 'UNDO_STATE_CHANGED': {
@@ -234,5 +248,6 @@ export function createEditorState(): EditorState {
         paragraphIndent,
         isTrackingChanges,
         paragraphBorders,
+        editingStory,
     };
 }

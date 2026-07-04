@@ -46,28 +46,37 @@ export const ParagraphControls: Component = () => {
     const [shadingHex, setShadingHex] = createSignal('');
 
     const ready = createMemo(() => state.selection() !== undefined);
+    /* Phase 3 (#39) — every control in this component (indent, line
+     * spacing, shading) maps to a `Command::SetParagraph*` variant, and
+     * ALL of those are engine-gated while a header/footer story is
+     * active (`story_gate` in engine-wasm rejects them with
+     * `Event::Error`). Disable the whole shelf rather than let that
+     * error surface silently. */
+    const inStory = () => state.editingStory() !== undefined;
+    const gatedTitle = (label: string) =>
+        inStory() ? 'Not available while editing a header or footer' : label;
 
     const inc = async () => {
-        if (!ready()) return;
+        if (!ready() || inStory()) return;
         await cmd.increaseIndent(INDENT_STEP_PT);
     };
     const dec = async () => {
-        if (!ready()) return;
+        if (!ready() || inStory()) return;
         await cmd.decreaseIndent(INDENT_STEP_PT);
     };
     const applySpacing = async (v: number) => {
-        if (!ready()) return;
+        if (!ready() || inStory()) return;
         setSpacing(v);
         await cmd.setLineSpacing(v);
     };
     const applyShading = async (hex: string) => {
-        if (!ready()) return;
+        if (!ready() || inStory()) return;
         setShadingHex(hex);
         const color = hex.trim() === '' ? undefined : hexToColor(hex);
         await cmd.setParagraphShading(color);
     };
     const clearShading = async () => {
-        if (!ready()) return;
+        if (!ready() || inStory()) return;
         setShadingHex('');
         await cmd.setParagraphShading(undefined);
     };
@@ -79,8 +88,8 @@ export const ParagraphControls: Component = () => {
                     class="nge-btn nge-btn--icon nge-pcontrols__icon"
                     type="button"
                     aria-label="Decrease indent"
-                    title="Decrease indent"
-                    disabled={!ready()}
+                    title={gatedTitle('Decrease indent')}
+                    disabled={!ready() || inStory()}
                     onClick={() => void dec()}
                 >
                     ⇤
@@ -89,8 +98,8 @@ export const ParagraphControls: Component = () => {
                     class="nge-btn nge-btn--icon nge-pcontrols__icon"
                     type="button"
                     aria-label="Increase indent"
-                    title={`Increase indent (${INDENT_STEP_PT} pt step)`}
-                    disabled={!ready()}
+                    title={gatedTitle(`Increase indent (${INDENT_STEP_PT} pt step)`)}
+                    disabled={!ready() || inStory()}
                     onClick={() => void inc()}
                 >
                     ⇥
@@ -102,7 +111,8 @@ export const ParagraphControls: Component = () => {
                 <select
                     class="nge-pcontrols__select"
                     aria-label="Line spacing"
-                    disabled={!ready()}
+                    title={gatedTitle('Line spacing')}
+                    disabled={!ready() || inStory()}
                     value={spacing().toString()}
                     onChange={(e) =>
                         void applySpacing(parseFloat(e.currentTarget.value))
@@ -119,7 +129,8 @@ export const ParagraphControls: Component = () => {
                     class="nge-pcontrols__color"
                     type="color"
                     aria-label="Paragraph shading colour"
-                    disabled={!ready()}
+                    title={gatedTitle('Paragraph shading colour')}
+                    disabled={!ready() || inStory()}
                     value={shadingHex() || '#ffffff'}
                     /* `onChange` fires once on commit; `onInput` would
                      * dispatch a SetParagraphShading on every cursor
@@ -132,8 +143,8 @@ export const ParagraphControls: Component = () => {
                     class="nge-btn nge-btn--icon nge-pcontrols__icon"
                     type="button"
                     aria-label="Clear paragraph shading"
-                    title="Clear paragraph shading"
-                    disabled={!ready() || shadingHex() === ''}
+                    title={gatedTitle('Clear paragraph shading')}
+                    disabled={!ready() || inStory() || shadingHex() === ''}
                     onClick={() => void clearShading()}
                 >
                     ⌫

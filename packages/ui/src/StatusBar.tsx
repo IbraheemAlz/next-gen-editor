@@ -76,6 +76,13 @@ export const StatusBar: Component<StatusBarProps> = (props) => {
     return (
         <div class="nge-statusbar" role="status">
             <div class="nge-statusbar__group">
+                {/* Phase 3 (#40) — 1-based "Sec i/n" from the caret's
+                    SelectionChanged.section_geometry read-back. */}
+                <span class="nge-statusbar__stat" title="Section (caret) / total sections">
+                    Sec {(state.sectionGeometry()?.section_index ?? 0) + 1}/
+                    {state.sectionGeometry()?.section_count ?? 1}
+                </span>
+                <span class="nge-statusbar__sep" aria-hidden="true">·</span>
                 <span class="nge-statusbar__stat" title="Paragraphs">
                     ¶ {state.stats()?.paragraph_count ?? '–'}
                 </span>

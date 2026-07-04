@@ -377,12 +377,44 @@ pub struct PageBox {
     pub header: Option<HeaderFooterBox>,
     /// Mirror of `header`, painted in the bottom margin band.
     pub footer: Option<HeaderFooterBox>,
+    /// Phase 3 (#39) — `<w:pgMar w:header>`: distance from the page's top
+    /// edge to the header band's top, in the page's own units (already
+    /// scaled with `size` / `margins`). Previously parsed + threaded to
+    /// the paginator but dropped here, leaving the renderer on a
+    /// hardcoded fraction of the margin.
+    pub header_offset: f32,
+    /// `<w:pgMar w:footer>`: distance from the page's bottom edge to the
+    /// footer band's bottom.
+    pub footer_offset: f32,
     /// Phase 8a — footnote band. Each entry is the laid-out body of one
     /// `<w:footnote>` whose `<w:footnoteReference>` lands somewhere in
     /// this page's body content. Painted above the bottom margin in
     /// emission order, separated from the body by a thin horizontal
     /// rule. Origins are relative to the band's top-left.
     pub footnotes: Vec<FootnoteEntry>,
+}
+
+impl PageBox {
+    /// Phase 3 (#39) — page-relative Y of the header band's top. THE
+    /// single source of band placement: `render::scene` paints with it
+    /// and engine-wasm's story hit-testing/caret geometry reads the
+    /// same method, so paint and hit-test cannot diverge.
+    pub fn header_band_top(&self) -> f32 {
+        self.header_offset
+    }
+
+    /// Page-relative Y of the footer band's top: the band's laid-out
+    /// content bottom-anchors at `footer_offset` above the page's
+    /// bottom edge (Word's "Footer from Bottom" semantics). Overflow
+    /// expansion for bands taller than the margin is out of scope —
+    /// tracked as a follow-up.
+    pub fn footer_band_top(&self) -> f32 {
+        let content_h = self
+            .footer
+            .as_ref()
+            .map_or(0.0, HeaderFooterBox::content_height);
+        self.size.height - self.footer_offset - content_h
+    }
 }
 
 /// Phase 8a — one laid-out footnote inside a [`PageBox::footnotes`] band.
@@ -405,4 +437,16 @@ pub struct HeaderFooterBox {
     /// Each laid-out paragraph in the band. Origins are relative to the
     /// band's top-left.
     pub paragraphs: Vec<ParagraphBox>,
+}
+
+impl HeaderFooterBox {
+    /// Phase 3 (#39) — the band content's laid-out height: the deepest
+    /// paragraph bottom edge, band-relative. Feeds
+    /// [`PageBox::footer_band_top`]'s bottom-anchoring.
+    pub fn content_height(&self) -> f32 {
+        self.paragraphs
+            .iter()
+            .map(|p| p.origin.y + p.size.height)
+            .fold(0.0, f32::max)
+    }
 }

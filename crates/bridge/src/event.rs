@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
-use crate::command::{BridgeCellBorders, BridgeTabStop, PageOrientation};
+use crate::command::{BridgeCellBorders, BridgeTabStop, HeaderFooterArea, PageOrientation};
 use crate::common::{
     Alignment, Color, Direction, DocFormat, ImageRect, LogicalPos, LogicalRange, Rect, Script,
     SelectionKind, TextAttrs,
@@ -146,6 +146,18 @@ pub enum Event {
         /// (common) image-free document instead of paying an extra worker
         /// round-trip + geometry walk on every paint.
         image_count: u32,
+        /// Phase 3 (#39) — per-page TOP margin in device px, index-aligned
+        /// with `page_tops`. The shell's pointer pipeline gates the
+        /// double-click-to-edit-header zone with
+        /// `page_top ≤ y < page_top + margin`, exact for mixed-geometry
+        /// sections (a caret-section read-back can't answer for an
+        /// arbitrary page, and a mid-gesture worker round-trip would
+        /// arrive after the click).
+        page_margin_tops: Vec<f32>,
+        /// Phase 3 (#39) — per-page BOTTOM margin in device px,
+        /// index-aligned with `page_tops`; the footer-zone mirror of
+        /// `page_margin_tops`.
+        page_margin_bottoms: Vec<f32>,
     },
 
     /* Selection */
@@ -241,6 +253,14 @@ pub enum Event {
         /// colour from the live document (mirrors how `cell_properties`
         /// feeds the cell border editor) instead of always opening blank.
         paragraph_borders: Option<BridgeCellBorders>,
+        /// Phase 3 (#39) — the active header/footer story, or `None` in
+        /// body mode. While `Some`, `range`/`caret`/`rects` (and every
+        /// caret-relative command) are expressed in STORY space — paths
+        /// root at the story's paragraph list — while the geometry
+        /// values stay absolute page device px, so the caret/selection
+        /// overlays render unchanged. The shell dims the body, outlines
+        /// the band on the anchor page, and gates non-story controls.
+        editing_story: Option<BridgeStoryRef>,
     },
 
     /* IME */
@@ -360,6 +380,22 @@ pub struct BridgeIndent {
     pub first_line_pt: f32,
 }
 
+/// Phase 3 (#39) — wire shape for the active header/footer story riding
+/// `Event::SelectionChanged.editing_story`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+pub struct BridgeStoryRef {
+    /// Which band is being edited.
+    pub area: HeaderFooterArea,
+    /// Relationship id of the story's part — the key into the engine's
+    /// header/footer maps. Diagnostic + dedup value for the shell (two
+    /// pages showing the same part share a rid).
+    pub rid: String,
+    /// The ANCHOR page (0-based): where the user entered the story and
+    /// where the caret/selection geometry is projected. Edits reflect on
+    /// every page of the owning section at the next paint.
+    pub page: u32,
+}
+
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
 pub struct BridgeSectionGeometry {
     pub width_pt: f32,
@@ -373,6 +409,11 @@ pub struct BridgeSectionGeometry {
     pub columns: u32,
     /// `<w:cols w:space>` — inter-column gutter in pt.
     pub column_gutter_pt: f32,
+    /// Phase 3 (#40) — 0-based index of the caret's section in document
+    /// order. Drives the StatusBar "Sec i/n" indicator + QA assertions.
+    pub section_index: u32,
+    /// Phase 3 (#40) — total section count in the document.
+    pub section_count: u32,
 }
 
 /// Sprint 10 — wire shape for the active cell's shading + per-edge

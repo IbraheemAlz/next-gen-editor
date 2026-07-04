@@ -18,6 +18,7 @@ import { attachPointer } from '../input/pointer';
 import { PageSelectionOverlay } from './PageSelectionOverlay';
 import { CaretOverlay } from './CaretOverlay';
 import { ImageHandlesOverlay } from './ImageHandlesOverlay';
+import { StoryModeOverlay } from './StoryModeOverlay';
 
 export interface ExtraPageCanvasProps {
     client: EngineClient;
@@ -55,6 +56,7 @@ export function ExtraPageCanvas(props: ExtraPageCanvasProps) {
                 client={props.client}
                 pageIdx={props.pageIdx}
             />
+            <StoryModeOverlay store={props.store} pageIdx={props.pageIdx} />
         </div>
     );
 }

@@ -16,7 +16,7 @@ import type {
     TextAttrsPatch,
 } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
-import { clearSelectedImage } from '../state/engine-store';
+import { clearSelectedImage, editingStoryForPointer } from '../state/engine-store';
 import { ClipboardWriteError, copy, cut, paste } from '../input/clipboard';
 
 /** Map a non-composition `InputEvent` to an engine command. */
@@ -137,6 +137,18 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
            Shift-in-preparation doesn't drop the selection. */
         if (e.key !== 'Shift' && e.key !== 'Control' && e.key !== 'Alt' && e.key !== 'Meta') {
             clearSelectedImage();
+        }
+
+        /* Phase 3 (#39) — Esc leaves header/footer editing (Word
+           parity). Lives HERE, not on a second window-level listener:
+           HiddenInput already owns every editing-adjacent key, and
+           Dialog.tsx's own Escape handler doesn't stopPropagation — a
+           global listener would double-fire when a dialog closes while
+           a story is active. */
+        if (e.key === 'Escape' && editingStoryForPointer()) {
+            e.preventDefault();
+            void props.client.dispatch({ type: 'EXIT_HEADER_FOOTER' });
+            return;
         }
 
         /* Arrow keys: caret motion. Shift extends the selection

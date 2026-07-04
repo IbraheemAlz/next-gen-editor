@@ -1,0 +1,21 @@
+/* Phase 3 (#39) — header/footer toolbar entry points. */
+.nge-hf {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+}
+
+.nge-hf__btn {
+    gap: var(--nge-space-1);
+}
+
+.nge-hf__icon {
+    font-size: 12px;
+    line-height: 1;
+    color: var(--nge-color-primary);
+}
+
+.nge-hf__btn--close {
+    background: var(--nge-color-primary);
+    color: #ffffff;
+}

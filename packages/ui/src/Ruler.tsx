@@ -213,6 +213,14 @@ export const Ruler: Component<RulerProps> = (props) => {
 
     const geom = () => state.sectionGeometry();
     const isRtl = () => state.paragraphDirection() === 'Rtl';
+    /* Phase 3 (#39) — `Command::SetParagraphIndent` and
+     * `Command::SetTabStops`, the only two commands `commitDrag`
+     * dispatches, are both engine-gated while a header/footer story is
+     * active (neither is on the `story_gate` whitelist in
+     * engine-wasm). A drag would otherwise commit silently into a
+     * rejected `Event::Error` with no visible feedback — bail out of
+     * the commit and dim the ruler instead. */
+    const inStory = () => state.editingStory() !== undefined;
 
     /* Direction-aware marker tooltips. The handles edit LOGICAL indents
      * (`<w:start>` / `<w:firstLine>`), so the label names the logical
@@ -339,6 +347,7 @@ export const Ruler: Component<RulerProps> = (props) => {
         const d = drag();
         if (!d) return;
         setDrag(null);
+        if (inStory()) return;
         const range = state.selection();
         if (!range) return;
         switch (d.kind) {
@@ -578,8 +587,13 @@ export const Ruler: Component<RulerProps> = (props) => {
             ref={rulerEl}
             class="nge-ruler"
             data-rtl={isRtl() ? 'true' : 'false'}
+            data-story-disabled={inStory() ? 'true' : 'false'}
             role="region"
-            aria-label="Page ruler — drag to set indents and tab stops"
+            aria-label={
+                inStory()
+                    ? 'Page ruler — not available while editing a header or footer'
+                    : 'Page ruler — drag to set indents and tab stops'
+            }
         >
             <div
                 ref={stripEl}

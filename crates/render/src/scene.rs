@@ -172,9 +172,12 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         let content_y = top + page.margins.top;
 
         /* Phase 6 — header band painted before body so a wide header doesn't
-        sit on top of body text. Origin sits inside the top margin. */
+        sit on top of body text. Phase 3 (#39): band placement comes from
+        `PageBox::header_band_top()` — the document's real
+        `<w:pgMar w:header>` offset, shared with engine-wasm's story
+        hit-testing so paint and caret geometry cannot diverge. */
         if let Some(hf) = &page.header {
-            let band_top = top + (page.margins.top * 0.25);
+            let band_top = top + page.header_band_top();
             for para in &hf.paragraphs {
                 paint_paragraph(para, content_x, band_top, &mut cmds);
             }
@@ -214,7 +217,7 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         }
 
         if let Some(hf) = &page.footer {
-            let band_top = top + (page.size.height - page.margins.bottom * 0.75);
+            let band_top = top + page.footer_band_top();
             for para in &hf.paragraphs {
                 paint_paragraph(para, content_x, band_top, &mut cmds);
             }

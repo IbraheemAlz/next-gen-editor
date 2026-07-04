@@ -12,7 +12,12 @@
  * ImageFit matrix for manual QA.
  */
 import { createSignal, type Component } from 'solid-js';
-import { createEditorCommands, type ImageFit, type ImageBlob } from '@nge/core';
+import {
+    createEditorCommands,
+    createEditorState,
+    type ImageFit,
+    type ImageBlob,
+} from '@nge/core';
 import './InsertImageButton.css';
 
 const ACCEPT = 'image/png,image/jpeg,image/gif,image/webp';
@@ -63,6 +68,8 @@ export interface InsertImageButtonProps {
 
 export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
     const cmd = createEditorCommands();
+    const state = createEditorState();
+    const inStory = () => state.editingStory() !== undefined;
     const [busy, setBusy] = createSignal(false);
     /* Issue #44 — a user-chosen fit mode at insert time (the enum always
        existed on `Command::InsertImage` but no UI ever set it). */
@@ -70,6 +77,7 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
     let inputEl: HTMLInputElement | undefined;
 
     const onPick = async (file: File) => {
+        if (inStory()) return;
         setBusy(true);
         try {
             const bytes = new Uint8Array(await file.arrayBuffer());
@@ -93,8 +101,12 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
                 class="nge-btn nge-insert-image"
                 type="button"
                 aria-label="Insert image"
-                title="Insert image"
-                disabled={busy()}
+                title={
+                    inStory()
+                        ? 'Not available while editing a header or footer'
+                        : 'Insert image'
+                }
+                disabled={busy() || inStory()}
                 onClick={() => inputEl?.click()}
             >
                 <span class="nge-insert-image__icon" aria-hidden="true">🖼</span>
@@ -103,7 +115,12 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
             <select
                 class="nge-insert-image__fit"
                 aria-label="Image fit mode"
-                title="Image fit mode"
+                title={
+                    inStory()
+                        ? 'Not available while editing a header or footer'
+                        : 'Image fit mode'
+                }
+                disabled={inStory()}
                 value={fit()}
                 onChange={(e) => setFit(e.currentTarget.value as ImageFit)}
             >

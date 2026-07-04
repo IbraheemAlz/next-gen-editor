@@ -13,6 +13,7 @@ import type {
     Alignment,
     AttrsMixed,
     BlockPath,
+    BridgeStoryRef,
     Direction,
     Event,
     LogicalPos,
@@ -60,6 +61,45 @@ let latestPageTops: number[] | null = null;
  *  before one lands (callers fall back to the uniform constants). */
 export function enginePageTopDevice(idx: number): number | null {
     return latestPageTops?.[idx] ?? null;
+}
+
+/* Phase 3 (#39) — per-page margins + heights (device px) mirrored for
+ * the non-reactive pointer path's header/footer zone gate, and the
+ * active story ref for its already-in-this-story exemption. Margins
+ * ride every `Painted` (real + synthetic), so the gate stays exact for
+ * mixed-geometry sections without a mid-gesture worker round-trip. */
+let latestPageMargins: { tops: number[]; bottoms: number[] } | null = null;
+let latestPageHeights: number[] | null = null;
+
+const [editingStorySig, setEditingStorySig] = createSignal<
+    BridgeStoryRef | undefined
+>(undefined);
+
+/** The active header/footer story (reactive) — also read at event time
+ *  by the pointer path. */
+export function editingStoryForPointer(): BridgeStoryRef | undefined {
+    return editingStorySig();
+}
+
+/**
+ * Which margin band a PAGE-LOCAL device-px Y lands in on page `idx`,
+ * or `null` for the content area / before the first paginated paint
+ * (no gate — pre-paint clicks keep the legacy caret behaviour, the
+ * same fallback-then-exact duality the selection overlays use).
+ */
+export function headerFooterZoneAt(
+    pageIdx: number,
+    localDeviceY: number,
+): 'Header' | 'Footer' | null {
+    const top = latestPageMargins?.tops[pageIdx];
+    const bottom = latestPageMargins?.bottoms[pageIdx];
+    const height = latestPageHeights?.[pageIdx];
+    if (top === undefined || bottom === undefined || height === undefined) {
+        return null;
+    }
+    if (localDeviceY >= 0 && localDeviceY < top) return 'Header';
+    if (localDeviceY > height - bottom && localDeviceY <= height) return 'Footer';
+    return null;
 }
 
 /* Issue #36 — same module-level-mirror pattern for the selection view:
@@ -251,6 +291,12 @@ export function createEngineStore(client: EngineClient) {
        (an expand past a fully-laid-out tail would repaint for nothing). */
     const [isFullLayout, setIsFullLayout] = createSignal(false);
     const [pageGeometry, setPageGeometry] = createSignal<PageGeometry | null>(null);
+    /* Phase 3 (#39) — reactive per-page margins (device px) for the
+       StoryModeOverlay's dim + band-outline geometry. */
+    const [marginGeometry, setMarginGeometry] = createSignal<{
+        tops: number[];
+        bottoms: number[];
+    } | null>(null);
     let nodes: A11yNode[] = [];
     let announced = false;
 
@@ -306,6 +352,7 @@ export function createEngineStore(client: EngineClient) {
             setBaseDirection(ev.direction);
             setSelectionKind(ev.selection_kind);
             setListIlvl(ev.list_ilvl);
+            setEditingStorySig(ev.editing_story);
         } else if (ev.type === 'PAINTED') {
             /* Phase 6b — paginator reach. The engine emits
                `document_height` (device px) and `page_count` on every
@@ -321,7 +368,20 @@ export function createEngineStore(client: EngineClient) {
                arrays; keep the last real geometry in that case. */
             if (ev.page_tops.length > 0) {
                 latestPageTops = ev.page_tops;
+                latestPageHeights = ev.page_heights;
                 setPageGeometry({ tops: ev.page_tops, heights: ev.page_heights });
+            }
+            /* Phase 3 (#39) — margin zones for the pointer gate + the
+               story overlay. */
+            if (ev.page_margin_tops.length > 0) {
+                latestPageMargins = {
+                    tops: ev.page_margin_tops,
+                    bottoms: ev.page_margin_bottoms,
+                };
+                setMarginGeometry({
+                    tops: ev.page_margin_tops,
+                    bottoms: ev.page_margin_bottoms,
+                });
             }
             /* Issue #44 — refresh inline-image geometry after a paint so
                the resize-handle overlay tracks images through edits,
@@ -407,6 +467,9 @@ export function createEngineStore(client: EngineClient) {
         selectedImage: selectedImageSig,
         setSelectedImage: setSelectedImageSig,
         refreshImageRects,
+        /* Phase 3 (#39) — active story for overlays + control gating. */
+        editingStory: editingStorySig,
+        marginGeometry,
         /** CSS-px top of page `idx` — engine-exact once a paginated paint
          *  reported geometry; uniform-A4 fallback before that. */
         pageTopCss: (idx: number): number => {

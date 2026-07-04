@@ -940,6 +940,8 @@ function broadcastPaintDims(): void {
             page_tops: number[];
             page_heights: number[];
             image_count: number;
+            page_margin_tops: number[];
+            page_margin_bottoms: number[];
         };
         self.postMessage({
             evt: {
@@ -954,6 +956,13 @@ function broadcastPaintDims(): void {
                 page_tops: dims.page_tops,
                 page_heights: dims.page_heights,
                 image_count: dims.image_count,
+                /* Phase 3 (#39) — the double-click header/footer zone
+                gate reads per-page margins; BOTH Painted producers (the
+                real paint and this synthetic side-channel) must carry
+                them (the #44 image_count gate relearned this the hard
+                way). */
+                page_margin_tops: dims.page_margin_tops,
+                page_margin_bottoms: dims.page_margin_bottoms,
             },
         });
     } catch (e: unknown) {

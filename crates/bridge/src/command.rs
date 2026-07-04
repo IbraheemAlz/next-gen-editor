@@ -449,6 +449,36 @@ pub enum Command {
     InsertPageBreak {
         at: LogicalPos,
     },
+    /// Phase 3 (#40) — insert a REAL section break at `at`. The
+    /// paragraph splits at the caret; the text before it becomes the
+    /// tail of a new section carrying a copy of the covering section's
+    /// full `<w:sectPr>` payload, and the following section begins per
+    /// `kind` (Word semantics: `<w:type>` describes how the section it
+    /// opens starts relative to the previous one). Distinct from
+    /// `InsertPageBreak`, which is a paragraph render hint with no
+    /// geometry of its own. Rejected with `Event::Error` when `at`
+    /// sits inside a table cell (Word-parity there is deferred).
+    InsertSectionBreak {
+        at: LogicalPos,
+        kind: SectionBreakKind,
+    },
+    /// Phase 3 (#39) — enter header/footer editing for the section that
+    /// owns page `page` (0-based). The engine stashes the body
+    /// selection, guarantees the active section OWNS a private part
+    /// (materialize-on-enter when no part is referenced; fork-on-enter
+    /// when the resolved part is shared with another section — the v1
+    /// stand-in for Word's Link-to-Previous, whose explicit toggle is
+    /// tracked as a follow-up), and re-roots the selection + all
+    /// caret-relative commands into that story until
+    /// [`Command::ExitHeaderFooter`]. `SelectionChanged.editing_story`
+    /// reports the active story.
+    EnterHeaderFooter {
+        page: u32,
+        area: HeaderFooterArea,
+    },
+    /// Phase 3 (#39) — leave header/footer editing and restore the
+    /// stashed body selection (clamped if the body changed under it).
+    ExitHeaderFooter,
     /// Sprint 2 (UI Edition) — set `<w:pPr><w:pBdr>` on every
     /// paragraph the range spans. Mirrors `SetCellBorders` over the
     /// paragraph-border model that shipped in Sprint 5. Pass an
@@ -651,6 +681,26 @@ pub enum PageOrientation {
     #[default]
     Portrait,
     Landscape,
+}
+
+/// Phase 3 (#40) — the two AUTHORABLE section-break kinds for
+/// [`Command::InsertSectionBreak`]. Wire mirror of the engine
+/// `SectionType` authoring subset: `EvenPage` / `OddPage` round-trip
+/// from imported files but are not authorable (the paginator degrades
+/// them to `NextPage` until parity-aware page routing lands).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SectionBreakKind {
+    #[default]
+    NextPage,
+    Continuous,
+}
+
+/// Phase 3 (#39) — which margin band a header/footer command targets.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeaderFooterArea {
+    #[default]
+    Header,
+    Footer,
 }
 
 /// Sprint 11 (#13) — wire shape for one `<w:pPr><w:tabs><w:tab>`

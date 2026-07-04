@@ -306,6 +306,10 @@ fn parse_cell_paragraph(
          * re-application machinery, mirroring body paragraphs. */
         style_id: p_style,
         direct_overrides: direct_ppr,
+        /* Phase 3 (#40) — a cell paragraph can never terminate a
+        document section (interior sectPr is body-level-paragraph
+        only). */
+        section_end: None,
     }
 }
 

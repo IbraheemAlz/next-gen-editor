@@ -10,6 +10,7 @@ import { ExtraPageCanvas } from './components/ExtraPageCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
 import { PageSelectionOverlay } from './components/PageSelectionOverlay';
 import { ImageHandlesOverlay } from './components/ImageHandlesOverlay';
+import { StoryModeOverlay } from './components/StoryModeOverlay';
 import { HiddenInput } from './components/HiddenInput';
 import { SdkShelf } from './sdk-bridge';
 import { AccessibilityTree } from './components/AccessibilityTree';
@@ -314,6 +315,7 @@ export function App() {
                                 client={client}
                                 pageIdx={0}
                             />
+                            <StoryModeOverlay store={store} pageIdx={0} />
                             <HiddenInput client={client} store={store} />
                         </div>
                         {/* Extra pages live under a `booting` boundary: a

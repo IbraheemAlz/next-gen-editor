@@ -1044,6 +1044,11 @@ pub fn parse_document_xml(
                             fields: std::mem::take(&mut para_fields),
                             style_id: style_id_for_paragraph,
                             direct_overrides: direct_overrides_for_paragraph,
+                            /* Phase 3 (#40) — the range→marker conversion
+                            happens in `from_blocks_with_sections`; the
+                            parser keeps emitting range-stamped `Section`s
+                            below. */
+                            section_end: None,
                         }));
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this
                         paragraph. Emit a `Section` covering everything since

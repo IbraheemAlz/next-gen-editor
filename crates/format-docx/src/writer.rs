@@ -116,6 +116,26 @@ fn doc_has_hyperlinks(doc: &DocumentTree) -> bool {
     })
 }
 
+/// Phase 3 (#40) — `true` when any section (an interior marker paragraph
+/// or the trailing body section) references a header/footer part. The
+/// emitted `<w:headerReference r:id>` needs `xmlns:r` at the root — and
+/// so do the passthrough bytes of a CLEAN marker paragraph whose
+/// `source_xml` carries the reference, mirroring `doc_has_hyperlinks`'s
+/// dirty-or-not rationale. Markers are top-level-only, so no cell
+/// descent.
+fn doc_has_section_hf_refs(doc: &DocumentTree) -> bool {
+    if !doc.body_section.header_refs.is_empty() || !doc.body_section.footer_refs.is_empty() {
+        return true;
+    }
+    doc.blocks.iter().any(|b| match b {
+        Block::Paragraph(p) => p
+            .section_end
+            .as_ref()
+            .is_some_and(|s| !s.header_refs.is_empty() || !s.footer_refs.is_empty()),
+        Block::Table(_) => false,
+    })
+}
+
 fn family_docx_name(f: &FontFamily) -> &str {
     f.display_name()
 }
@@ -344,7 +364,7 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
     out.push_str("<w:docDefaults><w:rPrDefault>");
     emit_rpr(&doc.style_run_defaults, &mut out);
     out.push_str("</w:rPrDefault><w:pPrDefault>");
-    emit_ppr(&doc.style_defaults, None, None, &mut out);
+    emit_ppr(&doc.style_defaults, None, None, None, &mut out);
     out.push_str("</w:pPrDefault></w:docDefaults>");
     let mut ids: Vec<&String> = doc.styles.keys().collect();
     ids.sort();
@@ -360,7 +380,7 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
             push_escaped_attr(parent, &mut out);
             out.push_str("\"/>");
         }
-        emit_ppr(&def.para, None, None, &mut out);
+        emit_ppr(&def.para, None, None, None, &mut out);
         emit_rpr(&def.run, &mut out);
         out.push_str("</w:style>");
     }
@@ -368,13 +388,25 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Emit a paragraph's `<w:pPr>`, children in the TRUE CT_PPrBase schema
+/// sequence (ECMA-376 §17.3.1.26): pStyle → keepNext → keepLines →
+/// pageBreakBefore → numPr → pBdr → shd → tabs → bidi → spacing → ind →
+/// jc, then (CT_PPr) `sectPr` as the final child. Phase 3 (#40) fixed
+/// the pre-existing ordering drift here (numPr used to trail; shd sat
+/// after spacing; bidi after jc) — strict OOXML validators reject the
+/// old sequence.
 fn emit_ppr(
     props: &ParaProperties,
     style_id: Option<&str>,
     list_item: Option<engine::ListItem>,
+    section_end: Option<&engine::SectionProps>,
     out: &mut String,
 ) {
-    if *props == ParaProperties::default() && style_id.is_none() && list_item.is_none() {
+    if *props == ParaProperties::default()
+        && style_id.is_none()
+        && list_item.is_none()
+        && section_end.is_none()
+    {
         return;
     }
     out.push_str("<w:pPr>");
@@ -393,10 +425,6 @@ fn emit_ppr(
         }
         out.push_str("\"/>");
     }
-    if *props == ParaProperties::default() {
-        /* Style-only paragraph: open + style + close. The structured
-        emit body below will skip every per-field block (all defaults). */
-    }
     if props.keep_next {
         out.push_str("<w:keepNext/>");
     }
@@ -406,8 +434,16 @@ fn emit_ppr(
     if props.page_break_before {
         out.push_str("<w:pageBreakBefore/>");
     }
-    /* Audit gap A.M4 — `<w:pBdr>` paragraph borders. CT_PPr ordering
-    places pBdr between pageBreakBefore and spacing. Each edge with a
+    /* Sprint 13 (#12) — `<w:numPr>` carries list membership. CT_PPrBase
+    places numPr directly after pageBreakBefore (framePr/widowControl,
+    which we don't model, sit between). */
+    if let Some(li) = list_item {
+        out.push_str(&format!(
+            "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
+            li.ilvl, li.num_id
+        ));
+    }
+    /* Audit gap A.M4 — `<w:pBdr>` paragraph borders. Each edge with a
     populated stroke emits as a child; absent edges silently omit. */
     if let Some(b) = props.borders.as_ref() {
         out.push_str("<w:pBdr>");
@@ -417,6 +453,14 @@ fn emit_ppr(
         emit_border_edge("w:right", &b.right, out);
         emit_border_edge("w:between", &b.inside_h, out);
         out.push_str("</w:pBdr>");
+    }
+    /* Paragraph shading mirrors the rPr / tcPr `<w:shd>` emitters: the
+    arbitrary RGB rides `w:fill` with a `clear` pattern; alpha has no
+    OOXML slot. */
+    if let Some([r, g, b, _]) = props.shading {
+        out.push_str(&format!(
+            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
+        ));
     }
     /* Audit gap A.M3 — `<w:tabs>` custom stops, child order preserved.
     Empty list ⇒ no element. `Clear` kind round-trips so a user-defined
@@ -435,6 +479,14 @@ fn emit_ppr(
             out.push_str(&format!("<w:tab w:val=\"{val}\" w:pos=\"{pos_twips}\"/>"));
         }
         out.push_str("</w:tabs>");
+    }
+    if let Some(d) = props.direction {
+        match d {
+            TextDirection::Rtl => out.push_str("<w:bidi/>"),
+            /* LTR is the default; we still emit `<w:bidi w:val="false"/>` so
+            an explicit user override round-trips faithfully. */
+            TextDirection::Ltr => out.push_str("<w:bidi w:val=\"false\"/>"),
+        }
     }
     /* `<w:spacing>` carries both before/after gaps and the line rule. We
     omit the element entirely when none of its attributes are set. */
@@ -456,14 +508,6 @@ fn emit_ppr(
             out.push_str(&format!(" w:line=\"{line}\" w:lineRule=\"{rule}\""));
         }
         out.push_str("/>");
-    }
-    /* Paragraph shading mirrors the rPr / tcPr `<w:shd>` emitters: the
-    arbitrary RGB rides `w:fill` with a `clear` pattern; alpha has no
-    OOXML slot. */
-    if let Some([r, g, b, _]) = props.shading {
-        out.push_str(&format!(
-            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
-        ));
     }
     let ind = &props.indent;
     if ind.start_twips != 0
@@ -489,22 +533,11 @@ fn emit_ppr(
     if let Some(a) = props.alignment {
         out.push_str(&format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
     }
-    if let Some(d) = props.direction {
-        match d {
-            TextDirection::Rtl => out.push_str("<w:bidi/>"),
-            /* LTR is the default; we still emit `<w:bidi w:val="false"/>` so
-            an explicit user override round-trips faithfully. */
-            TextDirection::Ltr => out.push_str("<w:bidi w:val=\"false\"/>"),
-        }
-    }
-    /* Sprint 13 (#12) — `<w:numPr>` carries list membership; emitted
-    last so it sits at the tail of `<w:pPr>` (Word's canonical
-    placement; CT_PPrBase's `numPr` follows the other body fields). */
-    if let Some(li) = list_item {
-        out.push_str(&format!(
-            "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
-            li.ilvl, li.num_id
-        ));
+    /* Phase 3 (#40) — a marker paragraph's interior `<w:sectPr>`: the
+    genuinely-last CT_PPr content child (only the never-emitted
+    pPrChange follows it in the schema). */
+    if let Some(sect) = section_end {
+        emit_sect_pr(sect, out);
     }
     out.push_str("</w:pPr>");
 }
@@ -520,7 +553,13 @@ fn serialize_paragraph(
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
     out.push_str("<w:p>");
-    emit_ppr(&para.props, para.style_id.as_deref(), para.list_item, out);
+    emit_ppr(
+        &para.props,
+        para.style_id.as_deref(),
+        para.list_item,
+        para.section_end.as_deref(),
+        out,
+    );
     /* `<w:br>` (Phase 2 audit, gap A.12) lives as U+2028 / U+000C in
     `para.text`; the structural `<w:r><w:br/></w:r>` emission needs
     the cut-point walk. The fast path stays open for plain
@@ -1220,7 +1259,10 @@ fn build_document_xml(doc: &DocumentTree, hyperlink_rel_map: &HashMap<String, St
     let mut out = String::with_capacity(2048);
     if doc_has_inline_images(doc) {
         out.push_str(DOC_XML_HEADER_WITH_DRAWING);
-    } else if doc_has_hyperlinks(doc) {
+    } else if doc_has_hyperlinks(doc) || doc_has_section_hf_refs(doc) {
+        /* Phase 3 (#40) — `<w:headerReference r:id>` (freshly emitted OR
+        riding a clean marker paragraph's passthrough bytes) needs
+        `xmlns:r` bound at the root exactly like `<w:hyperlink r:id>`. */
         out.push_str(DOC_XML_HEADER_WITH_RELS);
     } else {
         out.push_str(DOC_XML_HEADER);
@@ -1228,26 +1270,24 @@ fn build_document_xml(doc: &DocumentTree, hyperlink_rel_map: &HashMap<String, St
     for block in &doc.blocks {
         emit_block(block, &mut out, hyperlink_rel_map);
     }
-    /* Audit gap A.H2 / A.M11 / A.M12 — trailing body-level `<w:sectPr/>`
-    carries the last section's column / page-numbering / section-type
-    descriptors. Emit the full element only when one of them is non-
-    default; otherwise stay on the bare `<w:sectPr/>` form so existing
-    roundtrip fixtures stay byte-identical. */
-    let trailing_sect = doc.sections.last().cloned().unwrap_or_default();
-    let cols = trailing_sect.columns;
-    let pgn = trailing_sect.page_num;
-    let sect_type = trailing_sect.section_type;
-    let needs_full = cols.is_multi()
-        || pgn != engine::PageNumType::default()
-        || sect_type != engine::SectionType::default();
+    /* Phase 3 (#40, closing bug B3) — the trailing body-level
+    `<w:sectPr>` now emits the final section's FULL payload (geometry,
+    header/footer references, titlePg, cols, pgNumType, type) via
+    `emit_sect_pr`. The bare `<w:sectPr/>` form survives only for the
+    all-stock case so plain-document roundtrip fixtures stay
+    byte-identical. Interior sections emit through their marker
+    paragraph's `<w:pPr>` (see `emit_ppr`). */
+    let trailing = engine::SectionProps::from(&doc.effective_sections().pop().unwrap_or_default());
+    let needs_full = !trailing.header_refs.is_empty()
+        || !trailing.footer_refs.is_empty()
+        || trailing.title_pg
+        || trailing.columns.is_multi()
+        || trailing.page_num != engine::PageNumType::default()
+        || trailing.section_type != engine::SectionType::default()
+        || !geometry_is_stock_a4(&trailing.geometry);
     if needs_full {
-        out.push_str("<w:sectPr>");
-        if cols.is_multi() {
-            emit_cols(cols, &mut out);
-        }
-        emit_pg_num_type(pgn, &mut out);
-        emit_sect_type(sect_type, &mut out);
-        out.push_str("</w:sectPr></w:body></w:document>");
+        emit_sect_pr(&trailing, &mut out);
+        out.push_str("</w:body></w:document>");
     } else {
         out.push_str(DOC_XML_FOOTER);
     }
@@ -1300,6 +1340,94 @@ fn emit_cols(cols: engine::ColumnSpec, out: &mut String) {
         "<w:cols w:num=\"{}\" w:space=\"{}\"/>",
         cols.count, space_twips
     ));
+}
+
+/// Phase 3 (#40) — one `<w:headerReference|w:footerReference w:type
+/// r:id/>` per populated role slot, stable default → first → even order.
+/// Requires `xmlns:r` bound at the document root
+/// ([`doc_has_section_hf_refs`] feeds the root-variant selection).
+fn emit_hf_references(elem: &str, refs: &engine::HeaderFooterRefs, out: &mut String) {
+    for (role, rid) in [
+        ("default", refs.default.as_deref()),
+        ("first", refs.first.as_deref()),
+        ("even", refs.even.as_deref()),
+    ] {
+        if let Some(rid) = rid {
+            out.push_str(&format!("<{elem} w:type=\"{role}\" r:id=\""));
+            for ch in rid.chars() {
+                match ch {
+                    '&' => out.push_str("&amp;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    '"' => out.push_str("&quot;"),
+                    other => out.push(other),
+                }
+            }
+            out.push_str("\"/>");
+        }
+    }
+}
+
+/// Phase 3 (#40) — emit one complete `<w:sectPr>…</w:sectPr>` from a
+/// [`engine::SectionProps`], children in the TRUE CT_SectPr schema
+/// sequence (ECMA-376 §17.6.17): headerReference*/footerReference* →
+/// type → pgSz → pgMar → pgNumType → cols → titlePg. `pgSz`/`pgMar`
+/// always emit (Word stamps them in every sectPr it writes — dropping
+/// them makes Word fall back to Letter on reopen); the remaining
+/// children skip their defaults. `w:orient="landscape"` rides pgSz when
+/// width exceeds height, closing audit gap C.5's metadata loss.
+fn emit_sect_pr(props: &engine::SectionProps, out: &mut String) {
+    out.push_str("<w:sectPr>");
+    emit_hf_references("w:headerReference", &props.header_refs, out);
+    emit_hf_references("w:footerReference", &props.footer_refs, out);
+    emit_sect_type(props.section_type, out);
+    let g = &props.geometry;
+    let tw = |pt: f32| (pt * 20.0).round() as i64;
+    out.push_str(&format!(
+        "<w:pgSz w:w=\"{}\" w:h=\"{}\"",
+        tw(g.width),
+        tw(g.height)
+    ));
+    if g.width > g.height {
+        out.push_str(" w:orient=\"landscape\"");
+    }
+    out.push_str("/>");
+    out.push_str(&format!(
+        "<w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"{}\" w:footer=\"{}\"/>",
+        tw(g.margin_top),
+        tw(g.margin_right),
+        tw(g.margin_bottom),
+        tw(g.margin_left),
+        tw(g.header_offset),
+        tw(g.footer_offset)
+    ));
+    emit_pg_num_type(props.page_num, out);
+    if props.columns.is_multi() {
+        emit_cols(props.columns, out);
+    }
+    if props.title_pg {
+        out.push_str("<w:titlePg/>");
+    }
+    out.push_str("</w:sectPr>");
+}
+
+/// Phase 3 (#40) — exact-compare against the stock A4 constructor. The
+/// bit-compare is deliberate: an untouched geometry derives from the
+/// same `from_twips` integer division as `a4()`, so it is bit-identical;
+/// any mutation (margins dialog, orientation swap, imported non-A4 page)
+/// diverges and forces full trailing-sectPr emission. Keeps the bare
+/// `<w:sectPr/>` footer — and with it byte-stable round-trips — for the
+/// plain-document fixtures.
+fn geometry_is_stock_a4(g: &engine::PageGeometry) -> bool {
+    let a4 = engine::PageGeometry::a4();
+    g.width.to_bits() == a4.width.to_bits()
+        && g.height.to_bits() == a4.height.to_bits()
+        && g.margin_top.to_bits() == a4.margin_top.to_bits()
+        && g.margin_right.to_bits() == a4.margin_right.to_bits()
+        && g.margin_bottom.to_bits() == a4.margin_bottom.to_bits()
+        && g.margin_left.to_bits() == a4.margin_left.to_bits()
+        && g.header_offset.to_bits() == a4.header_offset.to_bits()
+        && g.footer_offset.to_bits() == a4.footer_offset.to_bits()
 }
 
 /// Repack `archive`'s sibling entries verbatim + a freshly serialized
@@ -1414,6 +1542,58 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             hyperlink_rel_map(doc, &existing_rels, hyperlink_next);
         let needs_hyperlink_rels_splice = !new_hyperlink_rel_entries.is_empty();
 
+        /* Phase 3 (#39) — regenerate every DIRTY header/footer part.
+        A dirty rid with an existing rels entry replaces that part's
+        bytes in the passthrough loop below (an edited imported
+        header); a dirty rid unknown to the rels (an engine-minted
+        `ngeHfN`) becomes a fresh `word/headerN.xml` / `footerN.xml`
+        appended after the loop, with its `<Relationship>` +
+        `<Override>` rows spliced in. Clean parts ride the passthrough
+        byte-identical. */
+        let mut hf_replacements: HashMap<String, Vec<u8>> = HashMap::new();
+        /* (rid, part name, bytes, rel type, content type) */
+        let mut hf_new_parts: Vec<(String, String, Vec<u8>, &str, &str)> = Vec::new();
+        {
+            let mut planned: Vec<String> = Vec::new();
+            let mut plan =
+                |rid: &String, paras: &Vec<Paragraph>, header: bool, planned: &mut Vec<String>| {
+                    let bytes = build_hf_xml(paras, header);
+                    match existing_rels.items.iter().find(|r| &r.id == rid) {
+                        Some(rel) => {
+                            /* Rels targets are `word/`-relative. */
+                            let target = if rel.target.starts_with("word/") {
+                                rel.target.clone()
+                            } else {
+                                format!("word/{}", rel.target)
+                            };
+                            hf_replacements.insert(target, bytes);
+                        }
+                        None => {
+                            let prefix = if header { "header" } else { "footer" };
+                            let name = next_hf_part_name(prefix, &archive.other_entries, planned);
+                            planned.push(name.clone());
+                            let (rel_type, content_type) = if header {
+                                (HEADER_REL_TYPE, HEADER_CONTENT_TYPE)
+                            } else {
+                                (FOOTER_REL_TYPE, FOOTER_CONTENT_TYPE)
+                            };
+                            hf_new_parts.push((rid.clone(), name, bytes, rel_type, content_type));
+                        }
+                    }
+                };
+            for rid in &doc.hf_dirty.headers {
+                if let Some(paras) = doc.headers.get(rid) {
+                    plan(rid, paras, true, &mut planned);
+                }
+            }
+            for rid in &doc.hf_dirty.footers {
+                if let Some(paras) = doc.footers.get(rid) {
+                    plan(rid, paras, false, &mut planned);
+                }
+            }
+        }
+        let synth_hf = !hf_new_parts.is_empty();
+
         /* Write sibling entries verbatim, in original order — except
         for parts we have a regenerated copy for (replace in-place).
         `[Content_Types].xml` and `word/_rels/document.xml.rels` may
@@ -1441,7 +1621,12 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                 && let Some(new_bytes) = styles_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
-            } else if name == "[Content_Types].xml" && (synth_comments || synth_extended) {
+            } else if let Some(new_bytes) = hf_replacements.get(name.as_str()) {
+                /* Phase 3 (#39) — an edited imported header/footer part. */
+                zip.write_all(new_bytes)?;
+            } else if name == "[Content_Types].xml"
+                && (synth_comments || synth_extended || synth_hf)
+            {
                 let raw = std::str::from_utf8(bytes)?;
                 let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
                 if synth_comments {
@@ -1464,9 +1649,19 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                         Cow::Owned(s) => Cow::Owned(s),
                     };
                 }
+                /* Phase 3 (#39) — one Override per fresh header/footer
+                part (part names carry the leading slash per OPC). */
+                for (_, part_name, _, _, content_type) in &hf_new_parts {
+                    let with_slash = format!("/{part_name}");
+                    patched =
+                        match inject_content_type_override(&patched, &with_slash, content_type) {
+                            Cow::Borrowed(_) => patched,
+                            Cow::Owned(s) => Cow::Owned(s),
+                        };
+                }
                 zip.write_all(patched.as_bytes())?;
             } else if name == RELS_XML
-                && (synth_comments || synth_extended || needs_hyperlink_rels_splice)
+                && (synth_comments || synth_extended || needs_hyperlink_rels_splice || synth_hf)
             {
                 let raw = std::str::from_utf8(bytes)?;
                 let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
@@ -1505,6 +1700,17 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                 for (rid, target) in &new_hyperlink_rel_entries {
                     let new =
                         inject_doc_rel(&patched, rid, HYPERLINK_REL_TYPE, target, Some("External"));
+                    if let Cow::Owned(s) = new {
+                        patched = Cow::Owned(s);
+                    }
+                }
+                /* Phase 3 (#39) — one Relationship per fresh header/footer
+                part, carrying the ENGINE's rid verbatim (`ngeHfN` —
+                collision-proof against Word's `rIdN` sequence by
+                prefix). Targets are `word/`-relative. */
+                for (rid, part_name, _, rel_type, _) in &hf_new_parts {
+                    let target = part_name.strip_prefix("word/").unwrap_or(part_name);
+                    let new = inject_doc_rel(&patched, rid, rel_type, target, None);
                     if let Cow::Owned(s) = new {
                         patched = Cow::Owned(s);
                     }
@@ -1549,7 +1755,7 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         Override is needed for a `.rels` part itself (it rides the
         `Default Extension="rels"` catch-all every archive already
         carries). */
-        if !rels_already_present && needs_hyperlink_rels_splice {
+        if !rels_already_present && (needs_hyperlink_rels_splice || synth_hf) {
             let mut fresh = String::with_capacity(256);
             fresh.push_str(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -1560,9 +1766,25 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                     "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL_TYPE}\" Target=\"{target}\" TargetMode=\"External\"/>\n"
                 ));
             }
+            /* Phase 3 (#39) — fresh header/footer rels on a document
+            that never had a rels part. */
+            for (rid, part_name, _, rel_type, _) in &hf_new_parts {
+                let target = part_name.strip_prefix("word/").unwrap_or(part_name);
+                fresh.push_str(&format!(
+                    "<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>\n"
+                ));
+            }
             fresh.push_str("</Relationships>");
             zip.start_file(RELS_XML, opts)?;
             zip.write_all(fresh.as_bytes())?;
+        }
+
+        /* Phase 3 (#39) — append every freshly-minted header/footer
+        part. Content_Types + rels rows were spliced in the loop above
+        (or the fresh-rels branch). */
+        for (_, part_name, bytes, _, _) in &hf_new_parts {
+            zip.start_file(part_name, opts)?;
+            zip.write_all(bytes)?;
         }
 
         /* Write the regenerated document.xml. */
@@ -1713,6 +1935,77 @@ const COMMENTS_PART_NAME: &str = "/word/comments.xml";
 const COMMENTS_EXT_PART_NAME: &str = "/word/commentsExtended.xml";
 const COMMENTS_REL_TARGET: &str = "comments.xml";
 const COMMENTS_EXT_REL_TARGET: &str = "commentsExtended.xml";
+
+/* Phase 3 (#39) — OPC plumbing for header/footer parts. */
+const HEADER_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
+const FOOTER_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml";
+const HEADER_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";
+const FOOTER_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
+
+/// Phase 3 (#39) — serialize one header/footer story into a complete
+/// `word/headerN.xml` / `word/footerN.xml` part. The root element picks
+/// its OWN xmlns variant by scanning the part's paragraphs — a header
+/// can carry a logo image or a hyperlink the body doesn't have, so the
+/// body's root-variant choice must never be reused here.
+fn build_hf_xml(paras: &[Paragraph], header: bool) -> Vec<u8> {
+    let has_image = paras.iter().any(|p| {
+        p.inline_objects
+            .iter()
+            .any(|o| matches!(o.kind, InlineKind::Image { .. }))
+    });
+    let has_link = paras.iter().any(|p| !p.hyperlinks.is_empty());
+    let tag = if header { "w:hdr" } else { "w:ftr" };
+    let mut out = String::with_capacity(512);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    out.push('<');
+    out.push_str(tag);
+    out.push_str(" xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"");
+    if has_image {
+        out.push_str(
+            " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\
+             \u{20}xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"\
+             \u{20}xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"\
+             \u{20}xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"",
+        );
+    } else if has_link {
+        out.push_str(
+            " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+        );
+    }
+    out.push('>');
+    /* Header/footer hyperlinks would need rels of their OWN part
+    (word/_rels/headerN.xml.rels) re-minted — out of v1 scope; the
+    empty map serializes their text without an `r:id`. Tracked as a
+    follow-up alongside tables-in-headers. */
+    let empty_rels: HashMap<String, String> = HashMap::new();
+    for p in paras {
+        serialize_paragraph(p, &mut out, &empty_rels);
+    }
+    out.push_str("</");
+    out.push_str(tag);
+    out.push('>');
+    out.into_bytes()
+}
+
+/// Phase 3 (#39) — smallest positive N such that `word/{prefix}N.xml`
+/// collides with neither an existing archive entry nor an
+/// already-planned fresh part.
+fn next_hf_part_name(prefix: &str, existing: &[(String, Vec<u8>)], planned: &[String]) -> String {
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("word/{prefix}{n}.xml");
+        let taken = existing.iter().any(|(name, _)| name == &candidate)
+            || planned.iter().any(|name| name == &candidate);
+        if !taken {
+            return candidate;
+        }
+        n = n.saturating_add(1);
+    }
+}
 
 /// L1.2 (#18) — additive-or-noop splice of a `<Override>` row into an
 /// existing `[Content_Types].xml`. Returns `Cow::Borrowed` when the
@@ -1916,6 +2209,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -1954,6 +2248,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -1996,6 +2291,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -2052,6 +2348,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -2094,6 +2391,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -2194,6 +2492,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -2673,7 +2972,7 @@ mod tests {
             zip.finish().unwrap();
         }
         let parsed = read_docx(&buf).expect("read");
-        let sections = &parsed.document.sections;
+        let sections = parsed.document.effective_sections();
         assert_eq!(sections.len(), 1, "expected one section");
         let s = &sections[0];
         assert_eq!(s.header_refs.default.as_deref(), Some("rIdH1"));
@@ -2683,6 +2982,344 @@ mod tests {
         assert!(s.footer_refs.first.is_none());
         assert!(s.footer_refs.even.is_none());
         assert!(s.title_pg, "<w:titlePg/> toggle must capture as on");
+    }
+
+    /* ================================================================
+    Phase 3 (#40) — full sectPr emission (bug B3). Interior sections
+    emit through their marker paragraph's <w:pPr>; the trailing body
+    section emits its complete payload; the bare <w:sectPr/> footer
+    survives only for the all-stock case.
+    ================================================================ */
+
+    #[test]
+    fn authored_mid_document_section_break_round_trips() {
+        /* Engine-authored two-section document (synthesised paragraphs,
+        no source_xml → the serialize path, not passthrough): the
+        interior section's geometry + the second section's Continuous
+        type must survive write → re-read. Pre-Phase-3 the writer
+        dropped every non-trailing section on save. */
+        let blocks = vec![
+            Block::Paragraph(Paragraph {
+                text: "first section".into(),
+                ..Default::default()
+            }),
+            Block::Paragraph(Paragraph {
+                text: "second section".into(),
+                ..Default::default()
+            }),
+        ];
+        let mut narrow = engine::PageGeometry::a4();
+        narrow.margin_left = 30.0;
+        let sections = vec![
+            engine::Section {
+                geometry: narrow,
+                start_block: 0,
+                end_block: 1,
+                ..Default::default()
+            },
+            engine::Section {
+                start_block: 1,
+                end_block: 2,
+                section_type: engine::SectionType::Continuous,
+                ..Default::default()
+            },
+        ];
+        let doc = DocumentTree::from_blocks_with_sections(blocks, sections);
+        let archive = DocxArchive {
+            other_entries: Vec::new(),
+            document: doc.clone(),
+        };
+        let saved = write_docx(&archive, &doc).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        let sections = reopened.document.effective_sections();
+        assert_eq!(sections.len(), 2, "both sections survive the round trip");
+        assert!((sections[0].geometry.margin_left - 30.0).abs() < 0.1);
+        assert_eq!(sections[1].section_type, engine::SectionType::Continuous);
+        /* And the boundary sits between the two paragraphs. */
+        assert_eq!((sections[0].start_block, sections[0].end_block), (0, 1));
+        assert_eq!((sections[1].start_block, sections[1].end_block), (1, 2));
+    }
+
+    #[test]
+    fn imported_mid_document_section_survives_edit_and_save() {
+        /* Reader → marker conversion → hyperlink-resolution rebuild →
+        writer, with an EDIT above the boundary in between: the classic
+        pre-Phase-3 desync + writer-drop double bug. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p><w:pPr><w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="2880" w:header="720" w:footer="720"/></w:sectPr></w:pPr><w:r><w:t xml:space="preserve">one</w:t></w:r></w:p>
+<w:p><w:r><w:t xml:space="preserve">two</w:t></w:r></w:p>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let parsed = read_docx(&buf).expect("read");
+        assert_eq!(parsed.document.effective_sections().len(), 2);
+        /* Split the FIRST paragraph — the marker paragraph itself. The
+        marker rides the right half; both derived boundaries shift. */
+        let edited = parsed
+            .document
+            .split_paragraph(engine::LogicalPos::new(engine::BlockPath::top(0), 1));
+        let sections = edited.effective_sections();
+        assert_eq!(sections.len(), 2, "boundary survived the edit");
+        assert_eq!((sections[0].start_block, sections[0].end_block), (0, 2));
+        let saved = write_docx(&parsed, &edited).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        let sections = reopened.document.effective_sections();
+        assert_eq!(sections.len(), 2, "boundary survived the save");
+        assert!(
+            (sections[0].geometry.margin_left - 144.0).abs() < 0.1,
+            "interior section's 2880-twip left margin survives: {:?}",
+            sections[0].geometry
+        );
+    }
+
+    #[test]
+    fn trailing_sectpr_emits_full_payload_and_binds_xmlns_r() {
+        let mut doc = DocumentTree::from_text("hello");
+        doc.body_section.geometry.margin_left = 100.0;
+        doc.body_section.header_refs.default = Some("rIdH9".to_string());
+        doc.body_section.title_pg = true;
+        let xml = build_document_xml(&doc, &HashMap::new());
+        assert!(
+            xml.contains("xmlns:r="),
+            "headerReference needs xmlns:r bound at the root: {xml}"
+        );
+        assert!(xml.contains(r#"<w:headerReference w:type="default" r:id="rIdH9"/>"#));
+        assert!(
+            xml.contains(r#"w:left="2000""#),
+            "100pt = 2000 twips: {xml}"
+        );
+        assert!(xml.contains("<w:titlePg/>"));
+        /* CT_SectPr order: the reference precedes pgSz. */
+        let r = xml.find("<w:headerReference").unwrap();
+        let s = xml.find("<w:pgSz").unwrap();
+        assert!(r < s, "headerReference must precede pgSz");
+    }
+
+    #[test]
+    fn stock_document_keeps_bare_trailing_sectpr() {
+        /* Byte-stability: an untouched default-A4 document keeps the
+        legacy bare footer so plain roundtrip fixtures see no drift. */
+        let doc = DocumentTree::from_text("hello");
+        let xml = build_document_xml(&doc, &HashMap::new());
+        assert!(
+            xml.ends_with("<w:sectPr/></w:body></w:document>"),
+            "stock doc must stay on the bare footer: {xml}"
+        );
+    }
+
+    #[test]
+    fn landscape_trailing_geometry_emits_orient() {
+        let mut doc = DocumentTree::from_text("hello");
+        let g = &mut doc.body_section.geometry;
+        std::mem::swap(&mut g.width, &mut g.height);
+        let xml = build_document_xml(&doc, &HashMap::new());
+        assert!(
+            xml.contains(r#"w:orient="landscape""#),
+            "audit gap C.5 — landscape must stamp w:orient: {xml}"
+        );
+    }
+
+    #[test]
+    fn sect_pr_children_follow_schema_order() {
+        let mut props = engine::SectionProps::default();
+        props.header_refs.default = Some("rId1".into());
+        props.footer_refs.default = Some("rId2".into());
+        props.section_type = engine::SectionType::Continuous;
+        props.page_num.start = Some(5);
+        props.columns = engine::ColumnSpec {
+            count: 2,
+            gutter_pt: 36.0,
+        };
+        props.title_pg = true;
+        let mut out = String::new();
+        emit_sect_pr(&props, &mut out);
+        let order = [
+            "<w:headerReference",
+            "<w:footerReference",
+            "<w:type",
+            "<w:pgSz",
+            "<w:pgMar",
+            "<w:pgNumType",
+            "<w:cols",
+            "<w:titlePg/>",
+            "</w:sectPr>",
+        ];
+        let mut cursor = 0usize;
+        for tag in order {
+            let off = out[cursor..]
+                .find(tag)
+                .unwrap_or_else(|| panic!("expected {tag} after {cursor}; xml={out}"));
+            cursor += off + tag.len();
+        }
+    }
+
+    /* ================================================================
+    Phase 3 (#39) — header/footer part write-back.
+    ================================================================ */
+
+    #[test]
+    fn engine_authored_header_full_opc_round_trip() {
+        /* The #39 money path: a story-authored header on a fresh
+        document must mint the part + rels row + content-type Override
+        + headerReference, and survive a full write → re-read. */
+        let doc = DocumentTree::from_text("body text")
+            .with_updated_header_part(
+                "ngeHf1",
+                vec![Paragraph {
+                    text: "Header A".into(),
+                    ..Default::default()
+                }],
+            )
+            .set_section_hf_default_ref_at(
+                engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+                true,
+                "ngeHf1",
+            );
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let reopened = read_docx(&bytes).expect("reread");
+        assert_eq!(
+            reopened.document.headers["ngeHf1"][0].text, "Header A",
+            "header content survives the OPC round trip"
+        );
+        let sections = reopened.document.effective_sections();
+        assert_eq!(
+            sections[0].header_refs.default.as_deref(),
+            Some("ngeHf1"),
+            "sectPr headerReference survives"
+        );
+        /* The plumbing rows landed. */
+        let ct = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "[Content_Types].xml")
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .expect("content types");
+        assert!(ct.contains("/word/header1.xml"));
+        assert!(ct.contains(HEADER_CONTENT_TYPE));
+        let rels = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == RELS_XML)
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .expect("rels");
+        assert!(rels.contains("Id=\"ngeHf1\""));
+        assert!(rels.contains(HEADER_REL_TYPE));
+    }
+
+    /// Shared fixture: an archive with one imported header part wired
+    /// through rels + content types + a body-level headerReference.
+    fn archive_with_imported_header() -> DocxArchive {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:body>
+<w:p><w:r><w:t xml:space="preserve">body</w:t></w:r></w:p>
+<w:sectPr><w:headerReference w:type="default" r:id="rId7"/></w:sectPr>
+</w:body>
+</w:document>"#;
+        let header_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t xml:space="preserve">Imported</w:t></w:r></w:p></w:hdr>"#;
+        let rels_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+</Relationships>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/_rels/document.xml.rels", rels_xml),
+                ("word/header1.xml", header_xml),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        read_docx(&buf).expect("read fixture")
+    }
+
+    #[test]
+    fn edited_imported_header_regenerates_only_its_part() {
+        let archive = archive_with_imported_header();
+        assert_eq!(archive.document.headers["rId7"][0].text, "Imported");
+        let edited = archive.document.with_updated_header_part(
+            "rId7",
+            vec![Paragraph {
+                text: "Edited header".into(),
+                ..Default::default()
+            }],
+        );
+        let saved = write_docx(&archive, &edited).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        assert_eq!(reopened.document.headers["rId7"][0].text, "Edited header");
+        /* Sibling entries stay byte-identical (docx.md invariant). */
+        for (name, bytes) in &archive.other_entries {
+            if name == "word/header1.xml" {
+                continue;
+            }
+            let after = reopened
+                .other_entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, b)| b);
+            assert_eq!(after, Some(bytes), "{name} must ride the passthrough");
+        }
+    }
+
+    #[test]
+    fn clean_imported_header_rides_the_passthrough() {
+        let archive = archive_with_imported_header();
+        let saved = write_docx(&archive, &archive.document).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        let before = archive
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "word/header1.xml")
+            .map(|(_, b)| b.clone())
+            .expect("fixture header");
+        let after = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "word/header1.xml")
+            .map(|(_, b)| b.clone())
+            .expect("header survives");
+        assert_eq!(before, after, "clean header part must be byte-identical");
     }
 
     /// Audit gap A.H2 — `<w:cols w:num w:space/>` round-trip. Reader
@@ -2723,7 +3360,8 @@ mod tests {
             zip.finish().unwrap();
         }
         let parsed = read_docx(&buf).expect("read");
-        let sect = parsed.document.sections.last().expect("section");
+        let sections = parsed.document.effective_sections();
+        let sect = sections.last().expect("section");
         assert_eq!(sect.columns.count, 2);
         assert!(
             (sect.columns.gutter_pt - 18.0).abs() < 0.001,
@@ -2753,7 +3391,8 @@ mod tests {
             xml.contains("<w:cols w:num=\"2\" w:space=\"360\"/>"),
             "writer dropped `<w:cols>` on round-trip; got: {xml}"
         );
-        let sect2 = archive.document.sections.last().expect("section after");
+        let sections2 = archive.document.effective_sections();
+        let sect2 = sections2.last().expect("section after");
         assert_eq!(sect2.columns.count, 2);
     }
 
@@ -3201,6 +3840,7 @@ mod tests {
                 fields: Vec::new(),
                 style_id: None,
                 direct_overrides: engine::ParaProperties::default(),
+                section_end: None,
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -3256,6 +3896,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -3317,6 +3958,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3344,6 +3986,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -3361,10 +4004,13 @@ mod tests {
 
     #[test]
     fn ppr_child_order_matches_schema() {
-        /* Schema mandates keepNext, keepLines, pageBreakBefore, spacing, ind,
-        jc, bidi in that order. Word rejects out-of-order children with a
-        repair dialog, so this is load-bearing. */
-        use engine::{Indent, Spacing, TextDirection};
+        /* Phase 3 (#40) — corrected to the TRUE CT_PPrBase sequence
+        (ECMA-376 §17.3.1.26): keepNext, keepLines, pageBreakBefore,
+        numPr, shd, bidi, spacing, ind, jc, then sectPr as the final
+        CT_PPr content child. The pre-Phase-3 order (numPr trailing,
+        shd after spacing, bidi after jc) was off-spec — strict
+        validators and Word's repair dialog reject it. */
+        use engine::{Indent, ListItem, Spacing, TextDirection};
         let para = Paragraph {
             text: "x".into(),
             spans: Vec::new(),
@@ -3385,7 +4031,7 @@ mod tests {
                 shading: Some([0xFF, 0xEE, 0xDD, 0xFF]),
                 ..Default::default()
             },
-            list_item: None,
+            list_item: Some(ListItem { num_id: 1, ilvl: 0 }),
             resolved_marker: None,
             resolved_list_indent: None,
             dirty: false,
@@ -3396,6 +4042,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: Some(Box::new(engine::SectionProps::default())),
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -3403,11 +4050,14 @@ mod tests {
             "<w:keepNext/>",
             "<w:keepLines/>",
             "<w:pageBreakBefore/>",
-            "<w:spacing",
+            "<w:numPr>",
             "<w:shd",
+            "<w:bidi",
+            "<w:spacing",
             "<w:ind",
             "<w:jc",
-            "<w:bidi",
+            "<w:sectPr>",
+            "</w:pPr>",
         ];
         let mut cursor = p;
         for tag in order {
@@ -3940,6 +4590,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
+            section_end: None,
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -4433,6 +5084,7 @@ mod tests {
             fields: Vec::new(),
             style_id: Some("Heading1".into()),
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");

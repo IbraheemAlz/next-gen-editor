@@ -90,15 +90,6 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     };
     let resolver = StyleResolver::new(&style_table);
     let mut document = parse_document_xml(&xml, &resolver)?;
-    /* Issue #61 — both rebuild passes below reconstruct the tree via
-    `DocumentTree::from_blocks_with_sections`, which hardcodes
-    `comment_ranges: Vec::new()` (it has no parameter for it, unlike
-    `sections`/`headers`/`footers`, which those call sites explicitly
-    take out and restore). Capture the parser's original comment ranges
-    once, up front, and restore them after every rebuild has run —
-    nothing between here and the restoration below reads or mutates
-    `comment_ranges`, so this is a pure carry-through. */
-    let comment_ranges = std::mem::take(&mut document.comment_ranges);
 
     /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
     numbering resolver. Second pass over the parsed paragraphs fills each
@@ -113,15 +104,17 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     };
     if !numbering.num_instances.is_empty() {
         /* `im::Vector` clones cheaply; we collect into a Vec to mutate
-        in-place, then rebuild the tree. `resolve_markers_blocks` only
-        writes `Paragraph::resolved_marker` and skips `Block::Table`,
-        so structurally-shared fields cost nothing here and tables
-        preserve their identity. Phase 6 — preserve the section table
-        the document parser collected from `<w:sectPr>`. */
+        in-place. `resolve_markers_blocks` only writes
+        `Paragraph::resolved_marker` and skips `Block::Table`, so tables
+        preserve their identity. Phase 3 (#40) — section markers ride the
+        paragraphs themselves and `body_section` never leaves `document`,
+        so replacing the block list IS the whole rebuild (the old
+        rebuild-via-`from_blocks_with_sections` zeroed unrelated fields
+        and needed take/restore dances for sections + comment_ranges —
+        the exact bug class issue #61 patched around). */
         let mut blocks: Vec<_> = document.blocks.iter().cloned().collect();
         resolve_markers_blocks(&mut blocks, &numbering);
-        let sections = std::mem::take(&mut document.sections);
-        document = DocumentTree::from_blocks_with_sections(blocks, sections);
+        document.blocks = blocks.into_iter().collect();
     }
 
     /* Phase 6b — header / footer wiring. The rels table maps each
@@ -149,8 +142,11 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     `HeaderFooterRefs` instead of a single `Option<String>`; resolve
     every populated slot so the `default` / `first` / `even` parts
     all land in the headers/footers maps. The map is keyed by `r:id`
-    so a single header part shared across roles only parses once. */
-    for section in &document.sections {
+    so a single header part shared across roles only parses once.
+    Phase 3 (#40) — sections are derived from the paragraph markers +
+    `body_section` on demand. */
+    let sections = document.effective_sections();
+    for section in &sections {
         for rid in [
             section.header_refs.default.as_deref(),
             section.header_refs.first.as_deref(),
@@ -215,21 +211,19 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
             );
         }
     }
-    /* Resolve hyperlink targets across every paragraph. */
-    let blocks: Vec<_> = document
+    /* Resolve hyperlink targets across every paragraph. Phase 3 (#40) —
+    a straight block-list replacement: section markers ride the
+    paragraphs (resolve_hyperlinks_block preserves every non-hyperlink
+    field), and body_section / headers / footers / comment_ranges never
+    leave `document`, so the old take/rebuild/restore dance (issue #61)
+    is gone. */
+    document.blocks = document
         .blocks
         .iter()
         .cloned()
         .map(|b| resolve_hyperlinks_block(b, &rels))
         .collect();
-    let sections = std::mem::take(&mut document.sections);
-    let headers = std::mem::take(&mut document.headers);
-    let footers = std::mem::take(&mut document.footers);
-    document = DocumentTree::from_blocks_with_sections(blocks, sections)
-        .with_header_footer_parts(headers, footers);
     document.media = media;
-    /* Issue #61 — restore the comment ranges the rebuilds above dropped. */
-    document.comment_ranges = comment_ranges;
 
     /* Sprint 12 (#11) — mirror the `StyleTable` into the engine model
     so the live editor can apply / re-resolve styles without the

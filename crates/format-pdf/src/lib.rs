@@ -1260,6 +1260,8 @@ mod tests {
             blocks: vec![LayoutBlock::Paragraph(para)],
             header: None,
             footer: None,
+            header_offset: 36.0,
+            footer_offset: 36.0,
             footnotes: Vec::new(),
         }
     }
@@ -1411,6 +1413,8 @@ mod tests {
             blocks: vec![LayoutBlock::Table(table)],
             header: None,
             footer: None,
+            header_offset: 36.0,
+            footer_offset: 36.0,
             footnotes: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1511,6 +1515,8 @@ mod tests {
                 blocks: vec![LayoutBlock::Table(table)],
                 header: None,
                 footer: None,
+                header_offset: 36.0,
+                footer_offset: 36.0,
                 footnotes: Vec::new(),
             }
         }
@@ -1540,6 +1546,8 @@ mod tests {
             blocks: vec![],
             header: None,
             footer: None,
+            header_offset: 36.0,
+            footer_offset: 36.0,
             footnotes: Vec::new(),
         };
         let mut out = Vec::new();
@@ -1882,6 +1890,8 @@ mod tests {
             blocks: vec![LayoutBlock::Paragraph(para)],
             header: None,
             footer: None,
+            header_offset: 36.0,
+            footer_offset: 36.0,
             footnotes: Vec::new(),
         };
         let mut out = Vec::new();

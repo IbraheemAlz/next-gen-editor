@@ -69,3 +69,65 @@
     color: var(--nge-color-warning);
     font: 500 var(--nge-font-size-xs)/1.3 var(--nge-font-ui);
 }
+
+/* Phase 3 (#40) — Breaks popover menu. */
+.nge-layout__breaks {
+    position: relative;
+    display: inline-flex;
+}
+
+.nge-layout__breaks-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: var(--nge-z-popover);
+    min-width: 240px;
+    margin: 0;
+    padding: var(--nge-space-1);
+    list-style: none;
+    background: var(--nge-color-surface);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-md);
+}
+
+.nge-layout__breaks-item {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--nge-space-3);
+    padding: var(--nge-space-2);
+    border: none;
+    border-radius: var(--nge-radius-sm);
+    background: transparent;
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm)/1.2 var(--nge-font-ui);
+    text-align: start;
+    cursor: pointer;
+}
+
+.nge-layout__breaks-item:hover:not([disabled]) {
+    background: var(--nge-color-primary);
+    color: #ffffff;
+}
+
+.nge-layout__breaks-item[disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.nge-layout__breaks-kbd {
+    color: var(--nge-color-text-muted);
+    font-size: var(--nge-font-size-xs);
+}
+
+.nge-layout__breaks-item:hover:not([disabled]) .nge-layout__breaks-kbd {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+.nge-layout__breaks-sep {
+    height: 1px;
+    margin: var(--nge-space-1) 0;
+    background: var(--nge-color-border);
+}

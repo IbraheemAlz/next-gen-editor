@@ -63,12 +63,14 @@ pub struct DocumentTree {
     /// any document position. Still `im::Vector` so undo snapshots clone
     /// in O(1) — table cells use plain `Vec<Block>` instead.
     pub blocks: Vector<Block>,
-    /// Phase 6 — `<w:sectPr>`. One `Section` per OOXML section, in document
-    /// order. Each owns a half-open `[start, end)` block range and the page
-    /// geometry the paginator uses for that range. Empty `Vec` ⇒ the engine
-    /// applies a single implicit A4 section over the whole document (the
-    /// pre-Phase-6 behaviour).
-    pub sections: Vec<Section>,
+    /// Phase 3 (#40) — the body-level trailing `<w:sectPr>` governing the
+    /// FINAL section. Interior section boundaries live on their closing
+    /// paragraphs ([`Paragraph::section_end`]); the derived per-range view
+    /// is [`Self::effective_sections`]. Default = a single implicit A4
+    /// section over the whole document — a fresh document therefore always
+    /// has a mutable trailing section (the pre-Phase-3 empty-`Vec` model
+    /// made `set_section_*` silent no-ops on new documents).
+    pub body_section: SectionProps,
     /// Phase 6b — parsed header parts keyed by the OOXML relationship id
     /// (`r:id` from `<w:headerReference>`). Each value is the flat
     /// per-paragraph plain text the header reader extracted. The
@@ -132,6 +134,10 @@ pub struct DocumentTree {
     /// actually appends new entries; the writer then regenerates
     /// the part, otherwise the OPC passthrough byte-identical.
     pub numbering: numbering::NumberingDefinitions,
+    /// Phase 3 (#39) — header/footer parts whose content the engine
+    /// mutated (or created) since load; the writer regenerates exactly
+    /// these and passthroughs the rest byte-identical.
+    pub hf_dirty: HfDirty,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -532,6 +538,90 @@ impl Section {
     pub fn column_x_offset_pt(&self, idx: u8) -> f32 {
         let cw = self.column_width_pt();
         (idx.min(self.columns.count.saturating_sub(1)) as f32) * (cw + self.columns.gutter_pt)
+    }
+}
+
+/// Phase 3 (#40) — the range-free payload of one `<w:sectPr>`: everything
+/// a [`Section`] carries except the derived `[start_block, end_block)`
+/// coverage. Two homes:
+///
+/// - [`Paragraph::section_end`] — a paragraph whose mark terminates a
+///   mid-document section stores that section's properties here
+///   (OOXML-faithful: an interior `<w:sectPr>` IS a `<w:pPr>` child of
+///   the section's last paragraph).
+/// - [`DocumentTree::body_section`] — the body-level trailing
+///   `<w:sectPr>` governing the final section.
+///
+/// Block ranges are NEVER stored — [`DocumentTree::effective_sections`]
+/// derives them by walking the block list, so section boundaries ride
+/// their paragraphs through every insert/delete/split/merge and cannot
+/// desync (the pre-Phase-3 `Vec<Section>` range-stamping never
+/// re-indexed on block-count changes, corrupting multi-section docs on
+/// the first edit).
+#[derive(Debug, Clone, Default)]
+pub struct SectionProps {
+    pub geometry: PageGeometry,
+    /// `<w:headerReference>` table, keyed by `w:type`.
+    pub header_refs: HeaderFooterRefs,
+    /// `<w:footerReference>` table, keyed by `w:type`.
+    pub footer_refs: HeaderFooterRefs,
+    /// `<w:titlePg/>`.
+    pub title_pg: bool,
+    /// `<w:cols>` descriptor.
+    pub columns: ColumnSpec,
+    /// `<w:pgNumType>` descriptor.
+    pub page_num: PageNumType,
+    /// `<w:type w:val>` — how this section BEGINS relative to the
+    /// previous one (§17.6.22: the kind of break that precedes this
+    /// section's content).
+    pub section_type: SectionType,
+}
+
+impl SectionProps {
+    /// Materialize a derived [`Section`] covering `[start_block, end_block)`.
+    pub fn into_section(self, start_block: u32, end_block: u32) -> Section {
+        Section {
+            geometry: self.geometry,
+            start_block,
+            end_block,
+            header_refs: self.header_refs,
+            footer_refs: self.footer_refs,
+            title_pg: self.title_pg,
+            columns: self.columns,
+            page_num: self.page_num,
+            section_type: self.section_type,
+        }
+    }
+}
+
+impl From<&Section> for SectionProps {
+    fn from(s: &Section) -> Self {
+        Self {
+            geometry: s.geometry,
+            header_refs: s.header_refs.clone(),
+            footer_refs: s.footer_refs.clone(),
+            title_pg: s.title_pg,
+            columns: s.columns,
+            page_num: s.page_num,
+            section_type: s.section_type,
+        }
+    }
+}
+
+/// Phase 3 (#39) — per-part dirty tracking for header/footer stories,
+/// keyed by relationship id. Lives IN the tree (mirroring `styles_dirty`
+/// and `numbering.dirty`) so undo reverts the flag together with the
+/// content: an edit-then-undo leaves the writer on the byte-identical
+/// passthrough path for that part.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HfDirty {
+    pub headers: std::collections::BTreeSet<String>,
+    pub footers: std::collections::BTreeSet<String>,
+}
+
+impl HfDirty {
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty() && self.footers.is_empty()
     }
 }
 
@@ -1285,6 +1375,24 @@ pub struct Paragraph {
     /// whole point of the shadow approach (a user's manual bold
     /// survives a style switch).
     pub direct_overrides: ParaProperties,
+    /// Phase 3 (#40) — `Some` when this paragraph's MARK terminates a
+    /// mid-document section: the terminated section's `<w:sectPr>`
+    /// payload (OOXML: an interior sectPr is a `<w:pPr>` child of the
+    /// section's last paragraph). Boxed — markers are rare and
+    /// `Paragraph` clones constantly.
+    ///
+    /// Travel rules (each has a dedicated regression test):
+    /// - `split_at`: the ORIGINAL paragraph mark ends the RIGHT half,
+    ///   so the marker moves right; the left half gets a fresh mark
+    ///   (`None`).
+    /// - `concat`: the TAIL's marker survives — the head's mark (and
+    ///   any marker on it) is the one being deleted. This is the
+    ///   OPPOSITE precedence from every other field in `concat`
+    ///   (head-wins) and matches Word: deleting a section break makes
+    ///   the preceding text adopt the FOLLOWING section's properties.
+    /// - clipboard fragments (`slice` / `slice_blocks`) always CLEAR
+    ///   it — pasting must never transplant a section break.
+    pub section_end: Option<Box<SectionProps>>,
 }
 
 impl Paragraph {
@@ -1362,6 +1470,9 @@ impl Paragraph {
             fields: self.fields.clone(),
             style_id: self.style_id.clone(),
             direct_overrides: self.direct_overrides.clone(),
+            /* Phase 3 (#40) — not offset-anchored; formatting a marker
+            paragraph must never dissolve its section break. */
+            section_end: self.section_end.clone(),
         }
     }
 
@@ -1458,6 +1569,10 @@ impl Paragraph {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            /* Phase 3 (#40) — NOT cleared with the overlays above: the
+            marker has no byte offsets and the paragraph mark survives
+            an in-paragraph character deletion. */
+            section_end: self.section_end.clone(),
         }
     }
 
@@ -1503,6 +1618,10 @@ impl Paragraph {
                 fields: Vec::new(),
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
+                /* Phase 3 (#40) — the LEFT half receives a brand-new
+                paragraph mark; the original mark (and any section
+                marker riding it) belongs to the right half. */
+                section_end: None,
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -1519,6 +1638,9 @@ impl Paragraph {
                 fields: Vec::new(),
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
+                /* Phase 3 (#40) — the ORIGINAL paragraph mark terminates
+                the right half, so a section marker travels with it. */
+                section_end: self.section_end.clone(),
             },
         )
     }
@@ -1559,6 +1681,14 @@ impl Paragraph {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            /* Phase 3 (#40) — DELIBERATELY INVERTED from the head-wins
+            convention every other field above follows: the surviving
+            paragraph mark for `section_end` purposes is the TAIL's.
+            A merge deletes the HEAD's mark, and with it any section
+            break riding that mark — Word-exact (deleting a section
+            break makes the preceding text adopt the FOLLOWING
+            section's properties). Do not "fix" this to self.*. */
+            section_end: other.section_end.clone(),
         }
     }
 
@@ -1869,7 +1999,7 @@ impl DocumentTree {
     pub fn new() -> Self {
         Self {
             blocks: Vector::new(),
-            sections: Vec::new(),
+            body_section: SectionProps::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
@@ -1882,6 +2012,7 @@ impl DocumentTree {
             style_run_defaults: SpanStyle::default(),
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
+            hf_dirty: HfDirty::default(),
         }
     }
 
@@ -1903,10 +2034,11 @@ impl DocumentTree {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         }));
         Self {
             blocks,
-            sections: Vec::new(),
+            body_section: SectionProps::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
@@ -1919,6 +2051,7 @@ impl DocumentTree {
             style_run_defaults: SpanStyle::default(),
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
+            hf_dirty: HfDirty::default(),
         }
     }
 
@@ -1941,11 +2074,12 @@ impl DocumentTree {
                 fields: Vec::new(),
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
+                section_end: None,
             }));
         }
         Self {
             blocks,
-            sections: Vec::new(),
+            body_section: SectionProps::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
@@ -1958,6 +2092,7 @@ impl DocumentTree {
             style_run_defaults: SpanStyle::default(),
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
+            hf_dirty: HfDirty::default(),
         }
     }
 
@@ -1970,7 +2105,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: Vec::new(),
+            body_section: SectionProps::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
@@ -1983,6 +2118,7 @@ impl DocumentTree {
             style_run_defaults: SpanStyle::default(),
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
+            hf_dirty: HfDirty::default(),
         }
     }
 
@@ -1995,7 +2131,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: Vec::new(),
+            body_section: SectionProps::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
@@ -2008,6 +2144,7 @@ impl DocumentTree {
             style_run_defaults: SpanStyle::default(),
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
+            hf_dirty: HfDirty::default(),
         }
     }
 
@@ -2015,6 +2152,15 @@ impl DocumentTree {
     /// section table the `.docx` reader collected from `<w:sectPr>` elements.
     /// Trims sections that fall outside the block range so the paginator
     /// never indexes off the end.
+    ///
+    /// Phase 3 (#40) — ranges are converted to the paragraph-anchored
+    /// marker model at this boundary: every non-final section stamps its
+    /// props onto the paragraph closing its range (`end_block - 1` — by
+    /// reader construction always a `Block::Paragraph`, since an interior
+    /// `<w:sectPr>` is itself a paragraph property); the final section
+    /// becomes [`Self::body_section`]. Stamping does NOT dirty the
+    /// paragraph — its `source_xml` already carries the sectPr verbatim,
+    /// so the writer's passthrough stays byte-stable.
     pub fn from_blocks_with_sections<I: IntoIterator<Item = Block>>(
         blocks_in: I,
         sections_in: Vec<Section>,
@@ -2035,9 +2181,36 @@ impl DocumentTree {
                 Some(s)
             })
             .collect();
+        let mut body_section = SectionProps::default();
+        if let Some((last, interior)) = sections.split_last() {
+            body_section = SectionProps::from(last);
+            for s in interior {
+                let marker_idx = s.end_block.saturating_sub(1) as usize;
+                /* Defensive: a range whose closing block is a table has
+                no legal marker home (cannot happen via the reader —
+                interior sectPr rides a paragraph). Walk back to the
+                nearest paragraph inside the range; if none exists the
+                boundary dissolves into the following section. */
+                let start = s.start_block as usize;
+                let mut target: Option<usize> = None;
+                for idx in (start..=marker_idx.min(blocks.len().saturating_sub(1))).rev() {
+                    if matches!(blocks.get(idx), Some(Block::Paragraph(_))) {
+                        target = Some(idx);
+                        break;
+                    }
+                }
+                if let Some(idx) = target
+                    && let Some(Block::Paragraph(p)) = blocks.get(idx)
+                {
+                    let mut p = p.clone();
+                    p.section_end = Some(Box::new(SectionProps::from(s)));
+                    blocks.set(idx, Block::Paragraph(p));
+                }
+            }
+        }
         Self {
             blocks,
-            sections,
+            body_section,
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
@@ -2050,6 +2223,7 @@ impl DocumentTree {
             style_run_defaults: SpanStyle::default(),
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
+            hf_dirty: HfDirty::default(),
         }
     }
 
@@ -2067,25 +2241,71 @@ impl DocumentTree {
         self
     }
 
-    /// Resolved section coverage — returns one effective `Section` per
-    /// top-level block. When `self.sections` is empty (the pre-Phase-6
-    /// case) the helper synthesises a single implicit A4 section over the
-    /// whole document.
-    pub fn effective_sections(&self) -> Vec<Section> {
-        if self.sections.is_empty() {
-            return vec![Section {
-                geometry: PageGeometry::a4(),
-                start_block: 0,
-                end_block: self.blocks.len() as u32,
-                header_refs: HeaderFooterRefs::default(),
-                footer_refs: HeaderFooterRefs::default(),
-                title_pg: false,
-                columns: ColumnSpec::single(),
-                page_num: PageNumType::default(),
-                section_type: SectionType::default(),
-            }];
+    /// Phase 3 (#39) — replace (or create) the header part keyed by
+    /// `rid` and mark it dirty for the writer. The only mutation path
+    /// into [`Self::headers`] — story editing routes every content
+    /// change through here so `hf_dirty` can never desync from the map.
+    pub fn with_updated_header_part(&self, rid: &str, paras: Vec<Paragraph>) -> Self {
+        let mut next = self.clone();
+        next.headers.insert(rid.to_string(), paras);
+        next.hf_dirty.headers.insert(rid.to_string());
+        next
+    }
+
+    /// Phase 3 (#39) — [`Self::with_updated_header_part`]'s footer twin.
+    pub fn with_updated_footer_part(&self, rid: &str, paras: Vec<Paragraph>) -> Self {
+        let mut next = self.clone();
+        next.footers.insert(rid.to_string(), paras);
+        next.hf_dirty.footers.insert(rid.to_string());
+        next
+    }
+
+    /// Phase 3 (#39) — mint a relationship id for an engine-created
+    /// header/footer part. The `ngeHf` prefix is collision-proof against
+    /// Word's `rIdN` ids by construction; the counter walks past any
+    /// engine-minted key already present in EITHER map (parts and their
+    /// ids may be shared or forked over the document's lifetime).
+    pub fn fresh_hf_rid(&self) -> String {
+        let mut counter = 1u32;
+        loop {
+            let candidate = format!("ngeHf{counter}");
+            if !self.headers.contains_key(&candidate) && !self.footers.contains_key(&candidate) {
+                return candidate;
+            }
+            counter = counter.saturating_add(1);
         }
-        self.sections.clone()
+    }
+
+    /// Resolved section coverage, DERIVED by walking the top-level block
+    /// list: every paragraph carrying a [`Paragraph::section_end`] marker
+    /// closes a section at its own index; [`Self::body_section`] closes
+    /// the final one. Ranges are therefore correct by construction under
+    /// any block insertion/deletion — nothing to re-index (Phase 3, #40).
+    ///
+    /// Always returns at least one section. A marker on the very last
+    /// block suppresses the would-be-empty trailing body section (an
+    /// edit can strand a marker there; the writer + paginator both want
+    /// non-empty ranges).
+    ///
+    /// O(top-level blocks) per call — hot callers (the per-keystroke
+    /// `SelectionChanged` builder in engine-wasm) go through a
+    /// revision-keyed memo rather than calling this directly.
+    pub fn effective_sections(&self) -> Vec<Section> {
+        let len = self.blocks.len() as u32;
+        let mut out: Vec<Section> = Vec::new();
+        let mut start = 0u32;
+        for (i, b) in self.blocks.iter().enumerate() {
+            if let Block::Paragraph(p) = b
+                && let Some(props) = &p.section_end
+            {
+                out.push(props.as_ref().clone().into_section(start, i as u32 + 1));
+                start = i as u32 + 1;
+            }
+        }
+        if start < len || out.is_empty() {
+            out.push(self.body_section.clone().into_section(start, len));
+        }
+        out
     }
 
     /* ============================================================
@@ -2155,30 +2375,28 @@ impl DocumentTree {
     }
 
     /// Sprint 10 — locate the `Section` covering top-level block
-    /// `block_idx`. Falls back to a synthesised default-A4 section
-    /// when the document carries no `<w:sectPr>` (the pre-Phase-6
-    /// behaviour). The caller can read the returned section's
-    /// geometry directly into the `SelectionChanged` event's
-    /// `section_geometry` field.
+    /// `block_idx`. Phase 3 (#40): derived from the paragraph markers —
+    /// the covering section is closed by the FIRST marker at index
+    /// `>= block_idx`, or by [`Self::body_section`] when no such marker
+    /// exists. The caller can read the returned section's geometry
+    /// directly into the `SelectionChanged` event's `section_geometry`
+    /// field.
     pub fn section_for_block(&self, block_idx: u32) -> Section {
-        if let Some(s) = self
-            .sections
-            .iter()
-            .find(|s| block_idx >= s.start_block && block_idx < s.end_block)
-        {
-            return s.clone();
+        let mut start = 0u32;
+        for (i, b) in self.blocks.iter().enumerate() {
+            let i = i as u32;
+            if let Block::Paragraph(p) = b
+                && let Some(props) = &p.section_end
+            {
+                if block_idx <= i {
+                    return props.as_ref().clone().into_section(start, i + 1);
+                }
+                start = i + 1;
+            }
         }
-        Section {
-            geometry: PageGeometry::a4(),
-            start_block: 0,
-            end_block: self.blocks.len() as u32,
-            header_refs: HeaderFooterRefs::default(),
-            footer_refs: HeaderFooterRefs::default(),
-            title_pg: false,
-            columns: ColumnSpec::single(),
-            page_num: PageNumType::default(),
-            section_type: SectionType::default(),
-        }
+        self.body_section
+            .clone()
+            .into_section(start, self.blocks.len() as u32)
     }
 
     /// Path to the Nth top-level paragraph (skipping tables). Compat
@@ -2587,7 +2805,7 @@ impl DocumentTree {
         });
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -2600,6 +2818,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -2660,7 +2879,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -2673,6 +2892,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -2698,10 +2918,11 @@ impl DocumentTree {
                 fields: Vec::new(),
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
+                section_end: None,
             }));
             return Self {
                 blocks,
-                sections: self.sections.clone(),
+                body_section: self.body_section.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
@@ -2714,6 +2935,7 @@ impl DocumentTree {
                 style_run_defaults: self.style_run_defaults.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
+                hf_dirty: self.hf_dirty.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -2746,7 +2968,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -2759,6 +2981,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -2799,7 +3022,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -2812,6 +3035,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -2829,7 +3053,7 @@ impl DocumentTree {
         replace_block_in_top(&mut blocks, &start.path, Block::Paragraph(styled));
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -2842,6 +3066,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -2878,7 +3103,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -2891,6 +3116,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -2933,7 +3159,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -2946,15 +3172,21 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
-    /// Sprint 2 (UI Edition) — set `Section.columns` for the section
-    /// containing the top-level block step at `pos`. `count == 0`
-    /// collapses to single column (matches `ColumnSpec::from_twips`
-    /// defensive clamping). The paginator picks the new geometry up
-    /// on the next reflow.
-    pub fn set_section_columns_at(&self, pos: LogicalPos, count: u8, gutter_pt: f32) -> Self {
+    /// Phase 3 (#40) — shared per-section mutation. Resolves the section
+    /// covering the top-level block step of `pos` and applies `f` to its
+    /// props IN THEIR STORAGE HOME: the closing marker paragraph for an
+    /// interior section (via `mutate_paragraph_in_top`, which dirties the
+    /// paragraph so the writer regenerates its `<w:pPr>` with the mutated
+    /// sectPr), or [`Self::body_section`] for the final section. A fresh
+    /// document always has a mutable trailing section, so this can never
+    /// silently no-op — the pre-Phase-3 setters skipped the whole
+    /// mutation on any document with an empty `sections` table (every
+    /// non-imported document).
+    fn update_section_props_at(&self, pos: &LogicalPos, f: impl FnOnce(&mut SectionProps)) -> Self {
         let block_idx = pos
             .path
             .steps
@@ -2964,22 +3196,31 @@ impl DocumentTree {
                 PathStep::Cell { .. } => None,
             })
             .unwrap_or(0);
-        let mut sections = self.sections.clone();
-        let section_idx = sections
+        let mut blocks = self.blocks.clone();
+        let mut body_section = self.body_section.clone();
+        /* The covering section is closed by the FIRST marker paragraph at
+        index >= block_idx; markers before it close earlier sections. */
+        let marker_idx = self
+            .blocks
             .iter()
-            .position(|s| s.start_block <= block_idx && block_idx < s.end_block)
-            .or_else(|| sections.len().checked_sub(1));
-        if let Some(idx) = section_idx
-            && let Some(s) = sections.get_mut(idx)
-        {
-            s.columns = ColumnSpec {
-                count: count.max(1),
-                gutter_pt,
-            };
+            .enumerate()
+            .skip(block_idx as usize)
+            .find_map(|(i, b)| match b {
+                Block::Paragraph(p) if p.section_end.is_some() => Some(i as u32),
+                _ => None,
+            });
+        if let Some(idx) = marker_idx {
+            let _ = mutate_paragraph_in_top(&mut blocks, &BlockPath::top(idx), |para| {
+                if let Some(props) = &mut para.section_end {
+                    f(props);
+                }
+            });
+        } else {
+            f(&mut body_section);
         }
         Self {
-            blocks: self.blocks.clone(),
-            sections,
+            blocks,
+            body_section,
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -2992,7 +3233,115 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
+    }
+
+    /// Phase 3 (#40) — insert a section break at `at`, Word-exact:
+    ///
+    /// 1. Split the paragraph at the caret (an existing marker on it
+    ///    rides the RIGHT half with the original paragraph mark).
+    /// 2. Stamp the LEFT half's fresh mark with a COPY of the covering
+    ///    section's props — its `section_type` (how the covering
+    ///    section itself begins) travels with the first half, which
+    ///    still starts the same way.
+    /// 3. Set `section_type := kind` on the covering section's OWN
+    ///    terminal storage — after the split that is the first marker
+    ///    at an index past the left half (possibly the right half
+    ///    itself), or `body_section`. NEVER the structurally-next
+    ///    section's storage: OOXML `<w:type>` describes how the
+    ///    section it terminates BEGINS, and the inserted break opens
+    ///    the covering section's second half.
+    ///
+    /// Both halves start with identical geometry (Word clones the
+    /// sectPr on break insertion). Returns `self` unchanged when `at`
+    /// addresses a table cell — the caller surfaces the rejection.
+    pub fn insert_section_break_at(&self, at: LogicalPos, kind: SectionType) -> Self {
+        /* Table cells cannot host a section boundary (an interior
+        sectPr is a body-level paragraph property). */
+        if at.path.steps.len() != 1 {
+            return self.clone();
+        }
+        let Some(block_idx) = at.path.last_block_index() else {
+            return self.clone();
+        };
+        if self.paragraph_at_path(&at.path).is_none() {
+            return self.clone();
+        }
+        let covering = SectionProps::from(&self.section_for_block(block_idx));
+        let split = self.split_paragraph(at.clone());
+        let mut blocks = split.blocks.clone();
+        let mut body_section = split.body_section.clone();
+        /* Step 2 — the left half closes the new first-half section. */
+        let _ = mutate_paragraph_in_top(&mut blocks, &at.path, |para| {
+            para.section_end = Some(Box::new(covering.clone()));
+        });
+        /* Step 3 — the covering section's own terminal now closes the
+        second half; it starts per `kind`. */
+        let next_marker = blocks
+            .iter()
+            .enumerate()
+            .skip(block_idx as usize + 1)
+            .find_map(|(i, b)| match b {
+                Block::Paragraph(p) if p.section_end.is_some() => Some(i as u32),
+                _ => None,
+            });
+        if let Some(mi) = next_marker {
+            let _ = mutate_paragraph_in_top(&mut blocks, &BlockPath::top(mi), |para| {
+                if let Some(props) = &mut para.section_end {
+                    props.section_type = kind;
+                }
+            });
+        } else {
+            body_section.section_type = kind;
+        }
+        Self {
+            blocks,
+            body_section,
+            headers: split.headers.clone(),
+            footers: split.footers.clone(),
+            media: split.media.clone(),
+            footnotes: split.footnotes.clone(),
+            comment_defs: split.comment_defs.clone(),
+            comment_ranges: split.comment_ranges.clone(),
+            settings: split.settings.clone(),
+            styles: split.styles.clone(),
+            style_defaults: split.style_defaults.clone(),
+            style_run_defaults: split.style_run_defaults.clone(),
+            styles_dirty: split.styles_dirty,
+            numbering: split.numbering.clone(),
+            hf_dirty: split.hf_dirty.clone(),
+        }
+    }
+
+    /// Phase 3 (#39) — point the covering section's DEFAULT
+    /// header/footer reference at `rid`. Backs materialize-on-enter and
+    /// fork-on-enter: the caller has already installed the part under
+    /// `rid` via [`Self::with_updated_header_part`] /
+    /// [`Self::with_updated_footer_part`].
+    pub fn set_section_hf_default_ref_at(&self, pos: LogicalPos, header: bool, rid: &str) -> Self {
+        let rid = rid.to_string();
+        self.update_section_props_at(&pos, move |props| {
+            if header {
+                props.header_refs.default = Some(rid);
+            } else {
+                props.footer_refs.default = Some(rid);
+            }
+        })
+    }
+
+    /// Sprint 2 (UI Edition) — set the covering section's `columns` for
+    /// the section containing the top-level block step at `pos`.
+    /// `count == 0` collapses to single column (matches
+    /// `ColumnSpec::from_twips` defensive clamping). The paginator picks
+    /// the new geometry up on the next reflow.
+    pub fn set_section_columns_at(&self, pos: LogicalPos, count: u8, gutter_pt: f32) -> Self {
+        self.update_section_props_at(&pos, |props| {
+            props.columns = ColumnSpec {
+                count: count.max(1),
+                gutter_pt,
+            };
+        })
     }
 
     /// Sprint 2 (UI Edition) — set `ParaProperties.page_break_before`
@@ -3007,7 +3356,7 @@ impl DocumentTree {
         });
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3020,6 +3369,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3081,7 +3431,7 @@ impl DocumentTree {
         });
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3094,6 +3444,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3140,7 +3491,7 @@ impl DocumentTree {
         });
         let doc = Self {
             blocks: self.blocks.clone(),
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3153,6 +3504,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         };
         (doc, new_id)
     }
@@ -3211,7 +3563,7 @@ impl DocumentTree {
         }
         let doc = Self {
             blocks: self.blocks.clone(),
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3224,6 +3576,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         };
         Some((doc, new_id))
     }
@@ -3261,7 +3614,7 @@ impl DocumentTree {
         comment_ranges.retain(|r| !doomed.contains(&r.id));
         Self {
             blocks: self.blocks.clone(),
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3274,6 +3627,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3287,7 +3641,7 @@ impl DocumentTree {
         }
         Self {
             blocks: self.blocks.clone(),
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3300,6 +3654,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3366,7 +3721,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3379,6 +3734,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3457,7 +3813,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3470,6 +3826,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3538,7 +3895,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3551,6 +3908,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: true,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3586,7 +3944,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3599,6 +3957,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3637,7 +3996,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3650,6 +4009,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3685,7 +4045,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3698,6 +4058,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3801,7 +4162,7 @@ impl DocumentTree {
         numbering::resolve_markers_in_place(&mut paragraph_refs, &next_numbering);
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3814,6 +4175,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: next_numbering,
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3866,7 +4228,7 @@ impl DocumentTree {
         numbering::resolve_markers_in_place(&mut paragraph_refs, &self.numbering);
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3879,6 +4241,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -3910,7 +4273,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -3923,6 +4286,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -3938,44 +4302,12 @@ impl DocumentTree {
         bottom_pt: f32,
         left_pt: f32,
     ) -> Self {
-        let block_idx = pos
-            .path
-            .steps
-            .iter()
-            .find_map(|s| match s {
-                PathStep::Block(n) => Some(*n),
-                PathStep::Cell { .. } => None,
-            })
-            .unwrap_or(0);
-        let mut sections = self.sections.clone();
-        let section_idx = sections
-            .iter()
-            .position(|s| s.start_block <= block_idx && block_idx < s.end_block)
-            .or_else(|| sections.len().checked_sub(1));
-        if let Some(idx) = section_idx
-            && let Some(s) = sections.get_mut(idx)
-        {
-            s.geometry.margin_top = top_pt.max(0.0);
-            s.geometry.margin_right = right_pt.max(0.0);
-            s.geometry.margin_bottom = bottom_pt.max(0.0);
-            s.geometry.margin_left = left_pt.max(0.0);
-        }
-        Self {
-            blocks: self.blocks.clone(),
-            sections,
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-        }
+        self.update_section_props_at(&pos, |props| {
+            props.geometry.margin_top = top_pt.max(0.0);
+            props.geometry.margin_right = right_pt.max(0.0);
+            props.geometry.margin_bottom = bottom_pt.max(0.0);
+            props.geometry.margin_left = left_pt.max(0.0);
+        })
     }
 
     /// Sprint 4 (UI Edition) — force the orientation of the section
@@ -3984,46 +4316,14 @@ impl DocumentTree {
     /// way. Margins are NOT rotated — Word treats `<w:pgMar>` as
     /// edge-labelled, not paper-relative.
     pub fn set_section_orientation_at(&self, pos: LogicalPos, landscape: bool) -> Self {
-        let block_idx = pos
-            .path
-            .steps
-            .iter()
-            .find_map(|s| match s {
-                PathStep::Block(n) => Some(*n),
-                PathStep::Cell { .. } => None,
-            })
-            .unwrap_or(0);
-        let mut sections = self.sections.clone();
-        let section_idx = sections
-            .iter()
-            .position(|s| s.start_block <= block_idx && block_idx < s.end_block)
-            .or_else(|| sections.len().checked_sub(1));
-        if let Some(idx) = section_idx
-            && let Some(s) = sections.get_mut(idx)
-        {
-            let is_landscape = s.geometry.width > s.geometry.height;
+        self.update_section_props_at(&pos, |props| {
+            let is_landscape = props.geometry.width > props.geometry.height;
             if landscape != is_landscape {
-                let (w, h) = (s.geometry.width, s.geometry.height);
-                s.geometry.width = h;
-                s.geometry.height = w;
+                let (w, h) = (props.geometry.width, props.geometry.height);
+                props.geometry.width = h;
+                props.geometry.height = w;
             }
-        }
-        Self {
-            blocks: self.blocks.clone(),
-            sections,
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
-            media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
-            comment_defs: self.comment_defs.clone(),
-            comment_ranges: self.comment_ranges.clone(),
-            settings: self.settings.clone(),
-            styles: self.styles.clone(),
-            style_defaults: self.style_defaults.clone(),
-            style_run_defaults: self.style_run_defaults.clone(),
-            styles_dirty: self.styles_dirty,
-            numbering: self.numbering.clone(),
-        }
+        })
     }
 
     /// Sprint 3 (UI Edition) — insert a brand-new inline image at
@@ -4124,7 +4424,7 @@ impl DocumentTree {
 
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media,
@@ -4137,6 +4437,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -4171,7 +4472,7 @@ impl DocumentTree {
         });
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -4184,6 +4485,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -4219,7 +4521,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -4232,6 +4534,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -4251,7 +4554,7 @@ impl DocumentTree {
             });
             return Self {
                 blocks,
-                sections: self.sections.clone(),
+                body_section: self.body_section.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
@@ -4264,6 +4567,7 @@ impl DocumentTree {
                 style_run_defaults: self.style_run_defaults.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
+                hf_dirty: self.hf_dirty.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -4310,7 +4614,7 @@ impl DocumentTree {
         replace_block_in_top(&mut blocks, &sp_path, Block::Paragraph(merged));
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -4323,6 +4627,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -4336,7 +4641,7 @@ impl DocumentTree {
             blocks.push_back(Block::Paragraph(Paragraph::default()));
             return Self {
                 blocks,
-                sections: self.sections.clone(),
+                body_section: self.body_section.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
@@ -4349,6 +4654,7 @@ impl DocumentTree {
                 style_run_defaults: self.style_run_defaults.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
+                hf_dirty: self.hf_dirty.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -4359,7 +4665,7 @@ impl DocumentTree {
         insert_block_after_path_in_top(&mut blocks, &at.path, Block::Paragraph(right));
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -4372,6 +4678,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -4426,13 +4733,13 @@ impl DocumentTree {
                 return Vec::new();
             };
             let head = p.split_at(end.offset).0;
-            return vec![head.split_at(start.offset).1];
+            return vec![strip_section_marker(head.split_at(start.offset).1)];
         }
         if !same_parent(&start.path, &end.path) {
             let Some(p) = self.paragraph_at_path(&start.path) else {
                 return Vec::new();
             };
-            return vec![p.split_at(start.offset).1];
+            return vec![strip_section_marker(p.split_at(start.offset).1)];
         }
         let Some(sp_idx) = start.path.last_block_index() else {
             return Vec::new();
@@ -4448,11 +4755,11 @@ impl DocumentTree {
             .get(sp_idx as usize)
             .and_then(|b| b.as_paragraph())
         {
-            out.push(p.split_at(start.offset).1);
+            out.push(strip_section_marker(p.split_at(start.offset).1));
         }
         for idx in (sp_idx + 1)..ep_idx {
             if let Some(p) = container.get(idx as usize).and_then(|b| b.as_paragraph()) {
-                out.push(p.clone());
+                out.push(strip_section_marker(p.clone()));
             }
         }
         if let Some(p) = container
@@ -4467,10 +4774,19 @@ impl DocumentTree {
     /// Insert pre-styled `paras` at `at`; returns the new tree and the caret
     /// at the end of the inserted content. The caller deletes any active
     /// selection first. Drives HTML paste (Backlog #12).
+    ///
+    /// Phase 3 (#40) — inputs are marker-stripped defensively: no paste
+    /// path may ever transplant a section break, regardless of which
+    /// producer built the fragment.
     pub fn insert_rich(&self, at: LogicalPos, paras: &[Paragraph]) -> (Self, LogicalPos) {
         if paras.is_empty() {
             return (self.clone(), at.clone());
         }
+        let paras: Vec<Paragraph> = paras
+            .iter()
+            .map(|p| strip_section_marker(p.clone()))
+            .collect();
+        let paras: &[Paragraph] = &paras;
         let mut blocks = self.blocks.clone();
         if self.paragraph_count() == 0 {
             blocks.push_back(Block::Paragraph(Paragraph::default()));
@@ -4502,7 +4818,7 @@ impl DocumentTree {
             return (
                 Self {
                     blocks,
-                    sections: self.sections.clone(),
+                    body_section: self.body_section.clone(),
                     headers: self.headers.clone(),
                     footers: self.footers.clone(),
                     media: self.media.clone(),
@@ -4515,6 +4831,7 @@ impl DocumentTree {
                     style_run_defaults: self.style_run_defaults.clone(),
                     styles_dirty: self.styles_dirty,
                     numbering: self.numbering.clone(),
+                    hf_dirty: self.hf_dirty.clone(),
                 }
                 .with_list_markers_refreshed(),
                 caret,
@@ -4544,7 +4861,7 @@ impl DocumentTree {
         (
             Self {
                 blocks,
-                sections: self.sections.clone(),
+                body_section: self.body_section.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
@@ -4557,6 +4874,7 @@ impl DocumentTree {
                 style_run_defaults: self.style_run_defaults.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
+                hf_dirty: self.hf_dirty.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -4582,13 +4900,17 @@ impl DocumentTree {
                 return Vec::new();
             };
             let head = p.split_at(end.offset).0;
-            return vec![Block::Paragraph(head.split_at(start.offset).1)];
+            return vec![Block::Paragraph(strip_section_marker(
+                head.split_at(start.offset).1,
+            ))];
         }
         if !same_parent(&start.path, &end.path) {
             let Some(p) = self.paragraph_at_path(&start.path) else {
                 return Vec::new();
             };
-            return vec![Block::Paragraph(p.split_at(start.offset).1)];
+            return vec![Block::Paragraph(strip_section_marker(
+                p.split_at(start.offset).1,
+            ))];
         }
         let Some(sp_idx) = start.path.last_block_index() else {
             return Vec::new();
@@ -4604,11 +4926,16 @@ impl DocumentTree {
             .get(sp_idx as usize)
             .and_then(|b| b.as_paragraph())
         {
-            out.push(Block::Paragraph(p.split_at(start.offset).1));
+            out.push(Block::Paragraph(strip_section_marker(
+                p.split_at(start.offset).1,
+            )));
         }
         for idx in (sp_idx + 1)..ep_idx {
             if let Some(b) = container.get(idx as usize) {
-                out.push(b.clone());
+                out.push(match b {
+                    Block::Paragraph(p) => Block::Paragraph(strip_section_marker(p.clone())),
+                    other => other.clone(),
+                });
             }
         }
         if let Some(p) = container
@@ -4630,6 +4957,16 @@ impl DocumentTree {
         if blocks_in.is_empty() {
             return (self.clone(), at.clone());
         }
+        /* Phase 3 (#40) — same defensive marker strip as `insert_rich`:
+        no paste path may transplant a section break. */
+        let blocks_in: Vec<Block> = blocks_in
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph(p) => Block::Paragraph(strip_section_marker(p.clone())),
+                other => other.clone(),
+            })
+            .collect();
+        let blocks_in: &[Block] = &blocks_in;
         /* When the input is all paragraphs, defer to the existing
         paragraph-only insert — it merges head+first and last+tail
         intra-paragraph so consecutive `\n`-joined paragraphs splice
@@ -4714,7 +5051,7 @@ impl DocumentTree {
         (
             Self {
                 blocks,
-                sections: self.sections.clone(),
+                body_section: self.body_section.clone(),
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
@@ -4727,6 +5064,7 @@ impl DocumentTree {
                 style_run_defaults: self.style_run_defaults.clone(),
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
+                hf_dirty: self.hf_dirty.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -4857,7 +5195,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -4870,6 +5208,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -4885,7 +5224,7 @@ impl DocumentTree {
         }
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -4898,6 +5237,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 
@@ -5162,7 +5502,7 @@ impl DocumentTree {
         blocks.set(idx, block);
         Self {
             blocks,
-            sections: self.sections.clone(),
+            body_section: self.body_section.clone(),
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -5175,6 +5515,7 @@ impl DocumentTree {
             style_run_defaults: self.style_run_defaults.clone(),
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
+            hf_dirty: self.hf_dirty.clone(),
         }
     }
 }
@@ -5496,6 +5837,16 @@ fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u
         shift(&mut f.end);
     }
     para.fields.retain(|f| f.start < f.end);
+}
+
+/// Phase 3 (#40) — clipboard fragments are never section-marker
+/// carriers: `slice` / `slice_blocks` strip on the way out and
+/// `insert_rich` / `insert_rich_blocks` strip on the way in, so no
+/// copy/paste path can transplant a section break into an unrelated
+/// part of the document.
+fn strip_section_marker(mut p: Paragraph) -> Paragraph {
+    p.section_end = None;
+    p
 }
 
 /// Mutate the paragraph addressed by `path` in `top` (the
@@ -6605,10 +6956,58 @@ mod tests {
 
     #[test]
     fn section_for_block_picks_matching_section() {
+        /* Marker-model rewrite of the old range-stamped test (was
+        `d.sections = vec![Section{0..1, narrow}, Section{1..5, a4}]`).
+        The sole paragraph (index 0) closes the narrow section via its
+        `section_end` marker; the trailing `body_section` (doc-wide
+        a4 default) plays the role of the old second range — a query
+        past the marker (block 2, which doesn't even exist in this
+        1-paragraph doc) must still fall through to it, exactly as the
+        old out-of-range `end_block: 5` did. */
         let mut d = DocumentTree::from_text("a");
         let mut narrow = PageGeometry::a4();
         narrow.margin_left = 36.0;
-        d.sections = vec![
+        if let Some(Block::Paragraph(p)) = d.blocks.get(0) {
+            let mut p = p.clone();
+            p.section_end = Some(Box::new(SectionProps {
+                geometry: narrow,
+                ..Default::default()
+            }));
+            d.blocks.set(0, Block::Paragraph(p));
+        }
+        d.body_section = SectionProps {
+            geometry: PageGeometry::a4(),
+            ..Default::default()
+        };
+        assert!((d.section_for_block(0).geometry.margin_left - 36.0).abs() < 0.1);
+        assert!((d.section_for_block(2).geometry.margin_left - 72.0).abs() < 0.1);
+    }
+
+    /* ================================================================
+    Phase 3 (#40) — paragraph-anchored section markers. Every rule in
+    `Paragraph::section_end`'s doc comment has a regression test here.
+    ================================================================ */
+
+    /// Two-section fixture: paragraphs "a" | "b" "c", the marker on "a"
+    /// carrying `margin_left = 30`, the body section stock A4 (72).
+    fn two_section_doc() -> DocumentTree {
+        let blocks = vec![
+            Block::Paragraph(Paragraph {
+                text: "a".into(),
+                ..Default::default()
+            }),
+            Block::Paragraph(Paragraph {
+                text: "b".into(),
+                ..Default::default()
+            }),
+            Block::Paragraph(Paragraph {
+                text: "c".into(),
+                ..Default::default()
+            }),
+        ];
+        let mut narrow = PageGeometry::a4();
+        narrow.margin_left = 30.0;
+        let sections = vec![
             Section {
                 geometry: narrow,
                 start_block: 0,
@@ -6616,14 +7015,337 @@ mod tests {
                 ..Default::default()
             },
             Section {
-                geometry: PageGeometry::a4(),
                 start_block: 1,
-                end_block: 5,
+                end_block: 3,
                 ..Default::default()
             },
         ];
-        assert!((d.section_for_block(0).geometry.margin_left - 36.0).abs() < 0.1);
-        assert!((d.section_for_block(2).geometry.margin_left - 72.0).abs() < 0.1);
+        DocumentTree::from_blocks_with_sections(blocks, sections)
+    }
+
+    #[test]
+    fn from_blocks_with_sections_stamps_markers_and_body_section() {
+        let d = two_section_doc();
+        let marker = d
+            .paragraph_at_path(&BlockPath::top(0))
+            .and_then(|p| p.section_end.as_ref())
+            .expect("paragraph 0 carries the interior section marker");
+        assert!((marker.geometry.margin_left - 30.0).abs() < 0.1);
+        /* Load-time stamping must not dirty the paragraph — its
+        source_xml (when present) already carries the sectPr, and the
+        writer passthrough must stay byte-stable. */
+        assert!(!d.paragraph_at_path(&BlockPath::top(0)).unwrap().dirty);
+        assert!((d.body_section.geometry.margin_left - 72.0).abs() < 0.1);
+        let derived = d.effective_sections();
+        assert_eq!(derived.len(), 2);
+        assert_eq!((derived[0].start_block, derived[0].end_block), (0, 1));
+        assert_eq!((derived[1].start_block, derived[1].end_block), (1, 3));
+    }
+
+    #[test]
+    fn editing_above_a_boundary_keeps_section_coverage() {
+        /* THE desync regression (pre-Phase-3 bug B1): pressing Enter in
+        section 1 grew `blocks` without re-indexing later sections, so
+        every block after the boundary fell under the wrong geometry.
+        With markers the boundary rides its paragraph. */
+        let d = two_section_doc();
+        let split = d.split_paragraph(LogicalPos::new(BlockPath::top(0), 0));
+        let derived = split.effective_sections();
+        assert_eq!(derived.len(), 2, "boundary survived the split");
+        /* The marker travelled with the RIGHT half (original mark), so
+        section 1 now covers blocks [0, 2). */
+        assert_eq!((derived[0].start_block, derived[0].end_block), (0, 2));
+        assert_eq!((derived[1].start_block, derived[1].end_block), (2, 4));
+        assert!((split.section_for_block(3).geometry.margin_left - 72.0).abs() < 0.1);
+        assert!((split.section_for_block(1).geometry.margin_left - 30.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn split_at_moves_marker_to_right_half_only() {
+        let mut p = Paragraph {
+            text: "xy".into(),
+            ..Default::default()
+        };
+        p.section_end = Some(Box::new(SectionProps::default()));
+        let (left, right) = p.split_at(1);
+        assert!(left.section_end.is_none(), "left half gets a fresh mark");
+        assert!(right.section_end.is_some(), "original mark ends the right");
+    }
+
+    #[test]
+    fn concat_takes_the_tail_marker_deleting_the_heads() {
+        /* Deliberately inverted from concat's head-wins convention:
+        merging deletes the HEAD's paragraph mark, so the head's
+        section break dies and the TAIL's survives (Word: deleting a
+        section break makes preceding text adopt the FOLLOWING
+        section's properties). */
+        let mut head = Paragraph {
+            text: "h".into(),
+            ..Default::default()
+        };
+        let mut head_props = SectionProps::default();
+        head_props.geometry.margin_left = 30.0;
+        head.section_end = Some(Box::new(head_props));
+        let tail = Paragraph {
+            text: "t".into(),
+            ..Default::default()
+        };
+        let merged = head.concat(&tail);
+        assert!(
+            merged.section_end.is_none(),
+            "head's break deleted; tail carried no marker"
+        );
+
+        let mut tail2 = Paragraph {
+            text: "t".into(),
+            ..Default::default()
+        };
+        let mut tail_props = SectionProps::default();
+        tail_props.geometry.margin_left = 40.0;
+        tail2.section_end = Some(Box::new(tail_props));
+        let merged2 = head.concat(&tail2);
+        let kept = merged2.section_end.expect("tail marker survives");
+        assert!((kept.geometry.margin_left - 40.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn deleting_across_a_marker_merges_sections_following_props_win() {
+        let d = two_section_doc();
+        /* Delete from mid-"a" (the marker paragraph) into "b" — the
+        marker paragraph's mark is consumed by the merge. */
+        let merged = d.delete_range(
+            LogicalPos::new(BlockPath::top(0), 0),
+            LogicalPos::new(BlockPath::top(1), 0),
+        );
+        let derived = merged.effective_sections();
+        assert_eq!(derived.len(), 1, "sections merged");
+        assert!(
+            (derived[0].geometry.margin_left - 72.0).abs() < 0.1,
+            "following (body) section's geometry governs the merged range"
+        );
+    }
+
+    #[test]
+    fn copy_paste_never_transplants_a_section_break() {
+        let d = two_section_doc();
+        /* Copy a range covering the marker paragraph... */
+        let fragment = d.slice(
+            LogicalPos::new(BlockPath::top(0), 0),
+            LogicalPos::new(BlockPath::top(1), 1),
+        );
+        assert!(
+            fragment.iter().all(|p| p.section_end.is_none()),
+            "clipboard fragments are never marker carriers"
+        );
+        /* ...and paste it at the document end: section count unchanged. */
+        let before = d.effective_sections().len();
+        let (pasted, _) = d.insert_rich(d.end_of_document(), &fragment);
+        assert_eq!(pasted.effective_sections().len(), before);
+
+        /* Same guarantee for the block-preserving variant. */
+        let block_fragment = d.slice_blocks(
+            LogicalPos::new(BlockPath::top(0), 0),
+            LogicalPos::new(BlockPath::top(1), 1),
+        );
+        assert!(block_fragment.iter().all(|b| match b {
+            Block::Paragraph(p) => p.section_end.is_none(),
+            _ => true,
+        }));
+        let (pasted2, _) = d.insert_rich_blocks(d.end_of_document(), &block_fragment);
+        assert_eq!(pasted2.effective_sections().len(), before);
+    }
+
+    #[test]
+    fn fresh_document_section_setters_hit_body_section() {
+        /* Pre-Phase-3 bug B2: on a fresh document (`sections` empty),
+        SetPageMargins/SetPageOrientation/SetColumns silently no-opped.
+        The always-present `body_section` makes them land. */
+        let d = DocumentTree::from_text("hello");
+        let pos = LogicalPos::new(BlockPath::top(0), 0);
+        let with_margins = d.set_section_margins_at(pos.clone(), 10.0, 20.0, 30.0, 40.0);
+        let s = with_margins.section_for_block(0);
+        assert!((s.geometry.margin_top - 10.0).abs() < 0.1);
+        assert!((s.geometry.margin_left - 40.0).abs() < 0.1);
+
+        let landscape = d.set_section_orientation_at(pos.clone(), true);
+        let s = landscape.section_for_block(0);
+        assert!(s.geometry.width > s.geometry.height);
+
+        let cols = d.set_section_columns_at(pos, 2, 18.0);
+        assert_eq!(cols.section_for_block(0).columns.count, 2);
+    }
+
+    #[test]
+    fn interior_section_setter_mutates_the_marker_and_dirties_it() {
+        let d = two_section_doc();
+        let updated =
+            d.set_section_margins_at(LogicalPos::new(BlockPath::top(0), 0), 5.0, 6.0, 7.0, 8.0);
+        let marker_para = updated.paragraph_at_path(&BlockPath::top(0)).unwrap();
+        let props = marker_para.section_end.as_ref().expect("marker survives");
+        assert!((props.geometry.margin_top - 5.0).abs() < 0.1);
+        assert!(
+            marker_para.dirty,
+            "writer must regenerate the pPr with the mutated sectPr"
+        );
+        /* The FOLLOWING section is untouched. */
+        assert!((updated.section_for_block(2).geometry.margin_top - 72.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn marker_on_last_block_suppresses_empty_trailing_section() {
+        let d = two_section_doc();
+        /* Delete blocks 1..3 ("b", "c") so the marker paragraph "a"
+        becomes the final block. */
+        let truncated = d.delete_range(
+            LogicalPos::new(BlockPath::top(0), 1),
+            LogicalPos::new(BlockPath::top(2), 1),
+        );
+        let derived = truncated.effective_sections();
+        assert!(
+            !derived.iter().any(|s| s.end_block <= s.start_block),
+            "no empty derived section: {derived:?}"
+        );
+    }
+
+    #[test]
+    fn insert_section_break_splits_and_stamps() {
+        let d = DocumentTree::from_text("hello world");
+        let broken =
+            d.insert_section_break_at(LogicalPos::new(BlockPath::top(0), 5), SectionType::NextPage);
+        let sections = broken.effective_sections();
+        assert_eq!(sections.len(), 2);
+        assert_eq!((sections[0].start_block, sections[0].end_block), (0, 1));
+        assert_eq!((sections[1].start_block, sections[1].end_block), (1, 2));
+        assert_eq!(broken.paragraph_text(0), Some("hello"));
+        assert_eq!(broken.paragraph_text(1), Some(" world"));
+        /* Both halves share the covering geometry (Word clones on
+        insert). */
+        assert!((sections[0].geometry.margin_left - 72.0).abs() < 0.1);
+        assert!((sections[1].geometry.margin_left - 72.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn insert_continuous_break_types_the_following_section() {
+        let d = DocumentTree::from_text("hello world");
+        let broken = d.insert_section_break_at(
+            LogicalPos::new(BlockPath::top(0), 5),
+            SectionType::Continuous,
+        );
+        let sections = broken.effective_sections();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(
+            sections[0].section_type,
+            SectionType::NextPage,
+            "first half keeps the covering section's own start type"
+        );
+        assert_eq!(
+            sections[1].section_type,
+            SectionType::Continuous,
+            "<w:type> describes how the section it OPENS begins"
+        );
+    }
+
+    #[test]
+    fn insert_break_targets_the_covering_sections_own_terminal() {
+        /* A | B | C — critic Q2's off-by-one-section hazard: a break
+        inside B must retype B's OWN terminal, never C's storage. */
+        let d = two_section_doc(); /* A = [0,1) narrow-marker, B = body [1,3) */
+        let broken = d.insert_section_break_at(
+            LogicalPos::new(BlockPath::top(1), 1),
+            SectionType::Continuous,
+        );
+        let sections = broken.effective_sections();
+        assert_eq!(sections.len(), 3);
+        /* A untouched. */
+        assert!((sections[0].geometry.margin_left - 30.0).abs() < 0.1);
+        assert_eq!(sections[0].section_type, SectionType::NextPage);
+        /* B's first half: new marker, B's original start type. */
+        assert_eq!(sections[1].section_type, SectionType::NextPage);
+        /* B's second half (closed by body_section) starts continuous. */
+        assert_eq!(sections[2].section_type, SectionType::Continuous);
+        assert_eq!(broken.body_section.section_type, SectionType::Continuous);
+    }
+
+    #[test]
+    fn insert_break_on_a_marker_paragraph_itself() {
+        /* Splitting the marker paragraph: the original marker rides the
+        right half; the new marker lands on the left; the right-half
+        marker (the covering section's own terminal) takes the kind. */
+        let d = two_section_doc();
+        let broken = d.insert_section_break_at(
+            LogicalPos::new(BlockPath::top(0), 1),
+            SectionType::Continuous,
+        );
+        let sections = broken.effective_sections();
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[1].section_type, SectionType::Continuous);
+        /* The old narrow geometry now closes section 2 (the original
+        marker, retyped). */
+        assert!((sections[1].geometry.margin_left - 30.0).abs() < 0.1);
+        /* Body section untouched. */
+        assert_eq!(broken.body_section.section_type, SectionType::NextPage);
+    }
+
+    #[test]
+    fn insert_break_inside_a_table_cell_is_rejected() {
+        let mut d = DocumentTree::from_text("body");
+        d.blocks.push_back(Block::Table(Table {
+            grid: vec![2000],
+            props: TableProperties::default(),
+            rows: vec![TableRow {
+                props: RowProperties::default(),
+                cells: vec![TableCell {
+                    props: CellProperties::default(),
+                    blocks: vec![Block::Paragraph(Paragraph {
+                        text: "cell".into(),
+                        ..Default::default()
+                    })],
+                }],
+            }],
+            dirty: true,
+            source_xml: None,
+        }));
+        let cell_pos = LogicalPos::new(
+            BlockPath::top(1)
+                .push(PathStep::Cell { row: 0, col: 0 })
+                .push(PathStep::Block(0)),
+            0,
+        );
+        let out = d.insert_section_break_at(cell_pos, SectionType::NextPage);
+        assert_eq!(out.effective_sections().len(), 1, "no section created");
+        assert_eq!(out.block_count(), d.block_count(), "no split happened");
+    }
+
+    #[test]
+    fn document_tree_default_body_section_is_a4() {
+        /* Guards the indirect Default chain: if PageGeometry ever gains
+        a derived (zeroed) Default, a fresh document would silently lay
+        out on a 0x0 page. */
+        let d = DocumentTree::default();
+        assert!((d.body_section.geometry.width - 595.3).abs() < 0.5);
+        assert!((d.body_section.geometry.height - 841.9).abs() < 0.5);
+        let derived = d.effective_sections();
+        assert_eq!(derived.len(), 1, "empty doc still derives one section");
+    }
+
+    #[test]
+    fn formatting_a_marker_paragraph_keeps_the_break() {
+        let d = two_section_doc();
+        let marker_para = d.paragraph_at_path(&BlockPath::top(0)).unwrap();
+        let styled = marker_para.apply_style(
+            0,
+            1,
+            SpanStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(styled.section_end.is_some(), "apply_style preserves marker");
+        let deleted = marker_para.delete_text(0, 1);
+        assert!(
+            deleted.section_end.is_some(),
+            "in-paragraph deletion preserves the mark's marker"
+        );
     }
 
     #[test]
@@ -6925,6 +7647,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -6951,6 +7674,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -6974,6 +7698,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -7075,6 +7800,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -7112,6 +7838,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -7606,6 +8333,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -7649,6 +8377,7 @@ mod tests {
             fields: Vec::new(),
             style_id: None,
             direct_overrides: ParaProperties::default(),
+            section_end: None,
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -7691,6 +8420,7 @@ mod tests {
                 fields: Vec::new(),
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
+                section_end: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -7711,6 +8441,7 @@ mod tests {
                 fields: Vec::new(),
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
+                section_end: None,
             },
         ];
         let (out, caret) = doc.insert_rich(
@@ -8181,7 +8912,7 @@ mod tests {
         }
         let d = DocumentTree {
             blocks,
-            sections: Vec::new(),
+            body_section: SectionProps::default(),
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
@@ -8194,6 +8925,7 @@ mod tests {
             style_run_defaults: SpanStyle::default(),
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
+            hf_dirty: HfDirty::default(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

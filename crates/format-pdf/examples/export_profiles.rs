@@ -68,6 +68,8 @@ fn hello_page(stack: &FontStack) -> PageBox {
         blocks: vec![LayoutBlock::Paragraph(para)],
         header: None,
         footer: None,
+        header_offset: 36.0,
+        footer_offset: 36.0,
         footnotes: Vec::new(),
     }
 }
