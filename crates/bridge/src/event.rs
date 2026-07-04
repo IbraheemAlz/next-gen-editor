@@ -213,6 +213,23 @@ pub enum Event {
         /// state, so a `ToggleTrackChanges` issued by another tab,
         /// macro, or undo path stays in sync.
         is_tracking_changes: bool,
+        /// Issue #38 — total snapshots ever pushed onto the `UndoStack`
+        /// (`UndoStack::depth`). Every interactive edit — typed insert,
+        /// tracked delete, paste, formatting — pushes exactly one new
+        /// snapshot, so a change in this count (and ONLY a change in
+        /// this count) means "a new edit landed," distinct from a plain
+        /// caret move / click, which never pushes. Undo/Redo replay
+        /// existing snapshots and do not change the count. Lets
+        /// `TrackChangesSidebar` re-fetch `revisions_snapshot()` on
+        /// every real edit without a dedicated event or a noisy
+        /// refetch-on-every-caret-move.
+        undo_depth: u32,
+        /// Issue #42 — `<w:numPr><w:ilvl>` of the paragraph under the
+        /// caret. `None` when the paragraph is not a list item. Lets the
+        /// shell's Tab-key handler decide, without a round-trip, whether
+        /// to demote/promote a list level or fall back to its existing
+        /// tab-char/cell-navigation behavior.
+        list_ilvl: Option<u8>,
     },
 
     /* IME */

@@ -3802,6 +3802,71 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #42 — demote (`delta > 0`) or promote (`delta < 0`) the
+    /// outline level of every list paragraph the range spans. Clamped to
+    /// `0..=8` — Word's nine stock outline levels, all synthesized up
+    /// front by [`numbering::stock_bullet_levels`] /
+    /// [`numbering::stock_number_levels`], so a bumped `ilvl` always
+    /// resolves against a real level definition. Paragraphs with no
+    /// `list_item` (not in a list) are left untouched — this is a no-op
+    /// on plain body text, matching the Tab-key contract in the shell.
+    pub fn change_list_level_on_range(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        delta: i8,
+    ) -> Self {
+        let (start, end) = order_positions(start, end);
+        let mut blocks = self.blocks.clone();
+        let apply = |para: &mut Paragraph| {
+            if let Some(item) = para.list_item.as_mut() {
+                item.ilvl = (i16::from(item.ilvl) + i16::from(delta)).clamp(0, 8) as u8;
+                /* resolved_marker is re-stamped by the document-wide
+                resolver below — clearing now keeps it consistent if the
+                resolver bails on a malformed cascade. */
+                para.resolved_marker = None;
+            }
+        };
+        if same_parent(&start.path, &end.path) {
+            let Some(start_idx) = start.path.last_block_index() else {
+                return self.clone();
+            };
+            let Some(end_idx) = end.path.last_block_index() else {
+                return self.clone();
+            };
+            let parent = start.path.parent();
+            for idx in start_idx..=end_idx {
+                let child_path = parent.clone().push(PathStep::Block(idx));
+                let _ = mutate_paragraph_in_top(&mut blocks, &child_path, apply);
+            }
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, &start.path, apply);
+        }
+        /* Document-wide marker refresh — counters reset at the top
+        because the changed range might appear in the middle. */
+        let mut paragraph_refs: Vec<&mut Paragraph> = blocks
+            .iter_mut()
+            .filter_map(|b| b.as_paragraph_mut())
+            .collect();
+        numbering::resolve_markers_in_place(&mut paragraph_refs, &self.numbering);
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
+            numbering: self.numbering.clone(),
+        }
+    }
+
     pub fn clear_list_item_on_range(&self, start: LogicalPos, end: LogicalPos) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
@@ -7648,6 +7713,84 @@ mod tests {
             }),
             "level-0 stock indent must ride along with the marker"
         );
+    }
+
+    /// Issue #42 — Tab (delta +1) demotes a bulleted list item's outline
+    /// level and the marker re-resolves against the deeper stock level's
+    /// glyph (level 0 "•" → level 1 "◦"), with its indent following.
+    #[test]
+    fn change_list_level_demotes_bullet_marker_and_indent() {
+        let d = DocumentTree::from_text("alpha");
+        let pos = LogicalPos::new(BlockPath::top(0), 0);
+        let d = d.toggle_list_on_range(
+            pos.clone(),
+            pos.clone(),
+            numbering::ListSynthesisKind::Bullet,
+        );
+        assert_eq!(
+            d.blocks[0].as_paragraph().unwrap().list_item.unwrap().ilvl,
+            0
+        );
+        let d = d.change_list_level_on_range(pos.clone(), pos.clone(), 1);
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.list_item.unwrap().ilvl, 1);
+        assert_eq!(p.resolved_marker.as_deref(), Some("\u{25E6}"));
+        assert_eq!(
+            p.resolved_list_indent,
+            Some(Indent {
+                start_twips: 1080,
+                end_twips: 0,
+                first_line_twips: 0,
+                hanging_twips: 360,
+            }),
+            "level-1 stock indent must follow the demote"
+        );
+        /* Shift+Tab (delta -1) promotes back to level 0. */
+        let d = d.change_list_level_on_range(pos.clone(), pos, -1);
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.list_item.unwrap().ilvl, 0);
+        assert_eq!(p.resolved_marker.as_deref(), Some("\u{2022}"));
+    }
+
+    /// Issue #42 — level clamps at the top (promote past 0 stays 0) and
+    /// the bottom (demote past the 9 stock levels stays at 8), matching
+    /// Word's outline-level bounds.
+    #[test]
+    fn change_list_level_clamps_at_bounds() {
+        let d = DocumentTree::from_text("alpha");
+        let pos = LogicalPos::new(BlockPath::top(0), 0);
+        let d = d.toggle_list_on_range(
+            pos.clone(),
+            pos.clone(),
+            numbering::ListSynthesisKind::Bullet,
+        );
+        let d = d.change_list_level_on_range(pos.clone(), pos.clone(), -5);
+        assert_eq!(
+            d.blocks[0].as_paragraph().unwrap().list_item.unwrap().ilvl,
+            0
+        );
+        let d = d.change_list_level_on_range(pos.clone(), pos.clone(), 20);
+        assert_eq!(
+            d.blocks[0].as_paragraph().unwrap().list_item.unwrap().ilvl,
+            8
+        );
+        let d = d.change_list_level_on_range(pos.clone(), pos, 3);
+        assert_eq!(
+            d.blocks[0].as_paragraph().unwrap().list_item.unwrap().ilvl,
+            8,
+            "demoting past the deepest stock level stays clamped at 8"
+        );
+    }
+
+    /// Issue #42 — a non-list paragraph is left untouched (no `list_item`
+    /// to demote/promote), matching the Tab key's fallback-to-tab-char
+    /// contract in the shell.
+    #[test]
+    fn change_list_level_is_noop_on_non_list_paragraph() {
+        let d = DocumentTree::from_text("alpha");
+        let pos = LogicalPos::new(BlockPath::top(0), 0);
+        let d = d.change_list_level_on_range(pos.clone(), pos, 1);
+        assert!(d.blocks[0].as_paragraph().unwrap().list_item.is_none());
     }
 
     /// Issue #50 — Enter inside a numbered list renumbers the tail;

@@ -3,15 +3,13 @@
  * tracked-change revision the engine has parsed from the loaded `.docx`.
  *
  * Consumes `engine.revisionsSnapshot()` (an optional capability on
- * EngineHandle). Re-fetches on every DOCUMENT_LOADED event so the list
- * mirrors the active document.
+ * EngineHandle). Re-fetches on DOCUMENT_LOADED/RECOVERED/FORMATTING_CHANGED,
+ * on every new tracked insertion (TEXT_INSERTED — issue #38), on a tracked
+ * deletion (SELECTION_CHANGED while `is_tracking_changes` is on), and after
+ * its own Accept/Reject actions.
  *
  * Validates the entire ins/del/rPrChange parser path — before this,
  * the only coverage was the `.docx` round-trip byte-diff harness.
- *
- * Accept/Reject controls are intentionally absent: the engine does not
- * yet expose mutation commands for revisions. Once it does, those
- * controls land here without touching the layout.
  */
 import {
     createEffect,
@@ -75,6 +73,15 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
     /* Initial load + refresh on document mutations. */
     void refresh();
 
+    /* Issue #38 — every interactive edit (typed insert, tracked delete,
+       paste, formatting) pushes exactly one new `UndoStack` snapshot, so
+       `SELECTION_CHANGED.undo_depth` changing (up OR down — a redo-branch
+       truncation can lower it) means "a new edit landed." A plain caret
+       move / click never pushes, so this does not refetch on navigation.
+       Plain closure variable, not a signal — no reactive tracking needed
+       for a value only read inside the subscribe callback. */
+    let lastUndoDepth: number | null = null;
+
     createEffect(() => {
         const unsub = engine.subscribe((evt) => {
             if (
@@ -83,6 +90,11 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
                 evt.type === 'FORMATTING_CHANGED'
             ) {
                 void refresh();
+            } else if (evt.type === 'SELECTION_CHANGED') {
+                if (lastUndoDepth !== null && evt.undo_depth !== lastUndoDepth) {
+                    void refresh();
+                }
+                lastUndoDepth = evt.undo_depth;
             }
         });
         onCleanup(unsub);

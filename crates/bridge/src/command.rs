@@ -465,6 +465,14 @@ pub enum Command {
         range: LogicalRange,
         kind: ListKind,
     },
+    /// Issue #42 — demote (`delta: 1`) or promote (`delta: -1`) the
+    /// outline level (`<w:numPr><w:ilvl>`) of every list paragraph the
+    /// range spans. No-op on paragraphs with no `list_item`. Clamped to
+    /// Word's nine stock outline levels (`0..=8`) engine-side.
+    ChangeListLevel {
+        range: LogicalRange,
+        delta: i8,
+    },
     /// Sprint 6 (UI Edition) — set `<w:pPr><w:ind>` on every
     /// paragraph the range spans. All values in points. Negative
     /// `first_line_pt` populates `<w:hanging>`; non-negative
@@ -603,10 +611,10 @@ pub struct BridgeBorderStroke {
 }
 
 /// Sprint 5 (UI Edition) — list kind for [`Command::ToggleList`].
-/// `Off` clears the paragraph's `list_item`; `Bullet` / `Number`
-/// would bind to a `<w:abstractNum>` entry but require a numbering
-/// synthesis path the engine does not yet ship — those variants
-/// surface a clear "engine pending" error on dispatch.
+/// `Off` clears the paragraph's `list_item`; `Bullet` / `Number` run
+/// the numbering synthesis path (`DocumentTree::toggle_list_on_range`,
+/// Sprint 13 #12) that mints/reuses an idempotent `<w:abstractNum>` /
+/// `<w:num>` template.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ListKind {
     #[default]

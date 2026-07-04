@@ -137,6 +137,10 @@ export function createEngineStore(client: EngineClient) {
        the document-level direction for the alignment picker; this
        reflects the SELECTION's paragraph direction. */
     const [paragraphDirection, setParagraphDirection] = createSignal<Direction | null>('Ltr');
+    /* Issue #42 — the caret paragraph's `<w:numPr><w:ilvl>`, or `undefined`
+       outside any list. Drives the Tab-key handler's demote/promote
+       branch in `HiddenInput`. */
+    const [listIlvl, setListIlvl] = createSignal<number | undefined>(undefined);
     const [announcement, setAnnouncement] = createSignal('');
     /* Sprint 10 — separate `aria-live="assertive"` channel. Engine
        emits this priority only for errors / blocked actions; the UI
@@ -211,6 +215,7 @@ export function createEngineStore(client: EngineClient) {
             setParagraphAlignment(ev.paragraph_alignment);
             setBaseDirection(ev.direction);
             setSelectionKind(ev.selection_kind);
+            setListIlvl(ev.list_ilvl);
         } else if (ev.type === 'PAINTED') {
             /* Phase 6b — paginator reach. The engine emits
                `document_height` (device px) and `page_count` on every
@@ -284,6 +289,7 @@ export function createEngineStore(client: EngineClient) {
         paragraphAlignment,
         baseDirection,
         paragraphDirection,
+        listIlvl,
         announcement,
         assertiveAnnouncement,
         uiError,

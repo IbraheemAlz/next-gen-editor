@@ -185,19 +185,32 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
 
         /* Tab — context-sensitive (Ctrl+Tab still falls through to the
            textarea default). Inside a table cell it navigates cell-to-cell
-           (Shift+Tab = previous). In body text it inserts a real `\t`
-           (U+0009), which the layout engine then aligns to the paragraph's
-           ruler tab stops (or the default 0.5-inch grid). preventDefault
-           stops the browser stealing Tab for focus navigation. */
+           (Shift+Tab = previous). Inside a list item it demotes/promotes
+           the outline level (Issue #42). Otherwise, in body text, it
+           inserts a real `\t` (U+0009), which the layout engine then
+           aligns to the paragraph's ruler tab stops (or the default
+           0.5-inch grid). preventDefault stops the browser stealing Tab
+           for focus navigation. */
         if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey) {
             e.preventDefault();
             const caret = props.store.caretLogical();
             const inCell = !!caret && caret.path.steps.some((s) => s.kind === 'CELL');
+            const ilvl = props.store.listIlvl();
             if (inCell) {
                 void props.client.dispatch({
                     type: 'MOVE_CARET',
                     direction: e.shiftKey ? 'PrevCell' : 'NextCell',
                     extend: false,
+                });
+            } else if (caret && ilvl !== undefined) {
+                /* Caret sits in a list item — demote (Tab) or promote
+                   (Shift+Tab) its outline level instead of inserting a
+                   tab character or no-op'ing. Issue #53 — engine-live
+                   caret, not the async UI mirror. */
+                void props.client.dispatch({
+                    type: 'CHANGE_LIST_LEVEL',
+                    range: { start: caret, end: caret },
+                    delta: e.shiftKey ? -1 : 1,
                 });
             } else if (caret && !e.shiftKey) {
                 /* Body paragraph → insert a tab character. Shift+Tab in body

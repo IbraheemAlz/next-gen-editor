@@ -4227,6 +4227,7 @@ impl Engine {
             // the model; Bullet / Number return Error until the
             // numbering synthesizer ships.
             Command::ToggleList { range, kind } => self.do_toggle_list(range, kind),
+            Command::ChangeListLevel { range, delta } => self.do_change_list_level(range, delta),
 
             // Sprint 6 (UI Edition) — paragraph indent, line spacing,
             // shading.
@@ -6223,7 +6224,22 @@ impl Engine {
             tab_stops: self.tab_stops_for_caret(&sel.caret.path),
             paragraph_indent: self.indent_for_caret(&sel.caret.path),
             is_tracking_changes: self.tracking_changes,
+            undo_depth: self.undo.depth(),
+            list_ilvl: self.list_ilvl_for_caret(&sel.caret.path),
         }
+    }
+
+    /// Issue #42 — the paragraph-under-caret's `<w:numPr><w:ilvl>`, or
+    /// `None` when it is not a list item / not addressable. Drives the
+    /// shell's Tab-key handler so it can dispatch `ChangeListLevel`
+    /// instead of falling back to tab-char insertion.
+    fn list_ilvl_for_caret(&self, path: &BridgeBlockPath) -> Option<u8> {
+        let engine_path = bridge_path_to_engine(path);
+        self.undo
+            .current()
+            .paragraph_at_path(&engine_path)?
+            .list_item
+            .map(|item| item.ilvl)
     }
 
     /// Sprint 15 (#13) — extract the paragraph-under-caret's
@@ -7643,6 +7659,33 @@ impl Engine {
             return *e;
         }
         self.announce(AnnouncementPriority::Polite, label);
+        self.selection_changed()
+    }
+
+    /// `Command::ChangeListLevel` — Issue #42. Demotes (`delta > 0`) or
+    /// promotes (`delta < 0`) the outline level of every list paragraph
+    /// the range spans; a no-op on non-list paragraphs.
+    fn do_change_list_level(&mut self, range: BridgeLogicalRange, delta: i8) -> Event {
+        let (start, end) = ordered(range.start, range.end);
+        let new_doc = self.undo.current().change_list_level_on_range(
+            to_engine_pos(start),
+            to_engine_pos(end),
+            delta,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(
+            AnnouncementPriority::Polite,
+            if delta > 0 {
+                "List level demoted"
+            } else {
+                "List level promoted"
+            },
+        );
         self.selection_changed()
     }
 
@@ -10195,6 +10238,74 @@ mod tests {
         assert!(
             (p1[0].size.height - p2[0].size.height).abs() < 0.01,
             "cache-hit geometry must be identical"
+        );
+    }
+
+    /// Issue #42 — `Command::ChangeListLevel`'s handler demotes the
+    /// caret's list item and the `SelectionChanged` reply reads back the
+    /// new `list_ilvl` — the exact field the shell's Tab handler branches
+    /// on to decide demote/promote vs. tab-char insertion.
+    #[test]
+    fn change_list_level_dispatch_reads_back_new_ilvl() {
+        let doc = DocumentTree::from_text("alpha").toggle_list_on_range(
+            engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+            engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+            engine::numbering::ListSynthesisKind::Bullet,
+        );
+        let mut engine = test_engine_with_doc(doc);
+        let range = BridgeLogicalRange {
+            start: bpos_top(0, 0),
+            end: bpos_top(0, 0),
+        };
+        let evt = engine.do_change_list_level(range, 1);
+        let Event::SelectionChanged { list_ilvl, .. } = evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        assert_eq!(list_ilvl, Some(1), "reply must read back the demoted level");
+    }
+
+    /// Issue #42 — dispatching `ChangeListLevel` on a non-list paragraph
+    /// is a no-op end-to-end: `list_ilvl` reads back `None`, matching the
+    /// shell's decision to fall through to tab-char insertion instead.
+    #[test]
+    fn change_list_level_dispatch_noop_reads_back_none() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("alpha"));
+        let range = BridgeLogicalRange {
+            start: bpos_top(0, 0),
+            end: bpos_top(0, 0),
+        };
+        let evt = engine.do_change_list_level(range, 1);
+        let Event::SelectionChanged { list_ilvl, .. } = evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        assert_eq!(list_ilvl, None);
+    }
+
+    /// Issue #38 — `SelectionChanged.undo_depth` increases on a real edit
+    /// (something the sidebar must refetch for) but stays put across a
+    /// pure caret placement (navigation the sidebar must NOT refetch on).
+    /// This is the exact invariant `TrackChangesSidebar`'s reactive
+    /// refetch depends on.
+    #[test]
+    fn undo_depth_changes_on_edit_not_on_caret_placement() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        let before = engine.undo.depth();
+        let evt = engine.do_place_caret_at_point(0, BridgePoint { x: 300.0, y: 130.0 });
+        let Event::SelectionChanged { undo_depth, .. } = evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        assert_eq!(
+            undo_depth, before,
+            "a plain caret placement must not push a new undo snapshot"
+        );
+        let evt = engine.do_insert_text_interactive(bpos_top(0, 0), "X".to_string());
+        let Event::SelectionChanged { undo_depth, .. } = evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        assert_eq!(
+            undo_depth,
+            before + 1,
+            "an interactive edit must push exactly one new snapshot"
         );
     }
 
