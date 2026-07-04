@@ -939,6 +939,7 @@ function broadcastPaintDims(): void {
             is_full_layout: boolean;
             page_tops: number[];
             page_heights: number[];
+            image_count: number;
         };
         self.postMessage({
             evt: {
@@ -952,6 +953,7 @@ function broadcastPaintDims(): void {
                 estimated_document_height: dims.estimated_document_height,
                 page_tops: dims.page_tops,
                 page_heights: dims.page_heights,
+                image_count: dims.image_count,
             },
         });
     } catch (e: unknown) {

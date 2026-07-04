@@ -8,9 +8,9 @@
  *      a separate picker.
  *   2. Insert Page Break button + `Ctrl+Enter` shortcut →
  *      `Command::InsertPageBreak` at the current caret.
- *   3. Paragraph Borders toggle → `Command::SetParagraphBorders`
- *      applies an all-four-edges single 4-eighth-pt (0.5 pt) stroke;
- *      a second click clears the borders.
+ *   3. Paragraph Borders button → opens `ParagraphBordersDialog`, the
+ *      full per-edge style/width/colour picker (issue #41). Its active
+ *      state reflects the live `paragraph_borders` read-back.
  *
  * All three commands shipped in the Sprint 2 (UI Edition) Rust bridge
  * additions — see `crates/bridge/src/command.rs` for the wire types and
@@ -26,22 +26,12 @@ import {
     Show,
     type Component,
 } from 'solid-js';
-import {
-    createEditorCommands,
-    createEditorState,
-    type BridgeCellBorders,
-} from '@nge/core';
+import { createEditorCommands, createEditorState } from '@nge/core';
 import { PageSetupDialog } from './PageSetupDialog';
+import { ParagraphBordersDialog } from './ParagraphBordersDialog';
 import './LayoutControls.css';
 
 const DEFAULT_GUTTER_PT = 36;
-
-const SINGLE_HAIRLINE: BridgeCellBorders = {
-    top: { style: 'Single', size_eighth_pt: 4, color: undefined },
-    left: { style: 'Single', size_eighth_pt: 4, color: undefined },
-    bottom: { style: 'Single', size_eighth_pt: 4, color: undefined },
-    right: { style: 'Single', size_eighth_pt: 4, color: undefined },
-};
 
 export interface LayoutControlsProps {
     /** Whether to bind `Ctrl+Enter` to InsertPageBreak. Default true. */
@@ -54,8 +44,21 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
     const cmd = createEditorCommands();
     const state = createEditorState();
     const [columnCount, setColumnCount] = createSignal(1);
-    const [hasBorders, setHasBorders] = createSignal(false);
     const [pageSetupOpen, setPageSetupOpen] = createSignal(false);
+    const [bordersOpen, setBordersOpen] = createSignal(false);
+
+    /* Active state reflects the live document (issue #41 read-back):
+       the button lights up whenever the caret paragraph has any edge. */
+    const hasBorders = createMemo(() => {
+        const b = state.paragraphBorders();
+        return (
+            !!b &&
+            (b.top !== undefined ||
+                b.right !== undefined ||
+                b.bottom !== undefined ||
+                b.left !== undefined)
+        );
+    });
 
     const gutter = () => props.gutterPt ?? DEFAULT_GUTTER_PT;
 
@@ -73,17 +76,6 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
     const insertBreak = async () => {
         if (!ready()) return;
         await cmd.insertPageBreak();
-    };
-
-    const toggleBorders = async () => {
-        if (!ready()) return;
-        if (hasBorders()) {
-            setHasBorders(false);
-            await cmd.clearParagraphBorders();
-        } else {
-            setHasBorders(true);
-            await cmd.setParagraphBorders(SINGLE_HAIRLINE);
-        }
     };
 
     /* Ctrl+Enter — Word's page-break shortcut. */
@@ -134,15 +126,15 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
             <button
                 class="nge-btn nge-layout__btn"
                 type="button"
-                aria-label="Toggle paragraph borders"
+                aria-label="Paragraph borders"
                 aria-pressed={hasBorders()}
                 data-active={hasBorders()}
-                title="Paragraph borders"
+                title="Paragraph borders…"
                 disabled={!ready()}
-                onClick={() => void toggleBorders()}
+                onClick={() => setBordersOpen(true)}
             >
                 <span class="nge-layout__borders-icon" aria-hidden="true">▢</span>
-                <span>Borders</span>
+                <span>Borders…</span>
             </button>
 
             <button
@@ -166,6 +158,11 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
             <PageSetupDialog
                 open={pageSetupOpen()}
                 onClose={() => setPageSetupOpen(false)}
+            />
+
+            <ParagraphBordersDialog
+                open={bordersOpen()}
+                onClose={() => setBordersOpen(false)}
             />
         </div>
     );

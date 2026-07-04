@@ -122,3 +122,9 @@
     width: 28px;
     padding: 0;
 }
+
+.nge-btn--sm {
+    height: 22px;
+    padding: 0 var(--nge-space-1);
+    font-size: var(--nge-font-size-xs, 11px);
+}

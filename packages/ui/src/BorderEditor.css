@@ -1,0 +1,81 @@
+.nge-borders {
+    display: flex;
+    gap: var(--nge-space-4);
+    align-items: flex-start;
+    flex-wrap: wrap;
+}
+
+.nge-borders__pen {
+    display: flex;
+    flex-direction: column;
+    gap: var(--nge-space-2);
+    flex: 1 1 220px;
+}
+
+.nge-borders__diagram {
+    display: flex;
+    flex-direction: column;
+    gap: var(--nge-space-2);
+    align-items: center;
+}
+
+.nge-borders__presets {
+    display: flex;
+    gap: var(--nge-space-1);
+}
+
+/* A plus-shaped edge diagram: top/bottom span the middle column,
+   left/right sit on the sides, an inert center cell in the middle. */
+.nge-borders__grid {
+    display: grid;
+    grid-template-columns: 28px 40px 28px;
+    grid-template-rows: 28px 40px 28px;
+    gap: 2px;
+}
+
+.nge-borders__edge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    background: var(--nge-color-surface);
+    color: var(--nge-color-text);
+    font: 600 var(--nge-font-size-xs, 11px) / 1 var(--nge-font-ui);
+    cursor: pointer;
+}
+
+.nge-borders__edge:hover {
+    border-color: var(--nge-color-border-strong);
+}
+
+.nge-borders__edge--on {
+    background: var(--nge-color-primary);
+    border-color: var(--nge-color-primary);
+    color: #ffffff;
+}
+
+.nge-borders__edge--top {
+    grid-column: 2;
+    grid-row: 1;
+}
+.nge-borders__edge--right {
+    grid-column: 3;
+    grid-row: 2;
+}
+.nge-borders__edge--bottom {
+    grid-column: 2;
+    grid-row: 3;
+}
+.nge-borders__edge--left {
+    grid-column: 1;
+    grid-row: 2;
+}
+
+.nge-borders__center {
+    grid-column: 2;
+    grid-row: 2;
+    border: 1px dashed var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    opacity: 0.5;
+}

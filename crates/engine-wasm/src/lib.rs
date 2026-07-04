@@ -7,7 +7,7 @@
 use bridge::{
     A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRow, A11yRun, A11yTable, A11yTree,
     Alignment as BridgeAlignment, AnnouncementPriority, BlockPath as BridgeBlockPath,
-    BridgeBorderStroke, BridgeBorderStyle, BridgeCellProperties, BridgeIndent,
+    BridgeBorderStroke, BridgeBorderStyle, BridgeCellBorders, BridgeCellProperties, BridgeIndent,
     BridgeSectionGeometry, BridgeStyleProperties, Color, Command, Direction, DocFormat,
     EngineStats, Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
     LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, MoveDirection,
@@ -541,6 +541,7 @@ impl Engine {
             is_full_layout: dims.is_full_layout,
             page_tops: dims.page_tops,
             page_heights: dims.page_heights,
+            image_count: self.undo.current().count_inline_images(),
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -636,6 +637,9 @@ struct PaintDimsOut {
     /// Issue #26 — per-page absolute tops + heights in device px.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Issue #44 — inline-image count, so the broadcast PAINTED can gate
+    /// the shell's `GetImageRects` refresh (mirrors `Event::Painted`).
+    image_count: u32,
 }
 
 #[derive(::serde::Serialize)]
@@ -3070,6 +3074,98 @@ fn collect_table_line_geom(
     }
 }
 
+/// Issue #44 — collect on-canvas rects for every inline image in a
+/// paragraph box. Mirrors the display-list image math in `render::scene`
+/// exactly: the image's bottom edge sits flush with the line baseline,
+/// its height is the glyph's `inline_object_height` (the grown ascent),
+/// and its width is the reserved glyph advance. Coordinates are absolute
+/// device px, matching `LineGeom` / `SelectionChanged.rects`.
+fn collect_paragraph_image_rects(
+    para_box: &ParagraphBox,
+    parent_origin_x: f32,
+    parent_origin_y: f32,
+    path: &BridgeBlockPath,
+    out: &mut Vec<bridge::ImageRect>,
+) {
+    let para_x = parent_origin_x + para_box.origin.x;
+    let para_y = parent_origin_y + para_box.origin.y;
+    for line in &para_box.lines {
+        let line_x = para_x + line.origin.x;
+        let baseline = para_y + line.origin.y + line.baseline;
+        /* One pen across the whole line, exactly as `render::scene`
+        places glyphs — runs lie left-to-right in visual order. */
+        let mut pen = 0.0_f32;
+        for run in &line.runs {
+            for g in &run.glyphs {
+                if let Some(rel) = g.inline_image_rel_id.as_deref() {
+                    let x0 = line_x + pen;
+                    let y1 = baseline;
+                    let y0 = y1 - g.inline_object_height;
+                    out.push(bridge::ImageRect {
+                        path: path.clone(),
+                        at: run.source_range.start + g.cluster,
+                        rel_id: rel.to_string(),
+                        rect: BridgeRect {
+                            x: x0,
+                            y: y0,
+                            w: g.x_advance,
+                            h: g.inline_object_height,
+                        },
+                        /* Filled from the document model in
+                        `image_geometry` — the layout box doesn't carry
+                        the EMU extent. */
+                        width_emu: 0,
+                        height_emu: 0,
+                    });
+                }
+                pen += g.x_advance;
+            }
+        }
+    }
+}
+
+/// Walk a table's cells and emit image rects for every inline image
+/// inside a cell paragraph — the image analog of `collect_table_line_geom`.
+fn collect_table_image_rects(
+    table_box: &TableBox,
+    table_block_idx: u32,
+    table_origin_x: f32,
+    table_origin_y: f32,
+    out: &mut Vec<bridge::ImageRect>,
+) {
+    for (r, row) in table_box.rows.iter().enumerate() {
+        let row_x = table_origin_x + row.origin.x;
+        let row_y = table_origin_y + row.origin.y;
+        for (c, cell) in row.cells.iter().enumerate() {
+            if cell.v_merge == engine::VMergeRole::Continue {
+                continue;
+            }
+            let cell_x = row_x + cell.origin.x;
+            let cell_y = row_y + cell.origin.y;
+            for (block_idx, content) in cell.content.iter().enumerate() {
+                let LayoutBlock::Paragraph(para_box) = content else {
+                    continue;
+                };
+                let path = BridgeBlockPath {
+                    steps: vec![
+                        BridgePathStep::Block {
+                            idx: table_block_idx,
+                        },
+                        BridgePathStep::Cell {
+                            row: r as u32,
+                            col: c as u32,
+                        },
+                        BridgePathStep::Block {
+                            idx: block_idx as u32,
+                        },
+                    ],
+                };
+                collect_paragraph_image_rects(para_box, cell_x, cell_y, &path, out);
+            }
+        }
+    }
+}
+
 /// Map an absolute pixel to a logical position — nearest line by `y`, then
 /// nearest caret slot by `x`. The returned `path` is the line's owning
 /// paragraph path, descending into a cell when the hit lands inside one.
@@ -4108,6 +4204,12 @@ impl Engine {
             // through Sprint 1, which silently broke the InsertImageButton
             // I shipped over it).
             Command::InsertImage { at, image, fit } => self.do_insert_image(at, image, fit),
+            Command::ResizeImage {
+                path,
+                at,
+                width_emu,
+                height_emu,
+            } => self.do_resize_image(path, at, width_emu, height_emu),
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => self.do_select_all(),
@@ -4131,6 +4233,7 @@ impl Engine {
             Command::HitTest { at } => self.do_hit_test(at),
             Command::HitTestInPage { page, at } => self.do_hit_test_in_page(page, at),
             Command::PlaceCaretAtPoint { page, at } => self.do_place_caret_at_point(page, at),
+            Command::GetImageRects => self.do_get_image_rects(),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
             Command::SelectParagraphAt { at } => self.do_select_paragraph_at(at),
             Command::SelectCellAt { at } => self.do_select_cell_at(at),
@@ -5426,6 +5529,7 @@ impl Engine {
             estimated_document_height: dims.estimated_document_height,
             page_tops: dims.page_tops,
             page_heights: dims.page_heights,
+            image_count: self.undo.current().count_inline_images(),
         }
     }
 
@@ -5481,6 +5585,7 @@ impl Engine {
             estimated_document_height: stats.estimated_document_height,
             page_tops: stats.page_tops,
             page_heights: stats.page_heights,
+            image_count: self.undo.current().count_inline_images(),
         }
     }
 
@@ -5548,6 +5653,87 @@ impl Engine {
             page_top += page.size.height + gap;
         }
         Ok(geom)
+    }
+
+    /// Issue #44 — flatten the current document into absolute-device-px
+    /// image rectangles (with resize addresses) for the shell's
+    /// resize-handle overlay + image hit-testing. Reuses the cached
+    /// layout snapshot like `document_geometry`, so it never re-lays-out.
+    fn image_geometry(&self) -> Result<Vec<bridge::ImageRect>, Box<Event>> {
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell
+            .as_ref()
+            .expect("ensure_layout_snapshot populated the memo");
+        let pages = &snap.pages;
+        let page_paths = &snap.page_paths;
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let mut out: Vec<bridge::ImageRect> = Vec::new();
+        let mut page_top: f32 = 0.0;
+        for (pi, page) in pages.iter().enumerate() {
+            let content_x = page.margins.left;
+            let content_y = page_top + page.margins.top;
+            let paths = page_paths.get(pi).map(|v| v.as_slice()).unwrap_or(&[]);
+            for (i, layout_block) in page.blocks.iter().enumerate() {
+                let Some(path) = paths.get(i) else {
+                    continue;
+                };
+                match layout_block {
+                    LayoutBlock::Paragraph(para_box) => {
+                        collect_paragraph_image_rects(
+                            para_box,
+                            content_x,
+                            content_y,
+                            &engine_to_bridge_path(path.clone()),
+                            &mut out,
+                        );
+                    }
+                    LayoutBlock::Table(table_box) => {
+                        let table_block_idx = path.last_block_index().unwrap_or(0);
+                        collect_table_image_rects(
+                            table_box,
+                            table_block_idx,
+                            content_x + table_box.origin.x,
+                            content_y + table_box.origin.y,
+                            &mut out,
+                        );
+                    }
+                }
+            }
+            page_top += page.size.height + gap;
+        }
+        /* Enrich each rect with its EMU extent from the document model
+        (the layout box only knows the reserved px size). The shell scales
+        resizes by `new_emu = emu × new_px / old_px`, so it needs the
+        current EMU alongside the current px rect. */
+        let doc = self.undo.current();
+        for im in &mut out {
+            let epath = bridge_path_to_engine(&im.path);
+            if let Some(p) = doc.paragraph_at_path(&epath)
+                && let Some(engine::InlineKind::Image {
+                    width_emu,
+                    height_emu,
+                    ..
+                }) = p
+                    .inline_objects
+                    .iter()
+                    .find(|io| io.at == im.at)
+                    .map(|io| &io.kind)
+            {
+                im.width_emu = *width_emu;
+                im.height_emu = *height_emu;
+            }
+        }
+        Ok(out)
+    }
+
+    /// `Command::GetImageRects` — reply with every inline image's rect.
+    fn do_get_image_rects(&self) -> Event {
+        match self.image_geometry() {
+            Ok(images) => Event::ImageRects { images },
+            Err(e) => *e,
+        }
     }
 
     /// `Command::HitTest` — pixel → logical position. A pure query; the
@@ -6226,6 +6412,7 @@ impl Engine {
             is_tracking_changes: self.tracking_changes,
             undo_depth: self.undo.depth(),
             list_ilvl: self.list_ilvl_for_caret(&sel.caret.path),
+            paragraph_borders: self.paragraph_borders_for_caret(&sel.caret.path),
         }
     }
 
@@ -6341,6 +6528,19 @@ impl Engine {
             shading: cell.shading.map(rgba_to_bridge_color),
             borders: engine_borders_to_bridge(cell.borders.as_ref()),
         })
+    }
+
+    /// Issue #41 — the caret paragraph's `<w:pPr><w:pBdr>` per-edge
+    /// borders as a wire `BridgeCellBorders`, or `None` when the
+    /// paragraph carries no borders. Feeds the border picker's prefill so
+    /// it reflects the live document instead of a local optimistic guess.
+    fn paragraph_borders_for_caret(&self, path: &BridgeBlockPath) -> Option<BridgeCellBorders> {
+        let engine_path = bridge_path_to_engine(path);
+        let para = self.undo.current().paragraph_at_path(&engine_path)?;
+        para.props
+            .borders
+            .as_ref()
+            .map(|b| engine_borders_to_bridge(Some(b)))
     }
 
     /// Compute the per-flag "mixed across the selection" bitmap. A
@@ -7933,6 +8133,32 @@ impl Engine {
         );
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::ResizeImage` (Issue #44) — overwrite the inline image's
+    /// `<wp:extent>` at `(path, at)` with new EMU dimensions. Clears the
+    /// layout cache (the reserved image box changed size) and repaints.
+    fn do_resize_image(
+        &mut self,
+        path: BridgeBlockPath,
+        at: u32,
+        width_emu: i64,
+        height_emu: i64,
+    ) -> Event {
+        let new_doc = self.undo.current().resize_inline_image_at(
+            &bridge_to_engine_path(path),
+            at,
+            width_emu,
+            height_emu,
+        );
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.invalidate_layout_snapshot();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -9578,6 +9804,131 @@ mod tests {
         );
     }
 
+    /// Issue #68 — an RTL paragraph resolves its marker through the
+    /// Arabic-script face, which (Amiri / NotoNaskhArabic) lacks the stock
+    /// hollow / filled bullet glyphs `◦` (U+25E6) / `▪` (U+25AA). Without a
+    /// coverage fallback the marker shapes to `.notdef` and vanishes. This
+    /// stack loads an Arabic face as primary PLUS the Latin face that does
+    /// cover the bullets, so the fix must swap in the covering face.
+    #[test]
+    fn rtl_bullet_falls_back_to_a_covering_face() {
+        use std::sync::Arc;
+        let arabic = LoadedFont::parse(
+            "test-arabic".to_string(),
+            include_bytes!("../../../ts/fonts/Amiri-Regular.ttf").to_vec(),
+        )
+        .expect("parse Amiri");
+        let latin = LoadedFont::parse(
+            "test-latin".to_string(),
+            include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec(),
+        )
+        .expect("parse LiberationSans");
+        /* Precondition: the Arabic face genuinely lacks the deeper bullets;
+        the Latin face has them. If a future font swap changes this the
+        test is no longer exercising the bug. */
+        assert!(
+            !arabic.covers('\u{25E6}') && !arabic.covers('\u{25AA}'),
+            "precondition: the Arabic face must NOT cover the hollow/filled bullets"
+        );
+        assert!(
+            latin.covers('\u{25E6}') && latin.covers('\u{25AA}'),
+            "precondition: the Latin face must cover the hollow/filled bullets"
+        );
+        let mut faces: HashMap<String, Arc<LoadedFont>> = HashMap::new();
+        faces.insert("test-arabic".to_string(), Arc::new(arabic));
+        faces.insert("test-latin".to_string(), Arc::new(latin));
+        /* Arabic is primary so `resolve(Script::Arabic, ...)` picks it for
+        an RTL paragraph — exactly the production path for the RTL seed. */
+        let stack = FontStack::from_faces(faces, "test-arabic");
+
+        for bullet in ['\u{25E6}', '\u{25AA}'] {
+            let para = layout_paragraph(ParagraphConfig {
+                text: "\u{0628}",
+                fonts: &stack,
+                spans: &[full_span(2)],
+                base_direction: ShapingDirection::Rtl,
+                max_width: 300.0,
+                line_height: 16.0,
+                line_height_exact: false,
+                alignment: Alignment::Start,
+                indent_start_px: 0.0,
+                indent_end_px: 36.0,
+                first_line_indent_px: 0.0,
+                hanging_indent_px: 18.0,
+                marker_text: Some(bullet.to_string()),
+                px_size_for_marker: 12.0,
+                inline_objects: &[],
+                tab_stops_px: &[],
+            });
+            let marker = para.marker.as_ref().expect("marker box");
+            assert!(
+                marker.run.glyphs.iter().any(|g| g.id != 0),
+                "RTL bullet U+{:04X} must map to a real glyph, not .notdef",
+                bullet as u32
+            );
+            assert_eq!(
+                marker.run.font, "test-latin",
+                "the marker must swap to the covering Latin face for U+{:04X}",
+                bullet as u32
+            );
+        }
+    }
+
+    /// Issue #68 — the coverage swap must NOT fire when the direction-
+    /// derived face already covers the marker: an Arabic-Indic numbered
+    /// marker legitimately belongs to the Arabic face, and `•` (U+2022) is
+    /// in Amiri too. Guards against a blanket-Latin regression.
+    #[test]
+    fn rtl_marker_keeps_arabic_face_when_it_covers_the_glyph() {
+        use std::sync::Arc;
+        let arabic = LoadedFont::parse(
+            "test-arabic".to_string(),
+            include_bytes!("../../../ts/fonts/Amiri-Regular.ttf").to_vec(),
+        )
+        .expect("parse Amiri");
+        assert!(
+            arabic.covers('\u{2022}'),
+            "precondition: Amiri covers the level-0 bullet"
+        );
+        let mut faces: HashMap<String, Arc<LoadedFont>> = HashMap::new();
+        faces.insert("test-arabic".to_string(), Arc::new(arabic));
+        faces.insert(
+            "test-latin".to_string(),
+            Arc::new(
+                LoadedFont::parse(
+                    "test-latin".to_string(),
+                    include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec(),
+                )
+                .expect("parse LiberationSans"),
+            ),
+        );
+        let stack = FontStack::from_faces(faces, "test-arabic");
+        let para = layout_paragraph(ParagraphConfig {
+            text: "\u{0628}",
+            fonts: &stack,
+            spans: &[full_span(2)],
+            base_direction: ShapingDirection::Rtl,
+            max_width: 300.0,
+            line_height: 16.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 36.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 18.0,
+            marker_text: Some("\u{2022}".to_string()),
+            px_size_for_marker: 12.0,
+            inline_objects: &[],
+            tab_stops_px: &[],
+        });
+        let marker = para.marker.as_ref().expect("marker box");
+        assert_eq!(
+            marker.run.font, "test-arabic",
+            "a covered marker must stay on the direction-derived face"
+        );
+        assert!(marker.run.glyphs.iter().any(|g| g.id != 0));
+    }
+
     /// Issue #50 — `effective_layout_indents`: the numbering level's
     /// indent applies only when the paragraph carries no direct `<w:ind>`,
     /// and it is leading-edge-relative (RTL reads the leading offset from
@@ -10306,6 +10657,79 @@ mod tests {
             undo_depth,
             before + 1,
             "an interactive edit must push exactly one new snapshot"
+        );
+    }
+
+    /// Issue #44 — `image_geometry()` surfaces one rect per inline image,
+    /// addressed by `(path, at)` at the sentinel byte offset, with a
+    /// non-degenerate size and the correct `rel_id`. This is the geometry
+    /// the resize-handle overlay hit-tests and positions against.
+    #[test]
+    fn image_geometry_exposes_inline_image_rects() {
+        let mut doc = DocumentTree::from_text("a\u{FFFC}b");
+        if let Some(p) = doc.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(engine::InlineObject {
+                at: 1,
+                kind: engine::InlineKind::Image {
+                    rel_id: "nge_img_1".to_string(),
+                    width_emu: 914_400,  // 1 inch
+                    height_emu: 457_200, // 0.5 inch
+                },
+            });
+        }
+        let engine = test_engine_with_doc(doc);
+        let rects = engine.image_geometry().expect("image geometry");
+        assert_eq!(rects.len(), 1, "exactly one image rect");
+        let img = &rects[0];
+        assert_eq!(img.at, 1, "addressed at the sentinel byte offset");
+        assert_eq!(img.rel_id, "nge_img_1");
+        assert_eq!(
+            img.path.steps,
+            vec![BridgePathStep::Block { idx: 0 }],
+            "top-level paragraph path"
+        );
+        assert!(
+            img.rect.w > 0.0 && img.rect.h > 0.0,
+            "image rect must have a real size: {:?}",
+            img.rect
+        );
+        /* The reserved box is wider than it is tall (2:1 EMU), so the
+        laid-out rect should preserve that aspect ordering. */
+        assert!(
+            img.rect.w > img.rect.h,
+            "1in × 0.5in image must lay out wider than tall: {:?}",
+            img.rect
+        );
+        assert_eq!(
+            (img.width_emu, img.height_emu),
+            (914_400, 457_200),
+            "the EMU extent must ride along for the shell's resize ratio"
+        );
+    }
+
+    /// Issue #44 — `Command::ResizeImage` dispatch overwrites the extent
+    /// and the follow-up `GetImageRects` reflects the larger box.
+    #[test]
+    fn resize_image_dispatch_grows_the_geometry() {
+        let mut doc = DocumentTree::from_text("\u{FFFC}");
+        if let Some(p) = doc.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(engine::InlineObject {
+                at: 0,
+                kind: engine::InlineKind::Image {
+                    rel_id: "nge_img_1".to_string(),
+                    width_emu: 457_200,
+                    height_emu: 457_200,
+                },
+            });
+        }
+        let mut engine = test_engine_with_doc(doc);
+        let before = engine.image_geometry().expect("geom")[0].rect.w;
+        let evt = engine.do_resize_image(BridgeBlockPath::top(0), 0, 1_828_800, 1_828_800);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let after = engine.image_geometry().expect("geom")[0].rect.w;
+        assert!(
+            after > before * 3.0,
+            "quadrupling the EMU width must widen the laid-out rect (before {before}, after {after})"
         );
     }
 

@@ -37,6 +37,7 @@ export type {
     SelectionKind,
     Rect,
     Point,
+    ImageRect,
     Color,
     Script,
     TextAttrs,

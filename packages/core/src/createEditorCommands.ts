@@ -150,6 +150,19 @@ export interface EditorCommands {
     /* Images */
     insertImage(image: ImageBlob, at: LogicalPos, fit?: ImageFit): Promise<Event>;
     insertImageAtCaret(image: ImageBlob, fit?: ImageFit): Promise<Event>;
+    /** Issue #44 — overwrite the display extent of the inline image at
+     *  `(path, at)` (its `U+FFFC` sentinel byte offset). Dimensions are
+     *  EMU, the model's native `<wp:extent>` unit. */
+    resizeImage(
+        path: BlockPath,
+        at: number,
+        widthEmu: number,
+        heightEmu: number,
+    ): Promise<Event>;
+    /** Issue #44 — query every inline image's on-canvas rect + resize
+     *  address. Resolve the `Event` and read `images` when it is an
+     *  `IMAGE_RECTS` reply. */
+    getImageRects(): Promise<Event>;
 
     /* Tables — every method maps 1:1 onto a `Command` variant in
      * `crates/bridge/src/command.rs`. */
@@ -416,6 +429,15 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             dispatch({ type: 'INSERT_IMAGE', at: currentCaret(), image, fit }, [
                 image.bytes.buffer as ArrayBuffer,
             ]),
+        resizeImage: (path, at, widthEmu, heightEmu) =>
+            dispatch({
+                type: 'RESIZE_IMAGE',
+                path,
+                at,
+                width_emu: widthEmu,
+                height_emu: heightEmu,
+            }),
+        getImageRects: () => dispatch({ type: 'GET_IMAGE_RECTS' }),
 
         insertTable: (at, rows, cols) =>
             dispatch({ type: 'INSERT_TABLE', at, rows, cols }),

@@ -12,6 +12,7 @@ import type {
     A11yTable,
     Alignment,
     AttrsMixed,
+    BlockPath,
     Direction,
     Event,
     LogicalPos,
@@ -75,6 +76,68 @@ let latestSelectionView: { rects: Rect[]; kind: SelectionKind } = {
  *  non-reactive pointer path. */
 export function selectionViewForPointer(): { rects: Rect[]; kind: SelectionKind } {
     return latestSelectionView;
+}
+
+/* Issue #44 — inline-image geometry + selection. `imageRectsSig` holds
+ * every image's CSS-px rect + resize address (refreshed after each paint
+ * via GET_IMAGE_RECTS); `selectedImageSig` is the image the user clicked,
+ * driving the resize-handle overlay. Both are module-level Solid signals
+ * (one editor instance) so the non-reactive pointer path can select an
+ * image on pointerdown and the reactive overlay can render its handles. */
+export interface ImageRectCss {
+    path: BlockPath;
+    at: number;
+    relId: string;
+    rect: Rect; // CSS px, document-absolute
+    widthEmu: number;
+    heightEmu: number;
+}
+export interface ImageAddr {
+    path: BlockPath;
+    at: number;
+}
+const [imageRectsSig, setImageRectsSig] = createSignal<ImageRectCss[]>([]);
+const [selectedImageSig, setSelectedImageSig] = createSignal<ImageAddr | null>(null);
+
+/** Latest image rects (CSS px) for the non-reactive pointer path. */
+export function imageRectsForPointer(): ImageRectCss[] {
+    return imageRectsSig();
+}
+
+const sameAddr = (a: ImageAddr, b: ImageAddr): boolean =>
+    a.at === b.at &&
+    a.path.steps.length === b.path.steps.length &&
+    a.path.steps.every((s, i) => {
+        const o = b.path.steps[i]!;
+        if (s.kind !== o.kind) return false;
+        if (s.kind === 'BLOCK' && o.kind === 'BLOCK') return s.idx === o.idx;
+        if (s.kind === 'CELL' && o.kind === 'CELL')
+            return s.row === o.row && s.col === o.col;
+        return false;
+    });
+
+/** Select the image under a document-absolute CSS point, if any. Returns
+ *  true when an image was hit (and selected); false clears the selection.
+ *  Called synchronously by the pointer path before it places a caret. */
+export function selectImageByPoint(cssX: number, cssY: number): boolean {
+    const hit = imageRectsSig().find(
+        (im) =>
+            cssX >= im.rect.x &&
+            cssX <= im.rect.x + im.rect.w &&
+            cssY >= im.rect.y &&
+            cssY <= im.rect.y + im.rect.h,
+    );
+    if (hit) {
+        setSelectedImageSig({ path: hit.path, at: hit.at });
+        return true;
+    }
+    setSelectedImageSig(null);
+    return false;
+}
+
+/** Clear any selected-image state (e.g. on a caret-placing click). */
+export function clearSelectedImage(): void {
+    setSelectedImageSig(null);
 }
 
 /** The current selection: its logical range plus rendered rectangles. */
@@ -197,6 +260,33 @@ export function createEngineStore(client: EngineClient) {
         setTables(out);
     };
 
+    /* Issue #44 — query image geometry and mirror it (device px → CSS
+       px) into the module-level signal the overlay + pointer path read.
+       If the currently-selected image vanished (deleted / undo), drop the
+       selection so stale handles never linger. */
+    const refreshImageRects = async (): Promise<void> => {
+        try {
+            const evt = await client.dispatch({ type: 'GET_IMAGE_RECTS' });
+            if (evt.type !== 'IMAGE_RECTS') return;
+            const dpr = window.devicePixelRatio || 1;
+            const rects: ImageRectCss[] = evt.images.map((im) => ({
+                path: im.path,
+                at: im.at,
+                relId: im.rel_id,
+                rect: toCssRect(im.rect, dpr),
+                widthEmu: im.width_emu,
+                heightEmu: im.height_emu,
+            }));
+            setImageRectsSig(rects);
+            const sel = selectedImageSig();
+            if (sel && !rects.some((r) => sameAddr({ path: r.path, at: r.at }, sel))) {
+                setSelectedImageSig(null);
+            }
+        } catch (e) {
+            console.error('refreshImageRects failed', e);
+        }
+    };
+
     client.subscribe((ev: Event) => {
         if (ev.type === 'SELECTION_CHANGED') {
             const dpr = window.devicePixelRatio || 1;
@@ -232,6 +322,16 @@ export function createEngineStore(client: EngineClient) {
             if (ev.page_tops.length > 0) {
                 latestPageTops = ev.page_tops;
                 setPageGeometry({ tops: ev.page_tops, heights: ev.page_heights });
+            }
+            /* Issue #44 — refresh inline-image geometry after a paint so
+               the resize-handle overlay tracks images through edits,
+               scroll (lazy layout), and resizes. Pure query — no repaint,
+               so no feedback loop. Gated on `image_count` so an image-free
+               document (the common case) never pays the extra worker
+               round-trip; the `imageRects` check still fires the final
+               clearing refresh when the last image was just removed. */
+            if (ev.image_count > 0 || imageRectsSig().length > 0) {
+                void refreshImageRects();
             }
         } else if (ev.type === 'ACCESSIBILITY_TREE_DELTA') {
             /* Mirror the patch stream into the local `nodes` array so the
@@ -301,6 +401,12 @@ export function createEngineStore(client: EngineClient) {
         pageCount,
         isFullLayout,
         pageGeometry,
+        /* Issue #44 — inline-image rects + selection for the resize
+           overlay. `imageRects` are CSS px, document-absolute. */
+        imageRects: imageRectsSig,
+        selectedImage: selectedImageSig,
+        setSelectedImage: setSelectedImageSig,
+        refreshImageRects,
         /** CSS-px top of page `idx` — engine-exact once a paginated paint
          *  reported geometry; uniform-A4 fallback before that. */
         pageTopCss: (idx: number): number => {

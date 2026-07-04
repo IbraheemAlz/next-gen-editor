@@ -46,6 +46,12 @@ export type { DialogProps } from './Dialog';
 export { CellPropertiesDialog } from './CellPropertiesDialog';
 export type { CellPropertiesDialogProps } from './CellPropertiesDialog';
 
+export { ParagraphBordersDialog } from './ParagraphBordersDialog';
+export type { ParagraphBordersDialogProps } from './ParagraphBordersDialog';
+
+export { BorderEditor } from './BorderEditor';
+export type { BorderEditorProps } from './BorderEditor';
+
 export { PageSetupDialog } from './PageSetupDialog';
 export type { PageSetupDialogProps } from './PageSetupDialog';
 

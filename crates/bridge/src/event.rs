@@ -5,8 +5,8 @@ use tsify_next::Tsify;
 
 use crate::command::{BridgeCellBorders, BridgeTabStop, PageOrientation};
 use crate::common::{
-    Alignment, Color, Direction, DocFormat, LogicalPos, LogicalRange, Rect, Script, SelectionKind,
-    TextAttrs,
+    Alignment, Color, Direction, DocFormat, ImageRect, LogicalPos, LogicalRange, Rect, Script,
+    SelectionKind, TextAttrs,
 };
 
 /// An event emitted by the engine. Serialized internally-tagged
@@ -141,6 +141,11 @@ pub enum Event {
         /// Issue #26 — per-page heights in device px, index-aligned
         /// with `page_tops`.
         page_heights: Vec<f32>,
+        /// Issue #44 — count of inline images in the whole document. Lets
+        /// the shell skip the `GetImageRects` refresh entirely for the
+        /// (common) image-free document instead of paying an extra worker
+        /// round-trip + geometry walk on every paint.
+        image_count: u32,
     },
 
     /* Selection */
@@ -230,6 +235,12 @@ pub enum Event {
         /// to demote/promote a list level or fall back to its existing
         /// tab-char/cell-navigation behavior.
         list_ilvl: Option<u8>,
+        /// Issue #41 — the caret paragraph's `<w:pPr><w:pBdr>` per-edge
+        /// borders, or `None` when the paragraph has no border set. Lets
+        /// the paragraph border picker prefill each edge's style / width /
+        /// colour from the live document (mirrors how `cell_properties`
+        /// feeds the cell border editor) instead of always opening blank.
+        paragraph_borders: Option<BridgeCellBorders>,
     },
 
     /* IME */
@@ -276,6 +287,13 @@ pub enum Event {
     /// the hit-tested pixel.
     HitResult {
         pos: LogicalPos,
+    },
+
+    /// Issue #44 — reply to [`crate::Command::GetImageRects`]. Every
+    /// inline image's absolute device-px rectangle plus its resize
+    /// address. Empty when the document holds no images.
+    ImageRects {
+        images: Vec<ImageRect>,
     },
 
     /// Reply to `Command::GetSelectionAsClipboard` — the selection as

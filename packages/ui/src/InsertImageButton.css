@@ -1,3 +1,9 @@
+.nge-insert-image__group {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+}
+
 .nge-insert-image {
     gap: var(--nge-space-2);
 }
@@ -5,4 +11,15 @@
 .nge-insert-image__icon {
     font-size: 14px;
     line-height: 1;
+}
+
+.nge-insert-image__fit {
+    height: 28px;
+    padding: 0 var(--nge-space-1);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    background: var(--nge-color-surface);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-sm) / 1 var(--nge-font-ui);
+    cursor: pointer;
 }

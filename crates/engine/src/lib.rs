@@ -2228,6 +2228,21 @@ impl DocumentTree {
         self.blocks.len() as u32
     }
 
+    /// Issue #44 — count of inline images across the whole document
+    /// (body + table cells). Lets the shell skip its `GetImageRects`
+    /// refresh for image-free documents. Cheap O(paragraphs) walk.
+    pub fn count_inline_images(&self) -> u32 {
+        let mut n = 0u32;
+        walk_paragraphs(&self.blocks, &mut |p| {
+            for io in &p.inline_objects {
+                if matches!(io.kind, InlineKind::Image { .. }) {
+                    n = n.saturating_add(1);
+                }
+            }
+        });
+        n
+    }
+
     /// Sprint 8 (UI Edition) — total character count across every
     /// paragraph in the document, including paragraphs nested in
     /// table cells. Counts Unicode scalars (`char`s), not bytes —
@@ -4125,6 +4140,53 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #44 — overwrite the display extent of the inline image
+    /// anchored at `(path, at)`. `at` is the `U+FFFC` sentinel byte
+    /// offset the image was inserted at (its `InlineObject.at`), which is
+    /// the true anchor even when the same blob is inserted more than once.
+    /// Dimensions are EMU (the model's native `<wp:extent>` unit), so the
+    /// `.docx` writer threads them straight through with no px round-trip.
+    /// A no-op (returns a structural clone) when the offset holds no image.
+    pub fn resize_inline_image_at(
+        &self,
+        path: &BlockPath,
+        at: u32,
+        width_emu: i64,
+        height_emu: i64,
+    ) -> Self {
+        let mut blocks = self.blocks.clone();
+        let _ = mutate_paragraph_in_top(&mut blocks, path, |para| {
+            for io in &mut para.inline_objects {
+                if io.at == at
+                    && let InlineKind::Image {
+                        width_emu: w,
+                        height_emu: h,
+                        ..
+                    } = &mut io.kind
+                {
+                    *w = width_emu.max(1);
+                    *h = height_emu.max(1);
+                }
+            }
+        });
+        Self {
+            blocks,
+            sections: self.sections.clone(),
+            headers: self.headers.clone(),
+            footers: self.footers.clone(),
+            media: self.media.clone(),
+            footnotes: self.footnotes.clone(),
+            comment_defs: self.comment_defs.clone(),
+            comment_ranges: self.comment_ranges.clone(),
+            settings: self.settings.clone(),
+            styles: self.styles.clone(),
+            style_defaults: self.style_defaults.clone(),
+            style_run_defaults: self.style_run_defaults.clone(),
+            styles_dirty: self.styles_dirty,
+            numbering: self.numbering.clone(),
+        }
+    }
+
     /// Sprint 2 (UI Edition) — set `<w:pPr><w:pBdr>` on every
     /// paragraph the range spans. Mirrors [`Self::set_alignment`] but
     /// writes `props.borders`. Pass `None` to clear the borders.
@@ -5983,6 +6045,109 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(d.to_plain_text(), "a[image]b");
+    }
+
+    #[test]
+    fn resize_inline_image_overwrites_extent_at_offset() {
+        let mut d = DocumentTree::default();
+        d.blocks.push_back(Block::Paragraph(Paragraph {
+            text: "a\u{FFFC}b".into(),
+            inline_objects: vec![InlineObject {
+                at: 1,
+                kind: InlineKind::Image {
+                    rel_id: "rId1".into(),
+                    width_emu: 914_400,
+                    height_emu: 914_400,
+                },
+            }],
+            ..Default::default()
+        }));
+        let d = d.resize_inline_image_at(&BlockPath::top(0), 1, 457_200, 228_600);
+        let InlineKind::Image {
+            width_emu,
+            height_emu,
+            ..
+        } = &d.blocks[0].as_paragraph().unwrap().inline_objects[0].kind
+        else {
+            panic!("expected an image inline object");
+        };
+        assert_eq!((*width_emu, *height_emu), (457_200, 228_600));
+    }
+
+    #[test]
+    fn resize_inline_image_clamps_to_at_least_one_emu() {
+        let mut d = DocumentTree::default();
+        d.blocks.push_back(Block::Paragraph(Paragraph {
+            text: "\u{FFFC}".into(),
+            inline_objects: vec![InlineObject {
+                at: 0,
+                kind: InlineKind::Image {
+                    rel_id: "rId1".into(),
+                    width_emu: 100,
+                    height_emu: 100,
+                },
+            }],
+            ..Default::default()
+        }));
+        let d = d.resize_inline_image_at(&BlockPath::top(0), 0, 0, -5);
+        let InlineKind::Image {
+            width_emu,
+            height_emu,
+            ..
+        } = &d.blocks[0].as_paragraph().unwrap().inline_objects[0].kind
+        else {
+            panic!("expected an image inline object");
+        };
+        assert_eq!(
+            (*width_emu, *height_emu),
+            (1, 1),
+            "a degenerate resize must clamp to 1 EMU, never 0/negative"
+        );
+    }
+
+    #[test]
+    fn count_inline_images_walks_body_and_cells() {
+        let mut d = DocumentTree::from_text("plain");
+        assert_eq!(d.count_inline_images(), 0);
+        d.blocks.push_back(Block::Paragraph(Paragraph {
+            text: "\u{FFFC}\u{FFFC}".into(),
+            inline_objects: vec![
+                InlineObject {
+                    at: 0,
+                    kind: InlineKind::Image {
+                        rel_id: "a".into(),
+                        width_emu: 1,
+                        height_emu: 1,
+                    },
+                },
+                InlineObject {
+                    at: 3,
+                    kind: InlineKind::Image {
+                        rel_id: "b".into(),
+                        width_emu: 1,
+                        height_emu: 1,
+                    },
+                },
+            ],
+            ..Default::default()
+        }));
+        assert_eq!(d.count_inline_images(), 2);
+    }
+
+    #[test]
+    fn resize_inline_image_is_noop_at_a_non_image_offset() {
+        let d = DocumentTree::from_text("plain text");
+        let before = d.clone();
+        let after = d.resize_inline_image_at(&BlockPath::top(0), 3, 500, 500);
+        assert_eq!(after.blocks[0].as_paragraph().unwrap().text, "plain text");
+        assert_eq!(
+            before.blocks[0]
+                .as_paragraph()
+                .unwrap()
+                .inline_objects
+                .len(),
+            after.blocks[0].as_paragraph().unwrap().inline_objects.len()
+        );
     }
 
     #[test]

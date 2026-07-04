@@ -320,7 +320,23 @@ fn build_marker(
         ShapingDirection::Rtl => Script::Arabic,
         ShapingDirection::Ltr => Script::Latin,
     };
-    let (font_id, face, _synth) = cfg.fonts.resolve(script, None, false, false)?;
+    let (mut font_id, mut face, _synth) = cfg.fonts.resolve(script, None, false, false)?;
+    /* Issue #68 — list markers (`•`, `◦`, `▪`, and letter/roman/decimal
+    numbers) are universal, direction-neutral symbols; Word paints the
+    same glyph regardless of paragraph direction. Resolving by base
+    direction alone routes an RTL paragraph's marker through an
+    Arabic-script face (Amiri / NotoNaskhArabic) that lacks the hollow /
+    filled bullet codepoints, so it shapes to `.notdef` and vanishes.
+    Keep the direction-derived face (an Arabic-Indic numbered marker
+    genuinely needs it), but if it doesn't cover the marker's leading
+    glyph, swap in any loaded face that does. */
+    if let Some(marker_char) = text.chars().next()
+        && !face.covers(marker_char)
+        && let Some((fb_id, fb_face)) = cfg.fonts.resolve_covering(marker_char)
+    {
+        font_id = fb_id;
+        face = fb_face;
+    }
     let shaped = shape_text(face, text, direction, cfg.px_size_for_marker);
     let glyphs: Vec<PositionedGlyph> = shaped
         .glyphs

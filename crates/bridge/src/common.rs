@@ -150,6 +150,25 @@ pub struct Point {
     pub y: f32,
 }
 
+/// Issue #44 — one inline image's on-canvas rectangle plus the address
+/// needed to resize it. `rect` is absolute document device px (same
+/// space as `Event::SelectionChanged.rects`; the shell divides by
+/// `devicePixelRatio` for its DOM overlay). `path` + `at` (the `U+FFFC`
+/// sentinel byte offset) address the image for `Command::ResizeImage`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+pub struct ImageRect {
+    pub path: BlockPath,
+    pub at: u32,
+    pub rel_id: String,
+    pub rect: Rect,
+    /// Current display extent in EMU (`<wp:extent>`). Lets the resize
+    /// handles scale by a pure CSS-px ratio (`new_emu = emu × new_px /
+    /// old_px`) — zoom / DPR independent, no reconstruction of the layout
+    /// scale chain in the shell.
+    pub width_emu: i64,
+    pub height_emu: i64,
+}
+
 /// Document container format.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]

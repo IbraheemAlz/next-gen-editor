@@ -115,6 +115,15 @@
     gap: var(--nge-space-3);
 }
 
+/* Full-width stacked row — a label above a block-level control (e.g. the
+   per-edge border diagram) instead of the 120px label + control grid. */
+.nge-form__row--block {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--nge-space-2);
+}
+
 .nge-form__grid-4 {
     display: grid;
     grid-template-columns: repeat(2, 1fr);

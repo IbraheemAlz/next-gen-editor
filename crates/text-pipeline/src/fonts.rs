@@ -322,6 +322,20 @@ impl FontStack {
     pub fn face(&self, id: &str) -> Option<&LoadedFont> {
         self.faces.get(id).map(|f| f.as_ref())
     }
+
+    /// The first loaded face — in `fallback_chain` order — whose cmap
+    /// covers `ch`. Issue #68: `resolve` picks a face by script only and
+    /// never checks glyph coverage, so a direction-derived Arabic face
+    /// can be selected for a universal list-marker glyph (`◦`, `▪`) it
+    /// lacks, mapping it to `.notdef` (invisible). Callers use this to
+    /// swap in any loaded face that actually has the glyph before shaping.
+    pub fn resolve_covering(&self, ch: char) -> Option<(&FontId, &LoadedFont)> {
+        self.fallback_chain
+            .iter()
+            .filter_map(|id| self.faces.get_key_value(id))
+            .find(|(_, face)| face.covers(ch))
+            .map(|(key, face)| (key, face.as_ref()))
+    }
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ import { useEngine } from './EngineProvider';
 import type {
     Alignment,
     AttrsMixed,
+    BridgeCellBorders,
     BridgeCellProperties,
     BridgeIndent,
     BridgeSectionGeometry,
@@ -112,6 +113,13 @@ export interface EditorState {
      * tab) stays in sync.
      */
     isTrackingChanges: Accessor<boolean>;
+    /**
+     * Issue #41 — per-edge borders of the paragraph under the caret, or
+     * `undefined` when it has none set. Feeds the paragraph border
+     * picker's prefill so it opens reflecting the live document (mirrors
+     * how `cellProperties` feeds the cell border editor).
+     */
+    paragraphBorders: Accessor<BridgeCellBorders | undefined>;
 }
 
 export function createEditorState(): EditorState {
@@ -145,6 +153,8 @@ export function createEditorState(): EditorState {
     const ZERO_INDENT: BridgeIndent = { start_pt: 0, end_pt: 0, first_line_pt: 0 };
     const [paragraphIndent, setParagraphIndent] = createSignal<BridgeIndent>(ZERO_INDENT);
     const [isTrackingChanges, setIsTrackingChanges] = createSignal(false);
+    const [paragraphBorders, setParagraphBorders] =
+        createSignal<BridgeCellBorders | undefined>(undefined);
 
     const unsubscribe = engine.subscribe((evt: Event) => {
         switch (evt.type) {
@@ -165,6 +175,7 @@ export function createEditorState(): EditorState {
                 setTabStops(evt.tab_stops);
                 setParagraphIndent(evt.paragraph_indent ?? ZERO_INDENT);
                 setIsTrackingChanges(evt.is_tracking_changes);
+                setParagraphBorders(evt.paragraph_borders);
                 break;
             }
             case 'UNDO_STATE_CHANGED': {
@@ -222,5 +233,6 @@ export function createEditorState(): EditorState {
         tabStops,
         paragraphIndent,
         isTrackingChanges,
+        paragraphBorders,
     };
 }

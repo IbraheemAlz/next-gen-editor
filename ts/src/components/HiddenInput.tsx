@@ -16,6 +16,7 @@ import type {
     TextAttrsPatch,
 } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
+import { clearSelectedImage } from '../state/engine-store';
 import { ClipboardWriteError, copy, cut, paste } from '../input/clipboard';
 
 /** Map a non-composition `InputEvent` to an engine command. */
@@ -128,6 +129,15 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
 
     const onKeyDown = (e: KeyboardEvent): void => {
         if (e.isComposing) return;
+
+        /* Issue #44 — any real keyboard interaction (typing, navigation,
+           deletion) means the user is working with the text caret, so
+           deselect any inline image whose resize handles are showing.
+           Bare modifier presses (Shift/Ctrl/Alt/Meta) are skipped so a
+           Shift-in-preparation doesn't drop the selection. */
+        if (e.key !== 'Shift' && e.key !== 'Control' && e.key !== 'Alt' && e.key !== 'Meta') {
+            clearSelectedImage();
+        }
 
         /* Arrow keys: caret motion. Shift extends the selection
            (anchor stays put); Ctrl/Cmd promotes ArrowLeft/Right to

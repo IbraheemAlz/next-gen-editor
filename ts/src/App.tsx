@@ -9,6 +9,7 @@ import { EditorCanvas } from './components/EditorCanvas';
 import { ExtraPageCanvas } from './components/ExtraPageCanvas';
 import { CaretOverlay } from './components/CaretOverlay';
 import { PageSelectionOverlay } from './components/PageSelectionOverlay';
+import { ImageHandlesOverlay } from './components/ImageHandlesOverlay';
 import { HiddenInput } from './components/HiddenInput';
 import { SdkShelf } from './sdk-bridge';
 import { AccessibilityTree } from './components/AccessibilityTree';
@@ -308,6 +309,11 @@ export function App() {
                             </For>
                             <PageSelectionOverlay store={store} pageIdx={0} />
                             <CaretOverlay store={store} pageIdx={0} />
+                            <ImageHandlesOverlay
+                                store={store}
+                                client={client}
+                                pageIdx={0}
+                            />
                             <HiddenInput client={client} store={store} />
                         </div>
                         {/* Extra pages live under a `booting` boundary: a

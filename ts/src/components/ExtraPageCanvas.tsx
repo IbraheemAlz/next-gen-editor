@@ -17,6 +17,7 @@ import type { EngineStore } from '../state/engine-store';
 import { attachPointer } from '../input/pointer';
 import { PageSelectionOverlay } from './PageSelectionOverlay';
 import { CaretOverlay } from './CaretOverlay';
+import { ImageHandlesOverlay } from './ImageHandlesOverlay';
 
 export interface ExtraPageCanvasProps {
     client: EngineClient;
@@ -49,6 +50,11 @@ export function ExtraPageCanvas(props: ExtraPageCanvasProps) {
             <canvas ref={canvasRef} class="editor-canvas" />
             <PageSelectionOverlay store={props.store} pageIdx={props.pageIdx} />
             <CaretOverlay store={props.store} pageIdx={props.pageIdx} />
+            <ImageHandlesOverlay
+                store={props.store}
+                client={props.client}
+                pageIdx={props.pageIdx}
+            />
         </div>
     );
 }

@@ -48,8 +48,14 @@ async function probeImageDimensions(
     }
 }
 
+const FIT_MODES: Array<{ value: ImageFit; label: string }> = [
+    { value: 'FitWidth', label: 'Fit width' },
+    { value: 'FitPage', label: 'Fit page' },
+    { value: 'Original', label: 'Original size' },
+];
+
 export interface InsertImageButtonProps {
-    /** Default fit mode applied at insert. */
+    /** Default fit mode applied at insert. Default: `FitWidth`. */
     defaultFit?: ImageFit;
     /** Override label. Default: "Image". */
     label?: string;
@@ -58,6 +64,9 @@ export interface InsertImageButtonProps {
 export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
     const cmd = createEditorCommands();
     const [busy, setBusy] = createSignal(false);
+    /* Issue #44 — a user-chosen fit mode at insert time (the enum always
+       existed on `Command::InsertImage` but no UI ever set it). */
+    const [fit, setFit] = createSignal<ImageFit>(props.defaultFit ?? 'FitWidth');
     let inputEl: HTMLInputElement | undefined;
 
     const onPick = async (file: File) => {
@@ -71,7 +80,7 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
                 width,
                 height,
             };
-            await cmd.insertImageAtCaret(blob, props.defaultFit ?? 'FitWidth');
+            await cmd.insertImageAtCaret(blob, fit());
         } finally {
             setBusy(false);
             if (inputEl) inputEl.value = '';
@@ -79,7 +88,7 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
     };
 
     return (
-        <>
+        <div class="nge-insert-image__group">
             <button
                 class="nge-btn nge-insert-image"
                 type="button"
@@ -91,6 +100,17 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
                 <span class="nge-insert-image__icon" aria-hidden="true">🖼</span>
                 <span>{props.label ?? 'Image'}</span>
             </button>
+            <select
+                class="nge-insert-image__fit"
+                aria-label="Image fit mode"
+                title="Image fit mode"
+                value={fit()}
+                onChange={(e) => setFit(e.currentTarget.value as ImageFit)}
+            >
+                {FIT_MODES.map((m) => (
+                    <option value={m.value}>{m.label}</option>
+                ))}
+            </select>
             <input
                 ref={(el) => (inputEl = el)}
                 type="file"
@@ -101,6 +121,6 @@ export const InsertImageButton: Component<InsertImageButtonProps> = (props) => {
                     if (file) void onPick(file);
                 }}
             />
-        </>
+        </div>
     );
 };

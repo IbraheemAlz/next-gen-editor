@@ -159,6 +159,18 @@ pub enum Command {
         image: ImageBlob,
         fit: ImageFit,
     },
+    /// Issue #44 — overwrite the display extent (`<wp:extent>`) of the
+    /// inline image anchored at `(path, at)`. `at` is the `U+FFFC`
+    /// sentinel byte offset the image occupies in its paragraph (its
+    /// `InlineObject.at`). Dimensions are EMU (914400/inch) — the model's
+    /// native unit, threaded straight to the writer. Drives the canvas
+    /// resize handles and the numeric size control.
+    ResizeImage {
+        path: BlockPath,
+        at: u32,
+        width_emu: i64,
+        height_emu: i64,
+    },
 
     /* Selection */
     SetSelection {
@@ -262,6 +274,12 @@ pub enum Command {
         page: u32,
         at: Point,
     },
+
+    /// Issue #44 — query every inline image's on-canvas rectangle +
+    /// resize address. A pure read; replies with `Event::ImageRects`.
+    /// The shell issues it after paints to position the resize-handle
+    /// overlay and to hit-test clicks against images.
+    GetImageRects,
 
     /// Select the word under a canvas pixel (double-click). The engine
     /// updates the selection and replies with `Event::SelectionChanged`.

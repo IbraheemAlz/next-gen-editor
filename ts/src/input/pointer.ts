@@ -12,6 +12,7 @@ import {
     PAGE_H_PT,
     SCREEN_DPI_SCALE,
     enginePageTopDevice,
+    selectImageByPoint,
     selectionViewForPointer,
 } from '../state/engine-store';
 
@@ -131,6 +132,22 @@ export function attachPointer(
                 }
             }
             return;
+        }
+        /* Issue #44 — a primary press on an inline image body selects
+           the image (showing resize handles) instead of placing a caret
+           or starting a text drag. Presses on the handles themselves
+           never reach the canvas — the overlay divs sit above it and
+           consume the event. `selectImageByPoint` also CLEARS a prior
+           image selection when the click misses every image, so a normal
+           text click deselects. Coordinates are document-absolute CSS
+           px, matching the stored image rects. */
+        {
+            const dpr = window.devicePixelRatio || 1;
+            const gCss = toGlobal(e);
+            if (selectImageByPoint(gCss.x / dpr, gCss.y / dpr)) {
+                gesture += 1;
+                return;
+            }
         }
         canvas.setPointerCapture(e.pointerId);
         dragging = true;
