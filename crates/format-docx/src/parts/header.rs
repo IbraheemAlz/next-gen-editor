@@ -1,4 +1,4 @@
-//! `word/header*.xml` — full-fidelity paragraph parser.
+//! `word/header*.xml` — full-fidelity block parser.
 //!
 //! Phase 2 audit (gap D.1 follow-up). The Phase-6 version of this
 //! reader extracted only paragraph text into `Vec<String>`, which lost
@@ -8,6 +8,11 @@
 //! uses, so a `<w:fldChar>` PAGE field in a footer hits the engine
 //! with the same `engine::Field` overlay it would in body content —
 //! and the paginator's per-page field evaluator picks it up.
+//!
+//! Issue #72 widened the part surface from `Vec<Paragraph>` (which
+//! silently dropped `<w:tbl>` inside a header) to the body's own
+//! `Vec<Block>` — tables inside header/footer parts now survive the
+//! read and ride the same block model everywhere downstream.
 //!
 //! The header XML root is `<w:hdr>` (footer is `<w:ftr>`) instead of
 //! `<w:document><w:body>`, but the [`parse_document_xml`] event loop
@@ -19,17 +24,13 @@
 use crate::error::DocxError;
 use crate::parts::document::parse_document_xml;
 use crate::style_resolver::StyleResolver;
-use engine::Paragraph;
+use engine::Block;
 
-/// One header part — the parsed paragraph sequence with every overlay
-/// the body parser captures. Tables nested inside a header land here
-/// too (the parser emits them on the `DocumentTree.blocks` list); the
-/// flattener below keeps the legacy paragraph-only surface for the
-/// paginator's header band, which doesn't yet render header-internal
-/// tables.
+/// One header part — the parsed block sequence with every overlay the
+/// body parser captures, tables included.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderPart {
-    pub paragraphs: Vec<Paragraph>,
+    pub blocks: Vec<Block>,
 }
 
 /// Parse a `word/header*.xml` byte blob. `resolver` is the same style
@@ -37,17 +38,20 @@ pub struct HeaderPart {
 /// paragraphs inherit document-wide defaults and named styles.
 pub fn parse_header_xml(xml: &[u8], resolver: &StyleResolver<'_>) -> Result<HeaderPart, DocxError> {
     let tree = parse_document_xml(xml, resolver)?;
-    /* Headers in practice are paragraph-only; if the file does carry a
-    `<w:tbl>` inside the header we drop it for now (rendering header
-    tables is a backlog item). The paragraph-only filter keeps the
-    paginator's band layout API surface unchanged. */
-    let paragraphs = tree
+    /* A stray sectPr inside a header part is meaningless — the body
+    parser may have stamped a `section_end` marker; drop it so a part
+    can never masquerade as a section boundary carrier. */
+    let blocks = tree
         .blocks
         .iter()
-        .filter_map(|b| match b {
-            engine::Block::Paragraph(p) => Some(p.clone()),
-            engine::Block::Table(_) => None,
+        .cloned()
+        .map(|b| match b {
+            Block::Paragraph(mut p) => {
+                p.section_end = None;
+                Block::Paragraph(p)
+            }
+            table => table,
         })
         .collect();
-    Ok(HeaderPart { paragraphs })
+    Ok(HeaderPart { blocks })
 }

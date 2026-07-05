@@ -18,9 +18,6 @@ export const ListButtons: Component = () => {
     const state = createEditorState();
 
     const ready = () => state.selection() !== undefined;
-    const inStory = () => state.editingStory() !== undefined;
-    const gatedTitle = (label: string) =>
-        inStory() ? 'Not available while editing a header or footer' : label;
 
     const removeList = async () => {
         await cmd.toggleList('Off');
@@ -40,8 +37,8 @@ export const ListButtons: Component = () => {
                 class="nge-btn nge-lists__btn"
                 type="button"
                 aria-label="Bulleted list"
-                title={gatedTitle('Bulleted list')}
-                disabled={!ready() || inStory()}
+                title="Bulleted list"
+                disabled={!ready()}
                 onClick={() => void bulletOn()}
             >
                 <span class="nge-lists__icon" aria-hidden="true">•≡</span>
@@ -51,8 +48,8 @@ export const ListButtons: Component = () => {
                 class="nge-btn nge-lists__btn"
                 type="button"
                 aria-label="Numbered list"
-                title={gatedTitle('Numbered list')}
-                disabled={!ready() || inStory()}
+                title="Numbered list"
+                disabled={!ready()}
                 onClick={() => void numberOn()}
             >
                 <span class="nge-lists__icon" aria-hidden="true">1≡</span>
@@ -62,8 +59,8 @@ export const ListButtons: Component = () => {
                 class="nge-btn nge-lists__btn"
                 type="button"
                 aria-label="Remove list"
-                title={gatedTitle('Remove list membership from selected paragraphs')}
-                disabled={!ready() || inStory()}
+                title="Remove list membership from selected paragraphs"
+                disabled={!ready()}
                 onClick={() => void removeList()}
             >
                 <span class="nge-lists__icon" aria-hidden="true">⌫≡</span>

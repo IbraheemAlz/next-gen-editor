@@ -361,6 +361,17 @@ pub struct TableCellBox {
     pub padding_bottom: f32,
 }
 
+/// Which header/footer slot a page resolved (issue #74). Lives here
+/// (not `paginate`) because [`PageBox`] carries it; `paginate`
+/// re-exports for its historical path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeaderRole {
+    #[default]
+    Default,
+    First,
+    Even,
+}
+
 /// A laid-out page — one element of the box tree the renderer consumes.
 /// Phase 6 turned the engine output into `Vec<PageBox>`: the paginator emits
 /// one `PageBox` per flow page; sections that change geometry produce a
@@ -392,6 +403,14 @@ pub struct PageBox {
     /// emission order, separated from the body by a thin horizontal
     /// rule. Origins are relative to the band's top-left.
     pub footnotes: Vec<FootnoteEntry>,
+    /// Issue #74 — the header/footer slot this page resolved at flush
+    /// time. Enter-header/footer derives the double-clicked page's
+    /// role from this instead of re-deriving parity in a second place.
+    pub hf_role: HeaderRole,
+    /// Issue #43 — the FORMATTED (displayed) page number, exactly what
+    /// a PAGE field on this page renders (pgNumType-rebased). The
+    /// field-resolution reshape pass and Even/Odd filler logic read it.
+    pub page_number: u32,
 }
 
 impl PageBox {
@@ -427,26 +446,92 @@ pub struct FootnoteEntry {
     pub paragraph: ParagraphBox,
 }
 
-/// A laid-out header / footer band — paragraph plain text positioned within
-/// the page's top or bottom margin. The Phase 6 cut is deliberately small:
-/// rich formatting in header / footer paragraphs ships with the Phase 7
-/// sprint that promotes them through the same shape / BiDi pipeline the
-/// body uses.
+/// A laid-out header / footer band. Issue #72 widened it from a flat
+/// `Vec<ParagraphBox>` to the body's own [`LayoutBlock`] list so a
+/// `<w:tbl>` inside a header part lays out, paints and hit-tests with
+/// the same table machinery the body uses.
 #[derive(Debug, Clone)]
 pub struct HeaderFooterBox {
-    /// Each laid-out paragraph in the band. Origins are relative to the
+    /// Each laid-out block in the band. Origins are relative to the
     /// band's top-left.
-    pub paragraphs: Vec<ParagraphBox>,
+    pub blocks: Vec<LayoutBlock>,
+    /// Issue #43 — the OOXML relationship id of the part this band was
+    /// laid from. The per-page field-resolution reshape re-derives the
+    /// SOURCE blocks from it (`doc.headers[rid]`), so a page's band can
+    /// re-lay with that page's resolved PAGE/NUMPAGES text without any
+    /// page→section→role bookkeeping. `None` for synthetic test bands.
+    pub source_rid: Option<String>,
 }
 
 impl HeaderFooterBox {
     /// Phase 3 (#39) — the band content's laid-out height: the deepest
-    /// paragraph bottom edge, band-relative. Feeds
+    /// block bottom edge, band-relative. Feeds
     /// [`PageBox::footer_band_top`]'s bottom-anchoring.
     pub fn content_height(&self) -> f32 {
-        self.paragraphs
+        self.blocks
             .iter()
-            .map(|p| p.origin.y + p.size.height)
+            .map(|b| match b {
+                LayoutBlock::Paragraph(p) => p.origin.y + p.size.height,
+                LayoutBlock::Table(t) => t.origin.y + t.size.height,
+            })
             .fold(0.0, f32::max)
+    }
+
+    /// Every paragraph box in the band, recursing through table cells —
+    /// the iteration shape the field evaluator and PDF exporter share.
+    pub fn for_each_paragraph<'a>(&'a self, f: &mut impl FnMut(&'a ParagraphBox)) {
+        for_each_paragraph_in_blocks(&self.blocks, f);
+    }
+
+    /// Mutable twin of [`Self::for_each_paragraph`] — the paginator's
+    /// per-page field stamping walks this.
+    pub fn for_each_paragraph_mut(&mut self, f: &mut impl FnMut(&mut ParagraphBox)) {
+        for_each_paragraph_in_blocks_mut(&mut self.blocks, f);
+    }
+}
+
+/// Recursive paragraph walk over a laid-out block list (skips
+/// vertically-merged continuation cells, whose content is a clone of
+/// the merge origin's).
+pub fn for_each_paragraph_in_blocks<'a>(
+    blocks: &'a [LayoutBlock],
+    f: &mut impl FnMut(&'a ParagraphBox),
+) {
+    for b in blocks {
+        match b {
+            LayoutBlock::Paragraph(p) => f(p),
+            LayoutBlock::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                            continue;
+                        }
+                        for_each_paragraph_in_blocks(&cell.content, f);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mutable twin of [`for_each_paragraph_in_blocks`].
+pub fn for_each_paragraph_in_blocks_mut(
+    blocks: &mut [LayoutBlock],
+    f: &mut impl FnMut(&mut ParagraphBox),
+) {
+    for b in blocks {
+        match b {
+            LayoutBlock::Paragraph(p) => f(p),
+            LayoutBlock::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                            continue;
+                        }
+                        for_each_paragraph_in_blocks_mut(&mut cell.content, f);
+                    }
+                }
+            }
+        }
     }
 }

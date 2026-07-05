@@ -44,6 +44,7 @@ import type {
     PageOrientation,
     SectionBreakKind,
     HeaderFooterArea,
+    FieldKind,
     ListKind,
     BridgeStyleProperties,
 } from './types';
@@ -222,6 +223,19 @@ export interface EditorCommands {
     /** Phase 3 (#39) — leave header/footer editing; the stashed body
      *  selection is restored (clamped). */
     exitHeaderFooter(): Promise<Event>;
+    /** Issue #70 — Word's "Link to Previous" for the ACTIVE story's
+     *  slot: `false` forks a private copy owned by the story's
+     *  section; `true` clears the slot so it inherits again
+     *  (Event::Error on the first section). Story-scoped. */
+    setHeaderFooterLink(linked: boolean): Promise<Event>;
+    /** Issue #74 — `<w:titlePg/>` on the covering section (the active
+     *  story's when one is open, else the caret's). */
+    setTitlePage(enabled: boolean): Promise<Event>;
+    /** Issue #74 — document-wide `<w:evenAndOddHeaders/>`. */
+    setEvenOddHeaders(enabled: boolean): Promise<Event>;
+    /** Issue #43 — author a PAGE / NUMPAGES / DATE field at the caret
+     *  (body or story; rejected inside table cells). */
+    insertField(kind: FieldKind, at?: LogicalPos): Promise<Event>;
     setParagraphBorders(
         borders: BridgeCellBorders,
         range?: LogicalRange,
@@ -535,6 +549,17 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
         enterHeaderFooter: (page, area) =>
             dispatch({ type: 'ENTER_HEADER_FOOTER', page, area }),
         exitHeaderFooter: () => dispatch({ type: 'EXIT_HEADER_FOOTER' }),
+        setHeaderFooterLink: (linked) =>
+            dispatch({ type: 'SET_HEADER_FOOTER_LINK', linked }),
+        setTitlePage: (enabled) => dispatch({ type: 'SET_TITLE_PAGE', enabled }),
+        setEvenOddHeaders: (enabled) =>
+            dispatch({ type: 'SET_EVEN_ODD_HEADERS', enabled }),
+        insertField: (kind, at) =>
+            dispatch({
+                type: 'INSERT_FIELD',
+                at: at ?? currentCaret(),
+                kind,
+            }),
         setParagraphBorders: (borders, range) =>
             dispatch({
                 type: 'SET_PARAGRAPH_BORDERS',

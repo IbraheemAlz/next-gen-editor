@@ -1,25 +1,24 @@
 //! `word/footer*.xml` — mirror of [`crate::parts::header`].
 //!
 //! Phase 2 audit (gap D.1 follow-up). The XML schema is identical to
-//! the header's; the engine model is the same `Vec<Paragraph>`. Kept
-//! as a separate type so callers reading both can distinguish them by
-//! type without an enum tag.
+//! the header's; the engine model is the same `Vec<Block>` (issue #72
+//! widened both from `Vec<Paragraph>` so tables survive). Kept as a
+//! separate type so callers reading both can distinguish them by type
+//! without an enum tag.
 
 use crate::error::DocxError;
 use crate::parts::header::{HeaderPart, parse_header_xml};
 use crate::style_resolver::StyleResolver;
-use engine::Paragraph;
+use engine::Block;
 
 #[derive(Debug, Clone, Default)]
 pub struct FooterPart {
-    pub paragraphs: Vec<Paragraph>,
+    pub blocks: Vec<Block>,
 }
 
 impl From<HeaderPart> for FooterPart {
     fn from(h: HeaderPart) -> Self {
-        Self {
-            paragraphs: h.paragraphs,
-        }
+        Self { blocks: h.blocks }
     }
 }
 

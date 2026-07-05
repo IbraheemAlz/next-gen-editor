@@ -380,6 +380,11 @@ pub fn parse_document_xml(
     text begins (set when `separate` arrives) and the accumulating
     instruction string. `cached_start: None` before `separate`. */
     let mut field_stack: Vec<FieldBuilder> = Vec::new();
+    /* Issue #43 — `<w:fldSimple w:instr="…">cached runs</w:fldSimple>`,
+    the compact single-element field form Word emits for simple PAGE /
+    DATE fields. Stack of (instruction, cached-start); the close tag
+    seals the byte range exactly like fldChar's begin/separate/end. */
+    let mut fld_simple_stack: Vec<(String, u32)> = Vec::new();
     let mut in_instr_text = false;
 
     /* Phase 8b — tracked-change wrapper state. A `<w:ins>` or `<w:del>`
@@ -596,6 +601,11 @@ pub fn parse_document_xml(
                             &run_text,
                             &mut para_fields,
                         );
+                    }
+                    b"w:fldSimple" => {
+                        let instr = attr_val(&e, b"w:instr").unwrap_or_default();
+                        let start = (para_text.len() + run_text.len()) as u32;
+                        fld_simple_stack.push((instr, start));
                     }
                     b"w:ins" | b"w:del" => {
                         let kind = if name.as_ref() == b"w:ins" {
@@ -897,6 +907,23 @@ pub fn parse_document_xml(
                         }
                         in_drawing = false;
                         in_wp_inline = false;
+                    }
+                    b"w:fldSimple" => {
+                        /* Issue #43 — seal the compact field. A result-
+                        less or instruction-less fldSimple leaves no
+                        anchor to re-evaluate; skip it (matches the
+                        fldChar machine's guards). */
+                        if let Some((instr, start)) = fld_simple_stack.pop() {
+                            let end = (para_text.len() + run_text.len()) as u32;
+                            let instr = instr.trim().to_string();
+                            if end > start && !instr.is_empty() {
+                                para_fields.push(engine::Field {
+                                    start,
+                                    end,
+                                    instruction: instr,
+                                });
+                            }
+                        }
                     }
                     b"w:hyperlink" => {
                         if let Some((target, start)) = hyperlink_stack.pop() {

@@ -60,11 +60,30 @@ export function StoryModeOverlay(props: { store: EngineStore; pageIdx: number })
                     }
                 >
                     <span class="story-band__chip">
-                        {story()?.area === 'Header' ? 'Header' : 'Footer'} — double-click
-                        the body or press Esc to finish
+                        {chipLabel(story())} — double-click the body or press Esc to
+                        finish
                     </span>
                 </div>
             </Show>
         </Show>
     );
+}
+
+/* Issue #70/#74 — role-aware chip: names WHICH slot is being edited
+ * ("First Page Header", "Even Page Footer") and mirrors Word's
+ * "Same as Previous" tag on linked bands. */
+function chipLabel(
+    story:
+        | { area: string; role?: string; linked?: boolean }
+        | undefined,
+): string {
+    if (!story) return '';
+    const base = story.area === 'Header' ? 'Header' : 'Footer';
+    const role =
+        story.role === 'First'
+            ? `First Page ${base}`
+            : story.role === 'Even'
+              ? `Even Page ${base}`
+              : base;
+    return story.linked ? `${role} (same as previous)` : role;
 }

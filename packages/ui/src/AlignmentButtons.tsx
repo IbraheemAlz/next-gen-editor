@@ -37,11 +37,9 @@ export const AlignmentButtons: Component = () => {
     const cmd = createEditorCommands();
     const state = createEditorState();
 
-    /* Phase 3 (#39) — SetParagraphAlign / SetParagraphDirection are
-       engine-gated during header/footer editing; grey out rather than
-       dispatch into an invisible Event::Error (Honest UX). */
-    const ready = () =>
-        state.selection() !== undefined && state.editingStory() === undefined;
+    /* Story editing v2 (#72) lifted the engine's story-mode gate for
+       SetParagraphAlign / SetParagraphDirection. */
+    const ready = () => state.selection() !== undefined;
     const currentAlign = () => state.paragraphAlignment();
     const currentDir = () => state.paragraphDirection();
 

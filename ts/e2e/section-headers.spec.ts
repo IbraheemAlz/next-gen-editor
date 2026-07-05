@@ -63,13 +63,21 @@ test('section break + independent headers survive a save/reload round trip', asy
         await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Header A' });
         const exitA = await dispatch({ type: 'EXIT_HEADER_FOOTER' });
 
-        /* 3 — Header B on page 2's section (independent part). */
-        const enterB = await dispatch({
+        /* 3 — page 2's section is born LINKED (issue #70): entering
+        its header resolves section 1's part through inheritance.
+        Word's "Same as Previous" → explicit unlink forks a private
+        copy, and only then does Header B diverge. */
+        const enterLinked = await dispatch({
             type: 'ENTER_HEADER_FOOTER',
             page: 1,
             area: 'Header',
         });
-        const storyB = enterB.editing_story;
+        const storyLinked = enterLinked.editing_story;
+        const unlinked = await dispatch({
+            type: 'SET_HEADER_FOOTER_LINK',
+            linked: false,
+        });
+        const storyB = unlinked.editing_story;
         await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Header B' });
         await dispatch({ type: 'EXIT_HEADER_FOOTER' });
 
@@ -99,6 +107,7 @@ test('section break + independent headers survive a save/reload round trip', asy
         return {
             breakGeo,
             storyA,
+            storyLinked,
             storyB,
             exitAStory: exitA.editing_story ?? null,
             gatedType: gated.type,
@@ -113,11 +122,17 @@ test('section break + independent headers survive a save/reload round trip', asy
     expect(result.breakGeo?.section_count).toBe(2);
     expect(result.breakGeo?.section_index).toBe(1);
 
-    /* Stories activated with INDEPENDENT parts. */
+    /* Issue #70 — the freshly-broken section INHERITS section 1's
+    part (Word's "Same as Previous"): same rid, linked flag on. */
     expect(result.storyA?.area).toBe('Header');
     expect(result.storyA?.page).toBe(0);
+    expect(result.storyLinked?.rid).toBe(result.storyA?.rid);
+    expect(result.storyLinked?.linked).toBe(true);
+
+    /* Explicit unlink forks a private part. */
     expect(result.storyB?.area).toBe('Header');
     expect(result.storyB?.rid).not.toBe(result.storyA?.rid);
+    expect(result.storyB?.linked).toBe(false);
     expect(result.exitAStory).toBeNull();
 
     /* Honest-UX backstop: gated commands error, never silently no-op. */

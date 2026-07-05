@@ -178,8 +178,10 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         hit-testing so paint and caret geometry cannot diverge. */
         if let Some(hf) = &page.header {
             let band_top = top + page.header_band_top();
-            for para in &hf.paragraphs {
-                paint_paragraph(para, content_x, band_top, &mut cmds);
+            /* Issue #72 — bands are block lists now; `paint_block`
+            dispatches tables through the same painter the body uses. */
+            for block in &hf.blocks {
+                paint_block(block, content_x, band_top, &mut cmds);
             }
         }
 
@@ -218,8 +220,8 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
 
         if let Some(hf) = &page.footer {
             let band_top = top + page.footer_band_top();
-            for para in &hf.paragraphs {
-                paint_paragraph(para, content_x, band_top, &mut cmds);
+            for block in &hf.blocks {
+                paint_block(block, content_x, band_top, &mut cmds);
             }
         }
 

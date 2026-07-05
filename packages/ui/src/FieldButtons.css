@@ -1,0 +1,45 @@
+/* Issue #43 — dynamic-field authoring popover. */
+.nge-fields {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+}
+
+.nge-fields__trigger {
+    gap: var(--nge-space-1);
+}
+
+.nge-fields__menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: var(--nge-z-popover);
+    min-width: 200px;
+    margin: 0;
+    padding: var(--nge-space-1);
+    list-style: none;
+    background: var(--nge-color-surface);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-md);
+}
+
+.nge-fields__item {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: var(--nge-space-2);
+    padding: var(--nge-space-1) var(--nge-space-2);
+    background: none;
+    border: none;
+    border-radius: var(--nge-radius-sm);
+    color: var(--nge-color-text);
+    font-size: 13px;
+    text-align: start;
+    cursor: pointer;
+}
+
+.nge-fields__item:hover {
+    background: var(--nge-color-primary);
+    color: #ffffff;
+}

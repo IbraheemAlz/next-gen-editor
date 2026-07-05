@@ -243,6 +243,11 @@ struct LastPaintDims {
     /// shell's header/footer double-click zone gate.
     page_margin_tops: Vec<f32>,
     page_margin_bottoms: Vec<f32>,
+    /// Issue #71 — per-page EFFECTIVE body extents (device px,
+    /// page-local): the zone gate's truth once a band intrudes past
+    /// its margin.
+    page_content_tops: Vec<f32>,
+    page_content_bottoms: Vec<f32>,
 }
 
 /// A candidate caret position on a line — an absolute x (canvas device px)
@@ -283,11 +288,18 @@ enum StoryTarget {
         /// section-scoped reads (`section_geometry_for_caret`) can
         /// resolve the section while selection paths are story-rooted.
         section_block: u32,
+        /// Issue #70 (design review B4) — which slot the anchor page's
+        /// role selected. The post-undo/redo validity guard re-resolves
+        /// (section, area, role) through inheritance and re-anchors
+        /// `rid` — a bare rid-exists check let undo leave the story
+        /// writing into a part the screen no longer shows.
+        role: engine::HeaderFooterRole,
     },
     Footer {
         rid: String,
         page: u32,
         section_block: u32,
+        role: engine::HeaderFooterRole,
     },
 }
 
@@ -381,6 +393,11 @@ pub struct Engine {
     /// Phase 3 (#39) — the body selection captured on
     /// `EnterHeaderFooter`, restored (clamped) on `ExitHeaderFooter`.
     stashed_body_selection: Option<SelectionState>,
+    /// Issue #43 — the shell-injected `(year, month, day)` DATE fields
+    /// resolve against (`Command::SetRenderDate`, dispatched by the
+    /// worker right after INIT). `None` keeps cached field text — the
+    /// engine core never reads a wall clock.
+    render_date: Option<(i32, u32, u32)>,
     /// Last accessibility tree broadcast to the UI (Backlog #10).
     /// `build_a11y_delta` diffs the freshly built tree against this so a
     /// keystroke emits only the changed paragraph. `None` until the first
@@ -484,6 +501,7 @@ fn assemble_engine(
         sections_memo: RefCell::new(None),
         active_story: StoryTarget::Body,
         stashed_body_selection: None,
+        render_date: None,
         a11y_cache: None,
         image_cache: HashMap::new(),
         last_paint_dims: LastPaintDims::default(),
@@ -592,6 +610,8 @@ impl Engine {
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: dims.page_margin_tops,
             page_margin_bottoms: dims.page_margin_bottoms,
+            page_content_tops: dims.page_content_tops,
+            page_content_bottoms: dims.page_content_bottoms,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -694,6 +714,9 @@ struct PaintDimsOut {
     /// zone gate (mirrors `Event::Painted`).
     page_margin_tops: Vec<f32>,
     page_margin_bottoms: Vec<f32>,
+    /// Issue #71 — effective body extents (mirrors `Event::Painted`).
+    page_content_tops: Vec<f32>,
+    page_content_bottoms: Vec<f32>,
 }
 
 #[derive(::serde::Serialize)]
@@ -1900,67 +1923,295 @@ fn walk_block_for_footnote_refs(
 /// alignment, base direction and line-height inherit from the
 /// paragraph's `props` exactly as in the body path. Returns `None`
 /// when every paragraph is empty.
+/// Issue #43 — post-pagination field-resolution reshape. Bands re-lay
+/// from their SOURCE part blocks (via `HeaderFooterBox::source_rid`)
+/// with each page's resolved PAGE/NUMPAGES/DATE text spliced in;
+/// whole (unsplit) body paragraphs re-lay in place when the swap keeps
+/// their line count + height (a digit-width change that would rewrap
+/// keeps the cached text instead of corrupting pagination — the
+/// accepted keep-last policy from the design review).
+#[allow(clippy::too_many_arguments)]
+fn reshape_resolved_fields(
+    pages: &mut [PageBox],
+    page_paths: &[Vec<EngineBlockPath>],
+    doc: &DocumentTree,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    story_skip: Option<(u32, bool)>,
+) {
+    for (page_idx, page) in pages.iter_mut().enumerate() {
+        /* ---- bands ---- */
+        for is_header in [true, false] {
+            if story_skip == Some((page_idx as u32, is_header)) {
+                continue;
+            }
+            let band = if is_header {
+                page.header.as_ref()
+            } else {
+                page.footer.as_ref()
+            };
+            let Some(band) = band else { continue };
+            let mut has_resolved = false;
+            band.for_each_paragraph(&mut |p| {
+                if p.fields.iter().any(|f| f.evaluated_text.is_some()) {
+                    has_resolved = true;
+                }
+            });
+            if !has_resolved {
+                continue;
+            }
+            let Some(rid) = band.source_rid.clone() else {
+                continue;
+            };
+            let table = if is_header {
+                &doc.headers
+            } else {
+                &doc.footers
+            };
+            let Some(source) = table.get(&rid) else {
+                continue;
+            };
+            /* Pair source block j with band block j (the builder
+            preserves order) and splice each resolved field. */
+            let mut spliced: Vec<engine::Block> = source.clone();
+            for (j, bb) in band.blocks.iter().enumerate() {
+                let LayoutBlock::Paragraph(pb) = bb else {
+                    continue;
+                };
+                if pb.fields.is_empty() {
+                    continue;
+                }
+                let Some(engine::Block::Paragraph(sp)) = spliced.get(j) else {
+                    continue;
+                };
+                let para = splice_resolved_fields_into(sp, &pb.fields);
+                spliced[j] = engine::Block::Paragraph(para);
+            }
+            let content_w = page.size.width - page.margins.left - page.margins.right;
+            if let Some(new_band) = build_header_footer_box(
+                &spliced,
+                content_w,
+                fonts,
+                cfg,
+                scale,
+                sctx,
+                cache,
+                Some(&rid),
+                None,
+            ) {
+                if is_header {
+                    page.header = Some(new_band);
+                } else {
+                    page.footer = Some(new_band);
+                }
+            }
+        }
+
+        /* ---- body ---- */
+        let paths = page_paths.get(page_idx).map(Vec::as_slice).unwrap_or(&[]);
+        for (bi, block) in page.blocks.iter_mut().enumerate() {
+            let LayoutBlock::Paragraph(pb) = block else {
+                continue;
+            };
+            if !pb.fields.iter().any(|f| f.evaluated_text.is_some()) {
+                continue;
+            }
+            let Some(path) = paths.get(bi) else { continue };
+            let Some(source) = doc.paragraph_at_path(path) else {
+                continue;
+            };
+            let para = splice_resolved_fields_into(source, &pb.fields);
+            if para.text == source.text {
+                continue; /* every resolved value matched the cache */
+            }
+            let new_box = layout_paragraph_cached(
+                &para,
+                fonts,
+                cfg,
+                scale,
+                pb.size.width.max(1.0),
+                sctx,
+                cache,
+            );
+            /* Only a shape-stable swap is safe post-pagination: a
+            rewrap would desync every later block's origin. */
+            if new_box.lines.len() == pb.lines.len()
+                && (new_box.size.height - pb.size.height).abs() < 0.5
+            {
+                let origin = pb.origin;
+                let src_id = pb.source_paragraph_id;
+                *pb = new_box;
+                pb.origin = origin;
+                pb.source_paragraph_id = src_id;
+            }
+        }
+    }
+}
+
+/// Splice every resolved field's text into a clone of `source`,
+/// highest offset first so earlier ranges stay valid. Values that
+/// already match the cached slice are skipped.
+fn splice_resolved_fields_into(
+    source: &engine::Paragraph,
+    fields: &[layout::LayoutField],
+) -> engine::Paragraph {
+    let mut subs: Vec<(u32, u32, &str)> = fields
+        .iter()
+        .filter_map(|f| {
+            f.evaluated_text
+                .as_deref()
+                .map(|t| (f.byte_range.start, f.byte_range.end, t))
+        })
+        .collect();
+    subs.sort_by_key(|(start, ..)| std::cmp::Reverse(*start));
+    let mut para = source.clone();
+    for (fs, fe, txt) in subs {
+        if para.text.get(fs as usize..fe as usize) == Some(txt) {
+            continue;
+        }
+        para = para.with_spliced_range(fs, fe, txt);
+    }
+    para
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_header_footer_box(
-    paragraphs: &[engine::Paragraph],
+    blocks: &[engine::Block],
     content_width: f32,
     fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
     sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    source_rid: Option<&str>,
+    composition: Option<&CompositionState>,
 ) -> Option<layout::HeaderFooterBox> {
-    if paragraphs.iter().all(|p| p.text.is_empty()) {
+    let has_content = blocks.iter().any(|b| match b {
+        engine::Block::Paragraph(p) => !p.text.is_empty(),
+        engine::Block::Table(_) => true,
+    }) || composition.is_some();
+    if !has_content {
         return None;
     }
-    let mut paras: Vec<ParagraphBox> = Vec::with_capacity(paragraphs.len());
+    let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
-    for para in paragraphs {
-        let spans = apply_revision_overlay(
-            apply_hyperlink_overlay(
-                build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
-                &para.hyperlinks,
-                [0, 0, 0, 255],
-            ),
-            &para.revisions,
-            [0, 0, 0, 255],
-        );
-        let base_direction = resolve_base_direction(para, cfg);
-        let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
-        let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
-        let mut p = layout_paragraph(ParagraphConfig {
-            text: &para.text,
-            fonts,
-            spans: &spans,
-            base_direction,
-            max_width: content_width,
-            line_height: lh_px,
-            line_height_exact: lh_exact,
-            alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
-            indent_start_px: ind_s,
-            indent_end_px: ind_e,
-            first_line_indent_px: ind_fl,
-            hanging_indent_px: ind_h,
-            marker_text: para.resolved_marker.clone(),
-            px_size_for_marker: cfg.px_size * scale,
-            inline_objects: &[],
-            tab_stops_px: &[],
-        });
-        /* Phase 2 audit (gap D.1) — propagate field overlays so the
-        paginator can re-evaluate PAGE / NUMPAGES per page. Identical
-        plumbing to the body-paragraph path. */
-        p.fields = para
-            .fields
-            .iter()
-            .map(|f| layout::LayoutField {
-                byte_range: f.start..f.end,
-                instruction: f.instruction.clone(),
-                evaluated_text: None,
-            })
-            .collect();
-        p.origin = Point { x: 0.0, y };
-        y += p.size.height;
-        paras.push(p);
+    for (block_idx, block) in blocks.iter().enumerate() {
+        let mut lb = match block {
+            engine::Block::Paragraph(para) => {
+                /* Issue #72 — inline IME preview inside a band. The
+                composition's `at` path is STORY-rooted (`Block(i)` =
+                the part's i-th block); splice exactly like the body
+                loop does. The caller only passes `composition` when
+                the active story edits THIS part, so every page
+                instance of the part previews consistently. */
+                let comp = composition.filter(|c| {
+                    bridge_to_engine_path(c.at.path.clone())
+                        == EngineBlockPath::top(block_idx as u32)
+                        && !c.text.is_empty()
+                        && (c.at.offset as usize) <= para.text.len()
+                        && para.text.is_char_boundary(c.at.offset as usize)
+                });
+                let base_direction = resolve_base_direction(para, cfg);
+                let (ind_s, ind_e, ind_fl, ind_h) =
+                    effective_layout_indents(para, base_direction, scale);
+                let (lh_px, lh_exact) =
+                    resolve_line_height(para.props.line_height, cfg.line_height, scale);
+                let (text, spans) = if let Some(c) = comp {
+                    let off = c.at.offset as usize;
+                    let mut text = String::with_capacity(para.text.len() + c.text.len());
+                    text.push_str(&para.text[..off]);
+                    text.push_str(&c.text);
+                    text.push_str(&para.text[off..]);
+                    let spans = apply_revision_overlay(
+                        apply_hyperlink_overlay(
+                            composition_layout_spans(
+                                para,
+                                sctx,
+                                off as u32,
+                                c.text.len() as u32,
+                                cfg.px_size,
+                                scale,
+                            ),
+                            &para.hyperlinks,
+                            [0, 0, 0, 255],
+                        ),
+                        &para.revisions,
+                        [0, 0, 0, 255],
+                    );
+                    (text, spans)
+                } else {
+                    let spans = apply_revision_overlay(
+                        apply_hyperlink_overlay(
+                            build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
+                            &para.hyperlinks,
+                            [0, 0, 0, 255],
+                        ),
+                        &para.revisions,
+                        [0, 0, 0, 255],
+                    );
+                    (para.text.clone(), spans)
+                };
+                let mut p = layout_paragraph(ParagraphConfig {
+                    text: &text,
+                    fonts,
+                    spans: &spans,
+                    base_direction,
+                    max_width: content_width,
+                    line_height: lh_px,
+                    line_height_exact: lh_exact,
+                    alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+                    indent_start_px: ind_s,
+                    indent_end_px: ind_e,
+                    first_line_indent_px: ind_fl,
+                    hanging_indent_px: ind_h,
+                    marker_text: para.resolved_marker.clone(),
+                    px_size_for_marker: cfg.px_size * scale,
+                    inline_objects: &[],
+                    tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+                });
+                /* Phase 2 audit (gap D.1) — propagate field overlays so
+                the paginator can re-evaluate PAGE / NUMPAGES per page.
+                Identical plumbing to the body-paragraph path. Skipped
+                while a composition preview is spliced in (the ranges
+                would be stale against the preview text). */
+                if comp.is_none() {
+                    p.fields = para
+                        .fields
+                        .iter()
+                        .map(|f| layout::LayoutField {
+                            byte_range: f.start..f.end,
+                            instruction: f.instruction.clone(),
+                            evaluated_text: None,
+                        })
+                        .collect();
+                }
+                LayoutBlock::Paragraph(p)
+            }
+            /* Issue #72 — `<w:tbl>` inside a part rides the SAME table
+            layout the body uses, at the band's content width. */
+            engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
+                t,
+                content_width,
+                fonts,
+                cfg,
+                scale,
+                sctx,
+                cache,
+            )),
+        };
+        let mut o = lb.origin();
+        o.y = y;
+        lb.set_origin(o);
+        y += lb.size().height;
+        out.push(lb);
     }
-    Some(layout::HeaderFooterBox { paragraphs: paras })
+    Some(layout::HeaderFooterBox {
+        blocks: out,
+        source_rid: source_rid.map(str::to_string),
+    })
 }
 
 /// Phase 6 — walk a freshly laid-out `TableBox` and stamp every nested
@@ -3923,15 +4174,27 @@ fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, Bridg
 /// (falling back to the document end), `offset` capped at the
 /// paragraph's UTF-8 length.
 fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+    /* Design review B6 — a TABLE-ONLY tree (a letterhead header whose
+    sole block is a table) has paragraph_count() == 0 but real caret
+    homes inside the cells; the old `bpos_top(0, 0)` fast-path parked
+    the caret on the bare table path, which no text consumer resolves.
+    Deep-descend instead; only a genuinely paragraph-free tree keeps
+    the legacy sentinel. */
     if doc.paragraph_count() == 0 {
-        return bpos_top(0, 0);
+        return match doc.path_to_first_paragraph_deep() {
+            Some(p) => BridgeLogicalPos {
+                path: engine_to_bridge_path(p),
+                offset: 0,
+            },
+            None => bpos_top(0, 0),
+        };
     }
     let engine_path = bridge_to_engine_path(pos.path.clone());
     let (resolved_path, para_len) = match doc.paragraph_at_path(&engine_path) {
         Some(p) => (engine_path, p.text.len() as u32),
         None => {
             let fallback = doc
-                .path_to_last_top_paragraph()
+                .path_to_last_paragraph_deep()
                 .unwrap_or(EngineBlockPath::top(0));
             let len = doc
                 .paragraph_at_path(&fallback)
@@ -4207,7 +4470,68 @@ impl Engine {
             | Command::SaveDocument { .. }
             | Command::ExportPdf { .. }
             | Command::EnterHeaderFooter { .. }
-            | Command::ExitHeaderFooter => None,
+            | Command::ExitHeaderFooter
+            /* Issue #70/#74/#43 — story-scoped by design (link toggle)
+            or story-safe (section toggles re-anchor; field authoring
+            routes through the story adapter; the render date is
+            global state). */
+            | Command::SetHeaderFooterLink { .. }
+            | Command::SetTitlePage { .. }
+            | Command::SetEvenOddHeaders { .. }
+            | Command::InsertField { .. }
+            | Command::SetRenderDate { .. }
+            /* Issue #72 — paragraph-property family. Each handler below
+            routes through `story_mutate` against the synthetic story
+            tree when a story is active. */
+            | Command::SetParagraphAlign { .. }
+            | Command::SetParagraphDirection { .. }
+            | Command::SetParagraphIndent { .. }
+            | Command::SetLineSpacing { .. }
+            | Command::SetParagraphShading { .. }
+            | Command::SetParagraphBorders { .. }
+            | Command::SetTabStops { .. }
+            /* Issue #72 — styles. `ApplyStyle` sets a paragraph's
+            `style_id` and routes through `story_mutate`. `ModifyStyle`
+            mutates the style TABLE, which is doc-global (shared by body
+            + every story) and already carried into the story tree by
+            `story_doc()`/merged back by `story_mutate`'s callers — but
+            `do_modify_style` itself writes straight to the real
+            `self.undo` tree, which is correct as-is in story mode (the
+            style table lives there, not in the story's block list), so
+            no handler change is needed for it. */
+            | Command::ApplyStyle { .. }
+            | Command::ModifyStyle { .. }
+            /* Issue #72 — lists. */
+            | Command::ToggleList { .. }
+            | Command::ChangeListLevel { .. }
+            /* Issue #72 — tables. Headers/footers can now hold tables
+            (`story_blocks` widened to `Vec<Block>`), so every table
+            mutation command routes through `story_mutate` the same way. */
+            | Command::InsertTable { .. }
+            | Command::DeleteTable { .. }
+            | Command::InsertRow { .. }
+            | Command::DeleteRow { .. }
+            | Command::InsertColumn { .. }
+            | Command::DeleteColumn { .. }
+            | Command::MergeCells { .. }
+            | Command::SplitCell { .. }
+            | Command::SetCellShading { .. }
+            | Command::SetCellBorders { .. }
+            /* Issue #72 — `SelectCellAt` resolves through
+            `document_geometry` (already story-aware) plus
+            `cell_content_span`, which now reads `self.selection_doc()`
+            instead of the body tree. */
+            | Command::SelectCellAt { .. }
+            /* Issue #72 — IME. The commit path already routes through
+            `do_insert_text_interactive`, which is story-aware; the
+            in-progress preview never touches the document tree. */
+            | Command::BeginComposition { .. }
+            | Command::UpdateComposition { .. }
+            | Command::EndComposition { .. }
+            /* Issue #72 — rich copy. `do_get_selection_as_clipboard` now
+            reads `self.selection_doc()` so a copy from inside a story
+            serializes the story's paragraphs, not the body's. */
+            | Command::GetSelectionAsClipboard => None,
             /* Loading a document tears the story's ground away —
             exit first, then handle normally. */
             Command::LoadDocx { .. } | Command::OpenDocument { .. } => {
@@ -4472,6 +4796,15 @@ impl Engine {
             Command::InsertSectionBreak { at, kind } => self.do_insert_section_break(at, kind),
             Command::EnterHeaderFooter { page, area } => self.do_enter_header_footer(page, area),
             Command::ExitHeaderFooter => self.do_exit_header_footer(),
+            Command::SetHeaderFooterLink { linked } => self.do_set_header_footer_link(linked),
+            Command::SetTitlePage { enabled } => self.do_set_title_page(enabled),
+            Command::SetEvenOddHeaders { enabled } => self.do_set_even_odd_headers(enabled),
+            Command::InsertField { at, kind } => self.do_insert_field(at, kind),
+            Command::SetRenderDate { year, month, day } => {
+                self.render_date = Some((year, month, day));
+                self.invalidate_layout_snapshot();
+                Event::Pong
+            }
             Command::SetParagraphBorders { range, borders } => {
                 self.do_set_paragraph_borders(range, borders)
             }
@@ -4817,17 +5150,60 @@ impl Engine {
         self.after_history_change()
     }
 
-    /// Phase 3 (#39) — an undo/redo can remove the active story's part
-    /// (e.g. undoing past materialize-on-enter) or shrink its paragraph
-    /// list under the selection. Exit to body in the first case; clamp
-    /// the story selection in the second.
+    /// Phase 3 (#39) / design review B4 — undo/redo can invalidate the
+    /// active story THREE ways: the part vanished (undo past
+    /// materialize), the paragraph list shrank under the selection, or
+    /// — with #70's linked editing — the (section, area, role) slot
+    /// now RESOLVES to a different rid (undo of an unlink/relink or of
+    /// the section break itself). A bare rid-exists check let the last
+    /// case silently write keystrokes into a part the screen no longer
+    /// shows. Re-resolve and re-anchor; exit to body when the chain
+    /// resolves to nothing.
     fn story_validity_guard(&mut self) {
         if !self.story_active() {
             return;
         }
-        match self.story_paras() {
+        /* Invalidate the sections memo (the undo/redo just swapped the
+        tree) then re-run the SAME resolution enter used. */
+        let (is_header, section_block, role) = match &self.active_story {
+            StoryTarget::Body => return,
+            StoryTarget::Header {
+                section_block,
+                role,
+                ..
+            } => (true, *section_block, *role),
+            StoryTarget::Footer {
+                section_block,
+                role,
+                ..
+            } => (false, *section_block, *role),
+        };
+        let block_count = self.undo.current().block_count();
+        let section_block = section_block.min(block_count.saturating_sub(1));
+        let section_idx = self.section_index_of_block(section_block);
+        match self.resolved_hf_rid(section_idx, is_header, role) {
             None => self.exit_story_to_body(),
-            Some(_) => {
+            Some((resolved, _linked)) => {
+                let stale = match &self.active_story {
+                    StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
+                        rid != &resolved
+                    }
+                    StoryTarget::Body => false,
+                };
+                if stale {
+                    match &mut self.active_story {
+                        StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
+                            *rid = resolved;
+                        }
+                        StoryTarget::Body => {}
+                    }
+                }
+                if self.story_blocks().is_none() {
+                    /* Resolved rid has no part content (defensive —
+                    a dangling ref in an imported doc). */
+                    self.exit_story_to_body();
+                    return;
+                }
                 if let Some(sel) = self.selection.clone() {
                     let clamped = self.with_selection_doc(|d| SelectionState {
                         anchor: clamp_pos(d, sel.anchor),
@@ -5096,7 +5472,34 @@ impl Engine {
         window. Falls back to the legacy `LAYOUT_BUFFER_PT` floor for
         small viewports and pre-viewport clients. */
         let runway = lazy_runway(self.lazy_layout.viewport_h, scale);
-        let cull_budget = target_y.map(|y| y + runway);
+        /* Issue #43 — a NUMPAGES field (body or any referenced part)
+        needs the FINAL page total; a culled build would resolve it
+        against a partial count. Force full layout for such documents
+        (Word paginates fully for its page counts too). */
+        let has_numpages = doc
+            .blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .flat_map(|p| p.fields.iter())
+            .any(|f| f.keyword() == "NUMPAGES")
+            || {
+                let mut found = false;
+                doc.for_each_referenced_story(&mut |_, _, blocks| {
+                    if !found {
+                        found = blocks
+                            .iter()
+                            .filter_map(engine::Block::as_paragraph)
+                            .flat_map(|p| p.fields.iter())
+                            .any(|f| f.keyword() == "NUMPAGES");
+                    }
+                });
+                found
+            };
+        let cull_budget = if has_numpages {
+            None
+        } else {
+            target_y.map(|y| y + runway)
+        };
         let mut culled = false;
         let gap = render::scene::PAGE_GAP_PT * scale;
         let height_so_far = |pages: &[PageBox], in_progress: f32| -> f32 {
@@ -5111,6 +5514,17 @@ impl Engine {
                 }
         };
 
+        /* Issue #70 — §17.10.3 Link-to-Previous: a section's empty ref
+        slot inherits the nearest earlier section's, per role. Bands
+        are built from the RESOLVED refs; storage stays absence-based. */
+        let resolved_refs = engine::resolve_hf_inheritance(&sections);
+        /* Issue #72 — the active story's part previews the live IME
+        composition on every page instance. */
+        let story_comp: Option<(&str, bool)> = match &self.active_story {
+            StoryTarget::Header { rid, .. } => Some((rid.as_str(), true)),
+            StoryTarget::Footer { rid, .. } => Some((rid.as_str(), false)),
+            StoryTarget::Body => None,
+        };
         'outer: for (sect_idx, section) in sections.iter().enumerate() {
             let geom = scaled_paginator_geometry(section.geometry, scale);
             /* Audit gap A.M12 — `Continuous` section break swaps
@@ -5133,25 +5547,86 @@ impl Engine {
                 paths_taken.resize_with(consume, Vec::new);
                 emitted_paths.append(&mut paths_taken);
             }
+            /* Issue #74 — Even/OddPage section start: when the incoming
+            page's FORMATTED number has the wrong parity (and no
+            pgNumType restart forces a number), emit ONE blank filler
+            page. The filler consumes a page number — PAGE fields
+            count it — and paints as an empty sheet (issue contract:
+            no bands, no body). A restart with mismatched parity is
+            left as-is: a filler cannot fix a forced number. */
+            if sect_idx > 0
+                && matches!(
+                    section.section_type,
+                    engine::SectionType::EvenPage | engine::SectionType::OddPage
+                )
+                && section.page_num.start.is_none()
+            {
+                let incoming = emitted_pages.len() as u32 + 1;
+                let want_even = matches!(section.section_type, engine::SectionType::EvenPage);
+                if (incoming % 2 == 0) != want_even {
+                    let filler_geom = emitted_pages
+                        .last()
+                        .map(|p| (p.size, p.margins, p.header_offset, p.footer_offset))
+                        .unwrap_or((
+                            Size {
+                                width: geom.width,
+                                height: geom.height,
+                            },
+                            geom.margins,
+                            geom.header_offset,
+                            geom.footer_offset,
+                        ));
+                    emitted_pages.push(PageBox {
+                        size: filler_geom.0,
+                        margins: filler_geom.1,
+                        blocks: Vec::new(),
+                        header: None,
+                        footer: None,
+                        header_offset: filler_geom.2,
+                        footer_offset: filler_geom.3,
+                        footnotes: Vec::new(),
+                        hf_role: layout::HeaderRole::Default,
+                        page_number: incoming,
+                    });
+                    emitted_paths.push(Vec::new());
+                }
+            }
             /* Phase 6b — resolve header / footer text the parser stashed
             on `doc.headers` / `doc.footers` (keyed by `r:id`) into laid-
             out paragraphs the renderer paints into the margin bands. */
             let content_w = geom.width - geom.margins.left - geom.margins.right;
-            let lay_band = |slot: Option<&String>,
-                            table: &std::collections::HashMap<String, Vec<engine::Paragraph>>|
+            let sect_resolved = &resolved_refs[sect_idx];
+            let mut lay_band = |slot: Option<&str>,
+                                table: &std::collections::HashMap<String, Vec<engine::Block>>,
+                                is_header: bool|
              -> Option<layout::HeaderFooterBox> {
                 let rid = slot?;
-                build_header_footer_box(table.get(rid)?, content_w, &font_stack, &cfg, scale, sctx)
+                let comp = story_comp
+                    .filter(|(story_rid, story_is_header)| {
+                        *story_rid == rid && *story_is_header == is_header
+                    })
+                    .and(composition);
+                build_header_footer_box(
+                    table.get(rid)?,
+                    content_w,
+                    &font_stack,
+                    &cfg,
+                    scale,
+                    sctx,
+                    &mut cache,
+                    Some(rid),
+                    comp,
+                )
             };
             let headers = layout::HeaderBands {
-                default: lay_band(section.header_refs.default.as_ref(), &doc.headers),
-                first: lay_band(section.header_refs.first.as_ref(), &doc.headers),
-                even: lay_band(section.header_refs.even.as_ref(), &doc.headers),
+                default: lay_band(sect_resolved.0.default.as_deref(), &doc.headers, true),
+                first: lay_band(sect_resolved.0.first.as_deref(), &doc.headers, true),
+                even: lay_band(sect_resolved.0.even.as_deref(), &doc.headers, true),
             };
             let footers = layout::HeaderBands {
-                default: lay_band(section.footer_refs.default.as_ref(), &doc.footers),
-                first: lay_band(section.footer_refs.first.as_ref(), &doc.footers),
-                even: lay_band(section.footer_refs.even.as_ref(), &doc.footers),
+                default: lay_band(sect_resolved.1.default.as_deref(), &doc.footers, false),
+                first: lay_band(sect_resolved.1.first.as_deref(), &doc.footers, false),
+                even: lay_band(sect_resolved.1.even.as_deref(), &doc.footers, false),
             };
             if is_continuous {
                 /* Audit gap A.M12 — in-place section swap. Keep the
@@ -5193,7 +5668,10 @@ impl Engine {
                     section.title_pg,
                     doc.settings.even_and_odd_headers,
                 )
-                .with_footnote_bodies(footnote_bodies.clone());
+                .with_footnote_bodies(footnote_bodies.clone())
+                /* Issue #43 — DATE fields resolve against the
+                shell-injected render date. */
+                .with_render_date(self.render_date);
                 if section.columns.is_multi() {
                     pag.set_columns(section.columns.count, section.columns.gutter_pt * scale);
                 }
@@ -5370,8 +5848,6 @@ impl Engine {
                 }
             }
         }
-        drop(cache);
-
         if let Some(p) = paginator.take() {
             let mut pages = p.finish();
             let consume = pages.len();
@@ -5380,6 +5856,33 @@ impl Engine {
             paths_taken.resize_with(consume, Vec::new);
             emitted_paths.append(&mut paths_taken);
         }
+
+        /* Issue #43 — the paginator stamped every field's resolved
+        value into `LayoutField::evaluated_text`, but painted glyphs
+        come from the text shaped BEFORE pagination — without this
+        pass PAGE/NUMPAGES render their stale cached text forever.
+        Re-lay each affected band (and stable body paragraph) with the
+        resolved text spliced in. The active story's own band is
+        SKIPPED (design review B2): story_geometry's caret offsets are
+        source-text offsets, and Word likewise shows the un-renumbered
+        field while you edit it. */
+        let story_skip: Option<(u32, bool)> = match &self.active_story {
+            StoryTarget::Header { page, .. } => Some((*page, true)),
+            StoryTarget::Footer { page, .. } => Some((*page, false)),
+            StoryTarget::Body => None,
+        };
+        reshape_resolved_fields(
+            &mut emitted_pages,
+            &emitted_paths,
+            &doc,
+            &font_stack,
+            &cfg,
+            scale,
+            sctx,
+            &mut cache,
+            story_skip,
+        );
+        drop(cache);
         /* Always at least one page so downstream consumers can index `[0]`. */
         if emitted_pages.is_empty() {
             let default_geom = scaled_paginator_geometry(engine::PageGeometry::a4(), scale);
@@ -5395,6 +5898,8 @@ impl Engine {
                 header_offset: default_geom.header_offset,
                 footer_offset: default_geom.footer_offset,
                 footnotes: Vec::new(),
+                hf_role: layout::HeaderRole::Default,
+                page_number: 1,
             });
             emitted_paths.push(Vec::new());
         }
@@ -5430,6 +5935,8 @@ impl Engine {
             header_offset: 0.0,
             footer_offset: 0.0,
             footnotes: Vec::new(),
+            hf_role: layout::HeaderRole::Default,
+            page_number: 1,
         });
         let p0 = paths.drain(..).next().unwrap_or_default();
         Ok((page, fonts, p0))
@@ -5505,6 +6012,8 @@ impl Engine {
         let mut page_heights = Vec::with_capacity(pages.len());
         let mut page_margin_tops = Vec::with_capacity(pages.len());
         let mut page_margin_bottoms = Vec::with_capacity(pages.len());
+        let mut page_content_tops = Vec::with_capacity(pages.len());
+        let mut page_content_bottoms = Vec::with_capacity(pages.len());
         let mut top_acc = 0.0f32;
         for page in pages {
             page_tops.push(top_acc);
@@ -5514,6 +6023,23 @@ impl Engine {
             sections. */
             page_margin_tops.push(page.margins.top);
             page_margin_bottoms.push(page.margins.bottom);
+            /* Issue #71 — EFFECTIVE body extents: a band spilling past
+            its margin pushes the body edge (the paginator opened
+            cur_y at the intrusion); the zone gate must cover the
+            whole painted band, so mirror the same max() here. */
+            let header_h = page
+                .header
+                .as_ref()
+                .map_or(0.0, layout::HeaderFooterBox::content_height);
+            let footer_h = page
+                .footer
+                .as_ref()
+                .map_or(0.0, layout::HeaderFooterBox::content_height);
+            page_content_tops.push(page.margins.top.max(page.header_offset + header_h));
+            page_content_bottoms.push(
+                (page.size.height - page.margins.bottom)
+                    .min(page.size.height - page.footer_offset - footer_h),
+            );
             top_acc += page.size.height + gap;
         }
         let stats = RenderStats {
@@ -5529,6 +6055,8 @@ impl Engine {
             page_heights,
             page_margin_tops,
             page_margin_bottoms,
+            page_content_tops,
+            page_content_bottoms,
         };
 
         /* Vello path: encode the whole display list and present it over
@@ -5560,6 +6088,8 @@ impl Engine {
                 page_heights: stats.page_heights.clone(),
                 page_margin_tops: stats.page_margin_tops.clone(),
                 page_margin_bottoms: stats.page_margin_bottoms.clone(),
+                page_content_tops: stats.page_content_tops.clone(),
+                page_content_bottoms: stats.page_content_bottoms.clone(),
             };
             return Ok(stats);
         }
@@ -5616,6 +6146,8 @@ impl Engine {
             page_heights: stats.page_heights.clone(),
             page_margin_tops: stats.page_margin_tops.clone(),
             page_margin_bottoms: stats.page_margin_bottoms.clone(),
+            page_content_tops: stats.page_content_tops.clone(),
+            page_content_bottoms: stats.page_content_bottoms.clone(),
         };
         Ok(stats)
     }
@@ -5631,7 +6163,7 @@ impl Engine {
         in-progress IME composition. */
         /* `target_y: None` — PDF export is a full-document materialization,
         not a viewport paint. The cull budget would corrupt page count. */
-        let (pages, font_stack, _box_paths, _info) = match self.build_pages(1.0, false, None) {
+        let (mut pages, font_stack, _box_paths, _info) = match self.build_pages(1.0, false, None) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -5650,6 +6182,41 @@ impl Engine {
         let mut para_texts: Vec<&str> = Vec::new();
         for b in doc.blocks.iter() {
             walk_block_texts(b, &mut para_texts);
+        }
+        /* Issue #71 — band paragraphs join the SAME table: per
+        referenced part (headers rid-sorted, then footers — the
+        deterministic `for_each_referenced_story` order) append the
+        part's paragraph texts and stamp the matching ids onto every
+        page's band boxes, so band glyphs get real /ToUnicode
+        mappings. A part shared by many pages stamps the same ids on
+        every instance — same source text, correct by construction. */
+        let mut hf_bases: HashMap<(bool, String), u32> = HashMap::new();
+        doc.for_each_referenced_story(&mut |is_header, rid, blocks| {
+            hf_bases.insert((is_header, rid.to_string()), para_texts.len() as u32);
+            for b in blocks {
+                walk_block_texts(b, &mut para_texts);
+            }
+        });
+        for page in pages.iter_mut() {
+            for is_header in [true, false] {
+                let band = if is_header {
+                    page.header.as_mut()
+                } else {
+                    page.footer.as_mut()
+                };
+                let Some(band) = band else { continue };
+                let Some(rid) = band.source_rid.clone() else {
+                    continue;
+                };
+                let Some(&base) = hf_bases.get(&(is_header, rid)) else {
+                    continue;
+                };
+                let mut next = base;
+                band.for_each_paragraph_mut(&mut |p| {
+                    p.source_paragraph_id = next;
+                    next += 1;
+                });
+            }
         }
         let mut bytes: Vec<u8> = Vec::new();
         if let Err(e) =
@@ -5719,6 +6286,8 @@ impl Engine {
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: dims.page_margin_tops,
             page_margin_bottoms: dims.page_margin_bottoms,
+            page_content_tops: dims.page_content_tops,
+            page_content_bottoms: dims.page_content_bottoms,
         }
     }
 
@@ -5777,6 +6346,8 @@ impl Engine {
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: stats.page_margin_tops,
             page_margin_bottoms: stats.page_margin_bottoms,
+            page_content_tops: stats.page_content_tops,
+            page_content_bottoms: stats.page_content_bottoms,
         }
     }
 
@@ -5791,9 +6362,10 @@ impl Engine {
         !matches!(self.active_story, StoryTarget::Body)
     }
 
-    /// The active story's paragraphs (cloned), or `None` in body mode /
-    /// when the part vanished (undo past materialize-on-enter).
-    fn story_paras(&self) -> Option<Vec<engine::Paragraph>> {
+    /// The active story's blocks (cloned), or `None` in body mode /
+    /// when the part vanished (undo past materialize-on-enter). Issue
+    /// #72 widened parts to `Vec<Block>` — tables ride along.
+    fn story_blocks(&self) -> Option<Vec<engine::Block>> {
         let doc = self.undo.current();
         match &self.active_story {
             StoryTarget::Body => None,
@@ -5809,9 +6381,9 @@ impl Engine {
     /// resolution read them); media / footnotes / comments stay empty
     /// (cheap + irrelevant — story commands touching them are gated).
     fn story_doc(&self) -> Option<DocumentTree> {
-        let paras = self.story_paras()?;
+        let blocks = self.story_blocks()?;
         let real = self.undo.current();
-        let mut tree = DocumentTree::from_rich_paragraphs(paras);
+        let mut tree = DocumentTree::from_blocks(blocks);
         tree.styles = real.styles.clone();
         tree.style_defaults = real.style_defaults.clone();
         tree.style_run_defaults = real.style_run_defaults.clone();
@@ -5837,21 +6409,56 @@ impl Engine {
         self.with_selection_doc(|d| d.clone())
     }
 
-    /// Wire shape of the active story for `SelectionChanged`.
+    /// Wire shape of the active story for `SelectionChanged`. `linked`
+    /// and `section_index` are RE-DERIVED on every read (issue #70) —
+    /// unlink/relink/undo all change them without touching the
+    /// StoryTarget, and the UI toggle must always reflect storage.
     fn bridge_story_ref(&self) -> Option<bridge::BridgeStoryRef> {
-        match &self.active_story {
-            StoryTarget::Body => None,
-            StoryTarget::Header { rid, page, .. } => Some(bridge::BridgeStoryRef {
-                area: bridge::HeaderFooterArea::Header,
-                rid: rid.clone(),
-                page: *page,
-            }),
-            StoryTarget::Footer { rid, page, .. } => Some(bridge::BridgeStoryRef {
-                area: bridge::HeaderFooterArea::Footer,
-                rid: rid.clone(),
-                page: *page,
-            }),
-        }
+        let (area, rid, page, section_block, role) = match &self.active_story {
+            StoryTarget::Body => return None,
+            StoryTarget::Header {
+                rid,
+                page,
+                section_block,
+                role,
+            } => (
+                bridge::HeaderFooterArea::Header,
+                rid.clone(),
+                *page,
+                *section_block,
+                *role,
+            ),
+            StoryTarget::Footer {
+                rid,
+                page,
+                section_block,
+                role,
+            } => (
+                bridge::HeaderFooterArea::Footer,
+                rid.clone(),
+                *page,
+                *section_block,
+                *role,
+            ),
+        };
+        let is_header = matches!(area, bridge::HeaderFooterArea::Header);
+        let section_index = self.section_index_of_block(section_block);
+        let linked = self
+            .resolved_hf_rid(section_index, is_header, role)
+            .map(|(_, linked)| linked)
+            .unwrap_or(false);
+        Some(bridge::BridgeStoryRef {
+            area,
+            rid,
+            page,
+            role: match role {
+                engine::HeaderFooterRole::Default => bridge::BridgeHfRole::Default,
+                engine::HeaderFooterRole::First => bridge::BridgeHfRole::First,
+                engine::HeaderFooterRole::Even => bridge::BridgeHfRole::Even,
+            },
+            linked,
+            section_index: section_index as u32,
+        })
     }
 
     /// Story-mode line geometry: the anchor page's band paragraphs
@@ -5890,18 +6497,35 @@ impl Engine {
             } else {
                 page.footer_band_top()
             };
-        for (i, para_box) in band.paragraphs.iter().enumerate() {
-            collect_paragraph_line_geom(
-                para_box,
-                content_x,
-                band_top,
-                content_x,
-                content_w,
-                &BridgeBlockPath {
-                    steps: vec![BridgePathStep::Block { idx: i as u32 }],
-                },
-                &mut geom,
-            );
+        for (i, band_block) in band.blocks.iter().enumerate() {
+            match band_block {
+                LayoutBlock::Paragraph(para_box) => {
+                    collect_paragraph_line_geom(
+                        para_box,
+                        content_x,
+                        band_top,
+                        content_x,
+                        content_w,
+                        &BridgeBlockPath {
+                            steps: vec![BridgePathStep::Block { idx: i as u32 }],
+                        },
+                        &mut geom,
+                    );
+                }
+                /* Issue #72 — a table inside the band hit-tests with the
+                body's own table geometry walk; paths come out story-
+                rooted (`[Block(i), Cell{r,c}, Block(p)]`) because `i`
+                is the band-local block index. */
+                LayoutBlock::Table(table_box) => {
+                    collect_table_line_geom(
+                        table_box,
+                        i as u32,
+                        content_x + table_box.origin.x,
+                        band_top + table_box.origin.y,
+                        &mut geom,
+                    );
+                }
+            }
         }
         Ok(geom)
     }
@@ -6309,8 +6933,11 @@ impl Engine {
         }
         /* Cell address = first two steps of the hit's path
         (`Block(t_idx)` + `Cell{r,c}`); `cell_content_span` builds the
-        first-paragraph → last-paragraph span. */
-        let Some((start, end)) = cell_content_span(self.undo.current(), &hit.path) else {
+        first-paragraph → last-paragraph span. Issue #72 — read through
+        `selection_doc()` so a cell hit inside a story resolves against
+        the story tree, not the body. */
+        let doc = self.selection_doc();
+        let Some((start, end)) = cell_content_span(&doc, &hit.path) else {
             return self.do_select_all();
         };
         self.pending_format = None;
@@ -6908,6 +7535,9 @@ impl Engine {
             column_gutter_pt: section.columns.gutter_pt,
             section_index,
             section_count,
+            /* Issue #74 — checkbox state for the story-mode toolbar. */
+            title_pg: section.title_pg,
+            even_odd_headers: self.undo.current().settings.even_and_odd_headers,
         })
     }
 
@@ -7274,8 +7904,10 @@ impl Engine {
     =========================================================== */
 
     /// Merge a mutated story tree back into the real document: extract
-    /// its paragraphs into the active part (marking it dirty for the
+    /// its blocks into the active part (marking it dirty for the
     /// writer), push ONE undo snapshot, collapse the caret, repaint.
+    /// Issue #72 — blocks travel whole: a table inserted in the story
+    /// tree lands in the part instead of being silently dropped.
     fn commit_story_edit(&mut self, mutated: &DocumentTree, caret: BridgeLogicalPos) -> Event {
         let (rid, is_header) = match &self.active_story {
             StoryTarget::Header { rid, .. } => (rid.clone(), true),
@@ -7286,21 +7918,19 @@ impl Engine {
                 };
             }
         };
-        let mut paras: Vec<engine::Paragraph> = mutated
-            .blocks
-            .iter()
-            .filter_map(|b| b.as_paragraph().cloned())
-            .collect();
-        if paras.is_empty() {
+        let mut blocks: Vec<engine::Block> = mutated.blocks.iter().cloned().collect();
+        if blocks.is_empty() {
             /* The band always keeps one paragraph so the caret has a
             home and the part stays a valid `<w:hdr>/<w:ftr>`. */
-            paras.push(engine::Paragraph::default());
+            blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
         }
         let real = self.undo.current();
+        /* `with_updated_*_part` strips any stray `section_end` marker —
+        a part can never masquerade as a section-boundary carrier. */
         let new_real = if is_header {
-            real.with_updated_header_part(&rid, paras)
+            real.with_updated_header_part(&rid, blocks)
         } else {
-            real.with_updated_footer_part(&rid, paras)
+            real.with_updated_footer_part(&rid, blocks)
         };
         self.undo.push(new_real);
         let caret = self.with_selection_doc(|d| clamp_pos(d, caret));
@@ -7463,19 +8093,15 @@ impl Engine {
             StoryTarget::Footer { rid, .. } => (rid.clone(), false),
             StoryTarget::Body => unreachable!("guarded by caller"),
         };
-        let mut paras: Vec<engine::Paragraph> = new_doc
-            .blocks
-            .iter()
-            .filter_map(|b| b.as_paragraph().cloned())
-            .collect();
-        if paras.is_empty() {
-            paras.push(engine::Paragraph::default());
+        let mut blocks: Vec<engine::Block> = new_doc.blocks.iter().cloned().collect();
+        if blocks.is_empty() {
+            blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
         }
         let real = self.undo.current();
         let new_real = if is_header {
-            real.with_updated_header_part(&rid, paras)
+            real.with_updated_header_part(&rid, blocks)
         } else {
-            real.with_updated_footer_part(&rid, paras)
+            real.with_updated_footer_part(&rid, blocks)
         };
         self.undo.push(new_real);
         self.selection = Some(SelectionState {
@@ -7543,18 +8169,75 @@ impl Engine {
         self.caret_affinity = CaretAffinity::default();
     }
 
-    /// `Command::EnterHeaderFooter` (Phase 3, #39) — activate story
-    /// editing for the section owning page `page`. Guarantees the
-    /// section OWNS a private part before the caret lands:
+    /// Issue #70 — 0-based index (into `effective_sections`) of the
+    /// section covering top-level `block`.
+    fn section_index_of_block(&self, block: u32) -> usize {
+        self.with_cached_sections(|sections| {
+            sections
+                .iter()
+                .position(|s| block >= s.start_block && block < s.end_block)
+                .unwrap_or(sections.len().saturating_sub(1))
+        })
+    }
+
+    /// Issue #70 — the §17.10.3-resolved rid for `(section_idx, area,
+    /// role)`, plus whether it is INHERITED (`linked`: the section's
+    /// own slot is empty). `None` = blank band, nothing anywhere in
+    /// the chain.
+    fn resolved_hf_rid(
+        &self,
+        section_idx: usize,
+        is_header: bool,
+        role: engine::HeaderFooterRole,
+    ) -> Option<(String, bool)> {
+        self.with_cached_sections(|sections| {
+            let resolved = engine::resolve_hf_inheritance(sections);
+            let entry = resolved.get(section_idx)?;
+            let refs = if is_header { &entry.0 } else { &entry.1 };
+            let rid = refs.resolve(role)?.to_string();
+            let own = sections.get(section_idx).map(|s| {
+                let r = if is_header {
+                    &s.header_refs
+                } else {
+                    &s.footer_refs
+                };
+                r.resolve(role).is_some()
+            });
+            Some((rid, !own.unwrap_or(false)))
+        })
+    }
+
+    /// The role page `page` displays, from the layout snapshot's
+    /// per-page stamp (falls back to `Default` past the laid tail).
+    fn page_hf_role(&self, page: u32) -> engine::HeaderFooterRole {
+        let snap_cell = self.layout_snapshot.borrow();
+        let role = snap_cell
+            .as_ref()
+            .and_then(|snap| snap.pages.get(page as usize))
+            .map(|p| p.hf_role)
+            .unwrap_or(layout::HeaderRole::Default);
+        match role {
+            layout::HeaderRole::Default => engine::HeaderFooterRole::Default,
+            layout::HeaderRole::First => engine::HeaderFooterRole::First,
+            layout::HeaderRole::Even => engine::HeaderFooterRole::Even,
+        }
+    }
+
+    /// `Command::EnterHeaderFooter` (Phase 3 #39, reworked for #70) —
+    /// activate story editing for the band page `page` DISPLAYS:
     ///
-    /// - no part referenced → MATERIALIZE an empty one (Word also
-    ///   creates the part + dirties the document on header entry);
-    /// - referenced part shared with another section → FORK a copy for
-    ///   this section only (the v1 stand-in for Word's Link-to-Previous
-    ///   toggle; documented deviation, tracked as a follow-up).
-    ///
-    /// Either mutation is ONE undo entry; entering an already-private
-    /// part mutates nothing.
+    /// - the page's role (Default / First / Even, from the layout
+    ///   snapshot) picks the slot;
+    /// - the (section, area, role) reference resolves through
+    ///   §17.10.3 inheritance; a resolved part — own OR inherited —
+    ///   is edited IN PLACE with NO mutation and NO undo push (Word's
+    ///   linked editing: the change shows on every page resolving to
+    ///   the part). `SetHeaderFooterLink` forks explicitly;
+    /// - only when NO section in the chain has a part does the engine
+    ///   MATERIALIZE an empty one, attached to the EDITED section
+    ///   (design review M1 — attaching at the chain root planted
+    ///   content on a structurally unrelated section and mismatched
+    ///   Word's titlePg materialization), as ONE undo entry.
     fn do_enter_header_footer(&mut self, page: u32, area: bridge::HeaderFooterArea) -> Event {
         let is_header = matches!(area, bridge::HeaderFooterArea::Header);
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
@@ -7577,58 +8260,27 @@ impl Engine {
                 .and_then(|p| p.last_block_index())
                 .unwrap_or(0)
         };
+        let role = self.page_hf_role(page);
+        let section_idx = self.section_index_of_block(section_block);
         let section = self.section_for_block_cached(section_block);
-        let refs = if is_header {
-            &section.header_refs
-        } else {
-            &section.footer_refs
-        };
-        let existing = refs.default.clone();
-        let shared = existing.as_ref().is_some_and(|rid| {
-            self.with_cached_sections(|sections| {
-                sections
-                    .iter()
-                    .filter(|s| {
-                        let r = if is_header {
-                            &s.header_refs
-                        } else {
-                            &s.footer_refs
-                        };
-                        [&r.default, &r.first, &r.even]
-                            .into_iter()
-                            .any(|slot| slot.as_deref() == Some(rid.as_str()))
-                    })
-                    .count()
-                    > 1
-            })
-        });
-        let doc = self.undo.current();
-        let sect_pos = EnginePos {
-            path: EngineBlockPath::top(section.start_block),
-            offset: 0,
-        };
-        let rid = match (existing, shared) {
-            (Some(rid), false) => rid,
-            (maybe_shared, _) => {
-                /* Materialize (None) or fork (Some + shared). */
+        let rid = match self.resolved_hf_rid(section_idx, is_header, role) {
+            Some((rid, _linked)) => rid,
+            None => {
+                /* Blank chain → materialize on the edited section. */
+                let doc = self.undo.current();
                 let new_rid = doc.fresh_hf_rid();
-                let seed = maybe_shared
-                    .as_ref()
-                    .and_then(|old| {
-                        if is_header {
-                            doc.headers.get(old).cloned()
-                        } else {
-                            doc.footers.get(old).cloned()
-                        }
-                    })
-                    .unwrap_or_else(|| vec![engine::Paragraph::default()]);
+                let seed = vec![engine::Block::Paragraph(engine::Paragraph::default())];
                 let with_part = if is_header {
                     doc.with_updated_header_part(&new_rid, seed)
                 } else {
                     doc.with_updated_footer_part(&new_rid, seed)
                 };
+                let sect_pos = EnginePos {
+                    path: EngineBlockPath::top(section.start_block),
+                    offset: 0,
+                };
                 let with_ref =
-                    with_part.set_section_hf_default_ref_at(sect_pos, is_header, &new_rid);
+                    with_part.set_section_hf_ref_at(sect_pos, is_header, role, Some(&new_rid));
                 self.undo.push(with_ref);
                 self.dirty.invalidate(full_page_rect(self.scale()));
                 new_rid
@@ -7640,17 +8292,33 @@ impl Engine {
                 rid,
                 page,
                 section_block,
+                role,
             }
         } else {
             StoryTarget::Footer {
                 rid,
                 page,
                 section_block,
+                role,
             }
         };
+        /* Design review B6 — a table-led part must park the caret on a
+        real paragraph INSIDE the table, never the bare table path. */
+        let home = self
+            .story_doc()
+            .as_ref()
+            .and_then(|d| d.path_to_first_paragraph_deep())
+            .map(engine_to_bridge_path)
+            .unwrap_or_else(|| BridgeBlockPath {
+                steps: vec![BridgePathStep::Block { idx: 0 }],
+            });
+        let home = BridgeLogicalPos {
+            path: home,
+            offset: 0,
+        };
         self.selection = Some(SelectionState {
-            anchor: bpos_top(0, 0),
-            caret: bpos_top(0, 0),
+            anchor: home.clone(),
+            caret: home,
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
@@ -7677,6 +8345,316 @@ impl Engine {
         }
         self.exit_story_to_body();
         self.announce(AnnouncementPriority::Polite, "Returned to document body");
+        self.selection_changed()
+    }
+
+    /// `Command::SetHeaderFooterLink` (issue #70) — Word's "Link to
+    /// Previous" toggle for the active story's (section, area, role).
+    fn do_set_header_footer_link(&mut self, linked: bool) -> Event {
+        let (is_header, page, section_block, role, cur_rid) = match &self.active_story {
+            StoryTarget::Body => {
+                return Event::Error {
+                    message: "SetHeaderFooterLink: no header or footer is being edited".into(),
+                };
+            }
+            StoryTarget::Header {
+                rid,
+                page,
+                section_block,
+                role,
+            } => (true, *page, *section_block, *role, rid.clone()),
+            StoryTarget::Footer {
+                rid,
+                page,
+                section_block,
+                role,
+            } => (false, *page, *section_block, *role, rid.clone()),
+        };
+        let section_idx = self.section_index_of_block(section_block);
+        let section = self.section_for_block_cached(section_block);
+        let sect_pos = EnginePos {
+            path: EngineBlockPath::top(section.start_block),
+            offset: 0,
+        };
+        if !linked {
+            /* UNLINK — fork the resolved content into a private part
+            owned by this section. No-op when already owned. */
+            let already_owned = self
+                .resolved_hf_rid(section_idx, is_header, role)
+                .map(|(_, inherited)| !inherited)
+                .unwrap_or(false);
+            if already_owned {
+                return self.selection_changed();
+            }
+            let doc = self.undo.current();
+            let seed = if is_header {
+                doc.headers.get(&cur_rid).cloned()
+            } else {
+                doc.footers.get(&cur_rid).cloned()
+            }
+            .unwrap_or_else(|| vec![engine::Block::Paragraph(engine::Paragraph::default())]);
+            let new_rid = doc.fresh_hf_rid();
+            let with_part = if is_header {
+                doc.with_updated_header_part(&new_rid, seed)
+            } else {
+                doc.with_updated_footer_part(&new_rid, seed)
+            };
+            let with_ref =
+                with_part.set_section_hf_ref_at(sect_pos, is_header, role, Some(&new_rid));
+            self.undo.push(with_ref);
+            match &mut self.active_story {
+                StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
+                    *rid = new_rid;
+                }
+                StoryTarget::Body => {}
+            }
+            self.dirty.invalidate(full_page_rect(self.scale()));
+            self.announce(
+                AnnouncementPriority::Polite,
+                "Unlinked from the previous section",
+            );
+        } else {
+            /* RELINK — clear the own slot; the section inherits again. */
+            if section_idx == 0 {
+                return Event::Error {
+                    message: "SetHeaderFooterLink: the first section cannot link to previous"
+                        .into(),
+                };
+            }
+            let doc = self.undo.current();
+            let cleared = doc.set_section_hf_ref_at(sect_pos, is_header, role, None);
+            self.undo.push(cleared);
+            self.dirty.invalidate(full_page_rect(self.scale()));
+            match self.resolved_hf_rid(section_idx, is_header, role) {
+                Some((resolved, _)) => {
+                    match &mut self.active_story {
+                        StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
+                            *rid = resolved;
+                        }
+                        StoryTarget::Body => {}
+                    }
+                    /* The inherited part may be shorter — clamp. */
+                    if let Some(sel) = self.selection.clone() {
+                        let clamped = self.with_selection_doc(|d| SelectionState {
+                            anchor: clamp_pos(d, sel.anchor),
+                            caret: clamp_pos(d, sel.caret),
+                            ideal_x: None,
+                            kind: sel.kind,
+                        });
+                        self.selection = Some(clamped);
+                    }
+                    self.announce(
+                        AnnouncementPriority::Polite,
+                        "Linked to the previous section",
+                    );
+                }
+                None => {
+                    /* Nothing anywhere in the chain — the band is now
+                    blank; there is nothing to edit. */
+                    self.exit_story_to_body();
+                    self.announce(
+                        AnnouncementPriority::Polite,
+                        "Linked to the previous section — the band is empty",
+                    );
+                }
+            }
+            let _ = page; // anchor page unchanged in both branches
+        }
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::SetTitlePage` (issue #74) — `<w:titlePg/>` on the
+    /// covering section (the active story's when one is open, else the
+    /// caret's). In story mode the shown band may change role —
+    /// re-anchor the story exactly as a fresh enter would.
+    fn do_set_title_page(&mut self, enabled: bool) -> Event {
+        let (anchor_block, story) = self.section_anchor_for_toggles();
+        let pos = EnginePos {
+            path: EngineBlockPath::top(anchor_block),
+            offset: 0,
+        };
+        let doc = self.undo.current().set_section_title_pg_at(pos, enabled);
+        self.undo.push(doc);
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Some((page, area)) = story {
+            /* Re-run enter: the anchor page's role may have flipped
+            between Default and First. May materialize (second undo
+            entry) — accepted, documented, tested. */
+            return self.do_enter_header_footer(page, area);
+        }
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// `Command::SetEvenOddHeaders` (issue #74) — document-wide
+    /// `<w:evenAndOddHeaders/>`. Same story re-anchor rule as
+    /// [`Self::do_set_title_page`].
+    fn do_set_even_odd_headers(&mut self, enabled: bool) -> Event {
+        let (_, story) = self.section_anchor_for_toggles();
+        let doc = self.undo.current().with_even_odd_headers(enabled);
+        self.undo.push(doc);
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Some((page, area)) = story {
+            return self.do_enter_header_footer(page, area);
+        }
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
+    /// The section-toggle anchor: the active story's section block +
+    /// its (page, area) for re-anchoring, or the caret's block in body
+    /// mode.
+    fn section_anchor_for_toggles(&self) -> (u32, Option<(u32, bridge::HeaderFooterArea)>) {
+        match &self.active_story {
+            StoryTarget::Header {
+                page,
+                section_block,
+                ..
+            } => (
+                *section_block,
+                Some((*page, bridge::HeaderFooterArea::Header)),
+            ),
+            StoryTarget::Footer {
+                page,
+                section_block,
+                ..
+            } => (
+                *section_block,
+                Some((*page, bridge::HeaderFooterArea::Footer)),
+            ),
+            StoryTarget::Body => {
+                let block = self
+                    .selection
+                    .as_ref()
+                    .and_then(|s| bridge_to_engine_path(s.caret.path.clone()).last_block_index())
+                    .unwrap_or(0);
+                (block, None)
+            }
+        }
+    }
+
+    /// `Command::InsertField` (issue #43) — author a PAGE / NUMPAGES /
+    /// DATE field at the caret. Works in the body AND in stories (a
+    /// page-number footer is the primary use); rejected inside table
+    /// cells (the cell reader cannot round-trip fields yet).
+    fn do_insert_field(&mut self, at: BridgeLogicalPos, kind: bridge::FieldKind) -> Event {
+        if at.path.steps.len() != 1 {
+            return Event::Error {
+                message: "InsertField: fields inside table cells aren't supported yet".into(),
+            };
+        }
+        let (instruction, cached) = match kind {
+            bridge::FieldKind::Page => ("PAGE".to_string(), "1".to_string()),
+            bridge::FieldKind::NumPages => ("NUMPAGES".to_string(), "1".to_string()),
+            bridge::FieldKind::Date => (
+                "DATE \\@ \"M/d/yyyy\"".to_string(),
+                match self.render_date {
+                    Some((y, m, d)) => engine::render_date_picture("M/d/yyyy", y, m, d),
+                    None => "1/1/2026".to_string(),
+                },
+            ),
+        };
+        if self.story_active() {
+            let Some(temp) = self.story_doc() else {
+                return self.story_vanished();
+            };
+            let new_doc = temp.insert_field_at(to_engine_pos(at.clone()), &instruction, &cached);
+            let caret = BridgeLogicalPos {
+                path: at.path,
+                offset: at.offset + cached.len() as u32,
+            };
+            return self.commit_story_edit(&new_doc, caret);
+        }
+        let new_doc =
+            self.undo
+                .current()
+                .insert_field_at(to_engine_pos(at.clone()), &instruction, &cached);
+        let caret = BridgeLogicalPos {
+            path: at.path,
+            offset: at.offset + cached.len() as u32,
+        };
+        self.invalidate_layout_snapshot();
+        self.commit_edit(new_doc, caret)
+    }
+
+    /// Issue #72 — the generic story transaction: run a pure
+    /// `DocumentTree` mutation against the synthetic story tree, carry
+    /// doc-wide resources back (numbering always; styles monotonic-OR
+    /// per design review B5), merge the blocks into the part, ONE undo
+    /// push. `preserve_selection` keeps the current range (formatting-
+    /// style commands); `false` collapses to `caret`.
+    fn story_mutate(
+        &mut self,
+        f: impl FnOnce(&DocumentTree) -> DocumentTree,
+        caret: BridgeLogicalPos,
+        preserve_selection: bool,
+    ) -> Event {
+        let (rid, is_header) = match &self.active_story {
+            StoryTarget::Header { rid, .. } => (rid.clone(), true),
+            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+            StoryTarget::Body => {
+                return Event::Error {
+                    message: "story_mutate outside a story".into(),
+                };
+            }
+        };
+        let Some(temp) = self.story_doc() else {
+            return self.story_vanished();
+        };
+        let mutated = f(&temp);
+        let mut blocks: Vec<engine::Block> = mutated.blocks.iter().cloned().collect();
+        if blocks.is_empty() {
+            blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
+        }
+        let real = self.undo.current();
+        let mut new_real = if is_header {
+            real.with_updated_header_part(&rid, blocks)
+        } else {
+            real.with_updated_footer_part(&rid, blocks)
+        };
+        /* Carry back doc-wide resources the mutation may have touched.
+        numbering: ToggleList mints num ids on the story tree's CLONE —
+        losing them dangles every new list_item (#72's documented
+        hazard). styles/styles_dirty: monotonic OR — a plain overwrite
+        would un-dirty an earlier body ModifyStyle and silently drop it
+        from the next save (design review B5). */
+        new_real.numbering = mutated.numbering.clone();
+        new_real.styles = mutated.styles.clone();
+        new_real.styles_dirty |= mutated.styles_dirty;
+        self.undo.push(new_real);
+        if preserve_selection {
+            if let Some(sel) = self.selection.clone() {
+                let clamped = self.with_selection_doc(|d| SelectionState {
+                    anchor: clamp_pos(d, sel.anchor),
+                    caret: clamp_pos(d, sel.caret),
+                    ideal_x: None,
+                    kind: sel.kind,
+                });
+                self.selection = Some(clamped);
+            }
+        } else {
+            let caret = self.with_selection_doc(|d| clamp_pos(d, caret));
+            self.caret_affinity = CaretAffinity::default();
+            self.selection = Some(SelectionState {
+                anchor: caret.clone(),
+                caret,
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            });
+        }
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
         self.selection_changed()
     }
 
@@ -8066,13 +9044,29 @@ impl Engine {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
         };
-        self.undo
-            .current()
+        let doc = self.undo.current();
+        let mut nodes: Vec<A11yNode> = doc
             .blocks
             .iter()
             .enumerate()
             .map(|(block_index, b)| build_a11y_block(b, block_index as u32, direction))
-            .collect()
+            .collect();
+        /* Issue #73 — mirror every REFERENCED header/footer part so
+        screen readers can reach band text (deduped by rid, stable
+        body → headers → footers order; the delta differ handles the
+        rest). */
+        doc.for_each_referenced_story(&mut |is_header, rid, blocks| {
+            nodes.push(A11yNode::Story(bridge::A11yStory {
+                header: is_header,
+                rid: rid.to_string(),
+                nodes: blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| build_a11y_block(b, i as u32, direction))
+                    .collect(),
+            }));
+        });
+        nodes
     }
 
     /// Build an incremental accessibility delta (Backlog #10). The first call
@@ -8111,7 +9105,10 @@ impl Engine {
         if start == end {
             return empty;
         }
-        let doc = self.undo.current();
+        /* Issue #72 — read through `selection_doc()` so a copy issued
+        from inside a story serializes the story's paragraphs (not the
+        body's). */
+        let doc = self.selection_doc();
         let estart = to_engine_pos(start);
         let eend = to_engine_pos(end);
         let plain = doc.text_range(estart.clone(), eend.clone());
@@ -8212,6 +9209,21 @@ impl Engine {
         range: BridgeLogicalRange,
         align: BridgeAlignment,
     ) -> Event {
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            return self.story_mutate(
+                move |d| {
+                    d.set_alignment(
+                        to_engine_pos(start),
+                        to_engine_pos(end),
+                        engine_align(align),
+                    )
+                },
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_alignment(
             to_engine_pos(start.clone()),
@@ -8250,6 +9262,15 @@ impl Engine {
             Direction::Ltr => engine::TextDirection::Ltr,
             Direction::Rtl => engine::TextDirection::Rtl,
         };
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            return self.story_mutate(
+                move |d| d.set_direction(to_engine_pos(start), to_engine_pos(end), engine_dir),
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_direction(
             to_engine_pos(start.clone()),
@@ -8438,6 +9459,23 @@ impl Engine {
         end_pt: f32,
         first_line_pt: f32,
     ) -> Event {
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            return self.story_mutate(
+                move |d| {
+                    d.set_paragraph_indent(
+                        to_engine_pos(start),
+                        to_engine_pos(end),
+                        start_pt,
+                        end_pt,
+                        first_line_pt,
+                    )
+                },
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_paragraph_indent(
             to_engine_pos(start),
@@ -8463,7 +9501,6 @@ impl Engine {
         range: BridgeLogicalRange,
         stops: Vec<bridge::BridgeTabStop>,
     ) -> Event {
-        let (start, end) = ordered(range.start, range.end);
         let engine_stops: Vec<engine::TabStop> = stops
             .into_iter()
             .map(|s| engine::TabStop {
@@ -8477,6 +9514,16 @@ impl Engine {
                 },
             })
             .collect();
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            return self.story_mutate(
+                move |d| d.set_tab_stops(to_engine_pos(start), to_engine_pos(end), engine_stops),
+                caret,
+                true,
+            );
+        }
+        let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_tab_stops(
             to_engine_pos(start),
             to_engine_pos(end),
@@ -8498,6 +9545,16 @@ impl Engine {
     /// `props` view from `style_cascade(style_id) ∪ direct_overrides`.
     /// Pre-existing direct edits survive.
     fn do_apply_style(&mut self, range: BridgeLogicalRange, style_id: Option<String>) -> Event {
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            let sid = style_id.clone();
+            return self.story_mutate(
+                move |d| d.set_paragraph_style(to_engine_pos(start), to_engine_pos(end), sid),
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_paragraph_style(
             to_engine_pos(start),
@@ -8603,6 +9660,15 @@ impl Engine {
 
     /// `Command::SetLineSpacing` (Sprint 6 UI Edition).
     fn do_set_line_spacing(&mut self, range: BridgeLogicalRange, multiplier: f32) -> Event {
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            return self.story_mutate(
+                move |d| d.set_line_spacing(to_engine_pos(start), to_engine_pos(end), multiplier),
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_line_spacing(
             to_engine_pos(start),
@@ -8625,6 +9691,15 @@ impl Engine {
         color: Option<Color>,
     ) -> Event {
         let target = color.map(|c| [c.r, c.g, c.b, c.a]);
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            return self.story_mutate(
+                move |d| d.set_paragraph_shading(to_engine_pos(start), to_engine_pos(end), target),
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_paragraph_shading(
             to_engine_pos(start),
@@ -8647,6 +9722,35 @@ impl Engine {
     ///   reuse existing AbstractNum / Num templates and never bloat
     ///   `numbering.xml`.
     fn do_toggle_list(&mut self, range: BridgeLogicalRange, kind: bridge::ListKind) -> Event {
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            /* Tuple return `(DocumentTree, &str)` doesn't fit
+            `story_mutate`'s `FnOnce(&DocumentTree) -> DocumentTree`
+            closure signature — match on `kind` and return just the
+            tree, dropping the announce-only label (story branches
+            skip `announce`). Each arm below is the identical pure-fn
+            call the body path makes. */
+            return self.story_mutate(
+                move |d| match kind {
+                    bridge::ListKind::Off => {
+                        d.clear_list_item_on_range(to_engine_pos(start), to_engine_pos(end))
+                    }
+                    bridge::ListKind::Bullet => d.toggle_list_on_range(
+                        to_engine_pos(start),
+                        to_engine_pos(end),
+                        engine::numbering::ListSynthesisKind::Bullet,
+                    ),
+                    bridge::ListKind::Number => d.toggle_list_on_range(
+                        to_engine_pos(start),
+                        to_engine_pos(end),
+                        engine::numbering::ListSynthesisKind::Number,
+                    ),
+                },
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let (new_doc, label) = match kind {
             bridge::ListKind::Off => {
@@ -8687,6 +9791,17 @@ impl Engine {
     /// promotes (`delta < 0`) the outline level of every list paragraph
     /// the range spans; a no-op on non-list paragraphs.
     fn do_change_list_level(&mut self, range: BridgeLogicalRange, delta: i8) -> Event {
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            return self.story_mutate(
+                move |d| {
+                    d.change_list_level_on_range(to_engine_pos(start), to_engine_pos(end), delta)
+                },
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().change_list_level_on_range(
             to_engine_pos(start),
@@ -9038,6 +10153,10 @@ impl Engine {
         let engine_kind = match kind {
             SectionBreakKind::NextPage => engine::SectionType::NextPage,
             SectionBreakKind::Continuous => engine::SectionType::Continuous,
+            /* Issue #74 — authorable now: the paginator emits a blank
+            filler page when the incoming page's parity mismatches. */
+            SectionBreakKind::EvenPage => engine::SectionType::EvenPage,
+            SectionBreakKind::OddPage => engine::SectionType::OddPage,
         };
         let new_doc = self
             .undo
@@ -9053,6 +10172,8 @@ impl Engine {
             match kind {
                 SectionBreakKind::NextPage => "Section break (next page) inserted",
                 SectionBreakKind::Continuous => "Section break (continuous) inserted",
+                SectionBreakKind::EvenPage => "Section break (even page) inserted",
+                SectionBreakKind::OddPage => "Section break (odd page) inserted",
             },
         );
         self.commit_edit(new_doc, caret)
@@ -9073,6 +10194,15 @@ impl Engine {
             && engine_borders.bottom.is_none()
             && engine_borders.right.is_none();
         let target = if cleared { None } else { Some(engine_borders) };
+        if self.story_active() {
+            let (start, end) = ordered(range.start, range.end);
+            let caret = start.clone();
+            return self.story_mutate(
+                move |d| d.set_paragraph_borders(to_engine_pos(start), to_engine_pos(end), target),
+                caret,
+                true,
+            );
+        }
         let (start, end) = ordered(range.start, range.end);
         let new_doc = self.undo.current().set_paragraph_borders(
             to_engine_pos(start),
@@ -9096,6 +10226,15 @@ impl Engine {
     =========================================================== */
 
     fn do_insert_table(&mut self, at: bridge::BlockPath, rows: u32, cols: u32) -> Event {
+        if self.story_active() {
+            let epath = bridge_to_engine_path(at);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(move |d| d.insert_table(epath, rows, cols), caret, false);
+        }
         let new_doc = self
             .undo
             .current()
@@ -9107,6 +10246,15 @@ impl Engine {
         self.push_table_edit(new_doc)
     }
     fn do_delete_table(&mut self, path: bridge::BlockPath) -> Event {
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(move |d| d.delete_table(epath), caret, false);
+        }
         let new_doc = self
             .undo
             .current()
@@ -9133,6 +10281,15 @@ impl Engine {
             bridge::InsertSide::Before => row as usize,
             bridge::InsertSide::After => (row as usize).saturating_add(1),
         };
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(move |d| d.insert_row(epath, at), caret, false);
+        }
         let new_doc = self
             .undo
             .current()
@@ -9141,6 +10298,15 @@ impl Engine {
         self.push_table_edit(new_doc)
     }
     fn do_delete_row(&mut self, path: bridge::BlockPath, row: u32) -> Event {
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(move |d| d.delete_row(epath, row), caret, false);
+        }
         let new_doc = self
             .undo
             .current()
@@ -9158,6 +10324,15 @@ impl Engine {
             bridge::InsertSide::Before => col as usize,
             bridge::InsertSide::After => (col as usize).saturating_add(1),
         };
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(move |d| d.insert_column(epath, at), caret, false);
+        }
         let new_doc = self
             .undo
             .current()
@@ -9166,6 +10341,15 @@ impl Engine {
         self.push_table_edit(new_doc)
     }
     fn do_delete_column(&mut self, path: bridge::BlockPath, col: u32) -> Event {
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(move |d| d.delete_column(epath, col), caret, false);
+        }
         let new_doc = self
             .undo
             .current()
@@ -9181,6 +10365,19 @@ impl Engine {
         to_row: u32,
         to_col: u32,
     ) -> Event {
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(
+                move |d| d.merge_cells(epath, from_row, from_col, to_row, to_col),
+                caret,
+                true,
+            );
+        }
         let new_doc = self.undo.current().merge_cells(
             bridge_to_engine_path(path),
             from_row,
@@ -9192,6 +10389,15 @@ impl Engine {
         self.push_table_edit(new_doc)
     }
     fn do_split_cell(&mut self, path: bridge::BlockPath, row: u32, col: u32) -> Event {
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(move |d| d.split_cell(epath, row, col), caret, false);
+        }
         let new_doc = self
             .undo
             .current()
@@ -9207,6 +10413,19 @@ impl Engine {
         color: Option<bridge::Color>,
     ) -> Event {
         let rgba = color.map(|c| [c.r, c.g, c.b, c.a]);
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(
+                move |d| d.set_cell_shading(epath, row, col, rgba),
+                caret,
+                true,
+            );
+        }
         let new_doc =
             self.undo
                 .current()
@@ -9228,6 +10447,20 @@ impl Engine {
         col: u32,
         borders: bridge::BridgeCellBorders,
     ) -> Event {
+        if self.story_active() {
+            let epath = bridge_to_engine_path(path);
+            let engine_borders = bridge_to_engine_borders(borders);
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(
+                move |d| d.set_cell_borders(epath, row, col, engine_borders),
+                caret,
+                true,
+            );
+        }
         let new_doc = self.undo.current().set_cell_borders(
             bridge_to_engine_path(path),
             row,
@@ -9384,6 +10617,10 @@ struct RenderStats {
     /// double-click zone gate.
     page_margin_tops: Vec<f32>,
     page_margin_bottoms: Vec<f32>,
+    /// Issue #71 — per-page effective body extents (device px,
+    /// page-local); the zone gate's truth under band intrusion.
+    page_content_tops: Vec<f32>,
+    page_content_bottoms: Vec<f32>,
 }
 
 #[cfg(test)]
@@ -9412,6 +10649,7 @@ mod tests {
             sections_memo: RefCell::new(None),
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
+            render_date: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -10151,6 +11389,7 @@ mod tests {
             sections_memo: RefCell::new(None),
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
+            render_date: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -10201,6 +11440,7 @@ mod tests {
             sections_memo: RefCell::new(None),
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
+            render_date: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -10242,6 +11482,7 @@ mod tests {
             sections_memo: RefCell::new(None),
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
+            render_date: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -10360,6 +11601,7 @@ mod tests {
             sections_memo: RefCell::new(None),
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
+            render_date: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -10895,6 +12137,7 @@ mod tests {
                 sections_memo: RefCell::new(None),
                 active_story: StoryTarget::Body,
                 stashed_body_selection: None,
+                render_date: None,
                 a11y_cache: None,
                 image_cache: HashMap::new(),
                 last_paint_dims: LastPaintDims::default(),
@@ -11711,7 +12954,7 @@ mod tests {
         let evt = engine.do_insert_text_interactive(bpos_top(0, 0), "Header A".into());
         assert!(matches!(evt, Event::SelectionChanged { .. }));
         let doc = engine.undo.current();
-        assert_eq!(doc.headers["ngeHf1"][0].text, "Header A");
+        assert_eq!(hf_text(&doc.headers["ngeHf1"], 0), "Header A");
         assert_eq!(
             doc.paragraph_text(0),
             Some("body text"),
@@ -11727,8 +12970,10 @@ mod tests {
 
     #[test]
     fn header_a_header_b_epic_scenario() {
-        /* The Phase 3 validation core: section break → Header A on
-        page 1, Header B on page 2, independent parts. */
+        /* The epic validation core, issue #70 semantics: section break
+        → Header A typed on page 1 → page 2 INHERITS it (linked, same
+        rid — Word's "Same as Previous") → explicit unlink forks →
+        Header B diverges. */
         let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
         let evt = engine.do_insert_section_break(bpos_top(0, 5), SectionBreakKind::NextPage);
         assert!(matches!(evt, Event::SelectionChanged { .. }));
@@ -11746,14 +12991,38 @@ mod tests {
         else {
             panic!("expected story mode on page 1, got {evt:?}");
         };
-        assert_ne!(story.rid, "ngeHf1", "section 2 owns a DIFFERENT part");
+        assert_eq!(
+            story.rid, "ngeHf1",
+            "section 2 is born linked — it resolves section 1's part"
+        );
+        assert!(story.linked, "the wire flag reports Same-as-Previous");
+        assert_eq!(story.section_index, 1);
+
+        /* Unlink → private fork seeded with the shared content. */
+        let evt = engine.do_set_header_footer_link(false);
+        let Event::SelectionChanged {
+            editing_story: Some(story),
+            ..
+        } = &evt
+        else {
+            panic!("expected story mode after unlink, got {evt:?}");
+        };
+        assert_ne!(story.rid, "ngeHf1", "unlink forks a private part");
+        assert!(!story.linked);
         let rid_b = story.rid.clone();
+        assert_eq!(
+            hf_text(&engine.undo.current().headers[&rid_b], 0),
+            "Header A",
+            "fork seeds from the resolved content"
+        );
+        /* Replace the seeded text with Header B. */
+        engine.do_select_all();
         engine.do_insert_text_interactive(bpos_top(0, 0), "Header B".into());
         engine.do_exit_header_footer();
 
         let doc = engine.undo.current();
-        assert_eq!(doc.headers["ngeHf1"][0].text, "Header A");
-        assert_eq!(doc.headers[&rid_b][0].text, "Header B");
+        assert_eq!(hf_text(&doc.headers["ngeHf1"], 0), "Header A");
+        assert_eq!(hf_text(&doc.headers[&rid_b], 0), "Header B");
         let sections = doc.effective_sections();
         assert_eq!(sections.len(), 2);
         assert_eq!(
@@ -11778,15 +13047,17 @@ mod tests {
     }
 
     #[test]
-    fn entering_a_shared_header_forks_it() {
-        /* Header FIRST, then break (which copies refs) → both sections
-        share one part. Entering page 2's header must fork a private
-        copy seeded with the shared content, leaving section 1 alone. */
+    fn entering_a_linked_header_edits_the_shared_part() {
+        /* Issue #70 FINAL semantics (replaces the v1 fork-on-enter
+        pin): entering a linked section's header edits the RESOLVED
+        part in place — the change shows on both sections; no fork,
+        no undo push on enter. */
         let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
         engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
         engine.do_insert_text_interactive(bpos_top(0, 0), "Shared".into());
         engine.do_exit_header_footer();
         engine.do_insert_section_break(bpos_top(0, 5), SectionBreakKind::NextPage);
+        let depth_before = engine.undo.depth();
 
         let evt = engine.do_enter_header_footer(1, bridge::HeaderFooterArea::Header);
         let Event::SelectionChanged {
@@ -11796,26 +13067,55 @@ mod tests {
         else {
             panic!("expected story mode, got {evt:?}");
         };
-        assert_ne!(story.rid, "ngeHf1", "shared part must fork on enter");
-        let doc = engine.undo.current();
+        assert_eq!(story.rid, "ngeHf1", "linked enter resolves the shared part");
+        assert!(story.linked);
         assert_eq!(
-            doc.headers[&story.rid][0].text, "Shared",
-            "fork seeds from the shared content"
+            engine.undo.depth(),
+            depth_before,
+            "a linked enter is a pure mode switch — no undo push"
         );
-        /* Edit the fork (story caret parked at the band start by
-        enter — move it to the end first); the original stays. */
+
+        /* Typing edits the SHARED part: section 1's display changes
+        too (same rid). */
         engine.selection = Some(SelectionState {
             anchor: bpos_top(0, 6),
             caret: bpos_top(0, 6),
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
-        engine.do_insert_text_interactive(bpos_top(0, 6), " B".into());
+        engine.do_insert_text_interactive(bpos_top(0, 6), " Everywhere".into());
         let doc = engine.undo.current();
-        assert_eq!(doc.headers[&story.rid][0].text, "Shared B");
-        assert_eq!(doc.headers["ngeHf1"][0].text, "Shared");
-    }
+        assert_eq!(hf_text(&doc.headers["ngeHf1"], 0), "Shared Everywhere");
 
+        /* Relink is rejected only on the FIRST section; section 2's
+        relink after an unlink round-trips back to the shared rid. */
+        engine.do_set_header_footer_link(false);
+        let forked_rid = match &engine.active_story {
+            StoryTarget::Header { rid, .. } => rid.clone(),
+            _ => panic!("still in a header story"),
+        };
+        assert_ne!(forked_rid, "ngeHf1");
+        let evt = engine.do_set_header_footer_link(true);
+        let Event::SelectionChanged {
+            editing_story: Some(story),
+            ..
+        } = &evt
+        else {
+            panic!("expected story mode after relink, got {evt:?}");
+        };
+        assert_eq!(
+            story.rid, "ngeHf1",
+            "relink re-anchors to the inherited part"
+        );
+        assert!(story.linked);
+        engine.do_exit_header_footer();
+
+        /* First section can never link to previous. */
+        engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        let evt = engine.do_set_header_footer_link(true);
+        assert!(matches!(evt, Event::Error { .. }));
+        engine.do_exit_header_footer();
+    }
     #[test]
     fn story_undo_past_materialize_falls_back_to_body() {
         let mut engine = test_engine_with_doc(DocumentTree::from_text("body"));
@@ -11862,6 +13162,16 @@ mod tests {
         assert_eq!((sel.anchor.offset, sel.caret.offset), (2, 7));
     }
 
+    /// Text of the `i`-th block of an hf part, asserting it's a
+    /// paragraph — parts are `Vec<Block>` since issue #72.
+    fn hf_text(part: &[engine::Block], i: usize) -> &str {
+        part[i]
+            .as_paragraph()
+            .expect("hf part block is a paragraph")
+            .text
+            .as_str()
+    }
+
     /// Shared scaffold: a native Engine over `doc` with a real Latin font
     /// and a cached layout config, mirroring the interactive boot state.
     fn test_engine_with_doc(doc: DocumentTree) -> Engine {
@@ -11901,6 +13211,7 @@ mod tests {
             sections_memo: RefCell::new(None),
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
+            render_date: None,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -12038,5 +13349,331 @@ mod tests {
                 "insert must succeed"
             );
         }
+    }
+
+    /* ================================================================
+    Issues #70/#71/#72/#74/#43 — Stage 3: enter v2, link toggle,
+    filler pages, field reshape, story re-anchoring.
+    ================================================================ */
+
+    /// Body doc that paginates to two pages — the first paragraph
+    /// carries a trailing U+000C FORM FEED, the canonical forced-break
+    /// mechanism the paginator honours (`page_break_after_line`).
+    fn two_page_doc(first: &str, second: &str) -> DocumentTree {
+        let mut d = DocumentTree::from_text(&format!("{first}\u{000C}"));
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: second.into(),
+                ..Default::default()
+            }));
+        d
+    }
+
+    fn band_glyph_count(band: &layout::HeaderFooterBox) -> usize {
+        let mut n = 0;
+        band.for_each_paragraph(&mut |p| {
+            n += p
+                .lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .map(|r| r.glyphs.len())
+                .sum::<usize>();
+        });
+        n
+    }
+
+    #[test]
+    fn odd_page_break_inserts_a_blank_filler_page() {
+        /* Issue #74 — content on page 1, then an OddPage break: the
+        incoming page would be 2 (even) → one blank filler page, and
+        the section opens on page 3. */
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        let evt = engine.do_insert_section_break(bpos_top(0, 5), SectionBreakKind::OddPage);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        engine
+            .ensure_layout_snapshot(engine.scale(), false, None)
+            .expect("layout");
+        let snap = engine.layout_snapshot.borrow();
+        let pages = &snap.as_ref().unwrap().pages;
+        assert_eq!(pages.len(), 3, "content, blank filler, section start");
+        assert!(
+            pages[1].blocks.is_empty() && pages[1].header.is_none() && pages[1].footer.is_none(),
+            "the filler paints as an empty sheet"
+        );
+        assert_eq!(pages[1].page_number, 2, "the filler consumes a number");
+        assert_eq!(pages[2].page_number, 3, "the section opens on an ODD page");
+
+        /* An EvenPage break from the same shape needs NO filler —
+        the incoming page 2 is already even. */
+        drop(snap);
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.do_insert_section_break(bpos_top(0, 5), SectionBreakKind::EvenPage);
+        engine
+            .ensure_layout_snapshot(engine.scale(), false, None)
+            .expect("layout");
+        let snap = engine.layout_snapshot.borrow();
+        assert_eq!(
+            snap.as_ref().unwrap().pages.len(),
+            2,
+            "parity already right"
+        );
+    }
+
+    #[test]
+    fn footer_page_field_repaints_per_page() {
+        /* Issue #43 — THE dead-end fix: a PAGE field in a shared
+        footer must PAINT each page's own number, not the cached
+        text. Cached "Page 99" (7 glyphs incl. two digits) resolves
+        to "Page 1" / "Page 2" (6 glyphs) once the reshape pass
+        re-lays the band clones. */
+        let doc = two_page_doc("first page", "second page")
+            .with_updated_footer_part(
+                "ngeHf1",
+                vec![engine::Block::Paragraph(engine::Paragraph {
+                    text: "Page 99".into(),
+                    fields: vec![engine::Field {
+                        start: 5,
+                        end: 7,
+                        instruction: "PAGE".into(),
+                    }],
+                    ..Default::default()
+                })],
+            )
+            .set_section_hf_ref_at(
+                engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+                false,
+                engine::HeaderFooterRole::Default,
+                Some("ngeHf1"),
+            );
+        let engine = test_engine_with_doc(doc);
+        engine
+            .ensure_layout_snapshot(engine.scale(), false, None)
+            .expect("layout");
+        let snap = engine.layout_snapshot.borrow();
+        let pages = &snap.as_ref().unwrap().pages;
+        assert!(pages.len() >= 2);
+        let f0 = pages[0].footer.as_ref().expect("page 1 footer");
+        let f1 = pages[1].footer.as_ref().expect("page 2 footer");
+        assert_eq!(
+            band_glyph_count(f0),
+            "Page 1".chars().count(),
+            "page 1's band re-laid with its resolved number"
+        );
+        assert_eq!(band_glyph_count(f1), "Page 2".chars().count());
+    }
+
+    #[test]
+    fn numpages_field_forces_full_layout() {
+        /* Issue #43 — a culled build would resolve NUMPAGES against a
+        partial count; documents carrying one lay out fully. */
+        let mut d = DocumentTree::from_text("p0");
+        for i in 1..200 {
+            d.blocks
+                .push_back(engine::Block::Paragraph(engine::Paragraph {
+                    text: if i % 3 == 0 {
+                        format!("paragraph {i}\u{000C}")
+                    } else {
+                        format!("paragraph {i}")
+                    },
+                    ..Default::default()
+                }));
+        }
+        let d = d
+            .with_updated_footer_part(
+                "ngeHf1",
+                vec![engine::Block::Paragraph(engine::Paragraph {
+                    text: "of 1".into(),
+                    fields: vec![engine::Field {
+                        start: 3,
+                        end: 4,
+                        instruction: "NUMPAGES".into(),
+                    }],
+                    ..Default::default()
+                })],
+            )
+            .set_section_hf_ref_at(
+                engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+                false,
+                engine::HeaderFooterRole::Default,
+                Some("ngeHf1"),
+            );
+        let engine = test_engine_with_doc(d);
+        /* A tight cull budget that would normally stop early. */
+        let (_pages, _fonts, _paths, info) = engine
+            .build_pages(engine.scale(), false, Some(500.0))
+            .expect("build");
+        assert!(info.is_full_layout, "NUMPAGES overrides the viewport cull");
+    }
+
+    #[test]
+    fn undo_after_relink_reanchors_the_story_rid() {
+        /* Design review B4 — undo of a relink restores the forked
+        slot; the guard must re-resolve and re-anchor the active rid
+        (a bare exists-check left keystrokes flowing into the
+        invisible part). */
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        engine.do_insert_text_interactive(bpos_top(0, 0), "Shared".into());
+        engine.do_exit_header_footer();
+        engine.do_insert_section_break(bpos_top(0, 5), SectionBreakKind::NextPage);
+        engine.do_enter_header_footer(1, bridge::HeaderFooterArea::Header);
+        engine.do_set_header_footer_link(false);
+        let forked = match &engine.active_story {
+            StoryTarget::Header { rid, .. } => rid.clone(),
+            _ => panic!("in a header story"),
+        };
+        engine.do_set_header_footer_link(true);
+        match &engine.active_story {
+            StoryTarget::Header { rid, .. } => assert_eq!(rid, "ngeHf1"),
+            _ => panic!("in a header story"),
+        }
+        /* Undo the relink — section 2 owns the fork again; the story
+        must follow it. */
+        engine.do_undo();
+        match &engine.active_story {
+            StoryTarget::Header { rid, .. } => {
+                assert_eq!(rid, &forked, "guard re-anchored to the restored fork")
+            }
+            _ => panic!("story survives the undo"),
+        }
+    }
+
+    #[test]
+    fn title_page_toggle_reanchors_the_story_to_first_role() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("body"));
+        engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        let default_rid = match &engine.active_story {
+            StoryTarget::Header { rid, role, .. } => {
+                assert_eq!(*role, engine::HeaderFooterRole::Default);
+                rid.clone()
+            }
+            _ => panic!("in a header story"),
+        };
+        /* Different First Page ON: page 0 now displays the First
+        role — the story re-anchors (materializing a First part). */
+        let evt = engine.do_set_title_page(true);
+        let Event::SelectionChanged {
+            editing_story: Some(story),
+            section_geometry: Some(geom),
+            ..
+        } = &evt
+        else {
+            panic!("expected story SelectionChanged, got {evt:?}");
+        };
+        assert!(geom.title_pg, "checkbox state reads back");
+        assert!(matches!(story.role, bridge::BridgeHfRole::First));
+        assert_ne!(story.rid, default_rid, "First slot got its own part");
+        engine.do_exit_header_footer();
+    }
+
+    #[test]
+    fn even_odd_toggle_selects_the_even_role_on_page_two() {
+        let mut engine = test_engine_with_doc(two_page_doc("first", "second"));
+        let evt = engine.do_set_even_odd_headers(true);
+        let Event::SelectionChanged {
+            section_geometry: Some(geom),
+            ..
+        } = &evt
+        else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        assert!(geom.even_odd_headers);
+        let evt = engine.do_enter_header_footer(1, bridge::HeaderFooterArea::Header);
+        let Event::SelectionChanged {
+            editing_story: Some(story),
+            ..
+        } = &evt
+        else {
+            panic!("expected story mode, got {evt:?}");
+        };
+        assert!(
+            matches!(story.role, bridge::BridgeHfRole::Even),
+            "page 2 displays the Even slot"
+        );
+        engine.do_exit_header_footer();
+    }
+
+    #[test]
+    fn table_only_header_parks_the_caret_inside_a_cell() {
+        /* Design review B6 — a letterhead (table-only) part must give
+        the caret a real paragraph home inside the table. */
+        let mut cell = engine::default_table_cell();
+        cell.blocks = vec![engine::Block::Paragraph(engine::Paragraph {
+            text: "corp".into(),
+            ..Default::default()
+        })];
+        let doc = DocumentTree::from_text("body")
+            .with_updated_header_part(
+                "ngeHf1",
+                vec![engine::Block::Table(engine::Table {
+                    rows: vec![engine::TableRow {
+                        cells: vec![cell],
+                        ..Default::default()
+                    }],
+                    dirty: true,
+                    ..Default::default()
+                })],
+            )
+            .set_section_hf_default_ref_at(
+                engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+                true,
+                "ngeHf1",
+            );
+        let mut engine = test_engine_with_doc(doc);
+        engine.do_enter_header_footer(0, bridge::HeaderFooterArea::Header);
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(
+            caret.path.steps.len(),
+            3,
+            "caret descended into the cell, not the bare table path: {:?}",
+            caret.path.steps
+        );
+        /* Typing lands in the cell paragraph. */
+        engine.do_insert_text_interactive(caret, "X".into());
+        let doc = engine.undo.current();
+        let engine::Block::Table(t) = &doc.headers["ngeHf1"][0] else {
+            panic!("table survived");
+        };
+        let cell_text = t.rows[0].cells[0].blocks[0]
+            .as_paragraph()
+            .map(|p| p.text.as_str());
+        assert_eq!(cell_text, Some("Xcorp"));
+        engine.do_exit_header_footer();
+    }
+
+    #[test]
+    fn date_field_resolves_against_the_injected_render_date() {
+        /* Issue #43 — DATE re-lays with the shell-injected date; the
+        cached "X" (1 glyph) becomes "7/5/2026" (8 glyphs). */
+        let d = DocumentTree::from_blocks(vec![engine::Block::Paragraph(engine::Paragraph {
+            text: "D: X end".into(),
+            fields: vec![engine::Field {
+                start: 3,
+                end: 4,
+                instruction: "DATE".into(),
+            }],
+            ..Default::default()
+        })]);
+        let mut engine = test_engine_with_doc(d);
+        engine.render_date = Some((2026, 7, 5));
+        engine
+            .ensure_layout_snapshot(engine.scale(), false, None)
+            .expect("layout");
+        let snap = engine.layout_snapshot.borrow();
+        let pages = &snap.as_ref().unwrap().pages;
+        let LayoutBlock::Paragraph(p) = &pages[0].blocks[0] else {
+            panic!("paragraph");
+        };
+        let glyphs: usize = p
+            .lines
+            .iter()
+            .flat_map(|l| l.runs.iter())
+            .map(|r| r.glyphs.len())
+            .sum();
+        assert_eq!(
+            glyphs,
+            "D: 7/5/2026 end".chars().count(),
+            "body DATE field re-laid with the resolved text"
+        );
     }
 }

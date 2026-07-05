@@ -158,6 +158,18 @@ pub enum Event {
         /// index-aligned with `page_tops`; the footer-zone mirror of
         /// `page_margin_tops`.
         page_margin_bottoms: Vec<f32>,
+        /// Issue #71 — per-page EFFECTIVE body-content top in device
+        /// px, page-local, index-aligned with `page_tops`. Equals the
+        /// top margin until a header band intrudes past it (band
+        /// overflow pushes body content down); the shell's band-zone
+        /// gate uses THESE instead of the raw margins so a tall header
+        /// keeps its whole painted band double-clickable.
+        page_content_tops: Vec<f32>,
+        /// Issue #71 — per-page effective body-content BOTTOM (as a
+        /// page-local Y, i.e. `height - effective_bottom_inset`),
+        /// index-aligned with `page_tops`; the footer mirror of
+        /// `page_content_tops`.
+        page_content_bottoms: Vec<f32>,
     },
 
     /* Selection */
@@ -380,6 +392,16 @@ pub struct BridgeIndent {
     pub first_line_pt: f32,
 }
 
+/// Issue #70 — which band SLOT a story edits, mirroring the page role
+/// that was double-clicked (`engine::HeaderFooterRole` wire twin).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BridgeHfRole {
+    #[default]
+    Default,
+    First,
+    Even,
+}
+
 /// Phase 3 (#39) — wire shape for the active header/footer story riding
 /// `Event::SelectionChanged.editing_story`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
@@ -394,6 +416,17 @@ pub struct BridgeStoryRef {
     /// where the caret/selection geometry is projected. Edits reflect on
     /// every page of the owning section at the next paint.
     pub page: u32,
+    /// Issue #70 — which slot (Default / First / Even) the anchor
+    /// page's role selected; names the story in the UI chip.
+    pub role: BridgeHfRole,
+    /// Issue #70 — `true` when the edited part is INHERITED from an
+    /// earlier section (Word's "Same as Previous"); `false` when the
+    /// story's section owns the slot. Drives the Link-to-Previous
+    /// toggle state.
+    pub linked: bool,
+    /// Issue #70 — 0-based index of the story's owning section; the
+    /// UI disables Link-to-Previous at index 0 (nothing precedes it).
+    pub section_index: u32,
 }
 
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
@@ -414,6 +447,12 @@ pub struct BridgeSectionGeometry {
     pub section_index: u32,
     /// Phase 3 (#40) — total section count in the document.
     pub section_count: u32,
+    /// Issue #74 — the covering section's `<w:titlePg/>` state; drives
+    /// the "Different first page" checkbox.
+    pub title_pg: bool,
+    /// Issue #74 — the DOCUMENT-wide `<w:evenAndOddHeaders/>` state
+    /// (settings.xml; rides section geometry for checkbox convenience).
+    pub even_odd_headers: bool,
 }
 
 /// Sprint 10 — wire shape for the active cell's shading + per-edge
@@ -498,12 +537,28 @@ pub struct A11yTree {
     pub nodes: Vec<A11yNode>,
 }
 
-/// A top-level (or nested) accessibility node — a paragraph or a table.
+/// A top-level (or nested) accessibility node — a paragraph, a table,
+/// or (issue #73) a header/footer story container.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum A11yNode {
     Paragraph(A11yParagraph),
     Table(A11yTable),
+    Story(A11yStory),
+}
+
+/// Issue #73 — one REFERENCED header/footer part mirrored into the
+/// screen-reader DOM (`role="banner"`-analog for headers,
+/// `role="contentinfo"` for footers). Band text was invisible to
+/// assistive tech before this. Ordered after the body nodes: headers
+/// rid-sorted, then footers.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct A11yStory {
+    /// `true` = header part, `false` = footer part.
+    pub header: bool,
+    /// Relationship id — stable across edits of the same part.
+    pub rid: String,
+    pub nodes: Vec<A11yNode>,
 }
 
 /// One paragraph in the accessibility tree — a `<p>` in the mirror DOM.

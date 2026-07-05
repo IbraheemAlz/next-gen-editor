@@ -128,8 +128,8 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         .find(|(n, _)| n == RELS_XML)
         .and_then(|(_, b)| parse_rels_xml(b).ok())
         .unwrap_or_default();
-    let mut headers: HashMap<String, Vec<engine::Paragraph>> = HashMap::new();
-    let mut footers: HashMap<String, Vec<engine::Paragraph>> = HashMap::new();
+    let mut headers: HashMap<String, Vec<engine::Block>> = HashMap::new();
+    let mut footers: HashMap<String, Vec<engine::Block>> = HashMap::new();
     let fetch_part = |rid: &str| -> Option<&[u8]> {
         let target = rels.get(rid)?;
         let entry = resolve_target(target);
@@ -159,7 +159,7 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
                 && let Some(bytes) = fetch_part(rid)
                 && let Ok(part) = parse_header_xml(bytes, &resolver)
             {
-                headers.insert(rid.to_string(), part.paragraphs);
+                headers.insert(rid.to_string(), part.blocks);
             }
         }
         for rid in [
@@ -174,8 +174,38 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
                 && let Some(bytes) = fetch_part(rid)
                 && let Ok(part) = parse_footer_xml(bytes, &resolver)
             {
-                footers.insert(rid.to_string(), part.paragraphs);
+                footers.insert(rid.to_string(), part.blocks);
             }
+        }
+    }
+    /* Issue #72 — post-process each header/footer part the way the
+    body already is:
+    - list markers: `resolve_markers_blocks` used to run only over
+      `document.blocks` (and BEFORE the parts were even parsed), so a
+      bulleted header rendered with `resolved_marker: None` forever;
+    - hyperlinks: rel ids inside a part are scoped to the PART's OWN
+      rels file (`word/_rels/headerN.xml.rels`), never to
+      document.xml.rels — the body-level resolve pass could not reach
+      or resolve them, leaving raw `rId` strings as targets. Resolve
+      against the part-local table; unresolved links drop, exactly the
+      body semantics. */
+    for (rid, blocks) in headers.iter_mut().chain(footers.iter_mut()) {
+        if !numbering.num_instances.is_empty() {
+            resolve_markers_blocks(blocks, &numbering);
+        }
+        if let Some(target) = rels.get(rid.as_str()) {
+            let entry = resolve_target(target);
+            let rels_name = part_rels_entry_name(&entry);
+            let part_rels = other_entries
+                .iter()
+                .find(|(n, _)| n == &rels_name)
+                .and_then(|(_, b)| parse_rels_xml(b).ok())
+                .unwrap_or_default();
+            *blocks = blocks
+                .iter()
+                .cloned()
+                .map(|b| resolve_hyperlinks_block(b, &part_rels))
+                .collect();
         }
     }
     document = document.with_header_footer_parts(headers, footers);
@@ -346,6 +376,16 @@ fn guess_image_mime(entry: &str) -> &'static str {
         "svg" => "image/svg+xml",
         "webp" => "image/webp",
         _ => "application/octet-stream",
+    }
+}
+
+/// Issue #72 — the OPC rels entry name for a part: relationships of
+/// `word/header1.xml` live at `word/_rels/header1.xml.rels` (the part's
+/// directory + `_rels/` + basename + `.rels`).
+fn part_rels_entry_name(part_entry: &str) -> String {
+    match part_entry.rsplit_once('/') {
+        Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
+        None => format!("_rels/{part_entry}.rels"),
     }
 }
 

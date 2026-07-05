@@ -79,5 +79,6 @@ export { AlignmentButtons } from './AlignmentButtons';
 export { InsertTableButton } from './InsertTableButton';
 export type { InsertTableButtonProps } from './InsertTableButton';
 export { HeaderFooterButtons } from './HeaderFooterButtons';
+export { FieldButtons } from './FieldButtons';
 export { HistoryButtons } from './HistoryButtons';
 export { CapsButtons } from './CapsButtons';

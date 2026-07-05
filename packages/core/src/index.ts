@@ -64,6 +64,8 @@ export type {
     SectionBreakKind,
     HeaderFooterArea,
     BridgeStoryRef,
+    BridgeHfRole,
+    FieldKind,
     ListKind,
     LogicalPos,
     LogicalRange,

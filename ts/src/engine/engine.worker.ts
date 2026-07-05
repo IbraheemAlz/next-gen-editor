@@ -764,6 +764,17 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
                 ? await Engine.with_vello(msg.canvas)
                 : new Engine(msg.canvas);
         await openEventLog(msg.documentId);
+        /* Issue #43 — inject today's date so DATE fields resolve at
+           layout time (Word updates DATE on open/print). Single
+           injection site: the engine core never reads a wall clock, so
+           native tests and byte-stable exports stay deterministic. */
+        const now = new Date();
+        await dispatch({
+            type: 'SET_RENDER_DATE',
+            year: now.getFullYear(),
+            month: now.getMonth() + 1,
+            day: now.getDate(),
+        } as Command);
         /* Report worker-context cross-origin isolation (D2.3) + the chosen
            renderer (Backlog #4) in the reply. */
         self.postMessage({
@@ -790,6 +801,14 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            post-recovery appends don't collide with or shadow prior rows. */
         logSequence = msg.lastSeq;
         lastSnapshotAt = msg.snapshotSeq;
+        /* Issue #43 — a recovered engine needs the render date again. */
+        const now = new Date();
+        await dispatch({
+            type: 'SET_RENDER_DATE',
+            year: now.getFullYear(),
+            month: now.getMonth() + 1,
+            day: now.getDate(),
+        } as Command);
         const evt = await dispatch({
             type: 'RECOVER',
             snapshot: msg.snapshot,
@@ -942,6 +961,8 @@ function broadcastPaintDims(): void {
             image_count: number;
             page_margin_tops: number[];
             page_margin_bottoms: number[];
+            page_content_tops: number[];
+            page_content_bottoms: number[];
         };
         self.postMessage({
             evt: {
@@ -963,6 +984,10 @@ function broadcastPaintDims(): void {
                 way). */
                 page_margin_tops: dims.page_margin_tops,
                 page_margin_bottoms: dims.page_margin_bottoms,
+                /* Issue #71 — effective body extents: the zone gate's
+                truth once a band intrudes past its margin. */
+                page_content_tops: dims.page_content_tops,
+                page_content_bottoms: dims.page_content_bottoms,
             },
         });
     } catch (e: unknown) {

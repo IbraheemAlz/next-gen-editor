@@ -21,12 +21,11 @@ export const InsertTableButton: Component<InsertTableButtonProps> = (props) => {
     const state = createEditorState();
 
     const ready = createMemo(() => state.selection() !== undefined);
-    const inStory = () => state.editingStory() !== undefined;
     const rows = () => props.rows ?? 3;
     const cols = () => props.cols ?? 3;
 
     const insert = async () => {
-        if (!ready() || inStory()) return;
+        if (!ready()) return;
         await cmd.insertTableAtCaret(rows(), cols());
     };
 
@@ -35,12 +34,8 @@ export const InsertTableButton: Component<InsertTableButtonProps> = (props) => {
             class="nge-btn nge-itable"
             type="button"
             aria-label={`Insert ${rows()}×${cols()} table`}
-            title={
-                inStory()
-                    ? 'Not available while editing a header or footer'
-                    : `Insert ${rows()}×${cols()} table`
-            }
-            disabled={!ready() || inStory()}
+            title={`Insert ${rows()}×${cols()} table`}
+            disabled={!ready()}
             onClick={() => void insert()}
         >
             <span class="nge-itable__icon" aria-hidden="true">▦</span>

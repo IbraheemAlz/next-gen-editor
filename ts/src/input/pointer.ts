@@ -144,9 +144,14 @@ export function attachPointer(
            - story mode + press in the ACTIVE story's own band on its
              anchor page → fall through (caret placement inside the
              band; the engine clamps to the story);
-           - story mode + press anywhere else → swallow (dblclick
-             switches band or exits — single clicks are inert, Word
-             semantics for the dimmed body). */
+           - story mode + press in ANY OTHER band → RE-ANCHOR there
+             (issue #70 / design review M6: linked parts span many
+             pages; the anchor-page-only identity test silently ate
+             clicks on every other instance — Word switches the edited
+             band on click, so dispatch EnterHeaderFooter for the
+             pressed page/area instead);
+           - story mode + press on the dimmed body → swallow (dblclick
+             exits — Word semantics). */
         {
             const local = toLocal(e);
             const zone = headerFooterZoneAt(pageIdx, local.y);
@@ -156,6 +161,13 @@ export function attachPointer(
                     zone === story.area && pageIdx === story.page;
                 if (!inOwnBand) {
                     gesture += 1;
+                    if (zone !== null) {
+                        void client.dispatch({
+                            type: 'ENTER_HEADER_FOOTER',
+                            page: pageIdx,
+                            area: zone,
+                        });
+                    }
                     return;
                 }
             } else if (zone !== null) {

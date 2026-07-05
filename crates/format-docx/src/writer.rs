@@ -1507,6 +1507,37 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             None
         };
         let styles_already_present = archive.other_entries.iter().any(|(n, _)| n == STYLES_XML);
+        /* Issue #74 — `SetEvenOddHeaders` flips `settings_dirty`; patch
+        `word/settings.xml` IN PLACE (a full regenerate would drop every
+        unmodeled sibling — zoom, proofState, compat). Synthesize a
+        minimal part only when the archive never had one. */
+        let settings_already_present = archive
+            .other_entries
+            .iter()
+            .any(|(n, _)| n == crate::opc::archive::SETTINGS_XML);
+        let settings_bytes: Option<Vec<u8>> = if doc.settings_dirty {
+            let existing = archive
+                .other_entries
+                .iter()
+                .find(|(n, _)| n == crate::opc::archive::SETTINGS_XML)
+                .and_then(|(_, b)| std::str::from_utf8(b).ok());
+            match existing {
+                Some(xml) => Some(
+                    patch_settings_even_odd(xml, doc.settings.even_and_odd_headers).into_bytes(),
+                ),
+                None if doc.settings.even_and_odd_headers => Some(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                     <w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                     <w:evenAndOddHeaders/></w:settings>"
+                        .to_string()
+                        .into_bytes(),
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let synth_settings = !settings_already_present && settings_bytes.is_some();
         let numbering_already_present = archive
             .other_entries
             .iter()
@@ -1538,6 +1569,9 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         if synth_extended {
             hyperlink_next += 1;
         }
+        if synth_settings {
+            hyperlink_next += 1;
+        }
         let (hyperlink_rid_by_target, new_hyperlink_rel_entries) =
             hyperlink_rel_map(doc, &existing_rels, hyperlink_next);
         let needs_hyperlink_rels_splice = !new_hyperlink_rel_entries.is_empty();
@@ -1553,42 +1587,148 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         let mut hf_replacements: HashMap<String, Vec<u8>> = HashMap::new();
         /* (rid, part name, bytes, rel type, content type) */
         let mut hf_new_parts: Vec<(String, String, Vec<u8>, &str, &str)> = Vec::new();
+        /* Issue #72 — part-LOCAL rels files (`word/_rels/headerN.xml.rels`)
+        carrying hyperlink targets for regenerated parts: in-place
+        replacements for parts whose rels file exists (splice-only, so
+        foreign rows — images — survive), fresh appends otherwise. */
+        let mut hf_rels_replacements: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut hf_rels_new: Vec<(String, Vec<u8>)> = Vec::new();
         {
+            /* Issue #70 — plan only rids REFERENCED by some section's
+            own slots. A relinked-away engine part stays in the tree
+            for undo but must not become an orphan archive entry. */
+            let sections = doc.effective_sections();
+            let mut referenced: Vec<&str> = Vec::new();
+            for sect in &sections {
+                for slot in [
+                    &sect.header_refs.default,
+                    &sect.header_refs.first,
+                    &sect.header_refs.even,
+                    &sect.footer_refs.default,
+                    &sect.footer_refs.first,
+                    &sect.footer_refs.even,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !referenced.contains(&slot.as_str()) {
+                        referenced.push(slot);
+                    }
+                }
+            }
             let mut planned: Vec<String> = Vec::new();
-            let mut plan =
-                |rid: &String, paras: &Vec<Paragraph>, header: bool, planned: &mut Vec<String>| {
-                    let bytes = build_hf_xml(paras, header);
-                    match existing_rels.items.iter().find(|r| &r.id == rid) {
-                        Some(rel) => {
-                            /* Rels targets are `word/`-relative. */
-                            let target = if rel.target.starts_with("word/") {
-                                rel.target.clone()
-                            } else {
-                                format!("word/{}", rel.target)
-                            };
-                            hf_replacements.insert(target, bytes);
-                        }
-                        None => {
-                            let prefix = if header { "header" } else { "footer" };
-                            let name = next_hf_part_name(prefix, &archive.other_entries, planned);
-                            planned.push(name.clone());
-                            let (rel_type, content_type) = if header {
-                                (HEADER_REL_TYPE, HEADER_CONTENT_TYPE)
-                            } else {
-                                (FOOTER_REL_TYPE, FOOTER_CONTENT_TYPE)
-                            };
-                            hf_new_parts.push((rid.clone(), name, bytes, rel_type, content_type));
-                        }
+            let mut plan = |rid: &String,
+                            blocks: &Vec<Block>,
+                            header: bool,
+                            planned: &mut Vec<String>| {
+                /* Resolve the part's archive name first — its rels
+                file name derives from it. */
+                let (part_name, exists) = match existing_rels.items.iter().find(|r| &r.id == rid) {
+                    Some(rel) => {
+                        /* Rels targets are `word/`-relative. */
+                        let target = if rel.target.starts_with("word/") {
+                            rel.target.clone()
+                        } else {
+                            format!("word/{}", rel.target)
+                        };
+                        (target, true)
+                    }
+                    None => {
+                        let prefix = if header { "header" } else { "footer" };
+                        let name = next_hf_part_name(prefix, &archive.other_entries, planned);
+                        planned.push(name.clone());
+                        (name, false)
                     }
                 };
+                /* Hyperlink targets in REGENERATED (dirty) paragraphs
+                need a part-local r:id. Clean paragraphs passthrough
+                their original markup, whose ids stay valid because
+                the rels splice below is strictly additive. */
+                let mut link_targets: Vec<String> = Vec::new();
+                for_each_hf_paragraph(blocks, &mut |para| {
+                    if para.dirty {
+                        for h in &para.hyperlinks {
+                            if !link_targets.contains(&h.target) {
+                                link_targets.push(h.target.clone());
+                            }
+                        }
+                    }
+                });
+                let mut link_map: HashMap<String, String> = HashMap::new();
+                if !link_targets.is_empty() {
+                    let rels_name = hf_part_rels_name(&part_name);
+                    let existing_bytes = archive
+                        .other_entries
+                        .iter()
+                        .find(|(n, _)| n == &rels_name)
+                        .map(|(_, b)| b.as_slice());
+                    let existing_str = existing_bytes
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .map(str::to_string);
+                    let parsed = existing_bytes
+                        .and_then(|b| crate::opc::relationships::parse_relationships(b).ok())
+                        .unwrap_or_default();
+                    let mut rels_xml = existing_str.unwrap_or_else(|| {
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                             <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n\
+                             </Relationships>"
+                                .to_string()
+                        });
+                    let mut minted = 0u32;
+                    for target in &link_targets {
+                        if let Some(existing) = parsed.items.iter().find(|r| &r.target == target) {
+                            link_map.insert(target.clone(), existing.id.clone());
+                            continue;
+                        }
+                        minted += 1;
+                        let mut id = format!("ngeL{minted}");
+                        while parsed.items.iter().any(|r| r.id == id)
+                            || link_map.values().any(|v| v == &id)
+                        {
+                            minted += 1;
+                            id = format!("ngeL{minted}");
+                        }
+                        rels_xml = inject_doc_rel(
+                            &rels_xml,
+                            &id,
+                            HYPERLINK_REL_TYPE,
+                            target,
+                            Some("External"),
+                        )
+                        .into_owned();
+                        link_map.insert(target.clone(), id);
+                    }
+                    let rels_bytes = rels_xml.into_bytes();
+                    if archive.other_entries.iter().any(|(n, _)| n == &rels_name) {
+                        hf_rels_replacements.insert(rels_name, rels_bytes);
+                    } else {
+                        hf_rels_new.push((rels_name, rels_bytes));
+                    }
+                }
+                let bytes = build_hf_xml(blocks, header, &link_map);
+                if exists {
+                    hf_replacements.insert(part_name, bytes);
+                } else {
+                    let (rel_type, content_type) = if header {
+                        (HEADER_REL_TYPE, HEADER_CONTENT_TYPE)
+                    } else {
+                        (FOOTER_REL_TYPE, FOOTER_CONTENT_TYPE)
+                    };
+                    hf_new_parts.push((rid.clone(), part_name, bytes, rel_type, content_type));
+                }
+            };
             for rid in &doc.hf_dirty.headers {
-                if let Some(paras) = doc.headers.get(rid) {
-                    plan(rid, paras, true, &mut planned);
+                if referenced.contains(&rid.as_str())
+                    && let Some(blocks) = doc.headers.get(rid)
+                {
+                    plan(rid, blocks, true, &mut planned);
                 }
             }
             for rid in &doc.hf_dirty.footers {
-                if let Some(paras) = doc.footers.get(rid) {
-                    plan(rid, paras, false, &mut planned);
+                if referenced.contains(&rid.as_str())
+                    && let Some(blocks) = doc.footers.get(rid)
+                {
+                    plan(rid, blocks, false, &mut planned);
                 }
             }
         }
@@ -1624,8 +1764,17 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             } else if let Some(new_bytes) = hf_replacements.get(name.as_str()) {
                 /* Phase 3 (#39) — an edited imported header/footer part. */
                 zip.write_all(new_bytes)?;
+            } else if let Some(new_bytes) = hf_rels_replacements.get(name.as_str()) {
+                /* Issue #72 — a regenerated part's rels file (additive
+                splice; foreign rows survive). */
+                zip.write_all(new_bytes)?;
+            } else if name == crate::opc::archive::SETTINGS_XML
+                && let Some(new_bytes) = settings_bytes.as_deref()
+            {
+                /* Issue #74 — patched-in-place settings.xml. */
+                zip.write_all(new_bytes)?;
             } else if name == "[Content_Types].xml"
-                && (synth_comments || synth_extended || synth_hf)
+                && (synth_comments || synth_extended || synth_hf || synth_settings)
             {
                 let raw = std::str::from_utf8(bytes)?;
                 let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
@@ -1649,6 +1798,16 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                         Cow::Owned(s) => Cow::Owned(s),
                     };
                 }
+                if synth_settings {
+                    patched = match inject_content_type_override(
+                        &patched,
+                        SETTINGS_PART_NAME,
+                        SETTINGS_CONTENT_TYPE,
+                    ) {
+                        Cow::Borrowed(_) => patched,
+                        Cow::Owned(v) => Cow::Owned(v),
+                    };
+                }
                 /* Phase 3 (#39) — one Override per fresh header/footer
                 part (part names carry the leading slash per OPC). */
                 for (_, part_name, _, _, content_type) in &hf_new_parts {
@@ -1661,7 +1820,11 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                 }
                 zip.write_all(patched.as_bytes())?;
             } else if name == RELS_XML
-                && (synth_comments || synth_extended || needs_hyperlink_rels_splice || synth_hf)
+                && (synth_comments
+                    || synth_extended
+                    || needs_hyperlink_rels_splice
+                    || synth_hf
+                    || synth_settings)
             {
                 let raw = std::str::from_utf8(bytes)?;
                 let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
@@ -1689,6 +1852,18 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                         COMMENTS_EXT_REL_TARGET,
                         None,
                     );
+                    if let Cow::Owned(s) = new {
+                        patched = Cow::Owned(s);
+                        next += 1;
+                    }
+                }
+                if synth_settings {
+                    /* Issue #74 (design review M2) — a synthesized
+                    settings.xml is unreachable without its
+                    document-level Relationship row. */
+                    let rid = format!("rId{next}");
+                    let new =
+                        inject_doc_rel(&patched, &rid, SETTINGS_REL_TYPE, "settings.xml", None);
                     if let Cow::Owned(s) = new {
                         patched = Cow::Owned(s);
                     }
@@ -1755,7 +1930,7 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         Override is needed for a `.rels` part itself (it rides the
         `Default Extension="rels"` catch-all every archive already
         carries). */
-        if !rels_already_present && (needs_hyperlink_rels_splice || synth_hf) {
+        if !rels_already_present && (needs_hyperlink_rels_splice || synth_hf || synth_settings) {
             let mut fresh = String::with_capacity(256);
             fresh.push_str(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -1774,6 +1949,11 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                     "<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>\n"
                 ));
             }
+            if synth_settings {
+                fresh.push_str(&format!(
+                    "<Relationship Id=\"ngeSettings1\" Type=\"{SETTINGS_REL_TYPE}\" Target=\"settings.xml\"/>\n"
+                ));
+            }
             fresh.push_str("</Relationships>");
             zip.start_file(RELS_XML, opts)?;
             zip.write_all(fresh.as_bytes())?;
@@ -1785,6 +1965,18 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         for (_, part_name, bytes, _, _) in &hf_new_parts {
             zip.start_file(part_name, opts)?;
             zip.write_all(bytes)?;
+        }
+        /* Issue #72 — fresh part-local rels files (`.rels` rides the
+        `Default Extension="rels"` rule — no Content_Types Override). */
+        for (name, bytes) in &hf_rels_new {
+            zip.start_file(name, opts)?;
+            zip.write_all(bytes)?;
+        }
+        /* Issue #74 — synthesized settings.xml on a document that never
+        had one. */
+        if synth_settings && let Some(new_bytes) = settings_bytes.as_deref() {
+            zip.start_file(crate::opc::archive::SETTINGS_XML, opts)?;
+            zip.write_all(new_bytes)?;
         }
 
         /* Write the regenerated document.xml. */
@@ -1946,18 +2138,112 @@ const HEADER_REL_TYPE: &str =
 const FOOTER_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
 
+/* Issue #74 — settings.xml OPC identity (synthesized only when the
+archive never carried one). */
+const SETTINGS_PART_NAME: &str = "/word/settings.xml";
+const SETTINGS_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml";
+const SETTINGS_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings";
+
+/// Issue #72 — the OPC rels entry name for a part:
+/// `word/header1.xml` → `word/_rels/header1.xml.rels`.
+fn hf_part_rels_name(part_entry: &str) -> String {
+    match part_entry.rsplit_once('/') {
+        Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
+        None => format!("_rels/{part_entry}.rels"),
+    }
+}
+
+/// Issue #74 (design review M2) — toggle `<w:evenAndOddHeaders/>` in an
+/// EXISTING settings.xml by targeted string surgery, preserving every
+/// unmodeled sibling (zoom, proofState, compat — a full regenerate
+/// would silently drop them all):
+///
+/// - element present in ANY form (`<w:evenAndOddHeaders/>`,
+///   `w:val="…"` variants, paired tag) → replaced by the bare toggle
+///   when enabling, REMOVED entirely when disabling (a naive
+///   literal-match remove missed `w:val` variants and silently read
+///   back as ON);
+/// - element absent + enabling → inserted right after the
+///   `<w:settings …>` open tag. CT_Settings declares a child sequence,
+///   but Word and LibreOffice both read known settings positionally
+///   independent — accepted order-leniency, pinned by tests.
+fn patch_settings_even_odd(xml: &str, enabled: bool) -> String {
+    const NEEDLE: &str = "<w:evenAndOddHeaders";
+    let mut out = String::with_capacity(xml.len() + 32);
+    let mut rest = xml;
+    let mut found = false;
+    while let Some(at) = rest.find(NEEDLE) {
+        /* Guard against prefix collisions (no such sibling element
+        exists today, but stay exact): the needle must be followed by
+        whitespace, '/', or '>'. */
+        let after = &rest[at + NEEDLE.len()..];
+        let boundary = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>');
+        if !boundary {
+            out.push_str(&rest[..at + NEEDLE.len()]);
+            rest = after;
+            continue;
+        }
+        found = true;
+        out.push_str(&rest[..at]);
+        /* Consume the element: self-closing `…/>` or paired
+        `…>…</w:evenAndOddHeaders>`. */
+        let elem_end = after.find('>').map(|i| i + 1).unwrap_or(after.len());
+        let self_closing = after[..elem_end].trim_end_matches('>').ends_with('/');
+        let consumed = if self_closing {
+            elem_end
+        } else {
+            const CLOSE: &str = "</w:evenAndOddHeaders>";
+            after[elem_end..]
+                .find(CLOSE)
+                .map(|i| elem_end + i + CLOSE.len())
+                .unwrap_or(elem_end)
+        };
+        if enabled {
+            out.push_str("<w:evenAndOddHeaders/>");
+        }
+        rest = &after[consumed..];
+    }
+    out.push_str(rest);
+    if enabled && !found {
+        /* Insert right after the settings open tag. */
+        if let Some(open) = out.find("<w:settings")
+            && let Some(close) = out[open..].find('>')
+        {
+            let at = open + close + 1;
+            out.insert_str(at, "<w:evenAndOddHeaders/>");
+        } else {
+            /* Malformed part — append defensively; the reader's
+            toggle scan still finds it. */
+            out.push_str("<w:evenAndOddHeaders/>");
+        }
+    }
+    out
+}
+
 /// Phase 3 (#39) — serialize one header/footer story into a complete
 /// `word/headerN.xml` / `word/footerN.xml` part. The root element picks
 /// its OWN xmlns variant by scanning the part's paragraphs — a header
 /// can carry a logo image or a hyperlink the body doesn't have, so the
 /// body's root-variant choice must never be reused here.
-fn build_hf_xml(paras: &[Paragraph], header: bool) -> Vec<u8> {
-    let has_image = paras.iter().any(|p| {
-        p.inline_objects
+fn build_hf_xml(
+    blocks: &[Block],
+    header: bool,
+    hyperlink_rel_map: &HashMap<String, String>,
+) -> Vec<u8> {
+    let mut has_image = false;
+    let mut has_link = false;
+    for_each_hf_paragraph(blocks, &mut |p| {
+        has_image |= p
+            .inline_objects
             .iter()
-            .any(|o| matches!(o.kind, InlineKind::Image { .. }))
+            .any(|o| matches!(o.kind, InlineKind::Image { .. }));
+        has_link |= !p.hyperlinks.is_empty();
     });
-    let has_link = paras.iter().any(|p| !p.hyperlinks.is_empty());
     let tag = if header { "w:hdr" } else { "w:ftr" };
     let mut out = String::with_capacity(512);
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
@@ -1977,18 +2263,42 @@ fn build_hf_xml(paras: &[Paragraph], header: bool) -> Vec<u8> {
         );
     }
     out.push('>');
-    /* Header/footer hyperlinks would need rels of their OWN part
-    (word/_rels/headerN.xml.rels) re-minted — out of v1 scope; the
-    empty map serializes their text without an `r:id`. Tracked as a
-    follow-up alongside tables-in-headers. */
-    let empty_rels: HashMap<String, String> = HashMap::new();
-    for p in paras {
-        serialize_paragraph(p, &mut out, &empty_rels);
+    /* Issue #72 — parts are block lists now; `emit_block` gives table
+    support AND the clean-paragraph `source_xml` passthrough, so
+    unedited paragraphs inside an edited story keep their original
+    markup (rsids, proofErr) instead of force-regenerating.
+    `hyperlink_rel_map` is the PART-LOCAL target→r:id table (the
+    caller minted/spliced `word/_rels/<part>.xml.rels`) — hyperlinks
+    in regenerated paragraphs keep working instead of degrading to
+    plain text. */
+    for b in blocks {
+        emit_block(b, &mut out, hyperlink_rel_map);
     }
     out.push_str("</");
     out.push_str(tag);
     out.push('>');
     out.into_bytes()
+}
+
+/// Walk every paragraph in a header/footer part's block list, one
+/// table-cell level deep — the same depth the body's overlay walks use.
+fn for_each_hf_paragraph<'a>(blocks: &'a [Block], f: &mut impl FnMut(&'a Paragraph)) {
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) => f(p),
+            Block::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        for nested in &cell.blocks {
+                            if let Block::Paragraph(p) = nested {
+                                f(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Phase 3 (#39) — smallest positive N such that `word/{prefix}N.xml`
@@ -3189,10 +3499,10 @@ mod tests {
         let doc = DocumentTree::from_text("body text")
             .with_updated_header_part(
                 "ngeHf1",
-                vec![Paragraph {
+                vec![Block::Paragraph(Paragraph {
                     text: "Header A".into(),
                     ..Default::default()
-                }],
+                })],
             )
             .set_section_hf_default_ref_at(
                 engine::LogicalPos::new(engine::BlockPath::top(0), 0),
@@ -3202,7 +3512,11 @@ mod tests {
         let bytes = build_minimal_docx(&doc).expect("build");
         let reopened = read_docx(&bytes).expect("reread");
         assert_eq!(
-            reopened.document.headers["ngeHf1"][0].text, "Header A",
+            reopened.document.headers["ngeHf1"][0]
+                .as_paragraph()
+                .expect("paragraph block")
+                .text,
+            "Header A",
             "header content survives the OPC round trip"
         );
         let sections = reopened.document.effective_sections();
@@ -3277,17 +3591,29 @@ mod tests {
     #[test]
     fn edited_imported_header_regenerates_only_its_part() {
         let archive = archive_with_imported_header();
-        assert_eq!(archive.document.headers["rId7"][0].text, "Imported");
+        assert_eq!(
+            archive.document.headers["rId7"][0]
+                .as_paragraph()
+                .expect("paragraph block")
+                .text,
+            "Imported"
+        );
         let edited = archive.document.with_updated_header_part(
             "rId7",
-            vec![Paragraph {
+            vec![Block::Paragraph(Paragraph {
                 text: "Edited header".into(),
                 ..Default::default()
-            }],
+            })],
         );
         let saved = write_docx(&archive, &edited).expect("write");
         let reopened = read_docx(&saved).expect("reread");
-        assert_eq!(reopened.document.headers["rId7"][0].text, "Edited header");
+        assert_eq!(
+            reopened.document.headers["rId7"][0]
+                .as_paragraph()
+                .expect("paragraph block")
+                .text,
+            "Edited header"
+        );
         /* Sibling entries stay byte-identical (docx.md invariant). */
         for (name, bytes) in &archive.other_entries {
             if name == "word/header1.xml" {
@@ -3699,7 +4025,9 @@ mod tests {
             .get("rIdH1")
             .expect("rIdH1 header part parsed");
         assert_eq!(header_paragraphs.len(), 1);
-        let hp = &header_paragraphs[0];
+        let hp = header_paragraphs[0]
+            .as_paragraph()
+            .expect("paragraph block");
         /* Header text contains the "Page " prefix + cached "1". */
         assert_eq!(hp.text, "Page 1");
         /* The PAGE field overlay survived the reroute through
@@ -5107,5 +5435,328 @@ mod tests {
         let p = reread.document.nth_paragraph(0).expect("paragraph 0");
         assert_eq!(p.style_id.as_deref(), Some("Heading1"));
         assert_eq!(p.text, "styled paragraph");
+    }
+
+    /* ================================================================
+    Issues #70/#72/#74/#43 — Stage 4: settings patcher, fldSimple,
+    part-local rels, referenced-only planning, tables in parts.
+    ================================================================ */
+
+    #[test]
+    fn patch_settings_even_odd_covers_every_variant() {
+        /* Bare element removal. */
+        let xml = r#"<w:settings xmlns:w="x"><w:zoom w:percent="130"/><w:evenAndOddHeaders/><w:proofState/></w:settings>"#;
+        let off = patch_settings_even_odd(xml, false);
+        assert!(!off.contains("evenAndOddHeaders"));
+        assert!(off.contains("w:zoom") && off.contains("w:proofState"));
+
+        /* Design review M2 — the `w:val` variants a literal-match
+        remove silently missed (reading back as ON). */
+        for variant in [
+            r#"<w:evenAndOddHeaders w:val="1"/>"#,
+            r#"<w:evenAndOddHeaders w:val="true"/>"#,
+            r#"<w:evenAndOddHeaders w:val="0"/>"#,
+            r#"<w:evenAndOddHeaders></w:evenAndOddHeaders>"#,
+        ] {
+            let xml = format!(r#"<w:settings xmlns:w="x">{variant}<w:zoom/></w:settings>"#);
+            let off = patch_settings_even_odd(&xml, false);
+            assert!(!off.contains("evenAndOddHeaders"), "variant {variant}");
+            assert!(off.contains("w:zoom"));
+            /* Enabling normalizes any variant to the bare toggle. */
+            let on = patch_settings_even_odd(&xml, true);
+            assert_eq!(on.matches("evenAndOddHeaders").count(), 1);
+            assert!(on.contains("<w:evenAndOddHeaders/>"));
+        }
+
+        /* Absent + enabling → inserted after the open tag. */
+        let xml = r#"<w:settings xmlns:w="x"><w:zoom/></w:settings>"#;
+        let on = patch_settings_even_odd(xml, true);
+        assert!(on.starts_with(r#"<w:settings xmlns:w="x"><w:evenAndOddHeaders/>"#));
+        /* Absent + disabling → byte-identical no-op. */
+        assert_eq!(patch_settings_even_odd(xml, false), xml);
+    }
+
+    #[test]
+    fn settings_toggle_round_trips_preserving_siblings() {
+        let archive = archive_with_imported_header();
+        /* Give the archive a settings.xml with an unmodeled sibling. */
+        let mut archive = archive;
+        archive.other_entries.push((
+            "word/settings.xml".into(),
+            br#"<?xml version="1.0"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:zoom w:percent="130"/></w:settings>"#.to_vec(),
+        ));
+        let toggled = archive.document.with_even_odd_headers(true);
+        let saved = write_docx(&archive, &toggled).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        assert!(
+            reopened.document.settings.even_and_odd_headers,
+            "toggle survives the round trip"
+        );
+        let settings_after = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "word/settings.xml")
+            .expect("settings part present");
+        let text = std::str::from_utf8(&settings_after.1).unwrap();
+        assert!(
+            text.contains("w:zoom"),
+            "unmodeled sibling survives the in-place patch"
+        );
+
+        /* And OFF again — element removed, sibling still intact. */
+        let toggled_off = reopened.document.with_even_odd_headers(false);
+        let saved2 = write_docx(&reopened, &toggled_off).expect("write 2");
+        let reopened2 = read_docx(&saved2).expect("reread 2");
+        assert!(!reopened2.document.settings.even_and_odd_headers);
+        let text2 = std::str::from_utf8(
+            &reopened2
+                .other_entries
+                .iter()
+                .find(|(n, _)| n == "word/settings.xml")
+                .unwrap()
+                .1,
+        )
+        .unwrap()
+        .to_string();
+        assert!(!text2.contains("evenAndOddHeaders"));
+        assert!(text2.contains("w:zoom"));
+    }
+
+    #[test]
+    fn settings_synthesized_with_rels_when_absent() {
+        /* A fresh engine document has no settings.xml at all; enabling
+        even/odd must synthesize part + Override + Relationship
+        (design review M2 — without the rel the part is unreachable). */
+        let doc = DocumentTree::from_text("body").with_even_odd_headers(true);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let reopened = read_docx(&bytes).expect("reread");
+        assert!(reopened.document.settings.even_and_odd_headers);
+        let rels = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "word/_rels/document.xml.rels")
+            .expect("rels part");
+        let rels_text = std::str::from_utf8(&rels.1).unwrap();
+        assert!(
+            rels_text.contains("relationships/settings"),
+            "settings Relationship row present: {rels_text}"
+        );
+        let ct = reopened
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "[Content_Types].xml")
+            .expect("content types");
+        assert!(
+            std::str::from_utf8(&ct.1)
+                .unwrap()
+                .contains("/word/settings.xml"),
+            "settings Override present"
+        );
+    }
+
+    #[test]
+    fn fld_simple_parses_into_a_field_overlay() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r><w:fldSimple w:instr=" PAGE \* MERGEFORMAT "><w:r><w:t>3</w:t></w:r></w:fldSimple></w:p>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+        let style_table = crate::parts::styles::StyleTable::default();
+        let resolver = crate::style_resolver::StyleResolver::new(&style_table);
+        let tree = crate::parts::document::parse_document_xml(document_xml.as_bytes(), &resolver)
+            .expect("parse");
+        let p = tree.blocks[0].as_paragraph().expect("paragraph");
+        assert_eq!(p.text, "Page 3");
+        assert_eq!(p.fields.len(), 1, "fldSimple produced a Field overlay");
+        assert_eq!(p.fields[0].keyword(), "PAGE");
+        assert_eq!((p.fields[0].start, p.fields[0].end), (5, 6));
+    }
+
+    #[test]
+    fn header_hyperlink_resolves_via_part_rels_and_survives_an_edit() {
+        /* Fixture: header with a hyperlink whose r:id lives in the
+        PART's own rels file. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:body>
+<w:p><w:r><w:t xml:space="preserve">body</w:t></w:r></w:p>
+<w:sectPr><w:headerReference w:type="default" r:id="rId7"/></w:sectPr>
+</w:body>
+</w:document>"#;
+        let header_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:p><w:hyperlink r:id="rIdL1"><w:r><w:t xml:space="preserve">visit us</w:t></w:r></w:hyperlink></w:p></w:hdr>"#;
+        let header_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rIdL1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/>
+</Relationships>"#;
+        let rels_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+</Relationships>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/_rels/document.xml.rels", rels_xml),
+                ("word/_rels/header1.xml.rels", header_rels),
+                ("word/header1.xml", header_xml),
+                ("word/document.xml", document_xml),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let archive = read_docx(&buf).expect("read fixture");
+        let hp = archive.document.headers["rId7"][0]
+            .as_paragraph()
+            .expect("paragraph");
+        assert_eq!(hp.hyperlinks.len(), 1, "part-local rel resolved");
+        assert_eq!(hp.hyperlinks[0].target, "https://example.com/");
+
+        /* Edit the part (dirty paragraph carrying the hyperlink) —
+        the writer must keep the link an `<w:hyperlink r:id>` backed
+        by the part's rels file, not degrade it to plain text. */
+        let edited_para = Paragraph {
+            text: "visit us now".into(),
+            hyperlinks: vec![engine::Hyperlink {
+                start: 0,
+                end: 8,
+                target: "https://example.com/".into(),
+            }],
+            dirty: true,
+            ..Default::default()
+        };
+        let edited = archive
+            .document
+            .with_updated_header_part("rId7", vec![Block::Paragraph(edited_para)]);
+        let saved = write_docx(&archive, &edited).expect("write");
+        let reopened = read_docx(&saved).expect("reread");
+        let hp2 = reopened.document.headers["rId7"][0]
+            .as_paragraph()
+            .expect("paragraph");
+        assert_eq!(
+            hp2.hyperlinks.first().map(|h| h.target.as_str()),
+            Some("https://example.com/"),
+            "hyperlink survives the part regeneration round trip"
+        );
+    }
+
+    #[test]
+    fn unreferenced_dirty_part_is_not_written() {
+        /* Issue #70 — a relinked-away engine part stays in the tree
+        (undo safety) but must not become an orphan archive entry. */
+        let doc = DocumentTree::from_text("body").with_updated_header_part(
+            "ngeHf9",
+            vec![Block::Paragraph(Paragraph {
+                text: "orphan".into(),
+                ..Default::default()
+            })],
+        );
+        /* NO set_section_hf_ref_at — the part is unreferenced. */
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let reopened = read_docx(&bytes).expect("reread");
+        assert!(
+            reopened.document.headers.is_empty(),
+            "no header part written for an unreferenced rid"
+        );
+        assert!(
+            !reopened
+                .other_entries
+                .iter()
+                .any(|(n, _)| n.starts_with("word/header")),
+            "no orphan header entry in the archive"
+        );
+    }
+
+    #[test]
+    fn table_in_header_round_trips() {
+        /* Issue #72 — a table inside an engine-authored header part
+        survives write → reopen with its cell text. */
+        let mut cell = engine::default_table_cell();
+        cell.blocks = vec![Block::Paragraph(Paragraph {
+            text: "letterhead".into(),
+            ..Default::default()
+        })];
+        let table = engine::Table {
+            rows: vec![engine::TableRow {
+                cells: vec![cell],
+                ..Default::default()
+            }],
+            dirty: true,
+            ..Default::default()
+        };
+        let doc = DocumentTree::from_text("body")
+            .with_updated_header_part("ngeHf1", vec![Block::Table(table)])
+            .set_section_hf_default_ref_at(
+                engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+                true,
+                "ngeHf1",
+            );
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let reopened = read_docx(&bytes).expect("reread");
+        let part = &reopened.document.headers["ngeHf1"];
+        let engine::Block::Table(t) = &part[0] else {
+            panic!("expected the table to survive; got a paragraph");
+        };
+        let cell_text = t.rows[0].cells[0].blocks[0]
+            .as_paragraph()
+            .map(|p| p.text.as_str());
+        assert_eq!(cell_text, Some("letterhead"));
+    }
+
+    #[test]
+    fn bulleted_list_in_header_round_trips_with_marker() {
+        /* Issue #72 acceptance — a bulleted header paragraph survives
+        save → reopen WITH its resolved marker (the reader's marker
+        pass historically ran before parts were even parsed, so band
+        bullets rendered markerless forever). */
+        let mut doc = DocumentTree::from_text("body");
+        let num_id = doc
+            .numbering
+            .synth_list_definition(engine::numbering::ListSynthesisKind::Bullet);
+        let doc = doc
+            .with_updated_header_part(
+                "ngeHf1",
+                vec![Block::Paragraph(Paragraph {
+                    text: "first bullet".into(),
+                    list_item: Some(engine::ListItem { num_id, ilvl: 0 }),
+                    dirty: true,
+                    ..Default::default()
+                })],
+            )
+            .set_section_hf_default_ref_at(
+                engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+                true,
+                "ngeHf1",
+            );
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let reopened = read_docx(&bytes).expect("reread");
+        let hp = reopened.document.headers["ngeHf1"][0]
+            .as_paragraph()
+            .expect("paragraph");
+        assert_eq!(hp.text, "first bullet");
+        assert!(
+            hp.list_item.is_some(),
+            "numPr round-tripped on the part paragraph"
+        );
+        assert!(
+            hp.resolved_marker.is_some(),
+            "the reader's part-marker pass resolved the bullet glyph"
+        );
     }
 }

@@ -66,18 +66,8 @@ export const StylesDropdown: Component = () => {
         optimistic() ?? state.paragraphStyleId() ?? 'Normal';
 
     const ready = () => state.selection() !== undefined;
-    /* Phase 3 (#39) — `Command::ApplyStyle` and `Command::ModifyStyle`
-     * are both engine-gated while a header/footer story is active
-     * ("style application/editing" on the story blocklist). Gate the
-     * trigger, every menu row's apply action, and the row's edit (✎)
-     * entry point — all three would otherwise round-trip to a silent
-     * `Event::Error`. */
-    const inStory = () => state.editingStory() !== undefined;
-    const gatedTitle = (label: string) =>
-        inStory() ? 'Not available while editing a header or footer' : label;
 
     const apply = async (id: ParagraphStyleId) => {
-        if (inStory()) return;
         setOptimistic(id);
         setOpen(false);
         /* Sprint 12 — real engine path: writes `<w:pStyle>` + folds
@@ -115,8 +105,8 @@ export const StylesDropdown: Component = () => {
                 aria-haspopup="menu"
                 aria-expanded={open()}
                 aria-label="Paragraph style"
-                disabled={!ready() || inStory()}
-                title={gatedTitle('Paragraph style')}
+                disabled={!ready()}
+                title="Paragraph style"
                 onClick={() => setOpen((v) => !v)}
             >
                 <span>{activeLabel()}</span>
@@ -136,12 +126,6 @@ export const StylesDropdown: Component = () => {
                                     type="button"
                                     role="menuitemradio"
                                     aria-checked={active() === s.id}
-                                    disabled={inStory()}
-                                    title={
-                                        inStory()
-                                            ? 'Not available while editing a header or footer'
-                                            : undefined
-                                    }
                                     onClick={() => void apply(s.id)}
                                 >
                                     <span
@@ -156,8 +140,7 @@ export const StylesDropdown: Component = () => {
                                     type="button"
                                     role="menuitem"
                                     aria-label={`Edit style ${s.label}`}
-                                    title={gatedTitle(`Edit the "${s.label}" style definition`)}
-                                    disabled={inStory()}
+                                    title={`Edit the "${s.label}" style definition`}
                                     onClick={() => {
                                         setOpen(false);
                                         setEditTarget({ id: s.id, label: s.label });

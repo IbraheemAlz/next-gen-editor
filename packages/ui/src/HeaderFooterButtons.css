@@ -19,3 +19,26 @@
     background: var(--nge-color-primary);
     color: #ffffff;
 }
+
+/* Issue #70/#74 — the story-mode Header & Footer cluster. */
+.nge-hf__btn--link[data-active='true'] {
+    background: rgba(37, 99, 235, 0.12);
+    border-color: var(--nge-color-primary);
+    color: var(--nge-color-primary);
+}
+
+.nge-hf__check {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+    font-size: 12px;
+    color: var(--nge-color-text);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+}
+
+.nge-hf__check input {
+    accent-color: var(--nge-color-primary);
+    margin: 0;
+}

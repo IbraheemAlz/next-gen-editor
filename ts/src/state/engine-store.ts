@@ -70,6 +70,11 @@ export function enginePageTopDevice(idx: number): number | null {
  * mixed-geometry sections without a mid-gesture worker round-trip. */
 let latestPageMargins: { tops: number[]; bottoms: number[] } | null = null;
 let latestPageHeights: number[] | null = null;
+/* Issue #71 — per-page EFFECTIVE body extents (page-local device px).
+ * Once a band spills past its margin the paginator pushes the body
+ * edge, and the whole painted band must stay double-clickable — these
+ * supersede the raw margins for the zone gate when present. */
+let latestContentExtents: { tops: number[]; bottoms: number[] } | null = null;
 
 const [editingStorySig, setEditingStorySig] = createSignal<
     BridgeStoryRef | undefined
@@ -91,14 +96,21 @@ export function headerFooterZoneAt(
     pageIdx: number,
     localDeviceY: number,
 ): 'Header' | 'Footer' | null {
-    const top = latestPageMargins?.tops[pageIdx];
+    /* Issue #71 — prefer the effective content extents (band-intrusion
+     * aware); fall back to raw margins for pre-extents paints. */
+    const top =
+        latestContentExtents?.tops[pageIdx] ?? latestPageMargins?.tops[pageIdx];
+    const contentBottomY = latestContentExtents?.bottoms[pageIdx];
     const bottom = latestPageMargins?.bottoms[pageIdx];
     const height = latestPageHeights?.[pageIdx];
-    if (top === undefined || bottom === undefined || height === undefined) {
+    if (top === undefined || height === undefined) {
         return null;
     }
+    const footerStartY =
+        contentBottomY ?? (bottom !== undefined ? height - bottom : undefined);
+    if (footerStartY === undefined) return null;
     if (localDeviceY >= 0 && localDeviceY < top) return 'Header';
-    if (localDeviceY > height - bottom && localDeviceY <= height) return 'Footer';
+    if (localDeviceY > footerStartY && localDeviceY <= height) return 'Footer';
     return null;
 }
 
@@ -382,6 +394,14 @@ export function createEngineStore(client: EngineClient) {
                     tops: ev.page_margin_tops,
                     bottoms: ev.page_margin_bottoms,
                 });
+            }
+            /* Issue #71 — effective body extents (band-intrusion
+               aware): the zone gate's preferred truth. */
+            if (ev.page_content_tops.length > 0) {
+                latestContentExtents = {
+                    tops: ev.page_content_tops,
+                    bottoms: ev.page_content_bottoms,
+                };
             }
             /* Issue #44 — refresh inline-image geometry after a paint so
                the resize-handle overlay tracks images through edits,

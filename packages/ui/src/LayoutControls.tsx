@@ -205,6 +205,38 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
                                 <span>Section Break (Continuous)</span>
                             </button>
                         </li>
+                        <li role="none">
+                            <button
+                                role="menuitem"
+                                class="nge-layout__breaks-item"
+                                type="button"
+                                disabled={inTable()}
+                                title={
+                                    inTable()
+                                        ? 'Section breaks cannot be inserted inside a table'
+                                        : 'Start a new section on the next EVEN-numbered page (a blank filler page is added when needed)'
+                                }
+                                onClick={() => void insertSectionBreak('EvenPage')}
+                            >
+                                <span>Section Break (Even Page)</span>
+                            </button>
+                        </li>
+                        <li role="none">
+                            <button
+                                role="menuitem"
+                                class="nge-layout__breaks-item"
+                                type="button"
+                                disabled={inTable()}
+                                title={
+                                    inTable()
+                                        ? 'Section breaks cannot be inserted inside a table'
+                                        : 'Start a new section on the next ODD-numbered page (a blank filler page is added when needed — book chapters)'
+                                }
+                                onClick={() => void insertSectionBreak('OddPage')}
+                            >
+                                <span>Section Break (Odd Page)</span>
+                            </button>
+                        </li>
                     </ul>
                 </Show>
             </div>

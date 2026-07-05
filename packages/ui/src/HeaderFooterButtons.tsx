@@ -1,20 +1,29 @@
 /**
  * HeaderFooterButtons — toolbar entry points for header/footer editing
- * (Phase 3, #39). The discoverable sibling of the double-click-in-margin
- * gesture:
+ * (Phase 3 #39, reworked for issues #70/#74). The discoverable sibling
+ * of the double-click-in-margin gesture:
  *
  *   - Body mode: "Header" / "Footer" buttons dispatch
  *     `Command::EnterHeaderFooter` for the CARET's page (derived from
  *     the caret rect against the engine-reported page tops — exact
  *     under mixed-geometry sections once a paginated paint has landed;
  *     page 0 fallback before that).
- *   - Story mode: a single "Close Header/Footer" button dispatches
- *     `Command::ExitHeaderFooter` (Esc and double-clicking the dimmed
- *     body do the same).
+ *   - Story mode: the Header & Footer cluster —
+ *       · "Link to previous" toggle (issue #70): reflects
+ *         `editingStory().linked` (Word's "Same as Previous");
+ *         unlinking forks a private part, relinking clears the slot.
+ *         Disabled on the first section (nothing precedes it).
+ *       · "Different first page" checkbox (issue #74): the covering
+ *         section's `<w:titlePg/>`; toggling may re-anchor the story
+ *         to the First-role slot.
+ *       · "Different odd & even" checkbox (issue #74): the
+ *         document-wide `<w:evenAndOddHeaders/>` setting.
+ *       · "Close" — `Command::ExitHeaderFooter` (Esc and
+ *         double-clicking the dimmed body do the same).
  *
- * The engine guarantees the target section owns a private part on
- * enter (materialize-on-enter / fork-on-enter — the v1 stand-in for
- * Word's Link-to-Previous, tracked as a follow-up issue).
+ * Entering resolves the band through §17.10.3 inheritance and edits
+ * the resolved part in place (linked editing); a part is only
+ * materialized when the whole chain is empty.
  */
 import { Show, createMemo, type Component } from 'solid-js';
 import {
@@ -50,23 +59,79 @@ export const HeaderFooterButtons: Component = () => {
         await cmd.enterHeaderFooter(caretPage(), area);
     };
 
+    /* Issue #70 — the toggle mirrors storage on every SelectionChanged:
+       linked = the story's section has NO own slot (inherits). The
+       first section can never link (engine rejects with an Error the
+       FileMenu toast would surface; disable instead — Honest UX). */
+    const linked = () => story()?.linked === true;
+    const firstSection = () => story()?.section_index === 0;
+    const titlePg = () => state.sectionGeometry()?.title_pg === true;
+    const evenOdd = () => state.sectionGeometry()?.even_odd_headers === true;
+
     return (
         <div class="nge-hf" role="group" aria-label="Header and footer">
             <Show
                 when={!story()}
                 fallback={
-                    <button
-                        class="nge-btn nge-hf__btn nge-hf__btn--close"
-                        type="button"
-                        aria-label="Close header/footer editing"
-                        title="Close header/footer editing (Esc)"
-                        onClick={() => void cmd.exitHeaderFooter()}
-                    >
-                        <span aria-hidden="true">✕</span>
-                        <span>
-                            Close {story()?.area === 'Footer' ? 'Footer' : 'Header'}
-                        </span>
-                    </button>
+                    <>
+                        <button
+                            class="nge-btn nge-hf__btn nge-hf__btn--link"
+                            type="button"
+                            aria-label="Link to previous section"
+                            aria-pressed={linked()}
+                            data-active={linked()}
+                            title={
+                                firstSection()
+                                    ? 'The first section has no previous section to link to'
+                                    : linked()
+                                      ? 'Same as previous section — click to make this section’s band independent'
+                                      : 'Independent — click to link back to the previous section’s band'
+                            }
+                            disabled={firstSection() && linked() === false}
+                            onClick={() => void cmd.setHeaderFooterLink(!linked())}
+                        >
+                            <span aria-hidden="true">🔗</span>
+                            <span>Link to previous</span>
+                        </button>
+                        <label
+                            class="nge-hf__check"
+                            title="First page of this section shows its own header/footer"
+                        >
+                            <input
+                                type="checkbox"
+                                checked={titlePg()}
+                                onChange={(e) =>
+                                    void cmd.setTitlePage(e.currentTarget.checked)
+                                }
+                            />
+                            <span>Different first page</span>
+                        </label>
+                        <label
+                            class="nge-hf__check"
+                            title="Odd and even pages show different headers/footers (whole document)"
+                        >
+                            <input
+                                type="checkbox"
+                                checked={evenOdd()}
+                                onChange={(e) =>
+                                    void cmd.setEvenOddHeaders(e.currentTarget.checked)
+                                }
+                            />
+                            <span>Different odd &amp; even</span>
+                        </label>
+                        <button
+                            class="nge-btn nge-hf__btn nge-hf__btn--close"
+                            type="button"
+                            aria-label="Close header/footer editing"
+                            title="Close header/footer editing (Esc)"
+                            onClick={() => void cmd.exitHeaderFooter()}
+                        >
+                            <span aria-hidden="true">✕</span>
+                            <span>
+                                Close {story()?.area === 'Footer' ? 'Footer' : 'Header'}
+                            </span>
+                        </button>
+                    </>
                 }
             >
                 <button

@@ -462,16 +462,18 @@ pub enum Command {
         at: LogicalPos,
         kind: SectionBreakKind,
     },
-    /// Phase 3 (#39) — enter header/footer editing for the section that
-    /// owns page `page` (0-based). The engine stashes the body
-    /// selection, guarantees the active section OWNS a private part
-    /// (materialize-on-enter when no part is referenced; fork-on-enter
-    /// when the resolved part is shared with another section — the v1
-    /// stand-in for Word's Link-to-Previous, whose explicit toggle is
-    /// tracked as a follow-up), and re-roots the selection + all
-    /// caret-relative commands into that story until
-    /// [`Command::ExitHeaderFooter`]. `SelectionChanged.editing_story`
-    /// reports the active story.
+    /// Phase 3 (#39) / issue #70 — enter header/footer editing for the
+    /// band the double-clicked page `page` (0-based) DISPLAYS: the
+    /// page's role (Default / First / Even) picks which slot is
+    /// edited. The engine stashes the body selection and resolves the
+    /// (section, area, role) reference through §17.10.3 inheritance:
+    /// a resolved part (own or inherited) is edited IN PLACE — edits
+    /// appear on every page that resolves to it, Word's linked-editing
+    /// semantics; only when NO section in the chain has a part does
+    /// the engine materialize an empty one on the edited section.
+    /// [`Command::SetHeaderFooterLink`] forks/relinks explicitly.
+    /// `SelectionChanged.editing_story` reports the active story
+    /// (rid + role + linked state).
     EnterHeaderFooter {
         page: u32,
         area: HeaderFooterArea,
@@ -479,6 +481,47 @@ pub enum Command {
     /// Phase 3 (#39) — leave header/footer editing and restore the
     /// stashed body selection (clamped if the body changed under it).
     ExitHeaderFooter,
+    /// Issue #70 — Word's "Link to Previous" toggle for the ACTIVE
+    /// story's (section, area, role) slot. `linked: false` (unlink)
+    /// copies the currently-resolved part into a fresh private part
+    /// owned by the story's section; `linked: true` (relink) clears
+    /// the section's own slot so it inherits again (Event::Error on
+    /// the first section — nothing precedes it). Story-scoped:
+    /// rejected outside header/footer editing.
+    SetHeaderFooterLink {
+        linked: bool,
+    },
+    /// Issue #74 — toggle `<w:titlePg/>` ("different first page") on
+    /// the covering section: the active story's section when a story
+    /// is open, else the caret's. The first page of that section then
+    /// displays the First-role band (blank until one is authored).
+    SetTitlePage {
+        enabled: bool,
+    },
+    /// Issue #74 — document-wide `<w:evenAndOddHeaders/>` toggle
+    /// (settings.xml). Even-NUMBERED pages then display Even-role
+    /// bands (blank until authored).
+    SetEvenOddHeaders {
+        enabled: bool,
+    },
+    /// Issue #43 — author a dynamic field at `at` (body paragraph or
+    /// header/footer story; rejected with `Event::Error` inside table
+    /// cells — the cell reader cannot round-trip fields yet). The
+    /// engine splices placeholder text + the field overlay; layout
+    /// resolves the live value per page.
+    InsertField {
+        at: LogicalPos,
+        kind: FieldKind,
+    },
+    /// Issue #43 — install the render-time date DATE fields resolve
+    /// against. The worker injects today's date right after INIT (the
+    /// engine core never reads a wall clock — determinism for tests
+    /// and byte-stable exports). Month/day are 1-based.
+    SetRenderDate {
+        year: i32,
+        month: u32,
+        day: u32,
+    },
     /// Sprint 2 (UI Edition) — set `<w:pPr><w:pBdr>` on every
     /// paragraph the range spans. Mirrors `SetCellBorders` over the
     /// paragraph-border model that shipped in Sprint 5. Pass an
@@ -683,16 +726,19 @@ pub enum PageOrientation {
     Landscape,
 }
 
-/// Phase 3 (#40) — the two AUTHORABLE section-break kinds for
-/// [`Command::InsertSectionBreak`]. Wire mirror of the engine
-/// `SectionType` authoring subset: `EvenPage` / `OddPage` round-trip
-/// from imported files but are not authorable (the paginator degrades
-/// them to `NextPage` until parity-aware page routing lands).
+/// Phase 3 (#40) / issue #74 — the authorable section-break kinds for
+/// [`Command::InsertSectionBreak`], the full wire mirror of engine
+/// `SectionType`. `EvenPage` / `OddPage` begin the new section on the
+/// next even/odd-NUMBERED page — the paginator emits one blank filler
+/// page (which PAGE fields count) when the incoming page's parity
+/// mismatches.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SectionBreakKind {
     #[default]
     NextPage,
     Continuous,
+    EvenPage,
+    OddPage,
 }
 
 /// Phase 3 (#39) — which margin band a header/footer command targets.
@@ -701,6 +747,19 @@ pub enum HeaderFooterArea {
     #[default]
     Header,
     Footer,
+}
+
+/// Issue #43 — the field kinds [`Command::InsertField`] authors.
+/// `Page` renders the page's formatted number, `NumPages` the
+/// document's total page count (forces full pagination on documents
+/// that carry one), `Date` today's date per the shell-injected render
+/// date (`M/d/yyyy`, Word's en default).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FieldKind {
+    #[default]
+    Page,
+    NumPages,
+    Date,
 }
 
 /// Sprint 11 (#13) — wire shape for one `<w:pPr><w:tabs><w:tab>`

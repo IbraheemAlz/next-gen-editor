@@ -69,9 +69,25 @@ function buildTable(node: Extract<A11yNode, { kind: 'TABLE' }>): HTMLTableElemen
     return el;
 }
 
+/** Issue #73 — one referenced header/footer part mirrored as a
+ *  landmark container (`role="banner"` for headers, `"contentinfo"`
+ *  for footers) so screen readers can reach band text. */
+function buildStory(node: Extract<A11yNode, { kind: 'STORY' }>): HTMLElement {
+    const el = document.createElement('div');
+    el.setAttribute('role', node.header ? 'banner' : 'contentinfo');
+    el.setAttribute(
+        'aria-label',
+        node.header ? 'Page header' : 'Page footer',
+    );
+    el.dataset.rid = node.rid;
+    for (const child of node.nodes) el.appendChild(buildNode(child));
+    return el;
+}
+
 /** Dispatch on `A11yNode.kind` — single entry point for builders + recursion. */
 function buildNode(node: A11yNode): HTMLElement {
     if (node.kind === 'TABLE') return buildTable(node);
+    if (node.kind === 'STORY') return buildStory(node);
     return buildParagraph(node);
 }
 

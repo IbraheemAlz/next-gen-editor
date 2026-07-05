@@ -231,23 +231,37 @@ pub fn export_pdf(
     metadata stream and the deterministic document `/ID`. */
     let conformant = pdfa || pdfx;
 
-    /* Distinct fonts referenced by every page, in first-seen order. */
-    let mut used: Vec<&str> = Vec::new();
+    /* Distinct fonts referenced by every page, in first-seen order.
+    Issue #71 — bands + footnotes collect too: `show_run` silently
+    draws NOTHING for a font missing from `font_objs` (the pen still
+    advances), so a header-only font would otherwise become invisible
+    text with no error. */
+    let mut used: Vec<String> = Vec::new();
     for page in pages {
-        for_each_paragraph(&page.blocks, &mut |para| {
+        let mut collect = |para: &ParagraphBox| {
             if let Some(marker) = &para.marker
-                && !used.contains(&marker.run.font.as_str())
+                && !used.iter().any(|u| u == &marker.run.font)
             {
-                used.push(marker.run.font.as_str());
+                used.push(marker.run.font.clone());
             }
             for line in &para.lines {
                 for run in &line.runs {
-                    if !used.contains(&run.font.as_str()) {
-                        used.push(run.font.as_str());
+                    if !used.iter().any(|u| u == &run.font) {
+                        used.push(run.font.clone());
                     }
                 }
             }
-        });
+        };
+        for_each_paragraph(&page.blocks, &mut collect);
+        if let Some(hf) = &page.header {
+            for_each_paragraph(&hf.blocks, &mut collect);
+        }
+        if let Some(hf) = &page.footer {
+            for_each_paragraph(&hf.blocks, &mut collect);
+        }
+        for entry in &page.footnotes {
+            collect(&entry.paragraph);
+        }
     }
 
     let mut pdf = Pdf::new();
@@ -274,7 +288,7 @@ pub fn export_pdf(
         .enumerate()
         .map(|(i, id)| {
             (
-                (*id).to_string(),
+                id.clone(),
                 FontObj {
                     type0: alloc(),
                     cid: alloc(),
@@ -442,6 +456,21 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
     let content_y = page.margins.top;
     let mut content = Content::new();
 
+    /* Issue #71 — header band BEFORE body (mirrors
+    `render/scene.rs::build_document_scene` ordering: header, body,
+    footnotes, footer). Band origin comes from the SAME shared
+    placement methods the canvas paints with. */
+    if let Some(hf) = &page.header {
+        emit_band_blocks(
+            &mut content,
+            page_h,
+            content_x,
+            page.header_band_top(),
+            &hf.blocks,
+            font_objs,
+        );
+    }
+
     /* Pass 1 — cell + paragraph shading. */
     for block in &page.blocks {
         emit_block_shading(&mut content, page_h, content_x, content_y, block);
@@ -465,7 +494,78 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
         emit_block_borders(&mut content, page_h, content_x, content_y, block);
     }
 
+    /* Issue #71 — footnote band: stacked entries bottom-anchored at
+    the margin, with the 30%-width separator rule scene.rs draws. */
+    if !page.footnotes.is_empty() {
+        let band_height: f32 = page.footnotes.iter().map(|e| e.paragraph.size.height).sum();
+        let band_bottom = page.size.height - page.margins.bottom;
+        let band_top = band_bottom - band_height;
+        let rule_w = (page.size.width - page.margins.left - page.margins.right) * 0.3;
+        let rule_y = band_top - 6.0;
+        content.save_state();
+        content.set_fill_rgb(
+            0x55 as f32 / 255.0,
+            0x55 as f32 / 255.0,
+            0x55 as f32 / 255.0,
+        );
+        content.rect(content_x, page_h - (rule_y + 0.75), rule_w, 0.75);
+        content.fill_nonzero();
+        content.restore_state();
+        for entry in &page.footnotes {
+            emit_paragraph_text(
+                &mut content,
+                page_h,
+                content_x,
+                band_top,
+                &entry.paragraph,
+                font_objs,
+            );
+        }
+    }
+
+    /* Issue #71 — footer band last (bottom-anchored via
+    `footer_band_top`, which already subtracts the laid content
+    height). */
+    if let Some(hf) = &page.footer {
+        emit_band_blocks(
+            &mut content,
+            page_h,
+            content_x,
+            page.footer_band_top(),
+            &hf.blocks,
+            font_objs,
+        );
+    }
+
     content.finish().to_vec()
+}
+
+/// Issue #71 — one header/footer band: the same shading → text →
+/// borders pass ordering the body uses, at the band's own origin.
+fn emit_band_blocks(
+    content: &mut Content,
+    page_h: f32,
+    band_x: f32,
+    band_y: f32,
+    blocks: &[LayoutBlock],
+    font_objs: &[(String, FontObj)],
+) {
+    for block in blocks {
+        emit_block_shading(content, page_h, band_x, band_y, block);
+    }
+    for block in blocks {
+        match block {
+            LayoutBlock::Paragraph(p) => {
+                emit_paragraph_text(content, page_h, band_x, band_y, p, font_objs);
+            }
+            LayoutBlock::Table(t) => {
+                emit_table_text(content, page_h, band_x, band_y, t, font_objs);
+            }
+        }
+    }
+    for block in blocks {
+        emit_block_borders(content, page_h, band_x, band_y, block);
+    }
 }
 
 /// Pass 1 dispatcher — shading fills for one block (recurses into cells).
@@ -1091,7 +1191,7 @@ fn collect_to_unicode_pages(
 ) -> HashMap<String, BTreeMap<u16, Vec<char>>> {
     let mut out: HashMap<String, BTreeMap<u16, Vec<char>>> = HashMap::new();
     for page in pages {
-        for_each_paragraph(&page.blocks, &mut |para| {
+        let mut collect = |para: &ParagraphBox| {
             let text = if para.source_paragraph_id == layout::ParagraphBox::NO_SOURCE_ID {
                 ""
             } else {
@@ -1106,7 +1206,22 @@ fn collect_to_unicode_pages(
                     add_run_mappings(run, text, map);
                 }
             }
-        });
+        };
+        for_each_paragraph(&page.blocks, &mut collect);
+        /* Issue #71 — band + footnote glyphs need /ToUnicode coverage
+        too (a header-only character otherwise copies as nothing).
+        `source_paragraph_id` for band paragraphs indexes the SAME
+        `para_texts` table — engine-wasm appends part texts after the
+        body walk. */
+        if let Some(hf) = &page.header {
+            for_each_paragraph(&hf.blocks, &mut collect);
+        }
+        if let Some(hf) = &page.footer {
+            for_each_paragraph(&hf.blocks, &mut collect);
+        }
+        for entry in &page.footnotes {
+            collect(&entry.paragraph);
+        }
     }
     out
 }
@@ -1263,6 +1378,8 @@ mod tests {
             header_offset: 36.0,
             footer_offset: 36.0,
             footnotes: Vec::new(),
+            hf_role: layout::HeaderRole::Default,
+            page_number: 1,
         }
     }
 
@@ -1416,6 +1533,8 @@ mod tests {
             header_offset: 36.0,
             footer_offset: 36.0,
             footnotes: Vec::new(),
+            hf_role: layout::HeaderRole::Default,
+            page_number: 1,
         };
         let mut out = Vec::new();
         export_pdf(
@@ -1518,6 +1637,8 @@ mod tests {
                 header_offset: 36.0,
                 footer_offset: 36.0,
                 footnotes: Vec::new(),
+                hf_role: layout::HeaderRole::Default,
+                page_number: 1,
             }
         }
         let stack = liberation_stack();
@@ -1549,6 +1670,8 @@ mod tests {
             header_offset: 36.0,
             footer_offset: 36.0,
             footnotes: Vec::new(),
+            hf_role: layout::HeaderRole::Default,
+            page_number: 1,
         };
         let mut out = Vec::new();
         export_pdf(
@@ -1893,6 +2016,8 @@ mod tests {
             header_offset: 36.0,
             footer_offset: 36.0,
             footnotes: Vec::new(),
+            hf_role: layout::HeaderRole::Default,
+            page_number: 1,
         };
         let mut out = Vec::new();
         export_pdf(
@@ -2014,6 +2139,136 @@ mod tests {
         assert!(
             find(&content[et..], b"\nS").is_some(),
             "paragraph borders must stroke after the text"
+        );
+    }
+
+    /* ================================================================
+    Issue #71 — header/footer band + footnote emission.
+    ================================================================ */
+
+    #[test]
+    fn header_and_footer_bands_reach_the_content_stream() {
+        let stack = liberation_stack();
+        let mut page = hello_page(&stack);
+        /* Reuse the laid body paragraph as band content — same font,
+        same glyph machinery. */
+        let band_para = match &page.blocks[0] {
+            LayoutBlock::Paragraph(p) => p.clone(),
+            LayoutBlock::Table(_) => unreachable!(),
+        };
+        page.header = Some(layout::HeaderFooterBox {
+            blocks: vec![LayoutBlock::Paragraph(band_para.clone())],
+            source_rid: None,
+        });
+        page.footer = Some(layout::HeaderFooterBox {
+            blocks: vec![LayoutBlock::Paragraph(band_para)],
+            source_rid: None,
+        });
+
+        /* Baseline: the SAME page without bands paints fewer glyph
+        show ops. Content streams are uncompressed for Plain, so count
+        `Tj`-family show operators via the 2-byte glyph strings. */
+        let mut with_bands = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::Plain,
+            &mut with_bands,
+        )
+        .expect("export with bands");
+
+        let mut without = page.clone();
+        without.header = None;
+        without.footer = None;
+        let mut plain = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&without),
+            &stack,
+            &["Hello world"],
+            PdfProfile::Plain,
+            &mut plain,
+        )
+        .expect("export without bands");
+
+        assert!(
+            with_bands.len() > plain.len(),
+            "band glyphs must add content-stream bytes: {} vs {}",
+            with_bands.len(),
+            plain.len()
+        );
+    }
+
+    #[test]
+    fn band_only_font_is_embedded() {
+        /* Design review hazard — `show_run` silently draws nothing for
+        an unembedded font. A font referenced ONLY by a band must
+        reach the embedded set. */
+        let stack = liberation_stack();
+        let page_body_less = {
+            let mut page = hello_page(&stack);
+            /* Move the paragraph into the FOOTER; body goes empty. */
+            let para = match page.blocks.remove(0) {
+                LayoutBlock::Paragraph(p) => p,
+                LayoutBlock::Table(_) => unreachable!(),
+            };
+            page.footer = Some(layout::HeaderFooterBox {
+                blocks: vec![LayoutBlock::Paragraph(para)],
+                source_rid: None,
+            });
+            page
+        };
+        let mut out = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&page_body_less),
+            &stack,
+            &["Hello world"],
+            PdfProfile::Plain,
+            &mut out,
+        )
+        .expect("export");
+        assert!(
+            out.windows(10).any(|w| w == b"/FontFile2"),
+            "footer-only font must be embedded"
+        );
+    }
+
+    #[test]
+    fn footnote_band_emits_its_separator_and_text() {
+        let stack = liberation_stack();
+        let mut page = hello_page(&stack);
+        let note_para = match &page.blocks[0] {
+            LayoutBlock::Paragraph(p) => p.clone(),
+            LayoutBlock::Table(_) => unreachable!(),
+        };
+        page.footnotes = vec![layout::boxes::FootnoteEntry {
+            id: 1,
+            marker: "1".into(),
+            paragraph: note_para,
+        }];
+        let mut with_notes = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&page),
+            &stack,
+            &["Hello world"],
+            PdfProfile::Plain,
+            &mut with_notes,
+        )
+        .expect("export");
+        let mut without = page.clone();
+        without.footnotes = Vec::new();
+        let mut plain = Vec::new();
+        export_pdf(
+            std::slice::from_ref(&without),
+            &stack,
+            &["Hello world"],
+            PdfProfile::Plain,
+            &mut plain,
+        )
+        .expect("export");
+        assert!(
+            with_notes.len() > plain.len(),
+            "footnote band adds separator rule + glyphs"
         );
     }
 }

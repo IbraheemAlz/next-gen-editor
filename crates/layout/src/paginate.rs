@@ -28,13 +28,16 @@ use crate::page::Margins;
 use std::collections::HashMap;
 
 /// Per-role header / footer bands the paginator picks from for each
-/// page (Phase 2 audit — C.1 / C.2 / C.3). `default` always covers
-/// every page where no more-specific variant applies. `first` is used
-/// for the first page of the section when [`Paginator::title_pg`] is
-/// `true`; `even` is used for even-numbered pages when
-/// [`Paginator::even_and_odd_headers`] is `true`. Missing variants
-/// fall back through `default` per OOXML §17.10.3, then to "no band"
-/// when even `default` is unset.
+/// page (Phase 2 audit — C.1 / C.2 / C.3). `default` covers pages
+/// where no more-specific variant applies. `first` is used for the
+/// first page of the section when [`Paginator::title_pg`] is `true`;
+/// `even` is used for even-NUMBERED pages when
+/// [`Paginator::even_and_odd_headers`] is `true`. Issue #70 — a
+/// missing variant is a BLANK band, never a fallback to `default`:
+/// §17.10.3 inherits each role independently ACROSS sections (the
+/// engine resolves that before bands are built), and Word observably
+/// shows an empty first-page header when titlePg is on with no first
+/// part.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderBands {
     pub default: Option<HeaderFooterBox>,
@@ -42,25 +45,18 @@ pub struct HeaderBands {
     pub even: Option<HeaderFooterBox>,
 }
 
-/// Which header/footer slot the paginator should attach to a given page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderRole {
-    Default,
-    First,
-    Even,
-}
+pub use crate::boxes::HeaderRole;
 
 impl HeaderBands {
-    /// Resolve `role` against the available slots. Falls back to
-    /// `Default` when the requested slot is unset; returns `None`
-    /// when even `Default` is missing.
+    /// The band for `role`, exactly — `None` means a blank band
+    /// (issue #70 removed the role→`Default` fallback; see the type
+    /// docs).
     pub fn resolve(&self, role: HeaderRole) -> Option<&HeaderFooterBox> {
-        let primary = match role {
+        match role {
             HeaderRole::Default => self.default.as_ref(),
             HeaderRole::First => self.first.as_ref(),
             HeaderRole::Even => self.even.as_ref(),
-        };
-        primary.or(self.default.as_ref())
+        }
     }
 }
 
@@ -152,6 +148,11 @@ pub struct Paginator {
     /// compute section-relative page numbers without needing to know
     /// about the global page accumulator.
     doc_page_offset: u32,
+    /// Issue #43 — the render-time date `(year, month, day)` DATE
+    /// fields resolve against. `None` (tests, headless) keeps the
+    /// cached text. Injected by the shell at boot (`SetRenderDate`) —
+    /// the engine core never reads a wall clock.
+    render_date: Option<(i32, u32, u32)>,
 }
 
 impl Paginator {
@@ -162,7 +163,7 @@ impl Paginator {
         title_pg: bool,
         even_and_odd_headers: bool,
     ) -> Self {
-        Self {
+        let mut p = Self {
             geometry,
             headers,
             footers,
@@ -181,7 +182,18 @@ impl Paginator {
             cur_footnote_height: 0.0,
             page_num: engine::PageNumType::default(),
             doc_page_offset: 0,
-        }
+            render_date: None,
+        };
+        /* Issue #71 (design review B3) — page 1 opens BELOW its
+        header band when the band is taller than the top margin. */
+        p.cur_y = p.opening_cur_y();
+        p
+    }
+
+    /// Issue #43 — install the render-time date for DATE fields.
+    pub fn with_render_date(mut self, date: Option<(i32, u32, u32)>) -> Self {
+        self.render_date = date;
+        self
     }
 
     /// Audit gap A.M11 — install the section's `<w:pgNumType>` plus the
@@ -328,27 +340,73 @@ impl Paginator {
         )
     }
 
-    /// Pick which header/footer role applies to the page that is about
-    /// to flush. Precedence (highest first):
+    /// Pick which header/footer role applies to the page numbered
+    /// `pages.len() + 1` within this paginator. Precedence:
     /// 1. Section first page AND `title_pg` → `First`.
-    /// 2. `even_and_odd_headers` AND 1-based page number is even →
-    ///    `Even`.
+    /// 2. `even_and_odd_headers` AND the FORMATTED page number is even
+    ///    → `Even`.
     /// 3. Otherwise → `Default`.
     ///
-    /// The paginator counts pages document-wide (`self.pages.len() + 1`
-    /// is the in-progress page number), matching Word's behaviour: a
-    /// `<w:type="even"/>` header lines up with absolute page parity, not
-    /// section-relative parity. The `First` check is section-scoped via
-    /// `section_first_page_pending`.
+    /// Issue #74 — parity comes from [`Self::current_formatted_page_no`]:
+    /// doc-wide (`doc_page_offset` carries prior sections' pages — the
+    /// old `pages.len()+1` reset every non-continuous section) AND
+    /// restart-aware. Word keys even/odd bands to the page NUMBER, not
+    /// the physical sheet: a section restarting at 2 opens with the
+    /// even-page header. (Recorded design decision R-M4 — supersedes
+    /// the earlier "absolute parity" comment, which predates restart
+    /// awareness.)
     fn page_role(&self) -> HeaderRole {
-        let page_no = self.pages.len() + 1;
         if self.section_first_page_pending && self.title_pg {
             HeaderRole::First
-        } else if self.even_and_odd_headers && page_no % 2 == 0 {
+        } else if self.even_and_odd_headers && self.current_formatted_page_no() % 2 == 0 {
             HeaderRole::Even
         } else {
             HeaderRole::Default
         }
+    }
+
+    /// The formatted (displayed) number of the page currently being
+    /// filled — the same value a PAGE field on it renders. Shared by
+    /// role parity and `flush_page`'s `PageBox::page_number` stamp so
+    /// they can never diverge.
+    fn current_formatted_page_no(&self) -> u32 {
+        let doc_page = self.doc_page_offset + self.pages.len() as u32 + 1;
+        let section_start_doc_page = self.doc_page_offset + 1;
+        match self.page_num.start {
+            Some(n) => n + doc_page.saturating_sub(section_start_doc_page),
+            None => doc_page,
+        }
+    }
+
+    /// Issue #71 — how far the given role's HEADER band spills past
+    /// the top margin. Body content on such a page starts below the
+    /// band instead of overlapping it (Word treats the header offset
+    /// as a soft minimum).
+    fn header_intrusion(&self, role: HeaderRole) -> f32 {
+        let h = self
+            .headers
+            .resolve(role)
+            .map_or(0.0, HeaderFooterBox::content_height);
+        (self.geometry.header_offset + h - self.geometry.margins.top).max(0.0)
+    }
+
+    /// Footer twin of [`Self::header_intrusion`] — the band grows
+    /// UPWARD past the bottom margin, shrinking the body budget.
+    fn footer_intrusion(&self, role: HeaderRole) -> f32 {
+        let h = self
+            .footers
+            .resolve(role)
+            .map_or(0.0, HeaderFooterBox::content_height);
+        (self.geometry.footer_offset + h - self.geometry.margins.bottom).max(0.0)
+    }
+
+    /// Where `cur_y` opens on the page/column currently being filled:
+    /// 0 for a band that fits its margin, the intrusion depth when it
+    /// spills. Uses the OPENING page's role — callers must invoke this
+    /// AFTER `pages.push` + the pending-flag update (design review B3:
+    /// reusing the closing page's role feeds the wrong band height).
+    fn opening_cur_y(&self) -> f32 {
+        self.header_intrusion(self.page_role())
     }
 
     /// Phase 8a — install the per-document footnote body table. The
@@ -426,7 +484,9 @@ impl Paginator {
     fn advance_column_or_flush_page(&mut self) -> bool {
         if (self.cur_column_index as u16 + 1) < self.column_count as u16 {
             self.cur_column_index += 1;
-            self.cur_y = 0.0;
+            /* Same page → same role → same header intrusion: every
+            column starts below the band (issue #71). */
+            self.cur_y = self.opening_cur_y();
             false
         } else {
             self.flush_page();
@@ -460,6 +520,9 @@ impl Paginator {
         self.column_count = 1;
         self.column_gutter = 0.0;
         self.cur_column_index = 0;
+        /* The flush above seeded `cur_y` from the OLD section's bands;
+        the new section's first page opens under its own (issue #71). */
+        self.cur_y = self.opening_cur_y();
     }
 
     /// Update the document-wide `even_and_odd_headers` toggle mid-flow.
@@ -503,7 +566,10 @@ impl Paginator {
             .collect();
         let (added_height, added_separator) = self.try_consume_footnotes(&new_refs);
 
-        let remaining = self.geometry.content_height() - self.cur_y - self.cur_footnote_height;
+        let remaining = self.geometry.content_height()
+            - self.cur_y
+            - self.cur_footnote_height
+            - self.footer_intrusion(self.page_role());
         let block_height = block.size().height;
 
         /* Paragraphs always run through the line-splitter when they
@@ -645,7 +711,10 @@ impl Paginator {
             return;
         }
 
-        let remaining = self.geometry.content_height() - self.cur_y - self.cur_footnote_height;
+        let remaining = self.geometry.content_height()
+            - self.cur_y
+            - self.cur_footnote_height
+            - self.footer_intrusion(self.page_role());
         let (head, tail) = split_paragraph_at_line(&para, remaining);
 
         match (head, tail) {
@@ -725,7 +794,15 @@ impl Paginator {
         let mut head_height = 0.0_f32;
         let mut tail_rows = Vec::new();
         let mut tail_height = 0.0_f32;
-        let budget = self.geometry.content_height();
+        /* Design review M3 — an "empty" page no longer implies
+        `cur_y == 0`: the header-intrusion opening offset (and any
+        footer intrusion) already consumed budget. The old bare
+        `content_height()` here silently seated rows into the footer
+        band on intruded pages. */
+        let budget = self.geometry.content_height()
+            - self.cur_y
+            - self.cur_footnote_height
+            - self.footer_intrusion(self.page_role());
         for row in table.rows.iter() {
             let row_h = row.size.height;
             if head_height + row_h <= budget || head_rows.is_empty() {
@@ -814,6 +891,7 @@ impl Paginator {
         doc_page: u32,
         page_num: engine::PageNumType,
         section_start_doc_page: u32,
+        render_date: Option<(i32, u32, u32)>,
     ) {
         for f in para.fields.iter_mut() {
             /* Keyword extraction lives on `engine::Field` so the
@@ -825,17 +903,31 @@ impl Paginator {
                 end: f.byte_range.end,
                 instruction: f.instruction.clone(),
             };
-            if synthetic.keyword() == "PAGE" {
-                /* Audit gap A.M11 — section-relative page numbering.
-                `start: Some(n)` rebases: the section's first page is
-                `n`, every subsequent page is `n + (doc_page -
-                section_start_doc_page)`. `start: None` keeps the
-                doc-wide count. Format renders the integer. */
-                let section_page = match page_num.start {
-                    Some(n) => n + doc_page.saturating_sub(section_start_doc_page),
-                    None => doc_page,
-                };
-                f.evaluated_text = Some(page_num.format.render(section_page));
+            match synthetic.keyword().as_str() {
+                "PAGE" => {
+                    /* Audit gap A.M11 — section-relative page numbering.
+                    `start: Some(n)` rebases: the section's first page is
+                    `n`, every subsequent page is `n + (doc_page -
+                    section_start_doc_page)`. `start: None` keeps the
+                    doc-wide count. Format renders the integer. */
+                    let section_page = match page_num.start {
+                        Some(n) => n + doc_page.saturating_sub(section_start_doc_page),
+                        None => doc_page,
+                    };
+                    f.evaluated_text = Some(page_num.format.render(section_page));
+                }
+                /* Issue #43 — DATE resolves against the shell-injected
+                render date (Word updates DATE on open/print). No date
+                installed → cached text stands. */
+                "DATE" => {
+                    if let Some((y, m, d)) = render_date {
+                        let pic = synthetic
+                            .date_picture()
+                            .unwrap_or_else(|| "M/d/yyyy".to_string());
+                        f.evaluated_text = Some(engine::render_date_picture(&pic, y, m, d));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -862,7 +954,9 @@ impl Paginator {
 
     fn flush_page(&mut self) {
         let blocks = std::mem::take(&mut self.cur_blocks);
-        self.cur_y = 0.0;
+        /* `cur_y` is re-seeded at the END of this fn — the opening
+        offset depends on the NEXT page's role, which is only known
+        after `pages.push` (design review B3). */
         /* Audit gap A.H2 — every page starts in column 0 of its
         section's column descriptor. The descriptor itself
         (`column_count` / `column_gutter`) stays — it is a section
@@ -913,26 +1007,46 @@ impl Paginator {
         let doc_page = self.doc_page_offset + (self.pages.len() as u32) + 1;
         let section_start_doc_page = self.doc_page_offset + 1;
         let page_num = self.page_num;
+        let render_date = self.render_date;
         let mut blocks = blocks;
         for block in blocks.iter_mut() {
             Self::for_each_paragraph_in_block(block, &mut |p| {
-                Self::evaluate_fields_on_paragraph(p, doc_page, page_num, section_start_doc_page);
+                Self::evaluate_fields_on_paragraph(
+                    p,
+                    doc_page,
+                    page_num,
+                    section_start_doc_page,
+                    render_date,
+                );
             });
         }
         if let Some(hf) = header.as_mut() {
-            for p in hf.paragraphs.iter_mut() {
-                Self::evaluate_fields_on_paragraph(p, doc_page, page_num, section_start_doc_page);
-            }
+            hf.for_each_paragraph_mut(&mut |p| {
+                Self::evaluate_fields_on_paragraph(
+                    p,
+                    doc_page,
+                    page_num,
+                    section_start_doc_page,
+                    render_date,
+                );
+            });
         }
         if let Some(hf) = footer.as_mut() {
-            for p in hf.paragraphs.iter_mut() {
-                Self::evaluate_fields_on_paragraph(p, doc_page, page_num, section_start_doc_page);
-            }
+            hf.for_each_paragraph_mut(&mut |p| {
+                Self::evaluate_fields_on_paragraph(
+                    p,
+                    doc_page,
+                    page_num,
+                    section_start_doc_page,
+                    render_date,
+                );
+            });
         }
 
         /* Even an empty page is emitted on an explicit `force_page_break`
         / `start_new_section` — the renderer paints the blank sheet so a
         section break is visible. */
+        let page_number = self.current_formatted_page_no();
         self.pages.push(PageBox {
             size: Size {
                 width: self.geometry.width,
@@ -948,12 +1062,22 @@ impl Paginator {
             header_offset: self.geometry.header_offset,
             footer_offset: self.geometry.footer_offset,
             footnotes,
+            /* Issues #70/#74/#43 — which band slot this page resolved
+            and the formatted number it displays. Enter-header/footer
+            derives the double-clicked page's role from `hf_role`; the
+            field-resolution pass reads `page_number`. */
+            hf_role: role,
+            page_number,
         });
 
         /* Clear the section-first-page flag once a page has flushed for
         the section. Subsequent pages in the same section pick
         `Default` or `Even`. */
         self.section_first_page_pending = false;
+        /* Design review B3 — NOW the next page's role is computable
+        (pages.len() bumped, pending flag settled): open below its own
+        header band. */
+        self.cur_y = self.opening_cur_y();
     }
 
     /// Finalize — drain the in-progress page and return every page emitted.
@@ -987,14 +1111,10 @@ impl Paginator {
                 Self::for_each_paragraph_in_block(block, &mut stamp);
             }
             if let Some(hf) = page.header.as_mut() {
-                for p in hf.paragraphs.iter_mut() {
-                    stamp(p);
-                }
+                hf.for_each_paragraph_mut(&mut stamp);
             }
             if let Some(hf) = page.footer.as_mut() {
-                for p in hf.paragraphs.iter_mut() {
-                    stamp(p);
-                }
+                hf.for_each_paragraph_mut(&mut stamp);
             }
         }
         self.pages
@@ -1348,7 +1468,7 @@ mod tests {
     /// on a page by reading back `tag` from the emitted `PageBox`.
     fn fake_band(tag: u32) -> HeaderFooterBox {
         HeaderFooterBox {
-            paragraphs: vec![ParagraphBox {
+            blocks: vec![LayoutBlock::Paragraph(ParagraphBox {
                 origin: Point { x: 0.0, y: 0.0 },
                 size: Size {
                     width: 200.0,
@@ -1362,7 +1482,8 @@ mod tests {
                 page_break_after_line: Vec::new(),
                 borders: None,
                 shading: None,
-            }],
+            })],
+            source_rid: None,
         }
     }
 
@@ -1372,7 +1493,11 @@ mod tests {
     fn header_tag(p: &PageBox) -> u32 {
         p.header
             .as_ref()
-            .and_then(|h| h.paragraphs.first())
+            .and_then(|h| h.blocks.first())
+            .and_then(|b| match b {
+                LayoutBlock::Paragraph(p) => Some(p),
+                LayoutBlock::Table(_) => None,
+            })
             .map_or(u32::MAX, |para| para.source_paragraph_id)
     }
 
@@ -1480,7 +1605,10 @@ mod tests {
         let geom = a4_geometry();
         let header_bands = HeaderBands {
             default: Some(HeaderFooterBox {
-                paragraphs: vec![fake_paragraph_with_field("PAGE", 16.0)],
+                blocks: vec![LayoutBlock::Paragraph(fake_paragraph_with_field(
+                    "PAGE", 16.0,
+                ))],
+                source_rid: None,
             }),
             first: None,
             even: None,
@@ -1494,7 +1622,9 @@ mod tests {
         assert!(pages.len() >= 3);
         let header_eval = |page: &PageBox| -> Option<String> {
             let hf = page.header.as_ref()?;
-            let para = hf.paragraphs.first()?;
+            let LayoutBlock::Paragraph(para) = hf.blocks.first()? else {
+                return None;
+            };
             para.fields.first().and_then(|f| f.evaluated_text.clone())
         };
         /* Each page's header carries the OWN page number, not a global
@@ -1515,7 +1645,10 @@ mod tests {
         let geom = a4_geometry();
         let footer_bands = HeaderBands {
             default: Some(HeaderFooterBox {
-                paragraphs: vec![fake_paragraph_with_field("NUMPAGES", 16.0)],
+                blocks: vec![LayoutBlock::Paragraph(fake_paragraph_with_field(
+                    "NUMPAGES", 16.0,
+                ))],
+                source_rid: None,
             }),
             first: None,
             even: None,
@@ -1531,7 +1664,11 @@ mod tests {
             let f = page
                 .footer
                 .as_ref()
-                .and_then(|hf| hf.paragraphs.first())
+                .and_then(|hf| hf.blocks.first())
+                .and_then(|b| match b {
+                    LayoutBlock::Paragraph(p) => Some(p),
+                    LayoutBlock::Table(_) => None,
+                })
                 .and_then(|p| p.fields.first())
                 .and_then(|f| f.evaluated_text.clone());
             assert_eq!(f.as_deref(), Some("4"), "page {i} footer NUMPAGES");
@@ -1749,9 +1886,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_first_falls_back_to_default() {
-        /* `title_pg` requests `First`, but only `Default` is set —
-        OOXML §17.10.3 fallback: every page reads Default. */
+    fn missing_first_is_a_blank_band_not_default() {
+        /* Issue #70 flipped this pin: `title_pg` requests `First` and
+        only `Default` is set — §17.10.3 inherits each role
+        independently across sections and an exhausted chain is a
+        BLANK band. Word observably shows an empty first-page header
+        when titlePg is on with no first part; the Default content
+        must NOT bleed through. Pages after the first read Default as
+        before. */
         let geom = a4_geometry();
         let headers = HeaderBands {
             default: Some(fake_band(7)),
@@ -1761,11 +1903,16 @@ mod tests {
         let mut pag = Paginator::new(geom, headers, HeaderBands::default(), true, false);
         pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
         pag.force_page_break();
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
         let pages = pag.finish();
+        assert!(
+            pages[0].header.is_none(),
+            "titlePg with no First part → blank first-page header"
+        );
         assert_eq!(
-            header_tag(&pages[0]),
+            header_tag(&pages[1]),
             7,
-            "missing First slot must fall back to Default"
+            "subsequent pages read Default as before"
         );
     }
 
@@ -2009,5 +2156,204 @@ mod tests {
             (col1_tail - 120.0).abs() < 0.5,
             "col 1 absorbs the three 40 pt blocks; got {col1_tail}"
         );
+    }
+
+    /// Taller `fake_band` variant for the intrusion tests — one
+    /// paragraph of the given height.
+    fn fake_band_tall(tag: u32, height: f32) -> HeaderFooterBox {
+        let mut band = fake_band(tag);
+        if let Some(LayoutBlock::Paragraph(p)) = band.blocks.first_mut() {
+            p.size.height = height;
+        }
+        band
+    }
+
+    #[test]
+    fn even_odd_parity_survives_a_section_boundary() {
+        /* Issue #74 regression — the old `pages.len() + 1` parity
+        reset on every fresh (per-section) Paginator, so a section
+        starting on doc page 2 wrongly opened with the ODD header.
+        `doc_page_offset` carries the true document-wide count. */
+        let geom = a4_geometry();
+        let headers = HeaderBands {
+            default: Some(fake_band(10)),
+            first: None,
+            even: Some(fake_band(20)),
+        };
+        let mut pag = Paginator::new(geom, headers, HeaderBands::default(), false, true);
+        /* Simulate "one page already emitted by the prior section". */
+        pag.set_page_numbering(engine::PageNumType::default(), 1);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(
+            header_tag(&pages[0]),
+            20,
+            "section opening on doc page 2 shows the EVEN header"
+        );
+    }
+
+    #[test]
+    fn even_odd_parity_is_restart_aware() {
+        /* Design decision R-M4 — Word keys even/odd bands to the page
+        NUMBER, not the physical sheet: a section restarting at 2
+        opens with the even-page header even on the document's first
+        physical page. */
+        let geom = a4_geometry();
+        let headers = HeaderBands {
+            default: Some(fake_band(10)),
+            first: None,
+            even: Some(fake_band(20)),
+        };
+        let mut pag = Paginator::new(geom, headers, HeaderBands::default(), false, true);
+        pag.set_page_numbering(
+            engine::PageNumType {
+                start: Some(2),
+                ..Default::default()
+            },
+            0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        pag.force_page_break();
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(header_tag(&pages[0]), 20, "displays 2 → even band");
+        assert_eq!(header_tag(&pages[1]), 10, "displays 3 → default band");
+        assert_eq!(pages[0].page_number, 2, "formatted number stamped");
+        assert_eq!(pages[1].page_number, 3);
+    }
+
+    #[test]
+    fn tall_header_band_pushes_body_content_down() {
+        /* Issue #71 — header intrusion. Band 100 pt, header_offset 36,
+        margins.top 72 → the band's bottom sits at 136, i.e. 64 pt past
+        the margin. Body line 1 must open at cur_y = 64, not 0. */
+        let geom = a4_geometry();
+        let headers = HeaderBands {
+            default: Some(fake_band_tall(9, 100.0)),
+            first: None,
+            even: None,
+        };
+        let mut pag = Paginator::new(geom, headers, HeaderBands::default(), false, false);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let pages = pag.finish();
+        let first_block_y = pages[0].blocks[0].origin().y;
+        assert!(
+            (first_block_y - 64.0).abs() < 0.5,
+            "body opens below the intruding band; got {first_block_y}"
+        );
+    }
+
+    #[test]
+    fn tall_footer_band_shrinks_the_body_budget() {
+        /* Footer 100 pt, footer_offset 36, margins.bottom 72 → 64 pt
+        of body budget consumed from the bottom. content_height 697.9;
+        with 16 pt lines: floor((697.9 - 64) / 16) = 39 lines fit. */
+        let geom = a4_geometry();
+        let footers = HeaderBands {
+            default: Some(fake_band_tall(9, 100.0)),
+            first: None,
+            even: None,
+        };
+        let mut pag = Paginator::new(geom, HeaderBands::default(), footers, false, false);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(60, 16.0)), 0.0, 0.0);
+        let pages = pag.finish();
+        let page0_lines = match &pages[0].blocks[0] {
+            LayoutBlock::Paragraph(p) => p.lines.len(),
+            LayoutBlock::Table(_) => 0,
+        };
+        let budget = geom.content_height() - 64.0;
+        let expect = (budget / 16.0).floor() as usize;
+        assert_eq!(
+            page0_lines, expect,
+            "footer intrusion trims the split budget"
+        );
+        assert!(pages.len() >= 2, "overflow flowed to page 2");
+    }
+
+    #[test]
+    fn opening_intrusion_uses_the_next_pages_role() {
+        /* Design review B3 — title_pg with a TALL First band (100 pt →
+        64 pt intrusion) and a short Default band. Page 1 opens at 64;
+        page 2 must open at 0 (Default role), NOT reuse page 1's First
+        intrusion. */
+        let geom = a4_geometry();
+        let headers = HeaderBands {
+            default: Some(fake_band(10)),
+            first: Some(fake_band_tall(11, 100.0)),
+            even: None,
+        };
+        let mut pag = Paginator::new(geom, headers, HeaderBands::default(), true, false);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        pag.force_page_break();
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let pages = pag.finish();
+        assert!(
+            (pages[0].blocks[0].origin().y - 64.0).abs() < 0.5,
+            "page 1 opens below the First band"
+        );
+        assert!(
+            pages[1].blocks[0].origin().y.abs() < 0.5,
+            "page 2 opens at the margin (Default role, no intrusion); got {}",
+            pages[1].blocks[0].origin().y
+        );
+        assert_eq!(pages[0].hf_role, HeaderRole::First);
+        assert_eq!(pages[1].hf_role, HeaderRole::Default);
+    }
+
+    #[test]
+    fn date_field_resolves_against_the_render_date() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::new(
+            geom,
+            HeaderBands::default(),
+            HeaderBands::default(),
+            false,
+            false,
+        )
+        .with_render_date(Some((2026, 7, 5)));
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_field("DATE \\@ \"yyyy-MM-dd\"", 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_field("DATE", 16.0)),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        let evals: Vec<Option<String>> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                LayoutBlock::Paragraph(p) => {
+                    Some(p.fields.first().and_then(|f| f.evaluated_text.clone()))
+                }
+                LayoutBlock::Table(_) => None,
+            })
+            .collect();
+        assert_eq!(evals[0].as_deref(), Some("2026-07-05"), "picture honoured");
+        assert_eq!(evals[1].as_deref(), Some("7/5/2026"), "Word en-default");
+
+        /* No render date installed → cached text stands (None). */
+        let mut bare = Paginator::new(
+            geom,
+            HeaderBands::default(),
+            HeaderBands::default(),
+            false,
+            false,
+        );
+        bare.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_field("DATE", 16.0)),
+            0.0,
+            0.0,
+        );
+        let pages = bare.finish();
+        let ev = match &pages[0].blocks[0] {
+            LayoutBlock::Paragraph(p) => p.fields[0].evaluated_text.clone(),
+            LayoutBlock::Table(_) => None,
+        };
+        assert_eq!(ev, None, "DATE is inert without an injected date");
     }
 }

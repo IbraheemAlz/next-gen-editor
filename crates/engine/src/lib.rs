@@ -72,18 +72,20 @@ pub struct DocumentTree {
     /// made `set_section_*` silent no-ops on new documents).
     pub body_section: SectionProps,
     /// Phase 6b — parsed header parts keyed by the OOXML relationship id
-    /// (`r:id` from `<w:headerReference>`). Each value is the flat
-    /// per-paragraph plain text the header reader extracted. The
-    /// paginator looks each `Section`'s `header_ref` up here and renders
-    /// the result in the top margin band.
-    pub headers: std::collections::HashMap<String, Vec<Paragraph>>,
-    /// Mirror of `headers` for `<w:footerReference>`. Phase 2 audit
-    /// (gap D.1 follow-up) — was `Vec<String>`; widened to full
-    /// `Paragraph` so headers/footers carry style spans, inline
-    /// objects, hyperlinks, revisions and `Field` overlays. The
-    /// paginator's per-page field evaluator stamps PAGE/NUMPAGES on
-    /// the laid-out copies these paragraphs produce.
-    pub footers: std::collections::HashMap<String, Vec<Paragraph>>,
+    /// (`r:id` from `<w:headerReference>`). Issue #72 widened the value
+    /// from `Vec<Paragraph>` to `Vec<Block>` so `<w:tbl>` inside a
+    /// header part survives — the same body/cell block model, so the
+    /// story adapter can run every body mutation against a part. The
+    /// paginator looks each `Section`'s refs up here and renders the
+    /// blocks in the top margin band. `section_end` markers are
+    /// meaningless inside a part and are stripped at every write path.
+    pub headers: std::collections::HashMap<String, Vec<Block>>,
+    /// Mirror of `headers` for `<w:footerReference>`. Carries the full
+    /// block model: style spans, inline objects, hyperlinks, revisions,
+    /// `Field` overlays and tables. The paginator's per-page field
+    /// evaluator stamps PAGE/NUMPAGES on the laid-out copies these
+    /// blocks produce.
+    pub footers: std::collections::HashMap<String, Vec<Block>>,
     /// Phase 7 — image blobs keyed by their relationship id (`r:id`). The
     /// archive reader fills this from `word/media/*` for every image rel
     /// the document references. Inline images look up by the `rel_id`
@@ -138,6 +140,11 @@ pub struct DocumentTree {
     /// mutated (or created) since load; the writer regenerates exactly
     /// these and passthroughs the rest byte-identical.
     pub hf_dirty: HfDirty,
+    /// Issues #74/#43 — flips when the engine mutates `settings`
+    /// (currently only `even_and_odd_headers`); the writer then patches
+    /// `word/settings.xml` in place. Mirror of `styles_dirty` /
+    /// `NumberingDefinitions.dirty`. Never set by reads.
+    pub settings_dirty: bool,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -302,8 +309,10 @@ pub enum HeaderFooterRole {
 }
 
 /// Per-role header / footer references. The reader fills the slots based
-/// on each `<w:headerReference w:type="…" r:id="…"/>` in a section;
-/// missing roles stay `None` and fall back to `Default` at paint time.
+/// on each `<w:headerReference w:type="…" r:id="…"/>` in a section; a
+/// `None` slot means "inherit from the previous section" (§17.10.3) —
+/// resolved by [`resolve_hf_inheritance`], NOT by a same-section
+/// default-fallback.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeaderFooterRefs {
     pub default: Option<String>,
@@ -325,18 +334,60 @@ impl HeaderFooterRefs {
         }
     }
 
-    /// Look up the rId for `role`, falling back to `Default` if the
-    /// requested role is unset (OOXML §17.10.3 — the default header
-    /// stands in for any unset variant). Returns `None` when even the
-    /// default is missing.
+    /// The slot for `role`, exactly. Issue #70 REMOVED the old
+    /// role→Default same-section fallback: per §17.10.3 each role
+    /// inherits independently ACROSS sections ([`resolve_hf_inheritance`])
+    /// and an exhausted chain means a BLANK band — Word observably shows
+    /// an empty first-page header when titlePg is on with no first ref,
+    /// not the Default content bleeding through.
     pub fn resolve(&self, role: HeaderFooterRole) -> Option<&str> {
-        let primary = match role {
+        match role {
             HeaderFooterRole::Default => self.default.as_deref(),
             HeaderFooterRole::First => self.first.as_deref(),
             HeaderFooterRole::Even => self.even.as_deref(),
-        };
-        primary.or(self.default.as_deref())
+        }
     }
+
+    /// Backfill every `None` slot from `from` — the §17.10.3 forward
+    /// fold's single step.
+    fn inherit_missing_from(&mut self, from: &HeaderFooterRefs) {
+        if self.default.is_none() {
+            self.default = from.default.clone();
+        }
+        if self.first.is_none() {
+            self.first = from.first.clone();
+        }
+        if self.even.is_none() {
+            self.even = from.even.clone();
+        }
+    }
+}
+
+/// Issue #70 — §17.10.3 Link-to-Previous inheritance, derived at
+/// consumption time (storage stays absence-based so the writer
+/// round-trips Word's linked sections faithfully). Returns one
+/// fully-resolved `(header_refs, footer_refs)` pair per section: a
+/// section's own slot wins; a `None` slot carries the nearest earlier
+/// section's resolved slot; still-`None` after section 0 = blank band.
+///
+/// Deliberately NOT stored on [`Section`]/[`SectionProps`]:
+/// `insert_section_break_at` copies `SectionProps::from(&Section)` into
+/// storage, and resolved refs riding that copy would silently
+/// denormalize the linked state.
+pub fn resolve_hf_inheritance(sections: &[Section]) -> Vec<(HeaderFooterRefs, HeaderFooterRefs)> {
+    let mut out = Vec::with_capacity(sections.len());
+    let mut carried_h = HeaderFooterRefs::default();
+    let mut carried_f = HeaderFooterRefs::default();
+    for section in sections {
+        let mut h = section.header_refs.clone();
+        let mut f = section.footer_refs.clone();
+        h.inherit_missing_from(&carried_h);
+        f.inherit_missing_from(&carried_f);
+        carried_h = h.clone();
+        carried_f = f.clone();
+        out.push((h, f));
+    }
+    out
 }
 
 /// Audit gap A.H2 — `<w:sectPr><w:cols/>` descriptor. Holds the column
@@ -1069,6 +1120,61 @@ impl Field {
             _ => None,
         }
     }
+
+    /// Issue #43 — the `\@ "…"` date-picture switch, or `None` when the
+    /// instruction carries none (the evaluator then uses the Word
+    /// en-default `M/d/yyyy`).
+    pub fn date_picture(&self) -> Option<String> {
+        let ins = &self.instruction;
+        let at = ins.find("\\@")?;
+        let rest = ins[at + 2..].trim_start();
+        if let Some(stripped) = rest.strip_prefix('"') {
+            let end = stripped.find('"')?;
+            Some(stripped[..end].to_string())
+        } else {
+            /* Unquoted picture — runs to the next switch or the end. */
+            let tok = rest.split_whitespace().next()?;
+            (!tok.starts_with('\\')).then(|| tok.to_string())
+        }
+    }
+}
+
+/// Issue #43 — render `(year, month, day)` through a minimal subset of
+/// Word's date-picture language: `yyyy`, `yy`, `MM`, `M`, `dd`, `d`
+/// (longest-match, case-sensitive per Word: `M` = month, `d` = day —
+/// `mm`/minutes is out of scope, time fields are not evaluated).
+/// Unrecognized characters pass through verbatim.
+pub fn render_date_picture(picture: &str, year: i32, month: u32, day: u32) -> String {
+    let mut out = String::with_capacity(picture.len() + 4);
+    let bytes = picture.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &picture[i..];
+        if rest.starts_with("yyyy") {
+            out.push_str(&format!("{year:04}"));
+            i += 4;
+        } else if rest.starts_with("yy") {
+            out.push_str(&format!("{:02}", year.rem_euclid(100)));
+            i += 2;
+        } else if rest.starts_with("MM") {
+            out.push_str(&format!("{month:02}"));
+            i += 2;
+        } else if rest.starts_with('M') {
+            out.push_str(&month.to_string());
+            i += 1;
+        } else if rest.starts_with("dd") {
+            out.push_str(&format!("{day:02}"));
+            i += 2;
+        } else if rest.starts_with('d') {
+            out.push_str(&day.to_string());
+            i += 1;
+        } else {
+            let ch = rest.chars().next().expect("non-empty rest");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 /// Phase 8b — kind of tracked-change revision.
@@ -1549,6 +1655,34 @@ impl Paragraph {
                 });
             }
         }
+        /* Issue #43 (field engine) — FIELD overlays are remapped, not
+        dropped: a PAGE field in a footer must survive the user editing
+        around it. Rules: strictly before the gap → unchanged; strictly
+        after → shift left; fully CONTAINING the gap → shrink (Word
+        keeps a field whose cached result you edit); anything crossing
+        a gap boundary → drop (the atom is broken). Hyperlink/revision/
+        inline-object remapping stays out of scope (issue #56). */
+        let mut fields = Vec::new();
+        for f in &self.fields {
+            if f.end <= s {
+                fields.push(f.clone());
+            } else if f.start >= e {
+                fields.push(Field {
+                    start: f.start - gap,
+                    end: f.end - gap,
+                    instruction: f.instruction.clone(),
+                });
+            } else if f.start <= s && f.end >= e {
+                let nf = Field {
+                    start: f.start,
+                    end: f.end - gap,
+                    instruction: f.instruction.clone(),
+                };
+                if nf.start < nf.end {
+                    fields.push(nf);
+                }
+            }
+        }
         Paragraph {
             text,
             spans,
@@ -1559,14 +1693,14 @@ impl Paragraph {
             dirty: true,
             source_xml: None,
             /* Unlike `apply_style` (issue #56), THIS rebuild changes `text` —
-            every stashed byte offset (hyperlink spans, revision ranges,
-            field anchors) would dangle across the deleted range. Clearing
-            these overlays is a known, deliberately out-of-scope limitation
-            (offset remapping is a separate, larger task), not an oversight. */
+            every stashed byte offset (hyperlink spans, revision ranges)
+            would dangle across the deleted range. Clearing these overlays
+            is a known, deliberately out-of-scope limitation (offset
+            remapping is a separate, larger task), not an oversight. */
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
-            fields: Vec::new(),
+            fields,
             style_id: None,
             direct_overrides: ParaProperties::default(),
             /* Phase 3 (#40) — NOT cleared with the overlays above: the
@@ -1600,8 +1734,23 @@ impl Paragraph {
         }
         /* Splitting shifts every offset in the right half to be relative to
         `at` — the same "offsets genuinely shift" class as `delete_text`
-        (see its comment). Overlay-dropping here is the same deliberately
-        out-of-scope limitation, not an oversight (issue #56). */
+        (see its comment). Hyperlink/revision dropping is the same
+        deliberately out-of-scope limitation (issue #56); FIELDS remap
+        (issue #43): whole-side fields survive, a field straddling the
+        split point is dropped (the atom is broken). */
+        let mut fields_left = Vec::new();
+        let mut fields_right = Vec::new();
+        for f in &self.fields {
+            if f.end <= at {
+                fields_left.push(f.clone());
+            } else if f.start >= at {
+                fields_right.push(Field {
+                    start: f.start - at,
+                    end: f.end - at,
+                    instruction: f.instruction.clone(),
+                });
+            }
+        }
         (
             Paragraph {
                 text: self.text[..at as usize].to_owned(),
@@ -1615,7 +1764,7 @@ impl Paragraph {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
-                fields: Vec::new(),
+                fields: fields_left,
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
                 /* Phase 3 (#40) — the LEFT half receives a brand-new
@@ -1635,7 +1784,7 @@ impl Paragraph {
                 inline_objects: Vec::new(),
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
-                fields: Vec::new(),
+                fields: fields_right,
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
                 /* Phase 3 (#40) — the ORIGINAL paragraph mark terminates
@@ -1662,10 +1811,19 @@ impl Paragraph {
         }
         /* Concatenation shifts `other`'s offsets right by `self`'s length —
         the same "offsets genuinely shift" class as `delete_text` (see its
-        comment). Overlay-dropping here is the same deliberately
+        comment). Hyperlink/revision dropping is the same deliberately
         out-of-scope limitation, not an oversight (issue #56); the merged
         paragraph also has two candidate `style_id`s to reconcile, which
-        offset remapping would need to resolve anyway. */
+        offset remapping would need to resolve anyway. FIELDS remap
+        (issue #43): both sides' fields survive, tail's shifted right. */
+        let mut fields = self.fields.clone();
+        for f in &other.fields {
+            fields.push(Field {
+                start: f.start + shift,
+                end: f.end + shift,
+                instruction: f.instruction.clone(),
+            });
+        }
         Paragraph {
             text,
             spans,
@@ -1678,7 +1836,7 @@ impl Paragraph {
             inline_objects: Vec::new(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
-            fields: Vec::new(),
+            fields,
             style_id: None,
             direct_overrides: ParaProperties::default(),
             /* Phase 3 (#40) — DELIBERATELY INVERTED from the head-wins
@@ -1690,6 +1848,113 @@ impl Paragraph {
             section's properties). Do not "fix" this to self.*. */
             section_end: other.section_end.clone(),
         }
+    }
+
+    /// Issue #43 (design review M5) — replace byte range `[start, end)`
+    /// with `replacement`, remapping EVERY overlay with the full
+    /// clamp-and-drop-degenerate discipline:
+    ///
+    /// - offsets ≤ `start` are unchanged; offsets ≥ `end` shift by the
+    ///   length delta;
+    /// - a START boundary strictly inside the range clamps to `start`,
+    ///   an END boundary strictly inside clamps to `start + rep_len`
+    ///   (a span reaching into the replaced text stretches over the
+    ///   whole replacement — visually closest for bold-over-a-field);
+    /// - degenerate results (`start >= end`) are dropped;
+    /// - an inline-object anchor strictly inside the range is dropped
+    ///   (its sentinel byte no longer exists).
+    ///
+    /// This is the field-resolution splice primitive: the per-page
+    /// reshape and the body substitution pass both run it on CLONES
+    /// destined for layout — it deliberately does NOT set `dirty` or
+    /// clear `source_xml` (the model text is not being edited).
+    pub fn with_spliced_range(&self, start: u32, end: u32, replacement: &str) -> Paragraph {
+        let len = self.text.len() as u32;
+        let start = start.min(len);
+        let end = end.clamp(start, len);
+        let rep_len = replacement.len() as u32;
+        let old_len = end - start;
+        let mut text = self.text.clone();
+        text.replace_range(start as usize..end as usize, replacement);
+        let map_start = |o: u32| -> u32 {
+            if o <= start {
+                o
+            } else if o >= end {
+                o - old_len + rep_len
+            } else {
+                start
+            }
+        };
+        let map_end = |o: u32| -> u32 {
+            if o <= start {
+                o
+            } else if o >= end {
+                o - old_len + rep_len
+            } else {
+                start + rep_len
+            }
+        };
+        let mut out = self.clone();
+        out.text = text;
+        out.spans = self
+            .spans
+            .iter()
+            .filter_map(|s| {
+                let (ns, ne) = (map_start(s.start), map_end(s.end));
+                (ns < ne).then(|| StyleRun {
+                    start: ns,
+                    end: ne,
+                    style: s.style.clone(),
+                })
+            })
+            .collect();
+        out.hyperlinks = self
+            .hyperlinks
+            .iter()
+            .filter_map(|h| {
+                let (ns, ne) = (map_start(h.start), map_end(h.end));
+                (ns < ne).then(|| Hyperlink {
+                    start: ns,
+                    end: ne,
+                    target: h.target.clone(),
+                })
+            })
+            .collect();
+        out.revisions = self
+            .revisions
+            .iter()
+            .filter_map(|r| {
+                let (ns, ne) = (map_start(r.start), map_end(r.end));
+                (ns < ne).then(|| {
+                    let mut nr = r.clone();
+                    nr.start = ns;
+                    nr.end = ne;
+                    nr
+                })
+            })
+            .collect();
+        out.fields = self
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let (ns, ne) = (map_start(f.start), map_end(f.end));
+                (ns < ne).then(|| Field {
+                    start: ns,
+                    end: ne,
+                    instruction: f.instruction.clone(),
+                })
+            })
+            .collect();
+        out.inline_objects = self
+            .inline_objects
+            .iter()
+            .filter(|o| o.at <= start || o.at >= end)
+            .map(|o| InlineObject {
+                at: map_start(o.at),
+                kind: o.kind.clone(),
+            })
+            .collect();
+        out
     }
 
     /// Byte offset of the UAX-#29 extended grapheme cluster boundary
@@ -2013,6 +2278,7 @@ impl DocumentTree {
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
+            settings_dirty: false,
         }
     }
 
@@ -2052,6 +2318,7 @@ impl DocumentTree {
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
+            settings_dirty: false,
         }
     }
 
@@ -2093,6 +2360,7 @@ impl DocumentTree {
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
+            settings_dirty: false,
         }
     }
 
@@ -2119,6 +2387,7 @@ impl DocumentTree {
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
+            settings_dirty: false,
         }
     }
 
@@ -2145,6 +2414,7 @@ impl DocumentTree {
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
+            settings_dirty: false,
         }
     }
 
@@ -2224,6 +2494,7 @@ impl DocumentTree {
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
+            settings_dirty: false,
         }
     }
 
@@ -2233,8 +2504,8 @@ impl DocumentTree {
     /// `header_ref` / `footer_ref` resolves.
     pub fn with_header_footer_parts(
         mut self,
-        headers: std::collections::HashMap<String, Vec<Paragraph>>,
-        footers: std::collections::HashMap<String, Vec<Paragraph>>,
+        headers: std::collections::HashMap<String, Vec<Block>>,
+        footers: std::collections::HashMap<String, Vec<Block>>,
     ) -> Self {
         self.headers = headers;
         self.footers = footers;
@@ -2245,17 +2516,22 @@ impl DocumentTree {
     /// `rid` and mark it dirty for the writer. The only mutation path
     /// into [`Self::headers`] — story editing routes every content
     /// change through here so `hf_dirty` can never desync from the map.
-    pub fn with_updated_header_part(&self, rid: &str, paras: Vec<Paragraph>) -> Self {
+    /// `section_end` markers are stripped: a part is not the body, and a
+    /// stray marker would corrupt `effective_sections` if the blocks ever
+    /// round-tripped through a body-shaped story tree.
+    pub fn with_updated_header_part(&self, rid: &str, blocks: Vec<Block>) -> Self {
         let mut next = self.clone();
-        next.headers.insert(rid.to_string(), paras);
+        next.headers
+            .insert(rid.to_string(), strip_section_markers(blocks));
         next.hf_dirty.headers.insert(rid.to_string());
         next
     }
 
     /// Phase 3 (#39) — [`Self::with_updated_header_part`]'s footer twin.
-    pub fn with_updated_footer_part(&self, rid: &str, paras: Vec<Paragraph>) -> Self {
+    pub fn with_updated_footer_part(&self, rid: &str, blocks: Vec<Block>) -> Self {
         let mut next = self.clone();
-        next.footers.insert(rid.to_string(), paras);
+        next.footers
+            .insert(rid.to_string(), strip_section_markers(blocks));
         next.hf_dirty.footers.insert(rid.to_string());
         next
     }
@@ -2427,6 +2703,43 @@ impl DocumentTree {
         last.map(BlockPath::top)
     }
 
+    /// Issue #72 (design review B6) — block-tree-aware FIRST caret
+    /// home: the first top-level paragraph's path, or — when the
+    /// document/story is table-led — a descent into the first table's
+    /// first cell's first paragraph. A table-only header part must
+    /// never park the caret on a bare `Block(table)` path (no text
+    /// consumer can resolve it).
+    pub fn path_to_first_paragraph_deep(&self) -> Option<BlockPath> {
+        for (i, b) in self.blocks.iter().enumerate() {
+            match b {
+                Block::Paragraph(_) => return Some(BlockPath::top(i as u32)),
+                Block::Table(t) => {
+                    if let Some(path) = first_cell_paragraph_path(t, BlockPath::top(i as u32)) {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Issue #72 (design review B6) — block-tree-aware LAST caret
+    /// home; [`Self::path_to_first_paragraph_deep`]'s tail twin, used
+    /// by clamp fallbacks after structural edits.
+    pub fn path_to_last_paragraph_deep(&self) -> Option<BlockPath> {
+        for (i, b) in self.blocks.iter().enumerate().rev() {
+            match b {
+                Block::Paragraph(_) => return Some(BlockPath::top(i as u32)),
+                Block::Table(t) => {
+                    if let Some(path) = last_cell_paragraph_path(t, BlockPath::top(i as u32)) {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /* ============================================================
     Phase 5 PR 1 — paragraph-flat shim
     Treats `Block::Table` as inert. Kept as a compatibility helper;
@@ -2466,10 +2779,19 @@ impl DocumentTree {
     /// table cells. Counts Unicode scalars (`char`s), not bytes —
     /// matches Word's "Characters (no spaces)" minus the no-space
     /// filter. Cheap O(n) walk.
+    ///
+    /// Issue #73 — includes REFERENCED header/footer stories (typing
+    /// in a band raises the StatusBar count; shared parts count once).
     pub fn character_count(&self) -> u32 {
         let mut n = 0u32;
-        walk_paragraphs(&self.blocks, &mut |p| {
+        let mut count = |p: &Paragraph| {
             n = n.saturating_add(p.text.chars().count() as u32);
+        };
+        walk_paragraphs(&self.blocks, &mut count);
+        self.for_each_referenced_story(&mut |_, _, blocks| {
+            for b in blocks {
+                walk_block(b, &mut count);
+            }
         });
         n
     }
@@ -2485,12 +2807,72 @@ impl DocumentTree {
     /// linked for line breaking. We filter `WordType::Word` so
     /// punctuation and inter-word whitespace runs don't count as
     /// words.
+    ///
+    /// Issue #73 — includes REFERENCED header/footer stories, like
+    /// [`Self::character_count`]. `count_inline_images` deliberately
+    /// stays body-only: the shell's image-rect/selection pipeline is
+    /// body-scoped, and the count gates exactly that pipeline.
     pub fn word_count(&self) -> u32 {
         let mut n = 0u32;
-        walk_paragraphs(&self.blocks, &mut |p| {
+        let mut count = |p: &Paragraph| {
             n = n.saturating_add(count_uax_words(&p.text) as u32);
+        };
+        walk_paragraphs(&self.blocks, &mut count);
+        self.for_each_referenced_story(&mut |_, _, blocks| {
+            for b in blocks {
+                walk_block(b, &mut count);
+            }
         });
         n
+    }
+
+    /// Issue #73 — every header/footer part REFERENCED by some
+    /// section's own ref slots, visited once per rid (shared parts
+    /// dedup), headers then footers, rid-sorted for determinism.
+    /// Orphaned parts (relinked-away, imported-but-unreferenced) are
+    /// NOT visited — they don't render, so they don't count.
+    pub fn for_each_referenced_story<'a>(&'a self, f: &mut impl FnMut(bool, &str, &'a [Block])) {
+        let sections = self.effective_sections();
+        let mut header_rids: Vec<String> = Vec::new();
+        let mut footer_rids: Vec<String> = Vec::new();
+        for s in &sections {
+            for rid in [
+                &s.header_refs.default,
+                &s.header_refs.first,
+                &s.header_refs.even,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !header_rids.contains(rid) {
+                    header_rids.push(rid.clone());
+                }
+            }
+            for rid in [
+                &s.footer_refs.default,
+                &s.footer_refs.first,
+                &s.footer_refs.even,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !footer_rids.contains(rid) {
+                    footer_rids.push(rid.clone());
+                }
+            }
+        }
+        header_rids.sort_unstable();
+        footer_rids.sort_unstable();
+        for rid in &header_rids {
+            if let Some(blocks) = self.headers.get(rid) {
+                f(true, rid, blocks);
+            }
+        }
+        for rid in &footer_rids {
+            if let Some(blocks) = self.footers.get(rid) {
+                f(false, rid, blocks);
+            }
+        }
     }
 
     /// The Nth `Block::Paragraph`, skipping tables. Phase 5 PR 1 shim
@@ -2819,6 +3201,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -2893,6 +3276,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -2901,8 +3285,12 @@ impl DocumentTree {
             return self.clone();
         }
         let mut blocks = self.blocks.clone();
+        /* Design review B6 — `paragraph_count()` is a TOP-LEVEL shim:
+        a table-only tree (letterhead header story) reports 0 but has
+        real cell paragraphs; the append fast-path must not fire for
+        it or typing lands in a phantom trailing paragraph. */
         let count = self.paragraph_count();
-        if count == 0 {
+        if count == 0 && self.path_to_first_paragraph_deep().is_none() {
             blocks.push_back(Block::Paragraph(Paragraph {
                 text: text.to_owned(),
                 spans: Vec::new(),
@@ -2936,14 +3324,16 @@ impl DocumentTree {
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
+                settings_dirty: self.settings_dirty,
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
             at.path.clone()
         } else {
             /* Path no longer addresses a paragraph (clamped after a
-            structural edit). Fall back to the document end. */
-            self.path_to_last_top_paragraph()
+            structural edit). Fall back to the document end — deep:
+            a table-only tree's last paragraph lives inside a cell. */
+            self.path_to_last_paragraph_deep()
                 .unwrap_or(BlockPath::top(0))
         };
         let off = at.offset;
@@ -2960,6 +3350,20 @@ impl DocumentTree {
                 }
                 if s.end > off {
                     s.end += len;
+                }
+            }
+            /* Issue #43 — FIELD anchors shift too (they render live now;
+            a stale range would repaint the wrong bytes). Typing at a
+            field's start boundary stays outside (shift); strictly inside
+            grows the field (the cached result was hand-edited — the next
+            resolution overwrites it wholesale). Hyperlinks/revisions
+            keep their pre-existing #56 limitation. */
+            for f in &mut para.fields {
+                if f.start >= off {
+                    f.start += len;
+                    f.end += len;
+                } else if f.end > off {
+                    f.end += len;
                 }
             }
         });
@@ -2982,6 +3386,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3036,6 +3441,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3067,6 +3473,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3117,6 +3524,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3173,6 +3581,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3234,7 +3643,40 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
+    }
+
+    /// Issue #43 — author a dynamic field at `at`: splice `cached`
+    /// (the placeholder display text — resolved live at layout time)
+    /// into the paragraph and stamp the `Field` overlay over it.
+    /// `insert_text` shifts pre-existing span/field anchors; the new
+    /// overlay is inserted in start order (fields stay disjoint —
+    /// authoring inside another field's range is the caller's error,
+    /// tolerated as overlapping overlays the renderer resolves
+    /// last-wins). Callers reject table-cell paths (the cell reader
+    /// cannot round-trip fields yet).
+    pub fn insert_field_at(&self, at: LogicalPos, instruction: &str, cached: &str) -> Self {
+        if cached.is_empty() || self.paragraph_at_path(&at.path).is_none() {
+            return self.clone();
+        }
+        let doc = self.insert_text(at.clone(), cached);
+        let mut blocks = doc.blocks.clone();
+        let ok = mutate_paragraph_in_top(&mut blocks, &at.path, |para| {
+            let start = at.offset.min(para.text.len() as u32);
+            para.fields.push(Field {
+                start,
+                end: start + cached.len() as u32,
+                instruction: instruction.to_string(),
+            });
+            para.fields.sort_by_key(|f| f.start);
+        });
+        if ok.is_none() {
+            return doc;
+        }
+        let mut next = doc;
+        next.blocks = blocks;
+        next
     }
 
     /// Phase 3 (#40) — insert a section break at `at`, Word-exact:
@@ -3277,7 +3719,18 @@ impl DocumentTree {
             para.section_end = Some(Box::new(covering.clone()));
         });
         /* Step 3 — the covering section's own terminal now closes the
-        second half; it starts per `kind`. */
+        second half; it starts per `kind`.
+
+        Issue #70 — the second half is also born LINKED: its hf ref
+        slots are CLEARED (absence = inherit, §17.10.3), matching what
+        Word writes after a fresh break ("Same as Previous" on). The
+        first half's marker owns the covering section's original refs
+        via the step-2 copy, so rendering is unchanged — the second
+        half now inherits them through the forward fold. Deleting the
+        break restores ownership to this terminal via the marker-drop
+        backfill in `backfill_hf_refs_from_dropped_markers` (design
+        review B1 — without it, insert-then-delete would orphan the
+        original parts). */
         let next_marker = blocks
             .iter()
             .enumerate()
@@ -3290,10 +3743,14 @@ impl DocumentTree {
             let _ = mutate_paragraph_in_top(&mut blocks, &BlockPath::top(mi), |para| {
                 if let Some(props) = &mut para.section_end {
                     props.section_type = kind;
+                    props.header_refs = HeaderFooterRefs::default();
+                    props.footer_refs = HeaderFooterRefs::default();
                 }
             });
         } else {
             body_section.section_type = kind;
+            body_section.header_refs = HeaderFooterRefs::default();
+            body_section.footer_refs = HeaderFooterRefs::default();
         }
         Self {
             blocks,
@@ -3311,6 +3768,7 @@ impl DocumentTree {
             styles_dirty: split.styles_dirty,
             numbering: split.numbering.clone(),
             hf_dirty: split.hf_dirty.clone(),
+            settings_dirty: split.settings_dirty,
         }
     }
 
@@ -3320,14 +3778,54 @@ impl DocumentTree {
     /// `rid` via [`Self::with_updated_header_part`] /
     /// [`Self::with_updated_footer_part`].
     pub fn set_section_hf_default_ref_at(&self, pos: LogicalPos, header: bool, rid: &str) -> Self {
-        let rid = rid.to_string();
+        self.set_section_hf_ref_at(pos, header, HeaderFooterRole::Default, Some(rid))
+    }
+
+    /// Issues #70/#74 — the generalized ref setter: write (or CLEAR,
+    /// with `rid: None`) any of the covering section's six
+    /// (header/footer × default/first/even) reference slots.
+    /// `None` is the Link-to-Previous storage state — inheritance is
+    /// the ABSENCE of a slot (§17.10.3), so "relink" is a clear.
+    pub fn set_section_hf_ref_at(
+        &self,
+        pos: LogicalPos,
+        header: bool,
+        role: HeaderFooterRole,
+        rid: Option<&str>,
+    ) -> Self {
+        let rid = rid.map(str::to_string);
         self.update_section_props_at(&pos, move |props| {
-            if header {
-                props.header_refs.default = Some(rid);
+            let refs = if header {
+                &mut props.header_refs
             } else {
-                props.footer_refs.default = Some(rid);
+                &mut props.footer_refs
+            };
+            match role {
+                HeaderFooterRole::Default => refs.default = rid,
+                HeaderFooterRole::First => refs.first = rid,
+                HeaderFooterRole::Even => refs.even = rid,
             }
         })
+    }
+
+    /// Issue #74 — toggle `<w:titlePg/>` ("different first page") on
+    /// the covering section.
+    pub fn set_section_title_pg_at(&self, pos: LogicalPos, enabled: bool) -> Self {
+        self.update_section_props_at(&pos, move |props| {
+            props.title_pg = enabled;
+        })
+    }
+
+    /// Issue #74 — document-wide `<w:evenAndOddHeaders/>` toggle
+    /// (settings.xml, NOT sectPr — even/odd is a document setting).
+    /// Flips `settings_dirty` so the writer patches settings.xml.
+    pub fn with_even_odd_headers(&self, enabled: bool) -> Self {
+        let mut next = self.clone();
+        if next.settings.even_and_odd_headers != enabled {
+            next.settings.even_and_odd_headers = enabled;
+            next.settings_dirty = true;
+        }
+        next
     }
 
     /// Sprint 2 (UI Edition) — set the covering section's `columns` for
@@ -3370,6 +3868,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3445,6 +3944,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3505,6 +4005,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         };
         (doc, new_id)
     }
@@ -3577,6 +4078,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         };
         Some((doc, new_id))
     }
@@ -3628,6 +4130,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3655,6 +4158,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3735,6 +4239,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3827,6 +4332,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3893,11 +4399,29 @@ impl DocumentTree {
             recompute_block(&mut b, &styles, &self.style_defaults);
             blocks.set(i, b);
         }
+        /* Design review B5 — header/footer paragraphs carry the SAME
+        baked cascade; skipping them left band paragraphs styled with
+        the pre-mutation look until an unrelated part edit. Recompute
+        every part; dirty tracking is untouched (a pure cascade
+        recompute does not change the part's serialized styling —
+        `pStyle` stays; the writer re-resolves at emission). */
+        let mut headers = self.headers.clone();
+        for part in headers.values_mut() {
+            for b in part.iter_mut() {
+                recompute_block(b, &styles, &self.style_defaults);
+            }
+        }
+        let mut footers = self.footers.clone();
+        for part in footers.values_mut() {
+            for b in part.iter_mut() {
+                recompute_block(b, &styles, &self.style_defaults);
+            }
+        }
         Self {
             blocks,
             body_section: self.body_section.clone(),
-            headers: self.headers.clone(),
-            footers: self.footers.clone(),
+            headers,
+            footers,
             media: self.media.clone(),
             footnotes: self.footnotes.clone(),
             comment_defs: self.comment_defs.clone(),
@@ -3909,6 +4433,7 @@ impl DocumentTree {
             styles_dirty: true,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -3958,6 +4483,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -4010,6 +4536,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -4059,6 +4586,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -4176,6 +4704,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: next_numbering,
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -4242,6 +4771,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -4287,6 +4817,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
         .with_list_markers_refreshed()
     }
@@ -4438,6 +4969,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -4486,6 +5018,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -4535,6 +5068,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -4568,6 +5102,7 @@ impl DocumentTree {
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
+                settings_dirty: self.settings_dirty,
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -4601,6 +5136,37 @@ impl DocumentTree {
             .and_then(|b| b.as_paragraph())
             .map(|p| p.split_at(end.offset).1)
             .unwrap_or_default();
+        /* Issue #70 (design review B1) — this branch DROPS section
+        markers: `sp`'s own marker (its paragraph mark is the one being
+        deleted; `tail`-wins concat discards it) and any marker on the
+        wholesale-removed middle blocks `sp+1..ep`. `ep`'s marker
+        survives on `merged`. A dropped marker may be the ONLY owner of
+        header/footer parts that later sections (and the merged section
+        itself) resolve through inheritance — losing it would silently
+        blank bands document-wide on save. Fold the dropped markers'
+        ref slots in document order (later provider wins — exactly what
+        the forward fold saw just before the next terminal)… */
+        let mut dropped_h = HeaderFooterRefs::default();
+        let mut dropped_f = HeaderFooterRefs::default();
+        let top_level = start.path.steps.len() == 1;
+        if top_level {
+            let mut fold = |p: &Paragraph| {
+                if let Some(props) = &p.section_end {
+                    /* later marker's Some slots override earlier's */
+                    let mut h = props.header_refs.clone();
+                    let mut f = props.footer_refs.clone();
+                    h.inherit_missing_from(&dropped_h);
+                    f.inherit_missing_from(&dropped_f);
+                    dropped_h = h;
+                    dropped_f = f;
+                }
+            };
+            for idx in sp_idx..ep_idx {
+                if let Some(p) = container.get(idx as usize).and_then(|b| b.as_paragraph()) {
+                    fold(p);
+                }
+            }
+        }
         let merged = head.concat(&tail);
         let mut blocks = self.blocks.clone();
         let parent = start.path.parent();
@@ -4612,9 +5178,38 @@ impl DocumentTree {
         }
         let sp_path = parent.push(PathStep::Block(sp_idx));
         replace_block_in_top(&mut blocks, &sp_path, Block::Paragraph(merged));
+        /* …then backfill them into the covering section's NEW terminal
+        (the first marker at/after the merge point — possibly `merged`
+        itself — else `body_section`) wherever that terminal's slot is
+        None. Downstream resolution is preserved by construction; a
+        terminal that OWNS a slot keeps it (Word: the following
+        section's own header wins when you delete a break). */
+        let mut body_section = self.body_section.clone();
+        if top_level && !(dropped_h.is_empty() && dropped_f.is_empty()) {
+            let next_terminal =
+                blocks
+                    .iter()
+                    .enumerate()
+                    .skip(sp_idx as usize)
+                    .find_map(|(i, b)| match b {
+                        Block::Paragraph(p) if p.section_end.is_some() => Some(i as u32),
+                        _ => None,
+                    });
+            if let Some(mi) = next_terminal {
+                let _ = mutate_paragraph_in_top(&mut blocks, &BlockPath::top(mi), |para| {
+                    if let Some(props) = &mut para.section_end {
+                        props.header_refs.inherit_missing_from(&dropped_h);
+                        props.footer_refs.inherit_missing_from(&dropped_f);
+                    }
+                });
+            } else {
+                body_section.header_refs.inherit_missing_from(&dropped_h);
+                body_section.footer_refs.inherit_missing_from(&dropped_f);
+            }
+        }
         Self {
             blocks,
-            body_section: self.body_section.clone(),
+            body_section,
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
@@ -4628,6 +5223,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
         .with_list_markers_refreshed()
     }
@@ -4636,7 +5232,9 @@ impl DocumentTree {
     pub fn split_paragraph(&self, at: LogicalPos) -> Self {
         let count = self.paragraph_count();
         let mut blocks = self.blocks.clone();
-        if count == 0 {
+        /* Design review B6 — see `insert_text`: a table-only tree has
+        cell paragraphs the deep path reaches. */
+        if count == 0 && self.path_to_first_paragraph_deep().is_none() {
             blocks.push_back(Block::Paragraph(Paragraph::default()));
             blocks.push_back(Block::Paragraph(Paragraph::default()));
             return Self {
@@ -4655,6 +5253,7 @@ impl DocumentTree {
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
+                settings_dirty: self.settings_dirty,
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -4679,6 +5278,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
         .with_list_markers_refreshed()
     }
@@ -4832,6 +5432,7 @@ impl DocumentTree {
                     styles_dirty: self.styles_dirty,
                     numbering: self.numbering.clone(),
                     hf_dirty: self.hf_dirty.clone(),
+                    settings_dirty: self.settings_dirty,
                 }
                 .with_list_markers_refreshed(),
                 caret,
@@ -4875,6 +5476,7 @@ impl DocumentTree {
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
+                settings_dirty: self.settings_dirty,
             }
             .with_list_markers_refreshed(),
             caret,
@@ -5065,6 +5667,7 @@ impl DocumentTree {
                 styles_dirty: self.styles_dirty,
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
+                settings_dirty: self.settings_dirty,
             }
             .with_list_markers_refreshed(),
             caret,
@@ -5209,6 +5812,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -5238,6 +5842,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 
@@ -5516,6 +6121,7 @@ impl DocumentTree {
             styles_dirty: self.styles_dirty,
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
+            settings_dirty: self.settings_dirty,
         }
     }
 }
@@ -5771,6 +6377,80 @@ fn block_at_descend<'a>(block: &'a Block, steps: &[PathStep]) -> Option<&'a Bloc
     block_at_descend(next, &steps[2..])
 }
 
+/// Issue #72 (design review B6) — first cell paragraph inside `t`,
+/// path rooted at `base` (the table's own path). One nesting level:
+/// a nested table's cells are searched too, depth-first.
+fn first_cell_paragraph_path(t: &Table, base: BlockPath) -> Option<BlockPath> {
+    for (ri, row) in t.rows.iter().enumerate() {
+        for (ci, cell) in row.cells.iter().enumerate() {
+            for (bi, b) in cell.blocks.iter().enumerate() {
+                let child = base
+                    .clone()
+                    .push(PathStep::Cell {
+                        row: ri as u32,
+                        col: ci as u32,
+                    })
+                    .push(PathStep::Block(bi as u32));
+                match b {
+                    Block::Paragraph(_) => return Some(child),
+                    Block::Table(nested) => {
+                        if let Some(p) = first_cell_paragraph_path(nested, child) {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Tail twin of [`first_cell_paragraph_path`].
+fn last_cell_paragraph_path(t: &Table, base: BlockPath) -> Option<BlockPath> {
+    for (ri, row) in t.rows.iter().enumerate().rev() {
+        for (ci, cell) in row.cells.iter().enumerate().rev() {
+            for (bi, b) in cell.blocks.iter().enumerate().rev() {
+                let child = base
+                    .clone()
+                    .push(PathStep::Cell {
+                        row: ri as u32,
+                        col: ci as u32,
+                    })
+                    .push(PathStep::Block(bi as u32));
+                match b {
+                    Block::Paragraph(_) => return Some(child),
+                    Block::Table(nested) => {
+                        if let Some(p) = last_cell_paragraph_path(nested, child) {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Issue #73 — single-block twin of [`walk_paragraphs`] for
+/// slice-backed header/footer parts (which are `Vec<Block>`, not
+/// `im::Vector`). Same one-cell-level descent.
+fn walk_block<F: FnMut(&Paragraph)>(block: &Block, f: &mut F) {
+    match block {
+        Block::Paragraph(p) => f(p),
+        Block::Table(t) => {
+            for row in &t.rows {
+                for cell in &row.cells {
+                    for nested in &cell.blocks {
+                        if let Block::Paragraph(p) = nested {
+                            f(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Sprint 8 (UI Edition) helper — depth-first walk over every
 /// `Block::Paragraph` in the tree, including paragraphs nested
 /// inside `Block::Table` cells. Used by the count-style helpers
@@ -5847,6 +6527,21 @@ fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u
 fn strip_section_marker(mut p: Paragraph) -> Paragraph {
     p.section_end = None;
     p
+}
+
+/// Issue #72 — header/footer parts are body-shaped block lists but are
+/// NOT the body: a `section_end` marker inside a part would corrupt
+/// `effective_sections` the moment the part round-trips through a
+/// story tree. Every write into `DocumentTree::headers` / `footers`
+/// funnels through this strip.
+fn strip_section_markers(blocks: Vec<Block>) -> Vec<Block> {
+    blocks
+        .into_iter()
+        .map(|b| match b {
+            Block::Paragraph(p) => Block::Paragraph(strip_section_marker(p)),
+            table => table,
+        })
+        .collect()
 }
 
 /// Mutate the paragraph addressed by `path` in `top` (the
@@ -8926,6 +9621,7 @@ mod tests {
             styles_dirty: false,
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
+            settings_dirty: false,
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();
@@ -9053,5 +9749,468 @@ mod tests {
         assert!(!doc.comment_defs.contains_key(&reply));
         assert!(doc.comment_ranges.iter().any(|r| r.id == parent));
         assert!(!doc.comment_ranges.iter().any(|r| r.id == reply));
+    }
+
+    /* ================================================================
+    Issues #70 / #43 / #73 / #74 — Stage 1 engine core: inheritance
+    resolver, marker-drop backfill, field-overlay survival, field
+    authoring, story-aware counts, role setters.
+    ================================================================ */
+
+    fn hf(default: Option<&str>, first: Option<&str>, even: Option<&str>) -> HeaderFooterRefs {
+        HeaderFooterRefs {
+            default: default.map(str::to_string),
+            first: first.map(str::to_string),
+            even: even.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn hf_inheritance_folds_forward_per_role_slot() {
+        let sections = vec![
+            Section {
+                header_refs: hf(Some("h1"), Some("f1"), None),
+                ..Default::default()
+            },
+            Section {
+                header_refs: hf(None, None, Some("e2")),
+                ..Default::default()
+            },
+            Section {
+                header_refs: hf(Some("h3"), None, None),
+                ..Default::default()
+            },
+        ];
+        let resolved = resolve_hf_inheritance(&sections);
+        /* Section 0 — own slots only; unset even stays blank. */
+        assert_eq!(resolved[0].0.default.as_deref(), Some("h1"));
+        assert_eq!(resolved[0].0.first.as_deref(), Some("f1"));
+        assert_eq!(resolved[0].0.even, None);
+        /* Section 1 — inherits default+first, owns even. */
+        assert_eq!(resolved[1].0.default.as_deref(), Some("h1"));
+        assert_eq!(resolved[1].0.first.as_deref(), Some("f1"));
+        assert_eq!(resolved[1].0.even.as_deref(), Some("e2"));
+        /* Section 2 — own default WINS over the carried h1; first and
+        even carry through the whole chain. */
+        assert_eq!(resolved[2].0.default.as_deref(), Some("h3"));
+        assert_eq!(resolved[2].0.first.as_deref(), Some("f1"));
+        assert_eq!(resolved[2].0.even.as_deref(), Some("e2"));
+    }
+
+    #[test]
+    fn hf_resolve_is_blank_not_default_fallback() {
+        /* Issue #70 removed the same-section role→Default fallback:
+        titlePg with no first ref shows a BLANK first-page header
+        (Word-observed), never the Default content. */
+        let refs = hf(Some("d"), None, None);
+        assert_eq!(refs.resolve(HeaderFooterRole::Default), Some("d"));
+        assert_eq!(refs.resolve(HeaderFooterRole::First), None);
+        assert_eq!(refs.resolve(HeaderFooterRole::Even), None);
+    }
+
+    #[test]
+    fn insert_break_clears_right_terminal_refs_left_keeps_copy() {
+        let mut d = DocumentTree::from_text("hello world");
+        d.body_section.header_refs.default = Some("rIdA".into());
+        let broken =
+            d.insert_section_break_at(LogicalPos::new(BlockPath::top(0), 5), SectionType::NextPage);
+        let sections = broken.effective_sections();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(
+            sections[0].header_refs.default.as_deref(),
+            Some("rIdA"),
+            "left half owns the covering section's original refs"
+        );
+        assert!(
+            sections[1].header_refs.is_empty(),
+            "second half is born LINKED (absence = inherit, like Word)"
+        );
+        /* Rendering unchanged: inheritance resolves section 2 to rIdA. */
+        let resolved = resolve_hf_inheritance(&sections);
+        assert_eq!(resolved[1].0.default.as_deref(), Some("rIdA"));
+    }
+
+    #[test]
+    fn insert_then_delete_break_restores_refs_via_backfill() {
+        /* Design review B1 — the content-loss repro: insert a break
+        into a doc whose ONLY ref lives on body_section, then delete
+        the break. Without the marker-drop backfill the ref would be
+        orphaned (left marker holds the only copy and tail-wins concat
+        discards it). */
+        let mut d = DocumentTree::from_text("hello world");
+        d.body_section.header_refs.default = Some("rIdA".into());
+        d.body_section.footer_refs.even = Some("rIdF".into());
+        let broken =
+            d.insert_section_break_at(LogicalPos::new(BlockPath::top(0), 5), SectionType::NextPage);
+        /* Backspace across the boundary — merges the marker paragraph
+        into the following one. */
+        let merged = broken.delete_range(
+            LogicalPos::new(BlockPath::top(0), 5),
+            LogicalPos::new(BlockPath::top(1), 0),
+        );
+        let sections = merged.effective_sections();
+        assert_eq!(sections.len(), 1, "back to one section");
+        assert_eq!(
+            sections[0].header_refs.default.as_deref(),
+            Some("rIdA"),
+            "insert+delete round trip must not lose the header"
+        );
+        assert_eq!(sections[0].footer_refs.even.as_deref(), Some("rIdF"));
+    }
+
+    #[test]
+    fn deleting_a_break_keeps_downstream_linked_sections_rendering() {
+        /* Imported shape: section A owns the header on its marker; B
+        and the trailing body section are linked (empty refs). Deleting
+        A's break must backfill A's refs into the next terminal so B/C
+        keep rendering the header. */
+        let blocks = vec![
+            Block::Paragraph(Paragraph {
+                text: "a".into(),
+                ..Default::default()
+            }),
+            Block::Paragraph(Paragraph {
+                text: "b".into(),
+                ..Default::default()
+            }),
+            Block::Paragraph(Paragraph {
+                text: "c".into(),
+                ..Default::default()
+            }),
+        ];
+        let sections = vec![
+            Section {
+                header_refs: hf(Some("rIdA"), None, None),
+                start_block: 0,
+                end_block: 1,
+                ..Default::default()
+            },
+            Section {
+                start_block: 1,
+                end_block: 2,
+                ..Default::default()
+            },
+            Section {
+                start_block: 2,
+                end_block: 3,
+                ..Default::default()
+            },
+        ];
+        let d = DocumentTree::from_blocks_with_sections(blocks, sections);
+        let merged = d.delete_range(
+            LogicalPos::new(BlockPath::top(0), 1),
+            LogicalPos::new(BlockPath::top(1), 0),
+        );
+        let derived = merged.effective_sections();
+        assert_eq!(derived.len(), 2, "A merged into B");
+        assert_eq!(
+            derived[0].header_refs.default.as_deref(),
+            Some("rIdA"),
+            "A's ref backfilled into B's terminal"
+        );
+        let resolved = resolve_hf_inheritance(&derived);
+        assert_eq!(
+            resolved[1].0.default.as_deref(),
+            Some("rIdA"),
+            "trailing section still inherits"
+        );
+    }
+
+    #[test]
+    fn backfill_never_overrides_an_owned_slot() {
+        /* Word: when the FOLLOWING section owns its header, deleting
+        the break keeps the following section's header. */
+        let blocks = vec![
+            Block::Paragraph(Paragraph {
+                text: "a".into(),
+                ..Default::default()
+            }),
+            Block::Paragraph(Paragraph {
+                text: "b".into(),
+                ..Default::default()
+            }),
+        ];
+        let sections = vec![
+            Section {
+                header_refs: hf(Some("rIdA"), Some("rIdAF"), None),
+                start_block: 0,
+                end_block: 1,
+                ..Default::default()
+            },
+            Section {
+                header_refs: hf(Some("rIdB"), None, None),
+                start_block: 1,
+                end_block: 2,
+                ..Default::default()
+            },
+        ];
+        let d = DocumentTree::from_blocks_with_sections(blocks, sections);
+        let merged = d.delete_range(
+            LogicalPos::new(BlockPath::top(0), 1),
+            LogicalPos::new(BlockPath::top(1), 0),
+        );
+        let derived = merged.effective_sections();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(
+            derived[0].header_refs.default.as_deref(),
+            Some("rIdB"),
+            "owned slot wins over the dropped marker's"
+        );
+        assert_eq!(
+            derived[0].header_refs.first.as_deref(),
+            Some("rIdAF"),
+            "unowned slot backfills from the dropped marker"
+        );
+    }
+
+    #[test]
+    fn delete_text_remaps_field_overlays() {
+        let p = Paragraph {
+            text: "abc PAGE xyz".into(),
+            fields: vec![Field {
+                start: 4,
+                end: 8,
+                instruction: "PAGE".into(),
+            }],
+            ..Default::default()
+        };
+        /* Delete strictly before — field shifts left. */
+        let d1 = p.delete_text(0, 2);
+        assert_eq!((d1.fields[0].start, d1.fields[0].end), (2, 6));
+        /* Delete strictly after — untouched. */
+        let d2 = p.delete_text(9, 12);
+        assert_eq!((d2.fields[0].start, d2.fields[0].end), (4, 8));
+        /* Delete strictly inside — field shrinks. */
+        let d3 = p.delete_text(5, 7);
+        assert_eq!((d3.fields[0].start, d3.fields[0].end), (4, 6));
+        /* Delete crossing a boundary — the atom breaks, field drops. */
+        let d4 = p.delete_text(2, 6);
+        assert!(d4.fields.is_empty());
+    }
+
+    #[test]
+    fn split_and_concat_field_rules() {
+        let p = Paragraph {
+            text: "ab12cd".into(),
+            fields: vec![Field {
+                start: 2,
+                end: 4,
+                instruction: "PAGE".into(),
+            }],
+            ..Default::default()
+        };
+        /* Split before the field — right keeps it, rebased. */
+        let (l, r) = p.split_at(1);
+        assert!(l.fields.is_empty());
+        assert_eq!((r.fields[0].start, r.fields[0].end), (1, 3));
+        /* Split after — left keeps it. */
+        let (l2, r2) = p.split_at(5);
+        assert_eq!((l2.fields[0].start, l2.fields[0].end), (2, 4));
+        assert!(r2.fields.is_empty());
+        /* Split inside — straddler drops on both sides. */
+        let (l3, r3) = p.split_at(3);
+        assert!(l3.fields.is_empty() && r3.fields.is_empty());
+        /* Concat — tail's field shifts right by head len. */
+        let head = Paragraph {
+            text: "head ".into(),
+            ..Default::default()
+        };
+        let merged = head.concat(&p);
+        assert_eq!((merged.fields[0].start, merged.fields[0].end), (7, 9));
+    }
+
+    #[test]
+    fn insert_text_shifts_field_anchors() {
+        let mut d = DocumentTree::from_text("Page 1");
+        {
+            let mut blocks = d.blocks.clone();
+            let _ = mutate_paragraph_in_top(&mut blocks, &BlockPath::top(0), |para| {
+                para.fields.push(Field {
+                    start: 5,
+                    end: 6,
+                    instruction: "PAGE".into(),
+                });
+            });
+            d.blocks = blocks;
+        }
+        /* Typing before the field shifts it whole. */
+        let d2 = d.insert_text(LogicalPos::new(BlockPath::top(0), 0), "X: ");
+        let p2 = d2.paragraph_at_path(&BlockPath::top(0)).unwrap();
+        assert_eq!((p2.fields[0].start, p2.fields[0].end), (8, 9));
+        /* Typing right AT the field start stays outside (shift). */
+        let d3 = d.insert_text(LogicalPos::new(BlockPath::top(0), 5), "~");
+        let p3 = d3.paragraph_at_path(&BlockPath::top(0)).unwrap();
+        assert_eq!((p3.fields[0].start, p3.fields[0].end), (6, 7));
+    }
+
+    #[test]
+    fn insert_field_at_authors_text_and_overlay() {
+        let d = DocumentTree::from_text("Page  of it");
+        let with_field = d.insert_field_at(LogicalPos::new(BlockPath::top(0), 5), "PAGE", "1");
+        let p = with_field.paragraph_at_path(&BlockPath::top(0)).unwrap();
+        assert_eq!(p.text, "Page 1 of it");
+        assert_eq!(p.fields.len(), 1);
+        assert_eq!((p.fields[0].start, p.fields[0].end), (5, 6));
+        assert_eq!(p.fields[0].instruction, "PAGE");
+        assert!(p.dirty, "authoring dirties the paragraph for the writer");
+    }
+
+    #[test]
+    fn with_spliced_range_full_overlay_discipline() {
+        /* Design review M5's mandated case: a style-span boundary
+        strictly inside the field's cached range must clamp, never
+        dangle. Text "Page 999 end", field [5,9), span [6,7) fully
+        inside, span [9,12) after. Splice the field to "12". */
+        let p = Paragraph {
+            text: "Page 999 end".into(),
+            fields: vec![Field {
+                start: 5,
+                end: 8,
+                instruction: "NUMPAGES".into(),
+            }],
+            spans: vec![
+                StyleRun {
+                    start: 6,
+                    end: 7,
+                    style: SpanStyle::default(),
+                },
+                StyleRun {
+                    start: 9,
+                    end: 12,
+                    style: SpanStyle::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let s = p.with_spliced_range(5, 8, "12");
+        assert_eq!(s.text, "Page 12 end");
+        /* Interior span stretches over the whole replacement. */
+        assert_eq!((s.spans[0].start, s.spans[0].end), (5, 7));
+        /* Trailing span shifts by the length delta (-1). */
+        assert_eq!((s.spans[1].start, s.spans[1].end), (8, 11));
+        /* The field itself now covers the replacement exactly. */
+        assert_eq!((s.fields[0].start, s.fields[0].end), (5, 7));
+        /* Degenerate span (entirely inside, zero-width after clamp
+        when replacement is empty) drops. */
+        let gone = p.with_spliced_range(6, 7, "");
+        assert!(gone.spans.iter().all(|r| r.start < r.end));
+    }
+
+    #[test]
+    fn date_picture_render_and_switch_parse() {
+        assert_eq!(render_date_picture("M/d/yyyy", 2026, 7, 5), "7/5/2026");
+        assert_eq!(render_date_picture("dd MM yy", 2026, 7, 5), "05 07 26");
+        assert_eq!(
+            render_date_picture("yyyy-MM-dd", 2026, 12, 31),
+            "2026-12-31"
+        );
+        let f = Field {
+            start: 0,
+            end: 1,
+            instruction: "DATE \\@ \"dd/MM/yyyy\" \\* MERGEFORMAT".into(),
+        };
+        assert_eq!(f.date_picture().as_deref(), Some("dd/MM/yyyy"));
+        let bare = Field {
+            start: 0,
+            end: 1,
+            instruction: "DATE".into(),
+        };
+        assert_eq!(bare.date_picture(), None);
+    }
+
+    #[test]
+    fn counts_include_referenced_stories_once() {
+        let mut d = DocumentTree::from_text("one two");
+        d.headers.insert(
+            "rH".into(),
+            vec![Block::Paragraph(Paragraph {
+                text: "three four five".into(),
+                ..Default::default()
+            })],
+        );
+        d.headers.insert(
+            "orphan".into(),
+            vec![Block::Paragraph(Paragraph {
+                text: "never counted words here".into(),
+                ..Default::default()
+            })],
+        );
+        /* Unreferenced parts don't count. */
+        assert_eq!(d.word_count(), 2);
+        /* Referenced once → counted once. */
+        let d = d.set_section_hf_ref_at(
+            LogicalPos::new(BlockPath::top(0), 0),
+            true,
+            HeaderFooterRole::Default,
+            Some("rH"),
+        );
+        assert_eq!(d.word_count(), 5);
+        /* A second role slot referencing the SAME rid still counts once. */
+        let d = d.set_section_hf_ref_at(
+            LogicalPos::new(BlockPath::top(0), 0),
+            true,
+            HeaderFooterRole::First,
+            Some("rH"),
+        );
+        assert_eq!(d.word_count(), 5);
+        assert_eq!(d.character_count(), 7 + 15);
+    }
+
+    #[test]
+    fn role_setters_and_settings_toggles() {
+        let d = DocumentTree::from_text("x");
+        let pos = LogicalPos::new(BlockPath::top(0), 0);
+        let d = d.set_section_hf_ref_at(pos.clone(), false, HeaderFooterRole::Even, Some("fe"));
+        assert_eq!(
+            d.effective_sections()[0].footer_refs.even.as_deref(),
+            Some("fe")
+        );
+        /* Clearing = relink (absence-based linked state). */
+        let d = d.set_section_hf_ref_at(pos.clone(), false, HeaderFooterRole::Even, None);
+        assert!(d.effective_sections()[0].footer_refs.even.is_none());
+        let d = d.set_section_title_pg_at(pos, true);
+        assert!(d.effective_sections()[0].title_pg);
+        assert!(!d.settings_dirty, "sectPr edits never dirty settings.xml");
+        let d = d.with_even_odd_headers(true);
+        assert!(d.settings.even_and_odd_headers);
+        assert!(d.settings_dirty, "settings edit flips the dirty flag");
+        let same = d.with_even_odd_headers(true);
+        assert!(same.settings_dirty, "no-op toggle keeps existing dirt");
+    }
+
+    #[test]
+    fn deep_paragraph_paths_descend_into_table_cells() {
+        /* Design review B6 — a table-only document/story must resolve
+        caret homes INSIDE the table, never a bare table path. */
+        let table = Table {
+            rows: vec![TableRow {
+                cells: vec![default_table_cell(), default_table_cell()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let d = DocumentTree::from_blocks(vec![Block::Table(table)]);
+        let first = d.path_to_first_paragraph_deep().expect("first path");
+        assert_eq!(
+            first.steps,
+            vec![
+                PathStep::Block(0),
+                PathStep::Cell { row: 0, col: 0 },
+                PathStep::Block(0)
+            ]
+        );
+        let last = d.path_to_last_paragraph_deep().expect("last path");
+        assert_eq!(
+            last.steps,
+            vec![
+                PathStep::Block(0),
+                PathStep::Cell { row: 0, col: 1 },
+                PathStep::Block(0)
+            ]
+        );
+        assert!(
+            d.paragraph_at_path(&first).is_some(),
+            "deep path resolves to a real paragraph"
+        );
     }
 }

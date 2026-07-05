@@ -71,6 +71,8 @@ fn hello_page(stack: &FontStack) -> PageBox {
         header_offset: 36.0,
         footer_offset: 36.0,
         footnotes: Vec::new(),
+        hf_role: layout::HeaderRole::Default,
+        page_number: 1,
     }
 }
 
