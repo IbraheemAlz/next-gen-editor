@@ -200,6 +200,24 @@ Monaco Editor's "Locked Surface with Headless Controls" precedent. The split is
   `EngineClient` moves into `@nge/core`; that refactor is a separate
   PR.
 
+## Clean-room reference protocol (load-bearing, legal)
+
+Copyleft competitor source (OnlyOffice AGPL, LibreOffice MPL) is cloned for
+*study* at `/data/code/reference/` — **outside** this repo. The full protocol
+is `plans/cleanroom/PROTOCOL.md`. The hard rules:
+
+- **The implementing context never opens any file under
+  `/data/code/reference/`.** Only dedicated Reader subagents do, and their
+  sole output is a sanitized methods memo (ideas, math, prose, paths-as-
+  pointers — never code, identifiers, constants, or case-ordering).
+- Never copy/symlink/commit anything from the reference trees into this repo.
+- Reader memos live in `plans/cleanroom/` and pass a leakage review before
+  use. Feature indexes: `plans/cleanroom/{onlyoffice,libreoffice}.yaml`.
+- Copyleft study is the last resort — spec / UAX / literature / permissive
+  code / black-box diffing come first (preference order in PROTOCOL.md).
+
+This project is `MIT OR Apache-2.0`; the wall is what keeps it that way.
+
 ## "Honest UX" discipline — never ship Phantom UI
 
 If an engine path is stubbed, missing, or partial, the UI must **visibly

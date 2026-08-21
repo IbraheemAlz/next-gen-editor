@@ -1,0 +1,557 @@
+# Sanitized clean-room index of the LibreOffice core tree (Reader-produced).
+# Purpose: targeted pointers for future Reader dives. Implementers must not
+# open any path listed here (see plans/cleanroom/PROTOCOL.md).
+# All paths are relative to the reference checkout root and were verified to
+# exist at the studied commit.
+
+provenance:
+  repo: https://github.com/LibreOffice/core.git
+  commit: 3b30dd71049edf71a5c649c9aefa31538542c294
+  branch: master
+  commit_date: "2026-08-21"
+  studied: "2026-08-22"
+  license: MPL-2.0
+  local_path: /data/code/reference/libreoffice-core
+
+areas:
+  - name: writer-document-model
+    dirs: [sw/source/core/doc, sw/source/core/docnode, sw/source/core/txtnode, sw/source/core/attr, sw/inc]
+  - name: writer-layout-engine
+    dirs: [sw/source/core/layout, sw/source/core/inc]
+  - name: writer-text-formatting
+    dirs: [sw/source/core/text]
+  - name: writer-object-positioning
+    dirs: [sw/source/core/objectpositioning, sw/source/core/draw]
+  - name: writer-cursor-editing
+    dirs: [sw/source/core/crsr, sw/source/core/edit, sw/source/core/frmedt]
+  - name: writer-undo
+    dirs: [sw/source/core/undo]
+  - name: writer-fields-toc
+    dirs: [sw/source/core/fields, sw/source/core/tox]
+  - name: writer-numbering
+    dirs: [sw/source/core/SwNumberTree]
+  - name: writer-tables-model
+    dirs: [sw/source/core/table]
+  - name: writer-uno-api
+    dirs: [sw/source/core/unocore]
+  - name: writer-accessibility
+    dirs: [sw/source/core/access]
+  - name: writer-ui-shell
+    dirs: [sw/source/uibase]
+  - name: docx-rtf-import
+    dirs: [sw/source/writerfilter/dmapper, sw/source/writerfilter/ooxml, sw/source/writerfilter/rtftok, sw/source/writerfilter/filter]
+  - name: doc-docx-rtf-export
+    dirs: [sw/source/filter/ww8]
+  - name: odf-filter
+    dirs: [xmloff, sw/source/filter/xml]
+  - name: other-writer-filters
+    dirs: [sw/source/filter/html, sw/source/filter/md, sw/source/filter/ascii]
+  - name: shared-items-undo
+    dirs: [svl]
+  - name: shared-edit-engine
+    dirs: [editeng/source]
+  - name: toolkit-text-fonts-pdf
+    dirs: [vcl/source/text, vcl/source/font, vcl/source/gdi, vcl/source/pdf]
+  - name: drawing-stack
+    dirs: [svx, drawinglayer, basegfx]
+  - name: i18n-services
+    dirs: [i18npool/source, i18nutil, i18nlangtag]
+  - name: linguistics
+    dirs: [linguistic, lingucomponent]
+  - name: ooxml-shared
+    dirs: [oox/source]
+  - name: tiled-rendering
+    dirs: [libreofficekit, desktop/source/lib]
+  - name: stability-recovery
+    dirs: [framework/source/services, sfx2/source/doc]
+  - name: math
+    dirs: [starmath]
+  - name: charts
+    dirs: [chart2]
+
+features:
+  # ---------- layout engine ----------
+  - key: frame-tree-model
+    name: Layout frame tree
+    category: layout
+    maturity: full
+    summary: Per-view derived tree of page/column/header/footer/footnote/body/section/table/row/cell/fly/text frames; disposable cache over the model.
+    where: [sw/source/core/inc/frame.hxx, sw/source/core/layout/newfrm.cxx, sw/source/core/layout/wsfrm.cxx]
+  - key: invalidation-repair-loop
+    name: Invalidate-then-repair layout
+    category: layout
+    maturity: full
+    summary: Position/size/inner-area validity flags per frame; a stack-scoped layout action walks pages front to back repairing invalid frames, interruptible by input.
+    where: [sw/source/core/layout/layact.cxx, sw/source/core/inc/layact.hxx, sw/source/core/layout/calcmove.cxx, sw/source/core/layout/wsfrm.cxx]
+  - key: idle-layout
+    name: Idle background formatting
+    category: layout
+    maturity: full
+    summary: Timer-driven idle jobs continue full-document layout, field updates, and grammar checking when the app is idle; busy documents postpone.
+    where: [sw/source/core/doc/SwDocIdle.cxx, sw/source/core/doc/DocumentTimerManager.cxx, sw/source/core/inc/DocumentTimerManager.hxx]
+  - key: flow-master-follow
+    name: Master/follow flow chains
+    category: layout
+    maturity: full
+    summary: Shared flow behavior lets paragraphs, tables, and sections split into frame chains across pages/columns with forward and backward movement.
+    where: [sw/source/core/layout/flowfrm.cxx, sw/source/core/inc/flowfrm.hxx, sw/source/core/layout/calcmove.cxx]
+  - key: grow-shrink-negotiation
+    name: Grow/shrink space negotiation
+    category: layout
+    maturity: full
+    summary: Children request space from parents through one protocol used by footnote areas, sections, cells, and headers/footers.
+    where: [sw/source/core/layout/wsfrm.cxx, sw/source/core/layout/ssfrm.cxx]
+  - key: layout-loop-control
+    name: Pagination loop watchdog
+    category: layout
+    maturity: full
+    summary: Counts repair rounds in a page window and escalates through stages up to force-validating frames, guaranteeing termination over perfect layout.
+    where: [sw/source/core/layout/layouter.cxx, sw/source/core/inc/layouter.hxx, sw/source/core/layout/movedfwdfrmsbyobjpos.cxx]
+  - key: layout-cache
+    name: Persisted pagination cache
+    category: layout
+    maturity: full
+    summary: Page-break/paragraph-split hints saved with the file and replayed on load to reproduce pagination without full reflow.
+    where: [sw/source/core/layout/laycache.cxx, sw/source/core/inc/laycache.hxx]
+  - key: page-styles-sequencing
+    name: Page styles and sequencing
+    category: sections-pages
+    maturity: full
+    summary: Page geometry owned by page styles with first/left/right variants and next-style chains; OOXML sections map onto this on import.
+    where: [sw/source/core/layout/pagedesc.cxx, sw/source/core/layout/pagechg.cxx]
+  - key: columns
+    name: Multi-column layout
+    category: sections-pages
+    maturity: full
+    summary: Columns at page-style and section level, with balancing and column breaks.
+    where: [sw/source/core/layout/colfrm.cxx, sw/source/core/layout/sectfrm.cxx]
+  - key: sections
+    name: Text sections
+    category: sections-pages
+    maturity: full
+    summary: Nestable body regions with own columns, protection, hidden/conditional visibility, section-end note collection, file/DDE linkage.
+    where: [sw/source/core/layout/sectfrm.cxx, sw/source/core/docnode/ndsect.cxx, sw/source/core/docnode/section.cxx]
+  - key: headers-footers
+    name: Headers and footers
+    category: sections-pages
+    maturity: full
+    summary: Per page style, shared or distinct left/right/first, with dynamic height negotiation against the body.
+    where: [sw/source/core/layout/hffrm.cxx, sw/source/core/inc/hffrm.hxx]
+  - key: vertical-writing
+    name: Vertical and mixed writing modes
+    category: layout
+    maturity: full
+    summary: Direction-aware geometry accessors let one pagination code path serve LTR, RTL, and vertical CJK page modes plus rotated cells/frames.
+    where: [sw/source/core/inc/frame.hxx, sw/source/core/text/frmform.cxx]
+
+  # ---------- text formatting ----------
+  - key: line-portion-model
+    name: Line builder portion model
+    category: text-formatting
+    maturity: full
+    summary: Each formatted line is a chain of typed portions (text, glue, tab, field, footnote ref, fly gap, hyphen, drop cap, bidi/ruby multiportions).
+    where: [sw/source/core/text/porlay.cxx, sw/source/core/text/portxt.cxx, sw/source/core/text/pormulti.cxx, sw/source/core/text/itrform2.cxx]
+  - key: line-break-guess
+    name: Guess-and-fit line breaking
+    category: text-formatting
+    maturity: full
+    summary: Measure to an estimated break, snap to a locale break-iterator opportunity, correct underflow/overflow, hyphenate on demand.
+    where: [sw/source/core/text/guess.cxx, sw/source/core/text/txthyph.cxx]
+  - key: reformat-range-earlyout
+    name: Incremental paragraph reformat
+    category: text-formatting
+    maturity: full
+    summary: Paragraph records the changed character range; reformat starts at the first affected line and stops when breaks resynchronize.
+    where: [sw/source/core/text/porlay.hxx, sw/source/core/text/frmform.cxx, sw/source/core/text/txtfrm.cxx]
+  - key: script-info-cache
+    name: Per-paragraph script/bidi/kashida cache
+    category: rtl-ctl
+    maturity: full
+    summary: Script runs, bidi levels, kashida candidates, and hidden ranges computed per paragraph revision and shared by layout, cursor, and paint.
+    where: [sw/source/core/text/porlay.cxx, sw/source/core/text/itratr.cxx]
+  - key: kashida-justification
+    name: Kashida justification
+    category: rtl-ctl
+    maturity: full
+    summary: One insertion point per word chosen by typographic priority; user marks can force or suppress points; validity exposed to cursor logic.
+    where: [sw/source/core/text/itradj.cxx, sw/source/core/txtnode/justify.cxx]
+  - key: bidi-multiportion
+    name: Bidi segment layout
+    category: rtl-ctl
+    maturity: full
+    summary: Direction changes within a line become nested sub-line portions; paragraph direction can auto-derive; per-line UAX 9 reordering.
+    where: [sw/source/core/text/pormulti.cxx, sw/source/core/text/porlay.cxx]
+  - key: widow-orphan
+    name: Widow/orphan and keep rules
+    category: text-formatting
+    maturity: full
+    summary: Widow/orphan minima, keep-with-next, and break rules drive frame splitting and backward moves.
+    where: [sw/source/core/text/widorp.cxx, sw/source/core/text/frmform.cxx]
+  - key: drop-caps
+    name: Drop caps
+    category: text-formatting
+    maturity: full
+    summary: Initial-character portions spanning several lines with whole-word option and automatic size fitting.
+    where: [sw/source/core/text/txtdrop.cxx]
+  - key: text-frame-cache
+    name: Formatted-line cache
+    category: text-formatting
+    maturity: full
+    summary: Bounded cache of formatted line structures; rarely painted paragraphs drop and rebuild them on demand.
+    where: [sw/source/core/text/txtcache.cxx]
+  - key: hidden-text
+    name: Hidden text and fields display
+    category: text-formatting
+    maturity: full
+    summary: Hidden ranges from attributes/fields are skipped or revealed per view; a model-to-view offset helper maps between representations.
+    where: [sw/source/core/txtnode/modeltoviewhelper.cxx, sw/source/core/text/porrst.cxx]
+
+  # ---------- document model ----------
+  - key: node-array-regions
+    name: Flat node array with hidden regions
+    category: document-model
+    maturity: full
+    summary: One array with paired begin/end markers encodes nesting; fixed top-level regions hold footnote text, header/footer/fly text, tracked deletions, and body.
+    where: [sw/source/core/docnode/nodes.cxx, sw/source/core/docnode/node.cxx]
+  - key: attribute-spans
+    name: Paragraph attribute spans
+    category: document-model
+    maturity: full
+    summary: Sorted span array per paragraph mixing flat formatting spans, nested spans (links, ruby, meta), and zero-width anchors with placeholder characters.
+    where: [sw/source/core/txtnode/ndhints.cxx, sw/source/core/txtnode/ndtxt.cxx, sw/source/core/txtnode/fmtatr2.cxx]
+  - key: pooled-item-sets
+    name: Pooled items and inherited item sets
+    category: styles
+    maturity: full
+    summary: Refcount-pooled property objects; parent-chained sets implement style inheritance and direct-formatting override resolution.
+    where: [svl/source/items, sw/source/core/attr]
+  - key: style-families
+    name: Style families
+    category: styles
+    maturity: full
+    summary: Character, paragraph, frame, page, list, table styles; built-ins carry stable programmatic names separate from translated UI names; conditional paragraph styles.
+    where: [sw/source/core/doc/fmtcol.cxx, sw/source/core/doc/DocumentStylePoolManager.cxx, sw/source/core/doc/SwStyleNameMapper.cxx]
+  - key: manager-facets
+    name: Document manager facets
+    category: document-model
+    maturity: full
+    summary: The document object delegates to ~25 single-purpose managers behind narrow interfaces (fields, redlines, lists, undo, timers, settings, statistics).
+    where: [sw/source/core/doc, sw/source/core/inc/DocumentContentOperationsManager.hxx]
+  - key: undo-model
+    name: Undo/redo model
+    category: document-model
+    maturity: full
+    summary: Inverse-operation objects with attribute history; deleted content stashed in a hidden node region; compound actions bracketed under one user entry.
+    where: [sw/source/core/undo/docundo.cxx, sw/source/core/undo/rolbck.cxx, sw/source/core/undo/undel.cxx, svl/source/undo]
+  - key: bookmarks-marks
+    name: Bookmarks and range marks
+    category: document-model
+    maturity: full
+    summary: Position-anchored marks (bookmarks, annotation ranges, form fieldmarks, cross-reference marks) maintained across edits by a mark manager.
+    where: [sw/source/core/crsr/bookmark.cxx, sw/source/core/inc/MarkManager.hxx, sw/source/core/doc/docbm.cxx]
+
+  # ---------- tables ----------
+  - key: table-split
+    name: Table split across pages
+    category: tables
+    maturity: full
+    summary: Split inside a row via layout-only continuation rows, else move rows/table; repeated header rows cloned to follow tables; row-keep and row-span constraints.
+    where: [sw/source/core/layout/tabfrm.cxx]
+  - key: nested-tables
+    name: Nested tables
+    category: tables
+    maturity: full
+    summary: Cells contain full node ranges, so tables nest arbitrarily and split logic recurses.
+    where: [sw/source/core/layout/tabfrm.cxx, sw/source/core/docnode/ndtbl.cxx]
+  - key: table-autolayout
+    name: Auto table layout (AutoFit)
+    category: tables
+    maturity: full
+    summary: Two-pass min/max content-width measurement distributes column widths, in the style of CSS auto table layout.
+    where: [sw/source/core/doc/htmltbl.cxx, sw/source/core/doc/tblrwcl.cxx]
+  - key: table-styles
+    name: Table styles / autoformat
+    category: tables
+    maturity: full
+    summary: Reusable table formatting bundles with row/column banding and region-specific formats.
+    where: [sw/source/core/doc/tblafmt.cxx, sw/source/filter/ww8/docxtablestyleexport.cxx]
+  - key: table-formulas
+    name: Table cell formulas
+    category: tables
+    maturity: full
+    summary: Spreadsheet-like formulas over cell references inside text tables, with recalculation.
+    where: [sw/source/core/fields/cellfml.cxx, sw/source/core/fields/tblcalc.cxx]
+  - key: split-fly-tables
+    name: Floating tables that split
+    category: tables
+    maturity: full
+    summary: Tables anchored in floating frames can break across pages, matching Word's floating-table behavior.
+    where: [sw/source/core/layout/tabfrm.cxx, sw/source/core/layout/flycnt.cxx]
+
+  # ---------- notes, fields, indexes ----------
+  - key: footnote-negotiation
+    name: Footnote space negotiation
+    category: notes
+    maturity: full
+    summary: Page/column-level footnote containers grow bottom-up against the body, never past the reference line; notes split with continuation hints; migration follows references.
+    where: [sw/source/core/layout/ftnfrm.cxx, sw/source/core/text/txtftn.cxx, sw/source/core/doc/docftn.cxx, sw/source/core/inc/ftnboss.hxx]
+  - key: endnote-collection
+    name: Endnotes at section/document end
+    category: notes
+    maturity: full
+    summary: A collector gathers endnote frames and emits them at the owning section or document end.
+    where: [sw/source/core/layout/layouter.cxx, sw/source/core/layout/sectfrm.cxx]
+  - key: field-model
+    name: Field type/instance model
+    category: fields
+    maturity: full
+    summary: Shared per-type objects plus per-instance state; expansion text cached because evaluation may need finished layout; updates run positionally sorted.
+    where: [sw/source/core/fields/fldbas.cxx, sw/source/core/fields/expfld.cxx, sw/source/core/doc/DocumentFieldsManager.cxx, sw/source/core/doc/docfld.cxx]
+  - key: field-inventory
+    name: Field inventory
+    category: fields
+    maturity: full
+    summary: Page numbers, doc info, references, conditions, variables, input, database, user, script, dropdown, chapter, bibliography fields.
+    where: [sw/source/core/fields/docufld.cxx, sw/source/core/fields/reffld.cxx, sw/source/core/fields/chpfld.cxx, sw/source/core/fields/authfld.cxx]
+  - key: toc-generation
+    name: TOC and index generation
+    category: fields
+    maturity: full
+    summary: Indexes generated into read-only sections from headings, marks, and captions; tokenized entry templates drive tab-stop layout; hyperlinked entries.
+    where: [sw/source/core/doc/doctxm.cxx, sw/source/core/tox/ToxTextGenerator.cxx, sw/source/core/tox/txmsrt.cxx]
+
+  # ---------- numbering ----------
+  - key: numbering-tree
+    name: Hierarchical numbering trees
+    category: numbering
+    maturity: full
+    summary: Counting maintained in per-list trees of numbered nodes with phantom levels; list identity is separate from list style.
+    where: [sw/source/core/SwNumberTree, sw/source/core/doc/number.cxx, sw/source/core/doc/list.cxx, sw/source/core/doc/DocumentListsManager.cxx]
+  - key: outline-numbering
+    name: Outline/chapter numbering
+    category: numbering
+    maturity: full
+    summary: A special outline rule ties heading styles to levels; outline level can also exist without list membership.
+    where: [sw/source/core/doc/docnum.cxx, sw/source/core/doc/DocumentOutlineNodesManager.cxx]
+
+  # ---------- change tracking, comments ----------
+  - key: redline-model
+    name: Redline storage model
+    category: redlining
+    maturity: full
+    summary: Position-sorted range records for insert/delete/format/table/move with author/date stacks; deleted content moved to a hidden node region.
+    where: [sw/source/core/doc/docredln.cxx, sw/source/core/doc/DocumentRedlineManager.cxx, sw/inc/IDocumentRedlineAccess.hxx]
+  - key: redline-hide-merge
+    name: Hide-changes merged text frames
+    category: redlining
+    maturity: full
+    summary: With changes hidden, one layout text frame spans multiple model paragraphs via an extent map translating view offsets to model positions.
+    where: [sw/source/core/inc/txtfrm.hxx, sw/source/core/text/redlnitr.cxx, sw/source/core/text/txtfrm.cxx]
+  - key: document-compare
+    name: Document compare/merge
+    category: redlining
+    maturity: full
+    summary: Diffing two documents produces redlines; merging combines tracked changes from copies.
+    where: [sw/source/core/doc/doccomp.cxx]
+  - key: comments
+    name: Comments (annotations)
+    category: comments
+    maturity: full
+    summary: Point or range anchored, threaded with resolve state; body text lives in a small embedded edit engine; sidebar UI outside pagination.
+    where: [sw/source/core/fields/postithelper.cxx, sw/source/uibase/docvw/PostItMgr.cxx, sw/source/core/fields/textapi.cxx]
+
+  # ---------- objects and wrap ----------
+  - key: anchoring-model
+    name: Object anchoring model
+    category: objects-wrap
+    maturity: full
+    summary: Page/paragraph/character/as-character/frame anchors; as-character objects occupy a placeholder character and size the line.
+    where: [sw/source/core/layout/flycnt.cxx, sw/source/core/layout/flyincnt.cxx, sw/source/core/layout/fly.cxx]
+  - key: text-wrap
+    name: Text wrap around objects
+    category: objects-wrap
+    maturity: full
+    summary: Wrap modes including contour polygons and transparent-through; line builder inserts gap portions where objects intersect lines.
+    where: [sw/source/core/text/txtfly.cxx, sw/source/writerfilter/dmapper/WrapPolygonHandler.cxx]
+  - key: object-positioning
+    name: Anchored-object position resolution
+    category: objects-wrap
+    maturity: full
+    summary: Dedicated subsystem iterates object position vs. text flow to a fixpoint, with counters capping repeated wrap-driven forward moves.
+    where: [sw/source/core/objectpositioning, sw/source/core/layout/objectformatter.cxx, sw/source/core/layout/movedfwdfrmsbyobjpos.cxx]
+  - key: frame-chaining
+    name: Chained text frames
+    category: objects-wrap
+    maturity: full
+    summary: Overflow text flows from one floating frame into a designated next frame.
+    where: [sw/source/core/layout/flycnt.cxx, sw/source/core/doc/docfly.cxx]
+  - key: textbox-shapes
+    name: Shape text boxes
+    category: objects-wrap
+    maturity: full
+    summary: A drawing shape pairs with a hidden text frame so shape text gets full Writer layout.
+    where: [sw/source/core/doc/textboxhelper.cxx]
+
+  # ---------- i18n / toolkit text ----------
+  - key: vcl-shaping
+    name: HarfBuzz shaping layer
+    category: rtl-ctl
+    maturity: full
+    summary: Platform-independent shaping via HarfBuzz with bidi run segmentation (ICU) and glyph-level layout in the toolkit, below all applications.
+    where: [vcl/source/gdi/CommonSalLayout.cxx, vcl/source/text/ImplLayoutArgs.cxx, vcl/source/text/ImplLayoutRuns.cxx]
+  - key: font-fallback
+    name: Per-glyph font fallback
+    category: rtl-ctl
+    maturity: full
+    summary: Missing glyphs trigger fallback font selection from substitution candidates; layout stitches runs from multiple physical fonts.
+    where: [vcl/source/font/PhysicalFontCollection.cxx, vcl/source/font/fontcache.cxx]
+  - key: break-iteration
+    name: Locale break iteration
+    category: rtl-ctl
+    maturity: full
+    summary: Grapheme/word/line/sentence boundaries via ICU with locale-specific customization and CJK dictionaries.
+    where: [i18npool/source/breakiterator]
+  - key: ctl-script-attrs
+    name: Per-script attribute triplets
+    category: rtl-ctl
+    maturity: full
+    summary: Western/CJK/CTL each carry independent font/size/weight/posture/language on every run.
+    where: [sw/source/core/txtnode/swfont.cxx, editeng/source/items]
+  - key: ruby-text
+    name: Phonetic guides (ruby)
+    category: rtl-ctl
+    maturity: full
+    summary: Ruby base/annotation pairs laid out as stacked multiportions.
+    where: [sw/source/core/doc/docruby.cxx, sw/source/core/text/pormulti.cxx]
+
+  # ---------- filters ----------
+  - key: docx-import-pipeline
+    name: DOCX import pipeline
+    category: filters
+    maturity: full
+    summary: Grammar-generated tokenizer (model.xml) emits a uniform token stream; a domain mapper with context stacks drives the document API; RTF shares the mapper.
+    where: [sw/source/writerfilter/ooxml/model.xml, sw/source/writerfilter/ooxml, sw/source/writerfilter/dmapper/DomainMapper.cxx, sw/source/writerfilter/dmapper/PropertyMap.cxx, sw/source/writerfilter/rtftok]
+  - key: docx-export-walker
+    name: Shared export walker
+    category: filters
+    maturity: full
+    summary: One model traversal raises semantic events to an abstract attribute-output interface implemented per format (DOCX, RTF, binary DOC).
+    where: [sw/source/filter/ww8/wrtw8nds.cxx, sw/source/filter/ww8/attributeoutputbase.hxx, sw/source/filter/ww8/docxattributeoutput.cxx, sw/source/filter/ww8/docxexport.cxx, sw/source/filter/ww8/rtfattributeoutput.cxx]
+  - key: interop-grab-bag
+    name: Interop grab bags
+    category: filters
+    maturity: full
+    summary: Unknown OOXML attributes preserved as opaque bundles on document/style/paragraph/run/shape properties and re-emitted on export; semantic round-trip, not byte-preserving.
+    where: [sw/source/writerfilter/dmapper/PropertyMap.cxx, sw/source/filter/ww8/docxattributeoutput.cxx, sw/source/filter/ww8/docxsdrexport.cxx]
+  - key: odf-filter-framework
+    name: ODF filter framework
+    category: filters
+    maturity: full
+    summary: Streaming XML with a context-stack importer and versioned export modes, shared across applications through the document API.
+    where: [xmloff, sw/source/filter/xml]
+  - key: docx-settings-compat
+    name: Compatibility settings import
+    category: filters
+    maturity: full
+    summary: Per-document compatibility flags from w:settings and legacy formats steer layout behavior variants.
+    where: [sw/source/writerfilter/dmapper/SettingsTable.cxx, sw/source/core/doc/DocumentSettingManager.cxx]
+  - key: markdown-filter
+    name: Markdown filter
+    category: filters
+    maturity: partial
+    summary: Recent import/export for Markdown covering basic structures (headings, lists, tables, images).
+    where: [sw/source/filter/md]
+  - key: html-filter
+    name: HTML filter
+    category: filters
+    maturity: partial
+    summary: Long-standing HTML import/export; dated relative to modern HTML/CSS.
+    where: [sw/source/filter/html]
+
+  # ---------- editing UX ----------
+  - key: find-replace
+    name: Find and replace
+    category: editing
+    maturity: full
+    summary: Plain, regex, similarity search; search by attributes and styles; transliteration-aware options.
+    where: [sw/source/core/crsr/findtxt.cxx, sw/source/core/crsr/findattr.cxx, sw/source/core/crsr/findcoll.cxx]
+  - key: autocorrect
+    name: Autocorrect and word completion
+    category: editing
+    maturity: full
+    summary: Replacement tables, capitalization/quote rules, and completion, shared via the edit engine layer.
+    where: [editeng/source/misc/svxacorr.cxx, sw/source/core/doc/acmplwrd.cxx]
+  - key: spellcheck-online
+    name: Background spell/grammar
+    category: editing
+    maturity: full
+    summary: Async provider-based checking marks error ranges per paragraph; idle-driven; decorations painted by the line builder.
+    where: [sw/source/core/text/wrong.cxx, sw/source/core/txtnode/GrammarContact.cxx, linguistic]
+  - key: clipboard-transfer
+    name: Clipboard and drag-drop
+    category: editing
+    maturity: full
+    summary: Multi-format transferable (native fragment, ODF, RTF, HTML, text, images) with paste-special and internal-move optimization.
+    where: [sw/source/uibase/dochdl/swdtflvr.cxx]
+  - key: content-controls
+    name: Content controls
+    category: forms
+    maturity: full
+    summary: Rich/plain text, checkbox, dropdown, date, picture controls mapped to w:sdt with interactive in-document widgets.
+    where: [sw/source/core/txtnode/attrcontentcontrol.cxx, sw/source/writerfilter/dmapper/SdtHelper.cxx, sw/source/core/crsr/contentcontrolbutton.cxx]
+  - key: form-fieldmarks
+    name: Legacy form fields
+    category: forms
+    maturity: full
+    summary: Bookmark-based fieldmarks (text input, checkbox, dropdown) matching Word legacy forms.
+    where: [sw/source/core/crsr/bookmark.cxx, sw/source/writerfilter/dmapper/FFDataHandler.cxx]
+  - key: mail-merge
+    name: Mail merge
+    category: editing
+    maturity: full
+    summary: Database-driven merge with condition evaluation and printer/file/e-mail output.
+    where: [sw/source/uibase/dbui, sw/source/core/doc/DocumentFieldsManager.cxx]
+  - key: master-documents
+    name: Master documents
+    category: editing
+    maturity: full
+    summary: Container documents aggregating sub-documents via sections with shared styles and cross-document indexes.
+    where: [sw/source/core/doc/docglbl.cxx, sw/source/uibase/globdoc]
+
+  # ---------- output, a11y, stability ----------
+  - key: pdf-export
+    name: PDF export incl. tagged PDF
+    category: output
+    maturity: full
+    summary: Metafile record/replay into a PDF writer; structure tags derived from layout+model; PDF/A and PDF/UA profiles.
+    where: [vcl/source/pdf, sw/source/core/text/EnhancedPDFExportHelper.cxx]
+  - key: tiled-rendering
+    name: Tiled rendering (LibreOfficeKit)
+    category: output
+    maturity: full
+    summary: Paint arbitrary document tiles into caller buffers with callback-based invalidation; powers browser-based editing; closest analog to a canvas renderer.
+    where: [libreofficekit, desktop/source/lib/init.cxx, sw/source/uibase/uno]
+  - key: accessibility-tree
+    name: Accessibility tree
+    category: accessibility
+    maturity: full
+    summary: Parallel a11y objects mirror the layout frame tree and emit change events; platform bridges consume them.
+    where: [sw/source/core/access, winaccessibility]
+  - key: autorecovery
+    name: Autosave and crash recovery
+    category: stability
+    maturity: full
+    summary: Timed snapshots to a recovery store plus a journal; crash triggers emergency save; next start offers recovery.
+    where: [framework/source/services/autorecovery.cxx, sfx2/source/doc]
+  - key: document-versions
+    name: In-file document versions
+    category: stability
+    maturity: full
+    summary: Named snapshots stored inside the document container, independent of autosave.
+    where: [sfx2/source/doc]
+  - key: yjs-experiment
+    name: Experimental CRDT collaboration
+    category: collaboration
+    maturity: partial
+    summary: Scaffolding for Yjs-based real-time collaborative editing exists behind a build option.
+    where: [README.yrs]
