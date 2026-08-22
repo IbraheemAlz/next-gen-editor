@@ -1,6 +1,8 @@
-# Sanitized machine-readable index of the ONLYOFFICE reference trees.
-# Produced by a clean-room Reader per plans/cleanroom/PROTOCOL.md.
+# Sanitized machine-readable index of the ONLYOFFICE reference trees. (v2)
+# Produced by clean-room Readers per plans/cleanroom/PROTOCOL.md.
 # Paths are pointers for future Reader dives only — Implementers never open them.
+# v2 (2026-08-22): synthesized after an independent verification round; every
+# corrected claim is reflected in the entries below and in PRD_ONLYOFFICE.md §7.
 
 provenance:
   - repo: https://github.com/ONLYOFFICE/sdkjs.git
@@ -10,7 +12,10 @@ provenance:
     commit_date: "2026-05-26"
     studied: "2026-08-22"
     license: AGPL-3.0
-    note: tree updated from master@72b0421c (2026-05-19) between the v1 survey and the tables deep dive
+    note: >
+      Shallow clone (no git history; in-tree changelog stale). v2 synthesis
+      after verification round of 2026-08-22; version-timeline facts come
+      from the public DocumentServer changelog, not the tree.
   - repo: https://github.com/ONLYOFFICE/core.git
     local: /data/code/reference/onlyoffice-core
     commit: acdc1e39627638e1fa7b16c90f3c0da450a31256
@@ -18,7 +23,11 @@ provenance:
     commit_date: "2026-05-26"
     studied: "2026-08-22"
     license: AGPL-3.0
-    note: tree updated from master@3250a848 (2026-05-19) between the v1 survey and the tables deep dive
+    note: >
+      Shallow clone. HarfBuzz is fetched from upstream at a pinned commit at
+      build time (FreeType-glue patch only), not vendored; the vendored ICU
+      under the charset-conversion module contains an unused full UAX #9
+      engine.
 
 areas:
   - name: word document model + editing logic
@@ -27,12 +36,18 @@ areas:
     where: [{repo: sdkjs, path: word/Editor/Paragraph}]
   - name: run content item types (text, tab, break, field chars, note refs)
     where: [{repo: sdkjs, path: word/Editor/Paragraph/RunContent}]
+  - name: complex fields (instruction parser, typed fields, form data)
+    where: [{repo: sdkjs, path: word/Editor/Paragraph/ComplexFields}, {repo: sdkjs, path: word/Editor/Paragraph/ComplexFieldInstruction.js}, {repo: sdkjs, path: word/Editor/Paragraph/ComplexField.js}]
+  - name: footnote/endnote controllers + note content objects
+    where: [{repo: sdkjs, path: word/Editor/Footnotes.js}, {repo: sdkjs, path: word/Editor/Endnotes.js}, {repo: sdkjs, path: word/Editor/FootEndNote.js}]
+  - name: table layout engine (grid, autofit, row flow, headers, floating)
+    where: [{repo: sdkjs, path: word/Editor/Table}, {repo: sdkjs, path: word/Editor/Table.js}]
   - name: layout view policies (print vs reflowable read mode)
     where: [{repo: sdkjs, path: word/Editor/Layout}]
   - name: canvas view layer (pages, rulers, overlay, page bitmap cache)
     where: [{repo: sdkjs, path: word/Drawing}]
   - name: fonts + shaping (FreeType/HarfBuzz WASM wrapper, grapheme cache)
-    where: [{repo: sdkjs, path: common/libfont}]
+    where: [{repo: sdkjs, path: common/libfont}, {repo: core, path: DesktopEditor/fontengine}]
   - name: bidi classification data + streaming reorder
     where: [{repo: sdkjs, path: common/bidi}, {repo: sdkjs, path: word/Editor/Paragraph/bidi-flow.js}]
   - name: shared drawing object model (DrawingML shapes, charts, smartart)
@@ -43,7 +58,7 @@ areas:
     where: [{repo: sdkjs, path: word/Editor/History.js}, {repo: sdkjs, path: common/HistoryCommon.js}]
   - name: internal binary snapshot serializer (JS side)
     where: [{repo: sdkjs, path: word/Editor/Serialize2.js}]
-  - name: hidden-input / IME capture
+  - name: hidden-input / IME capture + screen-reader live region
     where: [{repo: sdkjs, path: common/text_input.js}, {repo: sdkjs, path: common/text_input2.js}]
   - name: OOXML DOM read/write (C++)
     where: [{repo: core, path: OOXML/DocxFormat}]
@@ -72,6 +87,7 @@ features:
     where:
       - {repo: sdkjs, path: word/Editor/Paragraph_Recalculate.js}
       - {repo: sdkjs, path: word/Editor/Document.js}
+    notes: The fast tiers skip footnote renegotiation and reference-mark renumbering entirely; correctness relies on verify-then-demote, not on re-negotiating.
   - key: timer-sliced-pagination
     name: Interruptible timer-sliced pagination
     category: layout
@@ -94,13 +110,13 @@ features:
     name: Line model as horizontal range segments
     category: layout
     maturity: full
-    summary: Each line is a set of x-intervals; float wrap cutouts and column layout both reduce to range segmentation before line filling.
+    summary: Each line is a set of x-intervals; float wrap cutouts and column layout both reduce to range segmentation before line filling. RTL paragraphs enumerate wrap-cutout ranges in reverse so lines fill right-to-left.
     where: [{repo: sdkjs, path: word/Editor/Paragraph_Recalculate.js}, {repo: sdkjs, path: word/Editor/FlowObjects.js}]
   - key: speculative-placement-rollback
     name: Speculative placement with layout snapshots
     category: layout
     maturity: full
-    summary: Elements snapshot/restore layout state so pagination can try a placement and roll back when footnote space or keep rules reject it; element layout returns explicit control-flow result flags.
+    summary: Elements snapshot/restore layout state so pagination can try a placement and roll back when footnote space or keep rules reject it; element layout returns explicit control-flow result flags; table rows also snapshot/roll back footnote controller state.
     where: [{repo: sdkjs, path: word/Editor/Paragraph_Recalculate.js}, {repo: sdkjs, path: word/Editor/Table/TableRecalculate.js}]
   - key: keep-rules-widow-orphan
     name: Keep-next/keep-lines/widow-orphan control
@@ -120,14 +136,14 @@ features:
     name: FreeType+HarfBuzz WASM font engine
     category: text-pipeline
     maturity: full
-    summary: All measurement/shaping/rastering goes through a WASM build of the C++ font stack, giving identical metrics across browsers and on the headless server renderer.
-    where: [{repo: sdkjs, path: common/libfont}, {repo: core, path: DesktopEditor/fontengine}]
+    summary: All measurement/shaping/rastering goes through a WASM build of the C++ font stack (stock upstream HarfBuzz pinned to a commit, FreeType-glue patch only), giving identical metrics across browsers and on the headless server renderer.
+    where: [{repo: sdkjs, path: common/libfont}, {repo: core, path: DesktopEditor/fontengine}, {repo: core, path: Common/3dParty/harfbuzz}]
   - key: grapheme-interning
     name: Global shaped-grapheme interning
     category: text-pipeline
     maturity: full
-    summary: Shaped clusters (font + glyphs + advances) are deduplicated in a global table addressed by integer ids; runs store grapheme ids plus widths.
-    where: [{repo: sdkjs, path: common/libfont/grapheme.js}, {repo: sdkjs, path: common/libfont/textshaper.js}]
+    summary: Shaped clusters (font + glyphs + advances + offsets) are deduplicated in a global table addressed by integer ids; runs store grapheme ids plus widths; monotone-grapheme clustering keeps base+marks in one cluster whose width divides evenly across its codepoints.
+    where: [{repo: sdkjs, path: common/libfont/grapheme.js}, {repo: sdkjs, path: common/libfont/textshaper.js}, {repo: sdkjs, path: common/libfont/engine.js}]
   - key: reference-size-shaping
     name: Shape once at reference size, scale linearly
     category: text-pipeline
@@ -138,87 +154,226 @@ features:
     name: Streaming pragmatic BiDi reorder
     category: text-pipeline
     maturity: partial
-    summary: A simplified streaming reorderer (strong/weak/neutral buffers, number grouping, bracket data) rather than full UAX #9 embedding levels; paragraph-level base direction with mirrored indents.
-    where: [{repo: sdkjs, path: word/Editor/Paragraph/bidi-flow.js}, {repo: sdkjs, path: common/bidi}]
-    notes: No kashida justification anywhere in the tree; RTL tables (bidiVisual) not implemented.
-  - key: script-font-fallback
-    name: Script itemization + font fallback
+    summary: >
+      Classification is full UAX #9 (per-codepoint table generated from
+      Unicode data incl. explicit/override/isolate codes, plus bracket-pair
+      data), but resolution is a streaming subset: strong/weak/neutral
+      buffers with flush rules, neutrals to the paragraph base direction,
+      digit islands LTR inside RTL. No embedding-level stack — explicit
+      directional codes are classified but never interpreted; bracket data
+      serves only draw-time mirrored-glyph substitution (not rule N0). One
+      reorderer is replayed by layout, painting, decorations, selection,
+      caret geometry, hit-testing, and list numbers — consistency by
+      construction.
+    where:
+      - {repo: sdkjs, path: word/Editor/Paragraph/bidi-flow.js}
+      - {repo: sdkjs, path: common/bidi}
+      - {repo: sdkjs, path: word/Editor/Paragraph/recalc/align-recalc-state.js}
+      - {repo: sdkjs, path: word/Editor/Paragraph/position-calculator.js}
+      - {repo: sdkjs, path: word/Editor/Paragraph/search-position-by-coords.js}
+      - {repo: sdkjs, path: word/Editor/Paragraph/draw-selection.js}
+      - {repo: sdkjs, path: word/Editor/Paragraph/draw}
+    notes: >
+      No first-strong auto paragraph direction (explicit toggle only); a
+      per-character RTL flag is stored but never read; typing never stamps
+      the run-level <w:rtl> property (in-tree to-do). A full UAX #9 engine
+      exists in the C++ tree only inside unused vendored ICU.
+  - key: rtl-paragraph-editing
+    name: RTL paragraph editing & mirrored geometry
     category: text-pipeline
     maturity: full
-    summary: Shaping buffers segment by script, direction, and resolved font (with substitution when the primary font lacks a codepoint).
-    where: [{repo: sdkjs, path: common/libfont/textshaper.js}, {repo: sdkjs, path: word/Editor/Paragraph/TextShaper.js}]
+    summary: >
+      Paragraph direction from compiled <w:bidi> (defaults/style/direct);
+      logical-order arrow movement with a paragraph-level left/right key
+      flip; as-you-type caret pinning at direction boundaries; cluster-aware
+      caret (never inside base+mark pairs); epsilon-merged visual-order
+      selection rects (discontinuous BiDi selection for free); mirrored
+      indents, alignment, trailing-space overhang, tabs resolved in a
+      reflected coordinate space, borders/shading, click-and-type,
+      formatting-mark glyphs, ruler with right origin, RTL list-number
+      anchoring; RTL section gutter placement.
+    where:
+      - {repo: sdkjs, path: word/Editor/Paragraph_Recalculate.js}
+      - {repo: sdkjs, path: word/Editor/Paragraph.js}
+      - {repo: sdkjs, path: word/Editor/Document.js}
+      - {repo: sdkjs, path: word/Editor/sections/sect-pr.js}
+      - {repo: sdkjs, path: word/Editor/Numbering/Num.js}
+      - {repo: sdkjs, path: word/Drawing/Rulers.js}
+    notes: >
+      Document paragraphs store logical (OOXML) alignment with left/right
+      swapped to visual terms at the UI boundary; shape text stores visual
+      alignment and swaps at toggle/recalc — two coexisting conventions.
+      Section-level <w:bidi> (RTL column fill order) is conversion-layer
+      only: the editor always fills columns left-to-right. HTML clipboard
+      does not carry direction, so RTL-ness survives only the internal
+      binary flavor.
+  - key: kashida-justification
+    name: Kashida/tatweel justification
+    category: text-pipeline
+    maturity: absent
+    summary: >
+      No kashida anywhere: justify distributes leftover width evenly across
+      inter-word spaces (trailing spaces excluded); the per-letter channel
+      exists only for the no-spaces CJK case. The WASM shaper has no
+      elongation hooks. Worse, the OOXML kashida jc values fall through the
+      docx-to-internal-binary conversion's default branch to LEFT alignment
+      — a kashida-justified document opens start-aligned, not even
+      justified, and loses the setting on save; distribute/thaiDistribute
+      degrade to plain justify. The RTF/.doc/ODF layers carry the values as
+      inert format data only.
+    where:
+      - {repo: sdkjs, path: word/Editor/Paragraph_Recalculate.js}
+      - {repo: core, path: OOXML/Common/SimpleTypes_Word.cpp}
+      - {repo: core, path: OOXML/Binary/Document/BinWriter/BinaryWriterD.cpp}
+      - {repo: core, path: RtfFile/OOXml/Reader/OOXParagraphElementReaders.cpp}
+  - key: arabic-shaping
+    name: Arabic/complex-script shaping behavior
+    category: text-pipeline
+    maturity: full
+    summary: >
+      Joining, contextual forms, ligatures, and mark placement are stock
+      HarfBuzz output with FreeType metrics. Shaping buffer flushes on
+      space, script/direction/font change, shaping-relevant property change,
+      inline-container boundary, and a max length; the shaping-context
+      comparison ignores color/underline/highlight/language so those changes
+      never break joining mid-word. Emergency over-wide-word breaks re-shape
+      each candidate sub-range so fragments keep correct contextual forms;
+      marks never separate from bases.
+    where:
+      - {repo: sdkjs, path: word/Editor/Paragraph/TextShaper.js}
+      - {repo: sdkjs, path: common/libfont/textshaper.js}
+      - {repo: core, path: DesktopEditor/fontengine/TextShaper.cpp}
+    notes: >
+      Shaping language hard-coded to English (locl never fires). A
+      hard-coded U+060C..U+074A force-Arabic script override (public-bug
+      workaround, in-tree to-do to replace with a real bidi algorithm)
+      mis-tags the Syriac block; duplicated in the spreadsheet cell
+      renderer. HarfBuzz unsafe-to-break flags exported but unused (to-do).
+      Suite-consistent: the spreadsheet cell editor shapes through the same
+      path.
+  - key: script-font-fallback
+    name: Font slots + script itemization + fallback
+    category: text-pipeline
+    maturity: full
+    summary: >
+      Three mechanisms: (a) an OOXML font-slot classifier
+      (ascii/hAnsi/eastAsia per the public ECMA TC45 DR 09-0040 disposition,
+      extended empirically) with the cs slot chosen only when the run
+      carries the CS or RTL flag — Arabic/Hebrew/Syriac ranges classify to
+      the ascii slot; (b) per-codepoint cmap-coverage substitution among
+      loaded fonts, migrating a buffered word wholesale when it fits the
+      substitute; (c) a server-generated Unicode-range-to-font table whose
+      hand-ordered priority list contains no dedicated Arabic font.
+    where:
+      - {repo: sdkjs, path: word/Editor/Paragraph/Run/FontClassification.js}
+      - {repo: sdkjs, path: word/Editor/Paragraph/Run/FontCalculator.js}
+      - {repo: sdkjs, path: common/libfont/character.js}
+      - {repo: sdkjs, path: common/libfont/textmeasurer.js}
+      - {repo: core, path: DesktopEditor/fontengine/ApplicationFontsWorker.cpp}
+    notes: A mid-word fallback font switch still flushes the shaping segment, so joining breaks across a fallback boundary. Spaces are always measured in the ascii-slot font.
   - key: auto-hyphenation
     name: Automatic hyphenation
     category: text-pipeline
     maturity: full
-    summary: Pattern-based per-language hyphenation with lazily loaded language data, applied during line breaking when enabled.
+    summary: Pattern-based per-language hyphenation with lazily loaded language data, applied during line breaking when enabled (no patterns for Arabic, correctly).
     where: [{repo: sdkjs, path: word/Editor/Paragraph/TextHyphenator.js}, {repo: sdkjs, path: common/api/auto-hyphenation-settings.js}]
   - key: ligature-control
-    name: Per-run ligature class control
+    name: OpenType feature control (ligatures + kern)
     category: text-pipeline
-    maturity: full
-    summary: Runs carry a setting for which ligature classes the shaper should enable.
-    where: [{repo: sdkjs, path: common/libfont/textshaper.js}]
+    maturity: partial
+    summary: >
+      Exactly five user-controllable features reach the shaping call — the
+      four ligature classes (mirroring the w14:ligatures value set) plus
+      kerning — all passed explicitly, zeroed when unset. Kerning is off
+      everywhere (no editor run property requests it); contextual ligatures
+      off by default; standard ligatures force-enabled for Arabic/Syriac
+      regardless of the run setting; nonzero letter-spacing disables all
+      ligatures on the run; w14:cntxtAlts round-trips in conversion but is
+      never applied. Everything else (joining forms, rlig, calt, mark,
+      mkmk, ccmp) rides HarfBuzz defaults.
+    where: [{repo: sdkjs, path: word/Editor/Paragraph/TextShaper.js}, {repo: core, path: DesktopEditor/fontengine/TextShaper.cpp}]
+  - key: numeral-display
+    name: Numeral display setting (western/hindi)
+    category: text-pipeline
+    maturity: partial
+    summary: Document-level numeral option matching Word's — western and hindi implemented as display-time substitution of ASCII digits with Arabic-Indic digits (model keeps ASCII); the context value is defined in the enum but explicitly rejected. PDF form fields have a separate per-field variant.
+    where: [{repo: sdkjs, path: word/api.js}, {repo: sdkjs, path: word/Editor/Paragraph/TextShaper.js}]
 
   # ---- tables ----
   - key: table-grid-autofit
     name: Table grid normalization + AutoFit
     category: tables
     maturity: full
-    summary: Declared column grid reconciled against actual cell spans, then min/max/preferred content widths resolve fixed/percent/auto layout into final column widths.
-    where: [{repo: sdkjs, path: word/Editor/Table/TableRecalculate.js}]
+    summary: >
+      A declared-grid reconciliation pass always runs (explicit cell widths
+      widen grid columns, monotonic widening walk over rows, proportional
+      rescale to any declared table width) and alone defines fixed layout;
+      the content-based min/max AutoFit pass runs only in autofit mode, with
+      the TOP-LEVEL ancestor table's mode governing nested tables. Explicit
+      cell widths replace a column's max-content; a min-ignoring-preferred
+      tier drives overflow fallbacks; multi-span distribution is
+      deliberately order-dependent; min/max clamp at Word's documented
+      22-inch cap. Recognizably the CSS2 auto-table algorithm extended with
+      Word's preferred-width tiers.
+    where: [{repo: sdkjs, path: word/Editor/Table/TableRecalculate.js}, {repo: sdkjs, path: word/Editor/Table.js}]
+    notes: No Word-style "AutoFit to Contents/Window" command — only the fixed/autofit layout property plus distribute-rows/columns. Percent base is the narrowest section column in multi-column sections; nested tables use the parent cell content width.
   - key: table-row-splitting
     name: Row splitting across pages
     category: tables
     maturity: full
-    summary: Rows split across page boundaries by splitting each cell's content with continuation state; vertically merged cells re-lay at the break; repeated header rows re-laid from per-page copies (inline top-level tables only, skipped when they don't fit).
+    summary: Rows split across page boundaries by splitting each cell's content with continuation state (only when every participating merge-start, non-vertical-text cell places some content — otherwise all cells restart on the next page); vertically merged cells re-lay at the break; repeated header rows re-laid from per-page clones (inline top-level tables only, trimmed of merge-crossing rows, skipped when they don't fit).
     where: [{repo: sdkjs, path: word/Editor/Table/TableRecalculate.js}, {repo: sdkjs, path: word/Editor/Table/TableRow.js}]
-    notes: The OOXML per-row can't-split flag is stored and round-tripped but NOT consumed by layout, and no UI exposes it — rows always split by content; only exact/at-least-height rows move to the next page whole.
+    notes: The OOXML per-row can't-split flag (<w:cantSplit>) is stored and round-tripped but NOT consumed by layout, and no UI/API sets it — rows always split by content; only exact/at-least-height rows move to the next page whole. Rotated-text cells never split.
   - key: table-border-conflicts
     name: Border conflict resolution
     category: tables
     maturity: full
-    summary: A dedicated pass resolves border conflicts per the ECMA-376 rules — cell border beats table border, then wider wins, then the spec's brightness tie-breaks — including merged-cell and adjacent-row interactions; spacing tables draw per-cell borders with no conflict pass.
+    summary: In the collapsed model an explicitly set cell border beats the table border, a none border loses to any set border, ties resolve by the ECMA-376 comparison (wider wins, then weighted-brightness cascade); results stored per cell edge as per-grid-segment arrays and inset into content metrics before layout. Cell-spacing tables have NO conflict pass — each cell draws its own borders plus the table outer border.
     where: [{repo: sdkjs, path: word/Editor/Table/TableRecalculate.js}, {repo: sdkjs, path: word/Editor/Table.js}]
   - key: table-styles-conditional
     name: Table styles with conditional bands
     category: tables
     maturity: full
-    summary: All 13 OOXML conditional slots (whole table, first/last row/col, band1/band2 horiz/vert, four corner cells) layered per the spec order under the six table-look flags, with band-size grouping and Word-compat quirks (first-row formatting extends to header-flagged rows; cell text direction never comes from the style).
+    summary: All 13 OOXML conditional slots layered per the spec order under the six table-look flags, band membership by floor-division of band size, with Word-compat quirks (row-band counting starts after the header row only when the first-row flag is on; the column shift requires a non-empty first-column conditional style; first-row formatting extends to header-flagged rows; cell text direction never comes from the style; <w:cnfStyle> transported but never consumed — conditions recomputed from live position).
     where: [{repo: sdkjs, path: word/Editor/Styles.js}, {repo: sdkjs, path: word/Editor/Table/TableLook.js}, {repo: sdkjs, path: word/Editor/Table/TableCell.js}]
   - key: floating-tables
     name: Floating (positioned) tables
     category: tables
     maturity: full
-    summary: Anchored H/V positioning with alignment or offsets, rectangular text wrap with distance-to-text, iterative overlap avoidance (push right, else below), page-bounds clamping; floating tables can split across pages (not in multi-column sections) but never repeat header rows.
+    summary: Anchored H/V positioning reusing the drawing anchor machinery, rectangular both-sides wrap only with distance-to-text, overlap avoidance honoring <w:tblOverlap>, Word-parity quirks replicated (table indent added to floating X; header/footer page- or margin-anchored floating tables get an unbounded bottom); multi-page floating tables flow but never repeat header rows.
     where: [{repo: sdkjs, path: word/Editor/Table.js}, {repo: sdkjs, path: word/Editor/FlowObjects.js}, {repo: sdkjs, path: word/Editor/Document.js}, {repo: sdkjs, path: word/Editor/Paragraph/ParaDrawing.js}]
   - key: cell-vertical-text
     name: Vertical cell text direction
     category: tables
     maturity: full
-    summary: Per-cell text direction (both rotated orientations) supported in layout and editing.
+    summary: The two 90-degree rotations of the five OOXML cell text directions are treated as vertical; rotated cells measure min/max in rotated space, lay out after row height is known, never split, and follow a compat-mode fork for overflow alignment.
     where: [{repo: sdkjs, path: word/Editor/Table/TableCell.js}]
   - key: table-formulas
     name: Table formula fields
     category: tables
     maturity: full
-    summary: Expression-field parser with a function library and table cell references, evaluated on field update.
+    summary: Expression-field parser with the complete Word-standard 18-function library, bookmark and table cell-name/cell-range arguments, and numeric-picture result formatting, evaluated on field update.
     where: [{repo: sdkjs, path: word/Editor/Paragraph/FormulaParser.js}]
   - key: rtl-tables
     name: RTL tables (bidiVisual)
     category: tables
     maturity: absent
     summary: No visual column mirroring for RTL tables in the word editor; the table layout module never consults paragraph/section direction at all (paragraph-level RTL inside cells works, table geometry is LTR-only).
-    where: [{repo: sdkjs, path: word/Editor/Table.js}, {repo: sdkjs, path: word/Editor/Serialize2.js}]
-    notes: The C++ conversion core round-trips <w:bidiVisual> (incl. a binary-format record for it), but the JS editor's binary vocabulary lacks that record, so the property is silently dropped when a document is edited and saved through the editor.
+    where:
+      - {repo: sdkjs, path: word/Editor/Table.js}
+      - {repo: sdkjs, path: word/Editor/Serialize2.js}
+      - {repo: core, path: OOXML/DocxFormat/Logic/TableProperty.cpp}
+      - {repo: core, path: OOXML/Binary/Document/BinWriter/BinReaderWriterDefines.h}
+    notes: The C++ conversion core fully round-trips <w:bidiVisual> (docx DOM read/write with revision merge, .doc/RTF/ODF-import mappings, and a dedicated binary-format record), but the JS editor's binary vocabulary stops one record short of it — unknown-record skipping silently drops the property on any editor open/save cycle. Pure C++ format-to-format conversion preserves it.
 
   # ---- sections, pages, headers/footers ----
   - key: sections-model
     name: Section model with all break types
     category: sections
     maturity: full
-    summary: Section properties attach to paragraphs and aggregate into a section index; next-page/continuous/even/odd/column breaks; per-section page size, margins, gutter (incl. RTL side), page borders, title page.
+    summary: Section properties attach to paragraphs and aggregate into a section index; next-page/continuous/even/odd/column breaks; per-section page size, margins, gutter (top setting wins, else right when rtlGutter else left, mirror-margins swapping on odd pages), page borders, title page.
     where: [{repo: sdkjs, path: word/Editor/sections}, {repo: sdkjs, path: word/Editor/document}]
+    notes: Section-level <w:bidi> (RTL column fill order) is conversion-layer-only — the editor always fills columns left-to-right.
   - key: multi-columns
     name: Multi-column sections
     category: sections
@@ -229,7 +384,7 @@ features:
     name: Headers/footers with inheritance
     category: sections
     maturity: full
-    summary: First/even/odd variants, link-to-previous as slot absence, watermarks, full document content inside; a dedicated re-layout pass updates page-count-dependent content.
+    summary: First/even/odd variants, link-to-previous as slot absence, watermarks, full document content inside; a dedicated re-layout pass updates page-count-dependent content via a per-header registry populated during layout.
     where: [{repo: sdkjs, path: word/Editor/HeaderFooter.js}, {repo: sdkjs, path: word/Editor/HeaderFooterController.js}]
   - key: line-numbering
     name: Line numbering
@@ -243,12 +398,30 @@ features:
     name: Complex fields (begin/separate/end)
     category: fields
     maturity: full
-    summary: Sentinel run items matching the OOXML field-char model, an instruction parser producing typed fields (alphabetically DATE, HYPERLINK, MERGEFIELD, NOTEREF, NUMPAGES, PAGE, PAGEREF, REF, SEQ, STYLEREF, TIME, TOC, form fields, expressions), and a layout-time field stack.
+    summary: >
+      Sentinel run items matching the OOXML field-char model; one
+      instruction parser with a single keyword dispatch producing typed
+      fields for PAGE, PAGEREF, TOC, REF, NOTEREF, NUMPAGES, HYPERLINK,
+      SEQ, STYLEREF, TIME, DATE, ADDIN, MERGEFIELD, FORMTEXT, FORMCHECKBOX,
+      and leading-equals formulas; unknown keywords fall back to
+      implicit-REF parsing; a layout-time field stack tracks nesting.
     where:
       - {repo: sdkjs, path: word/Editor/Paragraph/ComplexField.js}
       - {repo: sdkjs, path: word/Editor/Paragraph/ComplexFieldInstruction.js}
       - {repo: sdkjs, path: word/Editor/Paragraph/ComplexFields}
-    notes: Word's long tail of other field types is not modeled; simple fields are converted to the complex representation.
+      - {repo: sdkjs, path: word/Editor/Field.js}
+    notes: >
+      ASK is effectively unreachable — the keyword dispatch matches a
+      misspelled token, so real ASK instructions parse as REF (live bug).
+      FORMDROPDOWN is never typed by the parser (its w:ffData dropdown
+      payload is modeled and round-tripped, but the runtime treats the
+      instruction as REF). Simple fields (w:fldSimple) load into a distinct
+      inline wrapper representation (not converted to complex), with
+      PAGE/NUMPAGES special-cased into dedicated run items, header/footer
+      PAGE/NUMPAGES wrappers converted to complex on open, and untypeable
+      simple fields unwrapped to plain content. Word's long tail
+      (SECTIONPAGES, AUTONUM, DOCPROPERTY, INCLUDETEXT, INDEX/XE, etc.) is
+      not modeled.
   - key: page-number-fields
     name: PAGE/NUMPAGES with post-pass update
     category: fields
@@ -258,21 +431,35 @@ features:
   - key: toc
     name: Table of contents
     category: fields
-    maturity: full
-    summary: TOC field collects heading/outline-level paragraphs, regenerates its result content with page numbers, hyperlinks, and leader tabs; table-of-figures via SEQ.
+    maturity: partial
+    summary: TOC field collects heading-style / explicit-style-list / SEQ-caption paragraphs, regenerates its result content with page numbers, hyperlinks, and leader tabs; table-of-figures via SEQ.
     where: [{repo: sdkjs, path: word/Editor/Paragraph/ComplexFieldInstruction.js}, {repo: sdkjs, path: word/Editor/DocumentOutline.js}]
+    notes: Not parsed (in-code to-do) — bookmark scope (\b), sequence separators (\d), TC-entry collection (\f, \l), sequence-prefixed page numbers (\s), web leader hiding (\z), applied outline level (\u); TC-entry-based TOCs unsupported.
   - key: footnotes
     name: Footnotes with space negotiation
     category: notes
     maturity: full
-    summary: Per-line reservation of page-bottom space, per-column placement, splitting across pages with continuation separator/notice stories, numbering restart modes and custom marks.
-    where: [{repo: sdkjs, path: word/Editor/Footnotes.js}, {repo: sdkjs, path: word/Editor/Paragraph_Recalculate.js}]
+    summary: Per-line reservation of page-bottom space, per-page/per-column controller state, splitting across pages with separator and continuation-separator stories, numbering restart modes and custom marks, position options with a replicated Word quirk (section/document-end values act as beneath-text, everything else as page-bottom).
+    where:
+      - {repo: sdkjs, path: word/Editor/Footnotes.js}
+      - {repo: sdkjs, path: word/Editor/Paragraph_Recalculate.js}
+      - {repo: sdkjs, path: word/Editor/FootEndNote.js}
+      - {repo: sdkjs, path: word/Editor/Paragraph/RunContent/FootnoteReference.js}
+      - {repo: sdkjs, path: word/Editor/Table/TableRecalculate.js}
+    notes: >
+      The continuation-notice story is model-only — a serialized slot with
+      per-column snapshot space, but no layout or paint path ever renders
+      it. Mark formats limited to decimal/upper-lower roman/upper-lower
+      letter with decimal fallback (Chicago symbol marks not rendered for
+      footnote marks). Custom start numbers only apply in continuous
+      numbering mode. Table rows snapshot/roll back footnote state; fast
+      relayout tiers skip renegotiation entirely (verify-then-demote).
   - key: endnotes
     name: Endnotes
     category: notes
     maturity: full
-    summary: Registered during layout, flowed as a trailing story at section/document end with its own recalculation continuation.
-    where: [{repo: sdkjs, path: word/Editor/Endnotes.js}]
+    summary: Registered per line during layout but reserving no page space; flowed as a trailing story after the last body element at section/document end (document-end endnotes placed only on the final pass) with their own separator/continuation-separator stories.
+    where: [{repo: sdkjs, path: word/Editor/Endnotes.js}, {repo: sdkjs, path: word/Editor/Paragraph/RunContent/EndnoteReference.js}]
 
   # ---- review, comments, collaboration ----
   - key: track-changes
@@ -350,7 +537,7 @@ features:
     name: OMML math layout + linear input
     category: math
     maturity: full
-    summary: Recursive OMML content layout inside paragraph lines; UnicodeMath and LaTeX input parsers; math autocorrect; legacy binary equations converted to OMML at import by the C++ core.
+    summary: Recursive OMML content layout inside paragraph lines; UnicodeMath and LaTeX input parsers; math autocorrect; legacy binary equations converted to OMML at import by the C++ core. In BiDi context math is an opaque LTR island.
     where: [{repo: sdkjs, path: word/Math}, {repo: core, path: OOXML/Binary/MathEquation}]
 
   # ---- forms, content controls, mail merge ----
@@ -370,7 +557,7 @@ features:
     name: Mail merge
     category: mail-merge
     maturity: full
-    summary: MERGEFIELD registry, spreadsheet data source, record preview, server-side merged output to docx/pdf/email.
+    summary: MERGEFIELD registry, spreadsheet data source, record preview, server-side merged output to docx/pdf/email. MERGEFIELD parsing takes the field name only (before/after-text switches unparsed).
     where: [{repo: sdkjs, path: word/Editor/Document.js}, {repo: sdkjs, path: word/Editor/Paragraph/ComplexFields/MergeField.js}]
 
   # ---- input, clipboard, search, spelling ----
@@ -386,6 +573,7 @@ features:
     maturity: full
     summary: Internal binary flavor for lossless intra-suite paste, generated HTML for external apps, plain text; large HTML import/normalization path for pastes from Word/Google Docs.
     where: [{repo: sdkjs, path: common/wordcopypaste.js}, {repo: sdkjs, path: common/clipboard_base.js}]
+    notes: The HTML pipeline (both directions) has no dir/direction handling — RTL-ness does not survive HTML interchange; only the internal binary flavor preserves it.
   - key: find-replace
     name: Find/replace across stories
     category: search
@@ -396,13 +584,13 @@ features:
     name: Hunspell WASM spellcheck in a worker
     category: spellcheck
     maturity: full
-    summary: Per-paragraph incremental collection of dirty text, idle-batched checking in a worker, wavy underline painting, suggestions.
+    summary: Per-paragraph incremental collection of dirty text, idle-batched checking in a worker, wavy underline painting, suggestions; Arabic dictionary covering sixteen dialects since v9.0.
     where: [{repo: sdkjs, path: common/spell}, {repo: sdkjs, path: word/Editor/SpellChecker}]
   - key: autocorrect
     name: As-you-type autocorrect
     category: input
     maturity: full
-    summary: Capitalization, hyperlink detection, smart quotes, list detection, math autocorrect, exception lists — applied against the recent-change window.
+    summary: Capitalization, hyperlink detection, smart quotes, list detection (recognizing Arabic-Indic digits), math autocorrect, exception lists — applied against the recent-change window.
     where: [{repo: sdkjs, path: word/Editor/Paragraph/Run/RunAutoCorrect.js}, {repo: sdkjs, path: common/api/autoCorrectSettings.js}]
 
   # ---- rendering & view ----
@@ -428,7 +616,7 @@ features:
     name: Canvas rulers with drag interactions
     category: rendering
     maturity: full
-    summary: Horizontal/vertical rulers with indent/tab/margin/column drag handles drawn and hit-tested in the view layer.
+    summary: Horizontal/vertical rulers with indent/tab/margin/column drag handles drawn and hit-tested in the view layer; RTL mode moves the zero origin to the right margin and converts drags as distances from it.
     where: [{repo: sdkjs, path: word/Drawing/Rulers.js}]
 
   # ---- styles & numbering ----
@@ -442,8 +630,9 @@ features:
     name: Multilevel numbering
     category: numbering
     maturity: full
-    summary: Abstract definitions plus per-list overrides, restart/legal numbering, RTL-aware number rendering, incremental collection of numbered paragraphs.
-    where: [{repo: sdkjs, path: word/Editor/Numbering}]
+    summary: Abstract definitions plus per-list overrides, restart/legal numbering, RTL-aware number rendering, incremental collection of numbered paragraphs; Arabic alphabetic/abjad and two Hebrew letter formats genuinely generated.
+    where: [{repo: sdkjs, path: word/Editor/Numbering}, {repo: sdkjs, path: word/Editor/Numbering/NumberingCommon.js}]
+    notes: List-number text is painted codepoint-by-codepoint through the streaming reorderer (bracket-mirrored but unshaped) — multi-letter abjad values would render unjoined.
 
   # ---- protection, a11y, plugins ----
   - key: document-protection
@@ -452,12 +641,34 @@ features:
     maturity: full
     summary: Password-gated read-only/comments/forms/tracked modes and permission ranges limiting who may edit which spans.
     where: [{repo: sdkjs, path: word/Editor/DocumentProtection.js}, {repo: sdkjs, path: word/Editor/annotations}]
-  - key: accessibility-speech
-    name: Self-voicing speech layer
+  - key: accessibility-announcements
+    name: Screen-reader announcement bridge (ARIA live region)
     category: accessibility
     maturity: partial
-    summary: Editor events (typing, caret moves, selection) converted to spoken text via a speech worker; no DOM accessibility tree for document content.
-    where: [{repo: sdkjs, path: common/workerspeech.js}]
+    summary: >
+      Not speech synthesis (the Web Speech API appears nowhere): editor
+      events — typed characters, caret moves by char/word, selection
+      changes, story-part transitions, drawing selection via alt text,
+      slide and cell/sheet navigation — are diffed from selection-state
+      snapshots into localized text injected into a single visually-hidden
+      assertive/atomic ARIA live region that the user's own screen reader
+      voices. Suite-wide, toggled via a public API hook (outer shell) and
+      an in-editor shortcut (public docs: Ctrl+Alt+Z). Public release
+      notes: experimental ~v7.3, default-on ~v8.2.
+    where:
+      - {repo: sdkjs, path: common/workerspeech.js}
+      - {repo: sdkjs, path: common/apiBase.js}
+      - {repo: sdkjs, path: common/text_input2.js}
+      - {repo: sdkjs, path: word/Editor/DocumentContentBase.js}
+      - {repo: sdkjs, path: cell/view/WorksheetView.js}
+      - {repo: sdkjs, path: common/Drawings/CommonController.js}
+    notes: >
+      Beyond the one live region there is no accessibility tree for
+      document content — no DOM/ARIA mirror of the canvas document, no
+      platform-AT bridges; AT gets event-driven announcements only. The
+      C++ PDF writer can emit a tagged-PDF scaffold but no populated
+      content structure. Replaces v1's incorrect "self-voicing speech
+      layer" entry (key was accessibility-speech).
   - key: plugins-macros
     name: Plugin framework + JS macros
     category: plugins
@@ -484,13 +695,14 @@ features:
     maturity: full
     summary: The editor's native serialization, shared byte-for-byte with the C++ side; versioned with documented per-version default rules so old snapshots load.
     where: [{repo: sdkjs, path: word/Editor/Serialize2.js}, {repo: core, path: OOXML/Binary/Document}]
+    notes: Unknown records are length-skipped — which is also how <w:bidiVisual> dies at this boundary (the C++ writer emits a record the JS reader lacks).
   - key: docx-regeneration-io
     name: DOCX via full-model regeneration
     category: docx-io
     maturity: full
     summary: Open converts docx fully into the binary model; save regenerates every part from the model. No byte preservation of untouched parts; unmodeled constructs can be lost.
     where: [{repo: core, path: OOXML/Binary/Document/BinWriter}, {repo: core, path: OOXML/Binary/Document/BinReader}]
-    notes: Contrast with our sibling-byte-preserving strategy — this is their main fidelity trade-off.
+    notes: Contrast with our sibling-byte-preserving strategy — this is their main fidelity trade-off. Verified casualties — <w:bidiVisual> (dropped) and the kashida jc values (degraded to left alignment on import, then saved as such).
   - key: ooxml-dom
     name: OOXML DOM libraries (C++)
     category: docx-io
@@ -525,8 +737,8 @@ features:
     name: System font discovery + font list generation
     category: fonts
     maturity: full
-    summary: Scans font directories, resolves family/style names (incl. non-Latin names), and generates the font list + thumbnails the editors consume.
-    where: [{repo: core, path: DesktopEditor/fontengine}, {repo: core, path: DesktopEditor/AllFontsGen}]
+    summary: Scans font directories, resolves family/style names (incl. non-Latin names), and generates the font list + thumbnails the editors consume; also generates the Unicode-range-to-fallback-font table ("no squares" mode) from per-style codepoint coverage with a hand-ordered priority list.
+    where: [{repo: core, path: DesktopEditor/fontengine}, {repo: core, path: DesktopEditor/AllFontsGen}, {repo: core, path: DesktopEditor/fontengine/ApplicationFontsWorker.cpp}]
 
   # ---- stability ----
   - key: autosave-change-stream

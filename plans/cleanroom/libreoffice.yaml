@@ -9,7 +9,7 @@ provenance:
   commit: 3b30dd71049edf71a5c649c9aefa31538542c294
   branch: master
   commit_date: "2026-08-21"
-  studied: "2026-08-22"
+  studied: "2026-08-22 (v1 pass + v2 synthesis pass after independent verification round, same day)"
   license: MPL-2.0
   local_path: /data/code/reference/libreoffice-core
 
@@ -81,14 +81,14 @@ features:
     name: Invalidate-then-repair layout
     category: layout
     maturity: full
-    summary: Position/size/inner-area validity flags per frame; a stack-scoped layout action walks pages front to back repairing invalid frames, interruptible by input.
-    where: [sw/source/core/layout/layact.cxx, sw/source/core/inc/layact.hxx, sw/source/core/layout/calcmove.cxx, sw/source/core/layout/wsfrm.cxx]
+    summary: Position/size/inner-area validity flags per frame plus per-page dirty-summary bits (content/structure/three fly variants/page-anchored objects) for O(1) clean-page skipping; a root-level single-dirty-frame fast path serves plain typing; a stack-scoped layout action walks pages front to back with backtracking when earlier pages re-dirty, an off-screen skip that first stabilizes the next page break, and interrupt-then-clean-up-visible-pages semantics.
+    where: [sw/source/core/layout/layact.cxx, sw/source/core/inc/layact.hxx, sw/source/core/layout/calcmove.cxx, sw/source/core/layout/wsfrm.cxx, sw/source/core/inc/frame.hxx, sw/source/core/inc/pagefrm.hxx, sw/source/core/inc/rootfrm.hxx]
   - key: idle-layout
     name: Idle background formatting
     category: layout
     maturity: full
-    summary: Timer-driven idle jobs continue full-document layout, field updates, and grammar checking when the app is idle; busy documents postpone.
-    where: [sw/source/core/doc/SwDocIdle.cxx, sw/source/core/doc/DocumentTimerManager.cxx, sw/source/core/inc/DocumentTimerManager.hxx]
+    summary: Lowest-priority idle task whose readiness probe keeps it asleep while any view is busy; one prioritized job per wake (grammar kickoff > idle layout > field update); visible-page background jobs run before full-document repair; a completion scan over page summary bits ends in an explicit layout-finished document event.
+    where: [sw/source/core/doc/SwDocIdle.cxx, sw/source/core/doc/DocumentTimerManager.cxx, sw/source/core/inc/DocumentTimerManager.hxx, sw/source/core/layout/layact.cxx]
   - key: flow-master-follow
     name: Master/follow flow chains
     category: layout
@@ -105,14 +105,14 @@ features:
     name: Pagination loop watchdog
     category: layout
     maturity: full
-    summary: Counts repair rounds in a page window and escalates through stages up to force-validating frames, guaranteeing termination over perfect layout.
+    summary: Counts repair rounds in a sliding page window (progress in either direction resets counter and stage) and escalates through force-validation stages that widen from ordinary frames to floating objects to everything; backed by a moved-forward-by-object registry, backward-move suppression keyed by frame identity plus target-geometry fingerprint, a per-object grows-cell counter, and hard iteration caps convertible to test failures.
     where: [sw/source/core/layout/layouter.cxx, sw/source/core/inc/layouter.hxx, sw/source/core/layout/movedfwdfrmsbyobjpos.cxx]
   - key: layout-cache
     name: Persisted pagination cache
     category: layout
     maturity: full
-    summary: Page-break/paragraph-split hints saved with the file and replayed on load to reproduce pagination without full reflow.
-    where: [sw/source/core/layout/laycache.cxx, sw/source/core/inc/laycache.hxx]
+    summary: Per-page break records (body-relative node index, paragraph/table tag, split offset) plus floating-object position records, written as a versioned self-delimiting binary stream in the ODF package and consumed on load with split-before-format follow creation, a discard-all sanity pass, and a lock/consume discipline. ODF-only — foreign formats feed only a statistics-based page-count estimate for page pre-allocation.
+    where: [sw/source/core/layout/laycache.cxx, sw/source/core/inc/laycache.hxx, sw/source/core/layout/layhelp.hxx, sw/source/core/layout/frmtool.cxx, sw/source/filter/xml/wrtxml.cxx, sw/source/filter/xml/swxml.cxx]
   - key: page-styles-sequencing
     name: Page styles and sequencing
     category: sections-pages
@@ -141,8 +141,14 @@ features:
     name: Vertical and mixed writing modes
     category: layout
     maturity: full
-    summary: Direction-aware geometry accessors let one pagination code path serve LTR, RTL, and vertical CJK page modes plus rotated cells/frames.
-    where: [sw/source/core/inc/frame.hxx, sw/source/core/text/frmform.cxx]
+    summary: A function-pointer geometry-accessor table abstracts horizontal vs three vertical writing modes for pagination code; horizontal RTL is NOT an accessor variant — it is a separate lazily-derived per-frame flag applied by explicit mirroring at sibling-positioning/editing sites plus LTR/RTL coordinate-swap helpers at the paragraph-frame boundary (two composable abstractions, not one).
+    where: [sw/source/core/inc/frame.hxx, sw/source/core/inc/txtfrm.hxx, sw/source/core/layout/wsfrm.cxx, sw/source/core/layout/calcmove.cxx, sw/source/core/text/frmform.cxx]
+  - key: rtl-tables
+    name: Right-to-left table column order
+    category: layout
+    maturity: full
+    summary: RTL visual column order (the w:bidiVisual equivalent) end to end — frame-direction attribute on the table model (public WritingMode property with inherit-from-environment), DOCX/RTF/binary-DOC round-trip with unit tests, first cell anchored at the row's right edge with successors leftward and recursive invalidation on direction change, direction-aware editing (dialog control, RTL-aware ruler dragging, border-edge swapping, mirrored cursor clamping).
+    where: [sw/source/writerfilter/dmapper/DomainMapperTableManager.cxx, sw/source/filter/ww8/docxtableexport.cxx, sw/source/writerfilter/rtftok/rtfdispatchflag.cxx, sw/source/filter/ww8/ww8par2.cxx, sw/source/core/layout/wsfrm.cxx, sw/source/core/layout/tabfrm.cxx, sw/source/core/docnode/ndtbl1.cxx, sw/source/core/frmedt/fetab.cxx, sw/source/uibase/uiview/viewtab.cxx, sw/source/ui/table/tabledlg.cxx, sw/qa/extras/ooxmlexport/ooxmlexport.cxx]
 
   # ---------- text formatting ----------
   - key: line-portion-model
@@ -164,17 +170,23 @@ features:
     summary: Paragraph records the changed character range; reformat starts at the first affected line and stops when breaks resynchronize.
     where: [sw/source/core/text/porlay.hxx, sw/source/core/text/frmform.cxx, sw/source/core/text/txtfrm.cxx]
   - key: script-info-cache
-    name: Per-paragraph script/bidi/kashida cache
+    name: Per-paragraph script/bidi cache
     category: rtl-ctl
     maturity: full
-    summary: Script runs, bidi levels, kashida candidates, and hidden ranges computed per paragraph revision and shared by layout, cursor, and paint.
-    where: [sw/source/core/text/porlay.cxx, sw/source/core/text/itratr.cxx]
+    summary: Script runs, bidi levels, and hidden ranges computed per paragraph revision and shared by layout, cursor, and paint; also holds a kashida-capable-script flag and the chosen kashida positions, which are a per-justification font-dependent product written back after line adjustment (not precomputed per revision).
+    where: [sw/source/core/text/porlay.cxx, sw/source/core/text/porlay.hxx, sw/source/core/inc/scriptinfo.hxx, sw/source/core/text/itratr.cxx]
   - key: kashida-justification
     name: Kashida justification
     category: rtl-ctl
     maturity: full
-    summary: One insertion point per word chosen by typographic priority; user marks can force or suppress points; validity exposed to cursor logic.
-    where: [sw/source/core/text/itradj.cxx, sw/source/core/txtnode/justify.cxx]
+    summary: One font-validated insertion point per word chosen at justification time by a shared i18n utility (Arabic — the public IE 5.5 connection-priority ladder with documented amendments; Syriac — outside-in from word end); validity from HarfBuzz's safe-to-insert-tatweel glyph flag via a trial word layout (AAT fonts excluded); user-typed tatweel forces, ZWNJ excludes adjacent positions; points join spaces as glue units with insufficient-width dropping; rendering inserts actual repeated tatweel glyphs at the device layer; draw/measure/hit-test share one widened advance array so caret geometry matches rendering by construction; the edit engine shares the same chooser.
+    where: [i18nutil/source/utility/kashida.cxx, include/i18nutil/kashida.hxx, i18nutil/qa/cppunit/test_kashida.cxx, sw/source/core/text/itradj.cxx, sw/source/core/txtnode/justify.cxx, sw/source/core/txtnode/fntcache.cxx, vcl/source/outdev/font.cxx, vcl/source/gdi/CommonSalLayout.cxx, vcl/inc/justificationdata.hxx, editeng/source/editeng/impedit3.cxx]
+  - key: kashida-jc-ooxml
+    name: OOXML kashida justification levels
+    category: rtl-ctl
+    maturity: full
+    summary: The lowKashida/mediumKashida/highKashida w:jc values are imported as block-justify plus escalating word-spacing-maximum percentages and exported back by matching those percentages — an approximation, not distinct engine kashida-length modes.
+    where: [sw/source/writerfilter/dmapper/DomainMapper.cxx, sw/source/filter/ww8/docxattributeoutput.cxx]
   - key: bidi-multiportion
     name: Bidi segment layout
     category: rtl-ctl
@@ -255,8 +267,8 @@ features:
     name: Table split across pages
     category: tables
     maturity: full
-    summary: Split inside a row via layout-only continuation rows, else move rows/table; repeated header rows cloned to follow tables; row-keep and row-span constraints.
-    where: [sw/source/core/layout/tabfrm.cxx]
+    summary: Two-attempt protocol — in-row split via a layout-only continuation row (zero-out-and-reformat rebuild verified for non-empty fragments and fit), else whole-row move — with bounded retry counters; repeated header rows cloned to follows or deliberately omitted when the incoming row cannot fit under them (with an interop fallback zeroing the model repeat count); span groups move atomically with span-continuation stub rows; row-keep with escape valves; footnote rescue oracle and single-shot regained-space retry.
+    where: [sw/source/core/layout/tabfrm.cxx, sw/source/core/inc/tabfrm.hxx, sw/source/core/inc/rowfrm.hxx, sw/source/core/inc/cellfrm.hxx, sw/source/core/text/widorp.cxx, sw/source/core/layout/layouter.cxx]
   - key: nested-tables
     name: Nested tables
     category: tables
@@ -293,14 +305,14 @@ features:
     name: Footnote space negotiation
     category: notes
     maturity: full
-    summary: Page/column-level footnote containers grow bottom-up against the body, never past the reference line; notes split with continuation hints; migration follows references.
-    where: [sw/source/core/layout/ftnfrm.cxx, sw/source/core/text/txtftn.cxx, sw/source/core/doc/docftn.cxx, sw/source/core/inc/ftnboss.hxx]
+    summary: Per-host (page/column) footnote areas bounded by two budgets (page-style maximum and a reserved minimum body fraction); a deadline computed during line formatting keeps the area from growing above the bottom of the reference line; notes split into master/follow chains with configurable continuation notices; reference moves migrate notes via collect, fold follows in, condense to zero height, re-insert, reformat under backward-move lock; adjacent chain parts self-merge; dummy filler lines break wrap/footnote oscillation.
+    where: [sw/source/core/layout/ftnfrm.cxx, sw/source/core/inc/ftnfrm.hxx, sw/source/core/inc/ftnboss.hxx, sw/source/core/text/txtftn.cxx, sw/source/core/text/widorp.cxx, sw/source/core/doc/docftn.cxx, sw/inc/ftninfo.hxx, sw/source/core/layout/pagechg.cxx, sw/source/core/layout/colfrm.cxx]
   - key: endnote-collection
     name: Endnotes at section/document end
     category: notes
     maturity: full
-    summary: A collector gathers endnote frames and emits them at the owning section or document end.
-    where: [sw/source/core/layout/layouter.cxx, sw/source/core/layout/sectfrm.cxx]
+    summary: Three placement modes — dedicated endnote pages appended after content (native; footnotes-at-document-end produce dedicated footnote pages before them), section-end collection via a document-global collector pass that cuts notes out, reflows the section, and re-inserts them after its last content, and a Word-compat continuous mode synthesizing an endnote section at the end of the body.
+    where: [sw/source/core/layout/layouter.cxx, sw/source/core/layout/sectfrm.cxx, sw/source/core/layout/ftnfrm.cxx]
   - key: field-model
     name: Field type/instance model
     category: fields
@@ -397,8 +409,14 @@ features:
     name: HarfBuzz shaping layer
     category: rtl-ctl
     maturity: full
-    summary: Platform-independent shaping via HarfBuzz with bidi run segmentation (ICU) and glyph-level layout in the toolkit, below all applications.
-    where: [vcl/source/gdi/CommonSalLayout.cxx, vcl/source/text/ImplLayoutArgs.cxx, vcl/source/text/ImplLayoutRuns.cxx]
+    summary: Platform-independent shaping via HarfBuzz (Graphite2 preferred for Graphite fonts) with bidi run segmentation (ICU), full-paragraph shaping context across style-run boundaries, safe-to-insert-tatweel and unsafe-to-concat buffer flags, whole-string layout caching sliced at safe-to-concat boundaries, ligature-caret width distribution from GDEF, and kashida glyph insertion via a justification-data hand-off.
+    where: [vcl/source/gdi/CommonSalLayout.cxx, vcl/source/text/ImplLayoutArgs.cxx, vcl/source/text/ImplLayoutRuns.cxx, vcl/source/gdi/impglyphitem.cxx, vcl/inc/justificationdata.hxx, vcl/source/outdev/font.cxx]
+  - key: opentype-feature-ui
+    name: User OpenType feature selection
+    category: rtl-ctl
+    maturity: full
+    summary: OpenType features selectable via a tag=value suffix syntax on the font name (plus a language-system override), surfaced in a dialog enumerating the font's feature tables with human-readable names; ligatures-off never disables required ligatures.
+    where: [vcl/source/font/FeatureParser.cxx, vcl/source/font/FeatureCollector.cxx, vcl/source/font/OpenTypeFeatureDefinitionList.cxx, cui/source/dialogs/FontFeaturesDialog.cxx]
   - key: font-fallback
     name: Per-glyph font fallback
     category: rtl-ctl
@@ -415,8 +433,20 @@ features:
     name: Per-script attribute triplets
     category: rtl-ctl
     maturity: full
-    summary: Western/CJK/CTL each carry independent font/size/weight/posture/language on every run.
-    where: [sw/source/core/txtnode/swfont.cxx, editeng/source/items]
+    summary: Western/CJK/CTL each carry independent font/size/weight/posture/language on every run; slot choice is bidi-aware, not purely per-codepoint — characters in RTL runs are forced to the CTL slot (Asian scripts excepted), embedded digit-only LTR runs inside Arabic too; weak characters inherit the preceding run's script, leading weak characters take the paragraph's first non-weak script; an ODF attribute can pin the classification.
+    where: [sw/source/core/txtnode/swfont.cxx, sw/source/core/inc/swfont.hxx, i18nutil/source/utility/scriptchangescanner.cxx, editeng/source/items]
+  - key: ctl-cursoring
+    name: Bidi cursor travel and selection
+    category: rtl-ctl
+    maturity: full
+    summary: User-selectable logical vs visual cursor-travel modes; caret affinity resolved by comparing the cursor's stored bidi level against the boundary portion's embedding level (one caret, no split caret); navigation by grapheme cluster but deletion by codepoint (letter+harakat backspace removes the harakat first); ligature carets from the font's GDEF table; discontinuous visual selection rects across nested bidi portions.
+    where: [sw/source/core/crsr/swcrsr.cxx, sw/source/core/text/frmcrsr.cxx, sw/source/core/text/itrcrsr.cxx, sw/source/core/layout/trvlfrm.cxx, sw/source/core/docnode/node.cxx, sw/source/uibase/wrtsh/delete.cxx]
+  - key: ctl-hyphenation-gate
+    name: Hyphenation language gate
+    category: rtl-ctl
+    maturity: full
+    summary: Arabic-script languages, CJK, and Vietnamese are excluded from hyphenation as a concept by a language-database predicate; the hyphenation language comes from the active script slot, so mixed paragraphs hyphenate only the non-excluded runs; kashida absorbs Arabic raggedness instead.
+    where: [sw/source/core/text/inftxt.cxx, i18nlangtag/source/isolang/mslangid.cxx]
   - key: ruby-text
     name: Phonetic guides (ruby)
     category: rtl-ctl
@@ -429,8 +459,8 @@ features:
     name: DOCX import pipeline
     category: filters
     maturity: full
-    summary: Grammar-generated tokenizer (model.xml) emits a uniform token stream; a domain mapper with context stacks drives the document API; RTF shares the mapper.
-    where: [sw/source/writerfilter/ooxml/model.xml, sw/source/writerfilter/ooxml, sw/source/writerfilter/dmapper/DomainMapper.cxx, sw/source/writerfilter/dmapper/PropertyMap.cxx, sw/source/writerfilter/rtftok]
+    summary: DOCX tokenizer generated at build time from a declarative grammar (model.xml) by Python scripts; the RTF tokenizer is hand-written but emits the same uniform token stream; one shared domain mapper with context stacks drives the document API for both formats.
+    where: [sw/source/writerfilter/ooxml/model.xml, sw/source/writerfilter/ooxml, sw/source/writerfilter/dmapper/DomainMapper.cxx, sw/source/writerfilter/dmapper/PropertyMap.cxx, sw/source/writerfilter/rtftok, sw/README.writerfilter.md, sw/CustomTarget_source.mk]
   - key: docx-export-walker
     name: Shared export walker
     category: filters
@@ -441,8 +471,8 @@ features:
     name: Interop grab bags
     category: filters
     maturity: full
-    summary: Unknown OOXML attributes preserved as opaque bundles on document/style/paragraph/run/shape properties and re-emitted on export; semantic round-trip, not byte-preserving.
-    where: [sw/source/writerfilter/dmapper/PropertyMap.cxx, sw/source/filter/ww8/docxattributeoutput.cxx, sw/source/filter/ww8/docxsdrexport.cxx]
+    summary: Optional public key/value properties at document/style/paragraph/run/shape levels — and also frame/table/row/cell — preserving recognized-but-unmodeled OOXML; population is selective (elements absent from the import grammar are dropped, not a catch-all) and re-emission is almost exclusively DOCX-export-side; semantic round-trip, not byte-preserving.
+    where: [sw/source/writerfilter/dmapper/PropertyMap.cxx, sw/source/filter/ww8/docxattributeoutput.cxx, sw/source/filter/ww8/docxsdrexport.cxx, offapi/com/sun/star/document/OfficeDocument.idl, offapi/com/sun/star/style/ParagraphProperties.idl, offapi/com/sun/star/style/CharacterProperties.idl, offapi/com/sun/star/drawing/Shape.idl]
   - key: odf-filter-framework
     name: ODF filter framework
     category: filters
@@ -473,8 +503,8 @@ features:
     name: Find and replace
     category: editing
     maturity: full
-    summary: Plain, regex, similarity search; search by attributes and styles; transliteration-aware options.
-    where: [sw/source/core/crsr/findtxt.cxx, sw/source/core/crsr/findattr.cxx, sw/source/core/crsr/findcoll.cxx]
+    summary: Plain, regex, similarity search; search by attributes and styles; transliteration-aware options including CTL ignore-diacritics (decompose, strip marks, recompose) and ignore-kashida (skip tatweel when matching).
+    where: [sw/source/core/crsr/findtxt.cxx, sw/source/core/crsr/findattr.cxx, sw/source/core/crsr/findcoll.cxx, i18npool/source/transliteration/ignoreDiacritics_CTL.cxx, i18npool/source/transliteration/ignoreKashida_CTL.cxx]
   - key: autocorrect
     name: Autocorrect and word completion
     category: editing

@@ -3,7 +3,9 @@
 **Status:** Living reference. Created 2026-08-22 from the clean-room
 competitive study (`plans/cleanroom/PRD_ONLYOFFICE.md`,
 `plans/cleanroom/PRD_LIBREOFFICE.md`) crossed with our shipped state
-(`v0.6.0-beta.2`). This document defines positioning, the tiered coverage
+(`v0.6.0-beta.2`). Competitor claims were adversarially re-verified the
+same day by two multi-agent workflows (v2); both reference PRDs carry
+"Revision notes (v2)" sections listing every corrected statement. This document defines positioning, the tiered coverage
 policy, and the target feature matrix. **It is not a backlog** — every
 actionable gap lives in GitHub Issues (the single source of truth); this doc
 cites issue numbers where they exist and gaps discovered here are filed, not
@@ -17,13 +19,20 @@ listed here as TODOs.
 
 Four claims, each verified against the two reference products:
 
-1. **Native RTL/Arabic typography.** ONLYOFFICE ships *no kashida
-   justification* (justified Arabic stretches spaces only) and *no RTL
-   tables*; its BiDi is a pragmatic subset of UAX #9. LibreOffice is strong
-   here but is a desktop codebase, not an embeddable web SDK. We do full
-   per-line UAX #9, priority-band kashida with real tatweel glyphs, RTL tab
-   anchoring, and RTL-aware lists. **This is the moat; every sprint must
-   leave it stronger.**
+1. **Native RTL/Arabic typography.** Adversarially verified (v2 pass,
+   2026-08-22): ONLYOFFICE has *no kashida justification* — OOXML kashida
+   `w:jc` values degrade to left alignment at import and are destroyed on
+   save — and *no RTL tables* (`<w:bidiVisual>` is neither modeled nor
+   deserialized by the editor; the flag is silently dropped on any editor
+   open/save cycle). Its BiDi remains a pragmatic subset of UAX #9. For
+   accuracy: their 8.0→9.0 releases built genuinely solid everyday RTL
+   *editing* (HarfBuzz shaping, direction controls, Arabic spellcheck),
+   which is why production Arabic users rate it well — the verified gaps
+   are specifically *typographic* (justification, tables, full bidi).
+   LibreOffice is strong on all of it but is a desktop codebase, not an
+   embeddable web SDK. We do full per-line UAX #9, priority-band kashida
+   with real tatweel glyphs, RTL tab anchoring, and RTL-aware lists.
+   **This is the moat; every sprint must leave it stronger.**
 2. **Byte-preserving `.docx` fidelity.** Both competitors regenerate:
    ONLYOFFICE fully re-serializes through an internal binary (silent loss
    for unmodeled content); LibreOffice maps semantically + "grab bags" but
@@ -139,8 +148,10 @@ machine time plus safety properties. Committed tracks:
   model shift. Until then, the event log remains recovery-only.
 - **Heavyweight subsystems** (charts, OMML, SmartArt) stay Tier 3 behind
   the 15 MiB budget; when scheduled, they land as cargo-feature modules.
-- **RTL tables** (`bidiVisual`): ONLYOFFICE lacks them entirely; shipping
-  them extends the moat. File and schedule as a core feature.
+- **RTL tables** (`bidiVisual`): verified absent in ONLYOFFICE's editor —
+  worse, the flag is destroyed on their open/save cycle, an interop hazard
+  for RTL documents. LibreOffice supports them end to end. Shipping them
+  extends the moat (#79).
 - **In-part grab bags** (LO's device): for attributes *inside*
   `document.xml` runs/paragraphs we re-serialize but do not model, stash
   and re-emit opaquely — complements sibling byte-preservation and hardens
