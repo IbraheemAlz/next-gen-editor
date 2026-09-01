@@ -8,6 +8,7 @@ pub mod boxes;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
+pub mod watchdog;
 
 pub use boxes::{
     FontId, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, MarkerBox, PageBox, ParagraphBox,
@@ -20,3 +21,7 @@ pub use paginate::{
     split_paragraph_at_line,
 };
 pub use paragraph::{InlineObjectInfo, ParagraphConfig, layout_paragraph};
+pub use watchdog::{
+    BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation, Watchdog,
+    geometry_fingerprint, verify_prefix,
+};

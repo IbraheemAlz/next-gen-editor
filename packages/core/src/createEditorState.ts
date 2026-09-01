@@ -29,6 +29,7 @@ import type {
     Direction,
     EngineStats,
     Event,
+    LayoutDegraded,
     LogicalRange,
     Rect,
     SelectionKind,
@@ -68,6 +69,15 @@ export interface EditorState {
     paintVersion: Accessor<number>;
     /** Estimated full document height (lazy layout) in pt. */
     estimatedDocumentHeight: Accessor<number>;
+    /**
+     * Issue #87 — degradation notes of the latest paint (empty on a
+     * nominal paint). Non-empty means the layout self-defense fired:
+     * the paginator watchdog released a constraint, pinned a churning
+     * block or hit the page cap, or an incremental band was demoted to
+     * a full reflow. The pixels are on screen either way; surface this
+     * in diagnostics (Dev HUD, telemetry), never as a blocking error.
+     */
+    layoutDegraded: Accessor<LayoutDegraded[]>;
     /**
      * Issue #26 — absolute per-page top offsets + heights in document
      * device px, index-aligned, straight from the paginator. Empty
@@ -151,6 +161,7 @@ export function createEditorState(): EditorState {
     const [lastPaintMs, setLastPaintMs] = createSignal(0);
     const [paintVersion, setPaintVersion] = createSignal(0);
     const [estimatedDocumentHeight, setEstimatedDocumentHeight] = createSignal(0);
+    const [layoutDegraded, setLayoutDegraded] = createSignal<LayoutDegraded[]>([]);
     const [pageGeometry, setPageGeometry] = createSignal<{
         tops: number[];
         heights: number[];
@@ -212,6 +223,7 @@ export function createEditorState(): EditorState {
                 setLastPaintMs(evt.paint_ms);
                 setPaintVersion(evt.version);
                 setEstimatedDocumentHeight(evt.estimated_document_height);
+                setLayoutDegraded(evt.layout_degraded ?? []);
                 if (evt.page_tops.length > 0) {
                     setPageGeometry({ tops: evt.page_tops, heights: evt.page_heights });
                 }
@@ -240,6 +252,7 @@ export function createEditorState(): EditorState {
         lastPaintMs,
         paintVersion,
         estimatedDocumentHeight,
+        layoutDegraded,
         pageGeometry,
         renderer,
         sectionGeometry,

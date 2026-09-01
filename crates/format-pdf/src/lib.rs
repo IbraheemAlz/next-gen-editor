@@ -2003,6 +2003,7 @@ mod tests {
             page_break_after_line: vec![],
             borders: None,
             shading: None,
+            keep_next: false,
         };
         let page = PageBox {
             size: Size {

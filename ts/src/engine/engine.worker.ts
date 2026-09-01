@@ -963,6 +963,7 @@ function broadcastPaintDims(): void {
             page_margin_bottoms: number[];
             page_content_tops: number[];
             page_content_bottoms: number[];
+            layout_degraded: { reason: string; page: number | undefined }[];
         };
         self.postMessage({
             evt: {
@@ -988,6 +989,10 @@ function broadcastPaintDims(): void {
                 truth once a band intrudes past its margin. */
                 page_content_tops: dims.page_content_tops,
                 page_content_bottoms: dims.page_content_bottoms,
+                /* Issue #87 — the last real paint's degradation notes
+                ride the synthetic side-channel too, so a consumer never
+                sees a degraded paint "heal" on the next mutation. */
+                layout_degraded: dims.layout_degraded ?? [],
             },
         });
     } catch (e: unknown) {

@@ -10,10 +10,10 @@ use bridge::{
     BridgeBorderStroke, BridgeBorderStyle, BridgeCellBorders, BridgeCellProperties, BridgeIndent,
     BridgeSectionGeometry, BridgeStyleProperties, Color, Command, Direction, DocFormat,
     EngineStats, Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
-    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, MoveDirection,
-    PageOrientation as BridgePageOrientation, PathStep as BridgePathStep, PdfConformance,
-    Point as BridgePoint, Rect as BridgeRect, SectionBreakKind, SelectionKind, TextAttrs,
-    TextAttrsPatch, UnderlineStyle, VerticalScript,
+    LayoutDegradeReason, LayoutDegraded, LogicalPos as BridgeLogicalPos,
+    LogicalRange as BridgeLogicalRange, MoveDirection, PageOrientation as BridgePageOrientation,
+    PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
+    SectionBreakKind, SelectionKind, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
 use engine::{
     Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
@@ -182,7 +182,7 @@ fn lazy_runway(viewport_h_pt: f32, scale: f32) -> f32 {
 /// shell knows (a) whether more pages may materialize via
 /// `ExpandLayout`, and (b) the running virtual-height estimate that
 /// drives the scrollbar's backing store.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LazyLayoutInfo {
     /// `true` when every body block was consumed; `false` when the
     /// viewport-cull budget halted the paginator early.
@@ -190,6 +190,64 @@ struct LazyLayoutInfo {
     /// Number of top-level blocks across the doc that have not yet
     /// been processed (paragraph or table). Drives the height estimate.
     remaining_blocks: u32,
+    /// Issue #87 — every degradation the layout self-defense applied
+    /// during this build: the paginators' watchdog notes plus the notes
+    /// raised below `build_pages` (paragraph-cache verifier, autofit
+    /// solver, verified fast path). Forwarded on `Event::Painted`.
+    degradations: Vec<LayoutDegraded>,
+}
+
+thread_local! {
+    /// Issue #87 — degradation notes raised by layout helpers that sit
+    /// below `build_pages` and have no path back to the paginator (the
+    /// paragraph-cache verifier in `layout_paragraph_cached`, the autofit
+    /// shrink solver). `build_pages` clears the sink on entry and drains
+    /// it into `LazyLayoutInfo::degradations` on exit. WASM is
+    /// single-threaded; native tests get one sink per test thread.
+    static LAYOUT_NOTES: RefCell<Vec<LayoutDegraded>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Issue #87 — record a sub-paginator degradation (no page index).
+fn note_layout_degradation(reason: LayoutDegradeReason) {
+    LAYOUT_NOTES.with(|n| n.borrow_mut().push(LayoutDegraded { reason, page: None }));
+}
+
+/// Issue #87 — take every note recorded since the last drain.
+fn drain_layout_notes() -> Vec<LayoutDegraded> {
+    LAYOUT_NOTES.with(|n| std::mem::take(&mut *n.borrow_mut()))
+}
+
+/// Issue #87 — a paginator note in its wire shape.
+fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
+    use layout::DegradeReason as R;
+    let reason = match d.reason {
+        R::OversizeLine => LayoutDegradeReason::OversizeLine,
+        R::KeepChainDropped => LayoutDegradeReason::KeepChainDropped,
+        R::HeaderRepeatDropped => LayoutDegradeReason::HeaderRepeatDropped,
+        R::FootnoteOverflow => LayoutDegradeReason::FootnoteOverflow,
+        R::FrozenPlacement => LayoutDegradeReason::FrozenPlacement,
+        R::PageCap => LayoutDegradeReason::PageCap,
+        R::FastPathMismatch => LayoutDegradeReason::FastPathMismatch,
+        R::CacheMismatch => LayoutDegradeReason::CacheMismatch,
+        R::AutofitCap => LayoutDegradeReason::AutofitCap,
+    };
+    LayoutDegraded {
+        reason,
+        page: Some(d.page),
+    }
+}
+
+/// Issue #87 — the page a fast-path mismatch was detected on, for the
+/// `FastPathMismatch` note.
+fn fast_path_mismatch_page(m: layout::FastPathMismatch) -> Option<u32> {
+    use layout::FastPathMismatch as M;
+    match m {
+        M::PageCount { shorter, .. } => Some(shorter as u32),
+        M::PageGeometry { page }
+        | M::BlockCount { page, .. }
+        | M::BlockGeometry { page, .. }
+        | M::EndPosition { page } => Some(page as u32),
+    }
 }
 
 /// Issue #34/#51 — memo of the most recent `build_pages` output. Every
@@ -248,6 +306,9 @@ struct LastPaintDims {
     /// its margin.
     page_content_tops: Vec<f32>,
     page_content_bottoms: Vec<f32>,
+    /// Issue #87 — degradation notes of the last real paint, replayed
+    /// on the synthetic `Painted`s so both producers agree.
+    layout_degraded: Vec<LayoutDegraded>,
 }
 
 /// A candidate caret position on a line — an absolute x (canvas device px)
@@ -612,6 +673,7 @@ impl Engine {
             page_margin_bottoms: dims.page_margin_bottoms,
             page_content_tops: dims.page_content_tops,
             page_content_bottoms: dims.page_content_bottoms,
+            layout_degraded: dims.layout_degraded,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -717,6 +779,8 @@ struct PaintDimsOut {
     /// Issue #71 — effective body extents (mirrors `Event::Painted`).
     page_content_tops: Vec<f32>,
     page_content_bottoms: Vec<f32>,
+    /// Issue #87 — degradation notes (mirrors `Event::Painted`).
+    layout_degraded: Vec<LayoutDegraded>,
 }
 
 #[derive(::serde::Serialize)]
@@ -2810,7 +2874,18 @@ fn autofit_distribute(
     or terminates, bounded by n_cols passes. */
     let mut pinned = vec![false; n_cols];
     let mut final_widths = vec![0.0_f32; n_cols];
+    /* Issue #87 — hard cap on the shrink solver. Each pass pins at least
+    one more column or terminates, so `n_cols + 1` passes is the proof
+    bound; the cap is the watchdog's last-resort net for a future edit
+    that breaks the proof. Past it the floors win (the overflow answer). */
+    let mut passes: usize = 0;
     loop {
+        passes += 1;
+        if passes > n_cols + 1 {
+            note_layout_degradation(LayoutDegradeReason::AutofitCap);
+            final_widths[..n_cols].copy_from_slice(&col_floor[..n_cols]);
+            break;
+        }
         let mut pinned_total = 0.0_f32;
         let mut unpinned_natural = 0.0_f32;
         for i in 0..n_cols {
@@ -3069,7 +3144,18 @@ fn layout_paragraph_cached(
 ) -> ParagraphBox {
     let key = paragraph_layout_key(para, cfg, scale, max_width, sctx);
     if let Some(cached) = cache.get(&key) {
-        return cached.clone();
+        /* Issue #87 — verified fast path at the paragraph tier. A cache
+        hit predicts "this paragraph's layout is what it was"; check the
+        cheap post-conditions before trusting it. A key collision or an
+        input the key forgot to mix in would otherwise paint a stale
+        box forever. */
+        if cached_paragraph_is_consistent(cached, para, max_width) {
+            return cached.clone();
+        }
+    }
+    if cache.contains(&key) {
+        cache.pop(&key);
+        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
     }
     let spans = apply_revision_overlay(
         apply_hyperlink_overlay(
@@ -3105,6 +3191,26 @@ fn layout_paragraph_cached(
     let laid = layout_paragraph(para_cfg);
     cache.put(key, laid.clone());
     laid
+}
+
+/// Issue #87 — post-conditions a cached `ParagraphBox` must satisfy for
+/// the request it is about to serve: laid out at the requested width
+/// (`layout_paragraph` stamps `size.width = max_width`), at least one
+/// line (an empty paragraph still gets a placeholder), and every line /
+/// run source offset inside the paragraph's current text. O(lines +
+/// runs) — negligible next to the shaping a miss costs.
+fn cached_paragraph_is_consistent(
+    cached: &ParagraphBox,
+    para: &engine::Paragraph,
+    max_width: f32,
+) -> bool {
+    let len = para.text.len() as u32;
+    cached.size.width.to_bits() == max_width.to_bits()
+        && !cached.lines.is_empty()
+        && cached
+            .lines
+            .iter()
+            .all(|l| l.source_start <= len && l.runs.iter().all(|r| r.source_range.end <= len))
 }
 
 fn layout_cell_blocks(
@@ -5336,20 +5442,62 @@ impl Engine {
         let scale_bits = scale.to_bits();
         let target_bits = target_y.map(f32::to_bits);
         let viewport_h_bits = self.lazy_layout.viewport_h.to_bits();
+        /* The inputs the LAYOUT depends on; the cull target and the
+        viewport height only decide how deep the band goes. */
+        let same_layout_inputs = |s: &LayoutSnapshot| {
+            s.doc_revision == doc_revision
+                && s.scale_bits == scale_bits
+                && s.composition_active == composition_active
+        };
         {
             let snap = self.layout_snapshot.borrow();
             if let Some(s) = snap.as_ref()
-                && s.doc_revision == doc_revision
-                && s.scale_bits == scale_bits
-                && s.target_bits == target_bits
-                && s.viewport_h_bits == viewport_h_bits
-                && s.composition_active == composition_active
+                && same_layout_inputs(s)
+                && ((s.target_bits == target_bits && s.viewport_h_bits == viewport_h_bits)
+                    /* Issue #87 — a FULL layout at the same inputs covers
+                    every target; rebuilding a band from it would only
+                    throw pages away (and, after a fast-path demotion,
+                    thrash between band and full on every expand). */
+                    || s.info.is_full_layout)
             {
                 return Ok(());
             }
         }
-        let (pages, _fonts, page_paths, info) =
+        let (mut pages, _fonts, mut page_paths, mut info) =
             self.build_pages(scale, with_composition, target_y)?;
+        /* Issue #87 — verified fast path. A viewport-culled band is an
+        incremental relayout: it predicts that laying out MORE of the
+        same document reproduces the pages the previous band already
+        showed. Never trust the prediction — check it. The previous band
+        (same layout inputs, not a full layout) must be a geometric
+        prefix of this one (or vice versa when the runway shrank); on any
+        mismatch demote to a full reflow and say so. A stale layout-cache
+        entry or a non-deterministic pass becomes a perf blip and a
+        telemetry note, not pixels that disagree with the next scroll. */
+        let mismatch = {
+            let snap = self.layout_snapshot.borrow();
+            snap.as_ref()
+                .filter(|s| same_layout_inputs(s) && !s.info.is_full_layout)
+                .and_then(|prev| {
+                    let (shorter, longer) = if prev.pages.len() <= pages.len() {
+                        (&prev.pages[..], &pages[..])
+                    } else {
+                        (&pages[..], &prev.pages[..])
+                    };
+                    layout::verify_prefix(shorter, longer).err()
+                })
+        };
+        if let Some(m) = mismatch {
+            let (full_pages, _f, full_paths, mut full_info) =
+                self.build_pages(scale, with_composition, None)?;
+            full_info.degradations.push(LayoutDegraded {
+                reason: LayoutDegradeReason::FastPathMismatch,
+                page: fast_path_mismatch_page(m),
+            });
+            pages = full_pages;
+            page_paths = full_paths;
+            info = full_info;
+        }
         *self.layout_snapshot.borrow_mut() = Some(LayoutSnapshot {
             doc_revision,
             scale_bits,
@@ -5501,6 +5649,12 @@ impl Engine {
             target_y.map(|y| y + runway)
         };
         let mut culled = false;
+        /* Issue #87 — degradation notes for this build: paginator
+        watchdog notes join here as each paginator finishes; the
+        sub-paginator sink is drained at the end. Clear leftovers from
+        an aborted build first. */
+        let _ = drain_layout_notes();
+        let mut degradations: Vec<LayoutDegraded> = Vec::new();
         let gap = render::scene::PAGE_GAP_PT * scale;
         let height_so_far = |pages: &[PageBox], in_progress: f32| -> f32 {
             if pages.is_empty() {
@@ -5540,7 +5694,8 @@ impl Engine {
                 /* NextPage / EvenPage / OddPage section break — finish
                 the prior paginator (which flushes the in-progress
                 page if any), then build a fresh one below. */
-                let mut pages = p.finish();
+                let (mut pages, notes) = p.finish_with_notes();
+                degradations.extend(notes.into_iter().map(bridge_degradation));
                 let consume = pages.len();
                 emitted_pages.append(&mut pages);
                 let mut paths_taken: Vec<Vec<EngineBlockPath>> = std::mem::take(&mut page_paths);
@@ -5849,7 +6004,8 @@ impl Engine {
             }
         }
         if let Some(p) = paginator.take() {
-            let mut pages = p.finish();
+            let (mut pages, notes) = p.finish_with_notes();
+            degradations.extend(notes.into_iter().map(bridge_degradation));
             let consume = pages.len();
             emitted_pages.append(&mut pages);
             let mut paths_taken: Vec<Vec<EngineBlockPath>> = std::mem::take(&mut page_paths);
@@ -5904,9 +6060,11 @@ impl Engine {
             emitted_paths.push(Vec::new());
         }
         /* Audit gap C.H1 — fold the cull bookkeeping into the result. */
+        degradations.extend(drain_layout_notes());
         let info = LazyLayoutInfo {
             is_full_layout: !culled,
             remaining_blocks: total_blocks.saturating_sub(processed_blocks),
+            degradations,
         };
         Ok((emitted_pages, font_stack, emitted_paths, info))
     }
@@ -5958,7 +6116,7 @@ impl Engine {
             .as_ref()
             .expect("ensure_layout_snapshot populated the memo");
         let pages = &snap.pages;
-        let info = snap.info;
+        let info = snap.info.clone();
 
         let mut line_count: u32 = 0;
         let mut glyph_count: u32 = 0;
@@ -6057,6 +6215,7 @@ impl Engine {
             page_margin_bottoms,
             page_content_tops,
             page_content_bottoms,
+            layout_degraded: info.degradations,
         };
 
         /* Vello path: encode the whole display list and present it over
@@ -6090,6 +6249,7 @@ impl Engine {
                 page_margin_bottoms: stats.page_margin_bottoms.clone(),
                 page_content_tops: stats.page_content_tops.clone(),
                 page_content_bottoms: stats.page_content_bottoms.clone(),
+                layout_degraded: stats.layout_degraded.clone(),
             };
             return Ok(stats);
         }
@@ -6148,6 +6308,7 @@ impl Engine {
             page_margin_bottoms: stats.page_margin_bottoms.clone(),
             page_content_tops: stats.page_content_tops.clone(),
             page_content_bottoms: stats.page_content_bottoms.clone(),
+            layout_degraded: stats.layout_degraded.clone(),
         };
         Ok(stats)
     }
@@ -6288,6 +6449,7 @@ impl Engine {
             page_margin_bottoms: dims.page_margin_bottoms,
             page_content_tops: dims.page_content_tops,
             page_content_bottoms: dims.page_content_bottoms,
+            layout_degraded: dims.layout_degraded,
         }
     }
 
@@ -6348,6 +6510,7 @@ impl Engine {
             page_margin_bottoms: stats.page_margin_bottoms,
             page_content_tops: stats.page_content_tops,
             page_content_bottoms: stats.page_content_bottoms,
+            layout_degraded: stats.layout_degraded,
         }
     }
 
@@ -10621,6 +10784,8 @@ struct RenderStats {
     /// page-local); the zone gate's truth under band intrusion.
     page_content_tops: Vec<f32>,
     page_content_bottoms: Vec<f32>,
+    /// Issue #87 — degradation notes for this paint.
+    layout_degraded: Vec<LayoutDegraded>,
 }
 
 #[cfg(test)]
@@ -13675,5 +13840,375 @@ mod tests {
             "D: 7/5/2026 end".chars().count(),
             "body DATE field re-laid with the resolved text"
         );
+    }
+
+    /* ================================================================
+    Issue #87 — layout self-defense: geometry regression anchor for the
+    engine adapter (`build_pages` end to end, real shaping).
+    ================================================================ */
+
+    fn prose_doc(paragraphs: usize) -> DocumentTree {
+        let mut d = DocumentTree::from_text(
+            "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly.",
+        );
+        for i in 1..paragraphs {
+            d.blocks
+                .push_back(engine::Block::Paragraph(engine::Paragraph {
+                    text: format!(
+                        "Paragraph {i}: sphinx of black quartz, judge my vow; pack my box with five dozen liquor jugs."
+                    ),
+                    ..Default::default()
+                }));
+        }
+        d
+    }
+
+    fn table_doc() -> DocumentTree {
+        let mut d = DocumentTree::from_text("intro");
+        d.blocks.push_back(engine::Block::Table(one_row_table(vec![
+            cell_with_text("short"),
+            cell_with_text(
+                "a much longer cell text that wraps across several lines in a narrow column",
+            ),
+        ])));
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "outro".into(),
+                ..Default::default()
+            }));
+        d
+    }
+
+    /// Every engine-level nominal shape: the 50-page perf fixture (full
+    /// layout and a culled band, both at DPR 2), a forced page break, an
+    /// autofit table and a long multi-page prose doc. Fingerprints pinned
+    /// on the pre-#87 adapter — a changed value means the browser goldens
+    /// would move.
+    fn engine_nominal_fixtures() -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
+        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let engine = test_engine_with_doc(archive.document);
+        let mut out = Vec::new();
+        let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
+        out.push(("50p_full_x2", pages, info.degradations));
+        let (pages, _, _, info) = engine.build_pages(2.0, false, Some(2000.0)).expect("band");
+        out.push(("50p_band_2000_x2", pages, info.degradations));
+
+        let engine = test_engine_with_doc(two_page_doc("alpha beta gamma", "delta epsilon"));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
+        out.push(("two_page_form_feed", pages, info.degradations));
+
+        let engine = test_engine_with_doc(table_doc());
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
+        out.push(("autofit_table", pages, info.degradations));
+
+        let engine = test_engine_with_doc(prose_doc(300));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
+        out.push(("prose_300_full", pages, info.degradations));
+        let (pages, _, _, info) = engine
+            .build_pages(1.0, false, Some(1200.0))
+            .expect("prose band");
+        out.push(("prose_300_band_1200", pages, info.degradations));
+        out
+    }
+
+    /// Recorded on the pre-#87 adapter via `--nocapture`.
+    const PINNED_ENGINE_FINGERPRINTS: &[(&str, u64)] = &[
+        ("50p_full_x2", 0xf565e610ffdbc22d),
+        ("50p_band_2000_x2", 0x3b2d3d53655395a1),
+        ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("autofit_table", 0x92435b9636de4c72),
+        ("prose_300_full", 0xd3d662539c126b7d),
+        ("prose_300_band_1200", 0x5e704685f3cc770c),
+    ];
+
+    #[test]
+    fn engine_nominal_fixtures_are_geometrically_identical_to_the_pre_watchdog_adapter() {
+        for (name, pages, degradations) in engine_nominal_fixtures() {
+            let fp = layout::geometry_fingerprint(&pages);
+            match PINNED_ENGINE_FINGERPRINTS.iter().find(|(n, _)| *n == name) {
+                Some((_, want)) => assert_eq!(
+                    fp,
+                    *want,
+                    "fixture `{name}` changed geometry (got {fp:#x}, pinned {want:#x}, {} pages)",
+                    pages.len()
+                ),
+                None => eprintln!(
+                    "ENGINE FINGERPRINT {name} = {fp:#x} ({} pages)",
+                    pages.len()
+                ),
+            }
+            assert!(
+                degradations.is_empty(),
+                "nominal fixture `{name}` reported degradations: {degradations:?}"
+            );
+        }
+    }
+
+    /* ================================================================
+    Issue #87 — verified fast paths + adversarial fixtures at the
+    engine tier.
+    ================================================================ */
+
+    fn adversarial_budget() -> std::time::Duration {
+        if cfg!(debug_assertions) {
+            std::time::Duration::from_millis(5000)
+        } else {
+            std::time::Duration::from_millis(250)
+        }
+    }
+
+    /// A deeper `ExpandLayout` band verifies as a prefix of the previous
+    /// band — no note, still culled.
+    #[test]
+    fn expand_layout_band_verifies_as_a_prefix_without_demotion() {
+        let engine = test_engine_with_doc(prose_doc(300));
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(1200.0))
+            .expect("band 1");
+        let n1 = engine
+            .layout_snapshot
+            .borrow()
+            .as_ref()
+            .expect("snapshot")
+            .pages
+            .len();
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(4000.0))
+            .expect("band 2");
+        let snap = engine.layout_snapshot.borrow();
+        let s = snap.as_ref().expect("snapshot");
+        assert!(s.pages.len() > n1, "the deeper band grew");
+        assert!(!s.info.is_full_layout, "still a culled band");
+        assert!(s.info.degradations.is_empty(), "{:?}", s.info.degradations);
+    }
+
+    /// Acceptance: a fast-path mismatch injected into the previous band
+    /// demotes to a full reflow whose geometry equals a fresh full
+    /// layout, carries the `FastPathMismatch` note, and the full
+    /// snapshot then serves later targets without thrashing.
+    #[test]
+    fn fast_path_mismatch_demotes_to_full_reflow_with_identical_geometry() {
+        let engine = test_engine_with_doc(prose_doc(300));
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(1200.0))
+            .expect("band 1");
+        {
+            /* Corrupt the memo the way a stale cache entry would: page 0's
+            first block is 3 px lower than the real layout puts it. */
+            let mut snap = engine.layout_snapshot.borrow_mut();
+            let s = snap.as_mut().expect("snapshot");
+            assert!(!s.info.is_full_layout);
+            let b = &mut s.pages[0].blocks[0];
+            let mut o = b.origin();
+            o.y += 3.0;
+            b.set_origin(o);
+        }
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(2400.0))
+            .expect("band 2");
+        let (full_pages, _, _, full_info) =
+            engine.build_pages(1.0, false, None).expect("reference");
+        {
+            let snap = engine.layout_snapshot.borrow();
+            let s = snap.as_ref().expect("snapshot");
+            assert!(s.info.is_full_layout, "demoted to a full reflow");
+            assert_eq!(
+                s.info
+                    .degradations
+                    .iter()
+                    .filter(|d| d.reason == LayoutDegradeReason::FastPathMismatch)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                s.info.degradations[0].page,
+                Some(0),
+                "the mismatch was detected on page 0"
+            );
+            assert!(full_info.degradations.is_empty());
+            assert_eq!(
+                layout::geometry_fingerprint(&s.pages),
+                layout::geometry_fingerprint(&full_pages),
+                "demoted geometry equals a fresh full layout"
+            );
+            assert_eq!(s.pages.len(), full_pages.len());
+        }
+        /* A later, shallower target is served by the full snapshot. */
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(3000.0))
+            .expect("band 3");
+        let snap = engine.layout_snapshot.borrow();
+        let s = snap.as_ref().expect("snapshot");
+        assert!(s.info.is_full_layout, "no thrash back to a band");
+        assert_eq!(s.pages.len(), full_pages.len());
+    }
+
+    /// The paragraph-tier fast path: a poisoned cache entry fails its
+    /// post-conditions, is evicted, re-laid and reported — once.
+    #[test]
+    fn cache_mismatch_relays_the_paragraph_and_notes_it() {
+        let engine = test_engine_with_doc(DocumentTree::from_text("hello wide world"));
+        let cfg = engine.layout_cfg.clone().expect("cfg");
+        let doc = engine.undo.current().clone();
+        let sctx = StyleContext::of(&doc);
+        let fonts = FontStack::from_faces(engine.fonts.clone(), &cfg.font_id);
+        let para = doc
+            .blocks
+            .get(0)
+            .and_then(engine::Block::as_paragraph)
+            .expect("paragraph");
+        let mut cache = engine.layout_cache.borrow_mut();
+        let _ = drain_layout_notes();
+        let good = layout_paragraph_cached(para, &fonts, &cfg, 1.0, 400.0, sctx, &mut cache);
+        assert!(drain_layout_notes().is_empty(), "a miss is not a mismatch");
+        let key = paragraph_layout_key(para, &cfg, 1.0, 400.0, sctx);
+        let mut poisoned = good.clone();
+        poisoned.size.width = 123.0;
+        cache.put(key, poisoned);
+
+        let healed = layout_paragraph_cached(para, &fonts, &cfg, 1.0, 400.0, sctx, &mut cache);
+        assert_eq!(healed.size.width.to_bits(), 400.0f32.to_bits());
+        assert_eq!(
+            layout::geometry_fingerprint(&[page_of(healed.clone())]),
+            layout::geometry_fingerprint(&[page_of(good)])
+        );
+        let notes = drain_layout_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].reason, LayoutDegradeReason::CacheMismatch);
+        assert_eq!(notes[0].page, None);
+
+        let again = layout_paragraph_cached(para, &fonts, &cfg, 1.0, 400.0, sctx, &mut cache);
+        assert_eq!(again.size.width.to_bits(), 400.0f32.to_bits());
+        assert!(
+            drain_layout_notes().is_empty(),
+            "the healed entry is trusted"
+        );
+    }
+
+    fn page_of(p: ParagraphBox) -> PageBox {
+        PageBox {
+            size: Size {
+                width: 595.3,
+                height: 841.9,
+            },
+            margins: A4Page::a4().margin,
+            blocks: vec![LayoutBlock::Paragraph(p)],
+            header: None,
+            footer: None,
+            header_offset: 36.0,
+            footer_offset: 36.0,
+            footnotes: Vec::new(),
+            hf_role: layout::HeaderRole::Default,
+            page_number: 1,
+        }
+    }
+
+    /// Acceptance (#7 class): an autofit table whose columns are
+    /// narrower than their longest unbreakable token. Every pass — the
+    /// probe layout's char-level force-break, the min-content floor, the
+    /// shrink solver, the final cell layout — must terminate under
+    /// budget and the page must build a paint scene.
+    #[test]
+    fn autofit_column_narrower_than_its_longest_token_terminates_and_paints() {
+        let t0 = std::time::Instant::now();
+        let token = "x".repeat(160);
+        let mut d = DocumentTree::from_text("intro");
+        for _ in 0..3 {
+            d.blocks.push_back(engine::Block::Table(one_row_table(vec![
+                cell_with_text(&token),
+                cell_with_text("prose that wraps a little"),
+                cell_with_text(&token),
+            ])));
+        }
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(
+            t0.elapsed() < adversarial_budget(),
+            "took {:?}",
+            t0.elapsed()
+        );
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let tables: Vec<&TableBox> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter().filter_map(LayoutBlock::as_table))
+            .collect();
+        assert_eq!(tables.len(), 3);
+        let content_w = engine::PageGeometry::a4().content_width();
+        for t in &tables {
+            assert!(
+                t.size.width > content_w,
+                "the #7 invariant: overflow horizontally rather than clip the token"
+            );
+            for row in &t.rows {
+                /* Cells 0 and 2 hold the token; cell 1 is prose and may
+                wrap freely. */
+                for cell in [&row.cells[0], &row.cells[2]] {
+                    for p in cell.content.iter().filter_map(LayoutBlock::as_paragraph) {
+                        assert_eq!(p.lines.len(), 1, "no mid-token wrap at the final widths");
+                    }
+                }
+            }
+        }
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let _ = scene;
+    }
+
+    /// The notes reach `Event::Painted`: a paragraph whose exact line
+    /// height exceeds the page is placed atomically and the paint says
+    /// `OversizeLine`; a nominal paint says nothing.
+    #[test]
+    fn painted_carries_the_degradation_notes() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("nominal"));
+        let rect = BridgeRect {
+            x: 0.0,
+            y: 0.0,
+            w: 595.0,
+            h: 842.0,
+        };
+        let evt = engine.do_request_paint(rect, None);
+        let Event::Painted {
+            layout_degraded, ..
+        } = evt
+        else {
+            panic!("expected Painted, got {evt:?}");
+        };
+        assert!(layout_degraded.is_empty());
+
+        let mut d = DocumentTree::from_text("tall");
+        if let Some(engine::Block::Paragraph(p)) = d.blocks.get_mut(0) {
+            /* 1000 pt exact line height on a 698 pt body. */
+            p.props.line_height = Some(engine::LineHeight::Exact { twips: 20_000 });
+        }
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "after".into(),
+                ..Default::default()
+            }));
+        let mut engine = test_engine_with_doc(d);
+        let evt = engine.do_request_paint(rect, None);
+        let Event::Painted {
+            layout_degraded,
+            page_count,
+            ..
+        } = evt
+        else {
+            panic!("expected Painted, got {evt:?}");
+        };
+        assert_eq!(page_count, 2, "the flow continued past the oversize line");
+        assert_eq!(layout_degraded.len(), 1);
+        assert_eq!(layout_degraded[0].reason, LayoutDegradeReason::OversizeLine);
+        assert_eq!(layout_degraded[0].page, Some(0));
+        /* The synthetic side-channel replays the same notes. */
+        assert_eq!(engine.last_paint_dims.layout_degraded, layout_degraded);
+        let Event::Painted {
+            layout_degraded: replayed,
+            ..
+        } = engine.do_set_viewport(rect)
+        else {
+            panic!("expected Painted");
+        };
+        assert_eq!(replayed, layout_degraded);
     }
 }
