@@ -148,11 +148,12 @@ pub struct Paginator {
     /// compute section-relative page numbers without needing to know
     /// about the global page accumulator.
     doc_page_offset: u32,
-    /// Issue #43 — the render-time date `(year, month, day)` DATE
-    /// fields resolve against. `None` (tests, headless) keeps the
-    /// cached text. Injected by the shell at boot (`SetRenderDate`) —
-    /// the engine core never reads a wall clock.
-    render_date: Option<(i32, u32, u32)>,
+    /// Issue #43 / #77 — the field-evaluation environment (render
+    /// date + clock, document name, author) every non-page field kind
+    /// resolves against; the page context is filled per flush. All
+    /// inputs are shell-injected — the engine core never reads a wall
+    /// clock — and an absent input keeps the cached text.
+    field_env: engine::FieldEnv,
 }
 
 impl Paginator {
@@ -182,7 +183,7 @@ impl Paginator {
             cur_footnote_height: 0.0,
             page_num: engine::PageNumType::default(),
             doc_page_offset: 0,
-            render_date: None,
+            field_env: engine::FieldEnv::default(),
         };
         /* Issue #71 (design review B3) — page 1 opens BELOW its
         header band when the band is taller than the top margin. */
@@ -192,7 +193,15 @@ impl Paginator {
 
     /// Issue #43 — install the render-time date for DATE fields.
     pub fn with_render_date(mut self, date: Option<(i32, u32, u32)>) -> Self {
-        self.render_date = date;
+        self.field_env.date = date;
+        self
+    }
+
+    /// Issue #77 — install the full field-evaluation environment
+    /// (date, clock, document name, author). The page context is
+    /// ignored — the paginator fills it per flush.
+    pub fn with_field_env(mut self, env: engine::FieldEnv) -> Self {
+        self.field_env = engine::FieldEnv { page: None, ..env };
         self
     }
 
@@ -880,54 +889,43 @@ impl Paginator {
         }
     }
 
-    /// Phase 2 audit (gap D.1) — stamp every PAGE field in the
-    /// paragraph's [`ParagraphBox::fields`] with the 1-based page
-    /// number it is about to flush on. NUMPAGES is deferred: its
-    /// value is `pages.len()` at end-of-document, which is unknown
+    /// Phase 2 audit (gap D.1) / issue #77 — stamp every field in the
+    /// paragraph's [`ParagraphBox::fields`] with its live value for
+    /// the page it is about to flush on: PAGE from the page context,
+    /// DATE / TIME / FILENAME / AUTHOR from `env` (`engine::Field::
+    /// evaluate_in` is the single evaluator). NUMPAGES is deferred:
+    /// its value is `pages.len()` at end-of-document, which is unknown
     /// here; [`Paginator::finish`] walks every emitted page and
-    /// patches them in a second pass.
+    /// patches them in a second pass. An unresolvable kind keeps
+    /// `evaluated_text: None` (the cached text stands).
     fn evaluate_fields_on_paragraph(
         para: &mut ParagraphBox,
         doc_page: u32,
         page_num: engine::PageNumType,
         section_start_doc_page: u32,
-        render_date: Option<(i32, u32, u32)>,
+        env: &engine::FieldEnv,
     ) {
+        /* Audit gap A.M11 — section-relative page numbering.
+        `start: Some(n)` rebases: the section's first page is `n`,
+        every subsequent page is `n + (doc_page -
+        section_start_doc_page)`. `start: None` keeps the doc-wide
+        count. Format renders the integer. */
+        let section_page = match page_num.start {
+            Some(n) => n + doc_page.saturating_sub(section_start_doc_page),
+            None => doc_page,
+        };
+        let page_env = env.with_page(Some(page_num.format.render(section_page)), None);
         for f in para.fields.iter_mut() {
-            /* Keyword extraction lives on `engine::Field` so the
-            layout box doesn't need to reimplement the trim + split
-            + uppercase walk. Re-build a synthetic Field just to
-            call `keyword` — cheap, since instructions are short. */
+            /* Keyword dispatch lives on `engine::Field`; re-build a
+            synthetic Field just to evaluate — cheap, instructions are
+            short. */
             let synthetic = engine::Field {
                 start: f.byte_range.start,
                 end: f.byte_range.end,
                 instruction: f.instruction.clone(),
             };
-            match synthetic.keyword().as_str() {
-                "PAGE" => {
-                    /* Audit gap A.M11 — section-relative page numbering.
-                    `start: Some(n)` rebases: the section's first page is
-                    `n`, every subsequent page is `n + (doc_page -
-                    section_start_doc_page)`. `start: None` keeps the
-                    doc-wide count. Format renders the integer. */
-                    let section_page = match page_num.start {
-                        Some(n) => n + doc_page.saturating_sub(section_start_doc_page),
-                        None => doc_page,
-                    };
-                    f.evaluated_text = Some(page_num.format.render(section_page));
-                }
-                /* Issue #43 — DATE resolves against the shell-injected
-                render date (Word updates DATE on open/print). No date
-                installed → cached text stands. */
-                "DATE" => {
-                    if let Some((y, m, d)) = render_date {
-                        let pic = synthetic
-                            .date_picture()
-                            .unwrap_or_else(|| "M/d/yyyy".to_string());
-                        f.evaluated_text = Some(engine::render_date_picture(&pic, y, m, d));
-                    }
-                }
-                _ => {}
+            if let Some(v) = synthetic.evaluate_in(&page_env) {
+                f.evaluated_text = Some(v);
             }
         }
     }
@@ -1007,7 +1005,7 @@ impl Paginator {
         let doc_page = self.doc_page_offset + (self.pages.len() as u32) + 1;
         let section_start_doc_page = self.doc_page_offset + 1;
         let page_num = self.page_num;
-        let render_date = self.render_date;
+        let env = self.field_env.clone();
         let mut blocks = blocks;
         for block in blocks.iter_mut() {
             Self::for_each_paragraph_in_block(block, &mut |p| {
@@ -1016,7 +1014,7 @@ impl Paginator {
                     doc_page,
                     page_num,
                     section_start_doc_page,
-                    render_date,
+                    &env,
                 );
             });
         }
@@ -1027,7 +1025,7 @@ impl Paginator {
                     doc_page,
                     page_num,
                     section_start_doc_page,
-                    render_date,
+                    &env,
                 );
             });
         }
@@ -1038,7 +1036,7 @@ impl Paginator {
                     doc_page,
                     page_num,
                     section_start_doc_page,
-                    render_date,
+                    &env,
                 );
             });
         }
@@ -1093,17 +1091,17 @@ impl Paginator {
         page and stamp NUMPAGES on any field that hadn't already been
         evaluated as PAGE. */
         let total_pages = self.pages.len() as u32;
+        let total_env = engine::FieldEnv::default().with_page(None, Some(total_pages));
         for page in self.pages.iter_mut() {
             let mut stamp = |para: &mut ParagraphBox| {
                 for f in para.fields.iter_mut() {
-                    let kw = engine::Field {
+                    let synthetic = engine::Field {
                         start: f.byte_range.start,
                         end: f.byte_range.end,
                         instruction: f.instruction.clone(),
-                    }
-                    .keyword();
-                    if kw == "NUMPAGES" {
-                        f.evaluated_text = Some(total_pages.to_string());
+                    };
+                    if synthetic.typed() == engine::TypedField::NumPages {
+                        f.evaluated_text = synthetic.evaluate_in(&total_env);
                     }
                 }
             };

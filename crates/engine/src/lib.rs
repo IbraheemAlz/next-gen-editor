@@ -5,8 +5,14 @@
 
 use im::Vector;
 
+pub mod fields;
 pub mod html;
 pub mod numbering;
+
+pub use fields::{
+    FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TypedField,
+    render_date_time_picture,
+};
 
 /// Top-level document block (Phase 5 PR 1). Tables sit alongside
 /// paragraphs in the body; future block variants (Phase 7 floating
@@ -684,6 +690,11 @@ pub struct DocumentSettings {
     /// `<w:evenAndOddHeaders/>` — when `true`, even-numbered pages render
     /// the `Even` header / footer instead of the `Default` slot.
     pub even_and_odd_headers: bool,
+    /// Issue #77 — `docProps/core.xml` `<dc:creator>`, the value the
+    /// `AUTHOR` field resolves to. Read-only ingest: the writer never
+    /// regenerates the core-properties part (it rides the OPC
+    /// passthrough), so `None` on documents without one.
+    pub author: Option<String>,
 }
 
 /// Address of a `Block` inside a `DocumentTree`. Walks from the root
@@ -1114,9 +1125,11 @@ impl Field {
     /// evaluate (the renderer keeps the cached text in that case).
     /// `current_page` and `total_pages` are 1-based.
     pub fn evaluate(&self, current_page: u32, total_pages: u32) -> Option<String> {
-        match self.keyword().as_str() {
-            "PAGE" => Some(current_page.to_string()),
-            "NUMPAGES" => Some(total_pages.to_string()),
+        /* Issue #77 — page-only shim over the environment evaluator in
+        `fields.rs`; every kind resolves through `evaluate_in`. */
+        let env = FieldEnv::default().with_page(Some(current_page.to_string()), Some(total_pages));
+        match self.typed() {
+            TypedField::Page | TypedField::NumPages => self.evaluate_in(&env),
             _ => None,
         }
     }
@@ -1139,42 +1152,14 @@ impl Field {
     }
 }
 
-/// Issue #43 — render `(year, month, day)` through a minimal subset of
-/// Word's date-picture language: `yyyy`, `yy`, `MM`, `M`, `dd`, `d`
-/// (longest-match, case-sensitive per Word: `M` = month, `d` = day —
-/// `mm`/minutes is out of scope, time fields are not evaluated).
-/// Unrecognized characters pass through verbatim.
+/// Issue #43 — render `(year, month, day)` through Word's date-picture
+/// language: `yyyy`, `yy`, `MM`, `M`, `dd`, `d` (longest-match,
+/// case-sensitive per Word: `M` = month, `d` = day). Unrecognized
+/// characters (and time tokens — no clock here) pass through verbatim.
 pub fn render_date_picture(picture: &str, year: i32, month: u32, day: u32) -> String {
-    let mut out = String::with_capacity(picture.len() + 4);
-    let bytes = picture.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest = &picture[i..];
-        if rest.starts_with("yyyy") {
-            out.push_str(&format!("{year:04}"));
-            i += 4;
-        } else if rest.starts_with("yy") {
-            out.push_str(&format!("{:02}", year.rem_euclid(100)));
-            i += 2;
-        } else if rest.starts_with("MM") {
-            out.push_str(&format!("{month:02}"));
-            i += 2;
-        } else if rest.starts_with('M') {
-            out.push_str(&month.to_string());
-            i += 1;
-        } else if rest.starts_with("dd") {
-            out.push_str(&format!("{day:02}"));
-            i += 2;
-        } else if rest.starts_with('d') {
-            out.push_str(&day.to_string());
-            i += 1;
-        } else {
-            let ch = rest.chars().next().expect("non-empty rest");
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
+    /* Issue #77 — date-only shim over the shared date/time renderer
+    (`fields::render_date_time_picture`); time tokens pass through. */
+    render_date_time_picture(picture, Some((year, month, day)), None)
 }
 
 /// Phase 8b — kind of tracked-change revision.

@@ -273,6 +273,17 @@ pub enum Event {
         /// overlays render unchanged. The shell dims the body, outlines
         /// the band on the anchor page, and gates non-story controls.
         editing_story: Option<BridgeStoryRef>,
+        /// Issue #77 — `true` while the Alt+F9 field-code view is on.
+        /// Fields then display `{ INSTRUCTION }` codes instead of
+        /// results; `range` / `caret` / `rects` are expressed in that
+        /// display text.
+        field_code_view: bool,
+        /// Issue #77 — the field the selection addresses: the one the
+        /// selection covers EXACTLY (a click inside a field selects it
+        /// whole), else — for a collapsed caret — the field ending
+        /// at the caret, else the one starting there. `None` otherwise.
+        /// Drives the field-code editor + the "Update field" affordance.
+        field_at_caret: Option<BridgeFieldRef>,
     },
 
     /* IME */
@@ -427,6 +438,23 @@ pub struct BridgeStoryRef {
     /// Issue #70 — 0-based index of the story's owning section; the
     /// UI disables Link-to-Previous at index 0 (nothing precedes it).
     pub section_index: u32,
+}
+
+/// Issue #77 — wire shape for the field under the selection
+/// (`Event::SelectionChanged.field_at_caret`).
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq)]
+pub struct BridgeFieldRef {
+    /// Verbatim field code (`PAGE \* MERGEFORMAT`).
+    pub instruction: String,
+    /// Upper-cased leading keyword (`PAGE`, `DATE`, `TOC`, …).
+    pub keyword: String,
+    /// Start of the field's range in the CURRENT display text (source
+    /// result text, or the `{ … }` code text in code view).
+    pub start: LogicalPos,
+    /// End of that range.
+    pub end: LogicalPos,
+    /// `true` when the selection covers the field exactly.
+    pub selected: bool,
 }
 
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]

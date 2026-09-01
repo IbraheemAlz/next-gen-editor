@@ -5,9 +5,12 @@
 //! `layout_paragraph` owns all geometry; the renderer is a pure tree walk.
 
 pub mod boxes;
+pub mod fingerprint;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
+
+pub use fingerprint::geometry_fingerprint;
 
 pub use boxes::{
     FontId, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, MarkerBox, PageBox, ParagraphBox,

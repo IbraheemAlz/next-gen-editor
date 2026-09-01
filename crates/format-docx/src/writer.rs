@@ -4039,6 +4039,126 @@ mod tests {
         assert_eq!(hp.fields[0].end, 6);
     }
 
+    /// Issue #77 — pack `entries` into a minimal `.docx` (content
+    /// types + `.rels` + the given parts) and parse it.
+    fn read_docx_from_parts(entries: &[(&str, &str)]) -> DocxArchive {
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            zip.start_file("[Content_Types].xml", opts).unwrap();
+            zip.write_all(content_types.as_bytes()).unwrap();
+            zip.start_file("_rels/.rels", opts).unwrap();
+            zip.write_all(DOT_RELS_XML.as_bytes()).unwrap();
+            for (name, body) in entries {
+                zip.start_file(*name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        read_docx(&buf).expect("read fixture")
+    }
+
+    #[test]
+    fn fld_simple_filename_and_author_round_trip_as_complex_fields() {
+        /* Issue #77 — the compact `<w:fldSimple>` form of the new kinds
+        parses into `Field` overlays with the instruction verbatim; a
+        dirty paragraph re-emits them as the canonical complex triple,
+        and re-reading that output yields identical overlays. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p>
+<w:r><w:t xml:space="preserve">File </w:t></w:r>
+<w:fldSimple w:instr=" FILENAME \p "><w:r><w:t xml:space="preserve">draft.docx</w:t></w:r></w:fldSimple>
+<w:r><w:t xml:space="preserve"> by </w:t></w:r>
+<w:fldSimple w:instr="AUTHOR"><w:r><w:t xml:space="preserve">Ibrahim</w:t></w:r></w:fldSimple>
+</w:p>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+        let parsed = read_docx_from_parts(&[("word/document.xml", document_xml)]);
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "File draft.docx by Ibrahim");
+        assert_eq!(p.fields.len(), 2);
+        assert_eq!(p.fields[0].instruction, "FILENAME \\p");
+        assert_eq!((p.fields[0].start, p.fields[0].end), (5, 15));
+        assert_eq!(
+            p.fields[0].typed(),
+            engine::TypedField::FileName { with_path: true }
+        );
+        assert_eq!(p.fields[1].instruction, "AUTHOR");
+        assert_eq!((p.fields[1].start, p.fields[1].end), (19, 26));
+        assert_eq!(p.fields[1].typed(), engine::TypedField::Author);
+
+        /* Author-restamp the paragraph (dirty) and write — the writer
+        emits the complex sentinel triple for every field. */
+        let mut doc = parsed.document.clone();
+        let mut para = doc.nth_paragraph(0).unwrap().clone();
+        para = para.with_spliced_range(19, 26, "Zed");
+        para.dirty = true;
+        para.source_xml = None;
+        doc.blocks[0] = Block::Paragraph(para);
+        let bytes = write_docx(&parsed, &doc).expect("write");
+        let reparsed = read_docx(&bytes).expect("re-read");
+        let q = reparsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(q.text, "File draft.docx by Zed");
+        assert_eq!(q.fields.len(), 2);
+        assert_eq!(q.fields[0].instruction, "FILENAME \\p");
+        assert_eq!((q.fields[0].start, q.fields[0].end), (5, 15));
+        assert_eq!(q.fields[1].instruction, "AUTHOR");
+        assert_eq!((q.fields[1].start, q.fields[1].end), (19, 22));
+        let xml = String::from_utf8(
+            reparsed
+                .other_entries
+                .iter()
+                .find(|(n, _)| n == "[Content_Types].xml")
+                .map(|(_, b)| b.clone())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(xml.contains("<Types"), "siblings pass through");
+    }
+
+    #[test]
+    fn core_props_creator_feeds_settings_author() {
+        /* Issue #77 — `docProps/core.xml` `<dc:creator>` lifts into
+        `DocumentSettings.author` (what AUTHOR resolves to) and the
+        part itself round-trips byte-identical. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t xml:space="preserve">hi</w:t></w:r></w:p><w:sectPr/></w:body>
+</w:document>"#;
+        let core_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator>Ibrahim Z.</dc:creator></cp:coreProperties>"#;
+        let parsed = read_docx_from_parts(&[
+            ("word/document.xml", document_xml),
+            ("docProps/core.xml", core_xml),
+        ]);
+        assert_eq!(parsed.document.settings.author.as_deref(), Some("Ibrahim Z."));
+        let bytes = write_docx(&parsed, &parsed.document).expect("write");
+        let reparsed = read_docx(&bytes).expect("re-read");
+        let core = reparsed
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "docProps/core.xml")
+            .map(|(_, b)| b.clone())
+            .expect("core.xml passes through");
+        assert_eq!(core, core_xml.as_bytes());
+        assert_eq!(reparsed.document.settings.author.as_deref(), Some("Ibrahim Z."));
+        /* A document without the part reports no author. */
+        let plain = read_docx_from_parts(&[("word/document.xml", document_xml)]);
+        assert_eq!(plain.document.settings.author, None);
+    }
+
     #[test]
     fn complex_field_round_trip_page_number() {
         /* Reader: walk a `PAGE \\* MERGEFORMAT` complex field split
