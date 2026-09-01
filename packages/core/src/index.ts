@@ -35,6 +35,12 @@ export type {
 export { FontRegistryProvider, useFontRegistry } from './FontRegistryProvider';
 export type { FontRegistryProviderProps } from './FontRegistryProvider';
 
+export { createTelemetryConfig } from './createTelemetryConfig';
+export type { TelemetryConfig } from './createTelemetryConfig';
+
+export { TelemetryProvider, useTelemetryConfig } from './TelemetryProvider';
+export type { TelemetryProviderProps } from './TelemetryProvider';
+
 export type {
     EngineClientLike,
     EngineClientSnapshots,

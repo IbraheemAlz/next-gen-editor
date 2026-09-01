@@ -248,6 +248,12 @@ struct LastPaintDims {
     /// its margin.
     page_content_tops: Vec<f32>,
     page_content_bottoms: Vec<f32>,
+    /// Issue #86 — wall-clock cost (ms) of the `render_document` call that
+    /// produced these dimensions. Replayed verbatim by the synthetic
+    /// `Painted` side-channel (`do_set_viewport`, the worker's
+    /// `paint_dims()` broadcast) — those paths don't repaint, so "the last
+    /// real paint's cost" is the honest number to report, not `0.0`.
+    paint_ms: f32,
 }
 
 /// A candidate caret position on a line — an absolute x (canvas device px)
@@ -463,6 +469,19 @@ pub struct Engine {
     /// Sprint 14 (#14) — review date for synthesised revisions.
     /// Empty until the worker stamps `Date.now()` at command time.
     review_date: String,
+    /// Issue #86 — wall-clock cost of the most recently completed
+    /// `Engine::dispatch` call (`now_ms()` around `self.apply(cmd).await`),
+    /// mirrored onto `EngineStats.last_command_ms` on the next
+    /// `RequestStats`. `0.0` before the first dispatch and permanently on
+    /// native builds (`now_ms` is a no-op off-wasm).
+    last_command_ms: f32,
+    /// Issue #86 — wall-clock cost of the most recent `render_document`
+    /// call (layout-if-stale + the Vello or Canvas2D paint), mirrored onto
+    /// `EngineStats.last_paint_ms` and `Event::Painted.paint_ms`. Every
+    /// `render_document` call site updates this — the auto-repaint after a
+    /// mutation, the explicit `RequestPaint` path, and the IME preview
+    /// repaint all count as "the most recent paint".
+    last_paint_ms: f32,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -511,6 +530,8 @@ fn assemble_engine(
         tracking_changes: false,
         review_author: "You".to_string(),
         review_date: String::new(),
+        last_command_ms: 0.0,
+        last_paint_ms: 0.0,
     }
 }
 
@@ -532,7 +553,14 @@ impl Engine {
     pub async fn dispatch(&mut self, cmd: JsValue) -> Result<JsValue, JsValue> {
         let cmd: Command = serde_wasm_bindgen::from_value(cmd)
             .map_err(|e| JsValue::from_str(&format!("decode command: {e}")))?;
+        /* Issue #86 — D5.7 real telemetry. Wraps the ENTIRE command,
+        including any auto-repaint a mutation triggers (`maybe_repaint_result`
+        calls `render_document` inline), so `last_command_ms` matches what a
+        caller's own `performance.now()` around `dispatch()` would see (the
+        §D5.3 perf harness measures insert-latency exactly that way). */
+        let t0 = now_ms();
         let evt: Event = self.apply(cmd).await;
+        self.last_command_ms = (now_ms() - t0) as f32;
         serde_wasm_bindgen::to_value(&evt)
             .map_err(|e| JsValue::from_str(&format!("encode event: {e}")))
     }
@@ -612,6 +640,7 @@ impl Engine {
             page_margin_bottoms: dims.page_margin_bottoms,
             page_content_tops: dims.page_content_tops,
             page_content_bottoms: dims.page_content_bottoms,
+            paint_ms: dims.paint_ms,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -717,6 +746,8 @@ struct PaintDimsOut {
     /// Issue #71 — effective body extents (mirrors `Event::Painted`).
     page_content_tops: Vec<f32>,
     page_content_bottoms: Vec<f32>,
+    /// Issue #86 — mirrors `Event::Painted.paint_ms` (see `LastPaintDims`).
+    paint_ms: f32,
 }
 
 #[derive(::serde::Serialize)]
@@ -1050,6 +1081,38 @@ fn wasm_heap_bytes() -> u32 {
     #[cfg(not(target_arch = "wasm32"))]
     {
         0
+    }
+}
+
+/// Monotonic milliseconds since the JS realm's time origin (Issue #86 — D5.7
+/// real telemetry: `EngineStats.last_command_ms` / `last_paint_ms` and
+/// `Event::Painted.paint_ms`). Real on the `wasm32` browser artifact; `0.0`
+/// on native `cargo check`/`test`, where no JS global scope exists to host a
+/// `Performance` object at all — same fallback shape as [`wasm_heap_bytes`].
+///
+/// Tries `window()` first (the `wasm-bindgen-test` `run_in_browser` harness
+/// runs in a plain tab, not a worker, so `window` is the only global there),
+/// then falls back to `WorkerGlobalScope` (the production path: the engine
+/// always runs inside the dedicated worker per `ts/src/engine/engine.worker.ts`,
+/// where `window` does not exist). Either object's `Performance` is missing
+/// only in a pathological embedding, so `unwrap_or(0.0)` — a timing gap must
+/// never surface as a WASM error to the caller.
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(win) = web_sys::window() {
+            return win.performance().map(|p| p.now()).unwrap_or(0.0);
+        }
+        js_sys::global()
+            .dyn_into::<web_sys::WorkerGlobalScope>()
+            .ok()
+            .and_then(|g| g.performance())
+            .map(|p| p.now())
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0.0
     }
 }
 
@@ -5276,7 +5339,10 @@ impl Engine {
 
     /// D2.5 telemetry. `wasm_heap_bytes` and undo/font counters are real;
     /// `document_tree_bytes` is an estimate (sum of paragraph text bytes);
-    /// the glyph cache and frame timings land with the Phase 3 renderer.
+    /// the glyph cache lands with a future renderer pass. Issue #86 —
+    /// `last_paint_ms` / `last_command_ms` are real now (`Engine::last_paint_ms`
+    /// / `last_command_ms`, updated by `render_document` and `dispatch`
+    /// respectively) — no longer the `0.0` D5.7 placeholder.
     fn request_stats(&self) -> Event {
         let doc = self.undo.current();
         let document_tree_bytes: usize = doc
@@ -5291,8 +5357,8 @@ impl Engine {
             glyph_cache_entries: 0,
             undo_stack_depth: self.undo.depth(),
             fonts_resident: self.fonts.len() as u32,
-            last_paint_ms: 0.0,
-            last_command_ms: 0.0,
+            last_paint_ms: self.last_paint_ms,
+            last_command_ms: self.last_command_ms,
             paragraph_count: doc.paragraph_count(),
             word_count: doc.word_count(),
             character_count: doc.character_count(),
@@ -5943,6 +6009,12 @@ impl Engine {
     }
 
     fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
+        /* Issue #86 — D5.7 real telemetry. Covers layout-if-stale (the
+        `ensure_layout_snapshot` call just below, a no-op cache hit on the
+        common path) plus the actual Vello/Canvas2D paint — "paint_ms" has
+        always meant this whole call's cost (see `Event::Painted.paint_ms`
+        below), so the clock starts here rather than after layout. */
+        let paint_t0 = now_ms();
         /* `true` — splice the live IME composition preview into the
         paint. Audit gap C.H1 — `target_y` comes from `lazy_layout`
         (high-water mark the TS shell has asked us to cover). The
@@ -6079,6 +6151,7 @@ impl Engine {
                     message: format!("vello paint: {e}"),
                 })
             })?;
+            self.last_paint_ms = (now_ms() - paint_t0) as f32;
             self.last_paint_dims = LastPaintDims {
                 document_height: stats.document_height,
                 page_count: stats.page_count,
@@ -6090,6 +6163,7 @@ impl Engine {
                 page_margin_bottoms: stats.page_margin_bottoms.clone(),
                 page_content_tops: stats.page_content_tops.clone(),
                 page_content_bottoms: stats.page_content_bottoms.clone(),
+                paint_ms: self.last_paint_ms,
             };
             return Ok(stats);
         }
@@ -6137,6 +6211,7 @@ impl Engine {
             }
         }
 
+        self.last_paint_ms = (now_ms() - paint_t0) as f32;
         self.last_paint_dims = LastPaintDims {
             document_height: stats.document_height,
             page_count: stats.page_count,
@@ -6148,6 +6223,7 @@ impl Engine {
             page_margin_bottoms: stats.page_margin_bottoms.clone(),
             page_content_tops: stats.page_content_tops.clone(),
             page_content_bottoms: stats.page_content_bottoms.clone(),
+            paint_ms: self.last_paint_ms,
         };
         Ok(stats)
     }
@@ -6276,7 +6352,10 @@ impl Engine {
                 h: 0.0,
             },
             version: u64::from(self.undo.depth()),
-            paint_ms: 0.0,
+            /* Issue #86 — synthetic Painted: no repaint happened here, so
+            report the last REAL paint's cost (from `dims`) rather than a
+            dummy `0.0`. */
+            paint_ms: dims.paint_ms,
             document_height: dims.document_height,
             page_count: dims.page_count,
             is_full_layout: dims.is_full_layout,
@@ -6336,7 +6415,9 @@ impl Engine {
         Event::Painted {
             dirty: kurbo_to_bridge(region),
             version: u64::from(self.undo.depth()),
-            paint_ms: 0.0,
+            /* Issue #86 — real cost of the `render_document` call just
+            above (D5.7: was a permanent `0.0` dummy). */
+            paint_ms: self.last_paint_ms,
             document_height: stats.document_height,
             page_count: stats.page_count,
             is_full_layout: stats.is_full_layout,
@@ -10659,6 +10740,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -10702,6 +10785,72 @@ mod tests {
             Some("helloX world"),
             "insert must land at the just-set caret, not append at the end"
         );
+    }
+
+    /// Issue #86 — D5.7 real telemetry. Only meaningful on `wasm32` in a
+    /// real browser (`wasm-pack test --headless --chrome`): `now_ms()` is
+    /// a permanent `0.0` off-wasm (see `now_ms_is_a_stable_zero_off_wasm`),
+    /// so this can't assert non-zero on native. What it DOES pin
+    /// everywhere it runs: `RequestStats.last_command_ms` /
+    /// `.last_paint_ms` and `Event::Painted.paint_ms` are wired to the
+    /// SAME underlying `Engine::last_paint_ms` — not three independent
+    /// `0.0` literals that happen to agree by coincidence.
+    #[wasm_bindgen_test]
+    async fn dispatch_and_paint_share_one_real_timing_source() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        let insert = serde_wasm_bindgen::to_value(&Command::InsertText {
+            at: Some(bpos_top(0, 11)),
+            text: " again".to_string(),
+        })
+        .expect("encode insert");
+        engine.dispatch(insert).await.expect("insert dispatch");
+
+        let paint = serde_wasm_bindgen::to_value(&Command::RequestPaint {
+            viewport: BridgeRect {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 1200.0,
+            },
+            dirty: None,
+        })
+        .expect("encode request paint");
+        let painted_js = engine.dispatch(paint).await.expect("request paint");
+        let painted: Event = serde_wasm_bindgen::from_value(painted_js).expect("decode painted");
+        let Event::Painted { paint_ms, .. } = painted else {
+            panic!("expected Painted, got {painted:?}");
+        };
+
+        let stats_js = engine
+            .dispatch(serde_wasm_bindgen::to_value(&Command::RequestStats).expect("encode stats"))
+            .await
+            .expect("request stats");
+        let stats_evt: Event = serde_wasm_bindgen::from_value(stats_js).expect("decode stats");
+        let Event::Stats(stats) = stats_evt else {
+            panic!("expected Stats, got {stats_evt:?}");
+        };
+
+        assert!(stats.last_command_ms >= 0.0, "must never be negative");
+        assert!(stats.last_paint_ms >= 0.0, "must never be negative");
+        // The most recent paint IS the RequestPaint call above — the
+        // mirrored dimension cache and RequestStats must report the
+        // identical cost, not two independently-drifting numbers.
+        assert!(
+            (stats.last_paint_ms - paint_ms).abs() < f32::EPSILON,
+            "Painted.paint_ms ({paint_ms}) and Stats.last_paint_ms ({}) disagree",
+            stats.last_paint_ms
+        );
+    }
+
+    /// Issue #86 — `now_ms()` must degrade to a harmless constant on
+    /// native (`cargo test`), where no JS global scope exists to host a
+    /// `Performance` object — same fallback shape as `wasm_heap_bytes()`.
+    /// A future regression that makes this panic or return NaN on native
+    /// would otherwise only surface as a browser-only test failure.
+    #[test]
+    fn now_ms_is_a_stable_zero_off_wasm() {
+        assert_eq!(now_ms(), 0.0);
+        assert_eq!(now_ms(), now_ms());
     }
 
     /// Backlog #7 — a line with one LTR run and one RTL run; a selection
@@ -11399,6 +11548,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -11450,6 +11601,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -11492,6 +11645,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -11611,6 +11766,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -12147,6 +12304,8 @@ mod tests {
                 tracking_changes: false,
                 review_author: "You".to_string(),
                 review_date: String::new(),
+                last_command_ms: 0.0,
+                last_paint_ms: 0.0,
             }
         }
 
@@ -13223,6 +13382,8 @@ mod tests {
             /* Non-empty so `current_review_date` never reaches
             `js_sys::Date`, which panics on native targets. */
             review_date: "2026-01-01T00:00:00Z".to_string(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         }
     }
 

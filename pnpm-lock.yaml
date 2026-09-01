@@ -47,6 +47,8 @@ importers:
         specifier: ^1.60.0
         version: 1.60.0
 
+  tools/telemetry-sink: {}
+
   tools/visual-diff:
     dependencies:
       pixelmatch:

@@ -19,7 +19,7 @@ import { EngineClient } from './engine/engine-client';
 import { createEngineStore, SCREEN_DPI_SCALE, type EngineStore } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
 import { attachDragDrop } from './input/dnd';
-import { createFontRegistry, type FontRegistry } from '@nge/core';
+import { createFontRegistry, createTelemetryConfig, type FontRegistry } from '@nge/core';
 import type { Command, Event } from './engine/types';
 import { topPos } from './engine/types';
 import './styles/editor.css';
@@ -172,6 +172,16 @@ export function App() {
     const fontRegistry = createFontRegistry(client);
     window.__fontRegistry = fontRegistry;
 
+    /* Issue #86 — D5.7 telemetry opt-in flag, shared with `SettingsMenu`
+       (via `TelemetryProvider`, wired in `SdkShelf`) and the collector
+       started in `onReady` below. `?telemetryEndpoint=` is an e2e /
+       local-debug hook — production wiring supplies a real endpoint
+       through the same option once a collector exists (D5.6/D5.9 scope). */
+    const telemetryConfig = createTelemetryConfig();
+    const telemetryEndpoint =
+        new URLSearchParams(window.location.search).get('telemetryEndpoint') ?? undefined;
+    window.__setTelemetryEnabled = telemetryConfig.setEnabled;
+
     /* §9 store — mirrors engine SELECTION_CHANGED events into signals the
        caret + selection overlays render from. */
     const store = createEngineStore(client);
@@ -247,9 +257,15 @@ export function App() {
         if (firstReady) {
             firstReady = false;
             startStatsPolling(client);
-            /* D5.7 — mock telemetry pipeline: batches engine samples and
-               console.logs them every 60 s (a real collector would POST). */
-            startTelemetry(client);
+            /* Issue #86 — D5.7 real telemetry transport. Opt-in only
+               (`telemetryConfig.enabled`, off by default, toggled from
+               Settings); with no `?telemetryEndpoint=` configured, an
+               opted-in session still only logs to the console (dev-safe —
+               see `ConsoleTransport`), never fires a real network request. */
+            startTelemetry(client, {
+                enabled: telemetryConfig.enabled,
+                endpoint: telemetryEndpoint,
+            });
         }
     };
 
@@ -265,6 +281,7 @@ export function App() {
             <SdkShelf
                 client={client}
                 fontRegistry={fontRegistry}
+                telemetry={telemetryConfig}
                 engineReady={() => !booting()}
             >
                 <div class="editor-viewport" ref={viewportEl}>

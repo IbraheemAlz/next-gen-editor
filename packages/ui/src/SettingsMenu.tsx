@@ -14,11 +14,12 @@
  * `window` that the HUD subscribes to.
  */
 import { createSignal, onCleanup, Show, type Component } from 'solid-js';
-import { useEngine } from '@nge/core';
+import { useEngine, useTelemetryConfig } from '@nge/core';
 import './SettingsMenu.css';
 
 export const SettingsMenu: Component = () => {
     const engine = useEngine();
+    const telemetry = useTelemetryConfig();
     const [open, setOpen] = createSignal(false);
 
     const switchRenderer = (target: 'vello' | 'canvas2d') => {
@@ -103,6 +104,26 @@ export const SettingsMenu: Component = () => {
                         </div>
                         <div class="nge-settings__hint">
                             COI: <strong>{engine.crossOriginIsolated ? 'on' : 'off'}</strong>
+                        </div>
+                    </div>
+
+                    <div class="nge-settings__separator" />
+
+                    <div class="nge-settings__section">
+                        <div class="nge-settings__heading">Telemetry</div>
+                        <div class="nge-settings__row">
+                            <label class="nge-settings__checkbox">
+                                <input
+                                    type="checkbox"
+                                    checked={telemetry.enabled()}
+                                    onChange={(e) => telemetry.setEnabled(e.currentTarget.checked)}
+                                />
+                                Share anonymous performance telemetry
+                            </label>
+                        </div>
+                        <div class="nge-settings__hint">
+                            Opt-in only, off by default. Never carries document
+                            content or personal data — see Issue #86.
                         </div>
                     </div>
                 </div>

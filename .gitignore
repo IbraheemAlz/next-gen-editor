@@ -1,5 +1,6 @@
 # Rust
 target/
+target-private/
 **/*.rs.bk
 
 # wasm-pack output
@@ -33,6 +34,10 @@ ts/probe-renderer.mjs
 
 # Visual-diff golden backups (kept locally for human inspection only)
 tools/visual-diff/golden.*.bak/
+
+# tools/telemetry-sink runtime output (Issue #86, D5.7) — the dev/e2e
+# receiver's on-disk JSONL, never committed.
+tools/telemetry-sink/*.jsonl
 
 # OS
 .DS_Store

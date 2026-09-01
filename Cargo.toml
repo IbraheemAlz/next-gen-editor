@@ -30,11 +30,14 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "DedicatedWorkerGlobalScope", "WorkerGlobalScope", "MessagePort", "MessageEvent",
     "OffscreenCanvas", "OffscreenCanvasRenderingContext2d",
-    "ImageBitmap", "ImageData", "console",
+    "ImageBitmap", "ImageData", "console", "Performance",
 ] }
 console_error_panic_hook = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+# Dev-only: JSON round-trip tests assert the `#[serde(tag = "type", ...)]`
+# wire shape of bridge enums (Issue #86 telemetry.rs tests).
+serde_json = "1"
 serde-wasm-bindgen = "0.6"
 tsify-next = { version = "0.5", default-features = false, features = ["js"] }
 

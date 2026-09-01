@@ -19,8 +19,10 @@ import { Show, type JSX, type Component } from 'solid-js';
 import {
     EngineProvider,
     FontRegistryProvider,
+    TelemetryProvider,
     type EngineHandle,
     type FontRegistry,
+    type TelemetryConfig,
 } from '@nge/core';
 import {
     DevHud,
@@ -60,6 +62,10 @@ export interface SdkShelfProps {
      *  the JIT loader. Shared with App's boot sequence so the resident-font
      *  cache is one instance across boot + toolbar. */
     fontRegistry: FontRegistry;
+    /** Issue #86 — the D5.7 telemetry opt-in flag, shared with App's boot
+     *  sequence (`startTelemetry(client, { enabled: telemetry.enabled, ... })`)
+     *  so `SettingsMenu`'s toggle and the actual collector agree. */
+    telemetry: TelemetryConfig;
     /** Editor canvas + overlays mount here, inside the main grid track. */
     children: JSX.Element;
     /** True once the worker has finished INIT. Defaults to true if omitted
@@ -77,6 +83,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
     return (
         <EngineProvider client={handle}>
           <FontRegistryProvider registry={props.fontRegistry}>
+          <TelemetryProvider config={props.telemetry}>
             <div class="nge-root nge-shell">
                 <header class="nge-shell__topbar">
                     <div class="nge-shell__toolbar-row">
@@ -124,6 +131,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                 <DevHud pollMs={1000} />
                 <TrapOverlay />
             </div>
+          </TelemetryProvider>
           </FontRegistryProvider>
         </EngineProvider>
     );

@@ -963,13 +963,16 @@ function broadcastPaintDims(): void {
             page_margin_bottoms: number[];
             page_content_tops: number[];
             page_content_bottoms: number[];
+            /** Issue #86 — real cost (ms) of the last actual paint, replayed
+             *  here since this side-channel doesn't repaint. */
+            paint_ms: number;
         };
         self.postMessage({
             evt: {
                 type: 'PAINTED',
                 dirty: { x: 0, y: 0, w: 0, h: 0 },
                 version: lastPaintVersion,
-                paint_ms: 0,
+                paint_ms: dims.paint_ms,
                 document_height: dims.document_height,
                 page_count: dims.page_count,
                 is_full_layout: dims.is_full_layout,
