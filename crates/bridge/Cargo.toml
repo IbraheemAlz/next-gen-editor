@@ -11,3 +11,6 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 tsify-next = { workspace = true }
 wasm-bindgen = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
