@@ -992,7 +992,8 @@ impl VertAlign {
 /// Boxed behind an `Option` on every host struct so the common no-bag case
 /// costs one pointer-width and `SpanStyle::default()` stays cheap to
 /// compare.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct GrabBag {
     /// Raw child-element fragments (UTF-8 XML bytes), document order.
     pub fragments: Vec<Vec<u8>>,
