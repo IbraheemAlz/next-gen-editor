@@ -57,6 +57,14 @@ struct SectPrAccum {
     page_num: Option<engine::PageNumType>,
     /// Audit gap A.M12 — `<w:type w:val>` section-break discriminator.
     section_type: engine::SectionType,
+    /// Issue #80 — `<w:footnotePr>` overrides for this section.
+    footnote_props: engine::NoteProps,
+    /// Issue #80 — `<w:endnotePr>` overrides.
+    endnote_props: engine::NoteProps,
+    /// Issue #80 — which `<w:footnotePr>` / `<w:endnotePr>` container is
+    /// open, so its leaf children (`<w:pos>`, `<w:numFmt>`, …) route to
+    /// the right props. Cleared on the container's end tag.
+    note_pr_scope: Option<engine::NoteKind>,
 }
 
 /// Per-field accumulator on the [`field_stack`] in
@@ -227,6 +235,28 @@ impl SectPrAccum {
     /// `Start(...)` of `<w:headerReference>...</w:headerReference>`-style tags
     /// route here — every child the parser cares about is leaf-shaped.
     fn apply(&mut self, name: &[u8], e: &BytesStart) {
+        /* Issue #80 — `<w:footnotePr>` / `<w:endnotePr>` open a scope;
+        their leaf children fold into the scoped props. */
+        match name {
+            b"w:footnotePr" => {
+                self.note_pr_scope = Some(engine::NoteKind::Footnote);
+                return;
+            }
+            b"w:endnotePr" => {
+                self.note_pr_scope = Some(engine::NoteKind::Endnote);
+                return;
+            }
+            _ => {}
+        }
+        if let Some(kind) = self.note_pr_scope {
+            let props = match kind {
+                engine::NoteKind::Footnote => &mut self.footnote_props,
+                engine::NoteKind::Endnote => &mut self.endnote_props,
+            };
+            if crate::parts::footnotes::apply_note_pr_child(name, e, props) {
+                return;
+            }
+        }
         match name {
             b"w:pgSz" => {
                 if let Some(v) = attr_val(e, b"w:w").as_deref().and_then(twips_to_pt) {
@@ -401,10 +431,6 @@ pub fn parse_document_xml(
     deleted text rides alongside live content; the `Revision` overlay
     flags the byte range for the strikethrough renderer. */
     let mut in_del_text_elt = false;
-
-    /* Phase 8a — footnote refs auto-number 1, 2, 3 ... in document order
-    across every `<w:footnoteReference>` the body uses. */
-    let mut footnote_display_counter: u32 = 0;
 
     /* Phase 8a — comment ranges. `<w:commentRangeStart w:id="N"/>` opens
     a range; `<w:commentRangeEnd w:id="N"/>` closes it. Each may live in
@@ -746,24 +772,55 @@ pub fn parse_document_xml(
                         };
                         run_text.push(ch);
                     }
-                    b"w:footnoteReference" => {
-                        /* Phase 8a — inject U+FFFC at the run's current
-                        byte offset and queue a FootnoteRef inline
-                        object. Numbering counts up across the body in
-                        document order, independent of the OOXML `w:id`
-                        the file uses internally. */
-                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok()) {
-                            footnote_display_counter += 1;
+                    b"w:footnoteReference" | b"w:endnoteReference" => {
+                        /* Phase 8a / issue #80 — inject U+FFFC at the
+                        run's current byte offset and queue the reference
+                        inline object. The displayed number is derived at
+                        layout time in document order
+                        (`DocumentTree::note_markers`); only the OOXML
+                        `w:id` and the custom-mark flag are stored. */
+                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.trim().parse().ok())
+                        {
+                            let custom_mark_follows = attr_val(&e, b"w:customMarkFollows")
+                                .is_some_and(|v| {
+                                    !matches!(
+                                        v.trim().to_ascii_lowercase().as_str(),
+                                        "false" | "0" | "off"
+                                    )
+                                });
                             let at = (para_text.len() + run_text.len()) as u32;
                             run_text.push('\u{FFFC}');
-                            para_inline_objects.push(engine::InlineObject {
-                                at,
-                                kind: engine::InlineKind::FootnoteRef {
+                            let kind = if name.as_ref() == b"w:footnoteReference" {
+                                engine::InlineKind::FootnoteRef {
                                     id,
-                                    display_number: footnote_display_counter,
-                                },
-                            });
+                                    custom_mark_follows,
+                                }
+                            } else {
+                                engine::InlineKind::EndnoteRef {
+                                    id,
+                                    custom_mark_follows,
+                                }
+                            };
+                            para_inline_objects.push(engine::InlineObject { at, kind });
                         }
+                    }
+                    b"w:footnoteRef" | b"w:endnoteRef" => {
+                        /* Issue #80 — the self-mark at the head of a note
+                        body (only ever seen while parsing a note story).
+                        Anchored like a reference so the body paints its
+                        own number and a regenerated body re-emits the
+                        element. */
+                        let at = (para_text.len() + run_text.len()) as u32;
+                        run_text.push('\u{FFFC}');
+                        let kind = if name.as_ref() == b"w:footnoteRef" {
+                            engine::NoteKind::Footnote
+                        } else {
+                            engine::NoteKind::Endnote
+                        };
+                        para_inline_objects.push(engine::InlineObject {
+                            at,
+                            kind: engine::InlineKind::NoteSelfRef { kind },
+                        });
                     }
                     b"w:commentRangeStart" => {
                         if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok()) {
@@ -1007,6 +1064,10 @@ pub fn parse_document_xml(
                             }
                         }
                     }
+                    b"w:footnotePr" | b"w:endnotePr" if in_sect_pr => {
+                        /* Issue #80 — close the note-props scope. */
+                        cur_sect.note_pr_scope = None;
+                    }
                     b"w:sectPr" => {
                         /* Inline (inside a paragraph's `<w:pPr>`) → stash for
                         the matching `</w:p>` end. Body-level (the sectPr that
@@ -1026,6 +1087,8 @@ pub fn parse_document_xml(
                                 let columns = taken.columns.unwrap_or_default();
                                 let page_num = taken.page_num.unwrap_or_default();
                                 let section_type = taken.section_type;
+                                let footnote_props = taken.footnote_props;
+                                let endnote_props = taken.endnote_props;
                                 out_sections.push(Section {
                                     geometry: taken.into_geometry(),
                                     start_block: sect_start_block,
@@ -1036,6 +1099,8 @@ pub fn parse_document_xml(
                                     columns,
                                     page_num,
                                     section_type,
+                                    footnote_props,
+                                    endnote_props,
                                 });
                                 sect_start_block = end;
                             }
@@ -1164,6 +1229,8 @@ pub fn parse_document_xml(
                                 let columns = sect.columns.unwrap_or_default();
                                 let page_num = sect.page_num.unwrap_or_default();
                                 let section_type = sect.section_type;
+                                let footnote_props = sect.footnote_props;
+                                let endnote_props = sect.endnote_props;
                                 out_sections.push(Section {
                                     geometry: sect.into_geometry(),
                                     start_block: sect_start_block,
@@ -1174,6 +1241,8 @@ pub fn parse_document_xml(
                                     columns,
                                     page_num,
                                     section_type,
+                                    footnote_props,
+                                    endnote_props,
                                 });
                                 sect_start_block = end;
                             }

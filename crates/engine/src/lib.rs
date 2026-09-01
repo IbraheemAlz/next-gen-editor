@@ -97,12 +97,34 @@ pub struct DocumentTree {
     /// their [`InlineKind::Image`] carries.
     #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub media: std::collections::HashMap<String, ImageBlob>,
-    /// Phase 8a — parsed `word/footnotes.xml` entries keyed by the OOXML
-    /// `w:id`. The value is the footnote body's plain text per paragraph;
-    /// the paginator looks an `InlineKind::FootnoteRef.id` up here when
-    /// it lays out the page's footnote band.
+    /// Issue #80 — `word/footnotes.xml` note stories keyed by the OOXML
+    /// `w:id` (an `i32`: Word's separator sentinels are `-1` / `0`). Every
+    /// entry the part carries lands here — the special separator /
+    /// continuation notes included — so a regenerated part re-emits them
+    /// and the passthrough writer keeps clean notes byte-identical. Note
+    /// bodies are the body's own [`Block`] model, so the story adapter
+    /// runs every body mutation against a note unchanged.
+    ///
+    /// Snapshot discipline (issue #85): this REPLACES the Phase-8a
+    /// `footnotes: HashMap<u32, Vec<String>>` field. The old key is simply
+    /// unread by this build (serde ignores unknown map keys), and a fresh
+    /// default here is the correct reading of an older snapshot — the old
+    /// plain-text table was a render cache, never authoritative content.
     #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
-    pub footnotes: std::collections::HashMap<u32, Vec<String>>,
+    pub footnote_stories: std::collections::HashMap<i32, NoteStory>,
+    /// Issue #80 — `word/endnotes.xml` twin of [`Self::footnote_stories`].
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
+    pub endnote_stories: std::collections::HashMap<i32, NoteStory>,
+    /// Issue #80 — document-level `<w:settings><w:footnotePr>`: numbering
+    /// format / start / restart rule + position. Section-level
+    /// `<w:sectPr><w:footnotePr>` overrides ride [`SectionProps`].
+    pub footnote_props: NoteProps,
+    /// Issue #80 — document-level `<w:settings><w:endnotePr>`.
+    pub endnote_props: NoteProps,
+    /// Issue #80 — which note PARTS the writer must regenerate. Rides the
+    /// tree (like `hf_dirty`) so undo reverts it with the content; the
+    /// per-note [`NoteStory::dirty`] flag decides passthrough per entry.
+    pub notes_dirty: NotesDirty,
     /// Phase 8a — parsed `word/comments.xml` entries keyed by `w:id`.
     /// Plain text + author / date metadata for the sidebar UI.
     #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
@@ -482,6 +504,11 @@ pub struct Section {
     /// `EvenPage` / `OddPage` round-trip but degrade to `NextPage`
     /// (parity routing is paginator work deferred to a later sprint).
     pub section_type: SectionType,
+    /// Issue #80 — `<w:sectPr><w:footnotePr>` overrides for this section
+    /// (unset fields inherit the document-level `settings.xml` props).
+    pub footnote_props: NoteProps,
+    /// Issue #80 — `<w:sectPr><w:endnotePr>` overrides.
+    pub endnote_props: NoteProps,
 }
 
 /// Audit gap A.M11 — `<w:pgNumType>` descriptor.
@@ -643,6 +670,10 @@ pub struct SectionProps {
     /// previous one (§17.6.22: the kind of break that precedes this
     /// section's content).
     pub section_type: SectionType,
+    /// Issue #80 — `<w:footnotePr>` overrides.
+    pub footnote_props: NoteProps,
+    /// Issue #80 — `<w:endnotePr>` overrides.
+    pub endnote_props: NoteProps,
 }
 
 impl SectionProps {
@@ -658,6 +689,8 @@ impl SectionProps {
             columns: self.columns,
             page_num: self.page_num,
             section_type: self.section_type,
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
         }
     }
 }
@@ -672,6 +705,8 @@ impl From<&Section> for SectionProps {
             columns: s.columns,
             page_num: s.page_num,
             section_type: s.section_type,
+            footnote_props: s.footnote_props,
+            endnote_props: s.endnote_props,
         }
     }
 }
@@ -703,6 +738,156 @@ pub struct DocumentSettings {
     /// `<w:evenAndOddHeaders/>` — when `true`, even-numbered pages render
     /// the `Even` header / footer instead of the `Default` slot.
     pub even_and_odd_headers: bool,
+}
+
+/* ============================================================
+Issue #80 — footnotes & endnotes model.
+============================================================ */
+
+/// Issue #80 — which note family a story or a reference belongs to.
+/// Footnotes negotiate page-bottom space with the body flow; endnotes
+/// collect as a trailing story at section / document end.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum NoteKind {
+    #[default]
+    Footnote,
+    Endnote,
+}
+
+/// Issue #80 — `w:type` of a `<w:footnote>` / `<w:endnote>` entry
+/// (ECMA-376 §17.11.17 / §17.11.9). The three special kinds are the
+/// document's separator stories: Word always ships a
+/// `continuationSeparator` (`w:id="-1"`) and a `separator` (`w:id="0"`);
+/// a `continuationNotice` is authored on demand. None of them is ever
+/// referenced from body text.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoteType {
+    #[default]
+    Normal,
+    Separator,
+    ContinuationSeparator,
+    ContinuationNotice,
+}
+
+/// Issue #80 — one note story: the body of a `<w:footnote>` /
+/// `<w:endnote>` entry. `body` is the body's own block model (paragraphs
+/// carry the `<w:footnoteRef/>` self-mark as an
+/// [`InlineKind::NoteSelfRef`] anchor), so the story adapter, the
+/// paginator and the writer reuse every body code path. `source_xml`
+/// is the raw `<w:footnote …>…</w:footnote>` element for the passthrough
+/// writer; `dirty` flips on the first engine mutation and forces a
+/// regenerate of THIS entry only.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct NoteStory {
+    pub id: i32,
+    pub kind: NoteKind,
+    pub note_type: NoteType,
+    pub body: Vec<Block>,
+    #[serde(with = "serde_bytes")]
+    pub source_xml: Option<Vec<u8>>,
+    pub dirty: bool,
+}
+
+/// Issue #80 — `<w:footnotePr><w:pos>` / `<w:endnotePr><w:pos>`
+/// (§17.11.21 / §17.11.13). Footnotes: `pageBottom` (default) or
+/// `beneathText`; the section / document-end values are meaningless for
+/// footnotes in Word and behave as `beneathText`. Endnotes: `sectEnd` or
+/// `docEnd` (default).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotePosition {
+    #[default]
+    PageBottom,
+    BeneathText,
+    SectEnd,
+    DocEnd,
+}
+
+/// Issue #80 — `<w:numRestart w:val>` (§17.11.19). `EachPage` is
+/// footnote-only per the schema; it is parsed and round-tripped but
+/// numbered as `Continuous` by this build (per-page renumbering needs a
+/// post-pagination reshape — tracked as a follow-up).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoteNumRestart {
+    #[default]
+    Continuous,
+    EachSect,
+    EachPage,
+}
+
+/// Issue #80 — the payload of one `<w:footnotePr>` / `<w:endnotePr>`.
+/// Every field is optional so a section-level element can override a
+/// single property and inherit the rest from the document level
+/// (`settings.xml`); [`DocumentTree::resolved_note_props`] folds the two
+/// with the schema defaults.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct NoteProps {
+    pub position: Option<NotePosition>,
+    /// `<w:numFmt w:val>` — the same `ST_NumberFormat` subset page
+    /// numbering models; unknown formats (chicago, …) read as decimal.
+    pub num_format: Option<PageNumFormat>,
+    /// `<w:numStart w:val>` — first number of the sequence.
+    pub num_start: Option<u32>,
+    pub num_restart: Option<NoteNumRestart>,
+}
+
+impl NoteProps {
+    /// `true` when nothing is set — the writer omits the element.
+    pub fn is_empty(&self) -> bool {
+        self.position.is_none()
+            && self.num_format.is_none()
+            && self.num_start.is_none()
+            && self.num_restart.is_none()
+    }
+
+    /// `self` with every unset field taken from `base`.
+    pub fn inherit_from(self, base: &NoteProps) -> NoteProps {
+        NoteProps {
+            position: self.position.or(base.position),
+            num_format: self.num_format.or(base.num_format),
+            num_start: self.num_start.or(base.num_start),
+            num_restart: self.num_restart.or(base.num_restart),
+        }
+    }
+}
+
+/// Issue #80 — fully-resolved note properties for one kind in one
+/// section (schema defaults applied).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedNoteProps {
+    pub position: NotePosition,
+    pub num_format: PageNumFormat,
+    pub num_start: u32,
+    pub num_restart: NoteNumRestart,
+}
+
+/// Issue #80 — which note parts the writer regenerates. Flips when a
+/// story is added, edited or removed; mirrors [`HfDirty`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct NotesDirty {
+    pub footnotes: bool,
+    pub endnotes: bool,
+}
+
+/// Issue #80 — the key every numbering / layout table uses for one
+/// referenced note: `(kind, w:id)`. Shared with the layout crate so a
+/// glyph anchor and a laid-out note body agree by construction.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NoteAnchor {
+    pub kind: NoteKind,
+    pub id: u32,
+}
+
+/// Issue #80 — one body-order note reference: the top-level block that
+/// carries it, the anchor, and whether the author supplied a custom
+/// mark (`w:customMarkFollows` — the sequence skips it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteReference {
+    pub top_block: u32,
+    pub anchor: NoteAnchor,
+    pub custom_mark: bool,
 }
 
 /// Address of a `Block` inside a `DocumentTree`. Walks from the root
@@ -1124,12 +1309,31 @@ pub enum InlineKind {
         width_emu: i64,
         height_emu: i64,
     },
-    /// `<w:footnoteReference w:id="N"/>` — Phase 8a. `id` is the OOXML
-    /// footnote id; `display_number` is the 1-based ordinal the renderer
-    /// paints as the superscript marker (assigned at parse time in
-    /// document order, skipping the sentinel `id=0` / `id=-1`
-    /// separator / continuation entries `word/footnotes.xml` ships with).
-    FootnoteRef { id: u32, display_number: u32 },
+    /// `<w:footnoteReference w:id="N"/>` — Phase 8a / issue #80. `id` is
+    /// the OOXML footnote id (a key into
+    /// [`DocumentTree::footnote_stories`]). The displayed number is NOT
+    /// stored: [`DocumentTree::note_markers`] derives it in document
+    /// order at layout time, so an inserted or deleted note renumbers
+    /// every later reference for free. `custom_mark_follows` mirrors
+    /// `w:customMarkFollows` — the author's own mark text follows in the
+    /// next run and the auto-sequence skips this reference.
+    FootnoteRef {
+        id: u32,
+        #[serde(default)]
+        custom_mark_follows: bool,
+    },
+    /// `<w:endnoteReference w:id="N"/>` — issue #80 twin of
+    /// [`Self::FootnoteRef`] keyed into [`DocumentTree::endnote_stories`].
+    EndnoteRef {
+        id: u32,
+        #[serde(default)]
+        custom_mark_follows: bool,
+    },
+    /// `<w:footnoteRef/>` / `<w:endnoteRef/>` — issue #80. The self-mark
+    /// at the head of a note body: paints the note's own number and
+    /// round-trips the element on a regenerated body. Only meaningful
+    /// inside a [`NoteStory`]; body paragraphs never carry one.
+    NoteSelfRef { kind: NoteKind },
 }
 
 /// A non-text inline node anchored at a single byte offset in a paragraph.
@@ -1797,8 +2001,21 @@ impl Paragraph {
             every stashed byte offset (hyperlink spans, revision ranges)
             would dangle across the deleted range. Clearing these overlays
             is a known, deliberately out-of-scope limitation (offset
-            remapping is a separate, larger task), not an oversight. */
-            inline_objects: Vec::new(),
+            remapping is a separate, larger task), not an oversight.
+            Issue #80 — inline OBJECTS are the exception: an anchor is a
+            single sentinel byte, so the remap is exact — before the gap
+            unchanged, inside it gone (its sentinel was deleted), after it
+            shifted left. A footnote reference must survive editing the
+            words around it. */
+            inline_objects: self
+                .inline_objects
+                .iter()
+                .filter(|o| o.at < s || o.at >= e)
+                .map(|o| InlineObject {
+                    at: if o.at >= e { o.at - gap } else { o.at },
+                    kind: o.kind.clone(),
+                })
+                .collect(),
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields,
@@ -1852,6 +2069,20 @@ impl Paragraph {
                 });
             }
         }
+        /* Issue #80 — inline objects travel with the half that holds
+        their sentinel (an anchor is one byte, so nothing straddles). */
+        let mut objects_left = Vec::new();
+        let mut objects_right = Vec::new();
+        for o in &self.inline_objects {
+            if o.at < at {
+                objects_left.push(o.clone());
+            } else {
+                objects_right.push(InlineObject {
+                    at: o.at - at,
+                    kind: o.kind.clone(),
+                });
+            }
+        }
         (
             Paragraph {
                 text: self.text[..at as usize].to_owned(),
@@ -1862,7 +2093,7 @@ impl Paragraph {
                 resolved_list_indent: self.resolved_list_indent,
                 dirty: true,
                 source_xml: None,
-                inline_objects: Vec::new(),
+                inline_objects: objects_left,
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: fields_left,
@@ -1925,6 +2156,15 @@ impl Paragraph {
                 instruction: f.instruction.clone(),
             });
         }
+        /* Issue #80 — both sides' inline objects survive; the tail's
+        anchors shift right with its text. */
+        let mut inline_objects = self.inline_objects.clone();
+        for o in &other.inline_objects {
+            inline_objects.push(InlineObject {
+                at: o.at + shift,
+                kind: o.kind.clone(),
+            });
+        }
         Paragraph {
             text,
             spans,
@@ -1934,7 +2174,7 @@ impl Paragraph {
             resolved_list_indent: self.resolved_list_indent,
             dirty: true,
             source_xml: None,
-            inline_objects: Vec::new(),
+            inline_objects,
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields,
@@ -2388,7 +2628,11 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
-            footnotes: std::collections::HashMap::new(),
+            footnote_stories: std::collections::HashMap::new(),
+            endnote_stories: std::collections::HashMap::new(),
+            footnote_props: NoteProps::default(),
+            endnote_props: NoteProps::default(),
+            notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
@@ -2428,7 +2672,11 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
-            footnotes: std::collections::HashMap::new(),
+            footnote_stories: std::collections::HashMap::new(),
+            endnote_stories: std::collections::HashMap::new(),
+            footnote_props: NoteProps::default(),
+            endnote_props: NoteProps::default(),
+            notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
@@ -2470,7 +2718,11 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
-            footnotes: std::collections::HashMap::new(),
+            footnote_stories: std::collections::HashMap::new(),
+            endnote_stories: std::collections::HashMap::new(),
+            footnote_props: NoteProps::default(),
+            endnote_props: NoteProps::default(),
+            notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
@@ -2497,7 +2749,11 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
-            footnotes: std::collections::HashMap::new(),
+            footnote_stories: std::collections::HashMap::new(),
+            endnote_stories: std::collections::HashMap::new(),
+            footnote_props: NoteProps::default(),
+            endnote_props: NoteProps::default(),
+            notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
@@ -2524,7 +2780,11 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
-            footnotes: std::collections::HashMap::new(),
+            footnote_stories: std::collections::HashMap::new(),
+            endnote_stories: std::collections::HashMap::new(),
+            footnote_props: NoteProps::default(),
+            endnote_props: NoteProps::default(),
+            notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
@@ -2604,7 +2864,11 @@ impl DocumentTree {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
-            footnotes: std::collections::HashMap::new(),
+            footnote_stories: std::collections::HashMap::new(),
+            endnote_stories: std::collections::HashMap::new(),
+            footnote_props: NoteProps::default(),
+            endnote_props: NoteProps::default(),
+            notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),
@@ -2670,6 +2934,230 @@ impl DocumentTree {
             }
             counter = counter.saturating_add(1);
         }
+    }
+
+    /* ============================================================
+    Issue #80 — note stories (footnotes / endnotes).
+    ============================================================ */
+
+    /// The story map for `kind`.
+    pub fn note_stories(&self, kind: NoteKind) -> &std::collections::HashMap<i32, NoteStory> {
+        match kind {
+            NoteKind::Footnote => &self.footnote_stories,
+            NoteKind::Endnote => &self.endnote_stories,
+        }
+    }
+
+    fn note_stories_mut(
+        &mut self,
+        kind: NoteKind,
+    ) -> &mut std::collections::HashMap<i32, NoteStory> {
+        match kind {
+            NoteKind::Footnote => &mut self.footnote_stories,
+            NoteKind::Endnote => &mut self.endnote_stories,
+        }
+    }
+
+    /// The story a body reference addresses (`None` for a dangling id —
+    /// Word tolerates those; the paginator simply paints no note).
+    pub fn note_story(&self, anchor: NoteAnchor) -> Option<&NoteStory> {
+        self.note_stories(anchor.kind).get(&(anchor.id as i32))
+    }
+
+    /// The document's special story of `note_type` for `kind` (separator,
+    /// continuation separator, continuation notice), if the part ships one.
+    pub fn special_note(&self, kind: NoteKind, note_type: NoteType) -> Option<&NoteStory> {
+        let mut found: Option<&NoteStory> = None;
+        for s in self.note_stories(kind).values() {
+            if s.note_type == note_type && found.is_none_or(|f| s.id < f.id) {
+                found = Some(s);
+            }
+        }
+        found
+    }
+
+    /// Every body note reference in document order — top-level blocks in
+    /// sequence, table cells depth-first. The single walk the numbering,
+    /// the paginator's note-body table and the writer's "referenced
+    /// notes only" filter all key on.
+    pub fn note_references(&self) -> Vec<NoteReference> {
+        let mut out = Vec::new();
+        for (idx, b) in self.blocks.iter().enumerate() {
+            walk_block_note_refs(b, idx as u32, &mut out);
+        }
+        out
+    }
+
+    /// Resolved `<w:footnotePr>` / `<w:endnotePr>` for `kind`: the
+    /// section's own overrides over the document-level `settings.xml`
+    /// props over the schema defaults (footnotes: page bottom; endnotes:
+    /// document end; decimal, start 1, continuous).
+    pub fn resolved_note_props(
+        &self,
+        kind: NoteKind,
+        section: Option<&Section>,
+    ) -> ResolvedNoteProps {
+        let doc_level = match kind {
+            NoteKind::Footnote => &self.footnote_props,
+            NoteKind::Endnote => &self.endnote_props,
+        };
+        let merged = match section {
+            Some(s) => match kind {
+                NoteKind::Footnote => s.footnote_props.inherit_from(doc_level),
+                NoteKind::Endnote => s.endnote_props.inherit_from(doc_level),
+            },
+            None => *doc_level,
+        };
+        let default_pos = match kind {
+            NoteKind::Footnote => NotePosition::PageBottom,
+            NoteKind::Endnote => NotePosition::DocEnd,
+        };
+        ResolvedNoteProps {
+            position: merged.position.unwrap_or(default_pos),
+            num_format: merged.num_format.unwrap_or_default(),
+            num_start: merged.num_start.unwrap_or(1).max(1),
+            num_restart: merged.num_restart.unwrap_or_default(),
+        }
+    }
+
+    /// Display marker per referenced note, derived in document order:
+    /// each kind runs its own sequence from `numStart`, restarting at
+    /// every section boundary under `eachSect`, formatted per `numFmt`.
+    /// A custom-marked reference contributes no number and maps to an
+    /// empty string (its mark is the author's following run). `eachPage`
+    /// numbers as `continuous` in this build (see [`NoteNumRestart`]).
+    pub fn note_markers(&self) -> std::collections::HashMap<NoteAnchor, String> {
+        let sections = self.effective_sections();
+        let refs = self.note_references();
+        let mut out = std::collections::HashMap::with_capacity(refs.len());
+        for kind in [NoteKind::Footnote, NoteKind::Endnote] {
+            let mut counter: Option<u32> = None;
+            let mut section_idx: Option<usize> = None;
+            for r in refs.iter().filter(|r| r.anchor.kind == kind) {
+                let si = sections
+                    .iter()
+                    .position(|s| r.top_block >= s.start_block && r.top_block < s.end_block)
+                    .unwrap_or(sections.len().saturating_sub(1));
+                let props = self.resolved_note_props(kind, sections.get(si));
+                let restart_here = counter.is_none()
+                    || (props.num_restart == NoteNumRestart::EachSect && section_idx != Some(si));
+                if restart_here {
+                    counter = Some(props.num_start);
+                }
+                section_idx = Some(si);
+                if r.custom_mark {
+                    out.entry(r.anchor).or_insert_with(String::new);
+                    continue;
+                }
+                let n = counter.unwrap_or(1);
+                out.entry(r.anchor)
+                    .or_insert_with(|| props.num_format.render(n));
+                counter = Some(n.saturating_add(1));
+            }
+        }
+        out
+    }
+
+    /// Replace (or create) the body of note `id` of `kind` and mark the
+    /// entry + its part dirty for the writer — the only mutation path into
+    /// the story maps, so `notes_dirty` can never desync from the content.
+    /// Section markers are stripped: a note body is not the body.
+    pub fn with_updated_note_story(&self, kind: NoteKind, id: i32, body: Vec<Block>) -> Self {
+        let mut next = self.clone();
+        let body = strip_section_markers(body);
+        let map = next.note_stories_mut(kind);
+        match map.get_mut(&id) {
+            Some(story) => {
+                story.body = body;
+                story.dirty = true;
+                story.source_xml = None;
+            }
+            None => {
+                map.insert(
+                    id,
+                    NoteStory {
+                        id,
+                        kind,
+                        note_type: NoteType::Normal,
+                        body,
+                        source_xml: None,
+                        dirty: true,
+                    },
+                );
+            }
+        }
+        match kind {
+            NoteKind::Footnote => next.notes_dirty.footnotes = true,
+            NoteKind::Endnote => next.notes_dirty.endnotes = true,
+        }
+        next
+    }
+
+    /// Smallest positive id not used by any story of `kind` — Word's own
+    /// ids are small positive integers, so a fresh note simply extends
+    /// the sequence.
+    pub fn fresh_note_id(&self, kind: NoteKind) -> u32 {
+        let max = self
+            .note_stories(kind)
+            .keys()
+            .copied()
+            .filter(|id| *id > 0)
+            .max()
+            .unwrap_or(0);
+        (max as u32).saturating_add(1)
+    }
+
+    /// Author a new note of `kind` referenced at `pos`: a reference anchor
+    /// (U+FFFC + [`InlineKind::FootnoteRef`] / [`InlineKind::EndnoteRef`])
+    /// is spliced into the paragraph at `pos` and a fresh story — one
+    /// paragraph opening with the self-mark and a space, Word's empty-note
+    /// shape — is created. Returns the new tree and the minted id. `pos`
+    /// must address a paragraph (the caller gates table cells).
+    pub fn insert_note_at(&self, pos: LogicalPos, kind: NoteKind) -> (Self, u32) {
+        let id = self.fresh_note_id(kind);
+        let mut blocks = self.blocks.clone();
+        let target = if self.paragraph_at_path(&pos.path).is_some() {
+            pos.path.clone()
+        } else {
+            self.path_to_last_top_paragraph()
+                .unwrap_or(BlockPath::top(0))
+        };
+        let reference = match kind {
+            NoteKind::Footnote => InlineKind::FootnoteRef {
+                id,
+                custom_mark_follows: false,
+            },
+            NoteKind::Endnote => InlineKind::EndnoteRef {
+                id,
+                custom_mark_follows: false,
+            },
+        };
+        let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
+            splice_inline_object(para, pos.offset, reference);
+        });
+        let mut next = self.clone();
+        next.blocks = blocks;
+        let mut body_para = Paragraph {
+            text: format!("{}{}", '\u{FFFC}', ' '),
+            dirty: true,
+            ..Default::default()
+        };
+        body_para.inline_objects.push(InlineObject {
+            at: 0,
+            kind: InlineKind::NoteSelfRef { kind },
+        });
+        /* Word styles note bodies `FootnoteText` / `EndnoteText`; adopt
+        the style when the document defines it so the body picks up the
+        smaller size the template intends. */
+        let style_id = match kind {
+            NoteKind::Footnote => "FootnoteText",
+            NoteKind::Endnote => "EndnoteText",
+        };
+        if self.styles.contains_key(style_id) {
+            body_para.style_id = Some(style_id.to_string());
+        }
+        let next = next.with_updated_note_story(kind, id as i32, vec![Block::Paragraph(body_para)]);
+        (next, id)
     }
 
     /// Resolved section coverage, DERIVED by walking the top-level block
@@ -3311,7 +3799,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -3386,7 +3878,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -3434,7 +3930,11 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
-                footnotes: self.footnotes.clone(),
+                footnote_stories: self.footnote_stories.clone(),
+                endnote_stories: self.endnote_stories.clone(),
+                footnote_props: self.footnote_props,
+                endnote_props: self.endnote_props,
+                notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
@@ -3496,7 +3996,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -3551,7 +4055,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -3583,7 +4091,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -3634,7 +4146,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -3691,7 +4207,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -3753,7 +4273,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -3878,7 +4402,11 @@ impl DocumentTree {
             headers: split.headers.clone(),
             footers: split.footers.clone(),
             media: split.media.clone(),
-            footnotes: split.footnotes.clone(),
+            footnote_stories: split.footnote_stories.clone(),
+            endnote_stories: split.endnote_stories.clone(),
+            footnote_props: split.footnote_props,
+            endnote_props: split.endnote_props,
+            notes_dirty: split.notes_dirty.clone(),
             comment_defs: split.comment_defs.clone(),
             comment_ranges: split.comment_ranges.clone(),
             settings: split.settings.clone(),
@@ -3978,7 +4506,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4054,7 +4586,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4115,7 +4651,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
             settings: self.settings.clone(),
@@ -4188,7 +4728,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
             settings: self.settings.clone(),
@@ -4240,7 +4784,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges,
             settings: self.settings.clone(),
@@ -4268,7 +4816,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs,
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4349,7 +4901,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4442,7 +4998,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4543,7 +5103,11 @@ impl DocumentTree {
             headers,
             footers,
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4593,7 +5157,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4646,7 +5214,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4696,7 +5268,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4814,7 +5390,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4881,7 +5461,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -4927,7 +5511,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -5016,61 +5604,18 @@ impl DocumentTree {
             self.path_to_last_top_paragraph()
                 .unwrap_or(BlockPath::top(0))
         };
-        const SENTINEL: char = '\u{FFFC}';
-        let sentinel_len = SENTINEL.len_utf8() as u32;
         let off = pos.offset;
         let rel_id_for_inline = rel_id.clone();
         let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
-            let offset = (off as usize).min(para.text.len());
-            para.text.insert(offset, SENTINEL);
-            let off = offset as u32;
-            for s in &mut para.spans {
-                if s.start >= off {
-                    s.start += sentinel_len;
-                }
-                if s.end >= off {
-                    s.end += sentinel_len;
-                }
-            }
-            for io in &mut para.inline_objects {
-                if io.at >= off {
-                    io.at += sentinel_len;
-                }
-            }
-            for h in &mut para.hyperlinks {
-                if h.start >= off {
-                    h.start += sentinel_len;
-                }
-                if h.end >= off {
-                    h.end += sentinel_len;
-                }
-            }
-            for r in &mut para.revisions {
-                if r.start >= off {
-                    r.start += sentinel_len;
-                }
-                if r.end >= off {
-                    r.end += sentinel_len;
-                }
-            }
-            for f in &mut para.fields {
-                if f.start >= off {
-                    f.start += sentinel_len;
-                }
-                if f.end >= off {
-                    f.end += sentinel_len;
-                }
-            }
-            para.inline_objects.push(InlineObject {
-                at: off,
-                kind: InlineKind::Image {
+            splice_inline_object(
+                para,
+                off,
+                InlineKind::Image {
                     rel_id: rel_id_for_inline.clone(),
                     width_emu,
                     height_emu,
                 },
-            });
-            para.inline_objects.sort_by_key(|i| i.at);
-            para.dirty = true;
+            );
         });
 
         Self {
@@ -5079,7 +5624,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media,
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -5128,7 +5677,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -5178,7 +5731,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -5212,7 +5769,11 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
-                footnotes: self.footnotes.clone(),
+                footnote_stories: self.footnote_stories.clone(),
+                endnote_stories: self.endnote_stories.clone(),
+                footnote_props: self.footnote_props,
+                endnote_props: self.endnote_props,
+                notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
@@ -5333,7 +5894,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -5363,7 +5928,11 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
-                footnotes: self.footnotes.clone(),
+                footnote_stories: self.footnote_stories.clone(),
+                endnote_stories: self.endnote_stories.clone(),
+                footnote_props: self.footnote_props,
+                endnote_props: self.endnote_props,
+                notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
@@ -5388,7 +5957,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -5542,7 +6115,11 @@ impl DocumentTree {
                     headers: self.headers.clone(),
                     footers: self.footers.clone(),
                     media: self.media.clone(),
-                    footnotes: self.footnotes.clone(),
+                    footnote_stories: self.footnote_stories.clone(),
+                    endnote_stories: self.endnote_stories.clone(),
+                    footnote_props: self.footnote_props,
+                    endnote_props: self.endnote_props,
+                    notes_dirty: self.notes_dirty.clone(),
                     comment_defs: self.comment_defs.clone(),
                     comment_ranges: self.comment_ranges.clone(),
                     settings: self.settings.clone(),
@@ -5586,7 +6163,11 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
-                footnotes: self.footnotes.clone(),
+                footnote_stories: self.footnote_stories.clone(),
+                endnote_stories: self.endnote_stories.clone(),
+                footnote_props: self.footnote_props,
+                endnote_props: self.endnote_props,
+                notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
@@ -5777,7 +6358,11 @@ impl DocumentTree {
                 headers: self.headers.clone(),
                 footers: self.footers.clone(),
                 media: self.media.clone(),
-                footnotes: self.footnotes.clone(),
+                footnote_stories: self.footnote_stories.clone(),
+                endnote_stories: self.endnote_stories.clone(),
+                footnote_props: self.footnote_props,
+                endnote_props: self.endnote_props,
+                notes_dirty: self.notes_dirty.clone(),
                 comment_defs: self.comment_defs.clone(),
                 comment_ranges: self.comment_ranges.clone(),
                 settings: self.settings.clone(),
@@ -5922,7 +6507,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -5952,7 +6541,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -6231,7 +6824,11 @@ impl DocumentTree {
             headers: self.headers.clone(),
             footers: self.footers.clone(),
             media: self.media.clone(),
-            footnotes: self.footnotes.clone(),
+            footnote_stories: self.footnote_stories.clone(),
+            endnote_stories: self.endnote_stories.clone(),
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            notes_dirty: self.notes_dirty.clone(),
             comment_defs: self.comment_defs.clone(),
             comment_ranges: self.comment_ranges.clone(),
             settings: self.settings.clone(),
@@ -6287,9 +6884,12 @@ fn push_paragraph_plain(p: &Paragraph, out: &mut String) {
         }
         match &obj.kind {
             InlineKind::Image { .. } => out.push_str("[image]"),
-            InlineKind::FootnoteRef { display_number, .. } => {
-                out.push_str(&format!("[footnote {display_number}]"));
-            }
+            /* Issue #80 — numbers are derived at layout time
+            (`DocumentTree::note_markers`), so the flat placeholder
+            names the kind only. */
+            InlineKind::FootnoteRef { .. } => out.push_str("[footnote]"),
+            InlineKind::EndnoteRef { .. } => out.push_str("[endnote]"),
+            InlineKind::NoteSelfRef { .. } => {}
         }
         /* Skip the 3-byte U+FFFC sentinel. */
         cursor = at.saturating_add(3).min(p.text.len());
@@ -6654,6 +7254,110 @@ fn strip_section_marker(mut p: Paragraph) -> Paragraph {
 /// `effective_sections` the moment the part round-trips through a
 /// story tree. Every write into `DocumentTree::headers` / `footers`
 /// funnels through this strip.
+/// Splice a U+FFFC anchor + its [`InlineObject`] into `para` at byte
+/// `offset` (clamped to the text length), shifting every overlay at or
+/// past the anchor by the sentinel's 3 bytes. Shared by inline images
+/// (Phase 7) and note references (issue #80).
+fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) {
+    const SENTINEL: char = '\u{FFFC}';
+    let sentinel_len = SENTINEL.len_utf8() as u32;
+    let mut offset = (offset as usize).min(para.text.len());
+    while !para.text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    para.text.insert(offset, SENTINEL);
+    let off = offset as u32;
+    for s in &mut para.spans {
+        if s.start >= off {
+            s.start += sentinel_len;
+        }
+        if s.end >= off {
+            s.end += sentinel_len;
+        }
+    }
+    for io in &mut para.inline_objects {
+        if io.at >= off {
+            io.at += sentinel_len;
+        }
+    }
+    for h in &mut para.hyperlinks {
+        if h.start >= off {
+            h.start += sentinel_len;
+        }
+        if h.end >= off {
+            h.end += sentinel_len;
+        }
+    }
+    for r in &mut para.revisions {
+        if r.start >= off {
+            r.start += sentinel_len;
+        }
+        if r.end >= off {
+            r.end += sentinel_len;
+        }
+    }
+    for f in &mut para.fields {
+        if f.start >= off {
+            f.start += sentinel_len;
+        }
+        if f.end >= off {
+            f.end += sentinel_len;
+        }
+    }
+    para.inline_objects.push(InlineObject { at: off, kind });
+    para.inline_objects.sort_by_key(|i| i.at);
+    para.dirty = true;
+}
+
+/// Issue #80 — collect every note reference inside `block` (cells
+/// depth-first) in source order, stamped with the TOP-LEVEL block index
+/// `top` so numbering can resolve the owning section.
+fn walk_block_note_refs(block: &Block, top: u32, out: &mut Vec<NoteReference>) {
+    match block {
+        Block::Paragraph(p) => {
+            for obj in &p.inline_objects {
+                let (anchor, custom_mark) = match &obj.kind {
+                    InlineKind::FootnoteRef {
+                        id,
+                        custom_mark_follows,
+                    } => (
+                        NoteAnchor {
+                            kind: NoteKind::Footnote,
+                            id: *id,
+                        },
+                        *custom_mark_follows,
+                    ),
+                    InlineKind::EndnoteRef {
+                        id,
+                        custom_mark_follows,
+                    } => (
+                        NoteAnchor {
+                            kind: NoteKind::Endnote,
+                            id: *id,
+                        },
+                        *custom_mark_follows,
+                    ),
+                    InlineKind::Image { .. } | InlineKind::NoteSelfRef { .. } => continue,
+                };
+                out.push(NoteReference {
+                    top_block: top,
+                    anchor,
+                    custom_mark,
+                });
+            }
+        }
+        Block::Table(t) => {
+            for row in &t.rows {
+                for cell in &row.cells {
+                    for b in &cell.blocks {
+                        walk_block_note_refs(b, top, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn strip_section_markers(blocks: Vec<Block>) -> Vec<Block> {
     blocks
         .into_iter()
@@ -9883,7 +10587,11 @@ mod tests {
             headers: std::collections::HashMap::new(),
             footers: std::collections::HashMap::new(),
             media: std::collections::HashMap::new(),
-            footnotes: std::collections::HashMap::new(),
+            footnote_stories: std::collections::HashMap::new(),
+            endnote_stories: std::collections::HashMap::new(),
+            footnote_props: NoteProps::default(),
+            endnote_props: NoteProps::default(),
+            notes_dirty: NotesDirty::default(),
             comment_defs: std::collections::HashMap::new(),
             comment_ranges: Vec::new(),
             settings: DocumentSettings::default(),

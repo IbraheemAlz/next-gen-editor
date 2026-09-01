@@ -6177,6 +6177,8 @@ impl Engine {
                         header_offset: filler_geom.2,
                         footer_offset: filler_geom.3,
                         footnotes: Vec::new(),
+                        footnote_band_y: 0.0,
+                        footnote_band_continuation: false,
                         hf_role: layout::HeaderRole::Default,
                         page_number: incoming,
                     });
@@ -6491,6 +6493,8 @@ impl Engine {
                 header_offset: default_geom.header_offset,
                 footer_offset: default_geom.footer_offset,
                 footnotes: Vec::new(),
+                footnote_band_y: 0.0,
+                footnote_band_continuation: false,
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
             });
@@ -6530,6 +6534,8 @@ impl Engine {
             header_offset: 0.0,
             footer_offset: 0.0,
             footnotes: Vec::new(),
+            footnote_band_y: 0.0,
+            footnote_band_continuation: false,
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
         });
@@ -11637,6 +11643,7 @@ mod tests {
             synthetic,
             inline_image_rel_id: None,
             inline_footnote_marker: None,
+            inline_note_anchor: None,
             inline_object_height: 0.0,
         };
         let run = layout::VisualRun {
@@ -14633,6 +14640,8 @@ mod tests {
             header_offset: 36.0,
             footer_offset: 36.0,
             footnotes: Vec::new(),
+            footnote_band_y: 0.0,
+            footnote_band_continuation: false,
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
         }

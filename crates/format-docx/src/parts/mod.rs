@@ -6,6 +6,7 @@
 
 pub mod comments;
 pub mod document;
+pub mod endnotes;
 pub mod footer;
 pub mod footnotes;
 pub mod header;
