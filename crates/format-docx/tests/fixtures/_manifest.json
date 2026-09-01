@@ -1,5 +1,19 @@
 {
   "fixtures": {
+    "bom_utf8_passthrough.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 10,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "first",
+          "second"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 3
+      }
+    },
     "grab_bag_exotic.docx": {
       "generator": "handcrafted",
       "phase_introduced": 9,
@@ -182,6 +196,19 @@
         "paragraph_count": 1,
         "paragraph_texts": [
           "مقدمة"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "table_nested_200_deep.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 10,
+      "asserts": {
+        "paragraph_count": 1,
+        "paragraph_texts": [
+          "intro"
         ]
       },
       "roundtrip": {

@@ -80,6 +80,7 @@ fn run_default() -> Result<()> {
     println!("[roundtrip] step 3 OK — in-memory edit reflected");
 
     let edited_bytes = write_docx(&archive_a, &edited).context("write edited")?;
+    assert_document_xml_well_formed(&edited_bytes).context("edited .docx")?;
     println!(
         "[roundtrip] saved edited .docx: {} bytes",
         edited_bytes.len()
@@ -373,6 +374,7 @@ fn run_grab_bag_survival() -> Result<()> {
         );
     }
     let edited_bytes = write_docx(&archive_a, &edited).context("write edited exotic")?;
+    assert_document_xml_well_formed(&edited_bytes).context("edited exotic .docx")?;
 
     /* Siblings verbatim. */
     let archive_b = read_docx(&edited_bytes).context("re-read edited exotic")?;
@@ -593,8 +595,9 @@ fn validate_fixture(path: &Path, manifest: &ManifestFile) -> Result<()> {
         }
     }
 
-    /* 2. Re-emit and re-parse. */
+    /* 2. Re-emit, guard, re-parse. */
     let edited_bytes = write_docx(&archive_a, &archive_a.document).context("write_docx")?;
+    assert_document_xml_well_formed(&edited_bytes)?;
     let archive_b = read_docx(&edited_bytes).context("re-read")?;
 
     /* 3. Siblings byte-identical. */
@@ -965,6 +968,45 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 roundtrip: RoundtripBounds::default(),
             },
         },
+        /* Issue #110 — `word/document.xml` prefixed with a UTF-8 BOM, the
+        way docx4j and Apache POI write it (`toc.docx`, `55733.docx`, …).
+        quick-xml strips the BOM without counting it in
+        `buffer_position()`, which used to shift every passthrough capture
+        three bytes early and resave `</w<w:sectPr/>`. Drift bound 3: the
+        writer synthesizes its own declaration and never re-emits the BOM;
+        every paragraph must otherwise splice byte-exact. */
+        PrebuiltFixture {
+            name: "bom_utf8_passthrough.docx",
+            bytes: build_bom_utf8_passthrough_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 10,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec!["first".into(), "second".into()],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 3,
+                },
+            },
+        },
+        /* Issue #111 — 200 nested tables (Apache POI's `deep-table-cell.docx`
+        goes to 5000). The reader must open it on a bounded stack in well
+        under a second and the outer table rides the passthrough at drift 0
+        whatever depth the typed model stops at. */
+        PrebuiltFixture {
+            name: "table_nested_200_deep.docx",
+            bytes: build_table_nested_deep_docx(200),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 10,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["intro".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
     ]
 }
 
@@ -1136,12 +1178,18 @@ fn build_table_2x2_opaque_docx() -> Vec<u8> {
 /// becomes `<w:p>intro</w:p>` + inner_tbl_xml + `<w:sectPr/>`. Drift
 /// bound = 0 — every fixture rides the passthrough.
 fn build_table_fixture(body_intro_text: &str, inner_tbl_xml: &str) -> Vec<u8> {
-    use std::io::Write;
-    use zip::write::{SimpleFileOptions, ZipWriter};
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">{body_intro_text}</w:t></w:r></w:p>{inner_tbl_xml}<w:sectPr/></w:body></w:document>"#,
     );
+    package_document_xml(&document_xml)
+}
+
+/// Wrap one complete `word/document.xml` part (declaration included) in
+/// the minimal OPC skeleton the Phase 5+ handcrafted fixtures share.
+fn package_document_xml(document_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -1165,7 +1213,7 @@ fn build_table_fixture(body_intro_text: &str, inner_tbl_xml: &str) -> Vec<u8> {
             ("[Content_Types].xml", content_types),
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
-            ("word/document.xml", document_xml.as_str()),
+            ("word/document.xml", document_xml),
         ] {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
@@ -1200,7 +1248,49 @@ fn build_table_in_rtl_doc_docx() -> Vec<u8> {
     build_table_fixture("مقدمة", tbl)
 }
 
+/// Issue #110 — the part starts with U+FEFF (the UTF-8 BOM, bytes
+/// `EF BB BF`) exactly like docx4j / Apache POI emit it. Two adjacent
+/// paragraphs + a trailing body `<w:sectPr/>` cover both splice
+/// adjacencies the corruption showed up in.
+fn build_bom_utf8_passthrough_docx() -> Vec<u8> {
+    let document_xml = concat!(
+        "\u{FEFF}",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        "\n",
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        r#"<w:body><w:p><w:r><w:t xml:space="preserve">first</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">second</w:t></w:r></w:p>"#,
+        r#"<w:sectPr/></w:body></w:document>"#,
+    );
+    package_document_xml(document_xml)
+}
+
+/// Issue #111 — `depth` tables nested one inside the other (one row, one
+/// cell, one paragraph, one nested table per level).
+fn build_table_nested_deep_docx(depth: usize) -> Vec<u8> {
+    let mut tbl = String::new();
+    for level in 0..depth {
+        tbl.push_str(r#"<w:tbl><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc>"#);
+        tbl.push_str(&format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">level {level}</w:t></w:r></w:p>"#
+        ));
+    }
+    for _ in 0..depth {
+        tbl.push_str("</w:tc></w:tr></w:tbl>");
+    }
+    build_table_fixture("intro", &tbl)
+}
+
 /* ============================================================= helpers ==== */
+
+/// Issue #110 — every `write_docx` in this harness is followed by a strict
+/// re-parse of the saved `word/document.xml`. A misaligned passthrough
+/// splice (`</w<w:sectPr/>`) is unparseable XML; it must fail here, loudly,
+/// before any byte-drift arithmetic gets a chance to call it "3 bytes".
+fn assert_document_xml_well_formed(docx: &[u8]) -> Result<()> {
+    format_docx::check_document_xml_well_formed(docx)
+        .context("saved word/document.xml is not well-formed XML (issue #110 guard)")
+}
 
 fn extract_doc_xml(bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;

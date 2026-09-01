@@ -72,6 +72,25 @@ pub fn slice_fragment(xml: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
     (start < end && end <= xml.len()).then(|| xml[start..end].to_vec())
 }
 
+/// [`slice_fragment`] for a passthrough capture of the element `qname`
+/// (`b"w:p"`, `b"w:tbl"`): additionally requires the slice to start with
+/// that element's start tag and end on a `>`. A capture that fails the
+/// shape check returns `None`, so the writer regenerates the block from
+/// the typed model instead of splicing a misaligned byte range into the
+/// saved part — the failure mode of issue #110 (a reader offset that was
+/// three bytes off spliced `</w<w:sectPr/>` into `document.xml`). The
+/// zero-drift roundtrip fixtures turn that fallback into a visible
+/// failure; it must never be a silent one in production.
+pub fn slice_element(xml: &[u8], start: usize, end: usize, qname: &[u8]) -> Option<Vec<u8>> {
+    let slice = xml.get(start..end)?;
+    let body = slice.strip_prefix(b"<")?.strip_prefix(qname)?;
+    let opens_element = matches!(
+        body.first(),
+        Some(b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')
+    );
+    (opens_element && slice.ends_with(b">")).then(|| slice.to_vec())
+}
+
 /// Consume the subtree of the just-read start tag `e` (through its
 /// matching end tag) and return the whole element's raw bytes. `start` is
 /// the offset of `e`'s `<` in `xml`. The reader is left positioned after
@@ -239,6 +258,46 @@ mod tests {
         let mut slot = None;
         stash(&mut slot, b"<foo:bar/>".to_vec(), &s);
         assert!(slot.is_none());
+    }
+
+    /// Issue #110 — a passthrough capture must be exactly the named
+    /// element; a misaligned range (the BOM-shifted `dy><w:p>…</w`) or a
+    /// different element (`<w:pPr>` for `w:p`) is refused.
+    #[test]
+    fn slice_element_accepts_only_the_named_element() {
+        let xml = br#"<w:body><w:p w:a="1"><w:pPr/></w:p><w:p/><w:tbl>
+</w:tbl></w:body>"#;
+        let p_start = "<w:body>".len();
+        let p_end = p_start + "<w:p w:a=\"1\"><w:pPr/></w:p>".len();
+        assert_eq!(&xml[p_start..p_end], b"<w:p w:a=\"1\"><w:pPr/></w:p>");
+        assert_eq!(
+            slice_element(xml, p_start, p_end, b"w:p").as_deref(),
+            Some(b"<w:p w:a=\"1\"><w:pPr/></w:p>".as_slice())
+        );
+        /* Self-closing `<w:p/>`. */
+        assert_eq!(
+            slice_element(xml, p_end, p_end + 6, b"w:p").as_deref(),
+            Some(b"<w:p/>".as_slice())
+        );
+        /* Start tag broken across a newline. */
+        let t_start = p_end + 6;
+        let t_end = xml.len() - "</w:body>".len();
+        assert_eq!(
+            slice_element(xml, t_start, t_end, b"w:tbl").as_deref(),
+            Some(b"<w:tbl>\n</w:tbl>".as_slice())
+        );
+        /* Three bytes early / late — the issue #110 shape. */
+        assert_eq!(slice_element(xml, p_start - 3, p_end - 3, b"w:p"), None);
+        assert_eq!(slice_element(xml, p_start + 3, p_end + 3, b"w:p"), None);
+        /* A different element whose name merely starts the same way. */
+        assert_eq!(slice_element(xml, p_start + 13, p_start + 21, b"w:p"), None);
+        assert_eq!(
+            slice_element(xml, p_start + 13, p_start + 21, b"w:pPr").as_deref(),
+            Some(b"<w:pPr/>".as_slice())
+        );
+        /* Out-of-range / inverted ranges. */
+        assert_eq!(slice_element(xml, 0, xml.len() + 1, b"w:body"), None);
+        assert_eq!(slice_element(xml, 10, 8, b"w:p"), None);
     }
 
     #[test]
