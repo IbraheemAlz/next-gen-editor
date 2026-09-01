@@ -331,6 +331,18 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 - Long-running processes (vite dev, wasm-pack build) run in `run_in_background: true`.
 - Don't `git add .` blindly. Stage by explicit path.
 - Commit messages: heredoc + `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
+- **Parallel agents in git worktrees.** A shared `CARGO_TARGET_DIR` across
+  worktrees is *unsound*: cargo fingerprints workspace-relative paths, so a
+  sibling worktree's stale rlib (built from different sources) satisfies your
+  fingerprint and you link against their version — phantom "missing field"
+  errors and false-green gates. Rules: agents `touch` every `.rs` and rebuild
+  immediately before their gates (or use a private target dir when disk
+  allows); merge gates on `main` run only in the private `target-main/`
+  cache (gitignored) that nothing else writes to; judge every gate by exit
+  code. Large merge-conflict hunks are rebuilt by construction, never
+  keep-both — the shared closing brace may belong to different modules.
+  Disk is the binding constraint on this 8-core / 15 GB box: the shared
+  `target/` alone is ~20 GB.
 
 ## Things to never do
 
