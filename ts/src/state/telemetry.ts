@@ -27,7 +27,9 @@ type TelemetryKind =
           last_command_ms: number;
       }
     | { type: 'ERROR'; code: ErrorCode; recoverable: boolean }
-    | { type: 'FONT_FALLBACK'; script: string; requested: string; fallback: string };
+    | { type: 'FONT_FALLBACK'; script: string; requested: string; fallback: string }
+    /* Issue #87 — one sample per `Painted.layout_degraded` note. */
+    | { type: 'LAYOUT_DEGRADED'; reason: string; page: number | undefined };
 
 interface TelemetryEvent {
     doc_id: string;
@@ -54,6 +56,9 @@ export function startTelemetry(client: EngineClient): () => void {
     const docId = `anon-${Math.random().toString(36).slice(2, 10)}`;
     const paintSamples: number[] = [];
     const pending: TelemetryEvent[] = [];
+    /* Issue #87 — the synthetic paint side-channel replays the last real
+       paint's degradation notes verbatim; sample a note set once. */
+    let lastDegradedKey = '[]';
 
     const sample = (kind: TelemetryKind): TelemetryEvent => ({
         doc_id: docId,
@@ -64,6 +69,18 @@ export function startTelemetry(client: EngineClient): () => void {
     const unsubscribe = client.subscribe((e: Event) => {
         if (e.type === 'PAINTED') {
             paintSamples.push(e.paint_ms);
+            /* Issue #87 — a degraded paint is a telemetry event in its
+               own right: it says the layout watchdog fired in the field. */
+            const notes = e.layout_degraded ?? [];
+            const key = JSON.stringify(notes);
+            if (key !== lastDegradedKey) {
+                lastDegradedKey = key;
+                for (const note of notes) {
+                    pending.push(
+                        sample({ type: 'LAYOUT_DEGRADED', reason: note.reason, page: note.page }),
+                    );
+                }
+            }
         } else if (e.type === 'FONT_MISSING') {
             pending.push(
                 sample({

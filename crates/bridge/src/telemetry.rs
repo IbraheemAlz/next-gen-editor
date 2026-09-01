@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::Script;
-use crate::event::EngineStats;
+use crate::event::{EngineStats, LayoutDegradeReason};
 
 /// One telemetry sample. `doc_id` is anonymized — never a document title or
 /// path, only an opaque per-session identifier.
@@ -38,6 +38,13 @@ pub enum TelemetryKind {
         script: Script,
         requested: String,
         fallback: String,
+    },
+    /// Issue #87 — a paint was laid out degraded (one sample per note on
+    /// `Event::Painted::layout_degraded`). Counts how often the layout
+    /// self-defense fires in the field; carries no document content.
+    LayoutDegraded {
+        reason: LayoutDegradeReason,
+        page: Option<u32>,
     },
 }
 
