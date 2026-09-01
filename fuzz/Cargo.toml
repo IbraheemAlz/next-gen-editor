@@ -1,11 +1,28 @@
-# Fuzz harness — Phase 5 D5.5.
+# Fuzz harness — Phase 5 D5.5, scaled up by issue #90.
 #
 # Its own workspace (`[workspace]` below) so the pinned-toolchain
 # `cargo check --workspace` / `cargo test --workspace` at the repo root never
 # pull it in — running the targets needs the nightly `cargo fuzz` flow.
 #
 # Build check (stable, no sanitizers): cargo check --manifest-path fuzz/Cargo.toml
-# Run (nightly, see PHASE_5 §8):        cargo +nightly fuzz run docx_reader
+# Run (nightly, see .github/workflows/fuzz-nightly.yml):
+#   cargo +nightly fuzz run <target> -- -max_total_time=1800
+#
+# Four structure-aware targets (`src/lib.rs` holds the generators + the
+# `run_*` bodies each `fuzz_targets/*.rs` wraps in a `fuzz_target!`):
+#   - docx_reader:      schema-shaped WML in a minimal OPC package -> read_docx
+#   - docx_roundtrip:   read -> write -> read must be stable, never panic
+#   - rpc_command:      structure-aware Command sequences driven end to end
+#                       through the real Engine::apply dispatcher incl. layout
+#   - layout_paginate:  random paragraph/table/section trees straight into
+#                       the paginator, with a page-count bound as the
+#                       termination watchdog
+#
+# `examples/smoke.rs` is a stable-only driver (no libFuzzer/nightly needed)
+# that feeds deterministic pseudo-random inputs + the committed `corpus/`
+# seeds through each `run_*` function and asserts no panic — see issue #90
+# binding rule 6. Run it with:
+#   cargo run --manifest-path fuzz/Cargo.toml --example smoke
 [package]
 name = "engine-fuzz"
 version = "0.0.0"
@@ -17,15 +34,31 @@ cargo-fuzz = true
 
 [workspace]
 
+[lib]
+name = "engine_fuzz"
+path = "src/lib.rs"
+
 [dependencies]
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
 format-docx = { path = "../crates/format-docx" }
-bridge = { path = "../crates/bridge" }
-serde_json = "1"
+bridge = { path = "../crates/bridge", features = ["arbitrary"] }
+engine = { path = "../crates/engine" }
+engine-wasm = { path = "../crates/engine-wasm", features = ["fuzz-native"] }
+layout = { path = "../crates/layout" }
+render = { path = "../crates/render" }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "docx_reader"
 path = "fuzz_targets/docx_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docx_roundtrip"
+path = "fuzz_targets/docx_roundtrip.rs"
 test = false
 doc = false
 bench = false
@@ -36,6 +69,17 @@ path = "fuzz_targets/rpc_command.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "layout_paginate"
+path = "fuzz_targets/layout_paginate.rs"
+test = false
+doc = false
+bench = false
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
 
 [profile.release]
 # Keep symbols so libFuzzer can symbolize crashes.

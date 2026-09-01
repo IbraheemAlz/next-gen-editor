@@ -75,6 +75,13 @@ thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
 
+# Fuzzing (D5.5, issue #90) — `arbitrary` is an OPTIONAL, feature-gated dep
+# of `bridge` (see crates/bridge/Cargo.toml's `arbitrary` feature). Off by
+# default: never activated by the wasm build, zero cost to the production
+# artifact. `fuzz/` (its own cargo workspace) turns the feature on to derive
+# `Arbitrary` for `Command` and drive structure-aware command sequences.
+arbitrary = "1"
+
 [profile.release]
 opt-level = "z"
 lto = "thin"
