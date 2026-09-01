@@ -15,6 +15,7 @@ use bridge::{
     PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
     SectionBreakKind, SelectionKind, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
+use engine::snapshot::SnapshotError;
 use engine::{
     Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
     FontFamily as EngineFontFamily, LogicalPos as EnginePos, PathStep as EnginePathStep, SpanStyle,
@@ -67,6 +68,154 @@ struct RenderConfig {
     zoom: f32,
 }
 
+/// Bound on the undo stack (`UndoStack::new(_, UNDO_CAP)`).
+const UNDO_CAP: usize = 100;
+
+/// Issue #85 — most undo-stack entries a crash-recovery snapshot carries
+/// (the current document + up to eight undo steps).
+const SNAPSHOT_UNDO_MAX_ENTRIES: usize = 9;
+
+/// Issue #85 — block-serialization budget for the undo window: the number
+/// of history entries × the document's block count stays under this, so
+/// a one-page document persists the full window while a 50-page document
+/// (≈ 1000 blocks) persists the current tree plus one undo step. Keeps a
+/// snapshot's cost proportional to ONE document serialization for large
+/// files (the 50-page fixture encodes in ≈ 2.3 ms native / one order of
+/// magnitude under the insert-latency budget after the wasm penalty).
+const SNAPSHOT_UNDO_BLOCK_BUDGET: usize = 2_500;
+
+/// Issue #85 — the serializable shape of [`RenderConfig`]. Kept apart from
+/// `RenderConfig` (whose `ShapingDirection` / `Alignment` come from the
+/// text pipeline, which the snapshot format must not depend on) and
+/// spelled with the same strings the `RenderPage` command uses.
+#[derive(Clone, Debug, Default, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+struct LayoutCfgSnapshot {
+    font_id: String,
+    rtl: bool,
+    px_size: f32,
+    line_height: f32,
+    align: String,
+    base_scale: f32,
+    zoom: f32,
+}
+
+impl LayoutCfgSnapshot {
+    fn capture(cfg: &RenderConfig) -> Self {
+        Self {
+            font_id: cfg.font_id.clone(),
+            rtl: matches!(cfg.base_direction, ShapingDirection::Rtl),
+            px_size: cfg.px_size,
+            line_height: cfg.line_height,
+            align: match cfg.alignment {
+                Alignment::Start => "START",
+                Alignment::End => "END",
+                Alignment::Center => "CENTER",
+                Alignment::Justify => "JUSTIFY",
+            }
+            .to_string(),
+            base_scale: cfg.base_scale,
+            zoom: cfg.zoom,
+        }
+    }
+
+    /// `None` when the persisted config cannot describe a layout (no font,
+    /// non-positive sizes) — the engine then stays in the pre-`RenderPage`
+    /// cold state and the shell re-seeds it.
+    fn restore(self) -> Option<RenderConfig> {
+        let positive = |v: f32| v.is_finite() && v > 0.0;
+        if self.font_id.is_empty() || !positive(self.px_size) || !positive(self.line_height) {
+            return None;
+        }
+        let sane = |v: f32, lo: f32, hi: f32| {
+            if positive(v) { v.clamp(lo, hi) } else { 1.0 }
+        };
+        let base_scale = sane(self.base_scale, 0.5, 8.0);
+        let zoom = sane(self.zoom, 0.25, 4.0);
+        Some(RenderConfig {
+            font_id: self.font_id,
+            base_direction: if self.rtl {
+                ShapingDirection::Rtl
+            } else {
+                ShapingDirection::Ltr
+            },
+            px_size: self.px_size,
+            line_height: self.line_height,
+            alignment: match self.align.as_str() {
+                "JUSTIFY" => Alignment::Justify,
+                "END" => Alignment::End,
+                "CENTER" => Alignment::Center,
+                _ => Alignment::Start,
+            },
+            scale: base_scale * zoom,
+            base_scale,
+            zoom,
+        })
+    }
+}
+
+/// Issue #85 — everything a recovered engine needs besides its rendering
+/// surface: the document (with styles, numbering, header/footer stories,
+/// media and comments — all inside `DocumentTree`), a bounded window of
+/// the undo stack, the selection, the active story, sticky formatting and
+/// the review/track-changes session flags, plus the layout config so the
+/// shell does not have to re-seed the document to repaint it.
+///
+/// Persisted through `engine::snapshot::encode` (versioned envelope,
+/// named fields). Every field is `#[serde(default)]`-tolerant, so a
+/// snapshot written before a field existed still reads; per-version
+/// semantic defaults live in [`Self::apply_version_defaults`].
+#[derive(Default, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+struct EngineSnapshotV1 {
+    /// Undo-stack window, oldest first; `doc_history[undo_cursor]` is the
+    /// current document. Entries past the cursor are the redo branch.
+    doc_history: Vec<DocumentTree>,
+    undo_cursor: u32,
+    selection: Option<SelectionState>,
+    stashed_body_selection: Option<SelectionState>,
+    active_story: StoryTarget,
+    pending_format: Option<SpanStyle>,
+    caret_affinity: CaretAffinity,
+    tracking_changes: bool,
+    review_author: String,
+    review_date: String,
+    layout_cfg: Option<LayoutCfgSnapshot>,
+}
+
+impl EngineSnapshotV1 {
+    /// Per-version defaults (see the `engine::snapshot` module docs). The
+    /// decoder already filled absent fields with their `Default`; this
+    /// hook is where a field whose *implicit* historical value differs
+    /// from `Default` gets that value back, keyed on the version the
+    /// snapshot was written with. When `FORMAT_VERSION` becomes 2, the
+    /// rules that only apply to v1 payloads go under `if version < 2`.
+    fn apply_version_defaults(&mut self, version: u8) {
+        debug_assert!(
+            (engine::snapshot::MIN_SUPPORTED_VERSION..=engine::snapshot::FORMAT_VERSION)
+                .contains(&version)
+        );
+        /* Every version so far: an absent (empty) review author means the
+        engine's boot identity, never an anonymous author. */
+        if self.review_author.is_empty() {
+            self.review_author = "You".to_string();
+        }
+        /* Every version so far: an absent history is a fresh document. */
+        if self.doc_history.is_empty() {
+            self.doc_history = vec![DocumentTree::new()];
+            self.undo_cursor = 0;
+        }
+    }
+}
+
+/// Worker-console warning that stays linkable in native unit tests.
+fn warn_console(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::warn_1(&JsValue::from_str(msg));
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{msg}");
+}
+
 /// Width of the rendered caret, in canvas device pixels.
 const CARET_WIDTH: f32 = 2.0;
 
@@ -77,7 +226,7 @@ const CARET_WIDTH: f32 = 2.0;
 /// `MoveCaret` motion (Backlog #14). `Some` only while a Up/Down walk is in
 /// progress — every horizontal move, click, selection-set, or edit drops it
 /// by constructing a new `SelectionState` with `ideal_x: None`.
-#[derive(Clone)]
+#[derive(Clone, ::serde::Serialize, ::serde::Deserialize)]
 struct SelectionState {
     anchor: BridgeLogicalPos,
     caret: BridgeLogicalPos,
@@ -323,7 +472,7 @@ struct CaretSlot {
 /// default is `LeadingX` so a fresh selection / pointer-set caret
 /// renders at the smaller-x slot (consistent with the existing
 /// `slot_x_for_byte` choice).
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 enum CaretAffinity {
     #[default]
     LeadingX,
@@ -336,7 +485,7 @@ enum CaretAffinity {
 /// geometry pipeline projects onto the anchor page's band, and every
 /// document mutation routes through the story adapter
 /// (`commit_story_edit`) instead of the body tree.
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 enum StoryTarget {
     #[default]
     Body,
@@ -617,6 +766,37 @@ impl Engine {
             .collect();
         serde_wasm_bindgen::to_value(&entries)
             .map_err(|e| JsValue::from_str(&format!("encode media entries: {e}")))
+    }
+
+    /// Issue #85 — `Engine::snapshot()`: serialize the session (document
+    /// + styles + stories + undo window + selection + layout config) into
+    /// the versioned `engine::snapshot` envelope. Same bytes as
+    /// `Command::Snapshot`, without the event round-trip — for callers
+    /// that already hold the engine synchronously.
+    pub fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
+        self.snapshot_bytes()
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Issue #85 — `Engine::restore()`: install a snapshot produced by
+    /// [`Engine::snapshot`]; returns the format version it was written
+    /// with. Fonts and the rendering surface are untouched — the caller
+    /// re-loads fonts and repaints. `Command::Recover` is the same thing
+    /// plus the replay tail.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<u8, JsValue> {
+        self.restore_from_bytes(bytes)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Issue #85 fault injection — trap the wasm instance on purpose so
+    /// the crash-recovery path (`RuntimeError` → worker close → respawn →
+    /// `Recover`) can be exercised end-to-end. Only the worker's
+    /// `ARM_TRAP` test hook calls this. Never returns.
+    pub fn debug_force_trap(&self) {
+        #[cfg(target_arch = "wasm32")]
+        core::arch::wasm32::unreachable();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::process::abort();
     }
 
     /// Phase 7 — install a decoded inline-image bitmap. Idempotent; later
@@ -4637,7 +4817,11 @@ impl Engine {
             /* Issue #72 — rich copy. `do_get_selection_as_clipboard` now
             reads `self.selection_doc()` so a copy from inside a story
             serializes the story's paragraphs, not the body's. */
-            | Command::GetSelectionAsClipboard => None,
+            | Command::GetSelectionAsClipboard
+            /* Issue #85 — a snapshot is a read of the whole session (the
+            active story included) and recovery rebuilds it wholesale. */
+            | Command::Snapshot { .. }
+            | Command::Recover { .. } => None,
             /* Loading a document tears the story's ground away —
             exit first, then handle normally. */
             Command::LoadDocx { .. } | Command::OpenDocument { .. } => {
@@ -4754,7 +4938,8 @@ impl Engine {
             // behavior lands in Phase 3 behind the RequestPaint pipeline.
             // ===============================================================
             Command::Init { .. } => phase3_stub("Init"),
-            Command::Recover { .. } => self.do_recover(),
+            Command::Recover { snapshot, log_tail } => self.do_recover(snapshot, log_tail).await,
+            Command::Snapshot { seq } => self.do_snapshot(seq),
             Command::Dispose => phase3_stub("Dispose"),
             Command::Tick { .. } => phase3_stub("Tick"),
             // Sprint 3 (UI Edition) — Document I/O. OpenDocument /
@@ -5333,19 +5518,15 @@ impl Engine {
     /// reported HarfBuzz / Arabic-shaping degradation post-recovery
     /// was a stale-cache symptom).
     ///
-    /// `setupEngine` on the TS side re-issues `loadFont` + the boot
-    /// `RenderPage` after this returns, so wiping the engine to a
-    /// near-cold state is safe and idempotent. Rendering surfaces
-    /// (`page_ctxs`, `ctx`, `vello`, `atlas`) are preserved — those
-    /// own the live `OffscreenCanvas` context, which cannot be
-    /// re-transferred.
-    fn do_recover(&mut self) -> Event {
-        /* Full-stack rehydration: clear every cache + transient state
-        and reset the document to a fresh `DocumentTree`. The TS
-        shell's `setupEngine` immediately repopulates fonts + seed
-        text via the established cold-boot path. */
+    /// `setupEngine` on the TS side re-issues `loadFont` (and, when no
+    /// snapshot was restored, the boot `RenderPage`) after recovery
+    /// returns, so wiping the engine to a near-cold state is safe and
+    /// idempotent. Rendering surfaces (`page_ctxs`, `ctx`, `vello`,
+    /// `atlas`) are preserved — those own the live `OffscreenCanvas`
+    /// context, which cannot be re-transferred.
+    fn reset_session_state(&mut self) {
         self.fonts.clear();
-        self.undo = UndoStack::new(DocumentTree::new(), 100);
+        self.undo = UndoStack::new(DocumentTree::new(), UNDO_CAP);
         self.layout_cfg = None;
         self.selection = None;
         self.composition = None;
@@ -5365,8 +5546,195 @@ impl Engine {
         /* Phase 3 (#39) — recovery lands in body mode. */
         self.active_story = StoryTarget::Body;
         self.stashed_body_selection = None;
+    }
+
+    /// Issue #85 — real crash recovery: base snapshot + replayed tail.
+    ///
+    /// 1. Reset to the cold state ([`Self::reset_session_state`]).
+    /// 2. Restore the base snapshot when one was supplied. An unreadable
+    ///    snapshot (foreign bytes, unsupported version, corrupt payload)
+    ///    is logged and recovery continues onto a fresh document — a
+    ///    recovered-but-empty session beats a dead one, and the reply's
+    ///    `snapshot_restored: false` tells the shell what happened.
+    /// 3. Replay `log_tail` through the ordinary `apply` path with the
+    ///    layout config stashed: the fresh worker has loaded no fonts yet,
+    ///    so nothing may lay out or paint mid-replay, and one paint per
+    ///    replayed keystroke would make recovery O(tail × page). Zoom /
+    ///    device-scale changes in the tail are folded into the restored
+    ///    config afterwards; a replayed `RenderPage` re-seeds it.
+    ///
+    /// The shell repaints once fonts are back (`SetDeviceScale` +
+    /// `RequestPaint`), and reads the actual renderer off the reply so
+    /// `__renderer` cannot lie after a respawn (issue #66).
+    async fn do_recover(&mut self, snapshot: Vec<u8>, log_tail: Vec<Command>) -> Event {
+        self.reset_session_state();
+        let snapshot_restored = if snapshot.is_empty() {
+            false
+        } else {
+            match self.restore_from_bytes(&snapshot) {
+                Ok(_) => true,
+                Err(e) => {
+                    warn_console(&format!(
+                        "[engine] recovery: base snapshot unreadable ({e}); replaying the \
+                         tail onto a fresh document"
+                    ));
+                    self.reset_session_state();
+                    false
+                }
+            }
+        };
+
+        let mut stashed_cfg = self.layout_cfg.take();
+        let mut pending_base_scale: Option<f32> = None;
+        let mut pending_zoom: Option<f32> = None;
+        let mut applied_commands: u32 = 0;
+        for cmd in log_tail {
+            match &cmd {
+                Command::SetDeviceScale { scale } => pending_base_scale = Some(*scale),
+                Command::SetZoom { scale } => pending_zoom = Some(*scale),
+                _ => {}
+            }
+            /* Replayed events are not observable: the shell rebuilds its
+            mirrors (selection, a11y tree, paint dims) after recovery. */
+            let _ = Box::pin(self.apply(cmd)).await;
+            applied_commands += 1;
+            /* A replayed `RenderPage` re-seeds the config; keep it stashed
+            so the next replayed edit does not paint without fonts. */
+            if let Some(cfg) = self.layout_cfg.take() {
+                stashed_cfg = Some(cfg);
+            }
+        }
+        if let Some(cfg) = stashed_cfg.as_mut() {
+            if let Some(base) = pending_base_scale {
+                cfg.base_scale = base.clamp(0.5, 8.0);
+            }
+            if let Some(zoom) = pending_zoom {
+                cfg.zoom = zoom.clamp(0.25, 4.0);
+            }
+            cfg.scale = cfg.base_scale * cfg.zoom;
+        }
+        self.layout_cfg = stashed_cfg;
+        /* Replay side effects the user must not see twice: an IME preview
+        cannot survive a worker, and 200 replayed edits must not narrate. */
+        self.composition = None;
+        self.pending_announcements.clear();
+        self.a11y_cache = None;
+        self.layout_cache.get_mut().clear();
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
         Event::Recovered {
-            applied_commands: 0,
+            applied_commands,
+            snapshot_restored,
+            renderer: self.renderer_name().to_string(),
+        }
+    }
+
+    /// Issue #85 — `Command::Snapshot` handler.
+    fn do_snapshot(&self, seq: Option<u64>) -> Event {
+        match self.snapshot_bytes() {
+            Ok(bytes) => Event::Snapshot {
+                bytes,
+                seq: seq.unwrap_or(0),
+                format_version: engine::snapshot::FORMAT_VERSION,
+            },
+            Err(e) => Event::Error {
+                message: format!("Snapshot: {e}"),
+            },
+        }
+    }
+
+    /// Issue #66 — the backend this instance actually paints with.
+    fn renderer_name(&self) -> &'static str {
+        if self.vello.is_some() {
+            "vello"
+        } else {
+            "canvas2d"
+        }
+    }
+
+    /// Issue #85 — undo entries (current document included) the snapshot
+    /// carries for the current document size; see
+    /// [`SNAPSHOT_UNDO_BLOCK_BUDGET`].
+    fn snapshot_undo_entries(&self) -> usize {
+        let blocks = self.undo.current().block_count().max(1) as usize;
+        (SNAPSHOT_UNDO_BLOCK_BUDGET / blocks).clamp(1, SNAPSHOT_UNDO_MAX_ENTRIES)
+    }
+
+    /// Issue #85 — assemble the session state the snapshot persists.
+    fn capture_snapshot(&self) -> EngineSnapshotV1 {
+        let (doc_history, undo_cursor) = self.undo.history_window(self.snapshot_undo_entries());
+        EngineSnapshotV1 {
+            doc_history,
+            undo_cursor: undo_cursor as u32,
+            selection: self.selection.clone(),
+            stashed_body_selection: self.stashed_body_selection.clone(),
+            active_story: self.active_story.clone(),
+            pending_format: self.pending_format.clone(),
+            caret_affinity: self.caret_affinity,
+            tracking_changes: self.tracking_changes,
+            review_author: self.review_author.clone(),
+            review_date: self.review_date.clone(),
+            layout_cfg: self.layout_cfg.as_ref().map(LayoutCfgSnapshot::capture),
+        }
+    }
+
+    /// Issue #85 — `Engine::snapshot()`: the versioned envelope
+    /// (`engine::snapshot`) of [`Self::capture_snapshot`].
+    fn snapshot_bytes(&self) -> Result<Vec<u8>, SnapshotError> {
+        engine::snapshot::encode(&self.capture_snapshot())
+    }
+
+    /// Issue #85 — `Engine::restore()`: decode `bytes`, apply that
+    /// version's defaults, install the state. Returns the format version
+    /// the snapshot was written with. Does not touch fonts or the
+    /// rendering surface.
+    fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<u8, SnapshotError> {
+        let decoded = engine::snapshot::decode::<EngineSnapshotV1>(bytes)?;
+        let mut state = decoded.payload;
+        state.apply_version_defaults(decoded.version);
+        self.restore_snapshot(state);
+        Ok(decoded.version)
+    }
+
+    fn restore_snapshot(&mut self, s: EngineSnapshotV1) {
+        self.undo = UndoStack::from_history(s.doc_history, s.undo_cursor as usize, UNDO_CAP);
+        self.layout_cfg = s.layout_cfg.and_then(LayoutCfgSnapshot::restore);
+        self.active_story = s.active_story;
+        self.selection = s.selection;
+        self.stashed_body_selection = s.stashed_body_selection;
+        self.pending_format = s.pending_format;
+        self.caret_affinity = s.caret_affinity;
+        self.tracking_changes = s.tracking_changes;
+        self.review_author = s.review_author;
+        self.review_date = s.review_date;
+        self.composition = None;
+        /* The fresh stack restarts its revision counter at 0 — every
+        revision-keyed memo must go. */
+        self.layout_cache.get_mut().clear();
+        self.invalidate_layout_snapshot();
+        self.a11y_cache = None;
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        /* Positions are untrusted input once they have been through
+        IndexedDB: re-resolve the story (exits to the body when its part
+        no longer exists) and clamp every caret into its document. */
+        self.story_validity_guard();
+        if let Some(sel) = self.selection.clone() {
+            let clamped = self.with_selection_doc(|d| SelectionState {
+                anchor: clamp_pos(d, sel.anchor),
+                caret: clamp_pos(d, sel.caret),
+                ideal_x: sel.ideal_x,
+                kind: sel.kind,
+            });
+            self.selection = Some(clamped);
+        }
+        if let Some(sel) = self.stashed_body_selection.clone() {
+            let body = self.undo.current();
+            self.stashed_body_selection = Some(SelectionState {
+                anchor: clamp_pos(body, sel.anchor),
+                caret: clamp_pos(body, sel.caret),
+                ideal_x: sel.ideal_x,
+                kind: sel.kind,
+            });
         }
     }
 
@@ -14210,5 +14578,346 @@ mod tests {
             panic!("expected Painted");
         };
         assert_eq!(replayed, layout_degraded);
+    }
+}
+
+/// Issue #85 — crash-recovery snapshot + replay, exercised natively on a
+/// surface-less engine (no canvas, no fonts, no layout config — exactly
+/// the state a freshly respawned worker is in when `Recover` arrives).
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    /// The Canvas2D `apply` path never parks (no GPU await), so polling
+    /// with a no-op waker drives any command future to completion.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        let mut fut = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn engine() -> Engine {
+        assemble_engine(None, None)
+    }
+
+    fn apply(e: &mut Engine, cmd: Command) -> Event {
+        block_on(e.apply(cmd))
+    }
+
+    fn text(e: &Engine) -> String {
+        e.undo.current().to_plain_text()
+    }
+
+    fn insert(text: &str) -> Command {
+        Command::InsertText {
+            at: None,
+            text: text.into(),
+        }
+    }
+
+    /// Three edits (undo depth 4), a collapsed caret after "alpha", sticky
+    /// bold, track changes on, a review identity, BiDi affinity and a
+    /// zoomed RTL layout config.
+    fn seeded_engine() -> Engine {
+        let mut e = engine();
+        for word in ["alpha", " beta", " gamma"] {
+            let evt = apply(&mut e, insert(word));
+            assert!(matches!(evt, Event::TextInserted { .. }), "{evt:?}");
+        }
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(0, 5),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        e.pending_format = Some(SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        });
+        e.tracking_changes = true;
+        e.review_author = "Reviewer".into();
+        e.review_date = "2026-09-01T12:00:00Z".into();
+        e.caret_affinity = CaretAffinity::TrailingX;
+        e.layout_cfg = Some(RenderConfig {
+            font_id: "amiri".into(),
+            base_direction: ShapingDirection::Rtl,
+            px_size: 24.0,
+            line_height: 36.0,
+            alignment: Alignment::Justify,
+            scale: 1.5 * 1.25,
+            base_scale: 1.5,
+            zoom: 1.25,
+        });
+        e
+    }
+
+    #[test]
+    fn snapshot_round_trips_the_session_into_a_fresh_engine_byte_for_byte() {
+        let a = seeded_engine();
+        let bytes = a.snapshot_bytes().unwrap();
+        assert_eq!(&bytes[..4], b"NGES");
+
+        let mut b = engine();
+        let version = b.restore_from_bytes(&bytes).unwrap();
+        assert_eq!(version, engine::snapshot::FORMAT_VERSION);
+        assert_eq!(text(&b), "alpha beta gamma");
+        assert_eq!(b.undo.depth(), 4, "undo window restored");
+        assert!(b.undo.can_undo());
+        let sel = b.selection.as_ref().expect("selection restored");
+        assert_eq!(sel.anchor.offset, 5);
+        assert_eq!(sel.caret.offset, 5);
+        assert_eq!(b.pending_format.as_ref().unwrap().bold, Some(true));
+        assert!(b.tracking_changes);
+        assert_eq!(b.review_author, "Reviewer");
+        assert_eq!(b.review_date, "2026-09-01T12:00:00Z");
+        assert_eq!(b.caret_affinity, CaretAffinity::TrailingX);
+        let cfg = b.layout_cfg.as_ref().expect("layout config restored");
+        assert_eq!(cfg.font_id, "amiri");
+        assert!(matches!(cfg.base_direction, ShapingDirection::Rtl));
+        assert!(matches!(cfg.alignment, Alignment::Justify));
+        assert_eq!(cfg.px_size, 24.0);
+        assert_eq!(cfg.line_height, 36.0);
+        assert_eq!(cfg.base_scale, 1.5);
+        assert_eq!(cfg.zoom, 1.25);
+        assert_eq!(cfg.scale, 1.5 * 1.25);
+        assert_eq!(b.renderer_name(), "canvas2d");
+
+        /* The recovery e2e gate: a snapshot of the restored engine is
+        byte-identical to the snapshot it was restored from. */
+        assert_eq!(b.snapshot_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn undo_and_redo_keep_working_after_restore() {
+        let a = seeded_engine();
+        let mut b = engine();
+        b.restore_from_bytes(&a.snapshot_bytes().unwrap()).unwrap();
+        apply(&mut b, Command::Undo);
+        assert_eq!(text(&b), "alpha beta");
+        apply(&mut b, Command::Undo);
+        assert_eq!(text(&b), "alpha");
+        apply(&mut b, Command::Redo);
+        assert_eq!(text(&b), "alpha beta");
+    }
+
+    #[test]
+    fn recover_restores_the_snapshot_then_replays_the_tail() {
+        let a = seeded_engine();
+        let bytes = a.snapshot_bytes().unwrap();
+        let mut b = engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: bytes,
+                log_tail: vec![insert("X"), Command::SetZoom { scale: 2.0 }],
+            },
+        );
+        match evt {
+            Event::Recovered {
+                applied_commands,
+                snapshot_restored,
+                renderer,
+            } => {
+                assert_eq!(applied_commands, 2);
+                assert!(snapshot_restored);
+                assert_eq!(renderer, "canvas2d");
+            }
+            other => panic!("expected Recovered, got {other:?}"),
+        }
+        /* The replayed insert landed at the RESTORED caret (after "alpha"),
+        which proves the selection came back before the tail ran. */
+        assert_eq!(text(&b), "alphaX beta gamma");
+        assert_eq!(b.selection.as_ref().unwrap().caret.offset, 6);
+        /* The tail's zoom was folded into the restored config even though
+        painting was suppressed during replay. */
+        let cfg = b
+            .layout_cfg
+            .as_ref()
+            .expect("layout config survives replay");
+        assert_eq!(cfg.zoom, 2.0);
+        assert_eq!(cfg.base_scale, 1.5);
+        assert_eq!(cfg.scale, 3.0);
+        assert!(
+            b.pending_announcements.is_empty(),
+            "replay must not narrate"
+        );
+        assert!(b.composition.is_none());
+        /* Undo depth = restored window + replayed edit. */
+        assert!(b.undo.can_undo());
+        apply(&mut b, Command::Undo);
+        assert_eq!(text(&b), "alpha beta gamma");
+        apply(&mut b, Command::Undo);
+        assert_eq!(text(&b), "alpha beta");
+    }
+
+    #[test]
+    fn recover_with_an_unreadable_snapshot_replays_onto_a_fresh_document() {
+        let mut b = engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: b"definitely not a snapshot".to_vec(),
+                log_tail: vec![insert("hello"), insert(" world")],
+            },
+        );
+        match evt {
+            Event::Recovered {
+                applied_commands,
+                snapshot_restored,
+                ..
+            } => {
+                assert_eq!(applied_commands, 2);
+                assert!(!snapshot_restored);
+            }
+            other => panic!("expected Recovered, got {other:?}"),
+        }
+        assert_eq!(text(&b), "hello world");
+        assert!(b.layout_cfg.is_none(), "cold state: the shell re-seeds");
+        assert_eq!(b.review_author, "You");
+    }
+
+    #[test]
+    fn recover_with_nothing_persisted_is_a_cold_engine() {
+        let mut b = seeded_engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: Vec::new(),
+                log_tail: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            evt,
+            Event::Recovered {
+                applied_commands: 0,
+                snapshot_restored: false,
+                ..
+            }
+        ));
+        assert_eq!(text(&b), "");
+        assert!(b.selection.is_none());
+        assert!(b.layout_cfg.is_none());
+        assert!(!b.tracking_changes);
+        assert!(matches!(b.active_story, StoryTarget::Body));
+    }
+
+    #[test]
+    fn snapshot_command_echoes_seq_and_reports_the_format_version() {
+        let mut a = seeded_engine();
+        let expected = a.snapshot_bytes().unwrap();
+        match apply(&mut a, Command::Snapshot { seq: Some(42) }) {
+            Event::Snapshot {
+                bytes,
+                seq,
+                format_version,
+            } => {
+                assert_eq!(seq, 42);
+                assert_eq!(format_version, engine::snapshot::FORMAT_VERSION);
+                assert_eq!(bytes, expected);
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        assert!(matches!(
+            apply(&mut a, Command::Snapshot { seq: None }),
+            Event::Snapshot { seq: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn undo_window_shrinks_with_document_size() {
+        let mut e = engine();
+        assert_eq!(e.snapshot_undo_entries(), SNAPSHOT_UNDO_MAX_ENTRIES);
+        e.undo = UndoStack::new(
+            DocumentTree::from_paragraphs((0..1000).map(|i| i.to_string())),
+            UNDO_CAP,
+        );
+        assert_eq!(e.snapshot_undo_entries(), 2, "50-page doc: current + 1");
+        e.undo = UndoStack::new(
+            DocumentTree::from_paragraphs((0..5000).map(|i| i.to_string())),
+            UNDO_CAP,
+        );
+        assert_eq!(e.snapshot_undo_entries(), 1, "huge doc: current only");
+    }
+
+    #[test]
+    fn layout_cfg_snapshot_rejects_garbage_and_sanitizes_scales() {
+        assert!(LayoutCfgSnapshot::default().restore().is_none());
+        let cfg = LayoutCfgSnapshot {
+            font_id: "amiri".into(),
+            px_size: 16.0,
+            line_height: 20.0,
+            base_scale: f32::NAN,
+            zoom: -3.0,
+            ..Default::default()
+        }
+        .restore()
+        .unwrap();
+        assert_eq!(cfg.base_scale, 1.0);
+        assert_eq!(cfg.zoom, 1.0);
+        assert_eq!(cfg.scale, 1.0);
+        assert!(matches!(cfg.alignment, Alignment::Start));
+        assert!(matches!(cfg.base_direction, ShapingDirection::Ltr));
+    }
+
+    #[test]
+    fn version_defaults_restore_the_implicit_author_and_an_empty_history() {
+        let mut s = EngineSnapshotV1::default();
+        s.apply_version_defaults(engine::snapshot::FORMAT_VERSION);
+        assert_eq!(s.review_author, "You");
+        assert_eq!(s.doc_history.len(), 1);
+        assert_eq!(s.undo_cursor, 0);
+    }
+
+    #[test]
+    fn restore_clamps_a_hostile_selection_into_the_document() {
+        let hostile = EngineSnapshotV1 {
+            doc_history: vec![DocumentTree::from_text("short")],
+            undo_cursor: 0,
+            selection: Some(SelectionState {
+                anchor: bpos_top(7, 9_999),
+                caret: bpos_top(7, 9_999),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            ..Default::default()
+        };
+        let bytes = engine::snapshot::encode(&hostile).unwrap();
+        let mut b = engine();
+        b.restore_from_bytes(&bytes).unwrap();
+        let sel = b.selection.as_ref().unwrap();
+        assert_eq!(sel.caret.path, BridgeBlockPath::top(0));
+        assert!(sel.caret.offset <= "short".len() as u32);
+    }
+
+    #[test]
+    fn restore_exits_a_story_whose_part_no_longer_exists() {
+        let stale = EngineSnapshotV1 {
+            doc_history: vec![DocumentTree::from_text("body")],
+            undo_cursor: 0,
+            active_story: StoryTarget::Header {
+                rid: "rId404".into(),
+                page: 0,
+                section_block: 0,
+                role: engine::HeaderFooterRole::Default,
+            },
+            selection: Some(SelectionState {
+                anchor: bpos_top(0, 0),
+                caret: bpos_top(0, 0),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            ..Default::default()
+        };
+        let mut b = engine();
+        b.restore_from_bytes(&engine::snapshot::encode(&stale).unwrap())
+            .unwrap();
+        assert!(matches!(b.active_story, StoryTarget::Body));
     }
 }

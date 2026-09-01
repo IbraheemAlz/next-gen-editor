@@ -20,8 +20,16 @@ type WorkerReply = {
     trap?: boolean;
     /** Worker-context cross-origin isolation, reported in the INIT reply. */
     crossOriginIsolated?: boolean;
-    /** Active renderer the worker picked at INIT — `vello` or `canvas2d`. */
+    /** Active renderer the worker picked at INIT / re-probed at RECOVER —
+     *  `vello` or `canvas2d` (issue #66: the RECOVER value is the engine's
+     *  own report, never a remembered INIT-time one). */
     renderer?: string;
+    /** Issue #85 — RECOVER reply: whether a base snapshot was restored
+     *  (false ⇒ the engine recovered onto a fresh document from the
+     *  replay tail alone, and the shell must re-seed it). */
+    restored?: boolean;
+    /** Issue #85 — RECOVER reply: replay-tail commands applied. */
+    appliedCommands?: number;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -54,6 +62,16 @@ export interface RevisionSnapshot {
     date: string;
 }
 
+/** Issue #85 — what the most recent `recover()` achieved. */
+export interface RecoveryInfo {
+    /** A base snapshot was decoded and installed before the tail replay. */
+    restored: boolean;
+    /** Replay-tail commands applied on top of it. */
+    appliedCommands: number;
+    /** The renderer the recovered engine actually paints with (#66). */
+    renderer: string;
+}
+
 type Resolver = (v: WorkerReply) => void;
 
 export class EngineClient {
@@ -66,6 +84,7 @@ export class EngineClient {
     private recovering = false;
     private workerIsolated = false;
     private activeRenderer = 'canvas2d';
+    private lastRecoveryInfo: RecoveryInfo | undefined;
 
     /**
      * @param documentId identifies the IndexedDB event log for this document.
@@ -107,9 +126,19 @@ export class EngineClient {
     }
 
     /** Backlog #4: the renderer the worker picked at INIT — `vello` or
-     *  `canvas2d`. Set by `init()`; `canvas2d` before INIT completes. */
+     *  `canvas2d`. Set by `init()`; `canvas2d` before INIT completes.
+     *  Issue #66 — re-set by every `recover()` from the recovered
+     *  engine's own report, so it tracks the worker generation that is
+     *  actually painting. */
     get renderer(): string {
         return this.activeRenderer;
+    }
+
+    /** Issue #85 — outcome of the most recent `recover()`; `undefined`
+     *  until the first recovery. The shell reads `restored` to decide
+     *  between re-seeding a blank page and repainting the restored one. */
+    get lastRecovery(): RecoveryInfo | undefined {
+        return this.lastRecoveryInfo;
     }
 
     /**
@@ -135,6 +164,37 @@ export class EngineClient {
             canvas,
             snapshot.buffer as ArrayBuffer,
         ]);
+        if (!r.ok) throw new Error(r.error);
+        this.activeRenderer = r.renderer ?? 'canvas2d';
+        this.lastRecoveryInfo = {
+            restored: r.restored === true,
+            appliedCommands: r.appliedCommands ?? 0,
+            renderer: this.activeRenderer,
+        };
+    }
+
+    /**
+     * Issue #85 — `Command::Snapshot`: the versioned engine snapshot
+     * (`engine::snapshot` envelope) of the live session. Read-only; the
+     * same bytes the worker persists on its cadence.
+     */
+    async snapshot(): Promise<Uint8Array> {
+        const evt = await this.dispatch({ type: 'SNAPSHOT', seq: undefined });
+        if (evt.type !== 'SNAPSHOT') {
+            throw new Error(evt.type === 'ERROR' ? evt.message : `snapshot: unexpected ${evt.type}`);
+        }
+        return evt.bytes;
+    }
+
+    /**
+     * Issue #85 fault injection (test hook, ts/e2e/crash-recovery.spec.ts):
+     * make the worker trap the wasm instance for real after its next
+     * `afterCommands` logged commands, flushing the event log first. Unlike
+     * `forceTrap()` this exercises the genuine `RuntimeError` → close →
+     * respawn → `RECOVER` path.
+     */
+    async armTrap(afterCommands = 1): Promise<void> {
+        const r = await this.send({ type: 'ARM_TRAP', after_commands: afterCommands });
         if (!r.ok) throw new Error(r.error);
     }
 

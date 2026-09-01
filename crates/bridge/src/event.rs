@@ -89,8 +89,30 @@ pub enum Event {
         version: String,
         capabilities: EngineCapabilities,
     },
+    /// Reply to `Command::Recover` (issue #85).
     Recovered {
+        /// Replay-log commands applied on top of the base snapshot.
         applied_commands: u32,
+        /// `true` when a base snapshot was decoded and restored; `false`
+        /// when none was supplied or it was unreadable (the engine then
+        /// recovered onto a fresh document from the tail alone).
+        snapshot_restored: bool,
+        /// Issue #66 — the renderer this engine instance actually paints
+        /// with (`"vello"` / `"canvas2d"`), reported by the engine itself
+        /// so the shell's `__renderer` never drifts from the truth after a
+        /// post-trap respawn.
+        renderer: String,
+    },
+    /// Reply to `Command::Snapshot` (issue #85): the versioned snapshot
+    /// envelope (`engine::snapshot`, magic + format version + payload).
+    Snapshot {
+        #[serde(with = "serde_bytes")]
+        #[tsify(type = "Uint8Array")]
+        bytes: Vec<u8>,
+        /// Echo of `Command::Snapshot.seq` (0 when the caller passed none).
+        seq: u64,
+        /// `engine::snapshot::FORMAT_VERSION` the bytes were written with.
+        format_version: u8,
     },
 
     /* Document */

@@ -7,7 +7,12 @@ rust-version.workspace = true
 description = "Pure-Rust document model + undo/redo facade."
 
 [dependencies]
-im = { workspace = true }
+im = { workspace = true, features = ["serde"] }
+# Issue #85 — crash-recovery snapshots: the whole document model derives
+# serde so `snapshot::encode` / `decode` can persist it.
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+rmp-serde = { workspace = true }
 unicode-segmentation = { workspace = true }
 # Sprint 11 (#17) — UAX-#29 word segmentation for `word_count`.
 # `WordSegmenter::new_auto` is the same constructor `text-pipeline` already

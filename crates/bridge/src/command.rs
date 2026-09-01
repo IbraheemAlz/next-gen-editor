@@ -100,12 +100,27 @@ pub enum Command {
         locale: String,
         capabilities: ClientCapabilities,
     },
-    /// Restore engine state from a snapshot plus a tail of replay commands.
+    /// Restore engine state from a snapshot plus a tail of replay commands
+    /// (issue #85). `snapshot` is an `engine::snapshot` envelope produced by
+    /// [`Command::Snapshot`] — empty means "no base snapshot, replay the
+    /// tail onto a fresh document". The engine restores the snapshot, then
+    /// replays `log_tail` in order through the normal command path with
+    /// painting suppressed, and answers `Event::Recovered`.
     Recover {
         #[serde(with = "serde_bytes")]
         #[tsify(type = "Uint8Array")]
         snapshot: Vec<u8>,
         log_tail: Vec<Command>,
+    },
+    /// Issue #85 — serialize the whole engine session (document tree +
+    /// styles + stories + undo window + selection + layout config) into a
+    /// versioned `engine::snapshot` envelope; replies `Event::Snapshot`.
+    /// Read-only: never logged, never replayed. `seq` is echoed back so the
+    /// worker can stamp the persisted row with the event-log position the
+    /// snapshot was taken at (the engine itself has no notion of log
+    /// sequence).
+    Snapshot {
+        seq: Option<u64>,
     },
     /// Tear down the engine and release resources.
     Dispose,
