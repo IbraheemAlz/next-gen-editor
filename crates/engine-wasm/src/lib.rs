@@ -14942,6 +14942,67 @@ mod tests {
         };
         assert_eq!(replayed, layout_degraded);
     }
+
+    /// D5.5 (issue #90) — the `fuzz-native` surface actually works end to
+    /// end: a headless engine drives real `Command`s through the real
+    /// `apply` dispatcher, runs the real layout pipeline, and the
+    /// invariant accessors read back sane values. This is a native
+    /// smoke test for `fuzz/fuzz_targets/rpc_command.rs` /
+    /// `layout_paginate.rs`, exercised here where `cargo test --workspace`
+    /// already runs it — the fuzz crate itself is a *separate* cargo
+    /// workspace `cargo test` never touches (see `fuzz/Cargo.toml`).
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn fuzz_native_surface_drives_engine_end_to_end() {
+        let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+        assert!(engine.selection_is_valid());
+        assert_eq!(engine.undo_depth(), 1);
+
+        let evt = engine.apply_sync(Command::InsertText {
+            at: None,
+            text: " more".to_string(),
+        });
+        assert!(
+            matches!(evt, Event::SelectionChanged { .. }),
+            "expected SelectionChanged, got {evt:?}"
+        );
+        // `new_headless` seeds the caret at (0, 0), so `InsertText { at: None }`
+        // (the live-caret path) prepends.
+        assert_eq!(engine.undo.current().paragraph_text(0), Some(" moreseed"));
+        assert_eq!(engine.undo_depth(), 2);
+        assert!(engine.selection_is_valid());
+
+        // D5.5 (issue #90) fuzzing finding — NOT asserted here (would make
+        // this a red gate for a pre-existing product behaviour outside
+        // this task's scope; see the PR description / final report):
+        // `Command::SetSelection` and `ExtendSelection` write `range` /
+        // `caret` verbatim with no `clamp_pos` call, unlike every other
+        // selection-mutating path (`do_place_caret_at_point`,
+        // `do_select_word_at`, …). An out-of-bounds `SetSelection` (e.g.
+        // `{ path: [Block { idx: 50 }], offset: 999 }` against a 1-paragraph
+        // doc) leaves `engine.selection_is_valid() == false` until the next
+        // text-mutating command's own `resolve_interactive_insert_at`
+        // clamping self-heals it — a real, reproducible
+        // `selection_is_valid()` violation, not merely a hypothetical one.
+        // The `rpc_command` fuzz target asserts this invariant after every
+        // command (unfiltered), so it will keep surfacing this.
+
+        // Layout + the native (browser-free) rasterizer both run for real.
+        engine.ensure_layout_for_fuzzing().expect("layout");
+        assert!(
+            engine.rasterize_last_layout_for_fuzzing() > 0,
+            "expected at least one glyph rasterized for non-empty text"
+        );
+
+        // Undo depth never exceeds the bound `new_headless` constructed.
+        for _ in 0..150 {
+            let _ = engine.apply_sync(Command::InsertText {
+                at: None,
+                text: "x".to_string(),
+            });
+            assert!(engine.undo_depth() <= 100, "undo depth exceeded its bound");
+        }
+    }
 }
 
 /// Issue #85 — crash-recovery snapshot + replay, exercised natively on a
@@ -15282,64 +15343,5 @@ mod snapshot_tests {
         b.restore_from_bytes(&engine::snapshot::encode(&stale).unwrap())
             .unwrap();
         assert!(matches!(b.active_story, StoryTarget::Body));
-    /// D5.5 (issue #90) — the `fuzz-native` surface actually works end to
-    /// end: a headless engine drives real `Command`s through the real
-    /// `apply` dispatcher, runs the real layout pipeline, and the
-    /// invariant accessors read back sane values. This is a native
-    /// smoke test for `fuzz/fuzz_targets/rpc_command.rs` /
-    /// `layout_paginate.rs`, exercised here where `cargo test --workspace`
-    /// already runs it — the fuzz crate itself is a *separate* cargo
-    /// workspace `cargo test` never touches (see `fuzz/Cargo.toml`).
-    #[cfg(feature = "fuzz-native")]
-    #[test]
-    fn fuzz_native_surface_drives_engine_end_to_end() {
-        let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
-        assert!(engine.selection_is_valid());
-        assert_eq!(engine.undo_depth(), 1);
-
-        let evt = engine.apply_sync(Command::InsertText {
-            at: None,
-            text: " more".to_string(),
-        });
-        assert!(
-            matches!(evt, Event::SelectionChanged { .. }),
-            "expected SelectionChanged, got {evt:?}"
-        );
-        // `new_headless` seeds the caret at (0, 0), so `InsertText { at: None }`
-        // (the live-caret path) prepends.
-        assert_eq!(engine.undo.current().paragraph_text(0), Some(" moreseed"));
-        assert_eq!(engine.undo_depth(), 2);
-        assert!(engine.selection_is_valid());
-
-        // D5.5 (issue #90) fuzzing finding — NOT asserted here (would make
-        // this a red gate for a pre-existing product behaviour outside
-        // this task's scope; see the PR description / final report):
-        // `Command::SetSelection` and `ExtendSelection` write `range` /
-        // `caret` verbatim with no `clamp_pos` call, unlike every other
-        // selection-mutating path (`do_place_caret_at_point`,
-        // `do_select_word_at`, …). An out-of-bounds `SetSelection` (e.g.
-        // `{ path: [Block { idx: 50 }], offset: 999 }` against a 1-paragraph
-        // doc) leaves `engine.selection_is_valid() == false` until the next
-        // text-mutating command's own `resolve_interactive_insert_at`
-        // clamping self-heals it — a real, reproducible
-        // `selection_is_valid()` violation, not merely a hypothetical one.
-        // The `rpc_command` fuzz target asserts this invariant after every
-        // command (unfiltered), so it will keep surfacing this.
-
-        // Layout + the native (browser-free) rasterizer both run for real.
-        engine.ensure_layout_for_fuzzing().expect("layout");
-        assert!(
-            engine.rasterize_last_layout_for_fuzzing() > 0,
-            "expected at least one glyph rasterized for non-empty text"
-        );
-
-        // Undo depth never exceeds the bound `new_headless` constructed.
-        for _ in 0..150 {
-            let _ = engine.apply_sync(Command::InsertText {
-                at: None,
-                text: "x".to_string(),
-            });
-            assert!(engine.undo_depth() <= 100, "undo depth exceeded its bound");
-        }
     }
 }
