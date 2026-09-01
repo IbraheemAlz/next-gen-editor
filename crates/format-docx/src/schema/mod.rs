@@ -7,6 +7,8 @@
 
 pub mod ct_ppr;
 pub mod ct_rpr;
+pub mod ct_tbl;
+pub mod grab_bag;
 
 /// WordprocessingML namespace.
 pub const NS_W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";

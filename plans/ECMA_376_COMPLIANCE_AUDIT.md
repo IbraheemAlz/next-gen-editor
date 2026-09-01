@@ -26,6 +26,13 @@ the first edit.
   attributes or variants are dropped.
 - `[HIDDEN GAP - UNHANDLED]` — element silently ignored by the parser; only
   survives via the passthrough optimisation, lost on first edit.
+  **Since issue #84 (in-part grab bags)** this class no longer loses data:
+  every unmodeled child of `<w:rPr>` / `<w:pPr>` / `<w:tblPr>` / `<w:trPr>`
+  / `<w:tcPr>` is captured verbatim (`engine::GrabBag`) and re-emitted in
+  schema order when the paragraph / table regenerates. The entries below
+  keep the label because the element is still not *modeled* (no layout /
+  render / UI consumer); "lost on first edit" now reads "preserved
+  verbatim, semantically inert".
 - `[MODEL-ONLY]` — parsed + round-tripped through writer, but no layout /
   render consumer — semantically a no-op at paint time.
 

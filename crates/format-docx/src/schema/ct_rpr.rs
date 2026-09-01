@@ -7,7 +7,133 @@
 //! resolver can reuse them without depending on `parts::document`.
 
 use engine::{FontFamily, SpanStyle, UnderlineStyle, VertAlign};
-use quick_xml::events::BytesStart;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::reader::Reader;
+
+/// Issue #84 — `true` for every `<w:rPr>` child the model expresses (the
+/// arms of [`apply_rpr`] plus `<w:rStyle>`, which the part parsers fold
+/// through the character-style cascade). Everything else is captured
+/// verbatim into the run's grab bag.
+pub fn rpr_child_is_modeled(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"w:rStyle"
+            | b"w:rFonts"
+            | b"w:b"
+            | b"w:i"
+            | b"w:caps"
+            | b"w:smallCaps"
+            | b"w:strike"
+            | b"w:color"
+            | b"w:sz"
+            | b"w:szCs"
+            | b"w:highlight"
+            | b"w:u"
+            | b"w:shd"
+            | b"w:vertAlign"
+    )
+}
+
+/// Issue #84 — rank of a `<w:rPr>` child in the `EG_RPrBase` listing
+/// (ECMA-376 §17.3.2). The Transitional schema declares the group as an
+/// unbounded choice, so any order validates; Word nonetheless writes the
+/// listed order and `<w:rPrChange>` last, and the writer reproduces that
+/// when it interleaves grab-bag fragments with the modeled children.
+/// Unknown / foreign-namespace children rank just before the change
+/// record.
+pub fn rpr_child_rank(name: &[u8]) -> u16 {
+    const ORDER: &[&[u8]] = &[
+        b"w:rStyle",
+        b"w:rFonts",
+        b"w:b",
+        b"w:bCs",
+        b"w:i",
+        b"w:iCs",
+        b"w:caps",
+        b"w:smallCaps",
+        b"w:strike",
+        b"w:dstrike",
+        b"w:outline",
+        b"w:shadow",
+        b"w:emboss",
+        b"w:imprint",
+        b"w:noProof",
+        b"w:snapToGrid",
+        b"w:vanish",
+        b"w:webHidden",
+        b"w:color",
+        b"w:spacing",
+        b"w:w",
+        b"w:kern",
+        b"w:position",
+        b"w:sz",
+        b"w:szCs",
+        b"w:highlight",
+        b"w:u",
+        b"w:effect",
+        b"w:bdr",
+        b"w:shd",
+        b"w:fitText",
+        b"w:vertAlign",
+        b"w:rtl",
+        b"w:cs",
+        b"w:em",
+        b"w:lang",
+        b"w:eastAsianLayout",
+        b"w:specVanish",
+        b"w:oMath",
+    ];
+    schema_rank(ORDER, name, b"w:rPrChange")
+}
+
+/// Shared rank lookup: position in `order`, `u16::MAX` for the
+/// change-tracking tail element, `u16::MAX - 1` for anything unknown (so
+/// foreign-namespace extensions land after every schema child but before
+/// the `*Change` record, matching Word's own layout).
+pub(crate) fn schema_rank(order: &[&[u8]], name: &[u8], change_elem: &[u8]) -> u16 {
+    if name == change_elem {
+        return u16::MAX;
+    }
+    order
+        .iter()
+        .position(|n| *n == name)
+        .map_or(u16::MAX - 1, |i| i as u16)
+}
+
+/// Issue #84 — fold the top-level children of a captured `<w:rPr>…</w:rPr>`
+/// fragment into `style` through [`apply_rpr`]. Used for the
+/// paragraph-mark run properties: the whole element rides the paragraph's
+/// grab bag for round-trip, while its modeled children still seed the
+/// run baseline exactly as before. Nested subtrees (`<w:rPrChange>`) are
+/// skipped so the recorded *previous* formatting never overrides the
+/// live one.
+pub fn fold_rpr_fragment(fragment: &[u8], style: &mut SpanStyle) {
+    let mut reader = Reader::from_reader(fragment);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut depth = 0u32;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                if depth == 1 {
+                    apply_rpr(e.name().as_ref(), &e, style);
+                    let end = e.to_end().into_owned();
+                    let mut skip = Vec::new();
+                    if reader.read_to_end_into(end.name(), &mut skip).is_err() {
+                        break;
+                    }
+                } else {
+                    depth += 1;
+                }
+            }
+            Ok(Event::Empty(e)) if depth == 1 => apply_rpr(e.name().as_ref(), &e, style),
+            Ok(Event::End(_)) => depth = depth.saturating_sub(1),
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
 
 /// Value of attribute `key` on a start/empty tag, unescaped.
 pub fn attr_val(e: &BytesStart, key: &[u8]) -> Option<String> {
@@ -155,5 +281,59 @@ pub fn apply_rpr(name: &[u8], e: &BytesStart, style: &mut SpanStyle) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #84 — the rank table is the EG_RPrBase listing (+ `rPrChange`
+    /// last); every writer-emitted child has a rank, unknowns sort
+    /// before the change record.
+    #[test]
+    fn rpr_ranks_follow_eg_rpr_base_listing() {
+        let seq: [&[u8]; 14] = [
+            b"w:rStyle",
+            b"w:rFonts",
+            b"w:b",
+            b"w:i",
+            b"w:caps",
+            b"w:smallCaps",
+            b"w:strike",
+            b"w:noProof",
+            b"w:color",
+            b"w:sz",
+            b"w:szCs",
+            b"w:u",
+            b"w:shd",
+            b"w:vertAlign",
+        ];
+        for w in seq.windows(2) {
+            assert!(rpr_child_rank(w[0]) < rpr_child_rank(w[1]));
+        }
+        assert!(rpr_child_rank(b"w:vertAlign") < rpr_child_rank(b"w:lang"));
+        assert!(rpr_child_rank(b"w:lang") < rpr_child_rank(b"w:eastAsianLayout"));
+        assert!(rpr_child_rank(b"w:eastAsianLayout") < rpr_child_rank(b"w14:glow"));
+        assert!(rpr_child_rank(b"w14:glow") < rpr_child_rank(b"w:rPrChange"));
+        assert!(rpr_child_is_modeled(b"w:highlight"));
+        assert!(rpr_child_is_modeled(b"w:rStyle"));
+        assert!(!rpr_child_is_modeled(b"w:bCs"));
+        assert!(!rpr_child_is_modeled(b"w:lang"));
+    }
+
+    /// Issue #84 — folding a captured paragraph-mark `<w:rPr>` applies
+    /// its top-level modeled children and skips nested history.
+    #[test]
+    fn fold_rpr_fragment_applies_top_level_children_only() {
+        let frag = br#"<w:rPr><w:b/><w:sz w:val="28"/><w:rPrChange w:id="1"><w:rPr><w:i/><w:sz w:val="48"/></w:rPr></w:rPrChange></w:rPr>"#;
+        let mut style = SpanStyle::default();
+        fold_rpr_fragment(frag, &mut style);
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(style.font_size, Some(14.0));
+        assert_eq!(style.italic, None, "nested rPrChange must not apply");
+        let mut empty = SpanStyle::default();
+        fold_rpr_fragment(b"<w:rPr/>", &mut empty);
+        assert_eq!(empty, SpanStyle::default());
     }
 }

@@ -13,8 +13,9 @@
 
 use crate::error::DocxError;
 use crate::parts::table::parse_table_bytes;
-use crate::schema::ct_ppr::apply_ppr;
-use crate::schema::ct_rpr::{apply_rpr, attr_val};
+use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
+use crate::schema::ct_rpr::{apply_rpr, attr_val, fold_rpr_fragment, rpr_child_is_modeled};
+use crate::schema::grab_bag::{NamespaceScope, capture_subtree, slice_fragment, stash};
 use crate::style_resolver::StyleResolver;
 use engine::{
     Block, DocumentTree, HeaderFooterRefs, HeaderFooterRole, ListItem, PageGeometry,
@@ -498,12 +499,23 @@ pub fn parse_document_xml(
     let mut prev_pos: usize = 0;
     let mut p_start_byte: Option<usize> = None;
 
+    /* Issue #84 — namespace prefixes the part's root element binds. Grab-bag
+    fragments in a foreign namespace (`w14:`, `mc:`, …) re-bind their
+    prefixes from here so they stay well-formed under the writer's
+    synthesized root. */
+    let mut ns = NamespaceScope::default();
+    let mut root_seen = false;
+
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) => {
                 let name = e.name();
+                if !root_seen {
+                    root_seen = true;
+                    ns = NamespaceScope::from_root(&e);
+                }
                 /* Phase 5 PR 1 — outermost `<w:tbl>` opens. Capture leading
                 byte offset for the source-byte passthrough; ignore every
                 child event (`<w:p>` / `<w:r>` etc. inside cells) until the
@@ -541,6 +553,20 @@ pub fn parse_document_xml(
                         r_style_id = None;
                         direct_rpr = SpanStyle::default();
                         run_text.clear();
+                    }
+                    b"w:rPr" if in_ppr && !in_run => {
+                        /* Issue #84 — paragraph-mark run properties
+                        (`<w:pPr>/<w:rPr>`). The writer never regenerates
+                        this element, so the WHOLE subtree rides the
+                        paragraph's grab bag verbatim; its modeled children
+                        still seed the run baseline (`pmark_rpr`) exactly
+                        as before via `fold_rpr_fragment`, which also
+                        stops a nested `<w:rPrChange>/<w:rPr>` history from
+                        overriding the live formatting. */
+                        if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            fold_rpr_fragment(&frag, &mut pmark_rpr);
+                            stash(&mut direct_ppr.grab_bag, frag, &ns);
+                        }
                     }
                     b"w:rPr" => in_rpr = true,
                     /* A `<w:pPr>` only counts when it's the paragraph's own
@@ -632,12 +658,29 @@ pub fn parse_document_xml(
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
                     n if in_sect_pr => cur_sect.apply(n, &e),
+                    n if in_run && in_rpr && !rpr_child_is_modeled(n) => {
+                        /* Issue #84 — unmodeled `<w:rPr>` container child
+                        (`<w:rPrChange>`, `<w:bdr>` with content, `mc:`
+                        wrappers, …): the whole subtree goes into the run's
+                        grab bag and the parser skips it, so nothing inside
+                        can masquerade as live run formatting. */
+                        if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            stash(&mut direct_rpr.grab_bag, frag, &ns);
+                        }
+                    }
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
-                    n if in_ppr && in_rpr => {
-                        /* Paragraph-mark `<w:pPr>/<w:rPr>` — applies to the
-                        ¶ glyph. We keep it as `pmark_rpr` for round-trip
-                        and lay it under the run baseline below. */
-                        apply_rpr(n, &e, &mut pmark_rpr);
+                    n if in_ppr
+                        && !in_rpr
+                        && !in_num_pr
+                        && !in_pbdr
+                        && !in_tabs
+                        && !ppr_child_is_modeled(n) =>
+                    {
+                        /* Issue #84 — unmodeled `<w:pPr>` container child
+                        (`<w:pPrChange>`, `<w:framePr>` with content, …). */
+                        if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            stash(&mut direct_ppr.grab_bag, frag, &ns);
+                        }
                     }
                     n if in_ppr && !in_rpr && !in_num_pr => {
                         apply_ppr(n, &e, &mut direct_ppr);
@@ -763,15 +806,46 @@ pub fn parse_document_xml(
                             &mut para_fields,
                         );
                     }
+                    b"w:rPr" if in_ppr && !in_run => {
+                        /* Issue #84 — an empty paragraph-mark `<w:rPr/>`
+                        still rides the bag (byte-stable regeneration). */
+                        let end = reader.buffer_position() as usize;
+                        if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            stash(&mut direct_ppr.grab_bag, frag, &ns);
+                        }
+                    }
                     n if in_sect_pr => cur_sect.apply(n, &e),
+                    n if in_run && in_rpr && !rpr_child_is_modeled(n) => {
+                        /* Issue #84 — unmodeled `<w:rPr>` leaf child
+                        (`<w:lang>`, `<w:fitText>`, `<w:eastAsianLayout>`,
+                        `<w14:glow>`, …) → the run's grab bag, verbatim. */
+                        let end = reader.buffer_position() as usize;
+                        if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            stash(&mut direct_rpr.grab_bag, frag, &ns);
+                        }
+                    }
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
-                    n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
                     /* Audit gap A.M4 — `<w:pBdr>` per-edge children. */
                     n if in_ppr && in_pbdr => apply_pbdr_edge(n, &e, &mut direct_ppr),
                     /* Audit gap A.M3 — `<w:tabs>` per-stop children. */
                     n if in_ppr && in_tabs && n == b"w:tab" => {
                         if let Some(stop) = parse_tab_stop(&e) {
                             direct_ppr.tab_stops.push(stop);
+                        }
+                    }
+                    n if in_ppr
+                        && !in_rpr
+                        && !in_num_pr
+                        && !in_pbdr
+                        && !in_tabs
+                        && !ppr_child_is_modeled(n) =>
+                    {
+                        /* Issue #84 — unmodeled `<w:pPr>` leaf child
+                        (`<w:framePr>`, `<w:cnfStyle>`, `<w:widowControl>`,
+                        `<w:outlineLvl>`, …) → the paragraph's grab bag. */
+                        let end = reader.buffer_position() as usize;
+                        if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            stash(&mut direct_ppr.grab_bag, frag, &ns);
                         }
                     }
                     n if in_ppr && !in_rpr && !in_num_pr && !in_pbdr && !in_tabs => {
@@ -820,7 +894,7 @@ pub fn parse_document_xml(
                             tables. */
                             let (grid, props, rows) = source_xml
                                 .as_deref()
-                                .map(|b| parse_table_bytes(b, resolver).unwrap_or_default())
+                                .map(|b| parse_table_bytes(b, resolver, &ns).unwrap_or_default())
                                 .unwrap_or_default();
                             out_blocks.push(Block::Table(Table {
                                 grid,

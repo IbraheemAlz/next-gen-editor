@@ -41,6 +41,42 @@ pub struct DocxArchive {
     pub other_entries: Vec<(String, Vec<u8>)>,
     /// Pre-parsed paragraphs from `word/document.xml`.
     pub document: DocumentTree,
+    /// Issue #84 — every attribute of the source `<w:document>` start tag,
+    /// `(name, escaped value)` in document order: the `xmlns:*` bindings
+    /// (Word declares ~30, `w14` / `w15` / `mc` / … among them) plus
+    /// `mc:Ignorable`. The writer synthesizes its own root element and
+    /// re-declares these on it, so passthrough paragraphs (`w14:paraId`
+    /// on every Word-authored `<w:p>`) and preserved grab-bag fragments
+    /// stay namespace-well-formed. Empty for engine-authored archives.
+    pub document_root_attrs: Vec<(String, String)>,
+}
+
+/// Attributes of the first element in `xml` (the part's root), raw escaped
+/// values. Empty when the part has no element.
+pub(crate) fn root_attributes(xml: &[u8]) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                return e
+                    .attributes()
+                    .flatten()
+                    .map(|a| {
+                        (
+                            String::from_utf8_lossy(a.key.as_ref()).into_owned(),
+                            String::from_utf8_lossy(&a.value).into_owned(),
+                        )
+                    })
+                    .collect();
+            }
+            Ok(Event::Eof) | Err(_) => return Vec::new(),
+            _ => {}
+        }
+        buf.clear();
+    }
 }
 
 impl DocxArchive {
@@ -354,9 +390,12 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         document.settings.even_and_odd_headers = settings.even_and_odd_headers;
     }
 
+    let document_root_attrs = root_attributes(&xml);
+
     Ok(DocxArchive {
         other_entries,
         document,
+        document_root_attrs,
     })
 }
 

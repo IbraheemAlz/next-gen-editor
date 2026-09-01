@@ -944,6 +944,59 @@ impl VertAlign {
     }
 }
 
+/// Issue #84 — an in-part OOXML **grab bag**: the raw XML fragments of
+/// every child element the `.docx` reader saw inside a property container
+/// (`<w:rPr>`, `<w:pPr>`, `<w:tblPr>`, `<w:trPr>`, `<w:tcPr>`) but does
+/// not model. A dirty paragraph / table regenerates from the typed model,
+/// so anything the model cannot express would otherwise vanish on the
+/// first edit (the `[HIDDEN GAP - UNHANDLED]` class of the ECMA-376
+/// audit). The bag converts that whole long tail to "preserved verbatim":
+/// the writer re-emits each fragment byte-for-byte, interleaved with the
+/// modeled children in schema order.
+///
+/// Semantics — the bag is an opaque attachment, **not** a formatting
+/// property:
+///
+/// - fragments are complete elements (`<w:framePr …/>`,
+///   `<w:rPrChange>…</w:rPrChange>`), namespace prefixes intact, in source
+///   document order;
+/// - layout / render never read it;
+/// - on span split (`Paragraph::split_at`, `apply_style` re-derivation)
+///   both halves clone it; adjacent spans coalesce only when their whole
+///   `SpanStyle` — bag included — is byte-equal;
+/// - the cascade never inherits it: a merge keeps the *patch's* bag when
+///   the patch carries one, else the receiver's, so a style definition's
+///   bag can never leak into a run as direct formatting (style sources
+///   simply never carry one).
+///
+/// Boxed behind an `Option` on every host struct so the common no-bag case
+/// costs one pointer-width and `SpanStyle::default()` stays cheap to
+/// compare.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GrabBag {
+    /// Raw child-element fragments (UTF-8 XML bytes), document order.
+    pub fragments: Vec<Vec<u8>>,
+}
+
+impl GrabBag {
+    /// Append `fragment` to the bag behind `slot`, allocating the box on
+    /// first use. The reader's one-liner for every unmodeled child.
+    pub fn push_into(slot: &mut Option<Box<GrabBag>>, fragment: Vec<u8>) {
+        slot.get_or_insert_with(Default::default)
+            .fragments
+            .push(fragment);
+    }
+
+    /// Fragments of `slot`, or an empty slice when there is no bag.
+    pub fn fragments_of(slot: &Option<Box<GrabBag>>) -> &[Vec<u8>] {
+        slot.as_deref().map_or(&[], |b| b.fragments.as_slice())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fragments.is_empty()
+    }
+}
+
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
@@ -985,6 +1038,10 @@ pub struct SpanStyle {
     /// theme bindings break Word's "Update Style" — preserve at all
     /// costs even though our font picker ignores them.
     pub font_theme: Option<String>,
+    /// Issue #84 — unmodeled `<w:rPr>` children captured verbatim by the
+    /// `.docx` reader (see [`GrabBag`]). `None` for every engine-authored
+    /// style and for runs whose `<w:rPr>` the model fully expresses.
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
 impl SpanStyle {
@@ -1004,6 +1061,11 @@ impl SpanStyle {
             vert_align: patch.vert_align.or(self.vert_align),
             raw_font_family: patch.raw_font_family.or(self.raw_font_family),
             font_theme: patch.font_theme.or(self.font_theme),
+            /* Issue #84 — same "set field wins" rule as every slot above:
+            a formatting patch (no bag) keeps the run's bag; a direct
+            `<w:rPr>` folded onto a cascade baseline (which never carries
+            one) contributes its own. */
+            grab_bag: patch.grab_bag.or(self.grab_bag),
         }
     }
 }
@@ -1349,6 +1411,12 @@ pub struct ParaProperties {
     /// rect at the paragraph's bounding rectangle before drawing the
     /// `<w:pBdr>` strokes.
     pub shading: Option<[u8; 4]>,
+    /// Issue #84 — unmodeled direct `<w:pPr>` children (and the whole
+    /// paragraph-mark `<w:pPr>/<w:rPr>`, which the writer never
+    /// regenerates) captured verbatim by the `.docx` reader. See
+    /// [`GrabBag`]. Rides `Paragraph::direct_overrides` as well as the
+    /// resolved `props` so a style re-cascade keeps it.
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
 impl ParaProperties {
@@ -1397,6 +1465,10 @@ impl ParaProperties {
             /* Audit gap A.M17 — list binding cascades: patch wins
             when set, otherwise inherit. */
             list_item: patch.list_item.or(self.list_item),
+            /* Issue #84 — the bag is an attachment, not a cascading
+            property: the direct `<w:pPr>` (patch) contributes its own;
+            style sources never carry one, so nothing leaks downward. */
+            grab_bag: patch.grab_bag.or(self.grab_bag),
         }
     }
 }
@@ -2157,6 +2229,9 @@ pub struct RowProperties {
     /// `<w:tblHeader/>` — row repeats at the top of every page after
     /// a break. Phase 5a captures but does not honour.
     pub header: bool,
+    /// Issue #84 — unmodeled `<w:trPr>` children, verbatim. See
+    /// [`GrabBag`].
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2172,6 +2247,9 @@ pub struct CellProperties {
     /// `Some` value wins per-edge as resolved by
     /// [`CellMargins::resolve_edges`].
     pub cell_margins: Option<CellMargins>,
+    /// Issue #84 — unmodeled `<w:tcPr>` children, verbatim. See
+    /// [`GrabBag`].
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
 /// Audit gap A.M8 — `<w:tblLayout w:type>`. `Autofit` (Word's
@@ -2197,6 +2275,9 @@ pub struct TableProperties {
     /// Default `Autofit` matches Word's behaviour when the element
     /// is absent.
     pub layout: TableLayout,
+    /// Issue #84 — unmodeled `<w:tblPr>` children (`<w:tblLook>`,
+    /// `<w:bidiVisual>`, `<w:tblpPr>`, …), verbatim. See [`GrabBag`].
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -8294,6 +8375,116 @@ mod tests {
         );
         assert_eq!((spans[2].start, spans[2].end), (8, 11));
         assert_eq!(spans[2].style, big);
+    }
+
+    /// Issue #84 — a grab bag is an opaque attachment on the span style:
+    /// it rides every clone, never merges across spans that differ only
+    /// by bag, and is never inherited by a formatting patch.
+    #[test]
+    fn grab_bag_survives_split_merge_and_formatting() {
+        fn bag(frag: &str) -> Option<Box<GrabBag>> {
+            let mut slot = None;
+            GrabBag::push_into(&mut slot, frag.as_bytes().to_vec());
+            slot
+        }
+        let bold = |b: Option<Box<GrabBag>>| SpanStyle {
+            bold: Some(true),
+            grab_bag: b,
+            ..Default::default()
+        };
+        let para = Paragraph {
+            text: "abcdef".into(),
+            spans: vec![
+                StyleRun {
+                    start: 0,
+                    end: 3,
+                    style: bold(bag("<w:lang w:val=\"en-GB\"/>")),
+                },
+                StyleRun {
+                    start: 3,
+                    end: 6,
+                    style: bold(bag("<w:lang w:val=\"ar-SA\"/>")),
+                },
+            ],
+            ..Default::default()
+        };
+
+        /* A patch over both spans re-derives every interval; the two are
+        identical in modeled fields but differ by bag, so they must NOT
+        coalesce, and each keeps its own bag. */
+        let italic = SpanStyle {
+            italic: Some(true),
+            ..Default::default()
+        };
+        let p = para.apply_style(0, 6, italic.clone());
+        assert_eq!(p.spans.len(), 2, "byte-different bags never merge");
+        assert_eq!(p.spans[0].style.italic, Some(true));
+        assert_eq!(p.spans[0].style.grab_bag, bag("<w:lang w:val=\"en-GB\"/>"));
+        assert_eq!(p.spans[1].style.grab_bag, bag("<w:lang w:val=\"ar-SA\"/>"));
+
+        /* Byte-equal bags DO merge. */
+        let mut same = para.clone();
+        same.spans[1].style.grab_bag = bag("<w:lang w:val=\"en-GB\"/>");
+        let p = same.apply_style(0, 6, italic);
+        assert_eq!(p.spans.len(), 1, "byte-equal bags coalesce");
+        assert_eq!(p.spans[0].style.grab_bag, bag("<w:lang w:val=\"en-GB\"/>"));
+
+        /* Splitting inside a span clones the bag to both halves. */
+        let (l, r) = para.split_at(1);
+        assert_eq!(l.spans[0].style.grab_bag, bag("<w:lang w:val=\"en-GB\"/>"));
+        assert_eq!(r.spans[0].style.grab_bag, bag("<w:lang w:val=\"en-GB\"/>"));
+        assert_eq!(r.spans[1].style.grab_bag, bag("<w:lang w:val=\"ar-SA\"/>"));
+
+        /* Merge precedence: the patch's bag wins when it has one, else the
+        receiver keeps its own — a cascade baseline never carries one, so
+        a direct `<w:rPr>` bag always comes through unchanged. */
+        let base = bold(bag("<w:base/>"));
+        assert_eq!(
+            base.clone().merged_with(SpanStyle::default()).grab_bag,
+            bag("<w:base/>")
+        );
+        assert_eq!(
+            SpanStyle::default().merged_with(base.clone()).grab_bag,
+            bag("<w:base/>")
+        );
+        assert_eq!(
+            base.merged_with(bold(bag("<w:direct/>"))).grab_bag,
+            bag("<w:direct/>")
+        );
+        let pp = ParaProperties {
+            grab_bag: bag("<w:framePr/>"),
+            ..Default::default()
+        };
+        assert_eq!(
+            ParaProperties::default().merged_with(pp.clone()).grab_bag,
+            bag("<w:framePr/>")
+        );
+        assert_eq!(
+            pp.merged_with(ParaProperties::default()).grab_bag,
+            bag("<w:framePr/>")
+        );
+    }
+
+    /// Issue #84 — paragraph-level bags ride `props` through split /
+    /// concat like every other paragraph property.
+    #[test]
+    fn paragraph_grab_bag_rides_split_and_concat() {
+        let mut slot = None;
+        GrabBag::push_into(&mut slot, b"<w:cnfStyle w:val=\"1\"/>".to_vec());
+        let para = Paragraph {
+            text: "hello".into(),
+            props: ParaProperties {
+                grab_bag: slot.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (l, r) = para.split_at(2);
+        assert_eq!(l.props.grab_bag, slot);
+        assert_eq!(r.props.grab_bag, slot);
+        let joined = l.concat(&r);
+        assert_eq!(joined.props.grab_bag, slot);
+        assert_eq!(joined.text, "hello");
     }
 
     #[test]

@@ -4415,6 +4415,9 @@ fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
         file-round-trip only. */
         raw_font_family: None,
         font_theme: None,
+        /* Issue #84 — a formatting patch never carries a grab bag; the
+        run's own bag survives the merge (`SpanStyle::merged_with`). */
+        grab_bag: None,
     }
 }
 
@@ -9632,6 +9635,7 @@ impl Engine {
             vert_align: None,
             raw_font_family: r.font_family,
             font_theme: None,
+            grab_bag: None,
         });
         let based_on = if props.clear_based_on == Some(true) {
             Some(None)
