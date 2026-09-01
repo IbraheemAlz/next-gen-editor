@@ -1,0 +1,105 @@
+name: corpus-nightly
+
+# Issue #88 — nightly real-document corpus harness. Non-blocking (like
+# `qa-harness` in ci.yml): a "wild" .docx corpus is expected to surface
+# real bugs, and a bug FOUND is this workflow doing its job, not failing
+# CI. `continue-on-error: true` on the job keeps main green regardless of
+# outcome; the job's own findings go into the GitHub Step Summary and, for
+# new panic/crash signatures, a filed/updated tracking issue.
+#
+# The corpus currently seeded by `tools/corpus/sources.json` is ~170
+# documents (our own fixtures + Apache POI's `test-data/document/` +
+# docx4j's sample docs) — see tools/corpus/manifest.json for the exact
+# provenance record. The issue's "≥ 1,000 real documents" acceptance bar
+# is intentionally NOT met by this initial source list (this PR's own
+# disk/time budget is a local 1 GB / "a few hundred documents" cap); this
+# workflow's `--max-bytes` is generous (2 GB) precisely so growing
+# `sources.json` with more `github-dir` entries scales the corpus without
+# touching this file again.
+
+on:
+  schedule:
+    # 03:17 UTC — off-peak, arbitrary minute offset to avoid the top-of-hour
+    # GitHub Actions cron stampede.
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  # `file-issue.mjs` files/updates/reopens/comments on issues for new
+  # panic + crash signatures.
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  corpus:
+    name: Real-document corpus harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Corpus files are cached across runs, keyed on `sources.json` — a
+      # change to the source list invalidates the cache and re-fetches;
+      # otherwise `fetch.mjs` sees every file already on disk and only
+      # re-verifies (no network beyond the two directory-listing calls).
+      - name: Cache corpus files
+        uses: actions/cache@v4
+        with:
+          path: ~/corpus-cache/files
+          key: corpus-files-${{ hashFiles('tools/corpus/sources.json') }}
+
+      - name: Fetch corpus
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node tools/corpus/fetch.mjs --out-dir ~/corpus-cache/files --max-bytes 2000000000
+
+      - name: Build corpus-native (release)
+        run: cargo build -p corpus-native --release
+
+      - name: Run corpus harness
+        run: |
+          cargo run -p corpus-native --release -- \
+            --corpus-dir ~/corpus-cache/files \
+            --out ~/corpus-cache/results.jsonl \
+            --timeout-secs 90
+
+      - name: Triage report
+        if: always()
+        run: |
+          node tools/corpus/report.mjs \
+            --in ~/corpus-cache/results.jsonl \
+            --json ~/corpus-cache/summary.json \
+            --top 30 \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: File / update tracking issues for new panic + crash signatures
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node tools/corpus/file-issue.mjs --json ~/corpus-cache/summary.json --repo ${{ github.repository }}
+
+      - name: Upload JSONL + summary artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-results
+          path: |
+            ~/corpus-cache/results.jsonl
+            ~/corpus-cache/summary.json
+          retention-days: 30
