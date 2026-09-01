@@ -1380,6 +1380,7 @@ mod tests {
             footnotes: Vec::new(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         }
     }
 
@@ -1535,6 +1536,7 @@ mod tests {
             footnotes: Vec::new(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         };
         let mut out = Vec::new();
         export_pdf(
@@ -1639,6 +1641,7 @@ mod tests {
                 footnotes: Vec::new(),
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
+                floats: Vec::new(),
             }
         }
         let stack = liberation_stack();
@@ -1672,6 +1675,7 @@ mod tests {
             footnotes: Vec::new(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         };
         let mut out = Vec::new();
         export_pdf(
@@ -1969,6 +1973,7 @@ mod tests {
                 inline_image_rel_id: None,
                 inline_footnote_marker: None,
                 inline_object_height: 0.0,
+                float: None,
             }],
             font: "liberation".to_string(),
             direction: ShapingDirection::Ltr,
@@ -2019,6 +2024,7 @@ mod tests {
             footnotes: Vec::new(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         };
         let mut out = Vec::new();
         export_pdf(

@@ -6179,6 +6179,7 @@ impl Engine {
                         footnotes: Vec::new(),
                         hf_role: layout::HeaderRole::Default,
                         page_number: incoming,
+                        floats: Vec::new(),
                     });
                     emitted_paths.push(Vec::new());
                 }
@@ -6493,6 +6494,7 @@ impl Engine {
                 footnotes: Vec::new(),
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
+                floats: Vec::new(),
             });
             emitted_paths.push(Vec::new());
         }
@@ -6532,6 +6534,7 @@ impl Engine {
             footnotes: Vec::new(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         });
         let p0 = paths.drain(..).next().unwrap_or_default();
         Ok((page, fonts, p0))
@@ -11638,6 +11641,7 @@ mod tests {
             inline_image_rel_id: None,
             inline_footnote_marker: None,
             inline_object_height: 0.0,
+            float: None,
         };
         let run = layout::VisualRun {
             glyphs: vec![
@@ -13500,6 +13504,7 @@ mod tests {
                     width_emu: 914_400,  // 1 inch
                     height_emu: 457_200, // 0.5 inch
                 },
+                anchor: None,
             });
         }
         let engine = test_engine_with_doc(doc);
@@ -13545,6 +13550,7 @@ mod tests {
                     width_emu: 457_200,
                     height_emu: 457_200,
                 },
+                anchor: None,
             });
         }
         let mut engine = test_engine_with_doc(doc);
@@ -14635,6 +14641,7 @@ mod tests {
             footnotes: Vec::new(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         }
     }
 

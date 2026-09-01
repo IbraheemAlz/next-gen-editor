@@ -5372,6 +5372,7 @@ mod tests {
                     width_emu: 1_905_000,
                     height_emu: 1_524_000,
                 },
+                anchor: None,
             }],
             hyperlinks: Vec::new(),
             revisions: Vec::new(),

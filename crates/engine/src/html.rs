@@ -627,6 +627,7 @@ fn parse_img(body: &str) -> Option<InlineObject> {
             width_emu,
             height_emu,
         },
+        anchor: None,
     })
 }
 
@@ -1365,6 +1366,7 @@ mod tests {
                     width_emu: 1_905_000,  // 200 px @ 96 DPI
                     height_emu: 1_524_000, // 160 px @ 96 DPI
                 },
+                anchor: None,
             }],
             hyperlinks: Vec::new(),
             revisions: Vec::new(),

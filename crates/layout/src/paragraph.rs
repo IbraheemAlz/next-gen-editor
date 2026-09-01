@@ -44,6 +44,15 @@ pub struct InlineObjectInfo {
 pub enum InlineObjectInfoKind {
     Image { rel_id: String },
     FootnoteMarker { text: String },
+    /// Issue #69 — a FLOATING image (`<wp:anchor>`). The sentinel glyph
+    /// reserves no width; `width_px` / `height_px` on the owning
+    /// [`InlineObjectInfo`] are the object's own extent, carried to the
+    /// paginator through [`crate::boxes::FloatGlyph`] together with the
+    /// frame-relative positioning `spec`.
+    FloatingImage {
+        rel_id: String,
+        spec: crate::boxes::FloatSpec,
+    },
 }
 
 pub struct ParagraphConfig<'a> {
@@ -353,6 +362,7 @@ fn build_marker(
             inline_image_rel_id: None,
             inline_footnote_marker: None,
             inline_object_height: 0.0,
+            float: None,
         })
         .collect();
     let width = glyphs.iter().map(|g| g.x_advance).sum::<f32>();
@@ -1085,26 +1095,53 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                         .inline_objects
                         .iter()
                         .find(|info| info.at == abs_cluster);
-                    let (image_rel, footnote_marker) = match info.map(|i| &i.kind) {
+                    let (image_rel, footnote_marker, float) = match info.map(|i| &i.kind) {
                         Some(crate::paragraph::InlineObjectInfoKind::Image { rel_id }) => {
-                            (Some(rel_id.clone()), None)
+                            (Some(rel_id.clone()), None, None)
                         }
                         Some(crate::paragraph::InlineObjectInfoKind::FootnoteMarker { text }) => {
-                            (None, Some(text.clone()))
+                            (None, Some(text.clone()), None)
                         }
-                        None => (None, None),
+                        /* Issue #69 — a floating object's sentinel: the
+                        glyph reserves NO width and grows NO line; the
+                        payload rides to the paginator, which positions
+                        the object against its reference frame. */
+                        Some(crate::paragraph::InlineObjectInfoKind::FloatingImage {
+                            rel_id,
+                            spec,
+                        }) => (
+                            None,
+                            None,
+                            Some(Box::new(crate::boxes::FloatGlyph {
+                                rel_id: rel_id.clone(),
+                                width: info.map_or(0.0, |i| i.width_px),
+                                height: info.map_or(0.0, |i| i.height_px),
+                                spec: *spec,
+                            })),
+                        ),
+                        None => (None, None, None),
                     };
+                    let is_float = float.is_some();
                     PositionedGlyph {
                         id: g.glyph_id as u16,
                         cluster: cluster_src,
-                        x_advance: info.map_or(g.x_advance, |i| i.width_px),
+                        x_advance: if is_float {
+                            0.0
+                        } else {
+                            info.map_or(g.x_advance, |i| i.width_px)
+                        },
                         y_advance: g.y_advance,
                         x_offset: g.x_offset,
                         y_offset: g.y_offset,
                         synthetic: false,
                         inline_image_rel_id: image_rel,
                         inline_footnote_marker: footnote_marker,
-                        inline_object_height: info.map_or(0.0, |i| i.height_px),
+                        inline_object_height: if is_float {
+                            0.0
+                        } else {
+                            info.map_or(0.0, |i| i.height_px)
+                        },
+                        float,
                     }
                 })
                 .collect();
@@ -1475,6 +1512,7 @@ fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &Fon
         inline_image_rel_id: None,
         inline_footnote_marker: None,
         inline_object_height: 0.0,
+        float: None,
     };
     for _ in 0..n {
         run.glyphs.insert(glyph_idx + 1, tatweel_glyph.clone());
@@ -1615,6 +1653,7 @@ mod tests {
             inline_image_rel_id: None,
             inline_footnote_marker: None,
             inline_object_height: 0.0,
+            float: None,
         }
     }
 

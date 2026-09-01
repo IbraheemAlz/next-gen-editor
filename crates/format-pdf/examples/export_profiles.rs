@@ -73,6 +73,7 @@ fn hello_page(stack: &FontStack) -> PageBox {
         footnotes: Vec::new(),
         hf_role: layout::HeaderRole::Default,
         page_number: 1,
+        floats: Vec::new(),
     }
 }
 

@@ -679,6 +679,7 @@ mod tests {
                     width_emu: 1_905_000,
                     height_emu: 1_524_000,
                 },
+                anchor: None,
             }],
             ..Default::default()
         };
@@ -706,6 +707,7 @@ mod tests {
                     width_emu: 0,
                     height_emu: 0,
                 },
+                anchor: None,
             }],
             ..Default::default()
         };

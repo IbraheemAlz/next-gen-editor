@@ -171,6 +171,11 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         let content_x = page.margins.left;
         let content_y = top + page.margins.top;
 
+        /* Issue #69 — floating objects marked `behindDoc` paint UNDER every
+        band and body glyph (right after the page card), lowest z-order
+        first. The in-front group closes the page below. */
+        paint_floats(page, top, true, &mut cmds);
+
         /* Phase 6 — header band painted before body so a wide header doesn't
         sit on top of body text. Phase 3 (#39): band placement comes from
         `PageBox::header_band_top()` — the document's real

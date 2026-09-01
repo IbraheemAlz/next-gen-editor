@@ -1268,7 +1268,7 @@ impl Paginator {
         / `start_new_section` — the renderer paints the blank sheet so a
         section break is visible. */
         let page_number = self.current_formatted_page_no();
-        self.pages.push(PageBox {
+        let mut page = PageBox {
             size: Size {
                 width: self.geometry.width,
                 height: self.geometry.height,
@@ -1289,7 +1289,19 @@ impl Paginator {
             field-resolution pass reads `page_number`. */
             hf_role: role,
             page_number,
-        });
+            floats: Vec::new(),
+        };
+        /* Issue #69 — floating objects are a pure function of the placed
+        blocks (no wrap yet, so no feedback into the flow): resolve them
+        once the page's geometry is final. One pass, no iteration. */
+        page.floats = crate::floats::resolve_page_floats(
+            &page,
+            crate::floats::ColumnLayout {
+                count: self.column_count.max(1),
+                gutter: self.column_gutter,
+            },
+        );
+        self.pages.push(page);
 
         /* Clear the section-first-page flag once a page has flushed for
         the section. Subsequent pages in the same section pick
@@ -2666,6 +2678,7 @@ mod tests {
             inline_image_rel_id: None,
             inline_footnote_marker: Some(id.to_string()),
             inline_object_height: 0.0,
+            float: None,
         };
         p.lines[0].runs.push(crate::boxes::VisualRun {
             glyphs: vec![glyph],

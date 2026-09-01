@@ -417,6 +417,22 @@ pub fn geometry_fingerprint(pages: &[PageBox]) -> u64 {
             f.marker.hash(&mut h);
             hash_paragraph(&mut h, &f.paragraph);
         }
+        /* Issue #69 — floating objects join the fingerprint ONLY when
+        present, so every pre-#69 pinned value (documents without floats)
+        is unchanged by construction. */
+        if !page.floats.is_empty() {
+            (page.floats.len() as u64).hash(&mut h);
+            for f in &page.floats {
+                hash_f32(&mut h, f.origin.x);
+                hash_f32(&mut h, f.origin.y);
+                hash_f32(&mut h, f.size.width);
+                hash_f32(&mut h, f.size.height);
+                f.rel_id.hash(&mut h);
+                f.at.hash(&mut h);
+                f.z_order.hash(&mut h);
+                f.behind_doc.hash(&mut h);
+            }
+        }
     }
     h.finish()
 }
@@ -687,6 +703,7 @@ mod tests {
             footnotes: Vec::new(),
             hf_role: crate::boxes::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         }
     }
 

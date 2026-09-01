@@ -762,6 +762,7 @@ pub fn parse_document_xml(
                                     id,
                                     display_number: footnote_display_counter,
                                 },
+                                anchor: None,
                             });
                         }
                     }
@@ -972,6 +973,7 @@ pub fn parse_document_xml(
                                     width_emu: cx,
                                     height_emu: cy,
                                 },
+                                anchor: None,
                             });
                         } else {
                             /* Anchor / floating or malformed — drop. */
