@@ -242,6 +242,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "differential-native"
+version = "0.5.0-beta.3"
+dependencies = [
+ "anyhow",
+ "engine",
+ "format-docx",
+ "format-pdf",
+ "layout",
+ "text-pipeline",
+ "zip",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

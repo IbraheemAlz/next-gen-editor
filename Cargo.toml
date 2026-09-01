@@ -12,6 +12,7 @@ members = [
     "tools/shape-regression",
     "tools/roundtrip",
     "tools/perf-fixtures",
+    "tools/differential-native",
 ]
 resolver = "2"
 
