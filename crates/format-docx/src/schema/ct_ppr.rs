@@ -9,12 +9,85 @@
 //!
 //! Twip values land in the engine model verbatim; layout converts to px.
 
-use crate::schema::ct_rpr::{attr_val, parse_hex_color, toggle_on};
+use crate::schema::ct_rpr::{attr_val, parse_hex_color, schema_rank, toggle_on};
 use engine::{Alignment, Indent, LineHeight, ParaProperties, Spacing, TextDirection};
 use quick_xml::events::BytesStart;
 
+/// Issue #84 — `true` for every `<w:pPr>` child the reader consumes: the
+/// arms of [`apply_ppr`] plus the container / reference children the
+/// part parsers handle in their own loops (`pStyle`, `numPr`, `pBdr`,
+/// `tabs`, `sectPr`). The paragraph-mark `<w:rPr>` is deliberately NOT
+/// here — the writer never regenerates it, so the whole element rides
+/// the paragraph's grab bag (its modeled children still seed the run
+/// baseline via `ct_rpr::fold_rpr_fragment`).
+pub fn ppr_child_is_modeled(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"w:pStyle"
+            | b"w:keepNext"
+            | b"w:keepLines"
+            | b"w:pageBreakBefore"
+            | b"w:numPr"
+            | b"w:pBdr"
+            | b"w:shd"
+            | b"w:tabs"
+            | b"w:bidi"
+            | b"w:spacing"
+            | b"w:ind"
+            | b"w:jc"
+            | b"w:sectPr"
+    )
+}
+
+/// Issue #84 — rank of a `<w:pPr>` child in the `CT_PPrBase` sequence
+/// (ECMA-376 §17.3.1.26) followed by the `CT_PPr` tail (`rPr`, `sectPr`,
+/// `pPrChange`). Unlike `rPr`, this IS a strict sequence — strict
+/// validators and Word's repair dialog reject out-of-order children — so
+/// the writer emits modeled children and grab-bag fragments interleaved
+/// by this rank. Unknown children rank just before `pPrChange`.
+pub fn ppr_child_rank(name: &[u8]) -> u16 {
+    const ORDER: &[&[u8]] = &[
+        b"w:pStyle",
+        b"w:keepNext",
+        b"w:keepLines",
+        b"w:pageBreakBefore",
+        b"w:framePr",
+        b"w:widowControl",
+        b"w:numPr",
+        b"w:suppressLineNumbers",
+        b"w:pBdr",
+        b"w:shd",
+        b"w:tabs",
+        b"w:suppressAutoHyphens",
+        b"w:kinsoku",
+        b"w:wordWrap",
+        b"w:overflowPunct",
+        b"w:topLinePunct",
+        b"w:autoSpaceDE",
+        b"w:autoSpaceDN",
+        b"w:bidi",
+        b"w:adjustRightInd",
+        b"w:snapToGrid",
+        b"w:spacing",
+        b"w:ind",
+        b"w:contextualSpacing",
+        b"w:mirrorIndents",
+        b"w:suppressOverlap",
+        b"w:jc",
+        b"w:textDirection",
+        b"w:textAlignment",
+        b"w:textboxTightWrap",
+        b"w:outlineLvl",
+        b"w:divId",
+        b"w:cnfStyle",
+        b"w:rPr",
+        b"w:sectPr",
+    ];
+    schema_rank(ORDER, name, b"w:pPrChange")
+}
+
 /// `<w:jc w:val="…"/>` → engine `Alignment`. Unknown values are dropped.
-fn parse_jc(v: &str) -> Option<Alignment> {
+pub(crate) fn parse_jc(v: &str) -> Option<Alignment> {
     match v.trim().to_ascii_lowercase().as_str() {
         /* Word emits `start` / `end` (writing-direction-relative) in modern
         docs and `left` / `right` (absolute) in older / Strict ones; treat
@@ -132,6 +205,51 @@ mod tests {
             buf.clear();
         }
         props
+    }
+
+    /// Issue #84 — the rank table is the CT_PPrBase sequence + CT_PPr
+    /// tail; every modeled child has a rank and unknowns sort before
+    /// `pPrChange`.
+    #[test]
+    fn ppr_ranks_follow_ct_ppr_sequence() {
+        let seq: [&[u8]; 14] = [
+            b"w:pStyle",
+            b"w:keepNext",
+            b"w:pageBreakBefore",
+            b"w:framePr",
+            b"w:numPr",
+            b"w:pBdr",
+            b"w:shd",
+            b"w:tabs",
+            b"w:bidi",
+            b"w:spacing",
+            b"w:ind",
+            b"w:jc",
+            b"w:cnfStyle",
+            b"w:rPr",
+        ];
+        for w in seq.windows(2) {
+            assert!(
+                ppr_child_rank(w[0]) < ppr_child_rank(w[1]),
+                "{:?} must precede {:?}",
+                String::from_utf8_lossy(w[0]),
+                String::from_utf8_lossy(w[1])
+            );
+        }
+        assert!(ppr_child_rank(b"w:rPr") < ppr_child_rank(b"w:sectPr"));
+        assert!(ppr_child_rank(b"w:sectPr") < ppr_child_rank(b"mc:AlternateContent"));
+        assert!(ppr_child_rank(b"mc:AlternateContent") < ppr_child_rank(b"w:pPrChange"));
+        for name in seq {
+            if name == b"w:framePr" || name == b"w:cnfStyle" || name == b"w:rPr" {
+                assert!(!ppr_child_is_modeled(name));
+            } else {
+                assert!(
+                    ppr_child_is_modeled(name),
+                    "{}",
+                    String::from_utf8_lossy(name)
+                );
+            }
+        }
     }
 
     #[test]

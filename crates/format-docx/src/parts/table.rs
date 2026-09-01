@@ -13,21 +13,46 @@
 //! render can paint correctly, never for write-back at PR 2.
 
 use crate::error::DocxError;
+use crate::schema::ct_ppr::parse_jc;
 use crate::schema::ct_rpr::{attr_val, parse_hex_color};
+use crate::schema::ct_tbl;
+use crate::schema::grab_bag::{NamespaceScope, capture_subtree, slice_fragment, stash};
 use engine::{
-    Block, BorderStroke, BorderStyle, CellBorders, CellMargins, CellWidth, RowHeight, Table,
-    TableCell, TableProperties, TableRow, VMergeRole, VerticalAlign,
+    Block, BorderStroke, BorderStyle, CellBorders, CellMargins, CellWidth, GrabBag, RowHeight,
+    Table, TableCell, TableProperties, TableRow, VMergeRole, VerticalAlign,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
+
+/// Issue #84 — the grab-bag slot an unmodeled child of `parent`
+/// (`w:tblPr` / `w:trPr` / `w:tcPr`) belongs to. `None` when the row /
+/// cell it would attach to is not open (malformed nesting).
+fn bag_for<'a>(
+    parent: &[u8],
+    props: &'a mut TableProperties,
+    cur_row: &'a mut Option<TableRow>,
+    cur_cell: &'a mut Option<TableCell>,
+) -> Option<&'a mut Option<Box<GrabBag>>> {
+    match parent {
+        b"w:tblPr" => Some(&mut props.grab_bag),
+        b"w:trPr" => cur_row.as_mut().map(|r| &mut r.props.grab_bag),
+        b"w:tcPr" => cur_cell.as_mut().map(|c| &mut c.props.grab_bag),
+        _ => None,
+    }
+}
 
 /// Parse a `<w:tbl>...</w:tbl>` byte slice. Always starts with a
 /// `<w:tbl>` opening tag; depth bookkeeping handles nested tables
 /// inside cell content (each nested `<w:tbl>` produces a recursive
 /// `parse_table_bytes` call when we hit the `<w:tc>` close).
+///
+/// `ns` is the enclosing part's root namespace scope (issue #84): the
+/// slice has no root of its own, so foreign-prefixed grab-bag fragments
+/// re-bind from the part that contained the table.
 pub fn parse_table_bytes(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
+    ns: &NamespaceScope,
 ) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
@@ -86,6 +111,23 @@ pub fn parse_table_bytes(
                     }
                     _ => {}
                 }
+                /* Issue #84 — an unmodeled child of `<w:tblPr>` / `<w:trPr>`
+                / `<w:tcPr>` (`<w:tblpPr>`, `<w:trPrChange>`, …): capture
+                the whole subtree into the owning grab bag and skip it, so
+                nothing inside is mistaken for a live property. */
+                if nested_tbl_depth == 0
+                    && let Some(parent) = stack.last()
+                    && ct_tbl::child_is_modeled(parent, &name) == Some(false)
+                {
+                    if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)?
+                        && let Some(slot) = bag_for(parent, &mut props, &mut cur_row, &mut cur_cell)
+                    {
+                        stash(slot, frag, ns);
+                    }
+                    prev_pos = reader.buffer_position() as usize;
+                    buf.clear();
+                    continue;
+                }
                 if nested_tbl_depth == 0 {
                     handle_property_start(
                         &name,
@@ -101,7 +143,20 @@ pub fn parse_table_bytes(
             }
             Event::Empty(e) => {
                 let name = e.name().as_ref().to_owned();
-                if nested_tbl_depth == 0 {
+                if nested_tbl_depth == 0
+                    && let Some(parent) = stack.last()
+                    && ct_tbl::child_is_modeled(parent, &name) == Some(false)
+                {
+                    /* Issue #84 — unmodeled leaf child (`<w:tblLook>`,
+                    `<w:bidiVisual>`, `<w:cnfStyle>`, `<w:noWrap>`, …) →
+                    the owning grab bag, verbatim. */
+                    let end = reader.buffer_position() as usize;
+                    if let Some(frag) = slice_fragment(xml, prev_pos, end)
+                        && let Some(slot) = bag_for(parent, &mut props, &mut cur_row, &mut cur_cell)
+                    {
+                        stash(slot, frag, ns);
+                    }
+                } else if nested_tbl_depth == 0 {
                     handle_property_empty(
                         &name,
                         &e,
@@ -125,7 +180,7 @@ pub fn parse_table_bytes(
                             let end = reader.buffer_position() as usize;
                             if start < end && end <= xml.len() {
                                 let raw = xml[start..end].to_vec();
-                                if let Ok((g, p, r)) = parse_table_bytes(&raw, resolver) {
+                                if let Ok((g, p, r)) = parse_table_bytes(&raw, resolver, ns) {
                                     cell.blocks.push(Block::Table(Table {
                                         grid: g,
                                         props: p,
@@ -168,8 +223,9 @@ pub fn parse_table_bytes(
                                 the visible text and stash source bytes
                                 for round-trip. Full cascade + numbering
                                 inside cells lands in Phase 5 PR 3. */
-                                cell.blocks
-                                    .push(Block::Paragraph(parse_cell_paragraph(&raw, resolver)));
+                                cell.blocks.push(Block::Paragraph(parse_cell_paragraph(
+                                    &raw, resolver, ns,
+                                )));
                             }
                         }
                     }
@@ -198,17 +254,17 @@ pub fn parse_table_bytes(
 fn parse_cell_paragraph(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
+    ns: &NamespaceScope,
 ) -> engine::Paragraph {
     use crate::parts::document::{apply_pbdr_edge, parse_tab_stop};
-    use crate::schema::ct_ppr::apply_ppr;
-    use crate::schema::ct_rpr::{apply_rpr, attr_val};
+    use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
+    use crate::schema::ct_rpr::{attr_val, fold_rpr_fragment};
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut text = String::new();
     let mut in_text = false;
     let mut in_ppr = false;
-    let mut in_rpr = false;
     let mut in_num_pr = false;
     let mut in_pbdr = false;
     let mut in_tabs = false;
@@ -217,17 +273,33 @@ fn parse_cell_paragraph(
     let mut direct_ppr = engine::ParaProperties::default();
     let mut list_num_id: Option<u32> = None;
     let mut list_ilvl: Option<u8> = None;
+    /* Issue #84 — byte offset of the event about to be read, for
+    grab-bag fragment capture (mirrors `parts::document`). */
+    let mut prev_pos: usize = 0;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
                 b"w:t" => in_text = true,
                 b"w:pPr" => in_ppr = true,
-                b"w:rPr" if in_ppr => in_rpr = true,
+                b"w:rPr" if in_ppr => {
+                    /* Issue #84 — paragraph-mark `<w:rPr>`: whole element
+                    into the pPr grab bag, modeled children folded into
+                    the run baseline (see `parts::document`). */
+                    if let Ok(Some(frag)) = capture_subtree(xml, prev_pos, &mut reader, &e) {
+                        fold_rpr_fragment(&frag, &mut pmark_rpr);
+                        stash(&mut direct_ppr.grab_bag, frag, ns);
+                    }
+                }
                 b"w:numPr" if in_ppr => in_num_pr = true,
                 b"w:pBdr" if in_ppr => in_pbdr = true,
                 b"w:tabs" if in_ppr => in_tabs = true,
-                n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
-                n if in_ppr && !in_rpr && !in_num_pr && !in_pbdr && !in_tabs => {
+                n if in_ppr && !in_num_pr && !in_pbdr && !in_tabs && !ppr_child_is_modeled(n) => {
+                    /* Issue #84 — unmodeled `<w:pPr>` container child. */
+                    if let Ok(Some(frag)) = capture_subtree(xml, prev_pos, &mut reader, &e) {
+                        stash(&mut direct_ppr.grab_bag, frag, ns);
+                    }
+                }
+                n if in_ppr && !in_num_pr && !in_pbdr && !in_tabs => {
                     apply_ppr(n, &e, &mut direct_ppr);
                 }
                 _ => {}
@@ -240,14 +312,26 @@ fn parse_cell_paragraph(
                 b"w:ilvl" if in_num_pr => {
                     list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.trim().parse().ok());
                 }
-                n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
+                b"w:rPr" if in_ppr => {
+                    let end = reader.buffer_position() as usize;
+                    if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                        stash(&mut direct_ppr.grab_bag, frag, ns);
+                    }
+                }
                 n if in_ppr && in_pbdr => apply_pbdr_edge(n, &e, &mut direct_ppr),
                 n if in_ppr && in_tabs && n == b"w:tab" => {
                     if let Some(stop) = parse_tab_stop(&e) {
                         direct_ppr.tab_stops.push(stop);
                     }
                 }
-                n if in_ppr && !in_rpr && !in_num_pr && !in_pbdr && !in_tabs => {
+                n if in_ppr && !in_num_pr && !in_pbdr && !in_tabs && !ppr_child_is_modeled(n) => {
+                    /* Issue #84 — unmodeled `<w:pPr>` leaf child. */
+                    let end = reader.buffer_position() as usize;
+                    if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                        stash(&mut direct_ppr.grab_bag, frag, ns);
+                    }
+                }
+                n if in_ppr && !in_num_pr && !in_pbdr && !in_tabs => {
                     apply_ppr(n, &e, &mut direct_ppr);
                 }
                 _ => {}
@@ -255,7 +339,6 @@ fn parse_cell_paragraph(
             Ok(Event::End(e)) => match e.name().as_ref() {
                 b"w:t" => in_text = false,
                 b"w:pPr" => in_ppr = false,
-                b"w:rPr" => in_rpr = false,
                 b"w:numPr" => in_num_pr = false,
                 b"w:pBdr" => in_pbdr = false,
                 b"w:tabs" => in_tabs = false,
@@ -269,6 +352,7 @@ fn parse_cell_paragraph(
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
+        prev_pos = reader.buffer_position() as usize;
         buf.clear();
     }
     /* Audit gap A.M18 — resolve cell paragraph through the style cascade.
@@ -515,6 +599,14 @@ fn handle_property_inner(
             b"w:tblStyle" => {
                 props.table_style_id = attr_val(e, b"w:val");
             }
+            /* Issue #84 — `<w:jc>` was write-only (the writer emits it
+            from `alignment`, the reader never filled it). Reading it
+            closes the asymmetry so it is modeled on both sides rather
+            than bagged — a bagged copy plus an engine-set alignment
+            would otherwise emit two `<w:jc>` children. */
+            b"w:jc" => {
+                props.alignment = attr_val(e, b"w:val").and_then(|v| parse_jc(&v));
+            }
             /* Audit gap A.M8 — `<w:tblLayout w:type="autofit|fixed"/>`. */
             b"w:tblLayout" => {
                 props.layout = match attr_val(e, b"w:type").as_deref().map(str::trim) {
@@ -593,8 +685,12 @@ mod tests {
     #[test]
     fn parses_2x2_table_with_grid() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
-        let (grid, _props, rows) =
-            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
+        let (grid, _props, rows) = parse_table_bytes(
+            xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+        )
+        .expect("parse");
         assert_eq!(grid, vec![2880, 2880]);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].cells.len(), 2);
@@ -613,8 +709,12 @@ mod tests {
     #[test]
     fn parses_grid_span_and_vmerge() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>merged</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>top</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>r1c2</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc><w:tc><w:p><w:r><w:t>r2c2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
-        let (_, _, rows) =
-            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
+        let (_, _, rows) = parse_table_bytes(
+            xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+        )
+        .expect("parse");
         assert_eq!(rows[0].cells[0].props.grid_span, 2);
         assert_eq!(rows[1].cells[0].props.v_merge, VMergeRole::Restart);
         assert_eq!(rows[2].cells[0].props.v_merge, VMergeRole::Continue);
@@ -623,8 +723,12 @@ mod tests {
     #[test]
     fn parses_cell_shading_and_borders() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="FFEB78"/><w:tcBorders><w:top w:val="double" w:sz="12" w:color="FF0000"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
-        let (_, _, rows) =
-            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
+        let (_, _, rows) = parse_table_bytes(
+            xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+        )
+        .expect("parse");
         let cell = &rows[0].cells[0];
         assert_eq!(cell.props.shading, Some([0xFF, 0xEB, 0x78, 0xFF]));
         let top = cell
@@ -644,8 +748,12 @@ mod tests {
     #[test]
     fn cell_paragraph_reads_direct_ppr() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:pPr><w:jc w:val="center"/><w:ind w:start="720"/><w:bidi/><w:shd w:val="clear" w:fill="FFEB78"/><w:pBdr><w:top w:val="single" w:sz="8"/></w:pBdr><w:tabs><w:tab w:val="left" w:pos="1440"/></w:tabs></w:pPr><w:r><w:t>styled</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
-        let (_, _, rows) =
-            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
+        let (_, _, rows) = parse_table_bytes(
+            xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+        )
+        .expect("parse");
         let para = rows[0].cells[0].blocks[0]
             .as_paragraph()
             .expect("cell paragraph");
@@ -665,11 +773,73 @@ mod tests {
         );
     }
 
+    /// Issue #84 — unmodeled children of every property container land
+    /// in the owning grab bag, document order, containers captured whole;
+    /// a cell paragraph's direct `<w:pPr>` (and its whole paragraph-mark
+    /// `<w:rPr>`) bag the same way.
+    #[test]
+    fn captures_unmodeled_property_children_into_grab_bags() {
+        let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblpPr w:leftFromText="180" w:vertAnchor="text"/><w:tblW w:w="0" w:type="auto"/><w:tblLook w:val="04A0"/><w:tblPrChange w:id="1" w:author="A" w:date="D"><w:tblPr><w:tblW w:w="5000" w:type="pct"/></w:tblPr></w:tblPrChange></w:tblPr><w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:trPr><w:cnfStyle w:val="1"/><w:cantSplit/><w:jc w:val="right"/></w:trPr><w:tc><w:tcPr><w:tcW w:w="2880" w:type="dxa"/><w:textDirection w:val="btLr"/><w:vAlign w:val="bottom"/><w:hideMark/></w:tcPr><w:p><w:pPr><w:widowControl w:val="false"/><w:jc w:val="center"/><w:rPr><w:b/></w:rPr></w:pPr><w:r><w:t>styled</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let (_, props, rows) = parse_table_bytes(
+            xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+        )
+        .expect("parse");
+        /* Modeled children still parse; the `tblPrChange` history does
+        not override the live width. */
+        assert_eq!(props.table_style_id.as_deref(), Some("TableGrid"));
+        assert_eq!(props.width, Some(CellWidth::Auto));
+        assert_eq!(
+            GrabBag::fragments_of(&props.grab_bag),
+            &[
+                br#"<w:tblpPr w:leftFromText="180" w:vertAnchor="text"/>"#.to_vec(),
+                br#"<w:tblLook w:val="04A0"/>"#.to_vec(),
+                br#"<w:tblPrChange w:id="1" w:author="A" w:date="D"><w:tblPr><w:tblW w:w="5000" w:type="pct"/></w:tblPr></w:tblPrChange>"#.to_vec(),
+            ]
+        );
+        let row = &rows[0];
+        assert!(row.props.cant_split);
+        assert_eq!(
+            GrabBag::fragments_of(&row.props.grab_bag),
+            &[
+                br#"<w:cnfStyle w:val="1"/>"#.to_vec(),
+                br#"<w:jc w:val="right"/>"#.to_vec()
+            ]
+        );
+        let cell = &row.cells[0];
+        assert_eq!(cell.props.v_align, VerticalAlign::Bottom);
+        assert_eq!(
+            GrabBag::fragments_of(&cell.props.grab_bag),
+            &[
+                br#"<w:textDirection w:val="btLr"/>"#.to_vec(),
+                b"<w:hideMark/>".to_vec()
+            ]
+        );
+        let para = cell.blocks[0].as_paragraph().expect("cell paragraph");
+        assert_eq!(para.props.alignment, Some(engine::Alignment::Center));
+        assert_eq!(
+            GrabBag::fragments_of(&para.props.grab_bag),
+            &[
+                br#"<w:widowControl w:val="false"/>"#.to_vec(),
+                b"<w:rPr><w:b/></w:rPr>".to_vec()
+            ]
+        );
+        assert_eq!(
+            para.direct_overrides.grab_bag, para.props.grab_bag,
+            "bag rides direct_overrides for style re-application"
+        );
+    }
+
     #[test]
     fn nested_table_recurses() {
         let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>outer</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc></w:tr></w:tbl>"#;
-        let (_, _, rows) =
-            parse_table_bytes(xml, &StyleResolver::new(&empty_resolver())).expect("parse");
+        let (_, _, rows) = parse_table_bytes(
+            xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+        )
+        .expect("parse");
         let cell = &rows[0].cells[0];
         /* `outer` paragraph + nested table block. */
         assert_eq!(cell.blocks.len(), 2);

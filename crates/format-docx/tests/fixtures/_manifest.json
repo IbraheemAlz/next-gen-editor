@@ -1,5 +1,19 @@
 {
   "fixtures": {
+    "grab_bag_exotic.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 9,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "exotic run",
+          "after"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "list_bullet_numbered.docx": {
       "generator": "handcrafted",
       "phase_introduced": 4,
