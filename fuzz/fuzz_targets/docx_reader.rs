@@ -1,17 +1,12 @@
 #![no_main]
-//! Fuzz the `.docx` reader with arbitrary bytes — the parser must never panic,
-//! only return `Err` on malformed input (PHASE_5 §8, §9 zip-slip / zip-bomb).
-//!
-//! PHASE_5 §8 sketches a `Reader::new(data).read_document()` API; the real
-//! `format-docx` surface is the free function `read_docx`, used here.
+//! Fuzz the `.docx` reader with a structure-aware, schema-shaped WML
+//! document wrapped in a minimal OPC package (D5.5, issue #90) — never
+//! raw bytes handed straight to the parser. See `engine_fuzz::docx_gen`
+//! for the generator and `engine_fuzz::run_docx_reader` for the body this
+//! wraps (also driven by `examples/smoke.rs` on stable Rust).
 
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    /* Skip trivially-tiny and oversized inputs — a `.docx` is a ZIP (needs a
-    header) and the §9 per-archive cap keeps the CI corpus run bounded. */
-    if data.len() < 4 || data.len() > 50 * 1024 * 1024 {
-        return;
-    }
-    let _ = format_docx::read_docx(data);
+    engine_fuzz::run_docx_reader(data);
 });
