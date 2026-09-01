@@ -41,3 +41,6 @@ Thumbs.db
 # Claude Code per-user overrides (settings.json is committed; .local.json is personal)
 .claude/settings.local.json
 .claude/.cache/
+
+# Private cargo cache for merge gates on main (never commit)
+target-main/
