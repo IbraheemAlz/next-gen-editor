@@ -1,0 +1,22 @@
+[package]
+name = "corpus-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Real-document corpus harness (issue #88) — native open -> layout -> PDF render -> save -> reopen driver over a directory of wild .docx files. Never touches a browser or engine-wasm; exercises crates/engine + crates/layout + crates/format-docx + crates/format-pdf directly."
+
+[[bin]]
+name = "corpus-native"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../../crates/engine" }
+format-docx = { path = "../../crates/format-docx" }
+layout = { path = "../../crates/layout" }
+text-pipeline = { path = "../../crates/text-pipeline" }
+format-pdf = { path = "../../crates/format-pdf" }
+serde = { workspace = true }
+serde_json = "1"
+anyhow = { workspace = true }
+zip = { workspace = true }

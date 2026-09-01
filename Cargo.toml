@@ -13,6 +13,7 @@ members = [
     "tools/roundtrip",
     "tools/perf-fixtures",
     "tools/differential-native",
+    "tools/corpus-native",
 ]
 resolver = "2"
 
