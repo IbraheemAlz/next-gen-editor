@@ -27,12 +27,13 @@
 //! truth for editing + synthesis.
 
 use crate::Indent;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// `<w:numFmt w:val>` — number/marker format. Engine ships the common
 /// formats; `Other` preserves the source token so a round-trip stays
 /// lossless.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum NumFmt {
     Decimal,
     DecimalZero,
@@ -46,7 +47,8 @@ pub enum NumFmt {
 }
 
 /// One `<w:lvl>` entry inside an `<w:abstractNum>`.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct LvlDef {
     pub ilvl: u8,
     pub start: i32,
@@ -70,7 +72,8 @@ impl Default for LvlDef {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct AbstractNum {
     pub id: u32,
     pub levels: Vec<LvlDef>,
@@ -82,7 +85,7 @@ impl AbstractNum {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LvlOverride {
     pub ilvl: u8,
     pub start_override: Option<i32>,
@@ -91,7 +94,7 @@ pub struct LvlOverride {
 
 /// `<w:num w:numId>` — paragraph-referenced instance binding a numId
 /// to an abstractNumId (plus optional per-level overrides).
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NumInstance {
     pub num_id: u32,
     pub abstract_num_id: u32,
@@ -108,15 +111,18 @@ impl NumInstance {
 /// [`NumberingDefinitions::synth_list_definition`] to pick which stock
 /// hierarchy to reuse or append. `Off` is handled by the caller; this
 /// enum covers only the two synthesisable kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListSynthesisKind {
     Bullet,
     Number,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct NumberingDefinitions {
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub abstract_nums: HashMap<u32, AbstractNum>,
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub num_instances: HashMap<u32, NumInstance>,
     /// Sprint 13 (#12) — flips to `true` on the first
     /// synth_list_definition call that materially mutates the store

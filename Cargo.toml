@@ -35,6 +35,9 @@ web-sys = { version = "0.3", features = [
 console_error_panic_hook = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+# Snapshot codec (issue #85) — self-describing MessagePack so `#[serde(default)]`
+# fills fields an older snapshot version lacks.
+rmp-serde = "1"
 serde-wasm-bindgen = "0.6"
 tsify-next = { version = "0.5", default-features = false, features = ["js"] }
 

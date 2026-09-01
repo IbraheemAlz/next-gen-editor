@@ -59,6 +59,13 @@ type GetRevisionsMsg = { id: number; type: 'GET_REVISIONS' };
    registers the surface so subsequent paints fill that page's
    <canvas> in the DOM. */
 type RegisterPageCanvasMsg = { id: number; type: 'REGISTER_PAGE_CANVAS'; idx: number; canvas: OffscreenCanvas };
+/* Issue #85 — fault injection (test hook). After `after_commands` more
+   LOGGED commands have been applied and acknowledged, the worker flushes
+   its in-flight event-log writes and traps the wasm instance on purpose
+   (`Engine.debug_force_trap`), exercising the REAL path — `RuntimeError`
+   → `{ trap: true }` → `self.close()` → respawn → `RECOVER` — instead of
+   `EngineClient.forceTrap()`'s worker.terminate() shortcut. */
+type ArmTrapMsg = { id: number; type: 'ARM_TRAP'; after_commands: number };
 
 type Msg =
     | InitMsg
@@ -68,7 +75,8 @@ type Msg =
     | ClientCommandMsg
     | GetCommentsMsg
     | GetRevisionsMsg
-    | RegisterPageCanvasMsg;
+    | RegisterPageCanvasMsg
+    | ArmTrapMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -91,6 +99,20 @@ let engine: Engine | null = null;
 let logSequence = 0;
 let lastSnapshotAt = 0;
 const SNAPSHOT_EVERY = 200;
+/* Issue #85 — idle snapshot cadence: this long after the last logged
+   command, with commands outstanding since the last snapshot, a snapshot
+   task is queued behind whatever is in flight. Together with
+   SNAPSHOT_EVERY this bounds the replay tail to ≤ 200 commands during a
+   typing burst and to ~0 once the user pauses. */
+const SNAPSHOT_IDLE_MS = 1500;
+let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
+/* Issue #85 — every in-flight event-log write, chained so the fault-
+   injection hook can flush before trapping. A REAL trap loses whatever
+   is still in flight at that instant — that is the inherent window of
+   logging off the critical path (D2.8), bounded by the idle snapshot. */
+let pendingLogWrites: Promise<unknown> = Promise.resolve();
+/* Issue #85 — fault-injection countdown; `null` = disarmed. */
+let trapAfterCommands: number | null = null;
 
 /* Highest `version` seen on a real `Painted` event — synthetic paint-dims
    broadcasts reuse it so `paintVersion` consumers never see a reset to 0. */
@@ -796,11 +818,22 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                 import.meta.url,
             ),
         });
-        engine = new Engine(msg.canvas);
+        /* Issue #66 — re-probe the backend exactly as INIT does. The fresh
+           canvas has taken no context yet, so Vello is available again
+           whenever the GPU is. The engine reports what it ACTUALLY paints
+           with on `Event::Recovered.renderer`; that value — never a
+           remembered INIT-time one — is what the reply and the shell's
+           `__renderer` carry. */
+        const probed = await detect_backend();
+        engine =
+            probed === 'vello'
+                ? await Engine.with_vello(msg.canvas)
+                : new Engine(msg.canvas);
         /* Resume the event-log sequence past what was already persisted, so
            post-recovery appends don't collide with or shadow prior rows. */
         logSequence = msg.lastSeq;
         lastSnapshotAt = msg.snapshotSeq;
+        trapAfterCommands = null;
         /* Issue #43 — a recovered engine needs the render date again. */
         const now = new Date();
         await dispatch({
@@ -808,13 +841,38 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             year: now.getFullYear(),
             month: now.getMonth() + 1,
             day: now.getDate(),
-        } as Command);
+        });
+        /* Issue #85 — base snapshot + replayed tail, inside the engine. */
         const evt = await dispatch({
             type: 'RECOVER',
             snapshot: msg.snapshot,
             log_tail: msg.log,
-        } as Command);
-        self.postMessage({ id: msg.id, ok: true, evt });
+        });
+        const recovered = evt.type === 'RECOVERED' ? evt : undefined;
+        const renderer = recovered?.renderer ?? probed;
+        const restored = recovered?.snapshot_restored === true;
+        /* Phase 7 — a restored document may carry inline images whose
+           bitmaps died with the old worker; decode them again. */
+        if (restored) {
+            await decodeAndRegisterMedia();
+        }
+        self.postMessage({
+            id: msg.id,
+            ok: true,
+            evt,
+            renderer,
+            restored,
+            appliedCommands: recovered?.applied_commands ?? 0,
+        });
+        /* §10 — the recovered engine has no a11y cache, so this delta is a
+           full `Replace`: the mirror DOM rebuilds from the restored tree
+           instead of narrating 200 replayed edits. */
+        if (restored) {
+            const delta = await dispatch({ type: 'REQUEST_ACCESSIBILITY_DELTA' });
+            if (delta.type === 'ACCESSIBILITY_TREE_DELTA') {
+                self.postMessage({ evt: delta });
+            }
+        }
     } catch (e: unknown) {
         replyError(msg.id, e);
     }
@@ -885,6 +943,10 @@ function shouldLogCommand(cmd: Command): boolean {
         case 'SAVE_DOCX':
         case 'SAVE_DOCUMENT':
         case 'EXPORT_PDF':
+        /* Issue #85 — the recovery primitives are never part of the
+           history they persist / restore. */
+        case 'SNAPSHOT':
+        case 'RECOVER':
             return false;
         default:
             return true;
@@ -906,7 +968,22 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
            the event log OFF the critical path. The RPC response is already
            sent, so event-log latency never throttles command throughput. */
         if (shouldLogCommand(msg.cmd)) {
-            logCommand(msg.cmd);
+            const seq = logCommand(msg.cmd);
+            /* Issue #85 — cadence snapshot, taken HERE (still inside this
+               command's queue task, reply already posted) so its bytes
+               describe exactly the state after `seq`: a command queued
+               behind us cannot slip in between and get replayed twice. */
+            if (seq - lastSnapshotAt >= SNAPSHOT_EVERY) {
+                await takeSnapshot(seq);
+            }
+            armIdleSnapshot();
+            if (trapAfterCommands !== null && --trapAfterCommands <= 0) {
+                trapAfterCommands = null;
+                await pendingLogWrites;
+                /* Throws `RuntimeError: unreachable` → the catch below
+                   flags `trap: true` and closes the worker. */
+                engine.debug_force_trap();
+            }
         }
         /* Phase 7 — after `OPEN_DOCUMENT`, enumerate the engine's parsed
            inline-image media blobs, decode each into an `ImageBitmap` via
@@ -1040,20 +1117,55 @@ async function decodeAndRegisterMedia(): Promise<void> {
 /**
  * Append a command to the durable log without blocking the RPC response.
  * `logSequence` increments synchronously so sequence order is preserved even
- * though the IndexedDB writes settle asynchronously.
+ * though the IndexedDB writes settle asynchronously. Returns the row's seq.
  */
-function logCommand(cmd: Command): void {
+function logCommand(cmd: Command): number {
     const seq = ++logSequence;
-    void appendCommand(seq, cmd).catch((e: unknown) =>
+    const write = appendCommand(seq, cmd).catch((e: unknown) =>
         console.warn('[worker] event-log append failed', e),
     );
-    if (seq - lastSnapshotAt >= SNAPSHOT_EVERY) {
+    pendingLogWrites = pendingLogWrites.then(() => write);
+    return seq;
+}
+
+/**
+ * Issue #85 — take an engine snapshot at log position `seq` and persist it
+ * (`persistSnapshot` prunes to the newest 3 and drops the command rows
+ * they make unreachable). Runs on the serial queue with no command in
+ * flight — callers are either a command task after its reply, or the
+ * queued idle task — so the bytes describe exactly the state after
+ * command `seq` and recovery's replay tail starts at `seq + 1`. The
+ * `SNAPSHOT` dispatch (≈ one document serialization) is the only
+ * synchronous cost; the IndexedDB write settles off the critical path.
+ */
+async function takeSnapshot(seq: number): Promise<void> {
+    if (!engine || seq <= lastSnapshotAt) return;
+    try {
+        const evt = await dispatch({ type: 'SNAPSHOT', seq });
+        if (evt.type !== 'SNAPSHOT') {
+            console.warn('[worker] engine snapshot failed', evt);
+            return;
+        }
         lastSnapshotAt = seq;
-        /* TODO Phase 2 D2.6: persist engine.snapshot() once that API exists. */
-        void persistSnapshot(seq, new Uint8Array(0)).catch((e: unknown) =>
+        const write = persistSnapshot(seq, evt.bytes).catch((e: unknown) =>
             console.warn('[worker] event-log snapshot failed', e),
         );
+        pendingLogWrites = pendingLogWrites.then(() => write);
+    } catch (e: unknown) {
+        console.warn('[worker] snapshot dispatch failed', e);
     }
+}
+
+/** Issue #85 — (re)arm the idle snapshot timer after a logged command. */
+function armIdleSnapshot(): void {
+    if (idleSnapshotTimer !== undefined) clearTimeout(idleSnapshotTimer);
+    idleSnapshotTimer = setTimeout(() => {
+        idleSnapshotTimer = undefined;
+        /* Read `logSequence` INSIDE the queued task: commands already
+           queued ahead of it advance the sequence before it runs, and the
+           snapshot must be stamped with the position it really captures. */
+        void enqueue(() => takeSnapshot(logSequence));
+    }, SNAPSHOT_IDLE_MS);
 }
 
 self.onmessage = (ev: MessageEvent<Msg>): void => {
@@ -1154,6 +1266,14 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
 
     if (msg.type === 'RECOVER') {
         void enqueue(() => handleClientRecover(msg));
+        return;
+    }
+
+    /* Issue #85 — fault injection. Not queued: arming must take effect
+       before the commands posted right after it. */
+    if (msg.type === 'ARM_TRAP') {
+        trapAfterCommands = Math.max(1, Math.floor(msg.after_commands));
+        self.postMessage({ id: msg.id, ok: true });
         return;
     }
 

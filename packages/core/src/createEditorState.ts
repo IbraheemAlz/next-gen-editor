@@ -76,7 +76,8 @@ export interface EditorState {
      * from uniform page-size constants.
      */
     pageGeometry: Accessor<{ tops: number[]; heights: number[] }>;
-    /** Active renderer reported by the worker at INIT. */
+    /** Active renderer reported by the worker at INIT, re-reported by the
+     *  engine on every `RECOVERED` (issue #66). */
     renderer: Accessor<string>;
     /**
      * Sprint 10 — page geometry of the section under the caret. Drives
@@ -155,7 +156,7 @@ export function createEditorState(): EditorState {
         tops: number[];
         heights: number[];
     }>({ tops: [], heights: [] });
-    const [renderer] = createSignal(engine.renderer);
+    const [renderer, setRenderer] = createSignal(engine.renderer);
     const [sectionGeometry, setSectionGeometry] =
         createSignal<BridgeSectionGeometry | undefined>(undefined);
     const [cellProperties, setCellProperties] =
@@ -195,6 +196,13 @@ export function createEditorState(): EditorState {
             case 'UNDO_STATE_CHANGED': {
                 setCanUndo(evt.can_undo);
                 setCanRedo(evt.can_redo);
+                break;
+            }
+            case 'RECOVERED': {
+                /* Issue #66 — the recovered engine reports the backend it
+                   actually paints with; the INIT-time value is stale once
+                   a respawned worker re-probed the GPU. */
+                setRenderer(evt.renderer);
                 break;
             }
             case 'TEXT_INSERTED': {

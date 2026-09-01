@@ -278,6 +278,11 @@ export interface EditorCommands {
      * `"You"`).
      */
     setReviewIdentity(author: string, date: string): Promise<Event>;
+    /** Issue #85 — `Command::Snapshot`: the versioned engine snapshot
+     *  (`engine::snapshot` envelope: document + styles + stories + undo
+     *  window + selection + layout config). Read-only; resolves with the
+     *  `SNAPSHOT` event (or `ERROR`). */
+    snapshot(): Promise<Event>;
     acceptRevision(block: number, start: number, end: number): Promise<Event>;
     rejectRevision(block: number, start: number, end: number): Promise<Event>;
     insertComment(
@@ -630,6 +635,7 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             dispatch({ type: 'TOGGLE_TRACK_CHANGES', enabled }),
         setReviewIdentity: (author, date) =>
             dispatch({ type: 'SET_REVIEW_IDENTITY', author, date }),
+        snapshot: () => dispatch({ type: 'SNAPSHOT', seq: undefined }),
         acceptRevision: (block, start, end) =>
             dispatch({ type: 'ACCEPT_REVISION', block, start, end }),
         rejectRevision: (block, start, end) =>

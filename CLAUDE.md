@@ -107,6 +107,7 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **Bridge schema** is split across `crates/bridge/src/{common,command,event}.rs`. Every layer landed **additively**: §4–§5 on the Phase-1 PoC subset, then Phase 4's pointer / IME / clipboard / a11y commands on §4–§5 (see the Phase 4 section). The discipline is permanent — extend, never break a consumer.
 - **IndexedDB event log** (`ts/src/event-log.ts`): one `engine-log` DB; stores `commands` / `snapshots` / `meta`; snapshots pruned to the newest 3. The worker logs **off the critical path** — `handleClientCommand` posts the RPC reply *before* `logCommand()` runs (D2.8 backpressure; sustains 1000+ cmds/s).
 - **Crash recovery**: a WASM trap (`/RuntimeError|unreachable/`) → worker posts `{ trap: true }` + `self.close()` → `EngineClient.onTrap` rejects pending + fires the UI `onCrash` callback → `App` bumps the `canvasGen` signal, remounting `EditorCanvas` with a fresh `<canvas>`, and calls `recover()` → respawn + `Command::Recover`. `loadLatestEventLog` returns `snapshotSeq` / `lastSeq` so the recovered worker resumes `logSequence` (never restarts at 0).
+- **Recovery = base snapshot + replayed tail (issue #85).** `Command::Snapshot` → `Event::Snapshot { bytes }` is the versioned `engine::snapshot` envelope (`NGES` magic + format-version byte + named-field MessagePack; every model struct is `#[serde(default)]`, maps serialize sorted so equal states are byte-identical). It carries the document tree (styles, numbering, header/footer stories, media, comments), a size-bounded undo window, the selection, the active story, sticky formatting, review flags and the layout config. The worker snapshots every `SNAPSHOT_EVERY` logged commands *inside* the command task after the reply (so the seq is exact) and on a 1.5 s idle timer; the IndexedDB write stays off the critical path. `Command::Recover { snapshot, log_tail }` restores, then replays the tail through `apply` with the layout config stashed (no fonts yet → nothing may paint), and answers `Recovered { applied_commands, snapshot_restored, renderer }` — the renderer is re-probed on the fresh canvas and reported by the engine itself (#66). `setupEngine(restored = true)` re-loads fonts and re-asserts the device scale instead of re-seeding. `ARM_TRAP` (`EngineClient.armTrap`) is the fault-injection hook: a real `Engine.debug_force_trap` after K logged commands, log flushed first.
 - **e2e suite**: `ts/e2e/*.spec.ts` + `ts/playwright.config.ts` — `@playwright/test` with `channel: 'chrome'` (system Chrome, no download); `webServer` auto-boots Vite. Run: `pnpm exec playwright test` from `ts/`.
 
 ## Phase 3 — rendering, RTL, box model
@@ -363,10 +364,11 @@ Phase 5 → MVP hand-off:
   the D5.7 `telemetry` module and the §10 `AccessibilityTreeDelta`. Phase-1 PoC
   commands (`RenderPage`, `RasterizeGlyph`, `ShapeAndRasterize`, `LoadDocx`,
   `SaveDocx`) are still live for the visual-diff `?test=` harness.
-- `Command::Recover` is still a stub — real recovery needs `Engine::snapshot()`
-  (event-log snapshots are empty placeholders). `EngineStats.last_paint_ms` /
-  `last_command_ms` and `Event::Painted.paint_ms` are still `0.0` dummies — the
-  D5.7 telemetry pipeline is wired and will carry real numbers once they are.
+- `Command::Recover` is real since issue #85 (`Engine::snapshot()` /
+  `Engine::restore()`, persisted event-log snapshots, replayed tail — see
+  the Phase 2 section). `EngineStats.last_paint_ms` / `last_command_ms` and
+  `Event::Painted.paint_ms` are still `0.0` dummies — the D5.7 telemetry
+  pipeline is wired and will carry real numbers once they are.
 - Remaining for the MVP `v0.1.0`: D5.6 (external security audit), D5.9
   (operator runbook), D5.10 (Arabic typography sign-off), then the §10 exit
   gate. `v0.6.0-beta.2` is the engineering-complete beta.
