@@ -1,0 +1,69 @@
+name: differential-nightly
+
+# Issue #89 — differential oracle harness (LibreOffice headless black-box
+# baseline for pagination / line-break / rendering). Nightly and
+# non-blocking: this is a *report*, not a merge gate — see
+# tools/differential/README.md. `workflow_dispatch` lets a human trigger an
+# ad-hoc run without waiting for the schedule.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  differential:
+    name: Differential oracle (LibreOffice)
+    runs-on: ubuntu-24.04
+    # Report-only: never block anything else, and never fail the workflow
+    # just because a disagreement was found — run.mjs itself only exits
+    # non-zero on total infra failure (see its docstring).
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install LibreOffice + poppler-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice poppler-utils
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install JS dependencies
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build differential-native (release)
+        run: cargo build -p differential-native --release
+
+      - name: Run the differential harness
+        run: node tools/differential/run.mjs --out tmp/differential
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-report
+          path: |
+            tmp/differential/report.json
+          retention-days: 30
