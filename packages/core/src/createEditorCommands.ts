@@ -248,6 +248,20 @@ export interface EditorCommands {
     /** Issue #43 — author a PAGE / NUMPAGES / DATE field at the caret
      *  (body or story; rejected inside table cells). */
     insertField(kind: FieldKind, at?: LogicalPos): Promise<Event>;
+    /** Issue #77 — F9: re-resolve every field (body + every header /
+     *  footer part) and stamp the live values into the document as ONE
+     *  undo step. PAGE / NUMPAGES read a full pagination; DATE / TIME /
+     *  FILENAME / AUTHOR read the shell-injected environment. A document
+     *  whose fields are all current is left untouched. */
+    updateFields(): Promise<Event>;
+    /** Issue #77 — Alt+F9: paint `{ INSTRUCTION }` codes in place of
+     *  results. Pure display state; `state.fieldCodeView()` mirrors it. */
+    setFieldCodeView(enabled: boolean): Promise<Event>;
+    /** Issue #77 — replace the code of the field the caret addresses
+     *  (`state.fieldAtCaret()`); the cached result stays until the next
+     *  update (Word parity). `at` defaults to the live caret; pass
+     *  `fieldAtCaret().end` to address a field explicitly. */
+    setFieldInstruction(instruction: string, at?: LogicalPos): Promise<Event>;
     setParagraphBorders(
         borders: BridgeCellBorders,
         range?: LogicalRange,
@@ -584,6 +598,15 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 type: 'INSERT_FIELD',
                 at: at ?? currentCaret(),
                 kind,
+            }),
+        updateFields: () => dispatch({ type: 'UPDATE_FIELDS' }),
+        setFieldCodeView: (enabled) =>
+            dispatch({ type: 'SET_FIELD_CODE_VIEW', enabled }),
+        setFieldInstruction: (instruction, at) =>
+            dispatch({
+                type: 'SET_FIELD_INSTRUCTION',
+                at: at ?? currentCaret(),
+                instruction,
             }),
         setParagraphBorders: (borders, range) =>
             dispatch({

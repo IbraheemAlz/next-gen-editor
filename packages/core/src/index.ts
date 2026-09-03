@@ -70,6 +70,7 @@ export type {
     SectionBreakKind,
     HeaderFooterArea,
     BridgeStoryRef,
+    BridgeFieldRef,
     BridgeHfRole,
     FieldKind,
     ListKind,
