@@ -80,6 +80,7 @@ fn run_default() -> Result<()> {
     println!("[roundtrip] step 3 OK — in-memory edit reflected");
 
     let edited_bytes = write_docx(&archive_a, &edited).context("write edited")?;
+    assert_document_xml_well_formed(&edited_bytes).context("edited .docx")?;
     println!(
         "[roundtrip] saved edited .docx: {} bytes",
         edited_bytes.len()
@@ -179,7 +180,295 @@ fn run_default() -> Result<()> {
         plain.len()
     );
 
+    run_grab_bag_survival()?;
+
     println!("\nPASS");
+    Ok(())
+}
+
+/* ===================================================== grab bags (#84) ==== */
+
+/// Issue #84 — the `w14` (Word 2010 extensions) namespace the exotic
+/// fixture declares on its root and uses for one `<w:rPr>` child.
+const W14_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
+
+/// Exotic `<w:rPr>` child in a foreign namespace, exactly as it sits in
+/// the fixture (prefix bound on the ROOT element, like Word writes it).
+/// The writer re-declares the source root's bindings on its synthesized
+/// root (`DocxArchive::document_root_attrs`), so the fragment itself is
+/// preserved byte-for-byte like every `w:` one.
+const GLOW_SRC: &str = r#"<w14:glow w14:rad="63500"><w14:srgbClr w14:val="FFC000"/></w14:glow>"#;
+
+/// Every unmodeled child the fixture plants, byte-for-byte as the writer
+/// must re-emit it inside a REGENERATED paragraph / table.
+fn exotic_fragments() -> Vec<String> {
+    vec![
+        /* `<w:pPr>` children (+ the whole paragraph-mark `<w:rPr>`). */
+        r#"<w:framePr w:w="2880" w:hAnchor="margin" w:xAlign="right"/>"#.into(),
+        r#"<w:widowControl w:val="false"/>"#.into(),
+        "<w:suppressAutoHyphens/>".into(),
+        r#"<w:outlineLvl w:val="2"/>"#.into(),
+        r#"<w:cnfStyle w:val="000000100000"/><w:rPr><w:lang w:val="ar-SA" w:bidi="ar-SA"/></w:rPr></w:pPr>"#.into(),
+        /* `<w:rPr>` children. */
+        "<w:noProof/>".into(),
+        r#"<w:kern w:val="28"/>"#.into(),
+        r#"<w:fitText w:val="1440" w:id="7"/>"#.into(),
+        r#"<w:lang w:val="en-GB"/>"#.into(),
+        r#"<w:eastAsianLayout w:id="1" w:combine="1"/>"#.into(),
+        GLOW_SRC.into(),
+        /* `<w:tblPr>` / `<w:trPr>` / `<w:tcPr>` children. */
+        "<w:bidiVisual/>".into(),
+        r#"<w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="1" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/>"#.into(),
+        r#"<w:cnfStyle w:val="100000000000"/>"#.into(),
+        r#"<w:jc w:val="center"/></w:trPr>"#.into(),
+        "<w:noWrap/>".into(),
+        r#"<w:textDirection w:val="btLr"/>"#.into(),
+        "<w:hideMark/>".into(),
+    ]
+}
+
+/// `word/document.xml` of the exotic fixture. Authored in the writer's
+/// own canonical shape (schema-ordered children, `xml:space="preserve"`,
+/// no pretty-printing) so a regenerated paragraph / table is
+/// byte-identical to its source except for the edit itself — which is
+/// what lets the step assert an EXACT expected output rather than just
+/// containment.
+fn grab_bag_exotic_document_xml() -> String {
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="{w14}">"#,
+            "<w:body>",
+            "<w:p><w:pPr><w:keepNext/>",
+            r#"<w:framePr w:w="2880" w:hAnchor="margin" w:xAlign="right"/>"#,
+            r#"<w:widowControl w:val="false"/>"#,
+            "<w:suppressAutoHyphens/>",
+            r#"<w:jc w:val="center"/>"#,
+            r#"<w:outlineLvl w:val="2"/>"#,
+            r#"<w:cnfStyle w:val="000000100000"/>"#,
+            r#"<w:rPr><w:lang w:val="ar-SA" w:bidi="ar-SA"/></w:rPr>"#,
+            "</w:pPr>",
+            "<w:r><w:rPr><w:b/><w:noProof/>",
+            r#"<w:kern w:val="28"/>"#,
+            r#"<w:fitText w:val="1440" w:id="7"/>"#,
+            r#"<w:lang w:val="en-GB"/>"#,
+            r#"<w:eastAsianLayout w:id="1" w:combine="1"/>"#,
+            "{glow}",
+            "</w:rPr>",
+            r#"<w:t xml:space="preserve">exotic run</w:t></w:r></w:p>"#,
+            "<w:tbl><w:tblPr>",
+            r#"<w:tblStyle w:val="TableGrid"/>"#,
+            "<w:bidiVisual/>",
+            r#"<w:tblW w:w="0" w:type="auto"/>"#,
+            r#"<w:jc w:val="center"/>"#,
+            r#"<w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="1" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/>"#,
+            "</w:tblPr>",
+            r#"<w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid>"#,
+            "<w:tr><w:trPr>",
+            r#"<w:cnfStyle w:val="100000000000"/>"#,
+            "<w:cantSplit/>",
+            r#"<w:trHeight w:val="400" w:hRule="atLeast"/>"#,
+            r#"<w:jc w:val="center"/>"#,
+            "</w:trPr>",
+            "<w:tc><w:tcPr>",
+            r#"<w:tcW w:w="2880" w:type="dxa"/>"#,
+            "<w:noWrap/>",
+            r#"<w:textDirection w:val="btLr"/>"#,
+            r#"<w:vAlign w:val="center"/>"#,
+            "<w:hideMark/>",
+            "</w:tcPr>",
+            r#"<w:p><w:r><w:t xml:space="preserve">cell</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t xml:space="preserve">other</w:t></w:r></w:p></w:tc>"#,
+            "</w:tr></w:tbl>",
+            r#"<w:p><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p>"#,
+            "<w:sectPr/></w:body></w:document>",
+        ),
+        w14 = W14_NS,
+        glow = GLOW_SRC,
+    )
+}
+
+/// Issue #84 fixture: one paragraph, one 1×2 table and one trailing
+/// paragraph, every property container seeded with children the model
+/// does not express. Rides the `--fixtures` passthrough at drift 0 and
+/// the default harness's dirty-regeneration step.
+fn build_grab_bag_exotic_docx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+    let document_xml = grab_bag_exotic_document_xml();
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+    let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>"#;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, body) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", dot_rels),
+            ("word/_rels/document.xml.rels", doc_rels),
+            ("word/document.xml", document_xml.as_str()),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// Issue #84 — step 9: edit a paragraph AND a table cell whose property
+/// containers carry unmodeled children, save, and require that the
+/// regenerated `document.xml` is EXACTLY the source with the two edits
+/// applied. Every exotic child must therefore survive byte-for-byte and
+/// in schema order, the root keeps its `xmlns:w14` binding, and the
+/// drift is exactly the inserted text — the bags add zero bytes.
+fn run_grab_bag_survival() -> Result<()> {
+    use engine::{BlockPath, LogicalPos, PathStep};
+
+    let fixture_bytes = build_grab_bag_exotic_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read exotic fixture")?;
+    if archive_a.document.paragraph_text(0) != Some("exotic run") {
+        bail!(
+            "exotic fixture text mismatch: {:?}",
+            archive_a.document.paragraph_text(0)
+        );
+    }
+
+    /* Paragraph edit strictly INSIDE the styled span so the span grows
+    and the paragraph still serializes as a single `<w:r>`. */
+    let para_pos = LogicalPos {
+        path: BlockPath::top(0),
+        offset: 3,
+    };
+    /* Cell edit: appends to the first cell's only paragraph, which
+    dirties the containing table (full `<w:tbl>` regeneration). */
+    let cell_pos = LogicalPos {
+        path: BlockPath::top(1)
+            .push(PathStep::Cell { row: 0, col: 0 })
+            .push(PathStep::Block(0)),
+        offset: "cell".len() as u32,
+    };
+    let edited = archive_a
+        .document
+        .insert_text(para_pos, INSERT_TEXT)
+        .insert_text(cell_pos, INSERT_TEXT);
+    let expected_para = format!("exo{INSERT_TEXT}tic run");
+    if edited.paragraph_text(0) != Some(expected_para.as_str()) {
+        bail!(
+            "in-memory paragraph edit wrong: {:?}",
+            edited.paragraph_text(0)
+        );
+    }
+    let edited_bytes = write_docx(&archive_a, &edited).context("write edited exotic")?;
+    assert_document_xml_well_formed(&edited_bytes).context("edited exotic .docx")?;
+
+    /* Siblings verbatim. */
+    let archive_b = read_docx(&edited_bytes).context("re-read edited exotic")?;
+    for (name, bytes) in &archive_a.other_entries {
+        let same = archive_b
+            .other_entries
+            .iter()
+            .any(|(n, b)| n == name && b == bytes);
+        if !same {
+            bail!("exotic fixture: sibling `{name}` drifted");
+        }
+    }
+
+    /* Exact expected output: the source with the two inserts, nothing
+    else — root bindings, every fragment and every modeled child byte-
+    identical and in place. */
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let doc_b = String::from_utf8(extract_doc_xml(&edited_bytes)?).context("utf8 output")?;
+    let expected = doc_a
+        .replacen(
+            r#"<w:t xml:space="preserve">exotic run</w:t>"#,
+            &format!(r#"<w:t xml:space="preserve">{expected_para}</w:t>"#),
+            1,
+        )
+        .replacen(
+            r#"<w:t xml:space="preserve">cell</w:t>"#,
+            &format!(r#"<w:t xml:space="preserve">cell{INSERT_TEXT}</w:t>"#),
+            1,
+        );
+    for frag in exotic_fragments() {
+        if !doc_b.contains(&frag) {
+            bail!("exotic fragment lost or altered on regenerate: `{frag}`\n--- got ---\n{doc_b}");
+        }
+    }
+    if doc_b != expected {
+        bail!(
+            "regenerated document.xml is not source + edits\n--- expected ---\n{expected}\n--- got ---\n{doc_b}"
+        );
+    }
+    let drift = (doc_b.len() as isize - doc_a.len() as isize).unsigned_abs();
+    let inserted = 2 * INSERT_TEXT.len();
+    println!(
+        "[roundtrip] exotic document.xml: {} -> {} bytes (Δ {} B, inserted {} B)",
+        doc_a.len(),
+        doc_b.len(),
+        drift,
+        inserted
+    );
+    if drift > 2 * inserted {
+        bail!(
+            "exotic document.xml drift {drift} B exceeds bound {} B",
+            2 * inserted
+        );
+    }
+
+    /* The bags themselves round-trip: a second read captures the same
+    fragments the first did (the writer emitted them verbatim). */
+    let bag_a = archive_a
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .next()
+        .and_then(|p| p.spans.first())
+        .and_then(|s| s.style.grab_bag.clone());
+    let bag_b = archive_b
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .next()
+        .and_then(|p| p.spans.first())
+        .and_then(|s| s.style.grab_bag.clone());
+    if bag_a.is_none() || bag_a != bag_b {
+        bail!("run grab bag did not survive the round-trip: {bag_a:?} vs {bag_b:?}");
+    }
+    let ppr_a = archive_a
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .next()
+        .and_then(|p| p.props.grab_bag.clone());
+    let ppr_b = archive_b
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .next()
+        .and_then(|p| p.props.grab_bag.clone());
+    if ppr_a.is_none() || ppr_a != ppr_b {
+        bail!("paragraph grab bag did not survive the round-trip: {ppr_a:?} vs {ppr_b:?}");
+    }
+    println!("[roundtrip] step 9 OK — grab bags survive dirty regeneration byte-for-byte");
     Ok(())
 }
 
@@ -306,8 +595,9 @@ fn validate_fixture(path: &Path, manifest: &ManifestFile) -> Result<()> {
         }
     }
 
-    /* 2. Re-emit and re-parse. */
+    /* 2. Re-emit, guard, re-parse. */
     let edited_bytes = write_docx(&archive_a, &archive_a.document).context("write_docx")?;
+    assert_document_xml_well_formed(&edited_bytes)?;
     let archive_b = read_docx(&edited_bytes).context("re-read")?;
 
     /* 3. Siblings byte-identical. */
@@ -662,6 +952,61 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 roundtrip: RoundtripBounds::default(),
             },
         },
+        /* Issue #84 — exotic (unmodeled) rPr / pPr / tblPr / trPr / tcPr
+        children. Untouched it rides the passthrough at drift 0; the
+        default harness's step 9 is the dirty-regeneration check. */
+        PrebuiltFixture {
+            name: "grab_bag_exotic.docx",
+            bytes: build_grab_bag_exotic_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 9,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec!["exotic run".into(), "after".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        /* Issue #110 — `word/document.xml` prefixed with a UTF-8 BOM, the
+        way docx4j and Apache POI write it (`toc.docx`, `55733.docx`, …).
+        quick-xml strips the BOM without counting it in
+        `buffer_position()`, which used to shift every passthrough capture
+        three bytes early and resave `</w<w:sectPr/>`. Drift bound 3: the
+        writer synthesizes its own declaration and never re-emits the BOM;
+        every paragraph must otherwise splice byte-exact. */
+        PrebuiltFixture {
+            name: "bom_utf8_passthrough.docx",
+            bytes: build_bom_utf8_passthrough_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 10,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec!["first".into(), "second".into()],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 3,
+                },
+            },
+        },
+        /* Issue #111 — 200 nested tables (Apache POI's `deep-table-cell.docx`
+        goes to 5000). The reader must open it on a bounded stack in well
+        under a second and the outer table rides the passthrough at drift 0
+        whatever depth the typed model stops at. */
+        PrebuiltFixture {
+            name: "table_nested_200_deep.docx",
+            bytes: build_table_nested_deep_docx(200),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 10,
+                asserts: FixtureAsserts {
+                    paragraph_count: 1,
+                    paragraph_texts: vec!["intro".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
     ]
 }
 
@@ -833,12 +1178,18 @@ fn build_table_2x2_opaque_docx() -> Vec<u8> {
 /// becomes `<w:p>intro</w:p>` + inner_tbl_xml + `<w:sectPr/>`. Drift
 /// bound = 0 — every fixture rides the passthrough.
 fn build_table_fixture(body_intro_text: &str, inner_tbl_xml: &str) -> Vec<u8> {
-    use std::io::Write;
-    use zip::write::{SimpleFileOptions, ZipWriter};
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">{body_intro_text}</w:t></w:r></w:p>{inner_tbl_xml}<w:sectPr/></w:body></w:document>"#,
     );
+    package_document_xml(&document_xml)
+}
+
+/// Wrap one complete `word/document.xml` part (declaration included) in
+/// the minimal OPC skeleton the Phase 5+ handcrafted fixtures share.
+fn package_document_xml(document_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -862,7 +1213,7 @@ fn build_table_fixture(body_intro_text: &str, inner_tbl_xml: &str) -> Vec<u8> {
             ("[Content_Types].xml", content_types),
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
-            ("word/document.xml", document_xml.as_str()),
+            ("word/document.xml", document_xml),
         ] {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
@@ -897,7 +1248,49 @@ fn build_table_in_rtl_doc_docx() -> Vec<u8> {
     build_table_fixture("مقدمة", tbl)
 }
 
+/// Issue #110 — the part starts with U+FEFF (the UTF-8 BOM, bytes
+/// `EF BB BF`) exactly like docx4j / Apache POI emit it. Two adjacent
+/// paragraphs + a trailing body `<w:sectPr/>` cover both splice
+/// adjacencies the corruption showed up in.
+fn build_bom_utf8_passthrough_docx() -> Vec<u8> {
+    let document_xml = concat!(
+        "\u{FEFF}",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        "\n",
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        r#"<w:body><w:p><w:r><w:t xml:space="preserve">first</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">second</w:t></w:r></w:p>"#,
+        r#"<w:sectPr/></w:body></w:document>"#,
+    );
+    package_document_xml(document_xml)
+}
+
+/// Issue #111 — `depth` tables nested one inside the other (one row, one
+/// cell, one paragraph, one nested table per level).
+fn build_table_nested_deep_docx(depth: usize) -> Vec<u8> {
+    let mut tbl = String::new();
+    for level in 0..depth {
+        tbl.push_str(r#"<w:tbl><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc>"#);
+        tbl.push_str(&format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">level {level}</w:t></w:r></w:p>"#
+        ));
+    }
+    for _ in 0..depth {
+        tbl.push_str("</w:tc></w:tr></w:tbl>");
+    }
+    build_table_fixture("intro", &tbl)
+}
+
 /* ============================================================= helpers ==== */
+
+/// Issue #110 — every `write_docx` in this harness is followed by a strict
+/// re-parse of the saved `word/document.xml`. A misaligned passthrough
+/// splice (`</w<w:sectPr/>`) is unparseable XML; it must fail here, loudly,
+/// before any byte-drift arithmetic gets a chance to call it "3 bytes".
+fn assert_document_xml_well_formed(docx: &[u8]) -> Result<()> {
+    format_docx::check_document_xml_well_formed(docx)
+        .context("saved word/document.xml is not well-formed XML (issue #110 guard)")
+}
 
 fn extract_doc_xml(bytes: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;

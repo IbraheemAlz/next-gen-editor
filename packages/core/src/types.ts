@@ -48,6 +48,8 @@ export type {
     TextAttrs,
     AttrsMixed,
     EngineStats,
+    LayoutDegraded,
+    LayoutDegradeReason,
     EngineCapabilities,
     A11yTree,
     A11yPatch,

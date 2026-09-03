@@ -10,11 +10,12 @@ use bridge::{
     BridgeBorderStroke, BridgeBorderStyle, BridgeCellBorders, BridgeCellProperties, BridgeIndent,
     BridgeSectionGeometry, BridgeStyleProperties, Color, Command, Direction, DocFormat,
     EngineStats, Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
-    LogicalPos as BridgeLogicalPos, LogicalRange as BridgeLogicalRange, MoveDirection,
-    PageOrientation as BridgePageOrientation, PathStep as BridgePathStep, PdfConformance,
-    Point as BridgePoint, Rect as BridgeRect, SectionBreakKind, SelectionKind, TextAttrs,
-    TextAttrsPatch, UnderlineStyle, VerticalScript,
+    LayoutDegradeReason, LayoutDegraded, LogicalPos as BridgeLogicalPos,
+    LogicalRange as BridgeLogicalRange, MoveDirection, PageOrientation as BridgePageOrientation,
+    PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
+    SectionBreakKind, SelectionKind, TextAttrs, TextAttrsPatch, UnderlineStyle, VerticalScript,
 };
+use engine::snapshot::SnapshotError;
 use engine::{
     Alignment as EngineAlignment, BlockPath as EngineBlockPath, DocumentTree,
     FontFamily as EngineFontFamily, LogicalPos as EnginePos, PathStep as EnginePathStep, SpanStyle,
@@ -67,6 +68,154 @@ struct RenderConfig {
     zoom: f32,
 }
 
+/// Bound on the undo stack (`UndoStack::new(_, UNDO_CAP)`).
+const UNDO_CAP: usize = 100;
+
+/// Issue #85 — most undo-stack entries a crash-recovery snapshot carries
+/// (the current document + up to eight undo steps).
+const SNAPSHOT_UNDO_MAX_ENTRIES: usize = 9;
+
+/// Issue #85 — block-serialization budget for the undo window: the number
+/// of history entries × the document's block count stays under this, so
+/// a one-page document persists the full window while a 50-page document
+/// (≈ 1000 blocks) persists the current tree plus one undo step. Keeps a
+/// snapshot's cost proportional to ONE document serialization for large
+/// files (the 50-page fixture encodes in ≈ 2.3 ms native / one order of
+/// magnitude under the insert-latency budget after the wasm penalty).
+const SNAPSHOT_UNDO_BLOCK_BUDGET: usize = 2_500;
+
+/// Issue #85 — the serializable shape of [`RenderConfig`]. Kept apart from
+/// `RenderConfig` (whose `ShapingDirection` / `Alignment` come from the
+/// text pipeline, which the snapshot format must not depend on) and
+/// spelled with the same strings the `RenderPage` command uses.
+#[derive(Clone, Debug, Default, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+struct LayoutCfgSnapshot {
+    font_id: String,
+    rtl: bool,
+    px_size: f32,
+    line_height: f32,
+    align: String,
+    base_scale: f32,
+    zoom: f32,
+}
+
+impl LayoutCfgSnapshot {
+    fn capture(cfg: &RenderConfig) -> Self {
+        Self {
+            font_id: cfg.font_id.clone(),
+            rtl: matches!(cfg.base_direction, ShapingDirection::Rtl),
+            px_size: cfg.px_size,
+            line_height: cfg.line_height,
+            align: match cfg.alignment {
+                Alignment::Start => "START",
+                Alignment::End => "END",
+                Alignment::Center => "CENTER",
+                Alignment::Justify => "JUSTIFY",
+            }
+            .to_string(),
+            base_scale: cfg.base_scale,
+            zoom: cfg.zoom,
+        }
+    }
+
+    /// `None` when the persisted config cannot describe a layout (no font,
+    /// non-positive sizes) — the engine then stays in the pre-`RenderPage`
+    /// cold state and the shell re-seeds it.
+    fn restore(self) -> Option<RenderConfig> {
+        let positive = |v: f32| v.is_finite() && v > 0.0;
+        if self.font_id.is_empty() || !positive(self.px_size) || !positive(self.line_height) {
+            return None;
+        }
+        let sane = |v: f32, lo: f32, hi: f32| {
+            if positive(v) { v.clamp(lo, hi) } else { 1.0 }
+        };
+        let base_scale = sane(self.base_scale, 0.5, 8.0);
+        let zoom = sane(self.zoom, 0.25, 4.0);
+        Some(RenderConfig {
+            font_id: self.font_id,
+            base_direction: if self.rtl {
+                ShapingDirection::Rtl
+            } else {
+                ShapingDirection::Ltr
+            },
+            px_size: self.px_size,
+            line_height: self.line_height,
+            alignment: match self.align.as_str() {
+                "JUSTIFY" => Alignment::Justify,
+                "END" => Alignment::End,
+                "CENTER" => Alignment::Center,
+                _ => Alignment::Start,
+            },
+            scale: base_scale * zoom,
+            base_scale,
+            zoom,
+        })
+    }
+}
+
+/// Issue #85 — everything a recovered engine needs besides its rendering
+/// surface: the document (with styles, numbering, header/footer stories,
+/// media and comments — all inside `DocumentTree`), a bounded window of
+/// the undo stack, the selection, the active story, sticky formatting and
+/// the review/track-changes session flags, plus the layout config so the
+/// shell does not have to re-seed the document to repaint it.
+///
+/// Persisted through `engine::snapshot::encode` (versioned envelope,
+/// named fields). Every field is `#[serde(default)]`-tolerant, so a
+/// snapshot written before a field existed still reads; per-version
+/// semantic defaults live in [`Self::apply_version_defaults`].
+#[derive(Default, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+struct EngineSnapshotV1 {
+    /// Undo-stack window, oldest first; `doc_history[undo_cursor]` is the
+    /// current document. Entries past the cursor are the redo branch.
+    doc_history: Vec<DocumentTree>,
+    undo_cursor: u32,
+    selection: Option<SelectionState>,
+    stashed_body_selection: Option<SelectionState>,
+    active_story: StoryTarget,
+    pending_format: Option<SpanStyle>,
+    caret_affinity: CaretAffinity,
+    tracking_changes: bool,
+    review_author: String,
+    review_date: String,
+    layout_cfg: Option<LayoutCfgSnapshot>,
+}
+
+impl EngineSnapshotV1 {
+    /// Per-version defaults (see the `engine::snapshot` module docs). The
+    /// decoder already filled absent fields with their `Default`; this
+    /// hook is where a field whose *implicit* historical value differs
+    /// from `Default` gets that value back, keyed on the version the
+    /// snapshot was written with. When `FORMAT_VERSION` becomes 2, the
+    /// rules that only apply to v1 payloads go under `if version < 2`.
+    fn apply_version_defaults(&mut self, version: u8) {
+        debug_assert!(
+            (engine::snapshot::MIN_SUPPORTED_VERSION..=engine::snapshot::FORMAT_VERSION)
+                .contains(&version)
+        );
+        /* Every version so far: an absent (empty) review author means the
+        engine's boot identity, never an anonymous author. */
+        if self.review_author.is_empty() {
+            self.review_author = "You".to_string();
+        }
+        /* Every version so far: an absent history is a fresh document. */
+        if self.doc_history.is_empty() {
+            self.doc_history = vec![DocumentTree::new()];
+            self.undo_cursor = 0;
+        }
+    }
+}
+
+/// Worker-console warning that stays linkable in native unit tests.
+fn warn_console(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::warn_1(&JsValue::from_str(msg));
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{msg}");
+}
+
 /// Width of the rendered caret, in canvas device pixels.
 const CARET_WIDTH: f32 = 2.0;
 
@@ -77,7 +226,7 @@ const CARET_WIDTH: f32 = 2.0;
 /// `MoveCaret` motion (Backlog #14). `Some` only while a Up/Down walk is in
 /// progress — every horizontal move, click, selection-set, or edit drops it
 /// by constructing a new `SelectionState` with `ideal_x: None`.
-#[derive(Clone)]
+#[derive(Clone, ::serde::Serialize, ::serde::Deserialize)]
 struct SelectionState {
     anchor: BridgeLogicalPos,
     caret: BridgeLogicalPos,
@@ -182,7 +331,7 @@ fn lazy_runway(viewport_h_pt: f32, scale: f32) -> f32 {
 /// shell knows (a) whether more pages may materialize via
 /// `ExpandLayout`, and (b) the running virtual-height estimate that
 /// drives the scrollbar's backing store.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LazyLayoutInfo {
     /// `true` when every body block was consumed; `false` when the
     /// viewport-cull budget halted the paginator early.
@@ -190,6 +339,64 @@ struct LazyLayoutInfo {
     /// Number of top-level blocks across the doc that have not yet
     /// been processed (paragraph or table). Drives the height estimate.
     remaining_blocks: u32,
+    /// Issue #87 — every degradation the layout self-defense applied
+    /// during this build: the paginators' watchdog notes plus the notes
+    /// raised below `build_pages` (paragraph-cache verifier, autofit
+    /// solver, verified fast path). Forwarded on `Event::Painted`.
+    degradations: Vec<LayoutDegraded>,
+}
+
+thread_local! {
+    /// Issue #87 — degradation notes raised by layout helpers that sit
+    /// below `build_pages` and have no path back to the paginator (the
+    /// paragraph-cache verifier in `layout_paragraph_cached`, the autofit
+    /// shrink solver). `build_pages` clears the sink on entry and drains
+    /// it into `LazyLayoutInfo::degradations` on exit. WASM is
+    /// single-threaded; native tests get one sink per test thread.
+    static LAYOUT_NOTES: RefCell<Vec<LayoutDegraded>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Issue #87 — record a sub-paginator degradation (no page index).
+fn note_layout_degradation(reason: LayoutDegradeReason) {
+    LAYOUT_NOTES.with(|n| n.borrow_mut().push(LayoutDegraded { reason, page: None }));
+}
+
+/// Issue #87 — take every note recorded since the last drain.
+fn drain_layout_notes() -> Vec<LayoutDegraded> {
+    LAYOUT_NOTES.with(|n| std::mem::take(&mut *n.borrow_mut()))
+}
+
+/// Issue #87 — a paginator note in its wire shape.
+fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
+    use layout::DegradeReason as R;
+    let reason = match d.reason {
+        R::OversizeLine => LayoutDegradeReason::OversizeLine,
+        R::KeepChainDropped => LayoutDegradeReason::KeepChainDropped,
+        R::HeaderRepeatDropped => LayoutDegradeReason::HeaderRepeatDropped,
+        R::FootnoteOverflow => LayoutDegradeReason::FootnoteOverflow,
+        R::FrozenPlacement => LayoutDegradeReason::FrozenPlacement,
+        R::PageCap => LayoutDegradeReason::PageCap,
+        R::FastPathMismatch => LayoutDegradeReason::FastPathMismatch,
+        R::CacheMismatch => LayoutDegradeReason::CacheMismatch,
+        R::AutofitCap => LayoutDegradeReason::AutofitCap,
+    };
+    LayoutDegraded {
+        reason,
+        page: Some(d.page),
+    }
+}
+
+/// Issue #87 — the page a fast-path mismatch was detected on, for the
+/// `FastPathMismatch` note.
+fn fast_path_mismatch_page(m: layout::FastPathMismatch) -> Option<u32> {
+    use layout::FastPathMismatch as M;
+    match m {
+        M::PageCount { shorter, .. } => Some(shorter as u32),
+        M::PageGeometry { page }
+        | M::BlockCount { page, .. }
+        | M::BlockGeometry { page, .. }
+        | M::EndPosition { page } => Some(page as u32),
+    }
 }
 
 /// Issue #34/#51 — memo of the most recent `build_pages` output. Every
@@ -248,6 +455,15 @@ struct LastPaintDims {
     /// its margin.
     page_content_tops: Vec<f32>,
     page_content_bottoms: Vec<f32>,
+    /// Issue #87 — degradation notes of the last real paint, replayed
+    /// on the synthetic `Painted`s so both producers agree.
+    layout_degraded: Vec<LayoutDegraded>,
+    /// Issue #86 — wall-clock cost (ms) of the `render_document` call that
+    /// produced these dimensions. Replayed verbatim by the synthetic
+    /// `Painted` side-channel (`do_set_viewport`, the worker's
+    /// `paint_dims()` broadcast) — those paths don't repaint, so "the last
+    /// real paint's cost" is the honest number to report, not `0.0`.
+    paint_ms: f32,
 }
 
 /// A candidate caret position on a line — an absolute x (canvas device px)
@@ -262,7 +478,7 @@ struct CaretSlot {
 /// default is `LeadingX` so a fresh selection / pointer-set caret
 /// renders at the smaller-x slot (consistent with the existing
 /// `slot_x_for_byte` choice).
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 enum CaretAffinity {
     #[default]
     LeadingX,
@@ -275,7 +491,7 @@ enum CaretAffinity {
 /// geometry pipeline projects onto the anchor page's band, and every
 /// document mutation routes through the story adapter
 /// (`commit_story_edit`) instead of the body tree.
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 enum StoryTarget {
     #[default]
     Body,
@@ -463,6 +679,19 @@ pub struct Engine {
     /// Sprint 14 (#14) — review date for synthesised revisions.
     /// Empty until the worker stamps `Date.now()` at command time.
     review_date: String,
+    /// Issue #86 — wall-clock cost of the most recently completed
+    /// `Engine::dispatch` call (`now_ms()` around `self.apply(cmd).await`),
+    /// mirrored onto `EngineStats.last_command_ms` on the next
+    /// `RequestStats`. `0.0` before the first dispatch and permanently on
+    /// native builds (`now_ms` is a no-op off-wasm).
+    last_command_ms: f32,
+    /// Issue #86 — wall-clock cost of the most recent `render_document`
+    /// call (layout-if-stale + the Vello or Canvas2D paint), mirrored onto
+    /// `EngineStats.last_paint_ms` and `Event::Painted.paint_ms`. Every
+    /// `render_document` call site updates this — the auto-repaint after a
+    /// mutation, the explicit `RequestPaint` path, and the IME preview
+    /// repaint all count as "the most recent paint".
+    last_paint_ms: f32,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -511,6 +740,8 @@ fn assemble_engine(
         tracking_changes: false,
         review_author: "You".to_string(),
         review_date: String::new(),
+        last_command_ms: 0.0,
+        last_paint_ms: 0.0,
     }
 }
 
@@ -532,7 +763,14 @@ impl Engine {
     pub async fn dispatch(&mut self, cmd: JsValue) -> Result<JsValue, JsValue> {
         let cmd: Command = serde_wasm_bindgen::from_value(cmd)
             .map_err(|e| JsValue::from_str(&format!("decode command: {e}")))?;
+        /* Issue #86 — D5.7 real telemetry. Wraps the ENTIRE command,
+        including any auto-repaint a mutation triggers (`maybe_repaint_result`
+        calls `render_document` inline), so `last_command_ms` matches what a
+        caller's own `performance.now()` around `dispatch()` would see (the
+        §D5.3 perf harness measures insert-latency exactly that way). */
+        let t0 = now_ms();
         let evt: Event = self.apply(cmd).await;
+        self.last_command_ms = (now_ms() - t0) as f32;
         serde_wasm_bindgen::to_value(&evt)
             .map_err(|e| JsValue::from_str(&format!("encode event: {e}")))
     }
@@ -556,6 +794,37 @@ impl Engine {
             .collect();
         serde_wasm_bindgen::to_value(&entries)
             .map_err(|e| JsValue::from_str(&format!("encode media entries: {e}")))
+    }
+
+    /// Issue #85 — `Engine::snapshot()`: serialize the session (document
+    /// + styles + stories + undo window + selection + layout config) into
+    /// the versioned `engine::snapshot` envelope. Same bytes as
+    /// `Command::Snapshot`, without the event round-trip — for callers
+    /// that already hold the engine synchronously.
+    pub fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
+        self.snapshot_bytes()
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Issue #85 — `Engine::restore()`: install a snapshot produced by
+    /// [`Engine::snapshot`]; returns the format version it was written
+    /// with. Fonts and the rendering surface are untouched — the caller
+    /// re-loads fonts and repaints. `Command::Recover` is the same thing
+    /// plus the replay tail.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<u8, JsValue> {
+        self.restore_from_bytes(bytes)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Issue #85 fault injection — trap the wasm instance on purpose so
+    /// the crash-recovery path (`RuntimeError` → worker close → respawn →
+    /// `Recover`) can be exercised end-to-end. Only the worker's
+    /// `ARM_TRAP` test hook calls this. Never returns.
+    pub fn debug_force_trap(&self) {
+        #[cfg(target_arch = "wasm32")]
+        core::arch::wasm32::unreachable();
+        #[cfg(not(target_arch = "wasm32"))]
+        std::process::abort();
     }
 
     /// Phase 7 — install a decoded inline-image bitmap. Idempotent; later
@@ -612,6 +881,8 @@ impl Engine {
             page_margin_bottoms: dims.page_margin_bottoms,
             page_content_tops: dims.page_content_tops,
             page_content_bottoms: dims.page_content_bottoms,
+            layout_degraded: dims.layout_degraded,
+            paint_ms: dims.paint_ms,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -717,6 +988,10 @@ struct PaintDimsOut {
     /// Issue #71 — effective body extents (mirrors `Event::Painted`).
     page_content_tops: Vec<f32>,
     page_content_bottoms: Vec<f32>,
+    /// Issue #87 — degradation notes (mirrors `Event::Painted`).
+    layout_degraded: Vec<LayoutDegraded>,
+    /// Issue #86 — mirrors `Event::Painted.paint_ms` (see `LastPaintDims`).
+    paint_ms: f32,
 }
 
 #[derive(::serde::Serialize)]
@@ -1050,6 +1325,38 @@ fn wasm_heap_bytes() -> u32 {
     #[cfg(not(target_arch = "wasm32"))]
     {
         0
+    }
+}
+
+/// Monotonic milliseconds since the JS realm's time origin (Issue #86 — D5.7
+/// real telemetry: `EngineStats.last_command_ms` / `last_paint_ms` and
+/// `Event::Painted.paint_ms`). Real on the `wasm32` browser artifact; `0.0`
+/// on native `cargo check`/`test`, where no JS global scope exists to host a
+/// `Performance` object at all — same fallback shape as [`wasm_heap_bytes`].
+///
+/// Tries `window()` first (the `wasm-bindgen-test` `run_in_browser` harness
+/// runs in a plain tab, not a worker, so `window` is the only global there),
+/// then falls back to `WorkerGlobalScope` (the production path: the engine
+/// always runs inside the dedicated worker per `ts/src/engine/engine.worker.ts`,
+/// where `window` does not exist). Either object's `Performance` is missing
+/// only in a pathological embedding, so `unwrap_or(0.0)` — a timing gap must
+/// never surface as a WASM error to the caller.
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(win) = web_sys::window() {
+            return win.performance().map(|p| p.now()).unwrap_or(0.0);
+        }
+        js_sys::global()
+            .dyn_into::<web_sys::WorkerGlobalScope>()
+            .ok()
+            .and_then(|g| g.performance())
+            .map(|p| p.now())
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0.0
     }
 }
 
@@ -2810,7 +3117,18 @@ fn autofit_distribute(
     or terminates, bounded by n_cols passes. */
     let mut pinned = vec![false; n_cols];
     let mut final_widths = vec![0.0_f32; n_cols];
+    /* Issue #87 — hard cap on the shrink solver. Each pass pins at least
+    one more column or terminates, so `n_cols + 1` passes is the proof
+    bound; the cap is the watchdog's last-resort net for a future edit
+    that breaks the proof. Past it the floors win (the overflow answer). */
+    let mut passes: usize = 0;
     loop {
+        passes += 1;
+        if passes > n_cols + 1 {
+            note_layout_degradation(LayoutDegradeReason::AutofitCap);
+            final_widths[..n_cols].copy_from_slice(&col_floor[..n_cols]);
+            break;
+        }
         let mut pinned_total = 0.0_f32;
         let mut unpinned_natural = 0.0_f32;
         for i in 0..n_cols {
@@ -3069,7 +3387,18 @@ fn layout_paragraph_cached(
 ) -> ParagraphBox {
     let key = paragraph_layout_key(para, cfg, scale, max_width, sctx);
     if let Some(cached) = cache.get(&key) {
-        return cached.clone();
+        /* Issue #87 — verified fast path at the paragraph tier. A cache
+        hit predicts "this paragraph's layout is what it was"; check the
+        cheap post-conditions before trusting it. A key collision or an
+        input the key forgot to mix in would otherwise paint a stale
+        box forever. */
+        if cached_paragraph_is_consistent(cached, para, max_width) {
+            return cached.clone();
+        }
+    }
+    if cache.contains(&key) {
+        cache.pop(&key);
+        note_layout_degradation(LayoutDegradeReason::CacheMismatch);
     }
     let spans = apply_revision_overlay(
         apply_hyperlink_overlay(
@@ -3105,6 +3434,26 @@ fn layout_paragraph_cached(
     let laid = layout_paragraph(para_cfg);
     cache.put(key, laid.clone());
     laid
+}
+
+/// Issue #87 — post-conditions a cached `ParagraphBox` must satisfy for
+/// the request it is about to serve: laid out at the requested width
+/// (`layout_paragraph` stamps `size.width = max_width`), at least one
+/// line (an empty paragraph still gets a placeholder), and every line /
+/// run source offset inside the paragraph's current text. O(lines +
+/// runs) — negligible next to the shaping a miss costs.
+fn cached_paragraph_is_consistent(
+    cached: &ParagraphBox,
+    para: &engine::Paragraph,
+    max_width: f32,
+) -> bool {
+    let len = para.text.len() as u32;
+    cached.size.width.to_bits() == max_width.to_bits()
+        && !cached.lines.is_empty()
+        && cached
+            .lines
+            .iter()
+            .all(|l| l.source_start <= len && l.runs.iter().all(|r| r.source_range.end <= len))
 }
 
 fn layout_cell_blocks(
@@ -4415,6 +4764,9 @@ fn patch_to_span_style(attrs: &TextAttrsPatch) -> SpanStyle {
         file-round-trip only. */
         raw_font_family: None,
         font_theme: None,
+        /* Issue #84 — a formatting patch never carries a grab bag; the
+        run's own bag survives the merge (`SpanStyle::merged_with`). */
+        grab_bag: None,
     }
 }
 
@@ -4531,7 +4883,11 @@ impl Engine {
             /* Issue #72 — rich copy. `do_get_selection_as_clipboard` now
             reads `self.selection_doc()` so a copy from inside a story
             serializes the story's paragraphs, not the body's. */
-            | Command::GetSelectionAsClipboard => None,
+            | Command::GetSelectionAsClipboard
+            /* Issue #85 — a snapshot is a read of the whole session (the
+            active story included) and recovery rebuilds it wholesale. */
+            | Command::Snapshot { .. }
+            | Command::Recover { .. } => None,
             /* Loading a document tears the story's ground away —
             exit first, then handle normally. */
             Command::LoadDocx { .. } | Command::OpenDocument { .. } => {
@@ -4648,7 +5004,8 @@ impl Engine {
             // behavior lands in Phase 3 behind the RequestPaint pipeline.
             // ===============================================================
             Command::Init { .. } => phase3_stub("Init"),
-            Command::Recover { .. } => self.do_recover(),
+            Command::Recover { snapshot, log_tail } => self.do_recover(snapshot, log_tail).await,
+            Command::Snapshot { seq } => self.do_snapshot(seq),
             Command::Dispose => phase3_stub("Dispose"),
             Command::Tick { .. } => phase3_stub("Tick"),
             // Sprint 3 (UI Edition) — Document I/O. OpenDocument /
@@ -5227,19 +5584,15 @@ impl Engine {
     /// reported HarfBuzz / Arabic-shaping degradation post-recovery
     /// was a stale-cache symptom).
     ///
-    /// `setupEngine` on the TS side re-issues `loadFont` + the boot
-    /// `RenderPage` after this returns, so wiping the engine to a
-    /// near-cold state is safe and idempotent. Rendering surfaces
-    /// (`page_ctxs`, `ctx`, `vello`, `atlas`) are preserved — those
-    /// own the live `OffscreenCanvas` context, which cannot be
-    /// re-transferred.
-    fn do_recover(&mut self) -> Event {
-        /* Full-stack rehydration: clear every cache + transient state
-        and reset the document to a fresh `DocumentTree`. The TS
-        shell's `setupEngine` immediately repopulates fonts + seed
-        text via the established cold-boot path. */
+    /// `setupEngine` on the TS side re-issues `loadFont` (and, when no
+    /// snapshot was restored, the boot `RenderPage`) after recovery
+    /// returns, so wiping the engine to a near-cold state is safe and
+    /// idempotent. Rendering surfaces (`page_ctxs`, `ctx`, `vello`,
+    /// `atlas`) are preserved — those own the live `OffscreenCanvas`
+    /// context, which cannot be re-transferred.
+    fn reset_session_state(&mut self) {
         self.fonts.clear();
-        self.undo = UndoStack::new(DocumentTree::new(), 100);
+        self.undo = UndoStack::new(DocumentTree::new(), UNDO_CAP);
         self.layout_cfg = None;
         self.selection = None;
         self.composition = None;
@@ -5259,8 +5612,195 @@ impl Engine {
         /* Phase 3 (#39) — recovery lands in body mode. */
         self.active_story = StoryTarget::Body;
         self.stashed_body_selection = None;
+    }
+
+    /// Issue #85 — real crash recovery: base snapshot + replayed tail.
+    ///
+    /// 1. Reset to the cold state ([`Self::reset_session_state`]).
+    /// 2. Restore the base snapshot when one was supplied. An unreadable
+    ///    snapshot (foreign bytes, unsupported version, corrupt payload)
+    ///    is logged and recovery continues onto a fresh document — a
+    ///    recovered-but-empty session beats a dead one, and the reply's
+    ///    `snapshot_restored: false` tells the shell what happened.
+    /// 3. Replay `log_tail` through the ordinary `apply` path with the
+    ///    layout config stashed: the fresh worker has loaded no fonts yet,
+    ///    so nothing may lay out or paint mid-replay, and one paint per
+    ///    replayed keystroke would make recovery O(tail × page). Zoom /
+    ///    device-scale changes in the tail are folded into the restored
+    ///    config afterwards; a replayed `RenderPage` re-seeds it.
+    ///
+    /// The shell repaints once fonts are back (`SetDeviceScale` +
+    /// `RequestPaint`), and reads the actual renderer off the reply so
+    /// `__renderer` cannot lie after a respawn (issue #66).
+    async fn do_recover(&mut self, snapshot: Vec<u8>, log_tail: Vec<Command>) -> Event {
+        self.reset_session_state();
+        let snapshot_restored = if snapshot.is_empty() {
+            false
+        } else {
+            match self.restore_from_bytes(&snapshot) {
+                Ok(_) => true,
+                Err(e) => {
+                    warn_console(&format!(
+                        "[engine] recovery: base snapshot unreadable ({e}); replaying the \
+                         tail onto a fresh document"
+                    ));
+                    self.reset_session_state();
+                    false
+                }
+            }
+        };
+
+        let mut stashed_cfg = self.layout_cfg.take();
+        let mut pending_base_scale: Option<f32> = None;
+        let mut pending_zoom: Option<f32> = None;
+        let mut applied_commands: u32 = 0;
+        for cmd in log_tail {
+            match &cmd {
+                Command::SetDeviceScale { scale } => pending_base_scale = Some(*scale),
+                Command::SetZoom { scale } => pending_zoom = Some(*scale),
+                _ => {}
+            }
+            /* Replayed events are not observable: the shell rebuilds its
+            mirrors (selection, a11y tree, paint dims) after recovery. */
+            let _ = Box::pin(self.apply(cmd)).await;
+            applied_commands += 1;
+            /* A replayed `RenderPage` re-seeds the config; keep it stashed
+            so the next replayed edit does not paint without fonts. */
+            if let Some(cfg) = self.layout_cfg.take() {
+                stashed_cfg = Some(cfg);
+            }
+        }
+        if let Some(cfg) = stashed_cfg.as_mut() {
+            if let Some(base) = pending_base_scale {
+                cfg.base_scale = base.clamp(0.5, 8.0);
+            }
+            if let Some(zoom) = pending_zoom {
+                cfg.zoom = zoom.clamp(0.25, 4.0);
+            }
+            cfg.scale = cfg.base_scale * cfg.zoom;
+        }
+        self.layout_cfg = stashed_cfg;
+        /* Replay side effects the user must not see twice: an IME preview
+        cannot survive a worker, and 200 replayed edits must not narrate. */
+        self.composition = None;
+        self.pending_announcements.clear();
+        self.a11y_cache = None;
+        self.layout_cache.get_mut().clear();
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
         Event::Recovered {
-            applied_commands: 0,
+            applied_commands,
+            snapshot_restored,
+            renderer: self.renderer_name().to_string(),
+        }
+    }
+
+    /// Issue #85 — `Command::Snapshot` handler.
+    fn do_snapshot(&self, seq: Option<u64>) -> Event {
+        match self.snapshot_bytes() {
+            Ok(bytes) => Event::Snapshot {
+                bytes,
+                seq: seq.unwrap_or(0),
+                format_version: engine::snapshot::FORMAT_VERSION,
+            },
+            Err(e) => Event::Error {
+                message: format!("Snapshot: {e}"),
+            },
+        }
+    }
+
+    /// Issue #66 — the backend this instance actually paints with.
+    fn renderer_name(&self) -> &'static str {
+        if self.vello.is_some() {
+            "vello"
+        } else {
+            "canvas2d"
+        }
+    }
+
+    /// Issue #85 — undo entries (current document included) the snapshot
+    /// carries for the current document size; see
+    /// [`SNAPSHOT_UNDO_BLOCK_BUDGET`].
+    fn snapshot_undo_entries(&self) -> usize {
+        let blocks = self.undo.current().block_count().max(1) as usize;
+        (SNAPSHOT_UNDO_BLOCK_BUDGET / blocks).clamp(1, SNAPSHOT_UNDO_MAX_ENTRIES)
+    }
+
+    /// Issue #85 — assemble the session state the snapshot persists.
+    fn capture_snapshot(&self) -> EngineSnapshotV1 {
+        let (doc_history, undo_cursor) = self.undo.history_window(self.snapshot_undo_entries());
+        EngineSnapshotV1 {
+            doc_history,
+            undo_cursor: undo_cursor as u32,
+            selection: self.selection.clone(),
+            stashed_body_selection: self.stashed_body_selection.clone(),
+            active_story: self.active_story.clone(),
+            pending_format: self.pending_format.clone(),
+            caret_affinity: self.caret_affinity,
+            tracking_changes: self.tracking_changes,
+            review_author: self.review_author.clone(),
+            review_date: self.review_date.clone(),
+            layout_cfg: self.layout_cfg.as_ref().map(LayoutCfgSnapshot::capture),
+        }
+    }
+
+    /// Issue #85 — `Engine::snapshot()`: the versioned envelope
+    /// (`engine::snapshot`) of [`Self::capture_snapshot`].
+    fn snapshot_bytes(&self) -> Result<Vec<u8>, SnapshotError> {
+        engine::snapshot::encode(&self.capture_snapshot())
+    }
+
+    /// Issue #85 — `Engine::restore()`: decode `bytes`, apply that
+    /// version's defaults, install the state. Returns the format version
+    /// the snapshot was written with. Does not touch fonts or the
+    /// rendering surface.
+    fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<u8, SnapshotError> {
+        let decoded = engine::snapshot::decode::<EngineSnapshotV1>(bytes)?;
+        let mut state = decoded.payload;
+        state.apply_version_defaults(decoded.version);
+        self.restore_snapshot(state);
+        Ok(decoded.version)
+    }
+
+    fn restore_snapshot(&mut self, s: EngineSnapshotV1) {
+        self.undo = UndoStack::from_history(s.doc_history, s.undo_cursor as usize, UNDO_CAP);
+        self.layout_cfg = s.layout_cfg.and_then(LayoutCfgSnapshot::restore);
+        self.active_story = s.active_story;
+        self.selection = s.selection;
+        self.stashed_body_selection = s.stashed_body_selection;
+        self.pending_format = s.pending_format;
+        self.caret_affinity = s.caret_affinity;
+        self.tracking_changes = s.tracking_changes;
+        self.review_author = s.review_author;
+        self.review_date = s.review_date;
+        self.composition = None;
+        /* The fresh stack restarts its revision counter at 0 — every
+        revision-keyed memo must go. */
+        self.layout_cache.get_mut().clear();
+        self.invalidate_layout_snapshot();
+        self.a11y_cache = None;
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        /* Positions are untrusted input once they have been through
+        IndexedDB: re-resolve the story (exits to the body when its part
+        no longer exists) and clamp every caret into its document. */
+        self.story_validity_guard();
+        if let Some(sel) = self.selection.clone() {
+            let clamped = self.with_selection_doc(|d| SelectionState {
+                anchor: clamp_pos(d, sel.anchor),
+                caret: clamp_pos(d, sel.caret),
+                ideal_x: sel.ideal_x,
+                kind: sel.kind,
+            });
+            self.selection = Some(clamped);
+        }
+        if let Some(sel) = self.stashed_body_selection.clone() {
+            let body = self.undo.current();
+            self.stashed_body_selection = Some(SelectionState {
+                anchor: clamp_pos(body, sel.anchor),
+                caret: clamp_pos(body, sel.caret),
+                ideal_x: sel.ideal_x,
+                kind: sel.kind,
+            });
         }
     }
 
@@ -5276,7 +5816,10 @@ impl Engine {
 
     /// D2.5 telemetry. `wasm_heap_bytes` and undo/font counters are real;
     /// `document_tree_bytes` is an estimate (sum of paragraph text bytes);
-    /// the glyph cache and frame timings land with the Phase 3 renderer.
+    /// the glyph cache lands with a future renderer pass. Issue #86 —
+    /// `last_paint_ms` / `last_command_ms` are real now (`Engine::last_paint_ms`
+    /// / `last_command_ms`, updated by `render_document` and `dispatch`
+    /// respectively) — no longer the `0.0` D5.7 placeholder.
     fn request_stats(&self) -> Event {
         let doc = self.undo.current();
         let document_tree_bytes: usize = doc
@@ -5291,8 +5834,8 @@ impl Engine {
             glyph_cache_entries: 0,
             undo_stack_depth: self.undo.depth(),
             fonts_resident: self.fonts.len() as u32,
-            last_paint_ms: 0.0,
-            last_command_ms: 0.0,
+            last_paint_ms: self.last_paint_ms,
+            last_command_ms: self.last_command_ms,
             paragraph_count: doc.paragraph_count(),
             word_count: doc.word_count(),
             character_count: doc.character_count(),
@@ -5336,20 +5879,62 @@ impl Engine {
         let scale_bits = scale.to_bits();
         let target_bits = target_y.map(f32::to_bits);
         let viewport_h_bits = self.lazy_layout.viewport_h.to_bits();
+        /* The inputs the LAYOUT depends on; the cull target and the
+        viewport height only decide how deep the band goes. */
+        let same_layout_inputs = |s: &LayoutSnapshot| {
+            s.doc_revision == doc_revision
+                && s.scale_bits == scale_bits
+                && s.composition_active == composition_active
+        };
         {
             let snap = self.layout_snapshot.borrow();
             if let Some(s) = snap.as_ref()
-                && s.doc_revision == doc_revision
-                && s.scale_bits == scale_bits
-                && s.target_bits == target_bits
-                && s.viewport_h_bits == viewport_h_bits
-                && s.composition_active == composition_active
+                && same_layout_inputs(s)
+                && ((s.target_bits == target_bits && s.viewport_h_bits == viewport_h_bits)
+                    /* Issue #87 — a FULL layout at the same inputs covers
+                    every target; rebuilding a band from it would only
+                    throw pages away (and, after a fast-path demotion,
+                    thrash between band and full on every expand). */
+                    || s.info.is_full_layout)
             {
                 return Ok(());
             }
         }
-        let (pages, _fonts, page_paths, info) =
+        let (mut pages, _fonts, mut page_paths, mut info) =
             self.build_pages(scale, with_composition, target_y)?;
+        /* Issue #87 — verified fast path. A viewport-culled band is an
+        incremental relayout: it predicts that laying out MORE of the
+        same document reproduces the pages the previous band already
+        showed. Never trust the prediction — check it. The previous band
+        (same layout inputs, not a full layout) must be a geometric
+        prefix of this one (or vice versa when the runway shrank); on any
+        mismatch demote to a full reflow and say so. A stale layout-cache
+        entry or a non-deterministic pass becomes a perf blip and a
+        telemetry note, not pixels that disagree with the next scroll. */
+        let mismatch = {
+            let snap = self.layout_snapshot.borrow();
+            snap.as_ref()
+                .filter(|s| same_layout_inputs(s) && !s.info.is_full_layout)
+                .and_then(|prev| {
+                    let (shorter, longer) = if prev.pages.len() <= pages.len() {
+                        (&prev.pages[..], &pages[..])
+                    } else {
+                        (&pages[..], &prev.pages[..])
+                    };
+                    layout::verify_prefix(shorter, longer).err()
+                })
+        };
+        if let Some(m) = mismatch {
+            let (full_pages, _f, full_paths, mut full_info) =
+                self.build_pages(scale, with_composition, None)?;
+            full_info.degradations.push(LayoutDegraded {
+                reason: LayoutDegradeReason::FastPathMismatch,
+                page: fast_path_mismatch_page(m),
+            });
+            pages = full_pages;
+            page_paths = full_paths;
+            info = full_info;
+        }
         *self.layout_snapshot.borrow_mut() = Some(LayoutSnapshot {
             doc_revision,
             scale_bits,
@@ -5501,6 +6086,12 @@ impl Engine {
             target_y.map(|y| y + runway)
         };
         let mut culled = false;
+        /* Issue #87 — degradation notes for this build: paginator
+        watchdog notes join here as each paginator finishes; the
+        sub-paginator sink is drained at the end. Clear leftovers from
+        an aborted build first. */
+        let _ = drain_layout_notes();
+        let mut degradations: Vec<LayoutDegraded> = Vec::new();
         let gap = render::scene::PAGE_GAP_PT * scale;
         let height_so_far = |pages: &[PageBox], in_progress: f32| -> f32 {
             if pages.is_empty() {
@@ -5540,7 +6131,8 @@ impl Engine {
                 /* NextPage / EvenPage / OddPage section break — finish
                 the prior paginator (which flushes the in-progress
                 page if any), then build a fresh one below. */
-                let mut pages = p.finish();
+                let (mut pages, notes) = p.finish_with_notes();
+                degradations.extend(notes.into_iter().map(bridge_degradation));
                 let consume = pages.len();
                 emitted_pages.append(&mut pages);
                 let mut paths_taken: Vec<Vec<EngineBlockPath>> = std::mem::take(&mut page_paths);
@@ -5849,7 +6441,8 @@ impl Engine {
             }
         }
         if let Some(p) = paginator.take() {
-            let mut pages = p.finish();
+            let (mut pages, notes) = p.finish_with_notes();
+            degradations.extend(notes.into_iter().map(bridge_degradation));
             let consume = pages.len();
             emitted_pages.append(&mut pages);
             let mut paths_taken: Vec<Vec<EngineBlockPath>> = std::mem::take(&mut page_paths);
@@ -5904,9 +6497,11 @@ impl Engine {
             emitted_paths.push(Vec::new());
         }
         /* Audit gap C.H1 — fold the cull bookkeeping into the result. */
+        degradations.extend(drain_layout_notes());
         let info = LazyLayoutInfo {
             is_full_layout: !culled,
             remaining_blocks: total_blocks.saturating_sub(processed_blocks),
+            degradations,
         };
         Ok((emitted_pages, font_stack, emitted_paths, info))
     }
@@ -5943,6 +6538,12 @@ impl Engine {
     }
 
     fn render_document(&mut self, clip: Option<Rect>) -> Result<RenderStats, Box<Event>> {
+        /* Issue #86 — D5.7 real telemetry. Covers layout-if-stale (the
+        `ensure_layout_snapshot` call just below, a no-op cache hit on the
+        common path) plus the actual Vello/Canvas2D paint — "paint_ms" has
+        always meant this whole call's cost (see `Event::Painted.paint_ms`
+        below), so the clock starts here rather than after layout. */
+        let paint_t0 = now_ms();
         /* `true` — splice the live IME composition preview into the
         paint. Audit gap C.H1 — `target_y` comes from `lazy_layout`
         (high-water mark the TS shell has asked us to cover). The
@@ -5958,7 +6559,7 @@ impl Engine {
             .as_ref()
             .expect("ensure_layout_snapshot populated the memo");
         let pages = &snap.pages;
-        let info = snap.info;
+        let info = snap.info.clone();
 
         let mut line_count: u32 = 0;
         let mut glyph_count: u32 = 0;
@@ -6057,6 +6658,7 @@ impl Engine {
             page_margin_bottoms,
             page_content_tops,
             page_content_bottoms,
+            layout_degraded: info.degradations,
         };
 
         /* Vello path: encode the whole display list and present it over
@@ -6079,6 +6681,7 @@ impl Engine {
                     message: format!("vello paint: {e}"),
                 })
             })?;
+            self.last_paint_ms = (now_ms() - paint_t0) as f32;
             self.last_paint_dims = LastPaintDims {
                 document_height: stats.document_height,
                 page_count: stats.page_count,
@@ -6090,6 +6693,8 @@ impl Engine {
                 page_margin_bottoms: stats.page_margin_bottoms.clone(),
                 page_content_tops: stats.page_content_tops.clone(),
                 page_content_bottoms: stats.page_content_bottoms.clone(),
+                layout_degraded: stats.layout_degraded.clone(),
+                paint_ms: self.last_paint_ms,
             };
             return Ok(stats);
         }
@@ -6137,6 +6742,7 @@ impl Engine {
             }
         }
 
+        self.last_paint_ms = (now_ms() - paint_t0) as f32;
         self.last_paint_dims = LastPaintDims {
             document_height: stats.document_height,
             page_count: stats.page_count,
@@ -6148,6 +6754,8 @@ impl Engine {
             page_margin_bottoms: stats.page_margin_bottoms.clone(),
             page_content_tops: stats.page_content_tops.clone(),
             page_content_bottoms: stats.page_content_bottoms.clone(),
+            layout_degraded: stats.layout_degraded.clone(),
+            paint_ms: self.last_paint_ms,
         };
         Ok(stats)
     }
@@ -6276,7 +6884,10 @@ impl Engine {
                 h: 0.0,
             },
             version: u64::from(self.undo.depth()),
-            paint_ms: 0.0,
+            /* Issue #86 — synthetic Painted: no repaint happened here, so
+            report the last REAL paint's cost (from `dims`) rather than a
+            dummy `0.0`. */
+            paint_ms: dims.paint_ms,
             document_height: dims.document_height,
             page_count: dims.page_count,
             is_full_layout: dims.is_full_layout,
@@ -6288,6 +6899,7 @@ impl Engine {
             page_margin_bottoms: dims.page_margin_bottoms,
             page_content_tops: dims.page_content_tops,
             page_content_bottoms: dims.page_content_bottoms,
+            layout_degraded: dims.layout_degraded,
         }
     }
 
@@ -6336,7 +6948,9 @@ impl Engine {
         Event::Painted {
             dirty: kurbo_to_bridge(region),
             version: u64::from(self.undo.depth()),
-            paint_ms: 0.0,
+            /* Issue #86 — real cost of the `render_document` call just
+            above (D5.7: was a permanent `0.0` dummy). */
+            paint_ms: self.last_paint_ms,
             document_height: stats.document_height,
             page_count: stats.page_count,
             is_full_layout: stats.is_full_layout,
@@ -6348,6 +6962,7 @@ impl Engine {
             page_margin_bottoms: stats.page_margin_bottoms,
             page_content_tops: stats.page_content_tops,
             page_content_bottoms: stats.page_content_bottoms,
+            layout_degraded: stats.layout_degraded,
         }
     }
 
@@ -9632,6 +10247,7 @@ impl Engine {
             vert_align: None,
             raw_font_family: r.font_family,
             font_theme: None,
+            grab_bag: None,
         });
         let based_on = if props.clear_based_on == Some(true) {
             Some(None)
@@ -10484,6 +11100,204 @@ impl Engine {
     }
 }
 
+/// Native testing/fuzzing entry points (D5.5, issue #90). Not part of the
+/// `#[wasm_bindgen]` RPC surface — `web_sys::OffscreenCanvas` and `JsValue`
+/// (via `serde_wasm_bindgen`) only function inside a browser's wasm32
+/// runtime, so a native `cargo fuzz` process has no way to call
+/// `Engine::new` or `Engine::dispatch` directly. This block gives
+/// `fuzz/fuzz_targets/rpc_command.rs` and `layout_paginate.rs` a plain-Rust
+/// path to the SAME production dispatcher (`apply`) the worker calls,
+/// including the auto-repaint → `build_pages` → `Paginator` →
+/// `layout_paragraph` pipeline — only the final `ctx.put_image_data` /
+/// `render_canvas2d` blit is unreachable outside a browser, and that piece
+/// is already skipped whenever `self.ctx` / `self.page_ctxs` are empty (see
+/// `render_document`'s per-page `let Some(ctx) = ... else { continue }`).
+/// Gated behind `fuzz-native` (off by default; never activated by
+/// `wasm-pack build`), so none of this reaches the production wasm bundle.
+#[cfg(feature = "fuzz-native")]
+impl Engine {
+    /// A canvas-less, pre-seeded engine. `web_sys::OffscreenCanvas` cannot
+    /// be constructed outside a browser, so this bypasses the
+    /// `#[wasm_bindgen(constructor)]` `Engine::new` entirely (`ctx: None`,
+    /// `page_ctxs: vec![]`, `vello: None`) and seeds `doc` as the initial
+    /// undo snapshot. Mirrors the shape of the crate's own native test
+    /// helper `test_engine_with_doc` (`mod tests`, below) — same bundled
+    /// `LiberationSans-Regular.ttf` real font (layout needs real glyph
+    /// metrics; a fake font would make every line-break / justify decision
+    /// meaningless) and a `layout_cfg` cached up front so layout runs from
+    /// the very first mutating command, no separate `LoadFont` +
+    /// `RenderPage` dance required in every corpus entry.
+    pub fn new_headless(doc: DocumentTree) -> Engine {
+        let bytes_font = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("fuzz-latin".to_string(), bytes_font)
+            .expect("bundled LiberationSans-Regular.ttf must parse");
+        let mut fonts: HashMap<String, Arc<LoadedFont>> = HashMap::new();
+        fonts.insert("fuzz-latin".to_string(), Arc::new(font));
+        let mut engine = assemble_engine(None, None);
+        engine.fonts = fonts;
+        engine.layout_cfg = Some(RenderConfig {
+            font_id: "fuzz-latin".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 16.0,
+            line_height: 26.0,
+            alignment: Alignment::Start,
+            scale: 1.0,
+            base_scale: 1.0,
+            zoom: 1.0,
+        });
+        engine.undo = UndoStack::new(doc, 100);
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        /* Non-empty so `current_review_date` never reaches `js_sys::Date`,
+        which panics on native targets outside a browser (mirrors the
+        crate's own `test_engine_with_doc` test helper, below). Does NOT
+        cover `do_insert_comment` / `do_reply_to_comment`, which call
+        `js_sys::Date::new_0()` directly rather than through
+        `current_review_date` — the fuzz generator excludes
+        `Command::InsertComment` / `Command::ReplyToComment` for exactly
+        this reason (D5.5, issue #90). */
+        engine.review_date = "2026-01-01T00:00:00Z".to_string();
+        engine
+    }
+
+    /// Drive one `Command` through the real production dispatcher
+    /// (`apply`) without a JS runtime. `apply` is declared `async` only
+    /// for the `dispatch` / wasm_bindgen boundary; auditing its body
+    /// (D5.5, issue #90) turned up no internal `.await` point, so this
+    /// polls the future once with a no-op waker instead of pulling in an
+    /// async executor dependency. Panics loudly if that assumption is
+    /// ever broken by a future change — a legitimate fuzz finding (a
+    /// command that suspends natively), not a bug in the harness.
+    pub fn apply_sync(&mut self, cmd: Command) -> Event {
+        block_on_ready(self.apply(cmd))
+    }
+
+    /// `true` when the live selection's anchor and caret both resolve to
+    /// a real position in the current document. `clamp_pos` (used by
+    /// `Command::SetSelection` itself) is idempotent on a valid position,
+    /// so "unchanged by clamping" is exactly the in-bounds check.
+    pub fn selection_is_valid(&self) -> bool {
+        match &self.selection {
+            None => true,
+            Some(sel) => {
+                let doc = self.undo.current();
+                clamp_pos(doc, sel.anchor.clone()) == sel.anchor
+                    && clamp_pos(doc, sel.caret.clone()) == sel.caret
+            }
+        }
+    }
+
+    /// Undo-stack depth — must never exceed the bound the stack was
+    /// constructed with (100, matching production — see `new_headless`).
+    pub fn undo_depth(&self) -> u32 {
+        self.undo.depth()
+    }
+
+    /// Run the real layout pipeline (`build_pages` → `Paginator` →
+    /// `layout_paragraph`) over the current document without requiring a
+    /// mutating command to trigger the auto-repaint path first. Used by
+    /// `layout_paginate` to drive arbitrary paragraph/table/section trees
+    /// "straight into the paginator". Mirrors `render_document`'s own
+    /// call to `ensure_layout_snapshot`.
+    pub fn ensure_layout_for_fuzzing(&mut self) -> Result<(), Box<Event>> {
+        let scale = self.scale();
+        self.ensure_layout_snapshot(scale, true, None)
+    }
+
+    /// Page count from the most recent layout snapshot; `0` before the
+    /// first `ensure_layout_for_fuzzing`. `layout_paginate` asserts this
+    /// stays under a fixed bound as its "layout terminates under a bound"
+    /// invariant (issue #90 acceptance) — a runaway paginator (e.g. an
+    /// off-by-one that never advances `cur_y`) shows up as a page count
+    /// blowing past anything a bounded random input should ever need,
+    /// which is cheaper and more deterministic than an in-process
+    /// wall-clock watchdog thread. Genuine infinite loops (one that never
+    /// returns to let us count pages at all) are still caught at the
+    /// process level by libFuzzer's own `-timeout=` flag in CI.
+    pub fn layout_page_count_for_fuzzing(&self) -> usize {
+        self.layout_snapshot
+            .borrow()
+            .as_ref()
+            .map_or(0, |s| s.pages.len())
+    }
+
+    /// Exercise the real, browser-free glyph rasterizer
+    /// (`render::atlas::GlyphAtlas::get_or_rasterize`, swash-backed) over
+    /// every glyph run in the most recent layout snapshot. This is
+    /// exactly what `render_canvas2d` does before its final
+    /// `ctx.put_image_data` blit — the blit is the only piece that
+    /// genuinely needs a browser `OffscreenCanvas`, so it is the only
+    /// piece skipped here. Returns the number of glyphs successfully
+    /// rasterized; `0` before the first layout has run (see
+    /// `ensure_layout_for_fuzzing`).
+    pub fn rasterize_last_layout_for_fuzzing(&mut self) -> usize {
+        let pages = match self.layout_snapshot.borrow().as_ref() {
+            Some(s) => s.pages.clone(),
+            None => return 0,
+        };
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let scene = render::scene::build_document_scene(&pages, gap);
+        let mut rasterized = 0usize;
+        for cmd in &scene.cmds {
+            let render::scene::DisplayCmd::DrawGlyphRun(run) = cmd else {
+                continue;
+            };
+            let Some(font) = self.fonts.get(&run.font) else {
+                continue;
+            };
+            for g in &run.glyphs {
+                let key = render::atlas::GlyphKey::new(
+                    run.font.clone(),
+                    g.glyph_id,
+                    run.px_size,
+                    run.faux_bold,
+                    run.faux_italic,
+                );
+                if self
+                    .atlas
+                    .get_or_rasterize(&key, font, run.px_size)
+                    .is_some()
+                {
+                    rasterized += 1;
+                }
+            }
+        }
+        rasterized
+    }
+}
+
+/// Poll `fut` once with a no-op waker and expect it to be immediately
+/// `Ready` — `Engine::apply` has no internal `.await` point (see
+/// `Engine::apply_sync`'s doc comment). Panics on `Pending` instead of
+/// silently blocking forever, since there is no reactor here to wake us.
+#[cfg(feature = "fuzz-native")]
+fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone_raw(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_raw, noop, noop, noop);
+    let raw = RawWaker::new(std::ptr::null(), &VTABLE);
+    // SAFETY: the vtable's clone/wake/wake_by_ref/drop are all no-ops over
+    // a null data pointer — there is nothing to (de)allocate or dereference.
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!(
+            "engine-wasm Engine::apply() suspended natively — the D5.5 fuzz \
+             harness (issue #90) assumed it never does; audit the new \
+             `.await` point before trusting `apply_sync` again"
+        ),
+    }
+}
+
 /// Bridge `BridgeCellBorders` → engine `CellBorders` (cell-level only;
 /// `inside_h` / `inside_v` are not exposed on the wire — they apply
 /// only at table level).
@@ -10621,6 +11435,8 @@ struct RenderStats {
     /// page-local); the zone gate's truth under band intrusion.
     page_content_tops: Vec<f32>,
     page_content_bottoms: Vec<f32>,
+    /// Issue #87 — degradation notes for this paint.
+    layout_degraded: Vec<LayoutDegraded>,
 }
 
 #[cfg(test)]
@@ -10659,6 +11475,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -10702,6 +11520,72 @@ mod tests {
             Some("helloX world"),
             "insert must land at the just-set caret, not append at the end"
         );
+    }
+
+    /// Issue #86 — D5.7 real telemetry. Only meaningful on `wasm32` in a
+    /// real browser (`wasm-pack test --headless --chrome`): `now_ms()` is
+    /// a permanent `0.0` off-wasm (see `now_ms_is_a_stable_zero_off_wasm`),
+    /// so this can't assert non-zero on native. What it DOES pin
+    /// everywhere it runs: `RequestStats.last_command_ms` /
+    /// `.last_paint_ms` and `Event::Painted.paint_ms` are wired to the
+    /// SAME underlying `Engine::last_paint_ms` — not three independent
+    /// `0.0` literals that happen to agree by coincidence.
+    #[wasm_bindgen_test]
+    async fn dispatch_and_paint_share_one_real_timing_source() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        let insert = serde_wasm_bindgen::to_value(&Command::InsertText {
+            at: Some(bpos_top(0, 11)),
+            text: " again".to_string(),
+        })
+        .expect("encode insert");
+        engine.dispatch(insert).await.expect("insert dispatch");
+
+        let paint = serde_wasm_bindgen::to_value(&Command::RequestPaint {
+            viewport: BridgeRect {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 1200.0,
+            },
+            dirty: None,
+        })
+        .expect("encode request paint");
+        let painted_js = engine.dispatch(paint).await.expect("request paint");
+        let painted: Event = serde_wasm_bindgen::from_value(painted_js).expect("decode painted");
+        let Event::Painted { paint_ms, .. } = painted else {
+            panic!("expected Painted, got {painted:?}");
+        };
+
+        let stats_js = engine
+            .dispatch(serde_wasm_bindgen::to_value(&Command::RequestStats).expect("encode stats"))
+            .await
+            .expect("request stats");
+        let stats_evt: Event = serde_wasm_bindgen::from_value(stats_js).expect("decode stats");
+        let Event::Stats(stats) = stats_evt else {
+            panic!("expected Stats, got {stats_evt:?}");
+        };
+
+        assert!(stats.last_command_ms >= 0.0, "must never be negative");
+        assert!(stats.last_paint_ms >= 0.0, "must never be negative");
+        // The most recent paint IS the RequestPaint call above — the
+        // mirrored dimension cache and RequestStats must report the
+        // identical cost, not two independently-drifting numbers.
+        assert!(
+            (stats.last_paint_ms - paint_ms).abs() < f32::EPSILON,
+            "Painted.paint_ms ({paint_ms}) and Stats.last_paint_ms ({}) disagree",
+            stats.last_paint_ms
+        );
+    }
+
+    /// Issue #86 — `now_ms()` must degrade to a harmless constant on
+    /// native (`cargo test`), where no JS global scope exists to host a
+    /// `Performance` object — same fallback shape as `wasm_heap_bytes()`.
+    /// A future regression that makes this panic or return NaN on native
+    /// would otherwise only surface as a browser-only test failure.
+    #[test]
+    fn now_ms_is_a_stable_zero_off_wasm() {
+        assert_eq!(now_ms(), 0.0);
+        assert_eq!(now_ms(), now_ms());
     }
 
     /// Backlog #7 — a line with one LTR run and one RTL run; a selection
@@ -11399,6 +12283,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -11450,6 +12336,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -11492,6 +12380,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -11611,6 +12501,8 @@ mod tests {
             tracking_changes: false,
             review_author: "You".to_string(),
             review_date: String::new(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -12147,6 +13039,8 @@ mod tests {
                 tracking_changes: false,
                 review_author: "You".to_string(),
                 review_date: String::new(),
+                last_command_ms: 0.0,
+                last_paint_ms: 0.0,
             }
         }
 
@@ -13223,6 +14117,8 @@ mod tests {
             /* Non-empty so `current_review_date` never reaches
             `js_sys::Date`, which panics on native targets. */
             review_date: "2026-01-01T00:00:00Z".to_string(),
+            last_command_ms: 0.0,
+            last_paint_ms: 0.0,
         }
     }
 
@@ -13675,5 +14571,777 @@ mod tests {
             "D: 7/5/2026 end".chars().count(),
             "body DATE field re-laid with the resolved text"
         );
+    }
+
+    /* ================================================================
+    Issue #87 — layout self-defense: geometry regression anchor for the
+    engine adapter (`build_pages` end to end, real shaping).
+    ================================================================ */
+
+    fn prose_doc(paragraphs: usize) -> DocumentTree {
+        let mut d = DocumentTree::from_text(
+            "The quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly.",
+        );
+        for i in 1..paragraphs {
+            d.blocks
+                .push_back(engine::Block::Paragraph(engine::Paragraph {
+                    text: format!(
+                        "Paragraph {i}: sphinx of black quartz, judge my vow; pack my box with five dozen liquor jugs."
+                    ),
+                    ..Default::default()
+                }));
+        }
+        d
+    }
+
+    fn table_doc() -> DocumentTree {
+        let mut d = DocumentTree::from_text("intro");
+        d.blocks.push_back(engine::Block::Table(one_row_table(vec![
+            cell_with_text("short"),
+            cell_with_text(
+                "a much longer cell text that wraps across several lines in a narrow column",
+            ),
+        ])));
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "outro".into(),
+                ..Default::default()
+            }));
+        d
+    }
+
+    /// Every engine-level nominal shape: the 50-page perf fixture (full
+    /// layout and a culled band, both at DPR 2), a forced page break, an
+    /// autofit table and a long multi-page prose doc. Fingerprints pinned
+    /// on the pre-#87 adapter — a changed value means the browser goldens
+    /// would move.
+    fn engine_nominal_fixtures() -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
+        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let engine = test_engine_with_doc(archive.document);
+        let mut out = Vec::new();
+        let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
+        out.push(("50p_full_x2", pages, info.degradations));
+        let (pages, _, _, info) = engine.build_pages(2.0, false, Some(2000.0)).expect("band");
+        out.push(("50p_band_2000_x2", pages, info.degradations));
+
+        let engine = test_engine_with_doc(two_page_doc("alpha beta gamma", "delta epsilon"));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
+        out.push(("two_page_form_feed", pages, info.degradations));
+
+        let engine = test_engine_with_doc(table_doc());
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
+        out.push(("autofit_table", pages, info.degradations));
+
+        let engine = test_engine_with_doc(prose_doc(300));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
+        out.push(("prose_300_full", pages, info.degradations));
+        let (pages, _, _, info) = engine
+            .build_pages(1.0, false, Some(1200.0))
+            .expect("prose band");
+        out.push(("prose_300_band_1200", pages, info.degradations));
+        out
+    }
+
+    /// Recorded on the pre-#87 adapter via `--nocapture`.
+    const PINNED_ENGINE_FINGERPRINTS: &[(&str, u64)] = &[
+        ("50p_full_x2", 0xf565e610ffdbc22d),
+        ("50p_band_2000_x2", 0x3b2d3d53655395a1),
+        ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("autofit_table", 0x92435b9636de4c72),
+        ("prose_300_full", 0xd3d662539c126b7d),
+        ("prose_300_band_1200", 0x5e704685f3cc770c),
+    ];
+
+    #[test]
+    fn engine_nominal_fixtures_are_geometrically_identical_to_the_pre_watchdog_adapter() {
+        for (name, pages, degradations) in engine_nominal_fixtures() {
+            let fp = layout::geometry_fingerprint(&pages);
+            match PINNED_ENGINE_FINGERPRINTS.iter().find(|(n, _)| *n == name) {
+                Some((_, want)) => assert_eq!(
+                    fp,
+                    *want,
+                    "fixture `{name}` changed geometry (got {fp:#x}, pinned {want:#x}, {} pages)",
+                    pages.len()
+                ),
+                None => eprintln!(
+                    "ENGINE FINGERPRINT {name} = {fp:#x} ({} pages)",
+                    pages.len()
+                ),
+            }
+            assert!(
+                degradations.is_empty(),
+                "nominal fixture `{name}` reported degradations: {degradations:?}"
+            );
+        }
+    }
+
+    /* ================================================================
+    Issue #87 — verified fast paths + adversarial fixtures at the
+    engine tier.
+    ================================================================ */
+
+    fn adversarial_budget() -> std::time::Duration {
+        if cfg!(debug_assertions) {
+            std::time::Duration::from_millis(5000)
+        } else {
+            std::time::Duration::from_millis(250)
+        }
+    }
+
+    /// A deeper `ExpandLayout` band verifies as a prefix of the previous
+    /// band — no note, still culled.
+    #[test]
+    fn expand_layout_band_verifies_as_a_prefix_without_demotion() {
+        let engine = test_engine_with_doc(prose_doc(300));
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(1200.0))
+            .expect("band 1");
+        let n1 = engine
+            .layout_snapshot
+            .borrow()
+            .as_ref()
+            .expect("snapshot")
+            .pages
+            .len();
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(4000.0))
+            .expect("band 2");
+        let snap = engine.layout_snapshot.borrow();
+        let s = snap.as_ref().expect("snapshot");
+        assert!(s.pages.len() > n1, "the deeper band grew");
+        assert!(!s.info.is_full_layout, "still a culled band");
+        assert!(s.info.degradations.is_empty(), "{:?}", s.info.degradations);
+    }
+
+    /// Acceptance: a fast-path mismatch injected into the previous band
+    /// demotes to a full reflow whose geometry equals a fresh full
+    /// layout, carries the `FastPathMismatch` note, and the full
+    /// snapshot then serves later targets without thrashing.
+    #[test]
+    fn fast_path_mismatch_demotes_to_full_reflow_with_identical_geometry() {
+        let engine = test_engine_with_doc(prose_doc(300));
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(1200.0))
+            .expect("band 1");
+        {
+            /* Corrupt the memo the way a stale cache entry would: page 0's
+            first block is 3 px lower than the real layout puts it. */
+            let mut snap = engine.layout_snapshot.borrow_mut();
+            let s = snap.as_mut().expect("snapshot");
+            assert!(!s.info.is_full_layout);
+            let b = &mut s.pages[0].blocks[0];
+            let mut o = b.origin();
+            o.y += 3.0;
+            b.set_origin(o);
+        }
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(2400.0))
+            .expect("band 2");
+        let (full_pages, _, _, full_info) =
+            engine.build_pages(1.0, false, None).expect("reference");
+        {
+            let snap = engine.layout_snapshot.borrow();
+            let s = snap.as_ref().expect("snapshot");
+            assert!(s.info.is_full_layout, "demoted to a full reflow");
+            assert_eq!(
+                s.info
+                    .degradations
+                    .iter()
+                    .filter(|d| d.reason == LayoutDegradeReason::FastPathMismatch)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                s.info.degradations[0].page,
+                Some(0),
+                "the mismatch was detected on page 0"
+            );
+            assert!(full_info.degradations.is_empty());
+            assert_eq!(
+                layout::geometry_fingerprint(&s.pages),
+                layout::geometry_fingerprint(&full_pages),
+                "demoted geometry equals a fresh full layout"
+            );
+            assert_eq!(s.pages.len(), full_pages.len());
+        }
+        /* A later, shallower target is served by the full snapshot. */
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(3000.0))
+            .expect("band 3");
+        let snap = engine.layout_snapshot.borrow();
+        let s = snap.as_ref().expect("snapshot");
+        assert!(s.info.is_full_layout, "no thrash back to a band");
+        assert_eq!(s.pages.len(), full_pages.len());
+    }
+
+    /// The paragraph-tier fast path: a poisoned cache entry fails its
+    /// post-conditions, is evicted, re-laid and reported — once.
+    #[test]
+    fn cache_mismatch_relays_the_paragraph_and_notes_it() {
+        let engine = test_engine_with_doc(DocumentTree::from_text("hello wide world"));
+        let cfg = engine.layout_cfg.clone().expect("cfg");
+        let doc = engine.undo.current().clone();
+        let sctx = StyleContext::of(&doc);
+        let fonts = FontStack::from_faces(engine.fonts.clone(), &cfg.font_id);
+        let para = doc
+            .blocks
+            .get(0)
+            .and_then(engine::Block::as_paragraph)
+            .expect("paragraph");
+        let mut cache = engine.layout_cache.borrow_mut();
+        let _ = drain_layout_notes();
+        let good = layout_paragraph_cached(para, &fonts, &cfg, 1.0, 400.0, sctx, &mut cache);
+        assert!(drain_layout_notes().is_empty(), "a miss is not a mismatch");
+        let key = paragraph_layout_key(para, &cfg, 1.0, 400.0, sctx);
+        let mut poisoned = good.clone();
+        poisoned.size.width = 123.0;
+        cache.put(key, poisoned);
+
+        let healed = layout_paragraph_cached(para, &fonts, &cfg, 1.0, 400.0, sctx, &mut cache);
+        assert_eq!(healed.size.width.to_bits(), 400.0f32.to_bits());
+        assert_eq!(
+            layout::geometry_fingerprint(&[page_of(healed.clone())]),
+            layout::geometry_fingerprint(&[page_of(good)])
+        );
+        let notes = drain_layout_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].reason, LayoutDegradeReason::CacheMismatch);
+        assert_eq!(notes[0].page, None);
+
+        let again = layout_paragraph_cached(para, &fonts, &cfg, 1.0, 400.0, sctx, &mut cache);
+        assert_eq!(again.size.width.to_bits(), 400.0f32.to_bits());
+        assert!(
+            drain_layout_notes().is_empty(),
+            "the healed entry is trusted"
+        );
+    }
+
+    fn page_of(p: ParagraphBox) -> PageBox {
+        PageBox {
+            size: Size {
+                width: 595.3,
+                height: 841.9,
+            },
+            margins: A4Page::a4().margin,
+            blocks: vec![LayoutBlock::Paragraph(p)],
+            header: None,
+            footer: None,
+            header_offset: 36.0,
+            footer_offset: 36.0,
+            footnotes: Vec::new(),
+            hf_role: layout::HeaderRole::Default,
+            page_number: 1,
+        }
+    }
+
+    /// Acceptance (#7 class): an autofit table whose columns are
+    /// narrower than their longest unbreakable token. Every pass — the
+    /// probe layout's char-level force-break, the min-content floor, the
+    /// shrink solver, the final cell layout — must terminate under
+    /// budget and the page must build a paint scene.
+    #[test]
+    fn autofit_column_narrower_than_its_longest_token_terminates_and_paints() {
+        let t0 = std::time::Instant::now();
+        let token = "x".repeat(160);
+        let mut d = DocumentTree::from_text("intro");
+        for _ in 0..3 {
+            d.blocks.push_back(engine::Block::Table(one_row_table(vec![
+                cell_with_text(&token),
+                cell_with_text("prose that wraps a little"),
+                cell_with_text(&token),
+            ])));
+        }
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(
+            t0.elapsed() < adversarial_budget(),
+            "took {:?}",
+            t0.elapsed()
+        );
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let tables: Vec<&TableBox> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter().filter_map(LayoutBlock::as_table))
+            .collect();
+        assert_eq!(tables.len(), 3);
+        let content_w = engine::PageGeometry::a4().content_width();
+        for t in &tables {
+            assert!(
+                t.size.width > content_w,
+                "the #7 invariant: overflow horizontally rather than clip the token"
+            );
+            for row in &t.rows {
+                /* Cells 0 and 2 hold the token; cell 1 is prose and may
+                wrap freely. */
+                for cell in [&row.cells[0], &row.cells[2]] {
+                    for p in cell.content.iter().filter_map(LayoutBlock::as_paragraph) {
+                        assert_eq!(p.lines.len(), 1, "no mid-token wrap at the final widths");
+                    }
+                }
+            }
+        }
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let _ = scene;
+    }
+
+    /// The notes reach `Event::Painted`: a paragraph whose exact line
+    /// height exceeds the page is placed atomically and the paint says
+    /// `OversizeLine`; a nominal paint says nothing.
+    #[test]
+    fn painted_carries_the_degradation_notes() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("nominal"));
+        let rect = BridgeRect {
+            x: 0.0,
+            y: 0.0,
+            w: 595.0,
+            h: 842.0,
+        };
+        let evt = engine.do_request_paint(rect, None);
+        let Event::Painted {
+            layout_degraded, ..
+        } = evt
+        else {
+            panic!("expected Painted, got {evt:?}");
+        };
+        assert!(layout_degraded.is_empty());
+
+        let mut d = DocumentTree::from_text("tall");
+        if let Some(engine::Block::Paragraph(p)) = d.blocks.get_mut(0) {
+            /* 1000 pt exact line height on a 698 pt body. */
+            p.props.line_height = Some(engine::LineHeight::Exact { twips: 20_000 });
+        }
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "after".into(),
+                ..Default::default()
+            }));
+        let mut engine = test_engine_with_doc(d);
+        let evt = engine.do_request_paint(rect, None);
+        let Event::Painted {
+            layout_degraded,
+            page_count,
+            ..
+        } = evt
+        else {
+            panic!("expected Painted, got {evt:?}");
+        };
+        assert_eq!(page_count, 2, "the flow continued past the oversize line");
+        assert_eq!(layout_degraded.len(), 1);
+        assert_eq!(layout_degraded[0].reason, LayoutDegradeReason::OversizeLine);
+        assert_eq!(layout_degraded[0].page, Some(0));
+        /* The synthetic side-channel replays the same notes. */
+        assert_eq!(engine.last_paint_dims.layout_degraded, layout_degraded);
+        let Event::Painted {
+            layout_degraded: replayed,
+            ..
+        } = engine.do_set_viewport(rect)
+        else {
+            panic!("expected Painted");
+        };
+        assert_eq!(replayed, layout_degraded);
+    }
+
+    /// D5.5 (issue #90) — the `fuzz-native` surface actually works end to
+    /// end: a headless engine drives real `Command`s through the real
+    /// `apply` dispatcher, runs the real layout pipeline, and the
+    /// invariant accessors read back sane values. This is a native
+    /// smoke test for `fuzz/fuzz_targets/rpc_command.rs` /
+    /// `layout_paginate.rs`, exercised here where `cargo test --workspace`
+    /// already runs it — the fuzz crate itself is a *separate* cargo
+    /// workspace `cargo test` never touches (see `fuzz/Cargo.toml`).
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn fuzz_native_surface_drives_engine_end_to_end() {
+        let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+        assert!(engine.selection_is_valid());
+        assert_eq!(engine.undo_depth(), 1);
+
+        let evt = engine.apply_sync(Command::InsertText {
+            at: None,
+            text: " more".to_string(),
+        });
+        assert!(
+            matches!(evt, Event::SelectionChanged { .. }),
+            "expected SelectionChanged, got {evt:?}"
+        );
+        // `new_headless` seeds the caret at (0, 0), so `InsertText { at: None }`
+        // (the live-caret path) prepends.
+        assert_eq!(engine.undo.current().paragraph_text(0), Some(" moreseed"));
+        assert_eq!(engine.undo_depth(), 2);
+        assert!(engine.selection_is_valid());
+
+        // D5.5 (issue #90) fuzzing finding — NOT asserted here (would make
+        // this a red gate for a pre-existing product behaviour outside
+        // this task's scope; see the PR description / final report):
+        // `Command::SetSelection` and `ExtendSelection` write `range` /
+        // `caret` verbatim with no `clamp_pos` call, unlike every other
+        // selection-mutating path (`do_place_caret_at_point`,
+        // `do_select_word_at`, …). An out-of-bounds `SetSelection` (e.g.
+        // `{ path: [Block { idx: 50 }], offset: 999 }` against a 1-paragraph
+        // doc) leaves `engine.selection_is_valid() == false` until the next
+        // text-mutating command's own `resolve_interactive_insert_at`
+        // clamping self-heals it — a real, reproducible
+        // `selection_is_valid()` violation, not merely a hypothetical one.
+        // The `rpc_command` fuzz target asserts this invariant after every
+        // command (unfiltered), so it will keep surfacing this.
+
+        // Layout + the native (browser-free) rasterizer both run for real.
+        engine.ensure_layout_for_fuzzing().expect("layout");
+        assert!(
+            engine.rasterize_last_layout_for_fuzzing() > 0,
+            "expected at least one glyph rasterized for non-empty text"
+        );
+
+        // Undo depth never exceeds the bound `new_headless` constructed.
+        for _ in 0..150 {
+            let _ = engine.apply_sync(Command::InsertText {
+                at: None,
+                text: "x".to_string(),
+            });
+            assert!(engine.undo_depth() <= 100, "undo depth exceeded its bound");
+        }
+    }
+}
+
+/// Issue #85 — crash-recovery snapshot + replay, exercised natively on a
+/// surface-less engine (no canvas, no fonts, no layout config — exactly
+/// the state a freshly respawned worker is in when `Recover` arrives).
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    /// The Canvas2D `apply` path never parks (no GPU await), so polling
+    /// with a no-op waker drives any command future to completion.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        let mut fut = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn engine() -> Engine {
+        assemble_engine(None, None)
+    }
+
+    fn apply(e: &mut Engine, cmd: Command) -> Event {
+        block_on(e.apply(cmd))
+    }
+
+    fn text(e: &Engine) -> String {
+        e.undo.current().to_plain_text()
+    }
+
+    fn insert(text: &str) -> Command {
+        Command::InsertText {
+            at: None,
+            text: text.into(),
+        }
+    }
+
+    /// Three edits (undo depth 4), a collapsed caret after "alpha", sticky
+    /// bold, track changes on, a review identity, BiDi affinity and a
+    /// zoomed RTL layout config.
+    fn seeded_engine() -> Engine {
+        let mut e = engine();
+        for word in ["alpha", " beta", " gamma"] {
+            let evt = apply(&mut e, insert(word));
+            assert!(matches!(evt, Event::TextInserted { .. }), "{evt:?}");
+        }
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(0, 5),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        e.pending_format = Some(SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        });
+        e.tracking_changes = true;
+        e.review_author = "Reviewer".into();
+        e.review_date = "2026-09-01T12:00:00Z".into();
+        e.caret_affinity = CaretAffinity::TrailingX;
+        e.layout_cfg = Some(RenderConfig {
+            font_id: "amiri".into(),
+            base_direction: ShapingDirection::Rtl,
+            px_size: 24.0,
+            line_height: 36.0,
+            alignment: Alignment::Justify,
+            scale: 1.5 * 1.25,
+            base_scale: 1.5,
+            zoom: 1.25,
+        });
+        e
+    }
+
+    #[test]
+    fn snapshot_round_trips_the_session_into_a_fresh_engine_byte_for_byte() {
+        let a = seeded_engine();
+        let bytes = a.snapshot_bytes().unwrap();
+        assert_eq!(&bytes[..4], b"NGES");
+
+        let mut b = engine();
+        let version = b.restore_from_bytes(&bytes).unwrap();
+        assert_eq!(version, engine::snapshot::FORMAT_VERSION);
+        assert_eq!(text(&b), "alpha beta gamma");
+        assert_eq!(b.undo.depth(), 4, "undo window restored");
+        assert!(b.undo.can_undo());
+        let sel = b.selection.as_ref().expect("selection restored");
+        assert_eq!(sel.anchor.offset, 5);
+        assert_eq!(sel.caret.offset, 5);
+        assert_eq!(b.pending_format.as_ref().unwrap().bold, Some(true));
+        assert!(b.tracking_changes);
+        assert_eq!(b.review_author, "Reviewer");
+        assert_eq!(b.review_date, "2026-09-01T12:00:00Z");
+        assert_eq!(b.caret_affinity, CaretAffinity::TrailingX);
+        let cfg = b.layout_cfg.as_ref().expect("layout config restored");
+        assert_eq!(cfg.font_id, "amiri");
+        assert!(matches!(cfg.base_direction, ShapingDirection::Rtl));
+        assert!(matches!(cfg.alignment, Alignment::Justify));
+        assert_eq!(cfg.px_size, 24.0);
+        assert_eq!(cfg.line_height, 36.0);
+        assert_eq!(cfg.base_scale, 1.5);
+        assert_eq!(cfg.zoom, 1.25);
+        assert_eq!(cfg.scale, 1.5 * 1.25);
+        assert_eq!(b.renderer_name(), "canvas2d");
+
+        /* The recovery e2e gate: a snapshot of the restored engine is
+        byte-identical to the snapshot it was restored from. */
+        assert_eq!(b.snapshot_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn undo_and_redo_keep_working_after_restore() {
+        let a = seeded_engine();
+        let mut b = engine();
+        b.restore_from_bytes(&a.snapshot_bytes().unwrap()).unwrap();
+        apply(&mut b, Command::Undo);
+        assert_eq!(text(&b), "alpha beta");
+        apply(&mut b, Command::Undo);
+        assert_eq!(text(&b), "alpha");
+        apply(&mut b, Command::Redo);
+        assert_eq!(text(&b), "alpha beta");
+    }
+
+    #[test]
+    fn recover_restores_the_snapshot_then_replays_the_tail() {
+        let a = seeded_engine();
+        let bytes = a.snapshot_bytes().unwrap();
+        let mut b = engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: bytes,
+                log_tail: vec![insert("X"), Command::SetZoom { scale: 2.0 }],
+            },
+        );
+        match evt {
+            Event::Recovered {
+                applied_commands,
+                snapshot_restored,
+                renderer,
+            } => {
+                assert_eq!(applied_commands, 2);
+                assert!(snapshot_restored);
+                assert_eq!(renderer, "canvas2d");
+            }
+            other => panic!("expected Recovered, got {other:?}"),
+        }
+        /* The replayed insert landed at the RESTORED caret (after "alpha"),
+        which proves the selection came back before the tail ran. */
+        assert_eq!(text(&b), "alphaX beta gamma");
+        assert_eq!(b.selection.as_ref().unwrap().caret.offset, 6);
+        /* The tail's zoom was folded into the restored config even though
+        painting was suppressed during replay. */
+        let cfg = b
+            .layout_cfg
+            .as_ref()
+            .expect("layout config survives replay");
+        assert_eq!(cfg.zoom, 2.0);
+        assert_eq!(cfg.base_scale, 1.5);
+        assert_eq!(cfg.scale, 3.0);
+        assert!(
+            b.pending_announcements.is_empty(),
+            "replay must not narrate"
+        );
+        assert!(b.composition.is_none());
+        /* Undo depth = restored window + replayed edit. */
+        assert!(b.undo.can_undo());
+        apply(&mut b, Command::Undo);
+        assert_eq!(text(&b), "alpha beta gamma");
+        apply(&mut b, Command::Undo);
+        assert_eq!(text(&b), "alpha beta");
+    }
+
+    #[test]
+    fn recover_with_an_unreadable_snapshot_replays_onto_a_fresh_document() {
+        let mut b = engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: b"definitely not a snapshot".to_vec(),
+                log_tail: vec![insert("hello"), insert(" world")],
+            },
+        );
+        match evt {
+            Event::Recovered {
+                applied_commands,
+                snapshot_restored,
+                ..
+            } => {
+                assert_eq!(applied_commands, 2);
+                assert!(!snapshot_restored);
+            }
+            other => panic!("expected Recovered, got {other:?}"),
+        }
+        assert_eq!(text(&b), "hello world");
+        assert!(b.layout_cfg.is_none(), "cold state: the shell re-seeds");
+        assert_eq!(b.review_author, "You");
+    }
+
+    #[test]
+    fn recover_with_nothing_persisted_is_a_cold_engine() {
+        let mut b = seeded_engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: Vec::new(),
+                log_tail: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            evt,
+            Event::Recovered {
+                applied_commands: 0,
+                snapshot_restored: false,
+                ..
+            }
+        ));
+        assert_eq!(text(&b), "");
+        assert!(b.selection.is_none());
+        assert!(b.layout_cfg.is_none());
+        assert!(!b.tracking_changes);
+        assert!(matches!(b.active_story, StoryTarget::Body));
+    }
+
+    #[test]
+    fn snapshot_command_echoes_seq_and_reports_the_format_version() {
+        let mut a = seeded_engine();
+        let expected = a.snapshot_bytes().unwrap();
+        match apply(&mut a, Command::Snapshot { seq: Some(42) }) {
+            Event::Snapshot {
+                bytes,
+                seq,
+                format_version,
+            } => {
+                assert_eq!(seq, 42);
+                assert_eq!(format_version, engine::snapshot::FORMAT_VERSION);
+                assert_eq!(bytes, expected);
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        assert!(matches!(
+            apply(&mut a, Command::Snapshot { seq: None }),
+            Event::Snapshot { seq: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn undo_window_shrinks_with_document_size() {
+        let mut e = engine();
+        assert_eq!(e.snapshot_undo_entries(), SNAPSHOT_UNDO_MAX_ENTRIES);
+        e.undo = UndoStack::new(
+            DocumentTree::from_paragraphs((0..1000).map(|i| i.to_string())),
+            UNDO_CAP,
+        );
+        assert_eq!(e.snapshot_undo_entries(), 2, "50-page doc: current + 1");
+        e.undo = UndoStack::new(
+            DocumentTree::from_paragraphs((0..5000).map(|i| i.to_string())),
+            UNDO_CAP,
+        );
+        assert_eq!(e.snapshot_undo_entries(), 1, "huge doc: current only");
+    }
+
+    #[test]
+    fn layout_cfg_snapshot_rejects_garbage_and_sanitizes_scales() {
+        assert!(LayoutCfgSnapshot::default().restore().is_none());
+        let cfg = LayoutCfgSnapshot {
+            font_id: "amiri".into(),
+            px_size: 16.0,
+            line_height: 20.0,
+            base_scale: f32::NAN,
+            zoom: -3.0,
+            ..Default::default()
+        }
+        .restore()
+        .unwrap();
+        assert_eq!(cfg.base_scale, 1.0);
+        assert_eq!(cfg.zoom, 1.0);
+        assert_eq!(cfg.scale, 1.0);
+        assert!(matches!(cfg.alignment, Alignment::Start));
+        assert!(matches!(cfg.base_direction, ShapingDirection::Ltr));
+    }
+
+    #[test]
+    fn version_defaults_restore_the_implicit_author_and_an_empty_history() {
+        let mut s = EngineSnapshotV1::default();
+        s.apply_version_defaults(engine::snapshot::FORMAT_VERSION);
+        assert_eq!(s.review_author, "You");
+        assert_eq!(s.doc_history.len(), 1);
+        assert_eq!(s.undo_cursor, 0);
+    }
+
+    #[test]
+    fn restore_clamps_a_hostile_selection_into_the_document() {
+        let hostile = EngineSnapshotV1 {
+            doc_history: vec![DocumentTree::from_text("short")],
+            undo_cursor: 0,
+            selection: Some(SelectionState {
+                anchor: bpos_top(7, 9_999),
+                caret: bpos_top(7, 9_999),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            ..Default::default()
+        };
+        let bytes = engine::snapshot::encode(&hostile).unwrap();
+        let mut b = engine();
+        b.restore_from_bytes(&bytes).unwrap();
+        let sel = b.selection.as_ref().unwrap();
+        assert_eq!(sel.caret.path, BridgeBlockPath::top(0));
+        assert!(sel.caret.offset <= "short".len() as u32);
+    }
+
+    #[test]
+    fn restore_exits_a_story_whose_part_no_longer_exists() {
+        let stale = EngineSnapshotV1 {
+            doc_history: vec![DocumentTree::from_text("body")],
+            undo_cursor: 0,
+            active_story: StoryTarget::Header {
+                rid: "rId404".into(),
+                page: 0,
+                section_block: 0,
+                role: engine::HeaderFooterRole::Default,
+            },
+            selection: Some(SelectionState {
+                anchor: bpos_top(0, 0),
+                caret: bpos_top(0, 0),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            }),
+            ..Default::default()
+        };
+        let mut b = engine();
+        b.restore_from_bytes(&engine::snapshot::encode(&stale).unwrap())
+            .unwrap();
+        assert!(matches!(b.active_story, StoryTarget::Body));
     }
 }

@@ -1,5 +1,6 @@
 # Rust
 target/
+target-private/
 **/*.rs.bk
 
 # wasm-pack output
@@ -34,6 +35,10 @@ ts/probe-renderer.mjs
 # Visual-diff golden backups (kept locally for human inspection only)
 tools/visual-diff/golden.*.bak/
 
+# tools/telemetry-sink runtime output (Issue #86, D5.7) — the dev/e2e
+# receiver's on-disk JSONL, never committed.
+tools/telemetry-sink/*.jsonl
+
 # OS
 .DS_Store
 Thumbs.db
@@ -41,3 +46,6 @@ Thumbs.db
 # Claude Code per-user overrides (settings.json is committed; .local.json is personal)
 .claude/settings.local.json
 .claude/.cache/
+
+# Private cargo cache for merge gates on main (never commit)
+target-main/

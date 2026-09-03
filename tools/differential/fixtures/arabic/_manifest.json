@@ -1,0 +1,47 @@
+{
+  "_comment": "Issue #89 Arabic/RTL differential-oracle fixture corpus. word_pdf is PENDING for every entry: no Word 365 available in this environment (see tools/differential/README.md).",
+  "fixtures": {
+    "justified_simple.docx": {
+      "description": "Two justified (jc=both), RTL-bidi Arabic paragraphs, each wrapping across several lines.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    },
+    "kashida_justified.docx": {
+      "description": "Dense, low-space-ratio justified Arabic paragraphs meant to push the justify pass toward Kashida elongation rather than pure space-stretch.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    },
+    "mixed_direction.docx": {
+      "description": "One RTL-bidi paragraph mixing Arabic prose with embedded Latin words/identifiers and digits (UAX #9 mixed-direction reordering).",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    },
+    "rtl_bullet_list.docx": {
+      "description": "RTL (bidi) bulleted list — one abstractNum bullet definition, three list-item paragraphs with numPr.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    },
+    "rtl_numbered_list.docx": {
+      "description": "RTL (bidi) decimal-numbered list with one nested level-1 item, mirroring format-docx's list_bullet_numbered.docx fixture but RTL.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    },
+    "rtl_table.docx": {
+      "description": "A <w:tblPr><w:bidiVisual/> RTL table: 3 columns x 3 rows (header + 2 data rows), every cell paragraph bidi.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    },
+    "long_document.docx": {
+      "description": "24 justified RTL Arabic paragraphs — a multi-page stress fixture for the page-count and per-paragraph line-break oracle.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    }
+  }
+}

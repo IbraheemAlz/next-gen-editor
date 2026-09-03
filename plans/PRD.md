@@ -86,12 +86,12 @@ goal for the MVP-and-beyond arc (T1/T2/T3 per §2).
 | Tables | 🟡 | full | full | T1 | AutoFit debt #62, AutoFit UI #46, story-Tab bug #76; **RTL tables: OO absent — differentiation chance** |
 | Sections & page layout | ✅ | full | full | T1 | Even/Odd, continuous balancing shipped (#74 #8) |
 | Headers & footers | ✅ | full | full | T1 | Story engine + Link-to-Previous shipped (#70–#74); HF images #78 |
-| Fields & TOC | 🟡 | full | full | T1 (core set) | PAGE/NUMPAGES/DATE shipped (#43); authoring v2 #77; TOC not started |
-| Footnotes & endnotes | ❌ | full | full | T2→T1 | Hardest pagination feature ahead; both refs document the negotiation protocol |
+| Fields & TOC | 🟡 | full | full | T1 (core set) | PAGE/NUMPAGES/DATE shipped (#43); authoring v2 #77; TOC epic #81 |
+| Footnotes & endnotes | ❌ | full | full | T2→T1 | Hardest pagination feature ahead; both refs document the negotiation protocol (#80) |
 | Comments | ✅ | full | full | T1 | Threaded + resolved + OPC round-trip shipped (#27 #15 #18) |
 | Track changes | 🟡 | full | full | T1 | Capture + accept/reject shipped (#14); display-for-review modes #47/#67 |
-| Images & wrap | 🟡 | full | full | T1 | Inline + resize shipped (#44); floating anchors #69; wrap absent |
-| Text frames / text boxes | ❌ | full | full | T2 | After floating anchors |
+| Images & wrap | 🟡 | full | full | T1 | Inline + resize shipped (#44); floating anchors #69; wrap epic #82 |
+| Text frames / text boxes | ❌ | full | full | T2 | After floating anchors (#83) |
 | Charts | ❌ | full | full | T3 | Future cargo-feature module; preserve verbatim today |
 | Math (OMML) | ❌ | full | full | T3 | Future cargo-feature module; preserve verbatim today |
 | Content controls / forms | ❌ | full (flagship) | full | T3→T2 | Their differentiator, not ours; preserve now |
@@ -105,7 +105,7 @@ goal for the MVP-and-beyond arc (T1/T2/T3 per §2).
 | Compare / combine | ❌ | full | full | T3 | |
 | Accessibility | ✅ | **partial (weak)** | full | T1 | DOM overlay + fine deltas already beats OO; stable para ids open |
 | Print / PDF | ✅ | full | full | T1 | PDF/A-1b/A-2u/X-3 shipped (#28); font subsetting open |
-| Autosave / recovery | 🟡 | full | full | T1 | Event log ships; `Recover` still stub, renderer downgrade #66 |
+| Autosave / recovery | 🟡 | full | full | T1 | Event log ships; `Recover` still stub (#85), renderer downgrade #66 |
 | Master documents | ❌ | absent | full | Out of scope | |
 | Plugins / macros | ❌ | full | full | Out of scope below bridge | SDK surface is our extensibility story |
 
@@ -114,24 +114,24 @@ goal for the MVP-and-beyond arc (T1/T2/T3 per §2).
 Their stability is fifteen years of field exposure; ours must be bought with
 machine time plus safety properties. Committed tracks:
 
-1. **Real-document corpus harness.** Wild `.docx` corpus (public sets +
+1. **Real-document corpus harness (#88).** Wild `.docx` corpus (public sets +
    Word-365-authored fixtures) run through open → layout → render → save →
    reopen nightly: no panic, sibling byte-identity, bounded drift, no text
    loss.
-2. **Differential oracles.** LibreOffice headless and Word as black-box
+2. **Differential oracles (#89).** LibreOffice headless and Word as black-box
    baselines (page counts, breaks, renders). Legally clean competitor-
    maturity mining.
-3. **Continuous fuzzing.** Scale D5.5 beyond compile-check; structure-aware
+3. **Continuous fuzzing (#90).** Scale D5.5 beyond compile-check; structure-aware
    docx + command-stream fuzzing.
-4. **Real crash recovery.** `Engine::snapshot()` + real `Command::Recover`
+4. **Real crash recovery (#85).** `Engine::snapshot()` + real `Command::Recover`
    + #66. Adopt the reference lesson both products teach: recovery = base
    snapshot + change replay, continuously persisted — our event log is
    already shaped for this.
-5. **Layout self-defense.** Both references converge on the same doctrine:
+5. **Layout self-defense (#87).** Both references converge on the same doctrine:
    *interruptible everything, watchdogged convergence, degraded layout
    beats a hang, optimistic fast paths verified not trusted.* Adopt as
    layout-crate invariants as incremental relayout deepens.
-6. **Real telemetry transport** for D5.7 so field failures come home.
+6. **Real telemetry transport (#86)** for D5.7 so field failures come home.
 
 ## 5. Decisions this study forces
 
@@ -152,7 +152,7 @@ machine time plus safety properties. Committed tracks:
   worse, the flag is destroyed on their open/save cycle, an interop hazard
   for RTL documents. LibreOffice supports them end to end. Shipping them
   extends the moat (#79).
-- **In-part grab bags** (LO's device): for attributes *inside*
+- **In-part grab bags (#84)** (LO's device): for attributes *inside*
   `document.xml` runs/paragraphs we re-serialize but do not model, stash
   and re-emit opaquely — complements sibling byte-preservation and hardens
   the ≤2× drift bound as coverage grows.

@@ -52,7 +52,11 @@ test('event log replays and sequence continuity survives a crash', async ({ page
             'pre-crash commands + snapshot',
         );
         const preMaxSeq = maxOf(before.cmd);
-        const snapshotSeq = maxOf(before.snap);
+        /* Issue #85 — an IDLE snapshot (1.5 s after the flood) may land
+           before this read and become the newest row, so the cadence
+           proof is "a snapshot at SNAPSHOT_EVERY exists", not "the newest
+           snapshot is at SNAPSHOT_EVERY". */
+        const snapshotSeqs = before.snap;
 
         /* Force a crash and wait for the UI recovery flow to finish. */
         (window as any).__engineClient.forceTrap();
@@ -69,16 +73,16 @@ test('event log replays and sequence continuity survives a crash', async ({ page
             'post-recovery seq beyond pre-crash max',
         );
 
-        return { preMaxSeq, snapshotSeq, recovered, postMaxSeq: maxOf(after.cmd) };
+        return { preMaxSeq, snapshotSeqs, recovered, postMaxSeq: maxOf(after.cmd) };
     });
 
     console.log(
-        `[event-log] preMaxSeq=${result.preMaxSeq} snapshotSeq=${result.snapshotSeq} ` +
+        `[event-log] preMaxSeq=${result.preMaxSeq} snapshotSeqs=${result.snapshotSeqs.join(',')} ` +
             `postMaxSeq=${result.postMaxSeq}`,
     );
 
     expect(result.recovered, 'UI completed crash recovery').toBe(true);
-    expect(result.snapshotSeq, 'snapshot persisted at SNAPSHOT_EVERY').toBe(200);
+    expect(result.snapshotSeqs, 'snapshot persisted at SNAPSHOT_EVERY').toContain(200);
     expect(result.preMaxSeq).toBeGreaterThanOrEqual(250);
     expect(
         result.postMaxSeq,

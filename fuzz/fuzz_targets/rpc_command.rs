@@ -1,11 +1,13 @@
 #![no_main]
-//! Fuzz `bridge::Command` JSON deserialization — a malicious or buggy TS
-//! caller must not be able to panic the engine with a crafted RPC payload
-//! (PHASE_5 §8, §9 "all RPC Command payloads bounds-checked").
+//! Fuzz `bridge::Command` sequences (D5.5, issue #90 — scaled up from
+//! single-command JSON deserialization) — structure-aware sequences driven
+//! end to end through the real `Engine::apply` dispatcher, incl. the
+//! auto-repaint -> layout pipeline and the native glyph rasterizer, with
+//! invariant assertions after every command. See
+//! `engine_fuzz::run_rpc_command` / `engine_fuzz::command_gen`.
 
-use bridge::Command;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = serde_json::from_slice::<Command>(data);
+    engine_fuzz::run_rpc_command(data);
 });

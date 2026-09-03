@@ -19,7 +19,7 @@ import { EngineClient } from './engine/engine-client';
 import { createEngineStore, SCREEN_DPI_SCALE, type EngineStore } from './state/engine-store';
 import { startTelemetry } from './state/telemetry';
 import { attachDragDrop } from './input/dnd';
-import { createFontRegistry, type FontRegistry } from '@nge/core';
+import { createFontRegistry, createTelemetryConfig, type FontRegistry } from '@nge/core';
 import type { Command, Event } from './engine/types';
 import { topPos } from './engine/types';
 import './styles/editor.css';
@@ -28,14 +28,34 @@ import './styles/a11y.css';
 
 /** Load the minimal default font set + seed a blank A4 page. Runs on boot
  *  AND crash recovery, so it must (re)establish fonts from scratch each
- *  time — `Command::Recover` wipes the engine's font map. */
-async function setupEngine(client: EngineClient, fonts: FontRegistry): Promise<void> {
+ *  time — `Command::Recover` wipes the engine's font map.
+ *
+ *  Issue #85 — `restored` is true when recovery installed a base snapshot:
+ *  the engine then already holds the document, selection, undo window and
+ *  layout config, and re-seeding via `RENDER_PAGE` would wipe exactly what
+ *  was just recovered. That path only re-asserts the live device scale
+ *  (which repaints and re-broadcasts the selection). */
+async function setupEngine(
+    client: EngineClient,
+    fonts: FontRegistry,
+    restored = false,
+): Promise<void> {
     /* Forget any resident-font flags (recovery wiped the engine's map),
        then push only the manifest's minimal boot set — one Latin + one
        dual-script Arabic. Every other declared font lazy-loads (JIT) the
        first time it is picked in the toolbar. */
     fonts.reset();
     await fonts.loadDefaults();
+    if (restored) {
+        const repaint = await client.dispatch({
+            type: 'SET_DEVICE_SCALE',
+            scale: window.devicePixelRatio * SCREEN_DPI_SCALE,
+        });
+        if (repaint.type === 'ERROR') {
+            console.warn('[recovery] post-restore repaint:', repaint.message);
+        }
+        return;
+    }
     /* `defaults[0]` is the manifest's seed/primary face (dual-script Amiri
        so the mixed RTL seed text shapes from one face). */
     const seedFont = fonts.defaults()[0] ?? 'amiri';
@@ -172,6 +192,16 @@ export function App() {
     const fontRegistry = createFontRegistry(client);
     window.__fontRegistry = fontRegistry;
 
+    /* Issue #86 — D5.7 telemetry opt-in flag, shared with `SettingsMenu`
+       (via `TelemetryProvider`, wired in `SdkShelf`) and the collector
+       started in `onReady` below. `?telemetryEndpoint=` is an e2e /
+       local-debug hook — production wiring supplies a real endpoint
+       through the same option once a collector exists (D5.6/D5.9 scope). */
+    const telemetryConfig = createTelemetryConfig();
+    const telemetryEndpoint =
+        new URLSearchParams(window.location.search).get('telemetryEndpoint') ?? undefined;
+    window.__setTelemetryEnabled = telemetryConfig.setEnabled;
+
     /* §9 store — mirrors engine SELECTION_CHANGED events into signals the
        caret + selection overlays render from. */
     const store = createEngineStore(client);
@@ -212,9 +242,17 @@ export function App() {
         if (generation === 0) {
             window.__bootMs = initMs;
             window.__engineReady = true;
-            window.__renderer = client.renderer;
         }
-        await setupEngine(client, fontRegistry);
+        /* Issue #66 — every generation, not just boot: a respawned worker
+           re-probes the GPU and may land on a different backend than the
+           one that trapped. `client.renderer` is the recovered engine's
+           own report after `recover()`. */
+        window.__renderer = client.renderer;
+        await setupEngine(
+            client,
+            fontRegistry,
+            generation > 0 && client.lastRecovery?.restored === true,
+        );
         setBooting(false);
         /* Issue #54 — the boot paint presents while the opaque
            `.boot-overlay` still covers the canvas, and WebGPU may
@@ -247,9 +285,15 @@ export function App() {
         if (firstReady) {
             firstReady = false;
             startStatsPolling(client);
-            /* D5.7 — mock telemetry pipeline: batches engine samples and
-               console.logs them every 60 s (a real collector would POST). */
-            startTelemetry(client);
+            /* Issue #86 — D5.7 real telemetry transport. Opt-in only
+               (`telemetryConfig.enabled`, off by default, toggled from
+               Settings); with no `?telemetryEndpoint=` configured, an
+               opted-in session still only logs to the console (dev-safe —
+               see `ConsoleTransport`), never fires a real network request. */
+            startTelemetry(client, {
+                enabled: telemetryConfig.enabled,
+                endpoint: telemetryEndpoint,
+            });
         }
     };
 
@@ -265,6 +309,7 @@ export function App() {
             <SdkShelf
                 client={client}
                 fontRegistry={fontRegistry}
+                telemetry={telemetryConfig}
                 engineReady={() => !booting()}
             >
                 <div class="editor-viewport" ref={viewportEl}>

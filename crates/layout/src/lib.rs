@@ -5,12 +5,10 @@
 //! `layout_paragraph` owns all geometry; the renderer is a pure tree walk.
 
 pub mod boxes;
-pub mod fingerprint;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
-
-pub use fingerprint::geometry_fingerprint;
+pub mod watchdog;
 
 pub use boxes::{
     FontId, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, MarkerBox, PageBox, ParagraphBox,
@@ -23,3 +21,7 @@ pub use paginate::{
     split_paragraph_at_line,
 };
 pub use paragraph::{InlineObjectInfo, ParagraphConfig, layout_paragraph};
+pub use watchdog::{
+    BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation, Watchdog,
+    geometry_fingerprint, verify_prefix,
+};

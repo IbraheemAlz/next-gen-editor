@@ -11,6 +11,10 @@ use crate::parts::comments::{
     build_comments_extended_xml, build_comments_extended_xml_with_overrides, build_comments_xml,
 };
 use crate::parts::numbering::build_numbering_xml;
+use crate::schema::ct_ppr::ppr_child_rank;
+use crate::schema::ct_rpr::rpr_child_rank;
+use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
+use crate::schema::grab_bag::fragment_qname;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
     FontFamily, Hyperlink, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph,
@@ -153,15 +157,80 @@ fn push_escaped(text: &str, out: &mut String) {
     }
 }
 
+/// Issue #84 — ordered child sink for one property container (`<w:rPr>`,
+/// `<w:pPr>`, `<w:tblPr>`, `<w:trPr>`, `<w:tcPr>`).
+///
+/// Every modeled child is pushed with the rank its element name has in
+/// the container's schema sequence (the `schema::ct_*` rank tables); the
+/// container's grab-bag fragments are pushed at the rank of *their*
+/// element name. `finish` stable-sorts by rank, so:
+///
+/// - the modeled children come out in schema order (the same order the
+///   emitters produced before the sink existed — `CT_PPrBase` /
+///   `CT_TcPrBase` / `CT_TblPrBase` are strict sequences and Word's
+///   repair dialog rejects violations);
+/// - a preserved `<w:framePr>` lands between `pageBreakBefore` and
+///   `numPr`, a `<w:cnfStyle>` after `jc`, a `<w:tblLook>` after
+///   `tblCellMar`, … exactly where the schema wants them;
+/// - fragments of the same element (repeated `<w:ins>` rows in a
+///   `<w:trPr>`) keep their source document order (stable sort);
+/// - foreign-namespace extensions rank after every schema child but
+///   before the `*Change` record, matching Word's own layout.
+struct PrChildren {
+    items: Vec<(u16, String)>,
+}
+
+impl PrChildren {
+    fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    fn push(&mut self, rank: u16, xml: String) {
+        self.items.push((rank, xml));
+    }
+
+    /// Append every grab-bag fragment at its element's schema rank.
+    fn push_bag(&mut self, bag: &Option<Box<engine::GrabBag>>, rank_of: fn(&[u8]) -> u16) {
+        for frag in engine::GrabBag::fragments_of(bag) {
+            /* Fragments are byte slices of a part quick-xml already
+            decoded as UTF-8; a lossy decode can only differ on bytes the
+            reader would have rejected. */
+            let xml = String::from_utf8_lossy(frag).into_owned();
+            self.push(rank_of(fragment_qname(frag)), xml);
+        }
+    }
+
+    /// `<elem>` + children in schema order + `</elem>`. Always emits the
+    /// wrapper — every caller has already returned early for the
+    /// nothing-to-say case, and an empty `<w:pPr></w:pPr>` is what the
+    /// pre-sink emitters produced for a non-default struct whose set
+    /// fields have no element of their own.
+    fn finish(mut self, elem: &str, out: &mut String) {
+        self.items.sort_by_key(|(rank, _)| *rank);
+        out.push('<');
+        out.push_str(elem);
+        out.push('>');
+        for (_, xml) in &self.items {
+            out.push_str(xml);
+        }
+        out.push_str("</");
+        out.push_str(elem);
+        out.push('>');
+    }
+}
+
 /// Emit a `<w:rPr>` block for `style`, or nothing when it is the default.
 /// Children follow the CT_RPr schema order (rFonts, b, i, strike, color, u,
 /// shd). A background colour is written as `<w:shd w:fill>` — that carries
 /// arbitrary hex, where `<w:highlight>` is limited to a named palette.
+/// Issue #84 — grab-bag fragments (`<w:lang>`, `<w:fitText>`, …)
+/// interleave at their own schema rank.
 fn emit_rpr(style: &SpanStyle, out: &mut String) {
     if *style == SpanStyle::default() {
         return;
     }
-    out.push_str("<w:rPr>");
+    let rank = rpr_child_rank;
+    let mut ch = PrChildren::new();
     /* Audit gap A.M2 — `<w:rFonts>` round-trips a known FontFamily,
     a verbatim raw name, and/or a theme binding. The reader splits
     the source's `w:ascii` either into `font_family` (recognised) or
@@ -173,56 +242,60 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
         .map(|f| family_docx_name(f).to_string())
         .or_else(|| style.raw_font_family.clone());
     if rfonts_name.is_some() || style.font_theme.is_some() {
-        out.push_str("<w:rFonts");
+        let mut s = String::from("<w:rFonts");
         if let Some(n) = rfonts_name.as_deref() {
-            out.push_str(" w:ascii=\"");
-            push_escaped_attr(n, out);
-            out.push_str("\" w:hAnsi=\"");
-            push_escaped_attr(n, out);
-            out.push_str("\" w:cs=\"");
-            push_escaped_attr(n, out);
-            out.push('"');
+            s.push_str(" w:ascii=\"");
+            push_escaped_attr(n, &mut s);
+            s.push_str("\" w:hAnsi=\"");
+            push_escaped_attr(n, &mut s);
+            s.push_str("\" w:cs=\"");
+            push_escaped_attr(n, &mut s);
+            s.push('"');
         }
         if let Some(t) = style.font_theme.as_deref() {
-            out.push_str(" w:asciiTheme=\"");
-            push_escaped_attr(t, out);
-            out.push_str("\" w:hAnsiTheme=\"");
-            push_escaped_attr(t, out);
-            out.push_str("\" w:cstheme=\"");
-            push_escaped_attr(t, out);
-            out.push('"');
+            s.push_str(" w:asciiTheme=\"");
+            push_escaped_attr(t, &mut s);
+            s.push_str("\" w:hAnsiTheme=\"");
+            push_escaped_attr(t, &mut s);
+            s.push_str("\" w:cstheme=\"");
+            push_escaped_attr(t, &mut s);
+            s.push('"');
         }
-        out.push_str("/>");
+        s.push_str("/>");
+        ch.push(rank(b"w:rFonts"), s);
     }
     if style.bold == Some(true) {
-        out.push_str("<w:b/>");
+        ch.push(rank(b"w:b"), "<w:b/>".into());
     }
     if style.italic == Some(true) {
-        out.push_str("<w:i/>");
+        ch.push(rank(b"w:i"), "<w:i/>".into());
     }
     /* CT_RPr ordering — caps/smallCaps sit between `<w:iCs/>` and
     `<w:strike/>` (OOXML §17.3.2). When both are on, Word's writer
     emits both; the reader's `apply_rpr` flips both flags and the
     shape-time transform prefers `caps` (full-height) over `smallCaps`. */
     if style.caps == Some(true) {
-        out.push_str("<w:caps/>");
+        ch.push(rank(b"w:caps"), "<w:caps/>".into());
     }
     if style.small_caps == Some(true) {
-        out.push_str("<w:smallCaps/>");
+        ch.push(rank(b"w:smallCaps"), "<w:smallCaps/>".into());
     }
     if style.strike == Some(true) {
-        out.push_str("<w:strike/>");
+        ch.push(rank(b"w:strike"), "<w:strike/>".into());
     }
     if let Some([r, g, b, _]) = style.color {
-        out.push_str(&format!("<w:color w:val=\"{r:02X}{g:02X}{b:02X}\"/>"));
+        ch.push(
+            rank(b"w:color"),
+            format!("<w:color w:val=\"{r:02X}{g:02X}{b:02X}\"/>"),
+        );
     }
     /* `<w:sz>` / `<w:szCs>` — Word's half-point encoding; round to nearest.
     Emit both elements so ASCII + complex-script runs (Arabic, Hebrew,
     Thai) both pick up the size. Word's own writer always pairs them. */
     if let Some(pt) = style.font_size {
         let half_pts = (pt * 2.0).round().max(2.0) as u32;
-        out.push_str(&format!("<w:sz w:val=\"{half_pts}\"/>"));
-        out.push_str(&format!("<w:szCs w:val=\"{half_pts}\"/>"));
+        ch.push(rank(b"w:sz"), format!("<w:sz w:val=\"{half_pts}\"/>"));
+        ch.push(rank(b"w:szCs"), format!("<w:szCs w:val=\"{half_pts}\"/>"));
     }
     /* `<w:u w:val="…"/>` — emit only when the variant is visible. The
     explicit `none` round-trips when the engine carries it (overrides an
@@ -236,12 +309,13 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
             UnderlineStyle::Dashed => "dash",
             UnderlineStyle::Wavy => "wave",
         };
-        out.push_str(&format!("<w:u w:val=\"{v}\"/>"));
+        ch.push(rank(b"w:u"), format!("<w:u w:val=\"{v}\"/>"));
     }
     if let Some([r, g, b, _]) = style.bg_color {
-        out.push_str(&format!(
-            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
-        ));
+        ch.push(
+            rank(b"w:shd"),
+            format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"),
+        );
     }
     /* Audit gap A.M1 — `<w:vertAlign>` after shading per OOXML §17.3.2.42
     ordering. Skip when the resolved value is the implicit baseline (the
@@ -254,9 +328,13 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
             engine::VertAlign::Superscript => "superscript",
             engine::VertAlign::Subscript => "subscript",
         };
-        out.push_str(&format!("<w:vertAlign w:val=\"{v}\"/>"));
+        ch.push(
+            rank(b"w:vertAlign"),
+            format!("<w:vertAlign w:val=\"{v}\"/>"),
+        );
     }
-    out.push_str("</w:rPr>");
+    ch.push_bag(&style.grab_bag, rpr_child_rank);
+    ch.finish("w:rPr", out);
 }
 
 /// Serialize one run: `<w:r>[<w:rPr>…]<w:t xml:space="preserve">…</w:t></w:r>`.
@@ -409,64 +487,67 @@ fn emit_ppr(
     {
         return;
     }
-    out.push_str("<w:pPr>");
+    /* Issue #84 — children are collected with their CT_PPrBase rank and
+    emitted sorted, so preserved grab-bag fragments (`<w:framePr>`,
+    `<w:widowControl>`, `<w:cnfStyle>`, the paragraph-mark `<w:rPr>`, …)
+    slot in where the strict sequence requires them. */
+    let rank = ppr_child_rank;
+    let mut ch = PrChildren::new();
     if let Some(id) = style_id {
-        out.push_str("<w:pStyle w:val=\"");
+        let mut s = String::from("<w:pStyle w:val=\"");
         /* Style ids are XML names — no `<`/`>`/`&`/`"` per OOXML — but
         defensively escape so a malformed id can't break the file. */
-        for ch in id.chars() {
-            match ch {
-                '&' => out.push_str("&amp;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                '"' => out.push_str("&quot;"),
-                other => out.push(other),
-            }
-        }
-        out.push_str("\"/>");
+        push_escaped_attr(id, &mut s);
+        s.push_str("\"/>");
+        ch.push(rank(b"w:pStyle"), s);
     }
     if props.keep_next {
-        out.push_str("<w:keepNext/>");
+        ch.push(rank(b"w:keepNext"), "<w:keepNext/>".into());
     }
     if props.keep_lines {
-        out.push_str("<w:keepLines/>");
+        ch.push(rank(b"w:keepLines"), "<w:keepLines/>".into());
     }
     if props.page_break_before {
-        out.push_str("<w:pageBreakBefore/>");
+        ch.push(rank(b"w:pageBreakBefore"), "<w:pageBreakBefore/>".into());
     }
     /* Sprint 13 (#12) — `<w:numPr>` carries list membership. CT_PPrBase
     places numPr directly after pageBreakBefore (framePr/widowControl,
-    which we don't model, sit between). */
+    which we don't model, sit between — and now ride the grab bag). */
     if let Some(li) = list_item {
-        out.push_str(&format!(
-            "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
-            li.ilvl, li.num_id
-        ));
+        ch.push(
+            rank(b"w:numPr"),
+            format!(
+                "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
+                li.ilvl, li.num_id
+            ),
+        );
     }
     /* Audit gap A.M4 — `<w:pBdr>` paragraph borders. Each edge with a
     populated stroke emits as a child; absent edges silently omit. */
     if let Some(b) = props.borders.as_ref() {
-        out.push_str("<w:pBdr>");
-        emit_border_edge("w:top", &b.top, out);
-        emit_border_edge("w:left", &b.left, out);
-        emit_border_edge("w:bottom", &b.bottom, out);
-        emit_border_edge("w:right", &b.right, out);
-        emit_border_edge("w:between", &b.inside_h, out);
-        out.push_str("</w:pBdr>");
+        let mut s = String::from("<w:pBdr>");
+        emit_border_edge("w:top", &b.top, &mut s);
+        emit_border_edge("w:left", &b.left, &mut s);
+        emit_border_edge("w:bottom", &b.bottom, &mut s);
+        emit_border_edge("w:right", &b.right, &mut s);
+        emit_border_edge("w:between", &b.inside_h, &mut s);
+        s.push_str("</w:pBdr>");
+        ch.push(rank(b"w:pBdr"), s);
     }
     /* Paragraph shading mirrors the rPr / tcPr `<w:shd>` emitters: the
     arbitrary RGB rides `w:fill` with a `clear` pattern; alpha has no
     OOXML slot. */
     if let Some([r, g, b, _]) = props.shading {
-        out.push_str(&format!(
-            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
-        ));
+        ch.push(
+            rank(b"w:shd"),
+            format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"),
+        );
     }
     /* Audit gap A.M3 — `<w:tabs>` custom stops, child order preserved.
     Empty list ⇒ no element. `Clear` kind round-trips so a user-defined
     clear-of-an-inherited-stop survives a save. */
     if !props.tab_stops.is_empty() {
-        out.push_str("<w:tabs>");
+        let mut s = String::from("<w:tabs>");
         for stop in &props.tab_stops {
             let val = match stop.kind {
                 engine::TabKind::Left => "left",
@@ -476,28 +557,30 @@ fn emit_ppr(
                 engine::TabKind::Clear => "clear",
             };
             let pos_twips = (stop.position_pt * 20.0).round() as i32;
-            out.push_str(&format!("<w:tab w:val=\"{val}\" w:pos=\"{pos_twips}\"/>"));
+            s.push_str(&format!("<w:tab w:val=\"{val}\" w:pos=\"{pos_twips}\"/>"));
         }
-        out.push_str("</w:tabs>");
+        s.push_str("</w:tabs>");
+        ch.push(rank(b"w:tabs"), s);
     }
     if let Some(d) = props.direction {
-        match d {
-            TextDirection::Rtl => out.push_str("<w:bidi/>"),
+        let s = match d {
+            TextDirection::Rtl => "<w:bidi/>",
             /* LTR is the default; we still emit `<w:bidi w:val="false"/>` so
             an explicit user override round-trips faithfully. */
-            TextDirection::Ltr => out.push_str("<w:bidi w:val=\"false\"/>"),
-        }
+            TextDirection::Ltr => "<w:bidi w:val=\"false\"/>",
+        };
+        ch.push(rank(b"w:bidi"), s.into());
     }
     /* `<w:spacing>` carries both before/after gaps and the line rule. We
     omit the element entirely when none of its attributes are set. */
     let has_gap = props.spacing.before_twips != 0 || props.spacing.after_twips != 0;
     if has_gap || props.line_height.is_some() {
-        out.push_str("<w:spacing");
+        let mut s = String::from("<w:spacing");
         if props.spacing.before_twips != 0 {
-            out.push_str(&format!(" w:before=\"{}\"", props.spacing.before_twips));
+            s.push_str(&format!(" w:before=\"{}\"", props.spacing.before_twips));
         }
         if props.spacing.after_twips != 0 {
-            out.push_str(&format!(" w:after=\"{}\"", props.spacing.after_twips));
+            s.push_str(&format!(" w:after=\"{}\"", props.spacing.after_twips));
         }
         if let Some(lh) = props.line_height {
             let (line, rule) = match lh {
@@ -505,9 +588,10 @@ fn emit_ppr(
                 LineHeight::Exact { twips } => (twips, "exact"),
                 LineHeight::AtLeast { twips } => (twips, "atLeast"),
             };
-            out.push_str(&format!(" w:line=\"{line}\" w:lineRule=\"{rule}\""));
+            s.push_str(&format!(" w:line=\"{line}\" w:lineRule=\"{rule}\""));
         }
-        out.push_str("/>");
+        s.push_str("/>");
+        ch.push(rank(b"w:spacing"), s);
     }
     let ind = &props.indent;
     if ind.start_twips != 0
@@ -515,31 +599,35 @@ fn emit_ppr(
         || ind.first_line_twips != 0
         || ind.hanging_twips != 0
     {
-        out.push_str("<w:ind");
+        let mut s = String::from("<w:ind");
         if ind.start_twips != 0 {
-            out.push_str(&format!(" w:start=\"{}\"", ind.start_twips));
+            s.push_str(&format!(" w:start=\"{}\"", ind.start_twips));
         }
         if ind.end_twips != 0 {
-            out.push_str(&format!(" w:end=\"{}\"", ind.end_twips));
+            s.push_str(&format!(" w:end=\"{}\"", ind.end_twips));
         }
         if ind.first_line_twips != 0 {
-            out.push_str(&format!(" w:firstLine=\"{}\"", ind.first_line_twips));
+            s.push_str(&format!(" w:firstLine=\"{}\"", ind.first_line_twips));
         }
         if ind.hanging_twips != 0 {
-            out.push_str(&format!(" w:hanging=\"{}\"", ind.hanging_twips));
+            s.push_str(&format!(" w:hanging=\"{}\"", ind.hanging_twips));
         }
-        out.push_str("/>");
+        s.push_str("/>");
+        ch.push(rank(b"w:ind"), s);
     }
     if let Some(a) = props.alignment {
-        out.push_str(&format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
+        ch.push(rank(b"w:jc"), format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
     }
     /* Phase 3 (#40) — a marker paragraph's interior `<w:sectPr>`: the
     genuinely-last CT_PPr content child (only the never-emitted
     pPrChange follows it in the schema). */
     if let Some(sect) = section_end {
-        emit_sect_pr(sect, out);
+        let mut s = String::new();
+        emit_sect_pr(sect, &mut s);
+        ch.push(rank(b"w:sectPr"), s);
     }
-    out.push_str("</w:pPr>");
+    ch.push_bag(&props.grab_bag, ppr_child_rank);
+    ch.finish("w:pPr", out);
 }
 
 /// Serialize one paragraph. A span-free paragraph with default `props` emits
@@ -1062,40 +1150,56 @@ fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
         || props.indent_twips != 0
         || props.borders.is_some()
         || props.table_style_id.is_some()
+        || props.grab_bag.is_some()
         || has_margins
         || has_layout_override;
     if !has_content {
         return;
     }
-    out.push_str("<w:tblPr>");
+    /* Issue #84 — CT_TblPrBase is a strict sequence; the sink orders the
+    modeled children (tblStyle, tblW, jc, tblInd, tblBorders, tblLayout,
+    tblCellMar) and slots grab-bag fragments (`<w:bidiVisual>`,
+    `<w:tblLook>`, `<w:tblpPr>`, …) at their own rank. */
+    let rank = tbl_pr_child_rank;
+    let mut ch = PrChildren::new();
     if let Some(id) = &props.table_style_id {
-        out.push_str(&format!("<w:tblStyle w:val=\"{id}\"/>"));
+        ch.push(rank(b"w:tblStyle"), format!("<w:tblStyle w:val=\"{id}\"/>"));
     }
     if let Some(w) = props.width {
-        emit_w_width("w:tblW", w, out);
+        let mut s = String::new();
+        emit_w_width("w:tblW", w, &mut s);
+        ch.push(rank(b"w:tblW"), s);
     }
     if props.indent_twips != 0 {
-        out.push_str(&format!(
-            "<w:tblInd w:w=\"{}\" w:type=\"dxa\"/>",
-            props.indent_twips
-        ));
+        ch.push(
+            rank(b"w:tblInd"),
+            format!("<w:tblInd w:w=\"{}\" w:type=\"dxa\"/>", props.indent_twips),
+        );
     }
     if let Some(a) = props.alignment {
-        out.push_str(&format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
+        ch.push(rank(b"w:jc"), format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
     }
     /* Audit gap A.M8 — emit `<w:tblLayout>` only for the non-default
     `Fixed` form so existing Autofit tables stay byte-identical on
     roundtrip. */
     if has_layout_override {
-        out.push_str("<w:tblLayout w:type=\"fixed\"/>");
+        ch.push(
+            rank(b"w:tblLayout"),
+            "<w:tblLayout w:type=\"fixed\"/>".into(),
+        );
     }
     if let Some(b) = &props.borders {
-        emit_cell_borders("w:tblBorders", b, out);
+        let mut s = String::new();
+        emit_cell_borders("w:tblBorders", b, &mut s);
+        ch.push(rank(b"w:tblBorders"), s);
     }
     if has_margins {
-        emit_cell_margins("w:tblCellMar", &props.cell_margins, out);
+        let mut s = String::new();
+        emit_cell_margins("w:tblCellMar", &props.cell_margins, &mut s);
+        ch.push(rank(b"w:tblCellMar"), s);
     }
-    out.push_str("</w:tblPr>");
+    ch.push_bag(&props.grab_bag, tbl_pr_child_rank);
+    ch.finish("w:tblPr", out);
 }
 
 fn emit_table_row(row: &TableRow, out: &mut String, hyperlink_rel_map: &HashMap<String, String>) {
@@ -1108,28 +1212,36 @@ fn emit_table_row(row: &TableRow, out: &mut String, hyperlink_rel_map: &HashMap<
 }
 
 fn emit_tr_pr(props: &engine::RowProperties, out: &mut String) {
-    let has = props.height.is_some() || props.cant_split || props.header;
+    let has =
+        props.height.is_some() || props.cant_split || props.header || props.grab_bag.is_some();
     if !has {
         return;
     }
-    out.push_str("<w:trPr>");
+    /* Issue #84 — EG_TrPrBase is a choice (any order validates); the
+    sink still emits the listed order — cantSplit, trHeight, tblHeader —
+    which is what Word writes, with grab-bag fragments (`<w:cnfStyle>`,
+    `<w:jc>`, `<w:gridBefore>`, …) at their own rank. */
+    let rank = tr_pr_child_rank;
+    let mut ch = PrChildren::new();
     if let Some(h) = props.height {
         let (twips, rule) = match h {
             RowHeight::Auto => (0, "auto"),
             RowHeight::AtLeast { twips } => (twips, "atLeast"),
             RowHeight::Exact { twips } => (twips, "exact"),
         };
-        out.push_str(&format!(
-            "<w:trHeight w:val=\"{twips}\" w:hRule=\"{rule}\"/>"
-        ));
+        ch.push(
+            rank(b"w:trHeight"),
+            format!("<w:trHeight w:val=\"{twips}\" w:hRule=\"{rule}\"/>"),
+        );
     }
     if props.cant_split {
-        out.push_str("<w:cantSplit/>");
+        ch.push(rank(b"w:cantSplit"), "<w:cantSplit/>".into());
     }
     if props.header {
-        out.push_str("<w:tblHeader/>");
+        ch.push(rank(b"w:tblHeader"), "<w:tblHeader/>".into());
     }
-    out.push_str("</w:trPr>");
+    ch.push_bag(&props.grab_bag, tr_pr_child_rank);
+    ch.finish("w:trPr", out);
 }
 
 fn emit_table_cell(
@@ -1159,39 +1271,61 @@ fn emit_tc_pr(props: &engine::CellProperties, out: &mut String) {
         || props.borders.is_some()
         || props.shading.is_some()
         || !matches!(props.v_align, engine::VerticalAlign::Top)
-        || props.cell_margins.is_some();
+        || props.cell_margins.is_some()
+        || props.grab_bag.is_some();
     if !has {
         return;
     }
-    out.push_str("<w:tcPr>");
+    /* Issue #84 — CT_TcPrBase is a strict sequence; the sink orders the
+    modeled children (tcW, gridSpan, vMerge, tcBorders, shd, tcMar,
+    vAlign — `tcMar` precedes `vAlign` in the schema) and slots grab-bag
+    fragments (`<w:noWrap>`, `<w:textDirection>`, `<w:hideMark>`, …) at
+    their own rank. */
+    let rank = tc_pr_child_rank;
+    let mut ch = PrChildren::new();
     if let Some(w) = props.width {
-        emit_w_width("w:tcW", w, out);
+        let mut s = String::new();
+        emit_w_width("w:tcW", w, &mut s);
+        ch.push(rank(b"w:tcW"), s);
     }
     if props.grid_span > 1 {
-        out.push_str(&format!("<w:gridSpan w:val=\"{}\"/>", props.grid_span));
+        ch.push(
+            rank(b"w:gridSpan"),
+            format!("<w:gridSpan w:val=\"{}\"/>", props.grid_span),
+        );
     }
     match props.v_merge {
-        VMergeRole::Restart => out.push_str("<w:vMerge w:val=\"restart\"/>"),
-        VMergeRole::Continue => out.push_str("<w:vMerge/>"),
+        VMergeRole::Restart => ch.push(rank(b"w:vMerge"), "<w:vMerge w:val=\"restart\"/>".into()),
+        VMergeRole::Continue => ch.push(rank(b"w:vMerge"), "<w:vMerge/>".into()),
         VMergeRole::None => {}
     }
     if let Some(b) = &props.borders {
-        emit_cell_borders("w:tcBorders", b, out);
+        let mut s = String::new();
+        emit_cell_borders("w:tcBorders", b, &mut s);
+        ch.push(rank(b"w:tcBorders"), s);
     }
     if let Some([r, g, b, _]) = props.shading {
-        out.push_str(&format!(
-            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"
-        ));
+        ch.push(
+            rank(b"w:shd"),
+            format!("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{r:02X}{g:02X}{b:02X}\"/>"),
+        );
     }
     match props.v_align {
-        engine::VerticalAlign::Center => out.push_str("<w:vAlign w:val=\"center\"/>"),
-        engine::VerticalAlign::Bottom => out.push_str("<w:vAlign w:val=\"bottom\"/>"),
+        engine::VerticalAlign::Center => {
+            ch.push(rank(b"w:vAlign"), "<w:vAlign w:val=\"center\"/>".into())
+        }
+        engine::VerticalAlign::Bottom => {
+            ch.push(rank(b"w:vAlign"), "<w:vAlign w:val=\"bottom\"/>".into())
+        }
         engine::VerticalAlign::Top => {}
     }
     if let Some(m) = &props.cell_margins {
-        emit_cell_margins("w:tcMar", m, out);
+        let mut s = String::new();
+        emit_cell_margins("w:tcMar", m, &mut s);
+        ch.push(rank(b"w:tcMar"), s);
     }
-    out.push_str("</w:tcPr>");
+    ch.push_bag(&props.grab_bag, tc_pr_child_rank);
+    ch.finish("w:tcPr", out);
 }
 
 /// Phase 2 audit (gap B.1/B.2) — emit `<w:tblCellMar>` or `<w:tcMar>`.
@@ -1255,17 +1389,64 @@ fn emit_border_edge(elem: &str, edge: &Option<BorderStroke>, out: &mut String) {
     out.push_str(&format!("<{elem}{attrs}/>"));
 }
 
+/// Issue #84 — the attributes a synthesized root must ADD to re-declare
+/// what the source part's root carried: every `(name, value)` in `extra`
+/// (the `xmlns:*` bindings + `mc:Ignorable` Word puts on `<w:document>`)
+/// that `declared` — the writer's own root text so far — does not already
+/// declare. Skipping duplicates is load-bearing: a repeated attribute is
+/// a fatal XML error. Empty for engine-authored archives and for source
+/// roots that declared nothing beyond the writer's own set, so the
+/// existing byte-stable fixtures are untouched.
+fn extra_root_attrs(declared: &str, extra: &[(String, String)]) -> String {
+    let mut s = String::new();
+    for (k, v) in extra {
+        let probe = format!(" {k}=\"");
+        if declared.contains(&probe) || s.contains(&probe) {
+            continue;
+        }
+        s.push_str(&probe);
+        s.push_str(v);
+        s.push('"');
+    }
+    s
+}
+
+/// Test-only shorthand: `build_document_xml_with_root` for an
+/// engine-authored document (no source root to re-declare). Production
+/// goes through `write_docx`, which always has the archive in hand.
+#[cfg(test)]
 fn build_document_xml(doc: &DocumentTree, hyperlink_rel_map: &HashMap<String, String>) -> String {
+    build_document_xml_with_root(doc, hyperlink_rel_map, &[])
+}
+
+/// `build_document_xml` re-declaring `root_attrs` (the source
+/// `<w:document>` attributes captured in `DocxArchive::document_root_attrs`)
+/// on the synthesized root, so passthrough paragraphs and grab-bag
+/// fragments that use a root-bound prefix (`w14:paraId`, `<w14:glow>`,
+/// `mc:AlternateContent`, …) stay namespace-well-formed.
+fn build_document_xml_with_root(
+    doc: &DocumentTree,
+    hyperlink_rel_map: &HashMap<String, String>,
+    root_attrs: &[(String, String)],
+) -> String {
     let mut out = String::with_capacity(2048);
-    if doc_has_inline_images(doc) {
-        out.push_str(DOC_XML_HEADER_WITH_DRAWING);
+    let header = if doc_has_inline_images(doc) {
+        DOC_XML_HEADER_WITH_DRAWING
     } else if doc_has_hyperlinks(doc) || doc_has_section_hf_refs(doc) {
         /* Phase 3 (#40) — `<w:headerReference r:id>` (freshly emitted OR
         riding a clean marker paragraph's passthrough bytes) needs
         `xmlns:r` bound at the root exactly like `<w:hyperlink r:id>`. */
-        out.push_str(DOC_XML_HEADER_WITH_RELS);
+        DOC_XML_HEADER_WITH_RELS
     } else {
-        out.push_str(DOC_XML_HEADER);
+        DOC_XML_HEADER
+    };
+    let extra = extra_root_attrs(header, root_attrs);
+    if extra.is_empty() {
+        out.push_str(header);
+    } else {
+        /* Every header constant closes the root tag right before
+        `<w:body>`; splice the carried declarations in there. */
+        out.push_str(&header.replacen("><w:body>", &format!("{extra}><w:body>"), 1));
     }
     for block in &doc.blocks {
         emit_block(block, &mut out, hyperlink_rel_map);
@@ -1705,7 +1886,7 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                         hf_rels_new.push((rels_name, rels_bytes));
                     }
                 }
-                let bytes = build_hf_xml(blocks, header, &link_map);
+                let bytes = build_hf_xml(blocks, header, &link_map, &archive.document_root_attrs);
                 if exists {
                     hf_replacements.insert(part_name, bytes);
                 } else {
@@ -1981,7 +2162,11 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
 
         /* Write the regenerated document.xml. */
         zip.start_file(DOC_XML, opts)?;
-        let xml = build_document_xml(doc, &hyperlink_rid_by_target);
+        let xml = build_document_xml_with_root(
+            doc,
+            &hyperlink_rid_by_target,
+            &archive.document_root_attrs,
+        );
         zip.write_all(xml.as_bytes())?;
 
         zip.finish()?;
@@ -2015,6 +2200,8 @@ pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
     let archive = DocxArchive {
         other_entries,
         document: doc.clone(),
+        document_root_attrs: Vec::new(),
+        warnings: Vec::new(),
     };
     write_docx(&archive, doc)
 }
@@ -2234,6 +2421,7 @@ fn build_hf_xml(
     blocks: &[Block],
     header: bool,
     hyperlink_rel_map: &HashMap<String, String>,
+    root_attrs: &[(String, String)],
 ) -> Vec<u8> {
     let mut has_image = false;
     let mut has_link = false;
@@ -2262,6 +2450,11 @@ fn build_hf_xml(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
         );
     }
+    /* Issue #84 — Word binds the same prefix set on every part root; a
+    header story's passthrough paragraphs and grab-bag fragments need
+    the document root's foreign bindings (`w14`, `mc`, …) here too. */
+    let extra = extra_root_attrs(&out, root_attrs);
+    out.push_str(&extra);
     out.push('>');
     /* Issue #72 — parts are block lists now; `emit_block` gives table
     support AND the clean-paragraph `source_xml` passthrough, so
@@ -2866,6 +3059,270 @@ mod tests {
         assert_eq!(p.revisions[0].author, "A");
     }
 
+    /* ================================================================
+    Issue #84 — in-part grab bags.
+    ================================================================ */
+
+    /// Read `document_xml` (wrapped in a minimal archive), flip every
+    /// top-level paragraph + table dirty, and regenerate.
+    fn regenerate_dirty(document_xml: &str) -> (DocxArchive, String) {
+        let parsed = read_docx(&zip_minimal_docx(document_xml, None)).expect("read");
+        let mut owned = parsed.document.clone();
+        for b in owned.blocks.iter_mut() {
+            match b {
+                engine::Block::Paragraph(p) => {
+                    p.dirty = true;
+                    p.source_xml = None;
+                }
+                engine::Block::Table(t) => {
+                    t.dirty = true;
+                    t.source_xml = None;
+                }
+            }
+        }
+        let xml = build_document_xml(&owned, &HashMap::new());
+        (parsed, xml)
+    }
+
+    fn assert_in_order(xml: &str, from: &str, tags: &[&str]) {
+        let mut cursor = xml
+            .find(from)
+            .unwrap_or_else(|| panic!("`{from}` missing in {xml}"));
+        for tag in tags {
+            let off = xml[cursor..]
+                .find(tag)
+                .unwrap_or_else(|| panic!("expected `{tag}` after offset {cursor}; xml={xml}"));
+            cursor += off + tag.len();
+        }
+    }
+
+    #[test]
+    fn rpr_grab_bag_survives_dirty_regeneration_in_schema_order() {
+        /* Source children deliberately out of schema order (`noProof`
+        before `b`), plus a `<w:rPrChange>` whose nested `<w:rPr><w:i/>`
+        used to leak into the live run as italic. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:noProof/><w:b/><w:lang w:val="en-GB"/><w:rPrChange w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr><w:t xml:space="preserve">x</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let (parsed, xml) = regenerate_dirty(document_xml);
+        let span = &parsed.document.nth_paragraph(0).unwrap().spans[0];
+        assert_eq!(span.style.bold, Some(true));
+        assert_eq!(
+            span.style.italic, None,
+            "the rPrChange history must not pollute the live style"
+        );
+        let frags: Vec<&[u8]> = engine::GrabBag::fragments_of(&span.style.grab_bag)
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        assert_eq!(
+            frags,
+            vec![
+                &b"<w:noProof/>"[..],
+                &br#"<w:lang w:val="en-GB"/>"#[..],
+                &br#"<w:rPrChange w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:rPr><w:i/></w:rPr></w:rPrChange>"#[..],
+            ]
+        );
+        assert!(
+            xml.contains(
+                r#"<w:rPr><w:b/><w:noProof/><w:lang w:val="en-GB"/><w:rPrChange w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr>"#
+            ),
+            "regenerated rPr must interleave bag fragments at schema rank: {xml}"
+        );
+    }
+
+    #[test]
+    fn ppr_grab_bag_interleaves_and_pmark_rpr_rides_whole() {
+        /* Scrambled source order; a `<w:pPrChange>` carrying a stale
+        `<w:jc w:val="right"/>` that must not override the live centre
+        alignment; the paragraph-mark `<w:rPr>` rides the bag as one
+        fragment while its `<w:b/>` still seeds the run baseline. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:cnfStyle w:val="000000100000"/><w:jc w:val="center"/><w:pPrChange w:id="2" w:author="A" w:date="2026-01-01T00:00:00Z"><w:pPr><w:jc w:val="right"/></w:pPr></w:pPrChange><w:framePr w:w="2880"/><w:keepNext/><w:rPr><w:b/><w:lang w:val="ar-SA"/></w:rPr></w:pPr><w:r><w:t xml:space="preserve">x</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let (parsed, xml) = regenerate_dirty(document_xml);
+        let para = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(para.props.alignment, Some(engine::Alignment::Center));
+        assert!(para.props.keep_next);
+        assert_eq!(
+            para.spans[0].style.bold,
+            Some(true),
+            "paragraph-mark rPr still seeds the run baseline"
+        );
+        assert_eq!(
+            para.direct_overrides.grab_bag, para.props.grab_bag,
+            "the bag rides direct_overrides so a style re-cascade keeps it"
+        );
+        assert_eq!(
+            engine::GrabBag::fragments_of(&para.props.grab_bag).len(),
+            4,
+            "cnfStyle, pPrChange, framePr, pmark rPr"
+        );
+        assert_in_order(
+            &xml,
+            "<w:pPr>",
+            &[
+                "<w:keepNext/>",
+                r#"<w:framePr w:w="2880"/>"#,
+                r#"<w:jc w:val="center"/>"#,
+                r#"<w:cnfStyle w:val="000000100000"/>"#,
+                r#"<w:rPr><w:b/><w:lang w:val="ar-SA"/></w:rPr>"#,
+                r#"<w:pPrChange w:id="2""#,
+                "</w:pPr>",
+            ],
+        );
+    }
+
+    #[test]
+    fn empty_pmark_rpr_and_foreign_namespace_children_round_trip() {
+        /* `w14` is bound on the ROOT (Word's layout) and `mc:Ignorable`
+        rides beside it. The fragment is captured byte-for-byte; the
+        writer's synthesized root re-declares the source root's bindings
+        (`DocxArchive::document_root_attrs`) so the output stays
+        namespace-well-formed for the passthrough paragraph AND the
+        regenerated one — and a second read captures the identical
+        fragment. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" mc:Ignorable="w14"><w:body><w:p><w:pPr><w:rPr/></w:pPr><w:r><w:rPr><w:b/><w14:ligatures w14:val="standard"/></w:rPr><w:t xml:space="preserve">x</w:t></w:r></w:p><w:p w14:paraId="1A2B3C4D"><w:r><w:t xml:space="preserve">clean</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let parsed = read_docx(&zip_minimal_docx(document_xml, None)).expect("read");
+        assert_eq!(
+            parsed.document_root_attrs,
+            vec![
+                (
+                    "xmlns:w".to_string(),
+                    "http://schemas.openxmlformats.org/wordprocessingml/2006/main".to_string()
+                ),
+                (
+                    "xmlns:mc".to_string(),
+                    "http://schemas.openxmlformats.org/markup-compatibility/2006".to_string()
+                ),
+                (
+                    "xmlns:w14".to_string(),
+                    "http://schemas.microsoft.com/office/word/2010/wordml".to_string()
+                ),
+                ("mc:Ignorable".to_string(), "w14".to_string()),
+            ]
+        );
+        let para = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(
+            engine::GrabBag::fragments_of(&para.props.grab_bag),
+            &[b"<w:rPr/>".to_vec()]
+        );
+        let frag = r#"<w14:ligatures w14:val="standard"/>"#;
+        assert_eq!(
+            engine::GrabBag::fragments_of(&para.spans[0].style.grab_bag),
+            &[frag.as_bytes().to_vec()],
+            "foreign-namespace fragment is captured verbatim"
+        );
+
+        /* Dirty the first paragraph only; the second rides the
+        passthrough with its `w14:paraId`. */
+        let mut owned = parsed.document.clone();
+        let mut p0 = owned.nth_paragraph(0).unwrap().clone();
+        p0.dirty = true;
+        p0.source_xml = None;
+        owned.blocks[0] = engine::Block::Paragraph(p0);
+        let bytes = write_docx(&parsed, &owned).expect("write");
+        let xml = {
+            let mut z = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            let mut f = z.by_name("word/document.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(
+            xml.contains(
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" mc:Ignorable="w14">"#
+            ),
+            "root must re-declare the source bindings exactly once each: {xml}"
+        );
+        assert!(
+            xml.contains(&format!("<w:rPr><w:b/>{frag}</w:rPr>")),
+            "fragment re-emitted verbatim: {xml}"
+        );
+        assert!(xml.contains("<w:pPr><w:rPr/></w:pPr>"), "{xml}");
+        assert!(xml.contains(r#"<w:p w14:paraId="1A2B3C4D">"#), "{xml}");
+        let again = read_docx(&bytes).expect("re-read");
+        assert_eq!(
+            again.document.nth_paragraph(0).unwrap().spans[0]
+                .style
+                .grab_bag,
+            para.spans[0].style.grab_bag,
+            "second read captures the identical fragment"
+        );
+        assert_eq!(again.document_root_attrs, parsed.document_root_attrs);
+    }
+
+    /// Issue #84 — a fragment whose prefix the root never bound cannot be
+    /// re-bound by the writer; it is dropped at capture rather than
+    /// written unbound (a namespace error would make Word reject the
+    /// whole part).
+    #[test]
+    fn unbound_prefix_fragment_is_dropped_not_corrupting() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:b/><w14:ligatures w14:val="standard"/><w:lang w:val="en-GB"/></w:rPr><w:t xml:space="preserve">x</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let (parsed, xml) = regenerate_dirty(document_xml);
+        let para = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(
+            engine::GrabBag::fragments_of(&para.spans[0].style.grab_bag),
+            &[br#"<w:lang w:val="en-GB"/>"#.to_vec()],
+            "the ancestor-bound w14 fragment is dropped, the w: one kept"
+        );
+        assert!(!xml.contains("w14:"), "{xml}");
+    }
+
+    #[test]
+    fn table_property_grab_bags_survive_regeneration_in_schema_order() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tblPr><w:tblLook w:val="04A0"/><w:tblW w:w="0" w:type="auto"/><w:bidiVisual/><w:jc w:val="center"/></w:tblPr><w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:trPr><w:jc w:val="center"/><w:trHeight w:val="400" w:hRule="atLeast"/><w:cnfStyle w:val="100000000000"/></w:trPr><w:tc><w:tcPr><w:hideMark/><w:noWrap/><w:tcW w:w="2880" w:type="dxa"/></w:tcPr><w:p><w:r><w:t xml:space="preserve">c</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let (parsed, xml) = regenerate_dirty(document_xml);
+        let table = parsed
+            .document
+            .blocks
+            .iter()
+            .find_map(|b| b.as_table())
+            .expect("table");
+        assert_eq!(
+            table.props.alignment,
+            Some(engine::Alignment::Center),
+            "tblPr <w:jc> is now read (was write-only)"
+        );
+        assert_eq!(
+            engine::GrabBag::fragments_of(&table.props.grab_bag),
+            &[
+                br#"<w:tblLook w:val="04A0"/>"#.to_vec(),
+                b"<w:bidiVisual/>".to_vec()
+            ]
+        );
+        assert_eq!(
+            engine::GrabBag::fragments_of(&table.rows[0].props.grab_bag),
+            &[
+                br#"<w:jc w:val="center"/>"#.to_vec(),
+                br#"<w:cnfStyle w:val="100000000000"/>"#.to_vec()
+            ]
+        );
+        assert_eq!(
+            engine::GrabBag::fragments_of(&table.rows[0].cells[0].props.grab_bag),
+            &[b"<w:hideMark/>".to_vec(), b"<w:noWrap/>".to_vec()]
+        );
+        assert!(
+            xml.contains(
+                r#"<w:tblPr><w:bidiVisual/><w:tblW w:w="0" w:type="auto"/><w:jc w:val="center"/><w:tblLook w:val="04A0"/></w:tblPr>"#
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<w:trPr><w:cnfStyle w:val="100000000000"/><w:trHeight w:val="400" w:hRule="atLeast"/><w:jc w:val="center"/></w:trPr>"#
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<w:tcPr><w:tcW w:w="2880" w:type="dxa"/><w:noWrap/><w:hideMark/></w:tcPr>"#
+            ),
+            "{xml}"
+        );
+    }
+
     /// Issue #59 test helper — zip up a minimal `.docx` from just a
     /// `word/document.xml` body (+ optional `word/_rels/document.xml.rels`,
     /// needed whenever the body carries a `<w:hyperlink r:id>` — the
@@ -2898,6 +3355,44 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    /// Issue #110 — a BOM-prefixed `word/document.xml` (docx4j / Apache
+    /// POI output) used to resave as unparseable XML: every passthrough
+    /// paragraph was captured three bytes early (`dy><w:p>…</w` instead of
+    /// `<w:p>…</w:p>`), so the writer spliced `</w<w:sectPr/>` /
+    /// `</wdy>` into the body. A zero-edit resave must re-read cleanly with
+    /// every paragraph's bytes intact.
+    #[test]
+    fn bom_prefixed_document_resaves_well_formed() {
+        let document_xml = concat!(
+            "\u{FEFF}",
+            r#"<?xml version="1.0" encoding="utf-8"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        let parsed = read_docx(&zip_minimal_docx(document_xml, None)).expect("read");
+        let resaved = write_docx(&parsed, &parsed.document).expect("write");
+        let reread = read_docx(&resaved).expect("a zero-edit resave must re-read");
+        assert_eq!(reread.document.paragraph_count(), 2);
+        assert_eq!(reread.document.paragraph_text(0), Some("first"));
+        assert_eq!(reread.document.paragraph_text(1), Some("second"));
+
+        let xml = {
+            let mut zip = zip::ZipArchive::new(Cursor::new(&resaved)).expect("zip");
+            let mut part = zip.by_name(DOC_XML).expect("document.xml");
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut part, &mut s).expect("utf-8");
+            s
+        };
+        assert!(
+            xml.contains("<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p><w:sectPr/></w:body>"),
+            "passthrough paragraphs must be spliced byte-exact: {xml}"
+        );
+        assert!(
+            !xml.contains('\u{FEFF}'),
+            "the writer synthesizes its own declaration — no BOM"
+        );
     }
 
     const HYPERLINK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -3165,6 +3660,8 @@ mod tests {
         let archive = DocxArchive {
             other_entries: Vec::new(),
             document: doc.clone(),
+            document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let saved = write_docx(&archive, &doc).expect("write");
@@ -3214,6 +3711,8 @@ mod tests {
         let archive = DocxArchive {
             other_entries: vec![(RELS_XML.to_string(), existing_rels.as_bytes().to_vec())],
             document: doc.clone(),
+            document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let saved = write_docx(&archive, &doc).expect("write");
@@ -3338,6 +3837,8 @@ mod tests {
         let archive = DocxArchive {
             other_entries: Vec::new(),
             document: doc.clone(),
+            document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
         let saved = write_docx(&archive, &doc).expect("write");
         let reopened = read_docx(&saved).expect("reread");
@@ -4390,6 +4891,7 @@ mod tests {
             tab_stops: Vec::new(),
             list_item: None,
             shading: Some([0x33, 0x66, 0x99, 0xFF]),
+            grab_bag: None,
         };
         let para = Paragraph {
             text: "hello world".into(),
@@ -5122,6 +5624,8 @@ mod tests {
         let archive = DocxArchive {
             other_entries: other,
             document: doc.clone(),
+            document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
         let bytes = write_docx(&archive, &doc).expect("initial write");
 
@@ -5365,6 +5869,8 @@ mod tests {
         let archive = DocxArchive {
             other_entries: other,
             document: doc.clone(),
+            document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let bytes = write_docx(&archive, &doc).expect("resave");

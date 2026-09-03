@@ -302,6 +302,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         page_break_after_line: Vec::new(),
         borders: None,
         shading: None,
+        keep_next: false,
     }
 }
 

@@ -11,10 +11,13 @@
 //!   when the engine has not mutated the paragraph (the passthrough
 //!   optimisation; zero document.xml drift on untouched paragraphs).
 
-use crate::error::DocxError;
-use crate::parts::table::parse_table_bytes;
-use crate::schema::ct_ppr::apply_ppr;
-use crate::schema::ct_rpr::{apply_rpr, attr_val};
+use crate::error::{DocxError, DocxWarning};
+use crate::parts::table::parse_table_bytes_with_warnings;
+use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
+use crate::schema::ct_rpr::{apply_rpr, attr_val, fold_rpr_fragment, rpr_child_is_modeled};
+use crate::schema::grab_bag::{
+    NamespaceScope, capture_subtree, slice_element, slice_fragment, stash,
+};
 use crate::style_resolver::StyleResolver;
 use engine::{
     Block, DocumentTree, HeaderFooterRefs, HeaderFooterRole, ListItem, PageGeometry,
@@ -339,11 +342,41 @@ impl SectPrAccum {
 /// Parse `word/document.xml` into paragraphs.
 ///
 /// `resolver` folds the OOXML cascade so each paragraph / run hits the
-/// engine as fully-resolved flat properties.
+/// engine as fully-resolved flat properties. Non-fatal degradations (the
+/// issue #111 table-nesting cap) are discarded here;
+/// [`parse_document_xml_with_warnings`] surfaces them.
 pub fn parse_document_xml(
     xml: &[u8],
     resolver: &StyleResolver<'_>,
 ) -> Result<DocumentTree, DocxError> {
+    let mut warnings = Vec::new();
+    parse_document_xml_with_warnings(xml, resolver, &mut warnings)
+}
+
+/// Strip a leading UTF-8 byte-order mark (`EF BB BF`).
+///
+/// Issue #110 — quick-xml silently drops the BOM from its input but does
+/// **not** count it in `buffer_position()`, so every offset the reader
+/// reports is relative to the BOM-less stream. Every passthrough /
+/// grab-bag capture in this crate indexes the raw part with those offsets;
+/// the part has to be BOM-stripped first so both live in the same byte
+/// space. docx4j and Apache POI write BOM-prefixed parts; before this,
+/// each `<w:p>` was captured three bytes early (`dy><w:p>…</w` instead of
+/// `<w:p>…</w:p>`) and a zero-edit resave was unparseable.
+pub(crate) fn strip_utf8_bom(xml: &[u8]) -> &[u8] {
+    xml.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(xml)
+}
+
+/// [`parse_document_xml`], appending every non-fatal reader diagnostic to
+/// `warnings` (see [`DocxWarning`]).
+pub fn parse_document_xml_with_warnings(
+    xml: &[u8],
+    resolver: &StyleResolver<'_>,
+    warnings: &mut Vec<DocxWarning>,
+) -> Result<DocumentTree, DocxError> {
+    /* Issue #110 — see `strip_utf8_bom`: `reader.buffer_position()` and
+    every `xml[..]` slice below must share one byte space. */
+    let xml = strip_utf8_bom(xml);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
 
@@ -498,12 +531,23 @@ pub fn parse_document_xml(
     let mut prev_pos: usize = 0;
     let mut p_start_byte: Option<usize> = None;
 
+    /* Issue #84 — namespace prefixes the part's root element binds. Grab-bag
+    fragments in a foreign namespace (`w14:`, `mc:`, …) re-bind their
+    prefixes from here so they stay well-formed under the writer's
+    synthesized root. */
+    let mut ns = NamespaceScope::default();
+    let mut root_seen = false;
+
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) => {
                 let name = e.name();
+                if !root_seen {
+                    root_seen = true;
+                    ns = NamespaceScope::from_root(&e);
+                }
                 /* Phase 5 PR 1 — outermost `<w:tbl>` opens. Capture leading
                 byte offset for the source-byte passthrough; ignore every
                 child event (`<w:p>` / `<w:r>` etc. inside cells) until the
@@ -541,6 +585,20 @@ pub fn parse_document_xml(
                         r_style_id = None;
                         direct_rpr = SpanStyle::default();
                         run_text.clear();
+                    }
+                    b"w:rPr" if in_ppr && !in_run => {
+                        /* Issue #84 — paragraph-mark run properties
+                        (`<w:pPr>/<w:rPr>`). The writer never regenerates
+                        this element, so the WHOLE subtree rides the
+                        paragraph's grab bag verbatim; its modeled children
+                        still seed the run baseline (`pmark_rpr`) exactly
+                        as before via `fold_rpr_fragment`, which also
+                        stops a nested `<w:rPrChange>/<w:rPr>` history from
+                        overriding the live formatting. */
+                        if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            fold_rpr_fragment(&frag, &mut pmark_rpr);
+                            stash(&mut direct_ppr.grab_bag, frag, &ns);
+                        }
                     }
                     b"w:rPr" => in_rpr = true,
                     /* A `<w:pPr>` only counts when it's the paragraph's own
@@ -632,12 +690,29 @@ pub fn parse_document_xml(
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
                     }
                     n if in_sect_pr => cur_sect.apply(n, &e),
+                    n if in_run && in_rpr && !rpr_child_is_modeled(n) => {
+                        /* Issue #84 — unmodeled `<w:rPr>` container child
+                        (`<w:rPrChange>`, `<w:bdr>` with content, `mc:`
+                        wrappers, …): the whole subtree goes into the run's
+                        grab bag and the parser skips it, so nothing inside
+                        can masquerade as live run formatting. */
+                        if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            stash(&mut direct_rpr.grab_bag, frag, &ns);
+                        }
+                    }
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
-                    n if in_ppr && in_rpr => {
-                        /* Paragraph-mark `<w:pPr>/<w:rPr>` — applies to the
-                        ¶ glyph. We keep it as `pmark_rpr` for round-trip
-                        and lay it under the run baseline below. */
-                        apply_rpr(n, &e, &mut pmark_rpr);
+                    n if in_ppr
+                        && !in_rpr
+                        && !in_num_pr
+                        && !in_pbdr
+                        && !in_tabs
+                        && !ppr_child_is_modeled(n) =>
+                    {
+                        /* Issue #84 — unmodeled `<w:pPr>` container child
+                        (`<w:pPrChange>`, `<w:framePr>` with content, …). */
+                        if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
+                            stash(&mut direct_ppr.grab_bag, frag, &ns);
+                        }
                     }
                     n if in_ppr && !in_rpr && !in_num_pr => {
                         apply_ppr(n, &e, &mut direct_ppr);
@@ -763,15 +838,46 @@ pub fn parse_document_xml(
                             &mut para_fields,
                         );
                     }
+                    b"w:rPr" if in_ppr && !in_run => {
+                        /* Issue #84 — an empty paragraph-mark `<w:rPr/>`
+                        still rides the bag (byte-stable regeneration). */
+                        let end = reader.buffer_position() as usize;
+                        if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            stash(&mut direct_ppr.grab_bag, frag, &ns);
+                        }
+                    }
                     n if in_sect_pr => cur_sect.apply(n, &e),
+                    n if in_run && in_rpr && !rpr_child_is_modeled(n) => {
+                        /* Issue #84 — unmodeled `<w:rPr>` leaf child
+                        (`<w:lang>`, `<w:fitText>`, `<w:eastAsianLayout>`,
+                        `<w14:glow>`, …) → the run's grab bag, verbatim. */
+                        let end = reader.buffer_position() as usize;
+                        if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            stash(&mut direct_rpr.grab_bag, frag, &ns);
+                        }
+                    }
                     n if in_run && in_rpr => apply_rpr(n, &e, &mut direct_rpr),
-                    n if in_ppr && in_rpr => apply_rpr(n, &e, &mut pmark_rpr),
                     /* Audit gap A.M4 — `<w:pBdr>` per-edge children. */
                     n if in_ppr && in_pbdr => apply_pbdr_edge(n, &e, &mut direct_ppr),
                     /* Audit gap A.M3 — `<w:tabs>` per-stop children. */
                     n if in_ppr && in_tabs && n == b"w:tab" => {
                         if let Some(stop) = parse_tab_stop(&e) {
                             direct_ppr.tab_stops.push(stop);
+                        }
+                    }
+                    n if in_ppr
+                        && !in_rpr
+                        && !in_num_pr
+                        && !in_pbdr
+                        && !in_tabs
+                        && !ppr_child_is_modeled(n) =>
+                    {
+                        /* Issue #84 — unmodeled `<w:pPr>` leaf child
+                        (`<w:framePr>`, `<w:cnfStyle>`, `<w:widowControl>`,
+                        `<w:outlineLvl>`, …) → the paragraph's grab bag. */
+                        let end = reader.buffer_position() as usize;
+                        if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            stash(&mut direct_ppr.grab_bag, frag, &ns);
                         }
                     }
                     n if in_ppr && !in_rpr && !in_num_pr && !in_pbdr && !in_tabs => {
@@ -806,8 +912,7 @@ pub fn parse_document_xml(
                             let tbl_end_byte = reader.buffer_position() as usize;
                             let source_xml = tbl_start_byte
                                 .take()
-                                .filter(|&s| s < tbl_end_byte && tbl_end_byte <= xml.len())
-                                .map(|s| xml[s..tbl_end_byte].to_vec());
+                                .and_then(|s| slice_element(xml, s, tbl_end_byte, b"w:tbl"));
                             /* Phase 5 PR 2 — full row/cell parse via
                             `parts::table::parse_table_bytes`. Source bytes
                             still ride the passthrough so the writer is
@@ -820,7 +925,10 @@ pub fn parse_document_xml(
                             tables. */
                             let (grid, props, rows) = source_xml
                                 .as_deref()
-                                .map(|b| parse_table_bytes(b, resolver).unwrap_or_default())
+                                .map(|b| {
+                                    parse_table_bytes_with_warnings(b, resolver, &ns, warnings)
+                                        .unwrap_or_default()
+                                })
                                 .unwrap_or_default();
                             out_blocks.push(Block::Table(Table {
                                 grid,
@@ -1017,8 +1125,7 @@ pub fn parse_document_xml(
                         let p_end_byte = reader.buffer_position() as usize;
                         let source_xml = p_start_byte
                             .take()
-                            .filter(|&s| s < p_end_byte && p_end_byte <= xml.len())
-                            .map(|s| xml[s..p_end_byte].to_vec());
+                            .and_then(|s| slice_element(xml, s, p_end_byte, b"w:p"));
 
                         /* Sprint 12 (#11) — preserve the direct `<w:pPr>`
                         and the `<w:pStyle>` reference on the Paragraph
@@ -1140,4 +1247,66 @@ pub fn parse_document_xml(
     let mut tree = DocumentTree::from_blocks_with_sections(out_blocks, out_sections);
     tree.comment_ranges = out_comment_ranges;
     Ok(tree)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parts::styles::StyleTable;
+
+    /// Issue #110 — a `word/document.xml` that starts with a UTF-8 BOM
+    /// (docx4j / Apache POI output) must still capture each `<w:p>`'s
+    /// EXACT source bytes. quick-xml strips the BOM from its input without
+    /// counting it in `buffer_position()`; the capture offsets have to
+    /// live in the same byte space as the slice they index.
+    #[test]
+    fn bom_prefixed_part_captures_exact_paragraph_bytes() {
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/></w:body></w:document>"#;
+        let mut xml = b"\xEF\xBB\xBF".to_vec();
+        xml.extend_from_slice(body.as_bytes());
+
+        let table = StyleTable::default();
+        let resolver = StyleResolver::new(&table);
+        let tree = parse_document_xml(&xml, &resolver).expect("parse");
+
+        let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
+        assert_eq!(p0.text, "first");
+        assert_eq!(
+            p0.source_xml.as_deref(),
+            Some(b"<w:p><w:r><w:t>first</w:t></w:r></w:p>".as_slice()),
+            "paragraph 0 source bytes must be the exact <w:p> element"
+        );
+        let p1 = tree.blocks[1].as_paragraph().expect("paragraph 1");
+        assert_eq!(
+            p1.source_xml.as_deref(),
+            Some(b"<w:p><w:r><w:t>second</w:t></w:r></w:p>".as_slice()),
+        );
+        let t = tree.blocks[2].as_table().expect("table");
+        let raw = t.source_xml.as_deref().expect("table source bytes");
+        assert!(
+            raw.starts_with(b"<w:tbl>"),
+            "{:?}",
+            String::from_utf8_lossy(raw)
+        );
+        assert!(
+            raw.ends_with(b"</w:tbl>"),
+            "{:?}",
+            String::from_utf8_lossy(raw)
+        );
+        assert_eq!(t.rows.len(), 1, "table rows must still parse behind a BOM");
+    }
+
+    /// The same document WITHOUT a BOM is the control — identical capture.
+    #[test]
+    fn bom_free_part_captures_exact_paragraph_bytes() {
+        let xml = br#"<?xml version="1.0" encoding="utf-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let table = StyleTable::default();
+        let resolver = StyleResolver::new(&table);
+        let tree = parse_document_xml(xml, &resolver).expect("parse");
+        let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
+        assert_eq!(
+            p0.source_xml.as_deref(),
+            Some(b"<w:p><w:r><w:t>first</w:t></w:r></w:p>".as_slice()),
+        );
+    }
 }

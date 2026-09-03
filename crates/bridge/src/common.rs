@@ -14,6 +14,7 @@ use tsify_next::Tsify;
 /// back to in-container clamping at PR 4 — full cross-container
 /// linear semantics land with Phase 5c.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct LogicalPos {
     pub path: BlockPath,
     pub offset: u32,
@@ -24,11 +25,13 @@ pub struct LogicalPos {
 /// followed by a `Cell` step, descends into a table cell). Phase 5
 /// PR 3 mirrors `engine::BlockPath` over the wire.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct BlockPath {
     pub steps: Vec<PathStep>,
 }
 
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PathStep {
     /// Index into the current `Vec<Block>` / `Vector<Block>`.
@@ -107,6 +110,7 @@ impl BlockPath {
 
 /// Half-open span between two logical positions.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct LogicalRange {
     pub start: LogicalPos,
     pub end: LogicalPos,
@@ -120,6 +124,7 @@ pub struct LogicalRange {
 /// `(from_row, from_col) ..= (to_row, to_col)` is highlighted as a
 /// whole.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SelectionKind {
     #[default]
@@ -135,6 +140,7 @@ pub enum SelectionKind {
 
 /// Axis-aligned rectangle in CSS pixels.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -145,6 +151,7 @@ pub struct Rect {
 /// A point in canvas device pixels — a pointer hit-test coordinate
 /// (PHASE_4_HEADLESS_UI.md §7).
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Point {
     pub x: f32,
     pub y: f32,
@@ -156,6 +163,7 @@ pub struct Point {
 /// `devicePixelRatio` for its DOM overlay). `path` + `at` (the `U+FFFC`
 /// sentinel byte offset) address the image for `Command::ResizeImage`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ImageRect {
     pub path: BlockPath,
     pub at: u32,
@@ -171,6 +179,7 @@ pub struct ImageRect {
 
 /// Document container format.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum DocFormat {
     Docx,
@@ -181,6 +190,7 @@ pub enum DocFormat {
 
 /// 8-bit-per-channel RGBA color.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -190,6 +200,7 @@ pub struct Color {
 
 /// Underline decoration style.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum UnderlineStyle {
     None,
     Single,
@@ -201,6 +212,7 @@ pub enum UnderlineStyle {
 
 /// Sub-/super-script positioning.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum VerticalScript {
     Normal,
     Superscript,
@@ -209,6 +221,7 @@ pub enum VerticalScript {
 
 /// Directionality of a selection or a resolved text run.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum Direction {
     Ltr,
     Rtl,
@@ -219,6 +232,7 @@ pub enum Direction {
 /// direction at layout time; `Center` and `Justify` are absolute. Serializes
 /// as the bare variant string (`"Start"`, `"Center"`, …).
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum Alignment {
     Start,
     End,
@@ -228,6 +242,7 @@ pub enum Alignment {
 
 /// Unicode script, reported when a glyph needs a font the engine lacks.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum Script {
     Common,
     Latin,
@@ -247,6 +262,7 @@ pub enum Script {
 /// Resolved (fully-specified) inline text attributes at a position or range.
 /// The sparse-patch counterpart is [`crate::TextAttrsPatch`].
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct TextAttrs {
     pub bold: bool,
     pub italic: bool,

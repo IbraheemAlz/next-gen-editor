@@ -1,0 +1,45 @@
+{
+  "$comment": "Hand-curated corpus sources for issue #88's real-document harness. `fetch.mjs` reads this file. Copyleft sources (OnlyOffice, LibreOffice) are never listed here — see plans/cleanroom/PROTOCOL.md; every remote source below is a permissively-licensed (Apache-2.0) open-source project's own test-fixture corpus, not a competitor editor's source tree.",
+  "sources": [
+    {
+      "id": "repo-fixtures-format-docx",
+      "kind": "local-dir",
+      "dir": "crates/format-docx/tests/fixtures",
+      "license": "MIT OR Apache-2.0",
+      "project": "next-gen-editor (this repo)",
+      "project_url": "https://github.com/IbraheemAlz/next-gen-editor",
+      "notes": "Our own round-trip fixture .docx files (tools/roundtrip --gen-seed output)."
+    },
+    {
+      "id": "repo-fixtures-perf",
+      "kind": "local-dir",
+      "dir": "tests/perf",
+      "license": "MIT OR Apache-2.0",
+      "project": "next-gen-editor (this repo)",
+      "project_url": "https://github.com/IbraheemAlz/next-gen-editor",
+      "notes": "Synthetic 50/100/250/500-page load-test .docx files (tools/perf-fixtures output)."
+    },
+    {
+      "id": "apache-poi-test-data-document",
+      "kind": "github-dir",
+      "repo": "apache/poi",
+      "ref": "trunk",
+      "path": "test-data/document",
+      "license": "Apache-2.0",
+      "project": "Apache POI",
+      "project_url": "https://github.com/apache/poi",
+      "notes": "Real-world Word document regression fixtures accumulated from ~20 years of Apache POI bug reports. Many are deliberately malformed, oddly-encoded, or edge-case Word output -- exactly the class of 'wild' document issue #88 wants. Only .docx entries are fetched; sibling .doc/.docm files in the same directory are skipped (this project reads OOXML only)."
+    },
+    {
+      "id": "docx4j-sample-docs",
+      "kind": "github-dir",
+      "repo": "plutext/docx4j",
+      "ref": "VERSION_17_0_4",
+      "path": "docx4j-samples-docx4j/sample-docs",
+      "license": "Apache-2.0",
+      "project": "docx4j",
+      "project_url": "https://github.com/plutext/docx4j",
+      "notes": "Real Word-authored sample .docx files docx4j ships for its own conversion/merge/inspection demos -- more 'ordinary document' diversity alongside POI's bug-report-driven fixtures."
+    }
+  ]
+}

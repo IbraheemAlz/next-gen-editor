@@ -25,6 +25,7 @@ use crate::boxes::{
     TableBox, TableRowBox,
 };
 use crate::page::Margins;
+use crate::watchdog::{BlockFingerprint, DegradeReason, DegradeStage, LayoutDegradation, Watchdog};
 use std::collections::HashMap;
 
 /// Per-role header / footer bands the paginator picks from for each
@@ -64,6 +65,14 @@ impl HeaderBands {
 /// pt at scale=1. The renderer multiplies by `scale` if it needs device
 /// pixels.
 pub const FOOTNOTE_SEPARATOR_HEIGHT_PT: f32 = 12.0;
+
+/// Issue #87 — stage (c) of the watchdog ladder: the hard cap on pages
+/// one paginator emits. Past it the remaining flow is appended to the
+/// current page without further page breaks and a `PageCap` note is
+/// recorded. A last-resort net, not a product limit: the 500-page perf
+/// fixture sits two orders of magnitude below it, and at this height
+/// `f32` page-top arithmetic has already lost sub-point precision.
+pub const DEFAULT_PAGE_CAP: usize = 65_536;
 
 /// Concrete geometry for one paginated page. Mirrors `engine::PageGeometry`
 /// without taking a dependency on the engine crate.
@@ -154,6 +163,13 @@ pub struct Paginator {
     /// inputs are shell-injected — the engine core never reads a wall
     /// clock — and an absent input keeps the cached text.
     field_env: engine::FieldEnv,
+    /// Issue #87 — churn watchdog + degradation notes for this flow.
+    watchdog: Watchdog,
+    /// Issue #87 — stage (c): hard cap on emitted pages.
+    page_cap: usize,
+    /// Set once the cap is hit; every later block is appended to the
+    /// current page atomically, without a page break.
+    capped: bool,
 }
 
 impl Paginator {
@@ -184,11 +200,53 @@ impl Paginator {
             page_num: engine::PageNumType::default(),
             doc_page_offset: 0,
             field_env: engine::FieldEnv::default(),
+            watchdog: Watchdog::default(),
+            page_cap: DEFAULT_PAGE_CAP,
+            capped: false,
         };
         /* Issue #71 (design review B3) — page 1 opens BELOW its
         header band when the band is taller than the top margin. */
         p.cur_y = p.opening_cur_y();
         p
+    }
+
+    /// Issue #87 — override the stage (c) page cap (tests, embedders
+    /// with a known page budget).
+    pub fn with_page_cap(mut self, cap: usize) -> Self {
+        self.page_cap = cap.max(1);
+        self
+    }
+
+    /// Issue #87 — test-only switch: every degradation becomes a hard
+    /// failure so CI catches a new loop instead of a silent recovery.
+    pub fn with_strict_watchdog(mut self, strict: bool) -> Self {
+        self.watchdog = std::mem::take(&mut self.watchdog).strict(strict);
+        self
+    }
+
+    /// Issue #87 — degradation notes recorded so far (drained by
+    /// [`Self::finish_with_notes`]).
+    pub fn degradations(&self) -> &[LayoutDegradation] {
+        self.watchdog.notes()
+    }
+
+    /// Issue #87 — the watchdog stage in force for the block currently
+    /// being placed (`Nominal` between blocks).
+    pub fn watchdog_stage(&self) -> DegradeStage {
+        self.watchdog.stage()
+    }
+
+    /// Issue #87 — direct access for tests that exercise a ladder stage
+    /// the local termination rules would otherwise pre-empt.
+    #[cfg(test)]
+    fn watchdog_mut(&mut self) -> &mut Watchdog {
+        &mut self.watchdog
+    }
+
+    /// 0-based index of the page currently being filled — what the
+    /// degradation notes stamp.
+    fn cur_page_index(&self) -> u32 {
+        self.pages.len() as u32
     }
 
     /// Issue #43 — install the render-time date for DATE fields.
@@ -232,6 +290,11 @@ impl Paginator {
         self.column_count = count.max(1);
         self.column_gutter = gutter_pt.max(0.0);
         self.cur_column_index = 0;
+        /* Issue #87 — the nominal column walk re-pushes identical
+        content once per remaining column before a page flush; the
+        non-fresh churn threshold must sit above that. */
+        self.watchdog
+            .set_walk_threshold(u32::from(self.column_count) + 1);
     }
 
     /// L2.3 (#8) — column balance pass for the just-finished section.
@@ -529,6 +592,8 @@ impl Paginator {
         self.column_count = 1;
         self.column_gutter = 0.0;
         self.cur_column_index = 0;
+        self.watchdog
+            .set_walk_threshold(Watchdog::DEFAULT_WALK_THRESHOLD);
         /* The flush above seeded `cur_y` from the OLD section's bands;
         the new section's first page opens under its own (issue #71). */
         self.cur_y = self.opening_cur_y();
@@ -559,11 +624,51 @@ impl Paginator {
     /// plus its new footnote draw exceeds the budget, the new
     /// footnote(s) get rolled back, the page closes, and the block is
     /// re-tried on a fresh page (where its footnotes start a new band).
-    pub fn push_block(&mut self, mut block: LayoutBlock, before: f32, after: f32) {
+    pub fn push_block(&mut self, block: LayoutBlock, before: f32, after: f32) {
+        /* Issue #87 — one top-level block is the watchdog's window:
+        churn counters and the escalation stage restart here. */
+        self.watchdog.begin_block();
+        self.push_block_inner(block, before, after, true);
+    }
+
+    /// The flow step proper. Every internal re-push (a paragraph tail, a
+    /// table continuation, a relocated keep-chain) re-enters HERE, not
+    /// through [`Self::push_block`], so the watchdog sees the whole
+    /// attempt sequence of one top-level block. `observe` is `true` for
+    /// the top-level block and its own tails; a relocated keep-chain
+    /// block re-enters with `false` — it is a different block whose
+    /// attempts must not be counted against the follower's fingerprint
+    /// (both may well be "one line"). Its sub-flow is bounded by
+    /// construction (tails shrink, the oversize guard clips) and still
+    /// honours the stage the follower's churn has reached.
+    fn push_block_inner(&mut self, block: LayoutBlock, before: f32, after: f32, observe: bool) {
         /* Apply the paragraph's `<w:spacing w:before>` first — the engine
         layer already had this concept; we keep it here so the paginator
         owns every Y-coordinate. */
         self.cur_y += before;
+
+        /* Issue #87 stage (c) — past the page cap nothing breaks pages
+        any more: append atomically and accept the state. */
+        if self.capped {
+            self.place_atomic(block, after);
+            return;
+        }
+        /* Issue #87 — churn accounting. A fingerprint the watchdog has
+        seen before on a fresh page is a proof of non-progress; the
+        ladder answers with stage (a) (constraints released, retried
+        below) and then stage (b): pin the block right here. */
+        let stage = if observe {
+            let fp = BlockFingerprint::of(&block, self.cur_blocks.is_empty());
+            self.watchdog.observe(fp)
+        } else {
+            self.watchdog.stage()
+        };
+        if stage >= DegradeStage::Freeze {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::FrozenPlacement, page);
+            self.place_atomic(block, after);
+            return;
+        }
 
         /* Phase 8a — gather every NEW footnote referenced by this block
         (already-on-page refs don't grow the band) and provisionally
@@ -580,6 +685,20 @@ impl Paginator {
             - self.cur_footnote_height
             - self.footer_intrusion(self.page_role());
         let block_height = block.size().height;
+
+        /* Issue #87 — footnote negotiation is one-shot (commit, check,
+        roll back), so it cannot loop; but a band that leaves NO body
+        budget on a fresh page can never be satisfied by any later page
+        either. Bouncing the block forward would drop the footnote on
+        the floor (the rollback below discards the refs while the head
+        that carries them stays here). Keep the band, place the block
+        atomically over it and say so. */
+        if remaining < 0.0 && !new_refs.is_empty() && self.cur_blocks.is_empty() {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::FootnoteOverflow, page);
+            self.place_atomic(block, after);
+            return;
+        }
 
         /* Paragraphs always run through the line-splitter when they
         don't fit — even when the current page is empty — so a single
@@ -603,15 +722,17 @@ impl Paginator {
             false
         };
         if (block_height <= remaining || atomic_overflow_ok) && !has_forced_break {
-            let mut origin = block.origin();
+            /* Issue #87 — an atomic table taller than the budget clips
+            past the bottom margin. Same placement as before; now the
+            paint says so. */
+            if block_height > remaining {
+                let page = self.cur_page_index();
+                self.watchdog.note(DegradeReason::OversizeLine, page);
+            }
             /* Audit gap A.H2 — origin.x carries the column offset for
             multi-column sections (zero for single-column, preserving
             the legacy "page-wide" behaviour). */
-            origin.x = self.current_column_origin_x();
-            origin.y = self.cur_y;
-            block.set_origin(origin);
-            self.cur_y += block_height + after;
-            self.cur_blocks.push(block);
+            self.place_atomic(block, after);
             return;
         }
         /* Rollback footnote provisional commit only for the
@@ -632,8 +753,8 @@ impl Paginator {
         boundaries (`push_paragraph_split` also handles the forced
         page-break path). */
         match block {
-            LayoutBlock::Paragraph(p) => self.push_paragraph_split(p, after),
-            LayoutBlock::Table(t) => self.push_table_split(t, after),
+            LayoutBlock::Paragraph(p) => self.push_paragraph_split(p, after, observe),
+            LayoutBlock::Table(t) => self.push_table_split(t, after, observe),
         }
     }
 
@@ -680,7 +801,92 @@ impl Paginator {
         }
     }
 
-    fn push_paragraph_split(&mut self, para: ParagraphBox, after: f32) {
+    /// Issue #87 — un-commit footnotes a relocated keep-chain carried:
+    /// the ids leave this page's band (they re-commit on the page the
+    /// chain lands on) and the band height shrinks accordingly.
+    fn uncommit_footnotes(&mut self, ids: &[u32]) {
+        for id in ids {
+            if let Some(pos) = self.cur_footnote_ids.iter().rposition(|x| x == id) {
+                self.cur_footnote_ids.remove(pos);
+                let h = self.footnote_bodies.get(id).map_or(0.0, |b| b.size.height);
+                self.cur_footnote_height -= h;
+            }
+        }
+        if self.cur_footnote_ids.is_empty() || self.cur_footnote_height < 0.0 {
+            self.cur_footnote_height = 0.0;
+        }
+    }
+
+    /// Place `block` at the cursor in the current column, whatever its
+    /// height — the "fits" step and every terminal degradation share it.
+    fn place_atomic(&mut self, mut block: LayoutBlock, after: f32) {
+        let h = block.size().height;
+        let mut origin = block.origin();
+        origin.x = self.current_column_origin_x();
+        origin.y = self.cur_y;
+        block.set_origin(origin);
+        self.cur_y += h + after;
+        self.cur_blocks.push(block);
+    }
+
+    /// Issue #87 — keep-with-next. The trailing run of `keep_next`
+    /// paragraphs in the current column is the chain that must travel
+    /// with the block about to move to the next column / page. Returns
+    /// the detached chain (in flow order), or an empty vector when the
+    /// constraint is released: no chain, the chain already opens the
+    /// column (there is no earlier page it could move back from — the
+    /// constraint is unsatisfiable, Word drops it too), or the watchdog
+    /// is at stage (a) or beyond. Releasing records `KeepChainDropped`.
+    fn detach_keep_chain(&mut self) -> Vec<LayoutBlock> {
+        let col_x = self.current_column_origin_x();
+        let in_column = |b: &LayoutBlock| (b.origin().x - col_x).abs() < 0.001;
+        let mut start = self.cur_blocks.len();
+        while start > 0 {
+            match &self.cur_blocks[start - 1] {
+                LayoutBlock::Paragraph(p)
+                    if p.keep_next && in_column(&self.cur_blocks[start - 1]) =>
+                {
+                    start -= 1;
+                }
+                _ => break,
+            }
+        }
+        if start == self.cur_blocks.len() {
+            return Vec::new();
+        }
+        let has_anchor_before = start > 0 && in_column(&self.cur_blocks[start - 1]);
+        if !has_anchor_before || self.watchdog.stage() >= DegradeStage::DropOptional {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::KeepChainDropped, page);
+            /* Release the flag on the chain so a later block cannot
+            re-trigger the same unsatisfiable move. */
+            for b in self.cur_blocks[start..].iter_mut() {
+                if let LayoutBlock::Paragraph(p) = b {
+                    p.keep_next = false;
+                }
+            }
+            return Vec::new();
+        }
+        let chain: Vec<LayoutBlock> = self.cur_blocks.drain(start..).collect();
+        let ids: Vec<u32> = chain.iter().flat_map(collect_footnote_refs).collect();
+        self.uncommit_footnotes(&ids);
+        chain
+    }
+
+    /// Issue #87 — move the block that does not fit to the next column /
+    /// page, carrying its keep-with-next chain along. Chain blocks re-enter
+    /// the flow ahead of `block`; their original `before` / `after`
+    /// spacing is not stored on the box and is not re-applied.
+    fn advance_with_keep_chain(&mut self, block: LayoutBlock, after: f32, observe: bool) {
+        let chain = self.detach_keep_chain();
+        self.advance_column_or_flush_page();
+        for b in chain {
+            self.push_block_inner(b, 0.0, 0.0, false);
+        }
+        self.push_block_inner(block, 0.0, after, observe);
+    }
+
+    fn push_paragraph_split(&mut self, para: ParagraphBox, after: f32, observe: bool) {
         /* Phase 2 audit (gap A.12) — forced page break path. If the
         paragraph carries a `\u{000C}` FORM FEED (the reader's
         mapping of `<w:br w:type="page"/>`), the earliest line index
@@ -708,14 +914,14 @@ impl Paginator {
                 break boundary). `after = 0.0` because the
                 outer-call's `after` belongs to the tail's last
                 line, not the forced break. */
-                self.push_block(LayoutBlock::Paragraph(head), 0.0, 0.0);
+                self.push_block_inner(LayoutBlock::Paragraph(head), 0.0, 0.0, observe);
             }
             /* Force the flush even when head was empty (page break at
             the very first line — produces a blank "current page"
             then the tail starts fresh; matches Word's behaviour). */
             self.flush_page();
             if let Some(tail) = tail_opt {
-                self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
+                self.push_block_inner(LayoutBlock::Paragraph(tail), 0.0, after, observe);
             }
             return;
         }
@@ -733,25 +939,21 @@ impl Paginator {
                 atomically (single oversize line clips the bottom; a
                 proper line-internal splitter is deferred). Without
                 this guard `push_block` would recurse on the same
-                tail on every fresh page → infinite loop. */
-                let h = tail.size.height;
-                let mut t = tail;
-                t.origin = Point {
-                    x: self.current_column_origin_x(),
-                    y: self.cur_y,
-                };
-                self.cur_y += h + after;
-                self.cur_blocks.push(LayoutBlock::Paragraph(t));
+                tail on every fresh page → infinite loop. Issue #87 —
+                the clip is now a reported degradation. */
+                let page = self.cur_page_index();
+                self.watchdog.note(DegradeReason::OversizeLine, page);
+                self.place_atomic(LayoutBlock::Paragraph(tail), after);
             }
             (None, Some(tail)) => {
                 /* Not even the first line fits in the *current* column.
                 Audit gap A.H2 — snake into the next column if available,
-                otherwise flush the page. The tail re-enters `push_block`
+                otherwise flush the page. The tail re-enters the flow
                 with a full column-of-content budget so the next attempt
                 always succeeds (or hits the atomic-single-line clip
-                path above). */
-                self.advance_column_or_flush_page();
-                self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
+                path above). Issue #87 — a keep-with-next chain ending
+                right before this paragraph travels with it. */
+                self.advance_with_keep_chain(LayoutBlock::Paragraph(tail), after, observe);
             }
             (Some(head), tail) => {
                 let h = head.size.height;
@@ -768,7 +970,7 @@ impl Paginator {
                     next column (snake) or, when this is the last
                     column, onto a fresh page. */
                     self.advance_column_or_flush_page();
-                    self.push_block(LayoutBlock::Paragraph(tail), 0.0, after);
+                    self.push_block_inner(LayoutBlock::Paragraph(tail), 0.0, after, observe);
                 } else {
                     self.cur_y += after;
                 }
@@ -777,7 +979,7 @@ impl Paginator {
         }
     }
 
-    fn push_table_split(&mut self, table: TableBox, after: f32) {
+    fn push_table_split(&mut self, table: TableBox, after: f32, observe: bool) {
         /* If the table is non-empty, try moving the *whole* table to a new
         column (or, when no further columns exist, a new page) first —
         that handles the common "table just barely overflows the column
@@ -785,8 +987,9 @@ impl Paginator {
         snake advance keeps the table inside the current page when a
         sibling column has room. */
         if !self.cur_blocks.is_empty() {
-            self.advance_column_or_flush_page();
-            self.push_block(LayoutBlock::Table(table), 0.0, after);
+            /* Issue #87 — a keep-with-next chain ending right before
+            this table travels with it. */
+            self.advance_with_keep_chain(LayoutBlock::Table(table), after, observe);
             return;
         }
 
@@ -845,8 +1048,26 @@ impl Paginator {
         each carrying paragraph-content `Vec`s); the originals stay in
         place at the top of the head. The tail prepends fresh clones
         so the headers repeat. */
-        let header_rows: Vec<TableRowBox> =
+        let mut header_rows: Vec<TableRowBox> =
             head.rows.iter().filter(|r| r.header).cloned().collect();
+        /* Issue #87 stage (a) — repeated headers are an OPTIONAL
+        constraint. When every row that fit on this page was a header
+        row, the continuation would be `headers + the same body rows`
+        — the exact table we started from — and the next page would
+        replay this split forever (the #7 class: an autofit column
+        narrower than its longest token wraps a header row past the
+        page height). Suppress the repeat for this continuation so the
+        tail is strictly smaller; likewise once the watchdog has
+        reached stage (a) on its own. */
+        let head_all_headers = head.rows.iter().all(|r| r.header);
+        let drop_repeat = !tail_rows.is_empty()
+            && !header_rows.is_empty()
+            && (head_all_headers || self.watchdog.stage() >= DegradeStage::DropOptional);
+        if drop_repeat {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::HeaderRepeatDropped, page);
+            header_rows.clear();
+        }
         self.cur_blocks.push(LayoutBlock::Table(head));
 
         if !tail_rows.is_empty() {
@@ -883,7 +1104,7 @@ impl Paginator {
             /* Audit gap A.H2 — snake into the next column before
             forcing a page; matches the paragraph split policy. */
             self.advance_column_or_flush_page();
-            self.push_block(LayoutBlock::Table(tail), 0.0, after);
+            self.push_block_inner(LayoutBlock::Table(tail), 0.0, after, observe);
         } else {
             self.cur_y += after;
         }
@@ -1076,6 +1297,23 @@ impl Paginator {
         (pages.len() bumped, pending flag settled): open below its own
         header band. */
         self.cur_y = self.opening_cur_y();
+        /* Issue #87 stage (c) — the page cap. From here on every block
+        is appended to the current page without a break; the layout is
+        accepted as final rather than risking an unbounded flow. */
+        if !self.capped && self.pages.len() >= self.page_cap {
+            self.capped = true;
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::PageCap, page);
+            self.watchdog.escalate_to(DegradeStage::ForceValidate);
+        }
+    }
+
+    /// [`Self::finish`] plus every degradation note the watchdog
+    /// recorded for this flow (issue #87). The engine forwards the notes
+    /// on `Event::Painted`.
+    pub fn finish_with_notes(mut self) -> (Vec<PageBox>, Vec<LayoutDegradation>) {
+        let notes = self.watchdog.take_notes();
+        (self.finish(), notes)
     }
 
     /// Finalize — drain the in-progress page and return every page emitted.
@@ -1247,6 +1485,7 @@ pub fn split_paragraph_at_line(
         page_break_after_line: head_pb,
         borders: para.borders.clone(),
         shading: para.shading,
+        keep_next: false,
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -1262,6 +1501,7 @@ pub fn split_paragraph_at_line(
         page_break_after_line: tail_pb,
         borders: para.borders.clone(),
         shading: para.shading,
+        keep_next: para.keep_next,
     };
     (Some(head), Some(tail))
 }
@@ -1315,6 +1555,7 @@ pub fn split_paragraph_at_line_index(
         page_break_after_line: head_pb,
         borders: para.borders.clone(),
         shading: para.shading,
+        keep_next: false,
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -1330,6 +1571,7 @@ pub fn split_paragraph_at_line_index(
         page_break_after_line: tail_pb,
         borders: para.borders.clone(),
         shading: para.shading,
+        keep_next: para.keep_next,
     };
     (Some(head), Some(tail))
 }
@@ -1359,6 +1601,8 @@ mod tests {
     use super::*;
     use crate::boxes::{LayoutField, ParagraphBox};
     use crate::page::{A4Page, Margins};
+    use crate::watchdog::geometry_fingerprint;
+    use std::time::{Duration, Instant};
     use text_pipeline::ShapingDirection;
 
     fn a4_geometry() -> PageGeometry {
@@ -1405,6 +1649,7 @@ mod tests {
             page_break_after_line: Vec::new(),
             borders: None,
             shading: None,
+            keep_next: false,
         }
     }
 
@@ -1480,6 +1725,7 @@ mod tests {
                 page_break_after_line: Vec::new(),
                 borders: None,
                 shading: None,
+                keep_next: false,
             })],
             source_rid: None,
         }
@@ -1529,6 +1775,7 @@ mod tests {
             page_break_after_line: Vec::new(),
             borders: None,
             shading: None,
+            keep_next: false,
         }
     }
 
@@ -2353,5 +2600,572 @@ mod tests {
             LayoutBlock::Table(_) => None,
         };
         assert_eq!(ev, None, "DATE is inert without an injected date");
+    }
+
+    /* ================================================================
+    Issue #87 — layout self-defense: geometry regression anchor.
+    ================================================================ */
+
+    /// A fake one-cell-per-row table. `rows` = `(height, is_header)`.
+    fn fake_table(rows: &[(f32, bool)]) -> TableBox {
+        let mut out_rows = Vec::with_capacity(rows.len());
+        let mut y = 0.0_f32;
+        for &(h, header) in rows {
+            out_rows.push(TableRowBox {
+                origin: Point { x: 0.0, y },
+                size: Size {
+                    width: 200.0,
+                    height: h,
+                },
+                cells: vec![crate::boxes::TableCellBox {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 200.0,
+                        height: h,
+                    },
+                    grid_span: 1,
+                    v_merge: engine::VMergeRole::None,
+                    borders: engine::CellBorders::default(),
+                    shading: None,
+                    content: vec![LayoutBlock::Paragraph(fake_paragraph(1, h))],
+                    padding_left: 0.0,
+                    padding_top: 0.0,
+                    padding_right: 0.0,
+                    padding_bottom: 0.0,
+                }],
+                header,
+                cant_split: false,
+            });
+            y += h;
+        }
+        TableBox {
+            origin: Point::default(),
+            size: Size {
+                width: 200.0,
+                height: y,
+            },
+            columns: vec![200.0],
+            rows: out_rows,
+            outer_borders: engine::CellBorders::default(),
+        }
+    }
+
+    /// A one-line paragraph whose only glyph anchors footnote `id`.
+    fn fake_paragraph_with_footnote_ref(id: u32, n_lines: usize, line_height: f32) -> ParagraphBox {
+        let mut p = fake_paragraph(n_lines, line_height);
+        let glyph = crate::boxes::PositionedGlyph {
+            id: 0,
+            cluster: 0,
+            x_advance: 8.0,
+            y_advance: 0.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            synthetic: false,
+            inline_image_rel_id: None,
+            inline_footnote_marker: Some(id.to_string()),
+            inline_object_height: 0.0,
+        };
+        p.lines[0].runs.push(crate::boxes::VisualRun {
+            glyphs: vec![glyph],
+            font: "f".to_string(),
+            direction: ShapingDirection::Ltr,
+            source_range: 0..1,
+            attrs: crate::boxes::TextAttrs {
+                px_size: 12.0,
+                color: [0, 0, 0, 255],
+                faux_bold: false,
+                faux_italic: false,
+                underline: engine::UnderlineStyle::None,
+                strike: false,
+                bg_color: None,
+                baseline_shift_px: 0.0,
+            },
+        });
+        p
+    }
+
+    /// Every nominal paginator shape the crate exercises, laid out and
+    /// finished. The fingerprints pinned in
+    /// `nominal_fixtures_are_geometrically_identical_to_the_pre_watchdog_paginator`
+    /// were recorded on the paginator BEFORE the #87 watchdog landed, so
+    /// the test is a native stand-in for the browser goldens: the
+    /// non-degraded path must be output-identical.
+    fn nominal_fixtures() -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegradation>)> {
+        let geom = a4_geometry();
+        let mut out: Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegradation>)> = Vec::new();
+        let mut finish = |name: &'static str, pag: Paginator| {
+            let (pages, notes) = pag.finish_with_notes();
+            out.push((name, pages, notes));
+        };
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(80, 16.0)), 0.0, 0.0);
+        finish("split80", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(3, 16.0)), 12.0, 6.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 14.0)), 12.0, 6.0);
+        finish("short_with_spacing", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 9999.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("oversize_line", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.set_columns(2, 12.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(120, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(4, 16.0)), 0.0, 0.0);
+        finish("snake_two_columns", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.set_columns(3, 12.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 9999.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("oversize_line_three_columns", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.set_columns(2, 12.0);
+        for h in [50.0, 30.0, 70.0, 50.0] {
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, h)), 0.0, 0.0);
+        }
+        pag.balance_current_section_columns();
+        pag.set_columns(1, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("continuous_balance", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_page_break(6, 16.0, 2)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), 0.0, 0.0);
+        finish("form_feed", pag);
+
+        let headers = HeaderBands {
+            default: Some(fake_band_tall(9, 100.0)),
+            first: Some(fake_band_tall(3, 20.0)),
+            even: None,
+        };
+        let footers = HeaderBands {
+            default: Some(fake_band_tall(8, 120.0)),
+            first: None,
+            even: None,
+        };
+        let mut pag = Paginator::new(geom, headers, footers, true, false);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(100, 16.0)), 0.0, 0.0);
+        finish("intruding_bands_title_pg", pag);
+
+        let mut bodies = HashMap::new();
+        bodies.insert(1, fake_paragraph(3, 14.0));
+        bodies.insert(2, fake_paragraph(2, 14.0));
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_footnote_bodies(bodies);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 3, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(2, 2, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(30, 16.0)), 0.0, 0.0);
+        finish("footnotes", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.start_new_section(geom, HeaderBands::default(), HeaderBands::default(), false);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.force_page_break();
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("sections_and_forced_breaks", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Table(fake_table(&[(20.0, true), (20.0, false), (20.0, false)])),
+            0.0,
+            0.0,
+        );
+        pag.push_block(
+            LayoutBlock::Table(fake_table(&[(100.0, true), (100.0, false), (900.0, false)])),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("tables_move_whole_and_atomic", pag);
+
+        out
+    }
+
+    /// Pinned on the pre-#87 paginator (recorded via `--nocapture` before
+    /// the watchdog landed). A changed value means the nominal path is
+    /// no longer output-identical — the browser goldens would move. The
+    /// third column is the degradation the fixture is EXPECTED to report
+    /// (the pre-existing clip paths, now visible), page-stamped.
+    type PinnedFixture = (&'static str, u64, &'static [(DegradeReason, u32)]);
+    const PINNED_FINGERPRINTS: &[PinnedFixture] = &[
+        ("split80", 0xfdd9dbb6fafb7a42, &[]),
+        ("short_with_spacing", 0xa4a5aeb949abca0c, &[]),
+        (
+            "oversize_line",
+            0x5fcdbcf7ef8bf095,
+            &[(DegradeReason::OversizeLine, 0)],
+        ),
+        ("snake_two_columns", 0x3ae2e4d684a08cb1, &[]),
+        (
+            "oversize_line_three_columns",
+            0x4f9b91bec5c91598,
+            &[(DegradeReason::OversizeLine, 0)],
+        ),
+        ("continuous_balance", 0x4223f896a4f3452c, &[]),
+        ("form_feed", 0x9cc8e34c49eb9a4e, &[]),
+        ("intruding_bands_title_pg", 0xd740800cab2c8c6d, &[]),
+        ("footnotes", 0x7f99643a17eaa915, &[]),
+        ("sections_and_forced_breaks", 0xc92c5638ce1f2440, &[]),
+        (
+            "tables_move_whole_and_atomic",
+            0x7e5c0eabb84250c6,
+            &[(DegradeReason::OversizeLine, 2)],
+        ),
+    ];
+
+    #[test]
+    fn nominal_fixtures_are_geometrically_identical_to_the_pre_watchdog_paginator() {
+        for (name, pages, notes) in nominal_fixtures() {
+            let fp = geometry_fingerprint(&pages);
+            let got: Vec<(DegradeReason, u32)> = notes.iter().map(|n| (n.reason, n.page)).collect();
+            match PINNED_FINGERPRINTS.iter().find(|(n, _, _)| *n == name) {
+                Some((_, want, want_notes)) => {
+                    assert_eq!(
+                        fp, *want,
+                        "fixture `{name}` changed geometry (got {fp:#x}, pinned {want:#x})"
+                    );
+                    assert_eq!(
+                        got.as_slice(),
+                        *want_notes,
+                        "fixture `{name}` reported unexpected degradations"
+                    );
+                }
+                None => eprintln!("FINGERPRINT {name} = {fp:#x} notes={got:?}"),
+            }
+        }
+    }
+
+    /// The strict switch: nominal shapes must not raise a single note.
+    #[test]
+    fn strict_watchdog_is_silent_on_nominal_flow() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+        pag.set_columns(2, 12.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(120, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Table(fake_table(&[(20.0, true), (20.0, false), (20.0, false)])),
+            6.0,
+            6.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(200, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(pages.len() >= 2);
+        assert!(notes.is_empty());
+    }
+
+    /* ================================================================
+    Issue #87 — adversarial fixtures. Each must terminate under budget
+    with a degraded-but-painted result, and say so in the notes.
+    ================================================================ */
+
+    /// The 250 ms acceptance budget is a release / perf-tier figure;
+    /// debug builds get an order of magnitude of slack and still trip on
+    /// anything that loops.
+    fn adversarial_budget() -> Duration {
+        if cfg!(debug_assertions) {
+            Duration::from_millis(2500)
+        } else {
+            Duration::from_millis(250)
+        }
+    }
+
+    fn reasons(notes: &[LayoutDegradation]) -> Vec<DegradeReason> {
+        notes.iter().map(|n| n.reason).collect()
+    }
+
+    fn keep_para(n: usize, line_height: f32) -> ParagraphBox {
+        let mut p = fake_paragraph(n, line_height);
+        p.keep_next = true;
+        p
+    }
+
+    fn total_blocks(pages: &[PageBox]) -> usize {
+        pages.iter().map(|p| p.blocks.len()).sum()
+    }
+
+    /// Keep-with-next chain longer than a page: 60 one-line keep-next
+    /// paragraphs (960 pt on a 698 pt budget) followed by a free
+    /// paragraph. The chain can never satisfy its constraint; the
+    /// paginator must release it (stage a) instead of bouncing the
+    /// chain page after page, emit no blank page, and keep every block.
+    #[test]
+    fn keep_chain_longer_than_a_page_drops_the_constraint_and_terminates() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        for _ in 0..60 {
+            pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), 0.0, 0.0);
+        }
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(
+            t0.elapsed() < adversarial_budget(),
+            "took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            pages.len(),
+            2,
+            "43 lines fit a page; the rest flow to page 2"
+        );
+        assert!(pages.iter().all(|p| !p.blocks.is_empty()), "no blank page");
+        assert_eq!(total_blocks(&pages), 61, "every block painted");
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+        assert_eq!(notes[0].page, 0);
+    }
+
+    /// The satisfiable case: a chain that CAN move does, together with
+    /// its follower, and nothing is reported.
+    #[test]
+    fn keep_chain_moves_with_its_follower_when_it_can() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        /* 640 pt anchor, 3 × 16 pt keep-next chain (688 total), then a
+        follower whose first line does not fit the remaining 10 pt. */
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        for _ in 0..3 {
+            pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), 0.0, 0.0);
+        }
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].blocks.len(), 1, "the anchor stays");
+        assert_eq!(pages[1].blocks.len(), 4, "chain + follower moved together");
+        let ys: Vec<f32> = pages[1].blocks.iter().map(|b| b.origin().y).collect();
+        assert_eq!(
+            ys,
+            vec![0.0, 16.0, 32.0, 48.0],
+            "re-flowed from the page top"
+        );
+    }
+
+    /// Oscillation guard: the chain moves once, fills the fresh page, and
+    /// its follower still does not fit — a naive "move the chain again"
+    /// would bounce forever. A chain already at a page top is released.
+    #[test]
+    fn keep_chain_that_fills_a_fresh_page_is_released_not_bounced() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        for _ in 0..43 {
+            pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), 0.0, 0.0);
+        }
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert_eq!(pages.len(), 3, "anchor | 43-line chain | follower");
+        assert_eq!(pages[0].blocks.len(), 1);
+        assert_eq!(pages[1].blocks.len(), 43);
+        assert_eq!(pages[2].blocks.len(), 1);
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+        assert_eq!(notes[0].page, 1);
+    }
+
+    /// Keep-with-next in front of a table travels the same way.
+    #[test]
+    fn keep_chain_moves_with_a_following_table() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(keep_para(2, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Table(fake_table(&[(40.0, false), (40.0, false)])),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty());
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].blocks.len(), 1);
+        assert_eq!(pages[1].blocks.len(), 2, "heading + table together");
+    }
+
+    /// Repeated header rows taller than the page (the #7 class: an
+    /// autofit column narrower than its longest unbreakable token wraps
+    /// the header row char-by-char past the page height). The row split
+    /// would otherwise produce `headers + the same body rows` — the exact
+    /// table it started from — on every page forever. Stage (a) suppresses
+    /// the repeat for that continuation so the tail strictly shrinks.
+    ///
+    /// Exercises `push_table_split`'s row path directly: through
+    /// `push_block` a table on a fresh page is placed atomically (its
+    /// row-split branch is unreachable today — see the #87 report).
+    #[test]
+    fn header_row_taller_than_the_page_terminates_with_the_repeat_dropped() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        let table = fake_table(&[(800.0, true), (20.0, false), (20.0, false), (20.0, false)]);
+        pag.push_table_split(table, 0.0, true);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert_eq!(pages.len(), 2, "header page, then the body rows");
+        let rows_per_page: Vec<usize> = pages
+            .iter()
+            .map(|p| {
+                p.blocks
+                    .iter()
+                    .filter_map(LayoutBlock::as_table)
+                    .map(|t| t.rows.len())
+                    .sum()
+            })
+            .collect();
+        assert_eq!(rows_per_page, vec![1, 3]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::HeaderRepeatDropped]);
+    }
+
+    /// Header + body rows that DO fit keep repeating the header — the
+    /// constraint is only released when honouring it cannot progress.
+    #[test]
+    fn header_repeat_is_kept_when_a_body_row_fits_under_it() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        let table = fake_table(&[
+            (20.0, true),
+            (300.0, false),
+            (300.0, false),
+            (300.0, false),
+            (300.0, false),
+        ]);
+        pag.push_table_split(table, 0.0, true);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        for p in &pages {
+            let t = p.blocks[0].as_table().expect("table");
+            assert!(t.rows[0].header, "every continuation opens with the header");
+            assert_eq!(t.rows.len(), 3);
+        }
+    }
+
+    /// Footnote taller than a page: its band leaves no body budget on any
+    /// page. The old flow bounced the paragraph forward and lost the
+    /// footnote; now the block is placed over the band on the fresh page,
+    /// the footnote paints, and the flow continues.
+    #[test]
+    fn footnote_taller_than_a_page_terminates_and_paints() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        let mut bodies = HashMap::new();
+        bodies.insert(1, fake_paragraph(1, 2000.0));
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_footnote_bodies(bodies);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 3, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert_eq!(pages.len(), 2);
+        assert_eq!(
+            pages[0].blocks.len(),
+            1,
+            "the referencing paragraph painted"
+        );
+        assert_eq!(
+            pages[0].footnotes.len(),
+            1,
+            "its footnote painted (clipped)"
+        );
+        assert_eq!(pages[0].footnotes[0].id, 1);
+        assert_eq!(pages[1].blocks.len(), 1, "the flow continued");
+        assert_eq!(reasons(&notes), vec![DegradeReason::FootnoteOverflow]);
+    }
+
+    /// Stage (c): the page cap. Past it the flow is appended to the
+    /// current page without breaks and the layout is accepted as final.
+    #[test]
+    fn page_cap_force_validates_the_remaining_flow() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_page_cap(3);
+        for _ in 0..10 {
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(43, 16.0)), 0.0, 0.0);
+        }
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert_eq!(pages.len(), 4, "3 capped pages + the in-progress page");
+        assert_eq!(total_blocks(&pages), 10, "nothing dropped");
+        assert_eq!(
+            pages[3].blocks.len(),
+            7,
+            "the remainder piled onto the last page"
+        );
+        assert_eq!(reasons(&notes), vec![DegradeReason::PageCap]);
+        assert_eq!(pag_stage_after_cap(), DegradeStage::ForceValidate);
+    }
+
+    fn pag_stage_after_cap() -> DegradeStage {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_page_cap(1);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(43, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(43, 16.0)), 0.0, 0.0);
+        pag.watchdog_stage()
+    }
+
+    /// Stage (b): a block the ladder has frozen is pinned atomically at
+    /// the cursor, clipping, instead of being split or moved.
+    #[test]
+    fn frozen_block_is_pinned_at_the_cursor() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.watchdog_mut().escalate_to(DegradeStage::Freeze);
+        pag.push_block_inner(
+            LayoutBlock::Paragraph(fake_paragraph(100, 16.0)),
+            0.0,
+            0.0,
+            true,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert_eq!(pages.len(), 1, "no split, no page move");
+        assert_eq!(pages[0].blocks.len(), 2);
+        assert_eq!(pages[0].blocks[1].origin().y, 32.0);
+        assert_eq!(reasons(&notes), vec![DegradeReason::FrozenPlacement]);
+    }
+
+    /// The generic ladder end to end on the paginator: identical content
+    /// re-entering on fresh pages escalates a → b; a strict watchdog turns
+    /// the recovery into a hard failure so CI catches a new loop.
+    #[test]
+    #[should_panic(expected = "layout watchdog (strict): FROZEN_PLACEMENT")]
+    fn strict_watchdog_fails_hard_on_churn() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+        let block = || LayoutBlock::Paragraph(fake_paragraph(100, 16.0));
+        pag.watchdog_mut().begin_block();
+        /* Three fresh-page attempts of the same content: nominal, stage
+        (a), then stage (b) → the strict note panics. */
+        for _ in 0..3 {
+            pag.force_page_break();
+            let fp = BlockFingerprint::of(&block(), true);
+            let stage = pag.watchdog_mut().observe(fp);
+            if stage >= DegradeStage::Freeze {
+                pag.watchdog_mut().note(DegradeReason::FrozenPlacement, 0);
+            }
+        }
     }
 }

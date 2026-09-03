@@ -4,10 +4,12 @@
 //! cheap snapshots via `im::Vector` for undo/redo.
 
 use im::Vector;
+use serde::{Deserialize, Serialize};
 
 pub mod fields;
 pub mod html;
 pub mod numbering;
+pub mod snapshot;
 
 pub use fields::{
     FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TypedField,
@@ -29,7 +31,7 @@ pub use fields::{
 /// snapshots anyway). Allowing the lint here is the documented
 /// pragmatic choice.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Block {
     Paragraph(Paragraph),
     Table(Table),
@@ -62,7 +64,8 @@ impl Block {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct DocumentTree {
     /// Top-level block sequence. Previously a flat `Vector<Paragraph>`;
     /// Phase 5 PR 1 widened it to `Vector<Block>` so tables can appear at
@@ -85,25 +88,30 @@ pub struct DocumentTree {
     /// paginator looks each `Section`'s refs up here and renders the
     /// blocks in the top margin band. `section_end` markers are
     /// meaningless inside a part and are stripped at every write path.
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub headers: std::collections::HashMap<String, Vec<Block>>,
     /// Mirror of `headers` for `<w:footerReference>`. Carries the full
     /// block model: style spans, inline objects, hyperlinks, revisions,
     /// `Field` overlays and tables. The paginator's per-page field
     /// evaluator stamps PAGE/NUMPAGES on the laid-out copies these
     /// blocks produce.
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub footers: std::collections::HashMap<String, Vec<Block>>,
     /// Phase 7 — image blobs keyed by their relationship id (`r:id`). The
     /// archive reader fills this from `word/media/*` for every image rel
     /// the document references. Inline images look up by the `rel_id`
     /// their [`InlineKind::Image`] carries.
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub media: std::collections::HashMap<String, ImageBlob>,
     /// Phase 8a — parsed `word/footnotes.xml` entries keyed by the OOXML
     /// `w:id`. The value is the footnote body's plain text per paragraph;
     /// the paginator looks an `InlineKind::FootnoteRef.id` up here when
     /// it lays out the page's footnote band.
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub footnotes: std::collections::HashMap<u32, Vec<String>>,
     /// Phase 8a — parsed `word/comments.xml` entries keyed by `w:id`.
     /// Plain text + author / date metadata for the sidebar UI.
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub comment_defs: std::collections::HashMap<u32, CommentDef>,
     /// Phase 8a — comment range overlays. Each entry is the byte-range
     /// span of one `<w:commentRangeStart>` / `<w:commentRangeEnd>` pair
@@ -120,6 +128,7 @@ pub struct DocumentTree {
     /// entries; the cascade walker
     /// (`DocumentTree::resolve_style_cascade`) folds a `style_id`
     /// chain through `based_on` into a flat `ParaProperties`.
+    #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub styles: std::collections::HashMap<String, ParagraphStyle>,
     /// Sprint 12 (#11) — document-wide `<w:docDefaults>`. Sits at
     /// the bottom of every paragraph's resolved cascade. The
@@ -157,7 +166,8 @@ pub struct DocumentTree {
 /// modelled in the engine so the live editor can apply / re-resolve
 /// styles without the format-docx crate's `StyleTable`. Character
 /// styles + table styles are deliberately out of scope.
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct ParagraphStyle {
     pub id: String,
     /// Human-readable name from `<w:name w:val>`. Drives the styles
@@ -177,7 +187,8 @@ pub struct ParagraphStyle {
 /// Phase 8a — author + date + body for one entry of `word/comments.xml`.
 /// Body is currently the joined plain text of every `<w:p>` inside the
 /// comment (rich formatting + reply threading deferred to Phase 8c).
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct CommentDef {
     pub author: String,
     pub date: String,
@@ -207,7 +218,7 @@ pub struct CommentDef {
 /// Phase 8a — one `<w:commentRangeStart>` / `<w:commentRangeEnd>` overlay
 /// on a logical position range. `id` matches a key in
 /// [`DocumentTree::comment_defs`].
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CommentRange {
     pub id: u32,
     pub start: LogicalPos,
@@ -227,7 +238,8 @@ pub struct CommentRange {
 /// - `1440 twips / 20 = 72.0 pt`    ← Word default 1-inch margins
 ///
 /// Aspect ratio 841.9 / 595.3 = 1.4143, matching ISO 216's `1 : √2`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[serde(default)]
 pub struct PageGeometry {
     pub width: f32,
     pub height: f32,
@@ -302,7 +314,7 @@ impl Default for PageGeometry {
 /// `<w:headerReference>` / `<w:footerReference>` discriminator — the
 /// `w:type` attribute. `Default` is what every page uses unless a more
 /// specific variant is requested and selected by the paginator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum HeaderFooterRole {
     #[default]
     Default,
@@ -319,7 +331,8 @@ pub enum HeaderFooterRole {
 /// `None` slot means "inherit from the previous section" (§17.10.3) —
 /// resolved by [`resolve_hf_inheritance`], NOT by a same-section
 /// default-fallback.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct HeaderFooterRefs {
     pub default: Option<String>,
     pub first: Option<String>,
@@ -401,7 +414,8 @@ pub fn resolve_hf_inheritance(sections: &[Section]) -> Vec<(HeaderFooterRefs, He
 /// is the only supported layout this sprint (uneven `<w:col>` child
 /// widths fall back to equal partitioning). Gutter is layout pixels
 /// converted from twips at parse time.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
 pub struct ColumnSpec {
     pub count: u8,
     pub gutter_pt: f32,
@@ -445,7 +459,8 @@ impl Default for ColumnSpec {
 /// reference structs carry the relationship ids the reader captured —
 /// the header / footer XML parts live in the archive's `other_entries`
 /// for the passthrough writer.
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct Section {
     pub geometry: PageGeometry,
     /// First top-level block (inclusive) covered by this section.
@@ -483,13 +498,14 @@ pub struct Section {
 /// keeps doc-wide numbering. `format` picks the glyph set: decimal,
 /// lower/upper roman, lower/upper letter — anything else falls back
 /// to decimal so an unrecognised `w:fmt` doesn't crash the paginator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct PageNumType {
     pub start: Option<u32>,
     pub format: PageNumFormat,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PageNumFormat {
     #[default]
     Decimal,
@@ -561,7 +577,7 @@ fn to_letter(n: u32, upper: bool) -> String {
 }
 
 /// Audit gap A.M12 — `<w:sectPr><w:type>` discriminator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SectionType {
     /// Section starts on a fresh page (the default when `<w:type>` is
     /// absent).
@@ -615,7 +631,8 @@ impl Section {
 /// desync (the pre-Phase-3 `Vec<Section>` range-stamping never
 /// re-indexed on block-count changes, corrupting multi-section docs on
 /// the first edit).
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SectionProps {
     pub geometry: PageGeometry,
     /// `<w:headerReference>` table, keyed by `w:type`.
@@ -670,7 +687,8 @@ impl From<&Section> for SectionProps {
 /// and `numbering.dirty`) so undo reverts the flag together with the
 /// content: an edit-then-undo leaves the writer on the byte-identical
 /// passthrough path for that part.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct HfDirty {
     pub headers: std::collections::BTreeSet<String>,
     pub footers: std::collections::BTreeSet<String>,
@@ -685,7 +703,8 @@ impl HfDirty {
 /// Document-wide flags pulled from `word/settings.xml`. Phase 2 — only
 /// the header/footer parity toggle is modelled; later phases grow the
 /// struct as more setting elements get typed support.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct DocumentSettings {
     /// `<w:evenAndOddHeaders/>` — when `true`, even-numbered pages render
     /// the `Even` header / footer instead of the `Default` slot.
@@ -707,12 +726,13 @@ pub struct DocumentSettings {
 ///   col:0}, PathStep::Block(0)] }` — the first paragraph in the
 ///   top-left cell of row 1 of the 3rd top-level block (which must be
 ///   `Block::Table`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[serde(default)]
 pub struct BlockPath {
     pub steps: Vec<PathStep>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PathStep {
     /// Index into the current `&[Block]` / `&Vector<Block>`.
     Block(u32),
@@ -801,7 +821,7 @@ impl BlockPath {
 /// round-trip byte-identically while still letting the layout engine resolve
 /// the loaded face. `Custom` holds owned `String`s, so the enum is `Clone` but
 /// **not** `Copy` — pass it by reference.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FontFamily {
     Amiri,
     LiberationSans,
@@ -917,7 +937,7 @@ fn slugify_font_name(name: &str) -> String {
 /// boolean-true behaviour; `None` matches boolean-false. The renderer
 /// approximates `Dotted` / `Dashed` / `Wavy` with patterned fill rects
 /// (Canvas2D backend has no native dash array on the underline path).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UnderlineStyle {
     #[default]
     None,
@@ -940,7 +960,7 @@ impl UnderlineStyle {
 /// renderer shrinks the run's font and shifts the baseline up
 /// (`Superscript`) or down (`Subscript`); `Baseline` is the implicit
 /// default and a no-op.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum VertAlign {
     #[default]
     Baseline,
@@ -955,10 +975,65 @@ impl VertAlign {
     }
 }
 
+/// Issue #84 — an in-part OOXML **grab bag**: the raw XML fragments of
+/// every child element the `.docx` reader saw inside a property container
+/// (`<w:rPr>`, `<w:pPr>`, `<w:tblPr>`, `<w:trPr>`, `<w:tcPr>`) but does
+/// not model. A dirty paragraph / table regenerates from the typed model,
+/// so anything the model cannot express would otherwise vanish on the
+/// first edit (the `[HIDDEN GAP - UNHANDLED]` class of the ECMA-376
+/// audit). The bag converts that whole long tail to "preserved verbatim":
+/// the writer re-emits each fragment byte-for-byte, interleaved with the
+/// modeled children in schema order.
+///
+/// Semantics — the bag is an opaque attachment, **not** a formatting
+/// property:
+///
+/// - fragments are complete elements (`<w:framePr …/>`,
+///   `<w:rPrChange>…</w:rPrChange>`), namespace prefixes intact, in source
+///   document order;
+/// - layout / render never read it;
+/// - on span split (`Paragraph::split_at`, `apply_style` re-derivation)
+///   both halves clone it; adjacent spans coalesce only when their whole
+///   `SpanStyle` — bag included — is byte-equal;
+/// - the cascade never inherits it: a merge keeps the *patch's* bag when
+///   the patch carries one, else the receiver's, so a style definition's
+///   bag can never leak into a run as direct formatting (style sources
+///   simply never carry one).
+///
+/// Boxed behind an `Option` on every host struct so the common no-bag case
+/// costs one pointer-width and `SpanStyle::default()` stays cheap to
+/// compare.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct GrabBag {
+    /// Raw child-element fragments (UTF-8 XML bytes), document order.
+    pub fragments: Vec<Vec<u8>>,
+}
+
+impl GrabBag {
+    /// Append `fragment` to the bag behind `slot`, allocating the box on
+    /// first use. The reader's one-liner for every unmodeled child.
+    pub fn push_into(slot: &mut Option<Box<GrabBag>>, fragment: Vec<u8>) {
+        slot.get_or_insert_with(Default::default)
+            .fragments
+            .push(fragment);
+    }
+
+    /// Fragments of `slot`, or an empty slice when there is no bag.
+    pub fn fragments_of(slot: &Option<Box<GrabBag>>) -> &[Vec<u8>] {
+        slot.as_deref().map_or(&[], |b| b.fragments.as_slice())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fragments.is_empty()
+    }
+}
+
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
 pub struct SpanStyle {
     pub font_size: Option<f32>,
     pub color: Option<[u8; 4]>,
@@ -996,6 +1071,10 @@ pub struct SpanStyle {
     /// theme bindings break Word's "Update Style" — preserve at all
     /// costs even though our font picker ignores them.
     pub font_theme: Option<String>,
+    /// Issue #84 — unmodeled `<w:rPr>` children captured verbatim by the
+    /// `.docx` reader (see [`GrabBag`]). `None` for every engine-authored
+    /// style and for runs whose `<w:rPr>` the model fully expresses.
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
 impl SpanStyle {
@@ -1015,12 +1094,17 @@ impl SpanStyle {
             vert_align: patch.vert_align.or(self.vert_align),
             raw_font_family: patch.raw_font_family.or(self.raw_font_family),
             font_theme: patch.font_theme.or(self.font_theme),
+            /* Issue #84 — same "set field wins" rule as every slot above:
+            a formatting patch (no bag) keeps the run's bag; a direct
+            `<w:rPr>` folded onto a cascade baseline (which never carries
+            one) contributes its own. */
+            grab_bag: patch.grab_bag.or(self.grab_bag),
         }
     }
 }
 
 /// A styled byte range `[start, end)` within a paragraph.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct StyleRun {
     pub start: u32,
     pub end: u32,
@@ -1040,7 +1124,7 @@ pub fn emu_to_pt(emu: i64) -> f32 {
 
 /// Kind of inline object anchored in a paragraph's text. Phase 7 ships
 /// inline images; Phase 8a adds footnote references.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum InlineKind {
     /// `<w:drawing><wp:inline><a:graphic><pic:pic>` — a DrawingML picture.
     /// `rel_id` is the OOXML relationship id from the `<a:blip r:embed=...>`
@@ -1063,7 +1147,7 @@ pub enum InlineKind {
 /// The paragraph text carries one U+FFFC (OBJECT REPLACEMENT CHARACTER) at
 /// `at`; layout looks the object up here when it sees the sentinel and
 /// reserves the right physical size in the line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct InlineObject {
     pub at: u32,
     pub kind: InlineKind,
@@ -1072,7 +1156,7 @@ pub struct InlineObject {
 /// A hyperlink overlay on a contiguous byte range of a paragraph. Display
 /// styling (blue + underline if no explicit `<w:rPr>`) is applied at layout
 /// time; clicks are out of scope for Phase 7 (the model is read-only).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Hyperlink {
     pub start: u32,
     pub end: u32,
@@ -1095,7 +1179,7 @@ pub struct Hyperlink {
 /// cached value the source `.docx` shipped (Word stamps the
 /// last-rendered value as the cached text); the paginator overrides it
 /// with the live value before flushing each page via [`Field::evaluate`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     /// Byte offset where the cached display text starts (inclusive).
     pub start: u32,
@@ -1169,7 +1253,7 @@ pub fn render_date_picture(picture: &str, year: i32, month: u32, day: u32) -> St
 ///   but a reviewer marked for removal. The deleted text rides in the
 ///   paragraph's `text` field alongside live content; the renderer
 ///   applies markup styling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevisionKind {
     Insert,
     Delete,
@@ -1188,7 +1272,7 @@ pub enum RevisionKind {
 /// UI uses to address an individual change; `None` for revisions the
 /// engine synthesised (writer assigns a fresh sequential id at
 /// emission time) or for source files that omit the attribute.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Revision {
     pub start: u32,
     pub end: u32,
@@ -1209,9 +1293,10 @@ pub struct Revision {
 /// `image/jpeg`, ...). The bytes are the raw archive entry contents — no
 /// re-encoding, so format round-trips byte-identical through the writer
 /// (writer-side media emission is a follow-up sprint).
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ImageBlob {
     pub content_type: String,
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
@@ -1220,7 +1305,7 @@ pub struct ImageBlob {
 /// layout time; `Center` and `Justify` are absolute. Mirrors
 /// `text_pipeline::Alignment`; kept here so the pure document model carries no
 /// dependency on the text-shaping crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Alignment {
     Start,
     End,
@@ -1233,7 +1318,8 @@ pub enum Alignment {
 /// `engine-wasm` boundary so the pure document model has no float-DPI
 /// dependency. `first_line` and `hanging` are mutually exclusive in OOXML;
 /// the reader sets the matching field and zeroes the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct Indent {
     pub start_twips: i32,
     pub end_twips: i32,
@@ -1242,7 +1328,8 @@ pub struct Indent {
 }
 
 /// Per-paragraph vertical spacing. Twips, matching `<w:spacing>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct Spacing {
     pub before_twips: i32,
     pub after_twips: i32,
@@ -1251,7 +1338,7 @@ pub struct Spacing {
 /// Explicit paragraph base direction (`<w:bidi/>` for RTL). `None` lets
 /// `text_pipeline::first_strong_direction` infer from the first strong
 /// character — the current document-wide default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextDirection {
     Ltr,
     Rtl,
@@ -1259,7 +1346,7 @@ pub enum TextDirection {
 
 /// Per-paragraph line-height override (`<w:spacing w:line>` /
 /// `w:lineRule>`). `None` inherits the renderer's default line height.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub enum LineHeight {
     /// `w:lineRule="auto"` — `w:line` is a 240-ths multiple of single line
     /// height; we store the integer twips for round-trip, layout converts.
@@ -1279,13 +1366,14 @@ pub enum LineHeight {
 /// faithfully on the writer but render as `Left` for now (proper
 /// alignment requires a measure-then-place pass deferred to a later
 /// sprint).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(default)]
 pub struct TabStop {
     pub position_pt: f32,
     pub kind: TabKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TabKind {
     /// Tab cursor jumps to `position_pt`; content lands right of it.
     /// Word's default and what the line builder honours.
@@ -1300,7 +1388,8 @@ pub enum TabKind {
 }
 
 /// alignment / indent / spacing / direction / line-height subset.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
 pub struct ParaProperties {
     pub alignment: Option<Alignment>,
     pub indent: Indent,
@@ -1334,6 +1423,12 @@ pub struct ParaProperties {
     /// rect at the paragraph's bounding rectangle before drawing the
     /// `<w:pBdr>` strokes.
     pub shading: Option<[u8; 4]>,
+    /// Issue #84 — unmodeled direct `<w:pPr>` children (and the whole
+    /// paragraph-mark `<w:pPr>/<w:rPr>`, which the writer never
+    /// regenerates) captured verbatim by the `.docx` reader. See
+    /// [`GrabBag`]. Rides `Paragraph::direct_overrides` as well as the
+    /// resolved `props` so a style re-cascade keeps it.
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
 impl ParaProperties {
@@ -1382,6 +1477,10 @@ impl ParaProperties {
             /* Audit gap A.M17 — list binding cascades: patch wins
             when set, otherwise inherit. */
             list_item: patch.list_item.or(self.list_item),
+            /* Issue #84 — the bag is an attachment, not a cascading
+            property: the direct `<w:pPr>` (patch) contributes its own;
+            style sources never carry one, so nothing leaks downward. */
+            grab_bag: patch.grab_bag.or(self.grab_bag),
         }
     }
 }
@@ -1390,13 +1489,14 @@ impl ParaProperties {
 /// `num_id` keys into `word/numbering.xml`'s `<w:num>` entries; `ilvl`
 /// (0-indexed) selects the level inside the bound `<w:abstractNum>`. The
 /// resolved marker text lives in [`Paragraph::resolved_marker`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListItem {
     pub num_id: u32,
     pub ilvl: u8,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct Paragraph {
     pub text: String,
     /// Non-overlapping styled ranges, sorted by `start`; default-styled ranges
@@ -1430,6 +1530,7 @@ pub struct Paragraph {
     /// Raw `<w:p>...</w:p>` source bytes captured by the reader (Phase 3).
     /// `None` for paragraphs the engine synthesised (`from_text`, splits,
     /// pastes); `Some` for any paragraph parsed from a real `.docx`.
+    #[serde(with = "serde_bytes")]
     pub source_xml: Option<Vec<u8>>,
     /// Phase 7 — non-text inline objects anchored in the paragraph's text.
     /// Each one corresponds to a U+FFFC OBJECT REPLACEMENT CHARACTER in
@@ -1977,7 +2078,7 @@ Phase 5 PR 1 — Table model
 /// Border line style (`<w:val>` on `<w:left>` / `<w:top>` / …).
 /// Phase 5 PR 1 ships the common subset; `Other` preserves the
 /// original token for round-trip.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub enum BorderStyle {
     #[default]
     Single,
@@ -1991,7 +2092,8 @@ pub enum BorderStyle {
 /// One border edge stroke. `size_eighth_pt` is `<w:sz>` (eighths of a
 /// point — the OOXML unit); divide by 8 to get points, by 6 to get px
 /// at 96 DPI.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
 pub struct BorderStroke {
     pub style: BorderStyle,
     pub size_eighth_pt: u16,
@@ -2001,7 +2103,8 @@ pub struct BorderStroke {
 /// Per-edge border strokes for a `<w:tcBorders>` or `<w:tblBorders>`.
 /// `inside_h` / `inside_v` only apply when carried at the table level
 /// (`<w:tblBorders>`); cell-level borders ignore them.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
 pub struct CellBorders {
     pub top: Option<BorderStroke>,
     pub left: Option<BorderStroke>,
@@ -2021,7 +2124,8 @@ pub struct CellBorders {
 /// the final fallback).
 ///
 /// `default()` is all-`None` — meaning every edge inherits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct CellMargins {
     pub top_twips: Option<i32>,
     pub left_twips: Option<i32>,
@@ -2033,7 +2137,7 @@ pub struct CellMargins {
 /// edge is populated; the [`CellMargins::resolve_edges`] resolver
 /// walks cell override → table default → Word stock for each edge
 /// independently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedCellMargins {
     pub top_twips: i32,
     pub left_twips: i32,
@@ -2091,7 +2195,7 @@ impl CellMargins {
 
 /// `<w:tcW>` / `<w:tblW>` width — twips, percent (50-thousandths per
 /// OOXML), auto (content-driven), or nil (no width).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellWidth {
     Dxa(i32),
     Pct(u16),
@@ -2100,7 +2204,7 @@ pub enum CellWidth {
 }
 
 /// `<w:vMerge>` — vertical merge role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VMergeRole {
     /// Independent cell.
     #[default]
@@ -2115,7 +2219,7 @@ pub enum VMergeRole {
 
 /// `<w:vAlign>` — vertical alignment of a cell's blocks within the
 /// cell bounding box.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VerticalAlign {
     #[default]
     Top,
@@ -2125,14 +2229,15 @@ pub enum VerticalAlign {
 
 /// `<w:trHeight>` row height. `hRule` decides whether the value is a
 /// minimum, exact, or auto-fit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowHeight {
     Auto,
     AtLeast { twips: i32 },
     Exact { twips: i32 },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct RowProperties {
     pub height: Option<RowHeight>,
     /// `<w:cantSplit/>` — row cannot break across pages. Phase 5a
@@ -2142,9 +2247,13 @@ pub struct RowProperties {
     /// `<w:tblHeader/>` — row repeats at the top of every page after
     /// a break. Phase 5a captures but does not honour.
     pub header: bool,
+    /// Issue #84 — unmodeled `<w:trPr>` children, verbatim. See
+    /// [`GrabBag`].
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct CellProperties {
     pub grid_span: u8,
     pub v_merge: VMergeRole,
@@ -2157,20 +2266,24 @@ pub struct CellProperties {
     /// `Some` value wins per-edge as resolved by
     /// [`CellMargins::resolve_edges`].
     pub cell_margins: Option<CellMargins>,
+    /// Issue #84 — unmodeled `<w:tcPr>` children, verbatim. See
+    /// [`GrabBag`].
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
 /// Audit gap A.M8 — `<w:tblLayout w:type>`. `Autofit` (Word's
 /// default) measures cell content and distributes column widths to
 /// fit the available band; `Fixed` honours `<w:tblGrid>` verbatim
 /// regardless of content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TableLayout {
     #[default]
     Autofit,
     Fixed,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct TableProperties {
     pub width: Option<CellWidth>,
     pub alignment: Option<Alignment>,
@@ -2182,9 +2295,13 @@ pub struct TableProperties {
     /// Default `Autofit` matches Word's behaviour when the element
     /// is absent.
     pub layout: TableLayout,
+    /// Issue #84 — unmodeled `<w:tblPr>` children (`<w:tblLook>`,
+    /// `<w:bidiVisual>`, `<w:tblpPr>`, …), verbatim. See [`GrabBag`].
+    pub grab_bag: Option<Box<GrabBag>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct TableCell {
     pub props: CellProperties,
     /// Nested block sequence. `Vec`, not `im::Vector`: cells average
@@ -2193,13 +2310,15 @@ pub struct TableCell {
     pub blocks: Vec<Block>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct TableRow {
     pub props: RowProperties,
     pub cells: Vec<TableCell>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct Table {
     /// `<w:tblGrid>` — column template widths in twips. Length is the
     /// logical column count; cells with `grid_span > 1` consume
@@ -2212,6 +2331,7 @@ pub struct Table {
     pub dirty: bool,
     /// Raw `<w:tbl>...</w:tbl>` source bytes captured by the reader.
     /// `None` for engine-synthesised tables.
+    #[serde(with = "serde_bytes")]
     pub source_xml: Option<Vec<u8>>,
 }
 
@@ -2224,7 +2344,7 @@ cross-container linear semantics ship with Phase 5c (the engine
 currently clamps to the deeper endpoint's container).
 ==================================================================== */
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogicalPos {
     pub path: BlockPath,
     /// Byte offset within the paragraph (UTF-8).
@@ -6849,7 +6969,7 @@ fn delete_block_in_vec(blocks: &mut Vec<Block>, steps: &[PathStep]) -> Option<()
 
 /// Bounded undo/redo snapshot stack. Pushing a new snapshot truncates the
 /// redo branch (standard editor semantics).
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UndoStack {
     /// Each element is a complete document snapshot. `im::Vector` clones in O(1)
     /// so pushing a snapshot is cheap structurally; only the modified
@@ -6937,6 +7057,48 @@ impl UndoStack {
 
     pub fn depth(&self) -> u32 {
         self.snapshots.len() as u32
+    }
+
+    /// Maximum snapshots this stack retains.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Issue #85 — the most recent `max_entries` snapshots plus the cursor
+    /// remapped into that window, for crash-recovery persistence. The
+    /// window always contains the current document (the cursor entry),
+    /// even when a long redo branch would otherwise push it out; entries
+    /// older than the window are the ones recovery forgets.
+    pub fn history_window(&self, max_entries: usize) -> (Vec<DocumentTree>, usize) {
+        let max_entries = max_entries.max(1);
+        let len = self.snapshots.len();
+        let lo = len.saturating_sub(max_entries).min(self.cursor);
+        (self.snapshots[lo..].to_vec(), self.cursor - lo)
+    }
+
+    /// Issue #85 — rebuild a stack from a persisted window. Sanitizes
+    /// hostile input: an empty window yields a fresh empty-document stack,
+    /// an out-of-range cursor is clamped to the newest entry, and the
+    /// window is trimmed from the bottom to `cap`. The revision counter
+    /// restarts at 0, so callers must drop any revision-keyed caches.
+    pub fn from_history(snapshots: Vec<DocumentTree>, cursor: usize, cap: usize) -> Self {
+        let cap = cap.max(1);
+        if snapshots.is_empty() {
+            return Self::new(DocumentTree::new(), cap);
+        }
+        let mut snapshots = snapshots;
+        let mut cursor = cursor.min(snapshots.len() - 1);
+        if snapshots.len() > cap {
+            let drop = snapshots.len() - cap;
+            snapshots.drain(..drop);
+            cursor = cursor.saturating_sub(drop);
+        }
+        Self {
+            snapshots,
+            cursor,
+            cap,
+            revision: 0,
+        }
     }
 }
 
@@ -8279,6 +8441,116 @@ mod tests {
         );
         assert_eq!((spans[2].start, spans[2].end), (8, 11));
         assert_eq!(spans[2].style, big);
+    }
+
+    /// Issue #84 — a grab bag is an opaque attachment on the span style:
+    /// it rides every clone, never merges across spans that differ only
+    /// by bag, and is never inherited by a formatting patch.
+    #[test]
+    fn grab_bag_survives_split_merge_and_formatting() {
+        fn bag(frag: &str) -> Option<Box<GrabBag>> {
+            let mut slot = None;
+            GrabBag::push_into(&mut slot, frag.as_bytes().to_vec());
+            slot
+        }
+        let bold = |b: Option<Box<GrabBag>>| SpanStyle {
+            bold: Some(true),
+            grab_bag: b,
+            ..Default::default()
+        };
+        let para = Paragraph {
+            text: "abcdef".into(),
+            spans: vec![
+                StyleRun {
+                    start: 0,
+                    end: 3,
+                    style: bold(bag("<w:lang w:val=\"en-GB\"/>")),
+                },
+                StyleRun {
+                    start: 3,
+                    end: 6,
+                    style: bold(bag("<w:lang w:val=\"ar-SA\"/>")),
+                },
+            ],
+            ..Default::default()
+        };
+
+        /* A patch over both spans re-derives every interval; the two are
+        identical in modeled fields but differ by bag, so they must NOT
+        coalesce, and each keeps its own bag. */
+        let italic = SpanStyle {
+            italic: Some(true),
+            ..Default::default()
+        };
+        let p = para.apply_style(0, 6, italic.clone());
+        assert_eq!(p.spans.len(), 2, "byte-different bags never merge");
+        assert_eq!(p.spans[0].style.italic, Some(true));
+        assert_eq!(p.spans[0].style.grab_bag, bag("<w:lang w:val=\"en-GB\"/>"));
+        assert_eq!(p.spans[1].style.grab_bag, bag("<w:lang w:val=\"ar-SA\"/>"));
+
+        /* Byte-equal bags DO merge. */
+        let mut same = para.clone();
+        same.spans[1].style.grab_bag = bag("<w:lang w:val=\"en-GB\"/>");
+        let p = same.apply_style(0, 6, italic);
+        assert_eq!(p.spans.len(), 1, "byte-equal bags coalesce");
+        assert_eq!(p.spans[0].style.grab_bag, bag("<w:lang w:val=\"en-GB\"/>"));
+
+        /* Splitting inside a span clones the bag to both halves. */
+        let (l, r) = para.split_at(1);
+        assert_eq!(l.spans[0].style.grab_bag, bag("<w:lang w:val=\"en-GB\"/>"));
+        assert_eq!(r.spans[0].style.grab_bag, bag("<w:lang w:val=\"en-GB\"/>"));
+        assert_eq!(r.spans[1].style.grab_bag, bag("<w:lang w:val=\"ar-SA\"/>"));
+
+        /* Merge precedence: the patch's bag wins when it has one, else the
+        receiver keeps its own — a cascade baseline never carries one, so
+        a direct `<w:rPr>` bag always comes through unchanged. */
+        let base = bold(bag("<w:base/>"));
+        assert_eq!(
+            base.clone().merged_with(SpanStyle::default()).grab_bag,
+            bag("<w:base/>")
+        );
+        assert_eq!(
+            SpanStyle::default().merged_with(base.clone()).grab_bag,
+            bag("<w:base/>")
+        );
+        assert_eq!(
+            base.merged_with(bold(bag("<w:direct/>"))).grab_bag,
+            bag("<w:direct/>")
+        );
+        let pp = ParaProperties {
+            grab_bag: bag("<w:framePr/>"),
+            ..Default::default()
+        };
+        assert_eq!(
+            ParaProperties::default().merged_with(pp.clone()).grab_bag,
+            bag("<w:framePr/>")
+        );
+        assert_eq!(
+            pp.merged_with(ParaProperties::default()).grab_bag,
+            bag("<w:framePr/>")
+        );
+    }
+
+    /// Issue #84 — paragraph-level bags ride `props` through split /
+    /// concat like every other paragraph property.
+    #[test]
+    fn paragraph_grab_bag_rides_split_and_concat() {
+        let mut slot = None;
+        GrabBag::push_into(&mut slot, b"<w:cnfStyle w:val=\"1\"/>".to_vec());
+        let para = Paragraph {
+            text: "hello".into(),
+            props: ParaProperties {
+                grab_bag: slot.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (l, r) = para.split_at(2);
+        assert_eq!(l.props.grab_bag, slot);
+        assert_eq!(r.props.grab_bag, slot);
+        let joined = l.concat(&r);
+        assert_eq!(joined.props.grab_bag, slot);
+        assert_eq!(joined.text, "hello");
     }
 
     #[test]
@@ -10197,5 +10469,97 @@ mod tests {
             d.paragraph_at_path(&first).is_some(),
             "deep path resolves to a real paragraph"
         );
+    }
+}
+
+/// Issue #85 — crash-recovery persistence of the undo stack.
+#[cfg(test)]
+mod undo_history_tests {
+    use super::*;
+
+    fn stack_with(n_pushes: usize, cap: usize) -> UndoStack {
+        let mut s = UndoStack::new(DocumentTree::from_text("0"), cap);
+        for i in 1..=n_pushes {
+            s.push(DocumentTree::from_text(&i.to_string()));
+        }
+        s
+    }
+
+    fn text(d: &DocumentTree) -> &str {
+        d.paragraph_text(0).unwrap()
+    }
+
+    #[test]
+    fn history_window_keeps_the_newest_entries_and_remaps_the_cursor() {
+        let s = stack_with(9, 100); /* entries "0".."9", cursor 9 */
+        let (win, cursor) = s.history_window(4);
+        assert_eq!(win.len(), 4);
+        assert_eq!(text(&win[0]), "6");
+        assert_eq!(text(&win[3]), "9");
+        assert_eq!(cursor, 3);
+        assert_eq!(text(&win[cursor]), text(s.current()));
+    }
+
+    #[test]
+    fn history_window_never_drops_the_current_document_behind_a_redo_branch() {
+        let mut s = stack_with(9, 100);
+        for _ in 0..6 {
+            assert!(s.undo());
+        }
+        assert_eq!(text(s.current()), "3");
+        /* A 4-entry window from the top would be "6".."9" — none of them
+        current. The window must slide down to include the cursor. */
+        let (win, cursor) = s.history_window(4);
+        assert_eq!(text(&win[cursor]), "3");
+        assert_eq!(cursor, 0);
+        assert_eq!(text(win.last().unwrap()), "9", "redo branch survives");
+    }
+
+    #[test]
+    fn history_window_with_fewer_entries_than_max_returns_everything() {
+        let s = stack_with(2, 100);
+        let (win, cursor) = s.history_window(16);
+        assert_eq!(win.len(), 3);
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn from_history_round_trips_a_window_and_keeps_undo_redo_working() {
+        let s = stack_with(9, 100);
+        let (win, cursor) = s.history_window(4);
+        let mut r = UndoStack::from_history(win, cursor, 100);
+        assert_eq!(text(r.current()), "9");
+        assert_eq!(r.depth(), 4);
+        assert!(r.can_undo());
+        assert!(!r.can_redo());
+        assert!(r.undo());
+        assert_eq!(text(r.current()), "8");
+        assert!(r.redo());
+        assert_eq!(text(r.current()), "9");
+        /* Below the window there is nothing to undo into. */
+        assert!(r.undo() && r.undo() && r.undo());
+        assert!(!r.undo());
+        assert_eq!(text(r.current()), "6");
+        assert_eq!(r.revision(), 5, "fresh revision counter, bumped per op");
+    }
+
+    #[test]
+    fn from_history_sanitizes_hostile_input() {
+        let fresh = UndoStack::from_history(Vec::new(), 7, 100);
+        assert_eq!(fresh.depth(), 1);
+        assert!(!fresh.can_undo());
+
+        let docs = vec![DocumentTree::from_text("a"), DocumentTree::from_text("b")];
+        let clamped = UndoStack::from_history(docs, 99, 100);
+        assert_eq!(text(clamped.current()), "b");
+
+        /* A window larger than the cap is trimmed from the bottom. */
+        let big: Vec<_> = (0..10)
+            .map(|i| DocumentTree::from_text(&i.to_string()))
+            .collect();
+        let trimmed = UndoStack::from_history(big, 9, 4);
+        assert_eq!(trimmed.depth(), 4);
+        assert_eq!(text(trimmed.current()), "9");
+        assert_eq!(trimmed.cap(), 4);
     }
 }

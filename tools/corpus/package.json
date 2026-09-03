@@ -1,0 +1,12 @@
+{
+  "name": "corpus",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Real-document corpus harness (issue #88) — fetch script, manifest, failure bucketer, and top-N report. The pipeline itself is the native `corpus-native` Rust bin crate (tools/corpus-native/); this package only assembles the corpus and triages its JSONL output.",
+  "scripts": {
+    "fetch": "node fetch.mjs",
+    "run": "node run.mjs",
+    "report": "node report.mjs"
+  }
+}

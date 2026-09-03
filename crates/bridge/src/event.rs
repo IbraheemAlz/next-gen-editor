@@ -89,8 +89,30 @@ pub enum Event {
         version: String,
         capabilities: EngineCapabilities,
     },
+    /// Reply to `Command::Recover` (issue #85).
     Recovered {
+        /// Replay-log commands applied on top of the base snapshot.
         applied_commands: u32,
+        /// `true` when a base snapshot was decoded and restored; `false`
+        /// when none was supplied or it was unreadable (the engine then
+        /// recovered onto a fresh document from the tail alone).
+        snapshot_restored: bool,
+        /// Issue #66 — the renderer this engine instance actually paints
+        /// with (`"vello"` / `"canvas2d"`), reported by the engine itself
+        /// so the shell's `__renderer` never drifts from the truth after a
+        /// post-trap respawn.
+        renderer: String,
+    },
+    /// Reply to `Command::Snapshot` (issue #85): the versioned snapshot
+    /// envelope (`engine::snapshot`, magic + format version + payload).
+    Snapshot {
+        #[serde(with = "serde_bytes")]
+        #[tsify(type = "Uint8Array")]
+        bytes: Vec<u8>,
+        /// Echo of `Command::Snapshot.seq` (0 when the caller passed none).
+        seq: u64,
+        /// `engine::snapshot::FORMAT_VERSION` the bytes were written with.
+        format_version: u8,
     },
 
     /* Document */
@@ -170,6 +192,14 @@ pub enum Event {
         /// index-aligned with `page_tops`; the footer mirror of
         /// `page_content_tops`.
         page_content_bottoms: Vec<f32>,
+        /// Issue #87 — every degradation the layout self-defense applied
+        /// while producing this paint (empty on a nominal paint). The
+        /// pixels are on screen either way; this is how telemetry and QA
+        /// learn that the paginator watchdog released a constraint, pinned
+        /// a churning block, hit the page cap, or that an incremental band
+        /// was demoted to a full reflow. Additive: consumers that ignore
+        /// it see the same paint they always did.
+        layout_degraded: Vec<LayoutDegraded>,
     },
 
     /* Selection */
@@ -532,6 +562,49 @@ pub struct EngineCapabilities {
 }
 
 /// Memory + performance counters, re-emitted on `Command::RequestStats`.
+/// Issue #87 — why a paint was laid out degraded. Mirrors
+/// `layout::DegradeReason` one-to-one (the engine maps at the bridge
+/// boundary; the layout crate has no serde).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LayoutDegradeReason {
+    /// A single line (or an atomic table) taller than the page budget was
+    /// placed on a fresh page and clips past the bottom margin.
+    OversizeLine,
+    /// A keep-with-next chain could not move with its follower; the
+    /// constraint was released (watchdog stage a).
+    KeepChainDropped,
+    /// Repeated table header rows left no room for a body row on a
+    /// continuation page; the repeat was suppressed there (stage a).
+    HeaderRepeatDropped,
+    /// A footnote band left no body budget on a fresh page; the block was
+    /// placed over the band instead of being bounced forever.
+    FootnoteOverflow,
+    /// Watchdog stage (b): a churning block was pinned at the cursor.
+    FrozenPlacement,
+    /// Watchdog stage (c): the page cap was hit; the remaining flow was
+    /// appended without further page breaks.
+    PageCap,
+    /// An incremental (viewport-culled) band failed its prefix invariant
+    /// against the previous band; the engine demoted to a full reflow.
+    FastPathMismatch,
+    /// A paragraph layout-cache entry failed its post-conditions and was
+    /// re-laid from scratch.
+    CacheMismatch,
+    /// The table autofit shrink solver hit its iteration cap; column
+    /// floors were used as-is.
+    AutofitCap,
+}
+
+/// Issue #87 — one degradation note on `Event::Painted`. `page` is the
+/// 0-based page being filled when the paginator applied it; `None` for
+/// document-level or sub-paginator notes (cache / autofit / fast path).
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct LayoutDegraded {
+    pub reason: LayoutDegradeReason,
+    pub page: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
 pub struct EngineStats {
     pub wasm_heap_bytes: u32,

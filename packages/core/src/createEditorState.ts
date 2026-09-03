@@ -29,6 +29,7 @@ import type {
     Direction,
     EngineStats,
     Event,
+    LayoutDegraded,
     LogicalRange,
     Rect,
     SelectionKind,
@@ -69,6 +70,15 @@ export interface EditorState {
     /** Estimated full document height (lazy layout) in pt. */
     estimatedDocumentHeight: Accessor<number>;
     /**
+     * Issue #87 — degradation notes of the latest paint (empty on a
+     * nominal paint). Non-empty means the layout self-defense fired:
+     * the paginator watchdog released a constraint, pinned a churning
+     * block or hit the page cap, or an incremental band was demoted to
+     * a full reflow. The pixels are on screen either way; surface this
+     * in diagnostics (Dev HUD, telemetry), never as a blocking error.
+     */
+    layoutDegraded: Accessor<LayoutDegraded[]>;
+    /**
      * Issue #26 — absolute per-page top offsets + heights in document
      * device px, index-aligned, straight from the paginator. Empty
      * arrays until the first paginated paint. Exact under
@@ -76,7 +86,8 @@ export interface EditorState {
      * from uniform page-size constants.
      */
     pageGeometry: Accessor<{ tops: number[]; heights: number[] }>;
-    /** Active renderer reported by the worker at INIT. */
+    /** Active renderer reported by the worker at INIT, re-reported by the
+     *  engine on every `RECOVERED` (issue #66). */
     renderer: Accessor<string>;
     /**
      * Sprint 10 — page geometry of the section under the caret. Drives
@@ -151,11 +162,12 @@ export function createEditorState(): EditorState {
     const [lastPaintMs, setLastPaintMs] = createSignal(0);
     const [paintVersion, setPaintVersion] = createSignal(0);
     const [estimatedDocumentHeight, setEstimatedDocumentHeight] = createSignal(0);
+    const [layoutDegraded, setLayoutDegraded] = createSignal<LayoutDegraded[]>([]);
     const [pageGeometry, setPageGeometry] = createSignal<{
         tops: number[];
         heights: number[];
     }>({ tops: [], heights: [] });
-    const [renderer] = createSignal(engine.renderer);
+    const [renderer, setRenderer] = createSignal(engine.renderer);
     const [sectionGeometry, setSectionGeometry] =
         createSignal<BridgeSectionGeometry | undefined>(undefined);
     const [cellProperties, setCellProperties] =
@@ -197,6 +209,13 @@ export function createEditorState(): EditorState {
                 setCanRedo(evt.can_redo);
                 break;
             }
+            case 'RECOVERED': {
+                /* Issue #66 — the recovered engine reports the backend it
+                   actually paints with; the INIT-time value is stale once
+                   a respawned worker re-probed the GPU. */
+                setRenderer(evt.renderer);
+                break;
+            }
             case 'TEXT_INSERTED': {
                 setCanUndo(evt.can_undo);
                 setCanRedo(evt.can_redo);
@@ -212,6 +231,7 @@ export function createEditorState(): EditorState {
                 setLastPaintMs(evt.paint_ms);
                 setPaintVersion(evt.version);
                 setEstimatedDocumentHeight(evt.estimated_document_height);
+                setLayoutDegraded(evt.layout_degraded ?? []);
                 if (evt.page_tops.length > 0) {
                     setPageGeometry({ tops: evt.page_tops, heights: evt.page_heights });
                 }
@@ -240,6 +260,7 @@ export function createEditorState(): EditorState {
         lastPaintMs,
         paintVersion,
         estimatedDocumentHeight,
+        layoutDegraded,
         pageGeometry,
         renderer,
         sectionGeometry,

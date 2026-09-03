@@ -1,0 +1,20 @@
+[package]
+name = "differential-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Issue #89 — native CLI: read_docx -> layout -> PDF via format-pdf, the 'our engine' side of the differential oracle harness."
+
+[[bin]]
+name = "differential-native"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../../crates/engine" }
+format-docx = { path = "../../crates/format-docx" }
+format-pdf = { path = "../../crates/format-pdf" }
+layout = { path = "../../crates/layout" }
+text-pipeline = { path = "../../crates/text-pipeline" }
+anyhow = { workspace = true }
+zip = { workspace = true }

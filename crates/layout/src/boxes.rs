@@ -233,6 +233,18 @@ pub struct ParagraphBox {
     /// rectangle BEFORE `borders` (so the strokes draw on top of the
     /// fill). `None` ⇒ no shading (fast path skips emission).
     pub shading: Option<[u8; 4]>,
+    /// Issue #87 — `<w:keepNext/>`: keep this paragraph's last line on
+    /// the same page as the next block's first line. The paginator
+    /// honours it as an *optional* constraint: a chain of keep-next
+    /// blocks moves to the next page together when the following block
+    /// does not fit, and the constraint is released (with a
+    /// `KeepChainDropped` note) when the chain is already at a page top
+    /// or the watchdog reaches stage (a). A split paragraph's head never
+    /// keeps (its keep is with its own tail); the tail inherits the flag.
+    /// Not yet wired from `engine::ParaProperties::keep_next` — the
+    /// engine adapter leaves it `false` until the golden corpus is
+    /// re-verified with keep-with-next enabled.
+    pub keep_next: bool,
 }
 
 impl ParagraphBox {

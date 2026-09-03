@@ -11,3 +11,12 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 tsify-next = { workspace = true }
 wasm-bindgen = { workspace = true }
+# Optional, off by default — see the root Cargo.toml comment on this dep.
+# `fuzz/` enables it to derive `Arbitrary` for `Command` (D5.5, issue #90).
+arbitrary = { workspace = true, features = ["derive"], optional = true }
+
+[features]
+arbitrary = ["dep:arbitrary"]
+
+[dev-dependencies]
+serde_json = { workspace = true }

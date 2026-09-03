@@ -32,6 +32,9 @@ declare global {
         __recovered?: boolean;
         /** Force a telemetry batch flush now (D5.7 debug + e2e hook). */
         __telemetryFlush?: () => Promise<void>;
+        /** Toggle the D5.7 telemetry opt-in flag directly, bypassing the
+         *  Settings-menu checkbox (Issue #86 debug + e2e hook). */
+        __setTelemetryEnabled?: (enabled: boolean) => void;
         /** Data-driven font registry (JIT loader; debug + e2e hook). */
         __fontRegistry?: FontRegistry;
     }

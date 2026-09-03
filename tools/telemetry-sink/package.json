@@ -1,0 +1,10 @@
+{
+  "name": "telemetry-sink",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tiny dev/e2e telemetry receiver (Issue #86) — accepts POSTed batches and writes JSONL.",
+  "scripts": {
+    "run": "node run.mjs"
+  }
+}
