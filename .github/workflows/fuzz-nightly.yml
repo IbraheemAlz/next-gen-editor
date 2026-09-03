@@ -1,0 +1,198 @@
+name: fuzz-nightly
+
+# D5.5 scaled up (issue #90) — nightly `cargo +nightly fuzz run` for each of
+# the four structure-aware targets in `fuzz/`. `ci.yml`'s `rust-native` job
+# only compile-checks `fuzz/` on stable
+# (`cargo check --manifest-path fuzz/Cargo.toml`); running the targets for
+# real wall-clock time needs the nightly toolchain + libFuzzer sanitizer
+# runtime, which is why this lives in its own scheduled workflow rather
+# than blocking every PR.
+#
+# Each matrix leg: restores the corpus + artifacts cache, runs
+# `cargo +nightly fuzz run <target>` for a fixed budget, minimizes any
+# crash it finds (`cargo +nightly fuzz tmin`), uploads the crash as a
+# workflow artifact, and auto-files a GitHub issue with the (minimized)
+# reproducer attached — deduplicated by a content-hash title so a crash
+# that reproduces every night doesn't spam a fresh issue each run.
+
+on:
+  schedule:
+    # 03:00 UTC daily — off peak, clear of the per-PR `ci.yml` traffic.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: 'Per-target fuzz budget, in seconds'
+        required: false
+        default: '1800'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: cargo fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    # 30 min fuzz budget (default) + build/minimize/upload overhead.
+    timeout-minutes: 50
+    permissions:
+      issues: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [docx_reader, docx_roundtrip, rpc_command, layout_paginate]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Corpus + artifacts persist and GROW across nightly runs: the cache
+      # key includes `github.run_id` (always a fresh miss), so the restore
+      # step falls back to `restore-keys` and grabs the most recent past
+      # cache, and the post-job save step then writes back whatever new
+      # corpus entries this run's fuzzing discovered under the new key.
+      # A same-key cache is immutable in GitHub Actions, so a STATIC key
+      # here would silently stop growing after the first run.
+      - name: Cache fuzz corpus + artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Cargo registry cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-${{ matrix.target }}
+
+      - name: Run cargo fuzz
+        id: run
+        # Crash artifacts (not this step's exit code) are the source of
+        # truth for pass/fail — see "Fail the job when a crash was found".
+        continue-on-error: true
+        working-directory: fuzz
+        run: |
+          set -uo pipefail
+          mkdir -p "corpus/${{ matrix.target }}" "artifacts/${{ matrix.target }}"
+          DURATION="${{ github.event.inputs.duration_secs || '1800' }}"
+          # `-fork=4`: libFuzzer runs testcases in forked worker processes
+          # and restarts a worker that crashes instead of ending the whole
+          # session — load-bearing here, not just a speed knob. A known,
+          # not-yet-fixed bug (e.g. `rpc_command`'s `SetSelection` clamp
+          # gap — see the PR description) reproduces on a large fraction
+          # of inputs; without `-fork`, `cargo fuzz run` stops at the
+          # FIRST crash of a whole session, so every nightly run would
+          # burn its entire budget re-finding the same issue in the first
+          # few seconds and never explore anything else. Each worker
+          # crash still gets minimized + filed exactly the same way.
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            "corpus/${{ matrix.target }}" \
+            -fork=4 \
+            -ignore_crashes=1 \
+            -ignore_ooms=1 \
+            -ignore_timeouts=1 \
+            -max_total_time="$DURATION" \
+            -rss_limit_mb=4096 \
+            -timeout=30 \
+            -artifact_prefix="artifacts/${{ matrix.target }}/" \
+            2>&1 | tee fuzz-run.log
+          # libFuzzer's own exit code, not `tee`'s — surfaced via PIPESTATUS
+          # so a crash still fails the run even though `tee` itself exits 0.
+          exit "${PIPESTATUS[0]}"
+
+      - name: Minimize any crash artifact
+        if: always()
+        working-directory: fuzz
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          for f in artifacts/${{ matrix.target }}/crash-* artifacts/${{ matrix.target }}/oom-* artifacts/${{ matrix.target }}/timeout-*; do
+            [ -f "$f" ] || continue
+            echo "Minimizing $f"
+            cargo +nightly fuzz tmin "${{ matrix.target }}" "$f" -o "$f.min" || cp "$f" "$f.min"
+          done
+
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: File a GitHub issue per new crash
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: fuzz
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          for f in artifacts/${{ matrix.target }}/*.min; do
+            [ -f "$f" ] || continue
+            HASH="$(sha256sum "$f" | cut -c1-12)"
+            TITLE="fuzz(${{ matrix.target }}): crash $HASH"
+            # Dedup across nightly runs — same minimized input hashes the
+            # same, so a recurring crash gets one issue, not one per night.
+            EXISTING="$(gh issue list --state all --search "\"$TITLE\" in:title" --json title --jq '.[].title' || true)"
+            if grep -qxF "$TITLE" <<<"$EXISTING"; then
+              echo "Already filed: $TITLE"
+              continue
+            fi
+            BODY_FILE="$(mktemp)"
+            {
+              echo "Nightly structure-aware fuzzing found a crash (D5.5, issue #90)."
+              echo
+              echo "- Target: \`${{ matrix.target }}\`"
+              echo "- Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              echo "- Minimized reproducer: \`$(basename "$f")\` (attached below and in the run's uploaded artifact)"
+              echo
+              echo "### Reproducer (base64)"
+              echo
+              echo '```'
+              base64 -w0 "$f"
+              echo
+              echo '```'
+              echo
+              echo "### Reproduce locally"
+              echo
+              echo '```'
+              echo "cd fuzz"
+              echo "base64 -d > repro.bin <<< '$(base64 -w0 "$f")'"
+              echo "cargo +nightly fuzz run ${{ matrix.target }} repro.bin"
+              echo '```'
+            } > "$BODY_FILE"
+            gh issue create \
+              --title "$TITLE" \
+              --label tech-debt \
+              --label core-engine \
+              --body-file "$BODY_FILE"
+          done
+
+      - name: Fail the job when a crash was found
+        if: always()
+        working-directory: fuzz
+        run: |
+          shopt -s nullglob
+          files=(artifacts/${{ matrix.target }}/crash-* artifacts/${{ matrix.target }}/oom-* artifacts/${{ matrix.target }}/timeout-*)
+          if [ ${#files[@]} -gt 0 ]; then
+            echo "${#files[@]} crash artifact(s) for ${{ matrix.target }} — see the filed issue(s) above."
+            exit 1
+          fi
+          echo "No crashes for ${{ matrix.target }}."

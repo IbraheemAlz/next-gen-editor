@@ -8,10 +8,10 @@
 //! This is the foundation of the round-trip diff bound: parts we do not yet
 //! model can never drift, because we re-emit them as raw bytes.
 
-use crate::error::DocxError;
+use crate::error::{DocxError, DocxWarning};
 use crate::numbering_resolver::resolve_markers_blocks;
 use crate::parts::comments::{parse_comments_extended_xml, parse_comments_xml};
-use crate::parts::document::parse_document_xml;
+use crate::parts::document::parse_document_xml_with_warnings;
 use crate::parts::endnotes::parse_endnotes_xml;
 use crate::parts::footer::parse_footer_xml;
 use crate::parts::footnotes::parse_footnotes_xml;
@@ -51,6 +51,74 @@ pub struct DocxArchive {
     /// on every Word-authored `<w:p>`) and preserved grab-bag fragments
     /// stay namespace-well-formed. Empty for engine-authored archives.
     pub document_root_attrs: Vec<(String, String)>,
+    /// Non-fatal reader diagnostics raised while parsing
+    /// `word/document.xml` (issue #111 — a table nested past
+    /// `parts::table::MAX_TABLE_NESTING_DEPTH` kept as an opaque block).
+    /// Empty when the whole part landed in the typed model.
+    pub warnings: Vec<DocxWarning>,
+}
+
+/// Issue #110 — strict well-formedness check of a saved package's
+/// `word/document.xml`, for the round-trip harnesses: re-parse the part
+/// with quick-xml (end-tag names checked, comments checked, unmatched end
+/// tags rejected) and require exactly one root element closed at EOF.
+/// Any violation is an error — a writer that splices a misaligned
+/// passthrough range produces a part this rejects, and our own reader
+/// then cannot reopen what we just saved.
+pub fn check_document_xml_well_formed(docx: &[u8]) -> Result<(), DocxError> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut archive = ZipArchive::new(Cursor::new(docx))?;
+    let mut part = archive
+        .by_name(DOC_XML)
+        .map_err(|_| DocxError::MissingEntry(DOC_XML.into()))?;
+    let mut xml = Vec::with_capacity(part.size() as usize);
+    part.read_to_end(&mut xml)?;
+
+    let mut reader = Reader::from_reader(xml.as_slice());
+    let config = reader.config_mut();
+    config.trim_text(false);
+    config.check_end_names = true;
+    config.check_comments = true;
+    config.allow_unmatched_ends = false;
+
+    let mut depth: usize = 0;
+    let mut roots: usize = 0;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(_) => {
+                if depth == 0 {
+                    roots += 1;
+                }
+                depth += 1;
+            }
+            Event::Empty(_) if depth == 0 => roots += 1,
+            Event::End(_) => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    DocxError::MalformedXml(format!(
+                        "unmatched end tag at byte {}",
+                        reader.buffer_position()
+                    ))
+                })?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    if depth != 0 {
+        return Err(DocxError::MalformedXml(format!(
+            "{depth} element(s) still open at end of {DOC_XML}"
+        )));
+    }
+    if roots != 1 {
+        return Err(DocxError::MalformedXml(format!(
+            "{DOC_XML} has {roots} root elements, expected exactly 1"
+        )));
+    }
+    Ok(())
 }
 
 /// Attributes of the first element in `xml` (the part's root), raw escaped
@@ -127,7 +195,8 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         _ => StyleTable::default(),
     };
     let resolver = StyleResolver::new(&style_table);
-    let mut document = parse_document_xml(&xml, &resolver)?;
+    let mut warnings: Vec<DocxWarning> = Vec::new();
+    let mut document = parse_document_xml_with_warnings(&xml, &resolver, &mut warnings)?;
 
     /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
     numbering resolver. Second pass over the parsed paragraphs fills each
@@ -441,6 +510,7 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         other_entries,
         document,
         document_root_attrs,
+        warnings,
     })
 }
 
@@ -571,4 +641,90 @@ fn engine_numbering_from(src: &NumberingDefinitions) -> engine::numbering::Numbe
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    /// Minimal package: just `word/document.xml` with the given bytes.
+    fn package(document_xml: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file(DOC_XML, opts).unwrap();
+            zip.write_all(document_xml).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    const ROOT: &str =
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#;
+
+    #[test]
+    fn well_formed_guard_accepts_a_clean_part() {
+        let xml = format!(
+            "{ROOT}<w:body><w:p><w:r><w:t>x</w:t></w:r></w:p><!-- c --><w:sectPr/></w:body></w:document>"
+        );
+        check_document_xml_well_formed(&package(xml.as_bytes())).expect("clean part");
+        /* A BOM + declaration are fine too. */
+        let bom = format!("\u{FEFF}<?xml version=\"1.0\"?>{ROOT}<w:body/></w:document>");
+        check_document_xml_well_formed(&package(bom.as_bytes())).expect("bom part");
+    }
+
+    /// Issue #110 — the exact corruption the corpus produced: a
+    /// passthrough paragraph truncated to `</w` before the next sibling.
+    #[test]
+    fn well_formed_guard_rejects_the_issue_110_splice() {
+        for body in [
+            "<w:body><w:p><w:r><w:t>x</w:t></w:r></w<w:sectPr/></w:body>",
+            "<w:body><w:p><w:r><w:t>x</w:t></w:r></w<w:p><w:r><w:t>y</w:t></w:r></w</w:body>",
+            "<w:body><w:p><w:r><w:t>x</w:t></w:r></wdy></w:document>",
+        ] {
+            let xml = format!("{ROOT}{body}</w:document>");
+            let err = check_document_xml_well_formed(&package(xml.as_bytes()))
+                .expect_err("splice must be rejected");
+            assert!(
+                matches!(err, DocxError::Xml(_) | DocxError::MalformedXml(_)),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_guard_rejects_structural_problems() {
+        /* Unclosed root at EOF. */
+        let open = format!("{ROOT}<w:body><w:p/>");
+        assert!(matches!(
+            check_document_xml_well_formed(&package(open.as_bytes())),
+            Err(DocxError::MalformedXml(_))
+        ));
+        /* Two root elements. */
+        let two = format!("{ROOT}</w:document>{ROOT}</w:document>");
+        assert!(matches!(
+            check_document_xml_well_formed(&package(two.as_bytes())),
+            Err(DocxError::MalformedXml(_))
+        ));
+        /* Stray end tag. */
+        let stray = format!("{ROOT}<w:body/></w:document></w:p>");
+        assert!(check_document_xml_well_formed(&package(stray.as_bytes())).is_err());
+        /* No document.xml at all. */
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            zip.start_file("word/other.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"<a/>").unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(matches!(
+            check_document_xml_well_formed(&buf),
+            Err(DocxError::MissingEntry(_))
+        ));
+    }
 }

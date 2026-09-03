@@ -152,9 +152,33 @@ D5.10 are external/human sign-offs, not code.
 - **PDF/A-1b (D5.4).** `format-pdf` emits true PDF/A-1b for `PdfProfile::A1b`;
   `crates/format-pdf/build.rs` synthesizes the sRGB ICC profile — no binary
   blob in the tree. `tools/pdf-validate` is the veraPDF harness.
-- **Fuzzing (D5.5).** `fuzz/` is a cargo-fuzz crate in its **own workspace** —
-  `docx_reader` fuzzes `read_docx`, `rpc_command` fuzzes `Command` JSON.
-  Compile-checked on stable; `cargo +nightly fuzz run` is the nightly flow.
+- **Fuzzing (D5.5, scaled up by issue #90).** `fuzz/` is a cargo-fuzz crate
+  in its **own workspace** with four structure-aware targets, all
+  compile-checked on stable via `cargo check --manifest-path fuzz/Cargo.toml`
+  (`cargo +nightly fuzz run` is the nightly flow, `.github/workflows/
+  fuzz-nightly.yml`, ≥ 30 min/target with `-fork=4` so one already-known
+  crash doesn't stop a whole session, crash minimization + `gh issue create`
+  auto-filing):
+  - `docx_reader` / `docx_roundtrip` (new) — `fuzz/src/docx_gen.rs` builds
+    schema-shaped WML (random `pPr`/`rPr`/`tbl`/`sectPr` trees, valid and
+    deliberately-invalid attributes) inside a minimal OPC zip, not raw
+    bytes, then `read_docx` / `read → write → read`.
+  - `rpc_command` — `fuzz/src/command_gen.rs` derives `arbitrary::Arbitrary`
+    for `Command` (bridge's `arbitrary` feature, optional + off by default,
+    zero cost to the wasm build) and drives sequences end to end through
+    the real `Engine::apply` dispatcher via `Engine::apply_sync` (the
+    `engine-wasm` `fuzz-native` feature, also off by default) — no browser
+    needed: `Engine::new_headless` skips the `OffscreenCanvas` requirement,
+    and `apply`'s auto-repaint still runs the full layout pipeline (only
+    the final canvas blit is unreachable, and already skipped whenever no
+    canvas is registered).
+  - `layout_paginate` (new) — `fuzz/src/layout_gen.rs` builds random
+    paragraph/table/section trees straight into the paginator; a page-count
+    bound stands in for a termination watchdog (`Engine::
+    layout_page_count_for_fuzzing`).
+  - `fuzz/examples/smoke.rs` is a stable-only driver (no nightly needed)
+    proving all four work: `cargo run --manifest-path fuzz/Cargo.toml
+    --example smoke --release`.
 - **Telemetry (D5.7).** Schema in `crates/bridge/src/telemetry.rs`; the UI
   collector `ts/src/state/telemetry.ts` batches samples and `console.log`s
   them every 60 s — a **mock** transport (no live collector for the MVP).
@@ -307,6 +331,18 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 - Long-running processes (vite dev, wasm-pack build) run in `run_in_background: true`.
 - Don't `git add .` blindly. Stage by explicit path.
 - Commit messages: heredoc + `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
+- **Parallel agents in git worktrees.** A shared `CARGO_TARGET_DIR` across
+  worktrees is *unsound*: cargo fingerprints workspace-relative paths, so a
+  sibling worktree's stale rlib (built from different sources) satisfies your
+  fingerprint and you link against their version — phantom "missing field"
+  errors and false-green gates. Rules: agents `touch` every `.rs` and rebuild
+  immediately before their gates (or use a private target dir when disk
+  allows); merge gates on `main` run only in the private `target-main/`
+  cache (gitignored) that nothing else writes to; judge every gate by exit
+  code. Large merge-conflict hunks are rebuilt by construction, never
+  keep-both — the shared closing brace may belong to different modules.
+  Disk is the binding constraint on this 8-core / 15 GB box: the shared
+  `target/` alone is ~20 GB.
 
 ## Things to never do
 

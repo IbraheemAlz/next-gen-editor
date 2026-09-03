@@ -25,6 +25,6 @@ pub mod schema;
 pub mod style_resolver;
 pub mod writer;
 
-pub use error::DocxError;
-pub use opc::archive::{DOC_XML, DocxArchive, read_docx};
+pub use error::{DocxError, DocxWarning};
+pub use opc::archive::{DOC_XML, DocxArchive, check_document_xml_well_formed, read_docx};
 pub use writer::{build_minimal_docx, write_docx};

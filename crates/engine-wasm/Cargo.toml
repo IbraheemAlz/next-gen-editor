@@ -32,3 +32,12 @@ unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+
+[features]
+# Native testing/fuzzing entry points (D5.5, issue #90) — off by default,
+# never activated by `wasm-pack build`. See the `#[cfg(feature =
+# "fuzz-native")] impl Engine` block near the end of `src/lib.rs` for what
+# it adds: a canvas-less `Engine::new_headless`, a JsValue-free
+# `Engine::apply_sync`, and a few invariant accessors the fuzz crate
+# (`fuzz/fuzz_targets/rpc_command.rs`, `layout_paginate.rs`) drives.
+fuzz-native = []

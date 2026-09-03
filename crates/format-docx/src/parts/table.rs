@@ -12,17 +12,31 @@
 //! (Phase 3 passthrough); the parsed `rows` exist only so layout +
 //! render can paint correctly, never for write-back at PR 2.
 
-use crate::error::DocxError;
+use crate::error::{DocxError, DocxWarning};
 use crate::schema::ct_ppr::parse_jc;
 use crate::schema::ct_rpr::{attr_val, parse_hex_color};
 use crate::schema::ct_tbl;
-use crate::schema::grab_bag::{NamespaceScope, capture_subtree, slice_fragment, stash};
+use crate::schema::grab_bag::{
+    NamespaceScope, capture_subtree, slice_element, slice_fragment, stash,
+};
 use engine::{
     Block, BorderStroke, BorderStyle, CellBorders, CellMargins, CellWidth, GrabBag, RowHeight,
     Table, TableCell, TableProperties, TableRow, VMergeRole, VerticalAlign,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
+
+/// Issue #111 — deepest `<w:tbl>` nesting the typed model follows. The
+/// outermost table is depth 0; a table nested at this depth or deeper is
+/// kept as an opaque passthrough block (`source_xml` preserved verbatim,
+/// `rows` empty) and reported through [`DocxWarning::TableNestingTooDeep`]
+/// instead of recursing. Each level costs one `parse_table_bytes_at` frame
+/// plus one copy of the remaining subtree, so the bound caps both stack
+/// depth and the O(depth × size) re-parse — Apache POI's
+/// `deep-table-cell.docx` (5000 levels, 1.2 MB) overflowed the native
+/// stack after ~15 s of CPU without it. Word itself tolerates only a
+/// handful of levels; 64 is far beyond any document authored by a human.
+pub const MAX_TABLE_NESTING_DEPTH: u32 = 64;
 
 /// Issue #84 — the grab-bag slot an unmodeled child of `parent`
 /// (`w:tblPr` / `w:trPr` / `w:tcPr`) belongs to. `None` when the row /
@@ -49,10 +63,39 @@ fn bag_for<'a>(
 /// `ns` is the enclosing part's root namespace scope (issue #84): the
 /// slice has no root of its own, so foreign-prefixed grab-bag fragments
 /// re-bind from the part that contained the table.
+///
+/// Non-fatal degradations (the [`MAX_TABLE_NESTING_DEPTH`] cap) are
+/// discarded here; [`parse_table_bytes_with_warnings`] surfaces them.
 pub fn parse_table_bytes(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
     ns: &NamespaceScope,
+) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
+    let mut warnings = Vec::new();
+    parse_table_bytes_at(xml, resolver, ns, 0, &mut warnings)
+}
+
+/// [`parse_table_bytes`], appending every non-fatal reader diagnostic to
+/// `warnings`.
+pub fn parse_table_bytes_with_warnings(
+    xml: &[u8],
+    resolver: &crate::style_resolver::StyleResolver<'_>,
+    ns: &NamespaceScope,
+    warnings: &mut Vec<DocxWarning>,
+) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
+    parse_table_bytes_at(xml, resolver, ns, 0, warnings)
+}
+
+/// The recursive worker behind [`parse_table_bytes`]. `depth` is this
+/// table's nesting level (outermost = 0); nested tables recurse at
+/// `depth + 1` until [`MAX_TABLE_NESTING_DEPTH`], where the walk stops
+/// and preserves the subtree opaquely.
+fn parse_table_bytes_at(
+    xml: &[u8],
+    resolver: &crate::style_resolver::StyleResolver<'_>,
+    ns: &NamespaceScope,
+    depth: u32,
+    warnings: &mut Vec<DocxWarning>,
 ) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
@@ -178,9 +221,27 @@ pub fn parse_table_bytes(
                             && let Some(cell) = cur_cell.as_mut()
                         {
                             let end = reader.buffer_position() as usize;
-                            if start < end && end <= xml.len() {
-                                let raw = xml[start..end].to_vec();
-                                if let Ok((g, p, r)) = parse_table_bytes(&raw, resolver, ns) {
+                            if let Some(raw) = slice_element(xml, start, end, b"w:tbl") {
+                                if depth + 1 >= MAX_TABLE_NESTING_DEPTH {
+                                    /* Issue #111 — Tier-3 opaque preservation.
+                                    The subtree's bytes ride the passthrough
+                                    (this table's `source_xml` and the
+                                    enclosing ones' already contain them), so
+                                    a resave is lossless; only the typed rows
+                                    stop here. Never recurse past the cap. */
+                                    warnings.push(DocxWarning::TableNestingTooDeep {
+                                        limit: MAX_TABLE_NESTING_DEPTH,
+                                    });
+                                    cell.blocks.push(Block::Table(Table {
+                                        grid: Vec::new(),
+                                        props: TableProperties::default(),
+                                        rows: Vec::new(),
+                                        dirty: false,
+                                        source_xml: Some(raw),
+                                    }));
+                                } else if let Ok((g, p, r)) =
+                                    parse_table_bytes_at(&raw, resolver, ns, depth + 1, warnings)
+                                {
                                     cell.blocks.push(Block::Table(Table {
                                         grid: g,
                                         props: p,
@@ -214,8 +275,7 @@ pub fn parse_table_bytes(
                     {
                         let p_end = reader.buffer_position() as usize;
                         let start = p_start_byte.take().unwrap();
-                        if start < p_end && p_end <= xml.len() {
-                            let raw = xml[start..p_end].to_vec();
+                        if let Some(raw) = slice_element(xml, start, p_end, b"w:p") {
                             if let Some(cell) = cur_cell.as_mut() {
                                 /* Phase 5 PR 2 — cell paragraphs are
                                 parsed via the existing single-paragraph
@@ -829,6 +889,108 @@ mod tests {
             para.direct_overrides.grab_bag, para.props.grab_bag,
             "bag rides direct_overrides for style re-application"
         );
+    }
+
+    /// Build a `<w:tbl>` nested `depth` levels deep (one row, one cell,
+    /// one paragraph, one nested table per level).
+    fn nested_table_xml(depth: usize) -> Vec<u8> {
+        let mut out = String::from(
+            r#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        );
+        for level in 0..depth {
+            if level > 0 {
+                out.push_str("<w:tbl>");
+            }
+            out.push_str(r#"<w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc>"#);
+            out.push_str(&format!("<w:p><w:r><w:t>level {level}</w:t></w:r></w:p>"));
+        }
+        for _ in 0..depth {
+            out.push_str("</w:tc></w:tr></w:tbl>");
+        }
+        out.into_bytes()
+    }
+
+    /// Walk the single-cell chain: `(typed levels, innermost table)` where
+    /// the innermost is the first opaque (row-less) nested table, if any.
+    fn typed_chain(rows: &[TableRow]) -> (u32, Option<Table>) {
+        let mut levels = 1;
+        let mut cur = rows;
+        loop {
+            let nested = cur
+                .first()
+                .and_then(|r| r.cells.first())
+                .and_then(|c| c.blocks.iter().find_map(Block::as_table));
+            match nested {
+                Some(t) if t.rows.is_empty() => return (levels, Some(t.clone())),
+                Some(t) => {
+                    levels += 1;
+                    cur = &t.rows;
+                }
+                None => return (levels, None),
+            }
+        }
+    }
+
+    /// Issue #111 — Apache POI's `deep-table-cell.docx` nests 5000 tables.
+    /// Unbounded recursion (one `parse_table_bytes` frame + one copy of the
+    /// remaining subtree per level) overflowed the native stack after
+    /// O(depth × size) work. The parser must terminate on a bounded stack:
+    /// the typed model stops at `MAX_TABLE_NESTING_DEPTH`, the remaining
+    /// subtree is preserved opaquely, and exactly one warning reports it.
+    #[test]
+    fn deep_nesting_does_not_overflow_the_stack() {
+        let xml = nested_table_xml(5000);
+        let mut warnings = Vec::new();
+        let (_, _, rows) = parse_table_bytes_with_warnings(
+            &xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+            &mut warnings,
+        )
+        .expect("parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            warnings,
+            vec![DocxWarning::TableNestingTooDeep {
+                limit: MAX_TABLE_NESTING_DEPTH
+            }]
+        );
+        let (levels, opaque) = typed_chain(&rows);
+        assert_eq!(
+            levels, MAX_TABLE_NESTING_DEPTH,
+            "typed rows stop at the cap"
+        );
+        let opaque = opaque.expect("the capped subtree is an opaque table block");
+        let raw = opaque
+            .source_xml
+            .as_deref()
+            .expect("source bytes preserved");
+        assert!(raw.starts_with(b"<w:tbl>"));
+        assert!(raw.ends_with(b"</w:tbl>"));
+        assert!(
+            raw.windows(b"level 4999".len()).any(|w| w == b"level 4999"),
+            "the innermost level must survive inside the opaque bytes"
+        );
+    }
+
+    /// A document that stays under the cap parses every level and emits
+    /// no warning — the bound must not change ordinary behaviour.
+    #[test]
+    fn nesting_under_the_cap_is_fully_typed_without_warnings() {
+        let depth = MAX_TABLE_NESTING_DEPTH as usize;
+        let xml = nested_table_xml(depth);
+        let mut warnings = Vec::new();
+        let (_, _, rows) = parse_table_bytes_with_warnings(
+            &xml,
+            &StyleResolver::new(&empty_resolver()),
+            &NamespaceScope::default(),
+            &mut warnings,
+        )
+        .expect("parse");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (levels, opaque) = typed_chain(&rows);
+        assert_eq!(levels, MAX_TABLE_NESTING_DEPTH);
+        assert!(opaque.is_none());
     }
 
     #[test]
