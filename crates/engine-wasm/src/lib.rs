@@ -517,6 +517,43 @@ enum StoryTarget {
         section_block: u32,
         role: engine::HeaderFooterRole,
     },
+    /// Issue #80 — a footnote / endnote story. Selection paths are
+    /// story-rooted (`Block(i)` = the note body's i-th block); geometry
+    /// comes from every band entry the paginator emitted for the note
+    /// (a split note spans pages). Entered by clicking into a note band
+    /// or by `InsertFootnote` / `InsertEndnote`; left with
+    /// `ExitHeaderFooter`.
+    Note {
+        kind: engine::NoteKind,
+        /// The story's OOXML `w:id` (key into the engine's story map).
+        id: i32,
+        /// Anchor page (0-based): where the note was entered.
+        page: u32,
+        /// Top-level block of the body paragraph carrying the reference
+        /// (section-scoped reads resolve the section through it).
+        section_block: u32,
+    },
+}
+
+/// Issue #80 — which part a story transaction writes back to. Header /
+/// footer parts and note stories share one merge path
+/// (`commit_story_edit`, `story_mutate`).
+enum StoryPart {
+    Header(String),
+    Footer(String),
+    Note(engine::NoteKind, i32),
+}
+
+impl StoryPart {
+    /// The real tree with `blocks` written into this part (dirty for the
+    /// writer; stray section markers stripped).
+    fn write_blocks(&self, real: &DocumentTree, blocks: Vec<engine::Block>) -> DocumentTree {
+        match self {
+            StoryPart::Header(rid) => real.with_updated_header_part(rid, blocks),
+            StoryPart::Footer(rid) => real.with_updated_footer_part(rid, blocks),
+            StoryPart::Note(kind, id) => real.with_updated_note_story(*kind, *id, blocks),
+        }
+    }
 }
 
 /// One laid-out line flattened for pointer hit-testing and caret/selection
@@ -5053,9 +5090,17 @@ impl Engine {
                 None
             }
             _ => Some(Event::Error {
-                message: "This action isn't available while editing a header or footer \
-                          — exit the header/footer first."
-                    .into(),
+                message: match &self.active_story {
+                    StoryTarget::Note { .. } => {
+                        "This action isn't available while editing a footnote or endnote \
+                         — click back into the document body first."
+                    }
+                    _ => {
+                        "This action isn't available while editing a header or footer \
+                         — exit the header/footer first."
+                    }
+                }
+                .into(),
             }),
         }
     }
@@ -5315,6 +5360,8 @@ impl Engine {
             Command::SetTitlePage { enabled } => self.do_set_title_page(enabled),
             Command::SetEvenOddHeaders { enabled } => self.do_set_even_odd_headers(enabled),
             Command::InsertField { at, kind } => self.do_insert_field(at, kind),
+            Command::InsertFootnote { at } => self.do_insert_note(at, engine::NoteKind::Footnote),
+            Command::InsertEndnote { at } => self.do_insert_note(at, engine::NoteKind::Endnote),
             Command::SetRenderDate { year, month, day } => {
                 self.render_date = Some((year, month, day));
                 self.invalidate_layout_snapshot();
@@ -5682,6 +5729,22 @@ impl Engine {
         tree) then re-run the SAME resolution enter used. */
         let (is_header, section_block, role) = match &self.active_story {
             StoryTarget::Body => return,
+            StoryTarget::Note { .. } => {
+                /* Issue #80 — the note either still exists (clamp the
+                selection to its body) or was undone away (exit). */
+                if self.story_blocks().is_none() {
+                    self.exit_story_to_body();
+                } else if let Some(sel) = self.selection.clone() {
+                    let clamped = self.with_selection_doc(|d| SelectionState {
+                        anchor: clamp_pos(d, sel.anchor),
+                        caret: clamp_pos(d, sel.caret),
+                        ideal_x: None,
+                        kind: sel.kind,
+                    });
+                    self.selection = Some(clamped);
+                }
+                return;
+            }
             StoryTarget::Header {
                 section_block,
                 role,
@@ -5703,14 +5766,14 @@ impl Engine {
                     StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                         rid != &resolved
                     }
-                    StoryTarget::Body => false,
+                    StoryTarget::Body | StoryTarget::Note { .. } => false,
                 };
                 if stale {
                     match &mut self.active_story {
                         StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                             *rid = resolved;
                         }
-                        StoryTarget::Body => {}
+                        StoryTarget::Body | StoryTarget::Note { .. } => {}
                     }
                 }
                 if self.story_blocks().is_none() {
@@ -6284,7 +6347,9 @@ impl Engine {
         let story_comp: Option<(&str, bool)> = match &self.active_story {
             StoryTarget::Header { rid, .. } => Some((rid.as_str(), true)),
             StoryTarget::Footer { rid, .. } => Some((rid.as_str(), false)),
-            StoryTarget::Body => None,
+            /* Issue #80 — no inline IME preview inside a note body yet
+            (the commit path is story-aware; the preview is a follow-up). */
+            StoryTarget::Body | StoryTarget::Note { .. } => None,
         };
         'outer: for (sect_idx, section) in sections.iter().enumerate() {
             let geom = scaled_paginator_geometry(section.geometry, scale);
@@ -6676,7 +6741,7 @@ impl Engine {
         let story_skip: Option<(u32, bool)> = match &self.active_story {
             StoryTarget::Header { page, .. } => Some((*page, true)),
             StoryTarget::Footer { page, .. } => Some((*page, false)),
-            StoryTarget::Body => None,
+            StoryTarget::Body | StoryTarget::Note { .. } => None,
         };
         reshape_resolved_fields(
             &mut emitted_pages,
@@ -7302,6 +7367,9 @@ impl Engine {
             StoryTarget::Body => None,
             StoryTarget::Header { rid, .. } => doc.headers.get(rid).cloned(),
             StoryTarget::Footer { rid, .. } => doc.footers.get(rid).cloned(),
+            StoryTarget::Note { kind, id, .. } => {
+                doc.note_stories(*kind).get(id).map(|s| s.body.clone())
+            }
         }
     }
 
@@ -7347,6 +7415,26 @@ impl Engine {
     fn bridge_story_ref(&self) -> Option<bridge::BridgeStoryRef> {
         let (area, rid, page, section_block, role) = match &self.active_story {
             StoryTarget::Body => return None,
+            /* Issue #80 — a note story: `rid` carries the note id, the
+            slot fields take their defaults (no inheritance for notes). */
+            StoryTarget::Note {
+                kind,
+                id,
+                page,
+                section_block,
+            } => {
+                return Some(bridge::BridgeStoryRef {
+                    area: match kind {
+                        engine::NoteKind::Footnote => bridge::HeaderFooterArea::Footnote,
+                        engine::NoteKind::Endnote => bridge::HeaderFooterArea::Endnote,
+                    },
+                    rid: id.to_string(),
+                    page: *page,
+                    role: bridge::BridgeHfRole::Default,
+                    linked: false,
+                    section_index: self.section_index_of_block(*section_block) as u32,
+                });
+            }
             StoryTarget::Header {
                 rid,
                 page,
@@ -7473,6 +7561,7 @@ impl Engine {
         match &self.active_story {
             StoryTarget::Header { page, .. } => return self.story_geometry(*page, true),
             StoryTarget::Footer { page, .. } => return self.story_geometry(*page, false),
+            StoryTarget::Note { kind, id, .. } => return self.note_geometry(*kind, *id),
             StoryTarget::Body => {}
         }
         /* `false` — hit-test + caret geometry run on committed document
@@ -7725,6 +7814,13 @@ impl Engine {
     /// keystroke that enters the serialized queue after the click is
     /// guaranteed to execute against the just-clicked caret.
     fn do_place_caret_at_point(&mut self, page_idx: u32, at: BridgePoint) -> Event {
+        /* Issue #80 — a press inside a note band switches the story
+        (Word: the footnote area is just another place the caret can
+        go); a press in the body while a note is open returns to the
+        body. Header/footer stories keep their own zone protocol. */
+        if let Err(e) = self.route_note_click(page_idx, at) {
+            return *e;
+        }
         let pos = match self.do_hit_test_in_page(page_idx, at) {
             Event::HitResult { pos } => pos,
             other => return other,
@@ -8431,7 +8527,8 @@ impl Engine {
         EnterHeaderFooter time. */
         let top_idx = match &self.active_story {
             StoryTarget::Header { section_block, .. }
-            | StoryTarget::Footer { section_block, .. } => *section_block,
+            | StoryTarget::Footer { section_block, .. }
+            | StoryTarget::Note { section_block, .. } => *section_block,
             StoryTarget::Body => match path.steps.first()? {
                 BridgePathStep::Block { idx } => *idx,
                 BridgePathStep::Cell { .. } => return None,
@@ -8840,9 +8937,10 @@ impl Engine {
     /// Issue #72 — blocks travel whole: a table inserted in the story
     /// tree lands in the part instead of being silently dropped.
     fn commit_story_edit(&mut self, mutated: &DocumentTree, caret: BridgeLogicalPos) -> Event {
-        let (rid, is_header) = match &self.active_story {
-            StoryTarget::Header { rid, .. } => (rid.clone(), true),
-            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+        let target = match &self.active_story {
+            StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
+            StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
+            StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
             StoryTarget::Body => {
                 return Event::Error {
                     message: "commit_story_edit outside a story".into(),
@@ -8858,11 +8956,7 @@ impl Engine {
         let real = self.undo.current();
         /* `with_updated_*_part` strips any stray `section_end` marker —
         a part can never masquerade as a section-boundary carrier. */
-        let new_real = if is_header {
-            real.with_updated_header_part(&rid, blocks)
-        } else {
-            real.with_updated_footer_part(&rid, blocks)
-        };
+        let new_real = target.write_blocks(real, blocks);
         self.undo.push(new_real);
         let caret = self.with_selection_doc(|d| clamp_pos(d, caret));
         self.caret_affinity = CaretAffinity::default();
@@ -9019,9 +9113,10 @@ impl Engine {
         );
         /* Keep the selection (a formatting change should not collapse
         it) — commit manually rather than through commit_story_edit. */
-        let (rid, is_header) = match &self.active_story {
-            StoryTarget::Header { rid, .. } => (rid.clone(), true),
-            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+        let target = match &self.active_story {
+            StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
+            StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
+            StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
             StoryTarget::Body => unreachable!("guarded by caller"),
         };
         let mut blocks: Vec<engine::Block> = new_doc.blocks.iter().cloned().collect();
@@ -9029,11 +9124,7 @@ impl Engine {
             blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
         }
         let real = self.undo.current();
-        let new_real = if is_header {
-            real.with_updated_header_part(&rid, blocks)
-        } else {
-            real.with_updated_footer_part(&rid, blocks)
-        };
+        let new_real = target.write_blocks(real, blocks);
         self.undo.push(new_real);
         self.selection = Some(SelectionState {
             anchor: start,
@@ -9076,6 +9167,292 @@ impl Engine {
     /// past materialize-on-enter). Drop back to body editing.
     fn story_vanished(&mut self) -> Event {
         self.exit_story_to_body();
+        self.selection_changed()
+    }
+
+    /// Issue #80 — the paginator's band entries for note `(kind, id)` on
+    /// every laid-out page, flattened into story-rooted line geometry:
+    /// entry block `j` is story block `first_block_index + j`, so a note
+    /// cut across pages hit-tests both fragments against the same body
+    /// (like a split body paragraph). Blocks past the story's own length
+    /// (the appended continuation notice) are not caret targets.
+    fn note_geometry(&self, kind: engine::NoteKind, id: i32) -> Result<Vec<LineGeom>, Box<Event>> {
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        let story_len = self
+            .undo
+            .current()
+            .note_stories(kind)
+            .get(&id)
+            .map_or(0, |s| s.body.len() as u32);
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell
+            .as_ref()
+            .expect("ensure_layout_snapshot populated the memo");
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let mut geom: Vec<LineGeom> = Vec::new();
+        let mut page_top = 0.0_f32;
+        for page in &snap.pages {
+            let content_x = page.margins.left;
+            let content_w = page.size.width - page.margins.left - page.margins.right;
+            for band in [&page.footnotes, &page.endnotes] {
+                for entry in &band.entries {
+                    if entry.kind != kind || i32::try_from(entry.id) != Ok(id) {
+                        continue;
+                    }
+                    let entry_top = page_top + band.y + entry.origin.y;
+                    let entry_x = content_x + entry.origin.x;
+                    for (j, block) in entry.blocks.iter().enumerate() {
+                        let idx = entry.first_block_index + j as u32;
+                        if idx >= story_len {
+                            break;
+                        }
+                        match block {
+                            LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
+                                para_box,
+                                entry_x,
+                                entry_top,
+                                entry_x,
+                                content_w,
+                                &BridgeBlockPath {
+                                    steps: vec![BridgePathStep::Block { idx }],
+                                },
+                                &mut geom,
+                            ),
+                            LayoutBlock::Table(table_box) => collect_table_line_geom(
+                                table_box,
+                                idx,
+                                entry_x + table_box.origin.x,
+                                entry_top + table_box.origin.y,
+                                &mut geom,
+                            ),
+                        }
+                    }
+                }
+            }
+            page_top += page.size.height + gap;
+        }
+        Ok(geom)
+    }
+
+    /// Issue #80 — the note band entry under a PAGE-LOCAL device-px
+    /// point on page `page_idx`, if any.
+    fn note_entry_at(&self, page_idx: u32, at: BridgePoint) -> Option<engine::NoteAnchor> {
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell.as_ref()?;
+        let page = snap.pages.get(page_idx as usize)?;
+        let content_x = page.margins.left;
+        let content_w = page.size.width - page.margins.left - page.margins.right;
+        for band in [&page.footnotes, &page.endnotes] {
+            for entry in &band.entries {
+                let x0 = content_x + entry.origin.x;
+                let y0 = band.y + entry.origin.y;
+                let y1 = y0 + entry.content_height();
+                if at.x >= x0 && at.x <= x0 + content_w && at.y >= y0 && at.y <= y1 {
+                    return Some(engine::NoteAnchor {
+                        kind: entry.kind,
+                        id: entry.id,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Issue #80 — story routing for a pointer press: enter the note
+    /// under the point (from the body or from another note), or leave a
+    /// note when the press lands outside every band. Header/footer
+    /// stories are untouched (their zone protocol lives in the shell).
+    fn route_note_click(&mut self, page_idx: u32, at: BridgePoint) -> Result<(), Box<Event>> {
+        if matches!(
+            self.active_story,
+            StoryTarget::Header { .. } | StoryTarget::Footer { .. }
+        ) {
+            return Ok(());
+        }
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        match self.note_entry_at(page_idx, at) {
+            Some(anchor) => {
+                let already = matches!(
+                    &self.active_story,
+                    StoryTarget::Note { kind, id, .. }
+                        if *kind == anchor.kind && i32::try_from(anchor.id) == Ok(*id)
+                );
+                if !already {
+                    let section_block = self.note_reference_block(anchor);
+                    self.enter_note_story(anchor, page_idx, section_block);
+                }
+            }
+            None => {
+                if matches!(self.active_story, StoryTarget::Note { .. }) {
+                    self.exit_story_to_body();
+                    self.announce(AnnouncementPriority::Polite, "Returned to document body");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Issue #80 — the top-level body block carrying the first reference
+    /// to `anchor` (0 for a dangling note).
+    fn note_reference_block(&self, anchor: engine::NoteAnchor) -> u32 {
+        self.undo
+            .current()
+            .note_references()
+            .iter()
+            .find(|r| r.anchor == anchor)
+            .map_or(0, |r| r.top_block)
+    }
+
+    /// Issue #80 — switch the caret into note `anchor`: stash the body
+    /// selection (when coming from the body), re-root the selection at
+    /// the note's first paragraph just past the self-mark (and its
+    /// following space, Word's caret home), announce.
+    fn enter_note_story(&mut self, anchor: engine::NoteAnchor, page: u32, section_block: u32) {
+        if !self.story_active() {
+            self.stashed_body_selection = self.selection.clone();
+        }
+        self.active_story = StoryTarget::Note {
+            kind: anchor.kind,
+            id: anchor.id as i32,
+            page,
+            section_block,
+        };
+        let home = self
+            .story_doc()
+            .as_ref()
+            .and_then(|d| {
+                let path = d.path_to_first_paragraph_deep()?;
+                let para = d.paragraph_at_path(&path)?;
+                let mut offset = 0u32;
+                if para.inline_objects.first().is_some_and(|o| {
+                    o.at == 0 && matches!(o.kind, engine::InlineKind::NoteSelfRef { .. })
+                }) {
+                    offset = '\u{FFFC}'.len_utf8() as u32;
+                    if para.text[offset as usize..].starts_with(' ') {
+                        offset += 1;
+                    }
+                }
+                Some(BridgeLogicalPos {
+                    path: engine_to_bridge_path(path),
+                    offset,
+                })
+            })
+            .unwrap_or_else(|| bpos_top(0, 0));
+        self.selection = Some(SelectionState {
+            anchor: home.clone(),
+            caret: home,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.caret_affinity = CaretAffinity::default();
+        self.pending_format = None;
+        let marker = self
+            .undo
+            .current()
+            .note_markers()
+            .get(&anchor)
+            .cloned()
+            .unwrap_or_else(|| anchor.id.to_string());
+        let what = match anchor.kind {
+            engine::NoteKind::Footnote => "footnote",
+            engine::NoteKind::Endnote => "endnote",
+        };
+        self.announce(
+            AnnouncementPriority::Polite,
+            format!("Editing {what} {marker}"),
+        );
+    }
+
+    /// Issue #80 — 0-based index of the laid-out page whose vertical
+    /// span (page + inter-page gap) contains document-absolute `y`.
+    fn page_index_at_y(&self, y: f32) -> u32 {
+        let snap_cell = self.layout_snapshot.borrow();
+        let Some(snap) = snap_cell.as_ref() else {
+            return 0;
+        };
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let mut top = 0.0_f32;
+        for (i, page) in snap.pages.iter().enumerate() {
+            let bottom = top + page.size.height + gap;
+            if y < bottom {
+                return i as u32;
+            }
+            top = bottom;
+        }
+        snap.pages.len().saturating_sub(1) as u32
+    }
+
+    /// `Command::InsertFootnote` / `Command::InsertEndnote` (issue #80)
+    /// — splice a reference at `at`, mint the story, then enter it so
+    /// typing lands in the note. One undo step (the insert); entering
+    /// is caret state. Body paragraphs only — the story gate rejects a
+    /// story caret, table cells are a follow-up (notes inside tables).
+    fn do_insert_note(&mut self, at: BridgeLogicalPos, kind: engine::NoteKind) -> Event {
+        let what = match kind {
+            engine::NoteKind::Footnote => "footnote",
+            engine::NoteKind::Endnote => "endnote",
+        };
+        if self.story_active() {
+            return Event::Error {
+                message: format!(
+                    "Insert {what}: notes can only be inserted from the document body"
+                ),
+            };
+        }
+        if at.path.steps.len() != 1 {
+            return Event::Error {
+                message: format!("Insert {what}: notes inside table cells aren't supported yet"),
+            };
+        }
+        let pos = to_engine_pos(at.clone());
+        let doc = self.undo.current();
+        if doc.paragraph_at_path(&pos.path).is_none() {
+            return Event::Error {
+                message: format!("Insert {what}: the caret does not address a paragraph"),
+            };
+        }
+        let (new_doc, id) = doc.insert_note_at(pos, kind);
+        self.undo.push(new_doc);
+        self.invalidate_layout_snapshot();
+        /* The body caret lands right after the new reference so exiting
+        the note returns there. */
+        let caret = BridgeLogicalPos {
+            path: at.path.clone(),
+            offset: at.offset + '\u{FFFC}'.len_utf8() as u32,
+        };
+        let caret = clamp_pos(self.undo.current(), caret);
+        self.caret_affinity = CaretAffinity::default();
+        self.pending_format = None;
+        self.selection = Some(SelectionState {
+            anchor: caret.clone(),
+            caret: caret.clone(),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        /* Anchor page = the page the reference line landed on. */
+        let page = match self.document_geometry() {
+            Ok(geom) => geom
+                .iter()
+                .find(|l| {
+                    l.path == caret.path
+                        && l.start_byte <= caret.offset
+                        && caret.offset <= l.end_byte
+                })
+                .map_or(0, |l| self.page_index_at_y(l.y_top)),
+            Err(e) => return *e,
+        };
+        let section_block = match at.path.steps.first() {
+            Some(BridgePathStep::Block { idx }) => *idx,
+            _ => 0,
+        };
+        let anchor = engine::NoteAnchor { kind, id };
+        self.enter_note_story(anchor, page, section_block);
         self.selection_changed()
     }
 
@@ -9170,6 +9547,16 @@ impl Engine {
     ///   content on a structurally unrelated section and mismatched
     ///   Word's titlePg materialization), as ONE undo entry.
     fn do_enter_header_footer(&mut self, page: u32, area: bridge::HeaderFooterArea) -> Event {
+        if matches!(
+            area,
+            bridge::HeaderFooterArea::Footnote | bridge::HeaderFooterArea::Endnote
+        ) {
+            return Event::Error {
+                message: "EnterHeaderFooter: notes are entered by clicking into the note \
+                          or with InsertFootnote / InsertEndnote, not by page zone"
+                    .into(),
+            };
+        }
         let is_header = matches!(area, bridge::HeaderFooterArea::Header);
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
         if let Err(e) = self.ensure_layout_snapshot(self.scale(), false, target_y) {
@@ -9217,7 +9604,12 @@ impl Engine {
                 new_rid
             }
         };
-        self.stashed_body_selection = self.selection.clone();
+        /* The BODY selection is what exit restores: switching from one
+        story to another (band → band, note → band) keeps the original
+        stash instead of overwriting it with a story-rooted path. */
+        if !self.story_active() {
+            self.stashed_body_selection = self.selection.clone();
+        }
         self.active_story = if is_header {
             StoryTarget::Header {
                 rid,
@@ -9283,7 +9675,7 @@ impl Engine {
     /// Previous" toggle for the active story's (section, area, role).
     fn do_set_header_footer_link(&mut self, linked: bool) -> Event {
         let (is_header, page, section_block, role, cur_rid) = match &self.active_story {
-            StoryTarget::Body => {
+            StoryTarget::Body | StoryTarget::Note { .. } => {
                 return Event::Error {
                     message: "SetHeaderFooterLink: no header or footer is being edited".into(),
                 };
@@ -9337,7 +9729,7 @@ impl Engine {
                 StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                     *rid = new_rid;
                 }
-                StoryTarget::Body => {}
+                StoryTarget::Body | StoryTarget::Note { .. } => {}
             }
             self.dirty.invalidate(full_page_rect(self.scale()));
             self.announce(
@@ -9362,7 +9754,7 @@ impl Engine {
                         StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                             *rid = resolved;
                         }
-                        StoryTarget::Body => {}
+                        StoryTarget::Body | StoryTarget::Note { .. } => {}
                     }
                     /* The inherited part may be shorter — clamp. */
                     if let Some(sel) = self.selection.clone() {
@@ -9462,6 +9854,9 @@ impl Engine {
                 *section_block,
                 Some((*page, bridge::HeaderFooterArea::Footer)),
             ),
+            /* Issue #80 — a note story anchors the toggle to the
+            reference's section but never re-anchors (no band slot). */
+            StoryTarget::Note { section_block, .. } => (*section_block, None),
             StoryTarget::Body => {
                 let block = self
                     .selection
@@ -9529,9 +9924,10 @@ impl Engine {
         caret: BridgeLogicalPos,
         preserve_selection: bool,
     ) -> Event {
-        let (rid, is_header) = match &self.active_story {
-            StoryTarget::Header { rid, .. } => (rid.clone(), true),
-            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+        let target = match &self.active_story {
+            StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
+            StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
+            StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
             StoryTarget::Body => {
                 return Event::Error {
                     message: "story_mutate outside a story".into(),
@@ -9547,11 +9943,7 @@ impl Engine {
             blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
         }
         let real = self.undo.current();
-        let mut new_real = if is_header {
-            real.with_updated_header_part(&rid, blocks)
-        } else {
-            real.with_updated_footer_part(&rid, blocks)
-        };
+        let mut new_real = target.write_blocks(real, blocks);
         /* Carry back doc-wide resources the mutation may have touched.
         numbering: ToggleList mints num ids on the story tree's CLONE —
         losing them dangles every new list_item (#72's documented
@@ -14002,6 +14394,191 @@ mod tests {
             before + 1,
             "an interactive edit must push exactly one new snapshot"
         );
+    }
+
+    /* ================================================================
+    Issue #80 — note stories: insert, enter, edit, exit, undo guard.
+    ================================================================ */
+
+    fn note_story_text(engine: &Engine, kind: engine::NoteKind, id: i32) -> String {
+        engine
+            .undo
+            .current()
+            .note_stories(kind)
+            .get(&id)
+            .and_then(|s| s.body.first())
+            .and_then(engine::Block::as_paragraph)
+            .map(|p| p.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// `InsertFootnote` splices the reference, mints story 1 and ENTERS
+    /// it; typing lands in the note (not the body); `ExitHeaderFooter`
+    /// returns to the body right after the reference; the marker of a
+    /// second, earlier footnote renumbers the first.
+    #[test]
+    fn insert_footnote_enters_the_note_and_types_into_it() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let at = bpos_top(0, "Alpha".len() as u32);
+        let evt = engine.do_insert_note(at, engine::NoteKind::Footnote);
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        let story = editing_story.as_ref().expect("the note story is active");
+        assert_eq!(story.area, bridge::HeaderFooterArea::Footnote);
+        assert_eq!(story.rid, "1");
+        assert!(matches!(
+            engine.active_story,
+            StoryTarget::Note {
+                kind: engine::NoteKind::Footnote,
+                id: 1,
+                ..
+            }
+        ));
+        let body0 = engine.undo.current().paragraph_text(0).unwrap().to_string();
+        assert_eq!(body0, "Alpha\u{FFFC} body text", "reference anchor spliced");
+        /* Caret home: past the self-mark + its space. */
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret.offset, 4);
+        assert_eq!(
+            note_story_text(&engine, engine::NoteKind::Footnote, 1),
+            "\u{FFFC} "
+        );
+
+        let typed = engine.do_insert_text_interactive(caret, "note text".to_string());
+        assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+        assert_eq!(
+            note_story_text(&engine, engine::NoteKind::Footnote, 1),
+            "\u{FFFC} note text",
+            "typing lands in the note story"
+        );
+        assert_eq!(
+            engine.undo.current().paragraph_text(0).unwrap(),
+            "Alpha\u{FFFC} body text",
+            "the body is untouched"
+        );
+        assert!(
+            engine.undo.current().notes_dirty.footnotes,
+            "the part is dirty for the writer"
+        );
+        let geom = engine.document_geometry().expect("note geometry");
+        assert!(
+            !geom.is_empty(),
+            "the note body hit-tests through its band entry"
+        );
+
+        let exited = engine.do_exit_header_footer();
+        let Event::SelectionChanged { editing_story, .. } = &exited else {
+            panic!("{exited:?}");
+        };
+        assert!(editing_story.is_none());
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret.path.steps, vec![BridgePathStep::Block { idx: 0 }]);
+        assert_eq!(caret.offset, 8, "body caret sits right after the reference");
+
+        /* A second footnote EARLIER in the body renumbers the first. */
+        let evt = engine.do_insert_note(bpos_top(0, 0), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let markers = engine.undo.current().note_markers();
+        let m = |id: u32| {
+            markers[&engine::NoteAnchor {
+                kind: engine::NoteKind::Footnote,
+                id,
+            }]
+                .clone()
+        };
+        assert_eq!((m(2), m(1)), ("1".to_string(), "2".to_string()));
+    }
+
+    /// Undo past the insert removes the story; the validity guard exits
+    /// the note back to the body instead of writing into a ghost.
+    #[test]
+    fn undo_past_note_insert_exits_the_story() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Endnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        assert!(matches!(engine.active_story, StoryTarget::Note { .. }));
+        let evt = engine.do_undo();
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(
+            matches!(engine.active_story, StoryTarget::Body),
+            "the note vanished with the undo — back in the body"
+        );
+        assert_eq!(
+            engine.undo.current().paragraph_text(0).unwrap(),
+            "Alpha body text"
+        );
+        assert!(engine.undo.current().endnote_stories.is_empty());
+    }
+
+    /// Story gate: inserting a note from inside a note (or a header) is
+    /// rejected; the message names the note.
+    #[test]
+    fn notes_cannot_nest() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let gated = engine.story_gate(&Command::InsertFootnote { at: bpos_top(0, 0) });
+        let Some(Event::Error { message }) = gated else {
+            panic!("expected a gate rejection, got {gated:?}");
+        };
+        assert!(message.contains("footnote or endnote"), "{message}");
+        let direct = engine.do_insert_note(bpos_top(0, 0), engine::NoteKind::Endnote);
+        assert!(matches!(direct, Event::Error { .. }));
+    }
+
+    /// Clicking inside the footnote band enters that note; clicking the
+    /// body while a note is open returns to the body.
+    #[test]
+    fn clicking_a_note_band_switches_the_story_and_back() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        engine.do_exit_header_footer();
+        assert!(matches!(engine.active_story, StoryTarget::Body));
+        /* Locate the band entry on page 0 from the layout snapshot. */
+        let (band_y, entry_h, x) = {
+            let snap_cell = engine.layout_snapshot.borrow();
+            let snap = snap_cell.as_ref().expect("snapshot");
+            let page = &snap.pages[0];
+            let entry = page
+                .footnotes
+                .entries
+                .first()
+                .expect("the note is on page 1");
+            (
+                page.footnotes.y + entry.origin.y,
+                entry.content_height(),
+                page.margins.left + 5.0,
+            )
+        };
+        let in_band = BridgePoint {
+            x,
+            y: band_y + entry_h * 0.5,
+        };
+        let evt = engine.do_place_caret_at_point(0, in_band);
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert_eq!(
+            editing_story.as_ref().map(|s| s.area),
+            Some(bridge::HeaderFooterArea::Footnote),
+            "a press in the band enters the note"
+        );
+        /* Press on the body's first line → back to the body. */
+        let body_point = BridgePoint {
+            x,
+            y: engine.undo.current().body_section.geometry.margin_top * engine.scale() + 4.0,
+        };
+        let evt = engine.do_place_caret_at_point(0, body_point);
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert!(
+            editing_story.is_none(),
+            "a press in the body leaves the note"
+        );
+        assert!(matches!(engine.active_story, StoryTarget::Body));
     }
 
     /// Issue #44 — `image_geometry()` surfaces one rect per inline image,
