@@ -23,6 +23,21 @@ paths:
 - Match on `e.name().as_ref() == b"w:t"` (byte comparison, namespace prefix included).
 - Track `in_text_elt` flag; `Event::Text(t)` only counts inside a `<w:t>` element.
 - Close paragraph on `</w:p>`; emit `<w:p>` boundaries into the `DocumentTree`.
+- **Byte space (issue #110).** quick-xml strips a leading UTF-8 BOM from
+  its input but does **not** count it in `buffer_position()`. Every
+  passthrough / grab-bag capture slices the raw part with reader offsets,
+  so a part parser must `strip_utf8_bom` first (`parts/document.rs`) —
+  never index the un-stripped bytes. Captures go through
+  `grab_bag::slice_element`, which refuses a range that does not start
+  with the expected start tag and end on `>` (regenerate beats splicing
+  a misaligned range). docx4j / Apache POI write BOM-prefixed parts.
+- **Nesting cap (issue #111).** `parts/table.rs` recurses one frame per
+  nested `<w:tbl>` and re-scans the remaining subtree at each level; the
+  walk stops at `MAX_TABLE_NESTING_DEPTH` (64), keeps the deeper subtree
+  as an opaque passthrough block, and reports
+  `DocxWarning::TableNestingTooDeep` on `DocxArchive::warnings`. Never add
+  an unbounded recursion over attacker-shaped input (POI ships a 5000-deep
+  17 KB file).
 
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:

@@ -278,6 +278,15 @@ pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: boo
         format_docx::write_docx(&archive_a, &archive_a.document)
     );
 
+    /* 4b. Issue #110 — strict well-formedness of the saved part, BEFORE
+    our own reader gets a say. A misaligned passthrough splice is
+    unparseable XML; it must surface as its own stage, never as a
+    downstream "read_docx_2" error or a byte-delta number. */
+    stage!(
+        "wellformed_noedit",
+        format_docx::check_document_xml_well_formed(&resaved_bytes)
+    );
+
     /* 5. read_docx again. */
     let archive_b: DocxArchive = stage!("read_docx_2", format_docx::read_docx(&resaved_bytes));
 
@@ -321,6 +330,11 @@ pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: boo
         let edited_bytes: Vec<u8> = stage!(
             "edit_write_docx",
             format_docx::write_docx(&archive_a, &edited_doc)
+        );
+        /* Issue #110 — same strict guard on the edited save. */
+        stage!(
+            "wellformed_edit",
+            format_docx::check_document_xml_well_formed(&edited_bytes)
         );
         if let (Ok(doc_xml_orig), Ok(doc_xml_edited)) =
             (extract_doc_xml(bytes), extract_doc_xml(&edited_bytes))

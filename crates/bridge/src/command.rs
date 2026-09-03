@@ -14,6 +14,7 @@ use crate::common::{
 /// `tsify-next` renders `Option<T>` as `T | undefined`; TS callers must pass
 /// `undefined`, never `null`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Command {
@@ -699,6 +700,7 @@ pub enum Command {
 /// cell. Phase 5 PR 3b: cell-level only; the `inside_*` edges apply
 /// only at table level and have no wire path yet.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct BridgeCellBorders {
     pub top: Option<BridgeBorderStroke>,
     pub left: Option<BridgeBorderStroke>,
@@ -710,6 +712,7 @@ pub struct BridgeCellBorders {
 /// is `<w:sz>` (eighths of a point, OOXML unit). `color: None` →
 /// inherit from style.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct BridgeBorderStroke {
     pub style: BridgeBorderStyle,
     pub size_eighth_pt: u16,
@@ -722,6 +725,7 @@ pub struct BridgeBorderStroke {
 /// Sprint 13 #12) that mints/reuses an idempotent `<w:abstractNum>` /
 /// `<w:num>` template.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum ListKind {
     #[default]
     Off,
@@ -735,6 +739,7 @@ pub enum ListKind {
 /// width > height. The handler swaps when needed and is a no-op
 /// when the page already matches.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum PageOrientation {
     #[default]
     Portrait,
@@ -748,6 +753,7 @@ pub enum PageOrientation {
 /// page (which PAGE fields count) when the incoming page's parity
 /// mismatches.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum SectionBreakKind {
     #[default]
     NextPage,
@@ -758,6 +764,7 @@ pub enum SectionBreakKind {
 
 /// Phase 3 (#39) — which margin band a header/footer command targets.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum HeaderFooterArea {
     #[default]
     Header,
@@ -770,6 +777,7 @@ pub enum HeaderFooterArea {
 /// that carry one), `Date` today's date per the shell-injected render
 /// date (`M/d/yyyy`, Word's en default).
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum FieldKind {
     #[default]
     Page,
@@ -781,6 +789,7 @@ pub enum FieldKind {
 /// entry. `position_pt` is layout pt (1/72 in) at scale=1 — the
 /// engine model unit. Kind mirrors `engine::TabKind`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct BridgeTabStop {
     pub position_pt: f32,
     pub kind: BridgeTabKind,
@@ -790,6 +799,7 @@ pub struct BridgeTabStop {
 /// round-tripped but renders as `Left` today (proper measure-then-
 /// place pass deferred — see BACKLOG / out-of-scope §11).
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum BridgeTabKind {
     #[default]
     Left,
@@ -809,6 +819,7 @@ pub enum BridgeTabKind {
 /// arriving as a negative `Number`. Tsify renders this enum as
 /// `"Before" | "After"`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum InsertSide {
     #[default]
     After,
@@ -818,6 +829,7 @@ pub enum InsertSide {
 /// Wire shape for `engine::BorderStyle`. PR 3b ships the common
 /// subset; round-tripped exotic styles stay engine-side.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum BridgeBorderStyle {
     #[default]
     Single,
@@ -829,6 +841,7 @@ pub enum BridgeBorderStyle {
 
 /// Browser/runtime capabilities advertised to the engine at `Init`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ClientCapabilities {
     pub shared_array_buffer: bool,
     pub offscreen_canvas: bool,
@@ -838,6 +851,7 @@ pub struct ClientCapabilities {
 
 /// Target PDF/A (or PDF/X) conformance level for `ExportPdf`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum PdfConformance {
     A1b,
     A2u,
@@ -850,6 +864,7 @@ pub enum PdfConformance {
 /// indents / shading); borders, tab stops and numbering stay
 /// per-paragraph concerns. `None` preserves the current value.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 pub struct BridgeParaPropertiesPatch {
     pub alignment: Option<Alignment>,
@@ -866,6 +881,7 @@ pub struct BridgeParaPropertiesPatch {
 /// Issue #21 — patch for a style's `<w:rPr>` half (engine `SpanStyle`
 /// mirror). `None` preserves.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 pub struct BridgeSpanStylePatch {
     pub bold: Option<bool>,
@@ -885,6 +901,7 @@ pub struct BridgeSpanStylePatch {
 /// because three states matter and `Option<Option<T>>` has no stable
 /// JSON encoding through tsify); both absent leaves the parent alone.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[tsify(into_wasm_abi, from_wasm_abi)]
 pub struct BridgeStyleProperties {
     pub para_props: Option<BridgeParaPropertiesPatch>,
@@ -896,6 +913,7 @@ pub struct BridgeStyleProperties {
 
 /// unchanged. The resolved counterpart is [`crate::TextAttrs`].
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct TextAttrsPatch {
     pub bold: Option<bool>,
     pub italic: Option<bool>,
@@ -918,12 +936,14 @@ pub struct TextAttrsPatch {
 
 /// Stable identifier for a paragraph in the document model.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ParagraphId {
     pub id: u32,
 }
 
 /// How an inserted image is sized relative to the content area.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum ImageFit {
     Original,
     FitWidth,
@@ -932,6 +952,7 @@ pub enum ImageFit {
 
 /// An encoded image payload plus its intrinsic dimensions.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ImageBlob {
     #[serde(with = "serde_bytes")]
     #[tsify(type = "Uint8Array")]
@@ -943,6 +964,7 @@ pub struct ImageBlob {
 
 /// Keyboard modifier accompanying a selection-extend gesture.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum SelectionModifier {
     None,
     Shift,
@@ -957,6 +979,7 @@ pub enum SelectionModifier {
 /// `NextCell` / `PrevCell` are the Phase 5 PR 4 cell-traversal motions
 /// — Tab / Shift+Tab inside a table. Outside a table they no-op.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum MoveDirection {
     /// Visual arrow keys. The engine maps these to logical byte motion
     /// using the caret's host paragraph base direction (UAX #9, see

@@ -2201,6 +2201,7 @@ pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
         other_entries,
         document: doc.clone(),
         document_root_attrs: Vec::new(),
+        warnings: Vec::new(),
     };
     write_docx(&archive, doc)
 }
@@ -3356,6 +3357,44 @@ mod tests {
         buf
     }
 
+    /// Issue #110 — a BOM-prefixed `word/document.xml` (docx4j / Apache
+    /// POI output) used to resave as unparseable XML: every passthrough
+    /// paragraph was captured three bytes early (`dy><w:p>…</w` instead of
+    /// `<w:p>…</w:p>`), so the writer spliced `</w<w:sectPr/>` /
+    /// `</wdy>` into the body. A zero-edit resave must re-read cleanly with
+    /// every paragraph's bytes intact.
+    #[test]
+    fn bom_prefixed_document_resaves_well_formed() {
+        let document_xml = concat!(
+            "\u{FEFF}",
+            r#"<?xml version="1.0" encoding="utf-8"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        let parsed = read_docx(&zip_minimal_docx(document_xml, None)).expect("read");
+        let resaved = write_docx(&parsed, &parsed.document).expect("write");
+        let reread = read_docx(&resaved).expect("a zero-edit resave must re-read");
+        assert_eq!(reread.document.paragraph_count(), 2);
+        assert_eq!(reread.document.paragraph_text(0), Some("first"));
+        assert_eq!(reread.document.paragraph_text(1), Some("second"));
+
+        let xml = {
+            let mut zip = zip::ZipArchive::new(Cursor::new(&resaved)).expect("zip");
+            let mut part = zip.by_name(DOC_XML).expect("document.xml");
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut part, &mut s).expect("utf-8");
+            s
+        };
+        assert!(
+            xml.contains("<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p><w:sectPr/></w:body>"),
+            "passthrough paragraphs must be spliced byte-exact: {xml}"
+        );
+        assert!(
+            !xml.contains('\u{FEFF}'),
+            "the writer synthesizes its own declaration — no BOM"
+        );
+    }
+
     const HYPERLINK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/>
@@ -3622,6 +3661,7 @@ mod tests {
             other_entries: Vec::new(),
             document: doc.clone(),
             document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let saved = write_docx(&archive, &doc).expect("write");
@@ -3672,6 +3712,7 @@ mod tests {
             other_entries: vec![(RELS_XML.to_string(), existing_rels.as_bytes().to_vec())],
             document: doc.clone(),
             document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let saved = write_docx(&archive, &doc).expect("write");
@@ -3797,6 +3838,7 @@ mod tests {
             other_entries: Vec::new(),
             document: doc.clone(),
             document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
         let saved = write_docx(&archive, &doc).expect("write");
         let reopened = read_docx(&saved).expect("reread");
@@ -5464,6 +5506,7 @@ mod tests {
             other_entries: other,
             document: doc.clone(),
             document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
         let bytes = write_docx(&archive, &doc).expect("initial write");
 
@@ -5708,6 +5751,7 @@ mod tests {
             other_entries: other,
             document: doc.clone(),
             document_root_attrs: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let bytes = write_docx(&archive, &doc).expect("resave");

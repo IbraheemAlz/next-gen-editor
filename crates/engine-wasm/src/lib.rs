@@ -11103,6 +11103,204 @@ impl Engine {
     }
 }
 
+/// Native testing/fuzzing entry points (D5.5, issue #90). Not part of the
+/// `#[wasm_bindgen]` RPC surface — `web_sys::OffscreenCanvas` and `JsValue`
+/// (via `serde_wasm_bindgen`) only function inside a browser's wasm32
+/// runtime, so a native `cargo fuzz` process has no way to call
+/// `Engine::new` or `Engine::dispatch` directly. This block gives
+/// `fuzz/fuzz_targets/rpc_command.rs` and `layout_paginate.rs` a plain-Rust
+/// path to the SAME production dispatcher (`apply`) the worker calls,
+/// including the auto-repaint → `build_pages` → `Paginator` →
+/// `layout_paragraph` pipeline — only the final `ctx.put_image_data` /
+/// `render_canvas2d` blit is unreachable outside a browser, and that piece
+/// is already skipped whenever `self.ctx` / `self.page_ctxs` are empty (see
+/// `render_document`'s per-page `let Some(ctx) = ... else { continue }`).
+/// Gated behind `fuzz-native` (off by default; never activated by
+/// `wasm-pack build`), so none of this reaches the production wasm bundle.
+#[cfg(feature = "fuzz-native")]
+impl Engine {
+    /// A canvas-less, pre-seeded engine. `web_sys::OffscreenCanvas` cannot
+    /// be constructed outside a browser, so this bypasses the
+    /// `#[wasm_bindgen(constructor)]` `Engine::new` entirely (`ctx: None`,
+    /// `page_ctxs: vec![]`, `vello: None`) and seeds `doc` as the initial
+    /// undo snapshot. Mirrors the shape of the crate's own native test
+    /// helper `test_engine_with_doc` (`mod tests`, below) — same bundled
+    /// `LiberationSans-Regular.ttf` real font (layout needs real glyph
+    /// metrics; a fake font would make every line-break / justify decision
+    /// meaningless) and a `layout_cfg` cached up front so layout runs from
+    /// the very first mutating command, no separate `LoadFont` +
+    /// `RenderPage` dance required in every corpus entry.
+    pub fn new_headless(doc: DocumentTree) -> Engine {
+        let bytes_font = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("fuzz-latin".to_string(), bytes_font)
+            .expect("bundled LiberationSans-Regular.ttf must parse");
+        let mut fonts: HashMap<String, Arc<LoadedFont>> = HashMap::new();
+        fonts.insert("fuzz-latin".to_string(), Arc::new(font));
+        let mut engine = assemble_engine(None, None);
+        engine.fonts = fonts;
+        engine.layout_cfg = Some(RenderConfig {
+            font_id: "fuzz-latin".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 16.0,
+            line_height: 26.0,
+            alignment: Alignment::Start,
+            scale: 1.0,
+            base_scale: 1.0,
+            zoom: 1.0,
+        });
+        engine.undo = UndoStack::new(doc, 100);
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        /* Non-empty so `current_review_date` never reaches `js_sys::Date`,
+        which panics on native targets outside a browser (mirrors the
+        crate's own `test_engine_with_doc` test helper, below). Does NOT
+        cover `do_insert_comment` / `do_reply_to_comment`, which call
+        `js_sys::Date::new_0()` directly rather than through
+        `current_review_date` — the fuzz generator excludes
+        `Command::InsertComment` / `Command::ReplyToComment` for exactly
+        this reason (D5.5, issue #90). */
+        engine.review_date = "2026-01-01T00:00:00Z".to_string();
+        engine
+    }
+
+    /// Drive one `Command` through the real production dispatcher
+    /// (`apply`) without a JS runtime. `apply` is declared `async` only
+    /// for the `dispatch` / wasm_bindgen boundary; auditing its body
+    /// (D5.5, issue #90) turned up no internal `.await` point, so this
+    /// polls the future once with a no-op waker instead of pulling in an
+    /// async executor dependency. Panics loudly if that assumption is
+    /// ever broken by a future change — a legitimate fuzz finding (a
+    /// command that suspends natively), not a bug in the harness.
+    pub fn apply_sync(&mut self, cmd: Command) -> Event {
+        block_on_ready(self.apply(cmd))
+    }
+
+    /// `true` when the live selection's anchor and caret both resolve to
+    /// a real position in the current document. `clamp_pos` (used by
+    /// `Command::SetSelection` itself) is idempotent on a valid position,
+    /// so "unchanged by clamping" is exactly the in-bounds check.
+    pub fn selection_is_valid(&self) -> bool {
+        match &self.selection {
+            None => true,
+            Some(sel) => {
+                let doc = self.undo.current();
+                clamp_pos(doc, sel.anchor.clone()) == sel.anchor
+                    && clamp_pos(doc, sel.caret.clone()) == sel.caret
+            }
+        }
+    }
+
+    /// Undo-stack depth — must never exceed the bound the stack was
+    /// constructed with (100, matching production — see `new_headless`).
+    pub fn undo_depth(&self) -> u32 {
+        self.undo.depth()
+    }
+
+    /// Run the real layout pipeline (`build_pages` → `Paginator` →
+    /// `layout_paragraph`) over the current document without requiring a
+    /// mutating command to trigger the auto-repaint path first. Used by
+    /// `layout_paginate` to drive arbitrary paragraph/table/section trees
+    /// "straight into the paginator". Mirrors `render_document`'s own
+    /// call to `ensure_layout_snapshot`.
+    pub fn ensure_layout_for_fuzzing(&mut self) -> Result<(), Box<Event>> {
+        let scale = self.scale();
+        self.ensure_layout_snapshot(scale, true, None)
+    }
+
+    /// Page count from the most recent layout snapshot; `0` before the
+    /// first `ensure_layout_for_fuzzing`. `layout_paginate` asserts this
+    /// stays under a fixed bound as its "layout terminates under a bound"
+    /// invariant (issue #90 acceptance) — a runaway paginator (e.g. an
+    /// off-by-one that never advances `cur_y`) shows up as a page count
+    /// blowing past anything a bounded random input should ever need,
+    /// which is cheaper and more deterministic than an in-process
+    /// wall-clock watchdog thread. Genuine infinite loops (one that never
+    /// returns to let us count pages at all) are still caught at the
+    /// process level by libFuzzer's own `-timeout=` flag in CI.
+    pub fn layout_page_count_for_fuzzing(&self) -> usize {
+        self.layout_snapshot
+            .borrow()
+            .as_ref()
+            .map_or(0, |s| s.pages.len())
+    }
+
+    /// Exercise the real, browser-free glyph rasterizer
+    /// (`render::atlas::GlyphAtlas::get_or_rasterize`, swash-backed) over
+    /// every glyph run in the most recent layout snapshot. This is
+    /// exactly what `render_canvas2d` does before its final
+    /// `ctx.put_image_data` blit — the blit is the only piece that
+    /// genuinely needs a browser `OffscreenCanvas`, so it is the only
+    /// piece skipped here. Returns the number of glyphs successfully
+    /// rasterized; `0` before the first layout has run (see
+    /// `ensure_layout_for_fuzzing`).
+    pub fn rasterize_last_layout_for_fuzzing(&mut self) -> usize {
+        let pages = match self.layout_snapshot.borrow().as_ref() {
+            Some(s) => s.pages.clone(),
+            None => return 0,
+        };
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let scene = render::scene::build_document_scene(&pages, gap);
+        let mut rasterized = 0usize;
+        for cmd in &scene.cmds {
+            let render::scene::DisplayCmd::DrawGlyphRun(run) = cmd else {
+                continue;
+            };
+            let Some(font) = self.fonts.get(&run.font) else {
+                continue;
+            };
+            for g in &run.glyphs {
+                let key = render::atlas::GlyphKey::new(
+                    run.font.clone(),
+                    g.glyph_id,
+                    run.px_size,
+                    run.faux_bold,
+                    run.faux_italic,
+                );
+                if self
+                    .atlas
+                    .get_or_rasterize(&key, font, run.px_size)
+                    .is_some()
+                {
+                    rasterized += 1;
+                }
+            }
+        }
+        rasterized
+    }
+}
+
+/// Poll `fut` once with a no-op waker and expect it to be immediately
+/// `Ready` — `Engine::apply` has no internal `.await` point (see
+/// `Engine::apply_sync`'s doc comment). Panics on `Pending` instead of
+/// silently blocking forever, since there is no reactor here to wake us.
+#[cfg(feature = "fuzz-native")]
+fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone_raw(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_raw, noop, noop, noop);
+    let raw = RawWaker::new(std::ptr::null(), &VTABLE);
+    // SAFETY: the vtable's clone/wake/wake_by_ref/drop are all no-ops over
+    // a null data pointer — there is nothing to (de)allocate or dereference.
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!(
+            "engine-wasm Engine::apply() suspended natively — the D5.5 fuzz \
+             harness (issue #90) assumed it never does; audit the new \
+             `.await` point before trusting `apply_sync` again"
+        ),
+    }
+}
+
 /// Bridge `BridgeCellBorders` → engine `CellBorders` (cell-level only;
 /// `inside_h` / `inside_v` are not exposed on the wire — they apply
 /// only at table level).
@@ -14750,6 +14948,67 @@ mod tests {
             panic!("expected Painted");
         };
         assert_eq!(replayed, layout_degraded);
+    }
+
+    /// D5.5 (issue #90) — the `fuzz-native` surface actually works end to
+    /// end: a headless engine drives real `Command`s through the real
+    /// `apply` dispatcher, runs the real layout pipeline, and the
+    /// invariant accessors read back sane values. This is a native
+    /// smoke test for `fuzz/fuzz_targets/rpc_command.rs` /
+    /// `layout_paginate.rs`, exercised here where `cargo test --workspace`
+    /// already runs it — the fuzz crate itself is a *separate* cargo
+    /// workspace `cargo test` never touches (see `fuzz/Cargo.toml`).
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn fuzz_native_surface_drives_engine_end_to_end() {
+        let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+        assert!(engine.selection_is_valid());
+        assert_eq!(engine.undo_depth(), 1);
+
+        let evt = engine.apply_sync(Command::InsertText {
+            at: None,
+            text: " more".to_string(),
+        });
+        assert!(
+            matches!(evt, Event::SelectionChanged { .. }),
+            "expected SelectionChanged, got {evt:?}"
+        );
+        // `new_headless` seeds the caret at (0, 0), so `InsertText { at: None }`
+        // (the live-caret path) prepends.
+        assert_eq!(engine.undo.current().paragraph_text(0), Some(" moreseed"));
+        assert_eq!(engine.undo_depth(), 2);
+        assert!(engine.selection_is_valid());
+
+        // D5.5 (issue #90) fuzzing finding — NOT asserted here (would make
+        // this a red gate for a pre-existing product behaviour outside
+        // this task's scope; see the PR description / final report):
+        // `Command::SetSelection` and `ExtendSelection` write `range` /
+        // `caret` verbatim with no `clamp_pos` call, unlike every other
+        // selection-mutating path (`do_place_caret_at_point`,
+        // `do_select_word_at`, …). An out-of-bounds `SetSelection` (e.g.
+        // `{ path: [Block { idx: 50 }], offset: 999 }` against a 1-paragraph
+        // doc) leaves `engine.selection_is_valid() == false` until the next
+        // text-mutating command's own `resolve_interactive_insert_at`
+        // clamping self-heals it — a real, reproducible
+        // `selection_is_valid()` violation, not merely a hypothetical one.
+        // The `rpc_command` fuzz target asserts this invariant after every
+        // command (unfiltered), so it will keep surfacing this.
+
+        // Layout + the native (browser-free) rasterizer both run for real.
+        engine.ensure_layout_for_fuzzing().expect("layout");
+        assert!(
+            engine.rasterize_last_layout_for_fuzzing() > 0,
+            "expected at least one glyph rasterized for non-empty text"
+        );
+
+        // Undo depth never exceeds the bound `new_headless` constructed.
+        for _ in 0..150 {
+            let _ = engine.apply_sync(Command::InsertText {
+                at: None,
+                text: "x".to_string(),
+            });
+            assert!(engine.undo_depth() <= 100, "undo depth exceeded its bound");
+        }
     }
 }
 
