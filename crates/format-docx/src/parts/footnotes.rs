@@ -115,21 +115,19 @@ pub fn parse_notes_xml(
                     depth += 1;
                 }
             }
-            Event::Empty(e) => {
-                if depth == 1 && e.name().as_ref() == entry_name {
-                    /* `<w:footnote w:id="3"/>` — degenerate but legal. */
-                    let (id, note_type) = entry_attrs(&e);
-                    let end = reader.buffer_position() as usize;
-                    let raw = crate::schema::grab_bag::slice_fragment(xml, prev_pos, end);
-                    out.notes.push(NoteStory {
-                        id,
-                        kind,
-                        note_type,
-                        body: ensure_non_empty(Vec::new()),
-                        source_xml: raw,
-                        dirty: false,
-                    });
-                }
+            Event::Empty(e) if depth == 1 && e.name().as_ref() == entry_name => {
+                /* `<w:footnote w:id="3"/>` — degenerate but legal. */
+                let (id, note_type) = entry_attrs(&e);
+                let end = reader.buffer_position() as usize;
+                let raw = crate::schema::grab_bag::slice_fragment(xml, prev_pos, end);
+                out.notes.push(NoteStory {
+                    id,
+                    kind,
+                    note_type,
+                    body: ensure_non_empty(Vec::new()),
+                    source_xml: raw,
+                    dirty: false,
+                });
             }
             Event::End(_) => {
                 depth = depth.saturating_sub(1);

@@ -3986,6 +3986,15 @@ impl DocumentTree {
                     f.end += len;
                 }
             }
+            /* Issue #80 — inline anchors (images, note references) are
+            single sentinel bytes: one at or past the insertion point
+            slides right with its sentinel. A footnote reference must
+            survive typing in front of it. */
+            for io in &mut para.inline_objects {
+                if io.at >= off {
+                    io.at += len;
+                }
+            }
         });
         if mutated.is_none() {
             return self.clone();
@@ -8044,6 +8053,65 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(d.count_inline_images(), 2);
+    }
+
+    /// Issue #80 — typing before an inline anchor slides it right with
+    /// its sentinel byte; typing after leaves it alone.
+    #[test]
+    fn insert_text_shifts_inline_anchors_past_the_insertion_point() {
+        let mut d = DocumentTree::from_text("ab\u{FFFC}cd\u{FFFC}");
+        d.blocks[0].as_paragraph_mut().unwrap().inline_objects = vec![
+            InlineObject {
+                at: 2,
+                kind: InlineKind::FootnoteRef {
+                    id: 1,
+                    custom_mark_follows: false,
+                },
+            },
+            InlineObject {
+                at: 7,
+                kind: InlineKind::EndnoteRef {
+                    id: 1,
+                    custom_mark_follows: false,
+                },
+            },
+        ];
+        let after = d.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 1,
+            },
+            "XYZ",
+        );
+        let p = after.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.text, "aXYZb\u{FFFC}cd\u{FFFC}");
+        assert_eq!(p.inline_objects[0].at, 5);
+        assert_eq!(p.inline_objects[1].at, 10);
+        assert_eq!(&p.text[5..8], "\u{FFFC}");
+        assert_eq!(&p.text[10..13], "\u{FFFC}");
+        /* Typing right AT the anchor byte inserts BEFORE the sentinel. */
+        let at_anchor = after.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
+            "!",
+        );
+        let p = at_anchor.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.text, "aXYZb!\u{FFFC}cd\u{FFFC}");
+        assert_eq!(p.inline_objects[0].at, 6);
+        /* Typing after every anchor leaves them in place. */
+        let tail = after.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 13,
+            },
+            "end",
+        );
+        assert_eq!(
+            tail.blocks[0].as_paragraph().unwrap().inline_objects[1].at,
+            10
+        );
     }
 
     #[test]

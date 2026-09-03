@@ -1660,7 +1660,9 @@ fn build_inline_object_infos(
     para: &engine::Paragraph,
     cfg: &RenderConfig,
     scale: f32,
+    sctx: StyleContext,
 ) -> Vec<layout::paragraph::InlineObjectInfo> {
+    let _ = cfg;
     para.inline_objects
         .iter()
         .map(|obj| match &obj.kind {
@@ -1676,22 +1678,52 @@ fn build_inline_object_infos(
                     rel_id: rel_id.clone(),
                 },
             },
-            engine::InlineKind::FootnoteRef { display_number, .. } => {
-                /* Phase 8a — footnote markers reserve a small fixed
-                width sized to the body font: ~0.45 em per digit at
-                the body size. The renderer paints the number as a
-                superscript at the glyph's pen position. */
-                let label = display_number.to_string();
-                let em = cfg.px_size * scale;
-                let width = em * 0.45 * (label.len() as f32).max(1.0);
-                let height = em * 0.7;
+            /* Issue #80 — note references shape their document-order
+            marker (`"1"`, `"iv"`, …) as real superscript glyphs at
+            layout time (`layout::paragraph::shape_note_marker`); the
+            anchor rides the first glyph so the paginator can reserve
+            the note's band space when the line is placed. Width /
+            height are measured by the shaper, not reserved here. */
+            engine::InlineKind::FootnoteRef {
+                id,
+                custom_mark_follows,
+            }
+            | engine::InlineKind::EndnoteRef {
+                id,
+                custom_mark_follows,
+            } => {
+                let anchor = engine::NoteAnchor {
+                    kind: if matches!(obj.kind, engine::InlineKind::FootnoteRef { .. }) {
+                        engine::NoteKind::Footnote
+                    } else {
+                        engine::NoteKind::Endnote
+                    },
+                    id: *id,
+                };
+                let text = if *custom_mark_follows {
+                    String::new()
+                } else {
+                    sctx.note_marker_text(anchor)
+                };
                 layout::paragraph::InlineObjectInfo {
                     at: obj.at,
-                    width_px: width,
-                    height_px: height,
-                    kind: layout::paragraph::InlineObjectInfoKind::FootnoteMarker { text: label },
+                    width_px: 0.0,
+                    height_px: 0.0,
+                    kind: layout::paragraph::InlineObjectInfoKind::NoteMarker {
+                        text,
+                        anchor: Some(anchor),
+                    },
                 }
             }
+            engine::InlineKind::NoteSelfRef { .. } => layout::paragraph::InlineObjectInfo {
+                at: obj.at,
+                width_px: 0.0,
+                height_px: 0.0,
+                kind: layout::paragraph::InlineObjectInfoKind::NoteMarker {
+                    text: sctx.note_self_mark.unwrap_or("").to_string(),
+                    anchor: None,
+                },
+            },
         })
         .collect()
 }
@@ -1704,18 +1736,48 @@ fn build_inline_object_infos(
 struct StyleContext<'a> {
     styles: &'a std::collections::HashMap<String, engine::ParagraphStyle>,
     run_defaults: &'a engine::SpanStyle,
+    /// Issue #80 — document-order display markers per referenced note
+    /// (`DocumentTree::note_markers`). `None` (callers outside a paint)
+    /// falls back to the OOXML id, which Word keeps equal to the display
+    /// number in the common case.
+    note_markers: Option<&'a HashMap<engine::NoteAnchor, String>>,
+    /// Issue #80 — the marker the `NoteSelfRef` heading a note body
+    /// paints; set only while laying out that note's blocks.
+    note_self_mark: Option<&'a str>,
 }
 
-impl StyleContext<'_> {
-    fn of(doc: &engine::DocumentTree) -> StyleContext<'_> {
+impl<'a> StyleContext<'a> {
+    fn of(doc: &'a engine::DocumentTree) -> StyleContext<'a> {
         StyleContext {
             styles: &doc.styles,
             run_defaults: &doc.style_run_defaults,
+            note_markers: None,
+            note_self_mark: None,
         }
     }
 
     fn run_base(&self, style_id: Option<&str>) -> engine::SpanStyle {
         engine::resolve_run_cascade(self.styles, self.run_defaults, style_id)
+    }
+
+    /// Issue #80 — thread the paint's resolved note markers.
+    fn with_note_markers(mut self, markers: &'a HashMap<engine::NoteAnchor, String>) -> Self {
+        self.note_markers = Some(markers);
+        self
+    }
+
+    /// Issue #80 — the self-mark for one note body's layout.
+    fn with_self_mark(mut self, mark: &'a str) -> Self {
+        self.note_self_mark = Some(mark);
+        self
+    }
+
+    /// Issue #80 — display text of a body reference's marker.
+    fn note_marker_text(&self, anchor: engine::NoteAnchor) -> String {
+        match self.note_markers.and_then(|m| m.get(&anchor)) {
+            Some(text) => text.clone(),
+            None => anchor.id.to_string(),
+        }
     }
 }
 
@@ -2069,6 +2131,35 @@ fn paragraph_layout_key(
     for s in &para.props.tab_stops {
         s.position_pt.to_bits().hash(&mut h);
     }
+    /* Issue #80 — note markers are shaped into the line, so the
+    resolved display text of every reference (and the self-mark of a
+    note body) is a layout input: inserting a note renumbers every
+    later reference without touching its paragraph's text. */
+    for obj in &para.inline_objects {
+        match &obj.kind {
+            engine::InlineKind::FootnoteRef { id, .. } => {
+                1u8.hash(&mut h);
+                sctx.note_marker_text(engine::NoteAnchor {
+                    kind: engine::NoteKind::Footnote,
+                    id: *id,
+                })
+                .hash(&mut h);
+            }
+            engine::InlineKind::EndnoteRef { id, .. } => {
+                2u8.hash(&mut h);
+                sctx.note_marker_text(engine::NoteAnchor {
+                    kind: engine::NoteKind::Endnote,
+                    id: *id,
+                })
+                .hash(&mut h);
+            }
+            engine::InlineKind::NoteSelfRef { .. } => {
+                3u8.hash(&mut h);
+                sctx.note_self_mark.hash(&mut h);
+            }
+            engine::InlineKind::Image { .. } => {}
+        }
+    }
     cfg.font_id.hash(&mut h);
     matches!(cfg.base_direction, ShapingDirection::Rtl).hash(&mut h);
     cfg.px_size.to_bits().hash(&mut h);
@@ -2122,99 +2213,166 @@ fn resolve_line_height(
     }
 }
 
-/// Phase 8a — walk every body paragraph in document order, mirror the
-/// `InlineKind::FootnoteRef` id → display_number mapping the parser
-/// assigned, then lay out each referenced footnote's body paragraph(s)
-/// into a single combined `ParagraphBox`. The paginator keys its
-/// `with_footnote_bodies` lookup by display_number — the same number
-/// that lives on every footnote-marker glyph — so layout never sees
-/// the OOXML `w:id`.
-fn build_footnote_bodies(
-    doc: &DocumentTree,
-    font_stack: &FontStack,
+/// Issue #80 — lay out one note story's blocks at `content_width` into
+/// a stacked block list (origins from `y = 0`), through the SAME cached
+/// paragraph + table pipeline the body uses. `sctx` carries the display
+/// number the story's `NoteSelfRef` paints (`StyleContext::with_self_mark`);
+/// `do_export_pdf` stamps `source_paragraph_id`s later so the PDF
+/// `/ToUnicode` table covers note glyphs.
+fn layout_note_blocks(
+    blocks: &[engine::Block],
+    content_width: f32,
+    fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
-) -> std::collections::HashMap<u32, ParagraphBox> {
-    let mut by_display: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for block in doc.blocks.iter() {
-        walk_block_for_footnote_refs(block, &mut by_display);
-    }
-    let mut out: std::collections::HashMap<u32, ParagraphBox> = std::collections::HashMap::new();
-    /* Footnote body width — content width of the default A4 section;
-    section-specific page widths are a follow-up (the table is built
-    once per document, not once per section, since footnotes flow
-    against the section they reference into). */
-    let body_width = engine::PageGeometry::a4().content_width() * scale;
-    for (display, w_id) in &by_display {
-        let Some(paragraphs) = doc.footnotes.get(w_id) else {
-            continue;
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+) -> Vec<LayoutBlock> {
+    let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
+    let mut y = 0.0_f32;
+    for block in blocks {
+        let mut lb = match block {
+            engine::Block::Paragraph(para) => {
+                let mut p =
+                    layout_paragraph_cached(para, fonts, cfg, scale, content_width, sctx, cache);
+                p.fields = para
+                    .fields
+                    .iter()
+                    .map(|f| layout::LayoutField {
+                        byte_range: f.start..f.end,
+                        instruction: f.instruction.clone(),
+                        evaluated_text: None,
+                    })
+                    .collect();
+                p.borders = para.props.borders.clone();
+                p.shading = para.props.shading;
+                LayoutBlock::Paragraph(p)
+            }
+            engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
+                t,
+                content_width,
+                fonts,
+                cfg,
+                scale,
+                sctx,
+                cache,
+            )),
         };
-        /* Flatten the footnote's per-`<w:p>` plain text into one body
-        paragraph so the band lays out a single block per footnote.
-        Rich body formatting + multi-paragraph footnote bodies ship
-        with the Phase 8c sprint. */
-        let joined: String = paragraphs.join(" ");
-        let combined = format!("{display}. {joined}");
-        let spans = [StyleSpan {
-            start: 0,
-            end: combined.len() as u32,
-            px_size: cfg.px_size * scale * 0.85,
-            color: [0, 0, 0, 255],
-            bold: false,
-            italic: false,
-            underline: engine::UnderlineStyle::None,
-            strike: false,
-            bg_color: None,
-            font_family: None,
-            caps_transform: false,
-            baseline_shift_px: 0.0,
-        }];
-        let p = layout_paragraph(ParagraphConfig {
-            text: &combined,
-            fonts: font_stack,
-            spans: &spans,
-            base_direction: first_strong_direction(&combined).unwrap_or(cfg.base_direction),
-            max_width: body_width,
-            line_height: cfg.line_height * scale * 0.85,
-            line_height_exact: false,
-            alignment: cfg.alignment,
-            indent_start_px: 0.0,
-            indent_end_px: 0.0,
-            first_line_indent_px: 0.0,
-            hanging_indent_px: 0.0,
-            marker_text: None,
-            px_size_for_marker: cfg.px_size * scale * 0.85,
-            inline_objects: &[],
-            tab_stops_px: &[],
-        });
-        out.insert(*display, p);
+        let before = match block {
+            engine::Block::Paragraph(p) => twips_to_layout_px(p.props.spacing.before_twips, scale),
+            engine::Block::Table(_) => 0.0,
+        };
+        let after = match block {
+            engine::Block::Paragraph(p) => twips_to_layout_px(p.props.spacing.after_twips, scale),
+            engine::Block::Table(_) => 0.0,
+        };
+        y += before;
+        let mut o = lb.origin();
+        o.x = 0.0;
+        o.y = y;
+        lb.set_origin(o);
+        y += lb.size().height + after;
+        out.push(lb);
     }
     out
 }
 
-/// Phase 8a — recursive walker that fills `by_display[display_number] = w_id`.
-fn walk_block_for_footnote_refs(
-    block: &engine::Block,
-    by_display: &mut std::collections::HashMap<u32, u32>,
+/// Issue #80 — the per-paint note tables the paginator consumes: every
+/// REFERENCED note story laid out at `content_width` keyed by its anchor,
+/// plus the document's `continuationNotice` story (if any). Special
+/// separator stories are never laid out — the paginator draws its own
+/// rules.
+fn build_note_bodies(
+    doc: &DocumentTree,
+    content_width: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+) -> (
+    HashMap<engine::NoteAnchor, layout::NoteBody>,
+    Option<layout::NoteBody>,
 ) {
-    match block {
-        engine::Block::Paragraph(p) => {
-            for obj in &p.inline_objects {
-                if let engine::InlineKind::FootnoteRef { id, display_number } = &obj.kind {
-                    by_display.insert(*display_number, *id);
-                }
-            }
+    let mut bodies: HashMap<engine::NoteAnchor, layout::NoteBody> = HashMap::new();
+    for r in doc.note_references() {
+        if bodies.contains_key(&r.anchor) {
+            continue;
         }
-        engine::Block::Table(t) => {
-            for row in &t.rows {
-                for cell in &row.cells {
-                    for b in &cell.blocks {
-                        walk_block_for_footnote_refs(b, by_display);
-                    }
-                }
-            }
+        let Some(story) = doc.note_story(r.anchor) else {
+            continue;
+        };
+        if story.note_type != engine::NoteType::Normal {
+            continue;
         }
+        let mark = sctx.note_marker_text(r.anchor);
+        let blocks = layout_note_blocks(
+            &story.body,
+            content_width,
+            fonts,
+            cfg,
+            scale,
+            sctx.with_self_mark(&mark),
+            cache,
+        );
+        bodies.insert(r.anchor, blocks);
     }
+    let notice = doc
+        .special_note(
+            engine::NoteKind::Footnote,
+            engine::NoteType::ContinuationNotice,
+        )
+        .filter(|n| {
+            n.body.iter().any(|b| match b {
+                engine::Block::Paragraph(p) => !p.text.is_empty(),
+                engine::Block::Table(_) => true,
+            })
+        })
+        .map(|n| {
+            layout_note_blocks(
+                &n.body,
+                content_width,
+                fonts,
+                cfg,
+                scale,
+                sctx.with_self_mark(""),
+                cache,
+            )
+        });
+    (bodies, notice)
+}
+
+/// Issue #80 — the endnotes referenced by top-level blocks in
+/// `[start, end)`, in reference order (deduped), paired with their laid
+/// out bodies — the paginator's trailing-band input.
+fn endnote_entries_for(
+    doc: &DocumentTree,
+    start: u32,
+    end: u32,
+    bodies: &HashMap<engine::NoteAnchor, layout::NoteBody>,
+    markers: &HashMap<engine::NoteAnchor, String>,
+    placed: &mut std::collections::HashSet<engine::NoteAnchor>,
+) -> Vec<(engine::NoteAnchor, String, layout::NoteBody)> {
+    let mut out = Vec::new();
+    for r in doc.note_references() {
+        if r.anchor.kind != engine::NoteKind::Endnote
+            || r.top_block < start
+            || r.top_block >= end
+            || placed.contains(&r.anchor)
+        {
+            continue;
+        }
+        let Some(body) = bodies.get(&r.anchor) else {
+            continue;
+        };
+        placed.insert(r.anchor);
+        let mark = markers
+            .get(&r.anchor)
+            .cloned()
+            .unwrap_or_else(|| r.anchor.id.to_string());
+        out.push((r.anchor, mark, body.clone()));
+    }
+    out
 }
 
 /// Phase 2 audit (gap D.1 follow-up) — lay out one section's header
@@ -3411,7 +3569,7 @@ fn layout_paragraph_cached(
     );
     let base_direction = resolve_base_direction(para, cfg);
     let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
-    let inline_infos = build_inline_object_infos(para, cfg, scale);
+    let inline_infos = build_inline_object_infos(para, cfg, scale, sctx);
     let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
     let para_cfg = ParagraphConfig {
         text: &para.text,
@@ -6006,7 +6164,10 @@ impl Engine {
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
         let doc = self.undo.current().clone();
-        let sctx = StyleContext::of(&doc);
+        /* Issue #80 — document-order note markers are a layout input
+        (shaped into every reference and self-mark). */
+        let note_markers = doc.note_markers();
+        let sctx = StyleContext::of(&doc).with_note_markers(&note_markers);
         let mut cache = self.layout_cache.borrow_mut();
         let composition = if with_composition {
             self.composition.as_ref()
@@ -6023,12 +6184,21 @@ impl Engine {
         split paragraphs (head + tail) share the same id and resolve
         to the same source string. */
         let mut next_para_id: u32 = 0;
-        /* Phase 8a — pre-resolve the footnote-body table the paginator
-        uses to grow the bottom band. The paginator keys by *display
-        number* (the marker text it sees on glyphs); we discover the
-        OOXML w:id → display_number mapping by scanning every body
-        paragraph's `InlineKind::FootnoteRef`. */
-        let footnote_bodies = build_footnote_bodies(&doc, &font_stack, &cfg, scale);
+        /* Issue #80 — lay every referenced note story out once at the
+        first section's content width (notes flow against the page they
+        reference into; a per-section width is a follow-up) and hand
+        the table to every paginator. Endnotes reuse the same bodies as
+        the trailing band's input. */
+        let note_width = sections
+            .first()
+            .map_or(engine::PageGeometry::a4().content_width(), |s| {
+                s.geometry.content_width()
+            })
+            * scale;
+        let (note_bodies, continuation_notice) =
+            build_note_bodies(&doc, note_width, &font_stack, &cfg, scale, sctx, &mut cache);
+        let mut endnotes_placed: std::collections::HashSet<engine::NoteAnchor> =
+            std::collections::HashSet::new();
         /* Each top-level block is covered by at most one effective section. The
         paginator runs once across the whole document; section boundaries
         trigger a hard page break + geometry swap. */
@@ -6176,9 +6346,8 @@ impl Engine {
                         footer: None,
                         header_offset: filler_geom.2,
                         footer_offset: filler_geom.3,
-                        footnotes: Vec::new(),
-                        footnote_band_y: 0.0,
-                        footnote_band_continuation: false,
+                        footnotes: layout::NoteBand::default(),
+                        endnotes: layout::NoteBand::default(),
                         hf_role: layout::HeaderRole::Default,
                         page_number: incoming,
                     });
@@ -6254,6 +6423,10 @@ impl Engine {
                 );
                 let doc_offset = emitted_pages.len() as u32;
                 pag.set_page_numbering(section.page_num, doc_offset);
+                pag.set_footnote_position(
+                    doc.resolved_note_props(engine::NoteKind::Footnote, Some(section))
+                        .position,
+                );
             } else {
                 let mut pag = Paginator::new(
                     geom,
@@ -6262,7 +6435,8 @@ impl Engine {
                     section.title_pg,
                     doc.settings.even_and_odd_headers,
                 )
-                .with_footnote_bodies(footnote_bodies.clone())
+                .with_note_bodies(note_bodies.clone())
+                .with_continuation_notice(continuation_notice.clone())
                 /* Issue #43 — DATE fields resolve against the
                 shell-injected render date. */
                 .with_render_date(self.render_date);
@@ -6274,6 +6448,11 @@ impl Engine {
                 / formatted numbers. */
                 let doc_offset = emitted_pages.len() as u32;
                 pag.set_page_numbering(section.page_num, doc_offset);
+                /* Issue #80 — `<w:footnotePr><w:pos>` for this section. */
+                pag.set_footnote_position(
+                    doc.resolved_note_props(engine::NoteKind::Footnote, Some(section))
+                        .position,
+                );
                 paginator = Some(pag);
                 page_paths.clear();
                 page_paths.push(Vec::new());
@@ -6441,6 +6620,39 @@ impl Engine {
                     }
                 }
             }
+            /* Issue #80 — `<w:endnotePr><w:pos w:val="sectEnd"/>`: this
+            section's endnotes trail its last block. */
+            let endnote_pos = doc
+                .resolved_note_props(engine::NoteKind::Endnote, Some(section))
+                .position;
+            if endnote_pos == engine::NotePosition::SectEnd
+                && let Some(pag) = paginator.as_mut()
+            {
+                let entries = endnote_entries_for(
+                    &doc,
+                    section.start_block,
+                    section.end_block,
+                    &note_bodies,
+                    &note_markers,
+                    &mut endnotes_placed,
+                );
+                pag.push_trailing_notes(entries);
+            }
+        }
+        /* Issue #80 — document-end endnotes (the default position):
+        every endnote not collected at a section end trails the body.
+        A culled (viewport) build never reaches the document end, so
+        it never places them — the full layout does. */
+        if !culled && let Some(pag) = paginator.as_mut() {
+            let entries = endnote_entries_for(
+                &doc,
+                0,
+                u32::MAX,
+                &note_bodies,
+                &note_markers,
+                &mut endnotes_placed,
+            );
+            pag.push_trailing_notes(entries);
         }
         if let Some(p) = paginator.take() {
             let (mut pages, notes) = p.finish_with_notes();
@@ -6492,9 +6704,8 @@ impl Engine {
                 footer: None,
                 header_offset: default_geom.header_offset,
                 footer_offset: default_geom.footer_offset,
-                footnotes: Vec::new(),
-                footnote_band_y: 0.0,
-                footnote_band_continuation: false,
+                footnotes: layout::NoteBand::default(),
+                endnotes: layout::NoteBand::default(),
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
             });
@@ -6533,9 +6744,8 @@ impl Engine {
             footer: None,
             header_offset: 0.0,
             footer_offset: 0.0,
-            footnotes: Vec::new(),
-            footnote_band_y: 0.0,
-            footnote_band_continuation: false,
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
         });
@@ -6830,6 +7040,106 @@ impl Engine {
                     p.source_paragraph_id = next;
                     next += 1;
                 });
+            }
+        }
+        /* Issue #80 — note stories join the table too (footnotes then
+        endnotes, id-ascending), and every band entry is stamped from
+        its story's base plus the paragraphs before the block the entry
+        opens with (`first_block_index`); a continuation-notice tail on
+        a cut entry maps to the notice story. */
+        let mut note_bases: HashMap<engine::NoteAnchor, u32> = HashMap::new();
+        let mut notice_base: Option<u32> = None;
+        for kind in [engine::NoteKind::Footnote, engine::NoteKind::Endnote] {
+            let mut ids: Vec<i32> = doc.note_stories(kind).keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                let Some(story) = doc.note_stories(kind).get(&id) else {
+                    continue;
+                };
+                match story.note_type {
+                    engine::NoteType::Normal if id >= 0 => {
+                        note_bases.insert(
+                            engine::NoteAnchor {
+                                kind,
+                                id: id as u32,
+                            },
+                            para_texts.len() as u32,
+                        );
+                    }
+                    engine::NoteType::ContinuationNotice
+                        if kind == engine::NoteKind::Footnote && notice_base.is_none() =>
+                    {
+                        notice_base = Some(para_texts.len() as u32);
+                    }
+                    _ => continue,
+                }
+                for b in &story.body {
+                    walk_block_texts(b, &mut para_texts);
+                }
+            }
+        }
+        let notice_len = doc
+            .special_note(
+                engine::NoteKind::Footnote,
+                engine::NoteType::ContinuationNotice,
+            )
+            .map_or(0, |n| n.body.len());
+        for page in pages.iter_mut() {
+            for band in [&mut page.footnotes, &mut page.endnotes] {
+                for entry in band.entries.iter_mut() {
+                    let anchor = engine::NoteAnchor {
+                        kind: entry.kind,
+                        id: entry.id,
+                    };
+                    let (Some(&base), Some(story)) =
+                        (note_bases.get(&anchor), doc.note_story(anchor))
+                    else {
+                        continue;
+                    };
+                    let mut skipped: Vec<&str> = Vec::new();
+                    for b in story.body.iter().take(entry.first_block_index as usize) {
+                        walk_block_texts(b, &mut skipped);
+                    }
+                    let mut next = base + skipped.len() as u32;
+                    let story_blocks = if entry.continues_on_next && notice_len > 0 {
+                        entry.blocks.len().saturating_sub(notice_len)
+                    } else {
+                        entry.blocks.len()
+                    };
+                    for (i, lb) in entry.blocks.iter_mut().enumerate() {
+                        if i == story_blocks {
+                            match notice_base {
+                                Some(nb) => next = nb,
+                                None => break,
+                            }
+                        }
+                        let mut stamp = |p: &mut ParagraphBox| {
+                            p.source_paragraph_id = next;
+                            next += 1;
+                        };
+                        match lb {
+                            LayoutBlock::Paragraph(p) => stamp(p),
+                            LayoutBlock::Table(t) => {
+                                let mut cursor = next;
+                                for row in t.rows.iter_mut() {
+                                    for cell in row.cells.iter_mut() {
+                                        if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                                            continue;
+                                        }
+                                        layout::boxes::for_each_paragraph_in_blocks_mut(
+                                            &mut cell.content,
+                                            &mut |p| {
+                                                p.source_paragraph_id = cursor;
+                                                cursor += 1;
+                                            },
+                                        );
+                                    }
+                                }
+                                next = cursor;
+                            }
+                        }
+                    }
+                }
             }
         }
         let mut bytes: Vec<u8> = Vec::new();
@@ -12532,6 +12842,8 @@ mod tests {
         StyleContext {
             styles: Box::leak(Box::default()),
             run_defaults: Box::leak(Box::default()),
+            note_markers: None,
+            note_self_mark: None,
         }
     }
 
@@ -12559,6 +12871,8 @@ mod tests {
         let sctx = StyleContext {
             styles: &styles,
             run_defaults: &run_defaults,
+            note_markers: None,
+            note_self_mark: None,
         };
         let mut para = engine::Paragraph {
             text: "hello world".into(),
@@ -14837,9 +15151,8 @@ mod tests {
             footer: None,
             header_offset: 36.0,
             footer_offset: 36.0,
-            footnotes: Vec::new(),
-            footnote_band_y: 0.0,
-            footnote_band_continuation: false,
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
         }

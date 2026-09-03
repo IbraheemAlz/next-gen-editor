@@ -74,7 +74,9 @@ fn next_note_marker_start(objects: &[InlineObjectInfo], from: u32, before: u32) 
     objects
         .iter()
         .filter(|o| {
-            matches!(o.kind, InlineObjectInfoKind::NoteMarker { .. }) && o.at > from && o.at < before
+            matches!(o.kind, InlineObjectInfoKind::NoteMarker { .. })
+                && o.at > from
+                && o.at < before
         })
         .map(|o| o.at)
         .min()

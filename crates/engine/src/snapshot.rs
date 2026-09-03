@@ -165,8 +165,8 @@ mod tests {
     use super::*;
     use crate::numbering::{AbstractNum, LvlDef, NumInstance, NumberingDefinitions};
     use crate::{
-        Block, CommentDef, CommentRange, DocumentTree, ImageBlob, ListItem, LogicalPos, Paragraph,
-        ParagraphStyle, SpanStyle, StyleRun,
+        Block, CommentDef, CommentRange, DocumentTree, ImageBlob, ListItem, LogicalPos, NoteKind,
+        NoteStory, NoteType, Paragraph, ParagraphStyle, SpanStyle, StyleRun,
     };
     use serde::Deserialize;
 
@@ -331,7 +331,21 @@ mod tests {
                 data: vec![0x89, b'P', b'N', b'G', 0, 1, 2, 255],
             },
         );
-        doc.footnotes.insert(1, vec!["a footnote".into()]);
+        doc.footnote_stories.insert(
+            1,
+            NoteStory {
+                id: 1,
+                kind: NoteKind::Footnote,
+                note_type: NoteType::Normal,
+                body: vec![Block::Paragraph(Paragraph {
+                    text: "a footnote".into(),
+                    ..Default::default()
+                })],
+                source_xml: Some(b"<w:footnote w:id=\"1\"/>".to_vec()),
+                dirty: false,
+            },
+        );
+        doc.notes_dirty.endnotes = true;
         doc.comment_defs.insert(
             0,
             CommentDef {
@@ -417,7 +431,14 @@ mod tests {
             d.media["rId9"].data,
             vec![0x89, b'P', b'N', b'G', 0, 1, 2, 255]
         );
-        assert_eq!(d.footnotes[&1], vec!["a footnote".to_string()]);
+        let note = &d.footnote_stories[&1];
+        assert_eq!(note.kind, NoteKind::Footnote);
+        assert_eq!(note.body[0].as_paragraph().unwrap().text, "a footnote");
+        assert_eq!(
+            note.source_xml.as_deref(),
+            Some(b"<w:footnote w:id=\"1\"/>".as_slice())
+        );
+        assert!(d.notes_dirty.endnotes && !d.notes_dirty.footnotes);
         assert_eq!(d.comment_defs[&0].author, "Reviewer");
         assert_eq!(d.comment_ranges.len(), 1);
         assert_eq!(d.comment_ranges[0].end.offset, 5);

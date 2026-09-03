@@ -1755,30 +1755,34 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         per entry) OR when the engine holds referenced notes but the
         archive never carried the part (a fresh document saved through
         `build_minimal_docx`). Untouched parts ride the passthrough. */
-        let notes_plan = |kind: engine::NoteKind, entry: &str, dirty: bool| -> (bool, Option<Vec<u8>>) {
-            let existing = archive.other_entries.iter().find(|(n, _)| n == entry);
-            let present = existing.is_some();
-            let stories = doc.note_stories(kind);
-            let any_normal = stories
-                .values()
-                .any(|s| s.note_type == engine::NoteType::Normal);
-            let regen = dirty || stories.values().any(|s| s.dirty) || (!present && any_normal);
-            if !regen {
-                return (present, None);
-            }
-            let root_attrs: Vec<(String, String)> = match existing {
-                Some((_, bytes)) => root_attributes(bytes),
-                None => archive.document_root_attrs.clone(),
+        let notes_plan =
+            |kind: engine::NoteKind, entry: &str, dirty: bool| -> (bool, Option<Vec<u8>>) {
+                let existing = archive.other_entries.iter().find(|(n, _)| n == entry);
+                let present = existing.is_some();
+                let stories = doc.note_stories(kind);
+                let any_normal = stories
+                    .values()
+                    .any(|s| s.note_type == engine::NoteType::Normal);
+                let regen = dirty || stories.values().any(|s| s.dirty) || (!present && any_normal);
+                if !regen {
+                    return (present, None);
+                }
+                let root_attrs: Vec<(String, String)> = match existing {
+                    Some((_, bytes)) => root_attributes(bytes),
+                    None => archive.document_root_attrs.clone(),
+                };
+                (present, Some(build_notes_xml(kind, doc, &root_attrs)))
             };
-            (present, Some(build_notes_xml(kind, doc, &root_attrs)))
-        };
         let (footnotes_present, footnotes_bytes) = notes_plan(
             engine::NoteKind::Footnote,
             FOOTNOTES_XML,
             doc.notes_dirty.footnotes,
         );
-        let (endnotes_present, endnotes_bytes) =
-            notes_plan(engine::NoteKind::Endnote, ENDNOTES_XML, doc.notes_dirty.endnotes);
+        let (endnotes_present, endnotes_bytes) = notes_plan(
+            engine::NoteKind::Endnote,
+            ENDNOTES_XML,
+            doc.notes_dirty.endnotes,
+        );
         let synth_footnotes = !footnotes_present && footnotes_bytes.is_some();
         let synth_endnotes = !endnotes_present && endnotes_bytes.is_some();
         let numbering_already_present = archive
@@ -2083,7 +2087,11 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                 }
                 /* Issue #80 — fresh note parts. */
                 for (on, part_name, content_type) in [
-                    (synth_footnotes, "/word/footnotes.xml", FOOTNOTES_CONTENT_TYPE),
+                    (
+                        synth_footnotes,
+                        "/word/footnotes.xml",
+                        FOOTNOTES_CONTENT_TYPE,
+                    ),
                     (synth_endnotes, "/word/endnotes.xml", ENDNOTES_CONTENT_TYPE),
                 ] {
                     if !on {
@@ -2617,7 +2625,11 @@ fn build_hf_xml(
 /// reference addresses any more are dropped — Word would otherwise show
 /// orphaned notes — while the special separator stories always survive;
 /// a part synthesized from scratch gets Word's two stock separators.
-fn build_notes_xml(kind: engine::NoteKind, doc: &DocumentTree, root_attrs: &[(String, String)]) -> Vec<u8> {
+fn build_notes_xml(
+    kind: engine::NoteKind,
+    doc: &DocumentTree,
+    root_attrs: &[(String, String)],
+) -> Vec<u8> {
     let (root, entry) = match kind {
         engine::NoteKind::Footnote => ("w:footnotes", "w:footnote"),
         engine::NoteKind::Endnote => ("w:endnotes", "w:endnote"),
@@ -2683,12 +2695,16 @@ fn build_notes_xml(kind: engine::NoteKind, doc: &DocumentTree, root_attrs: &[(St
     text on the regenerate path — clean paragraphs keep theirs). */
     let no_links: HashMap<String, String> = HashMap::new();
     for id in ids {
-        let Some(story) = stories.get(&id) else { continue };
+        let Some(story) = stories.get(&id) else {
+            continue;
+        };
         if story.note_type == engine::NoteType::Normal && !referenced.contains(&(id.max(0) as u32))
         {
             continue;
         }
-        if !story.dirty && let Some(src) = story.source_xml.as_deref() {
+        if !story.dirty
+            && let Some(src) = story.source_xml.as_deref()
+        {
             out.push_str(&String::from_utf8_lossy(src));
             continue;
         }

@@ -181,6 +181,7 @@ fn run_default() -> Result<()> {
     );
 
     run_grab_bag_survival()?;
+    run_notes_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -469,6 +470,402 @@ fn run_grab_bag_survival() -> Result<()> {
         bail!("paragraph grab bag did not survive the round-trip: {ppr_a:?} vs {ppr_b:?}");
     }
     println!("[roundtrip] step 9 OK — grab bags survive dirty regeneration byte-for-byte");
+    Ok(())
+}
+
+/* ================================================== notes (#80) ==== */
+
+/// Issue #80 fixture: three body paragraphs referencing three footnotes
+/// and two endnotes, with Word's stock separator stories in both note
+/// parts and `w14:paraId` markup on one note so passthrough fidelity is
+/// observable. The body sits in the writer's canonical shape so a dirty
+/// paragraph regenerates byte-identical modulo the edit.
+const NOTES_W14_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
+
+fn notes_fixture_document_xml() -> String {
+    concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        "\n",
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        "<w:body>",
+        r#"<w:p><w:r><w:t xml:space="preserve">Alpha body</w:t></w:r>"#,
+        r#"<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:footnoteReference w:id="1"/></w:r>"#,
+        r#"<w:r><w:t xml:space="preserve"> continues</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">Beta body</w:t></w:r>"#,
+        r#"<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:footnoteReference w:id="2"/></w:r>"#,
+        r#"<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:endnoteReference w:id="1"/></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">Gamma body</w:t></w:r>"#,
+        r#"<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:footnoteReference w:id="3"/></w:r>"#,
+        r#"<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:endnoteReference w:id="2"/></w:r></w:p>"#,
+        "<w:sectPr/></w:body></w:document>",
+    )
+    .to_string()
+}
+
+fn notes_fixture_footnotes_xml() -> String {
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="{w14}">"#,
+            r#"<w:footnote w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:footnote>"#,
+            r#"<w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>"#,
+            r#"<w:footnote w:id="1"><w:p w14:paraId="0A1B2C3D"><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> First footnote.</w:t></w:r></w:p></w:footnote>"#,
+            r#"<w:footnote w:id="2"><w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> Second footnote.</w:t></w:r></w:p></w:footnote>"#,
+            r#"<w:footnote w:id="3"><w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> Third footnote, </w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t xml:space="preserve">italic</w:t></w:r><w:r><w:t xml:space="preserve">.</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr><w:r><w:t xml:space="preserve">Second paragraph of the third.</w:t></w:r></w:p></w:footnote>"#,
+            "</w:footnotes>",
+        ),
+        w14 = NOTES_W14_NS,
+    )
+}
+
+fn notes_fixture_endnotes_xml() -> &'static str {
+    concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        "\n",
+        r#"<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        r#"<w:endnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:endnote>"#,
+        r#"<w:endnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:endnote>"#,
+        r#"<w:endnote w:id="1"><w:p><w:pPr><w:pStyle w:val="EndnoteText"/></w:pPr><w:r><w:rPr><w:rStyle w:val="EndnoteReference"/></w:rPr><w:endnoteRef/></w:r><w:r><w:t xml:space="preserve"> First endnote.</w:t></w:r></w:p></w:endnote>"#,
+        r#"<w:endnote w:id="2"><w:p><w:pPr><w:pStyle w:val="EndnoteText"/></w:pPr><w:r><w:rPr><w:rStyle w:val="EndnoteReference"/></w:rPr><w:endnoteRef/></w:r><w:r><w:t xml:space="preserve"> Second endnote.</w:t></w:r></w:p></w:endnote>"#,
+        "</w:endnotes>",
+    )
+}
+
+fn build_footnotes_endnotes_docx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+    let document_xml = notes_fixture_document_xml();
+    let footnotes_xml = notes_fixture_footnotes_xml();
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>
+<Override PartName="/word/endnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml"/>
+<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>
+</Types>"#;
+    let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>
+</Relationships>"#;
+    /* Document-level note properties: lower-roman endnotes so the
+    marker derivation is observable ("i", "ii"). */
+    let settings = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr><w:endnotePr><w:numFmt w:val="lowerRoman"/><w:endnote w:id="-1"/><w:endnote w:id="0"/></w:endnotePr></w:settings>"#;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, body) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", dot_rels),
+            ("word/_rels/document.xml.rels", doc_rels),
+            ("word/document.xml", document_xml.as_str()),
+            ("word/footnotes.xml", footnotes_xml.as_str()),
+            ("word/endnotes.xml", notes_fixture_endnotes_xml()),
+            ("word/settings.xml", settings),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+fn entry_bytes<'a>(archive: &'a DocxArchive, name: &str) -> Option<&'a [u8]> {
+    archive
+        .other_entries
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, b)| b.as_slice())
+}
+
+/// Issue #80 — step 10: the note story round-trip contract.
+///
+/// 1. The parts parse into stories (3 footnotes + 2 endnotes + the four
+///    separator sentinels), references land as inline anchors and the
+///    document-order markers derive (endnotes lower-roman per
+///    `settings.xml`).
+/// 2. A DIRTY body paragraph carrying a reference saves the reference
+///    back (`<w:footnoteReference w:id>`), and both note parts pass
+///    through byte-identical.
+/// 3. Editing ONE footnote regenerates `footnotes.xml` only: the
+///    untouched entries ride their captured bytes verbatim, the edited
+///    one carries the edit, `endnotes.xml` is untouched.
+/// 4. Inserting a footnote at the caret mints the next id, splices the
+///    anchor, renumbers every later marker, and round-trips.
+/// 5. A document that never had a note part gets one synthesized
+///    (part + content type + relationship) on save.
+fn run_notes_roundtrip() -> Result<()> {
+    use engine::{BlockPath, InlineKind, LogicalPos, NoteAnchor, NoteKind, NoteType};
+
+    let fixture_bytes = build_footnotes_endnotes_docx();
+    let a = read_docx(&fixture_bytes).context("read notes fixture")?;
+    let doc_a = &a.document;
+    let normal = |m: &std::collections::HashMap<i32, engine::NoteStory>| {
+        m.values()
+            .filter(|s| s.note_type == NoteType::Normal)
+            .count()
+    };
+    if normal(&doc_a.footnote_stories) != 3 || doc_a.footnote_stories.len() != 5 {
+        bail!(
+            "footnote stories: {} normal / {} total",
+            normal(&doc_a.footnote_stories),
+            doc_a.footnote_stories.len()
+        );
+    }
+    if normal(&doc_a.endnote_stories) != 2 || doc_a.endnote_stories.len() != 4 {
+        bail!("endnote stories: {}", doc_a.endnote_stories.len());
+    }
+    let refs = doc_a.note_references();
+    let ids: Vec<(NoteKind, u32)> = refs.iter().map(|r| (r.anchor.kind, r.anchor.id)).collect();
+    let want = vec![
+        (NoteKind::Footnote, 1),
+        (NoteKind::Footnote, 2),
+        (NoteKind::Endnote, 1),
+        (NoteKind::Footnote, 3),
+        (NoteKind::Endnote, 2),
+    ];
+    if ids != want {
+        bail!("note references in document order: {ids:?}");
+    }
+    let markers = doc_a.note_markers();
+    let mark = |kind: NoteKind, id: u32| {
+        markers
+            .get(&NoteAnchor { kind, id })
+            .cloned()
+            .unwrap_or_default()
+    };
+    if mark(NoteKind::Footnote, 3) != "3" || mark(NoteKind::Endnote, 2) != "ii" {
+        bail!(
+            "markers: fn3=`{}` en2=`{}`",
+            mark(NoteKind::Footnote, 3),
+            mark(NoteKind::Endnote, 2)
+        );
+    }
+    let third = &doc_a.footnote_stories[&3];
+    if third.body.len() != 2 || third.source_xml.is_none() || third.dirty {
+        bail!("third footnote story shape: {} blocks", third.body.len());
+    }
+    println!("[roundtrip] step 10a OK — note parts parse into stories, markers derive");
+
+    /* 2. Dirty body paragraph → reference survives, parts pass through. */
+    let edited = doc_a.insert_text(
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: "Alpha".len() as u32,
+        },
+        INSERT_TEXT,
+    );
+    let bytes_b = write_docx(&a, &edited).context("write dirty-paragraph doc")?;
+    assert_document_xml_well_formed(&bytes_b)?;
+    let b = read_docx(&bytes_b).context("re-read dirty-paragraph doc")?;
+    let p0 = b.document.blocks[0].as_paragraph().context("paragraph 0")?;
+    let has_ref = p0
+        .inline_objects
+        .iter()
+        .any(|o| matches!(o.kind, InlineKind::FootnoteRef { id: 1, .. }));
+    if !has_ref {
+        bail!(
+            "footnote reference dropped on dirty-paragraph save: {:?}",
+            p0.inline_objects
+        );
+    }
+    if !p0.text.contains(INSERT_TEXT) {
+        bail!("edit lost: {:?}", p0.text);
+    }
+    for part in [
+        "word/footnotes.xml",
+        "word/endnotes.xml",
+        "word/settings.xml",
+    ] {
+        if entry_bytes(&a, part) != entry_bytes(&b, part) {
+            bail!("`{part}` drifted on a body-only edit");
+        }
+    }
+    if b.document.note_references().len() != 5 {
+        bail!(
+            "reference count after save: {}",
+            b.document.note_references().len()
+        );
+    }
+    println!(
+        "[roundtrip] step 10b OK — reference survives a dirty-paragraph save, note parts passthrough"
+    );
+
+    /* 3. Edit footnote 2 → only footnotes.xml regenerates; untouched
+    entries verbatim. */
+    let story2 = &doc_a.footnote_stories[&2];
+    let story_doc = DocumentTree::from_blocks(story2.body.iter().cloned());
+    let story_doc = story_doc.insert_text(
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: story_doc.paragraph_text(0).map_or(0, |t| t.len() as u32),
+        },
+        " (edited)",
+    );
+    let new_body: Vec<engine::Block> = story_doc.blocks.iter().cloned().collect();
+    let edited2 = doc_a.with_updated_note_story(NoteKind::Footnote, 2, new_body);
+    if !edited2.notes_dirty.footnotes || edited2.notes_dirty.endnotes {
+        bail!("notes_dirty flags: {:?}", edited2.notes_dirty);
+    }
+    let bytes_c = write_docx(&a, &edited2).context("write edited-note doc")?;
+    assert_document_xml_well_formed(&bytes_c)?;
+    let c = read_docx(&bytes_c).context("re-read edited-note doc")?;
+    let fn_a = entry_bytes(&a, "word/footnotes.xml").context("fixture footnotes.xml")?;
+    let fn_c = entry_bytes(&c, "word/footnotes.xml").context("saved footnotes.xml")?;
+    if fn_a == fn_c {
+        bail!("footnotes.xml was not regenerated after a note edit");
+    }
+    let fn_c_str = std::str::from_utf8(fn_c).context("utf8 footnotes.xml")?;
+    for id in [-1, 0, 1, 3] {
+        let raw = doc_a.footnote_stories[&id]
+            .source_xml
+            .as_deref()
+            .context("source bytes")?;
+        let raw = std::str::from_utf8(raw)?;
+        if !fn_c_str.contains(raw) {
+            bail!("untouched footnote {id} not verbatim in the regenerated part:\n{fn_c_str}");
+        }
+    }
+    if !fn_c_str.contains("Second footnote. (edited)")
+        || fn_c_str.contains("Second footnote.</w:t>")
+    {
+        bail!("edited footnote text not regenerated:\n{fn_c_str}");
+    }
+    if !fn_c_str.contains(r#"xmlns:w14=""#) {
+        bail!("regenerated footnotes.xml lost the root's w14 binding");
+    }
+    if entry_bytes(&a, "word/endnotes.xml") != entry_bytes(&c, "word/endnotes.xml") {
+        bail!("endnotes.xml drifted on a footnote edit");
+    }
+    if extract_doc_xml(&fixture_bytes)? != extract_doc_xml(&bytes_c)? {
+        bail!("document.xml drifted on a note-only edit");
+    }
+    let c2 = c.document.footnote_stories[&2]
+        .body
+        .first()
+        .and_then(engine::Block::as_paragraph)
+        .map(|p| p.text.clone())
+        .unwrap_or_default();
+    if !c2.ends_with("Second footnote. (edited)") {
+        bail!("re-read edited footnote: {c2:?}");
+    }
+    if !c.document.footnote_stories[&2].body[0]
+        .as_paragraph()
+        .is_some_and(|p| {
+            p.inline_objects
+                .iter()
+                .any(|o| matches!(o.kind, InlineKind::NoteSelfRef { .. }))
+        })
+    {
+        bail!("regenerated footnote lost its <w:footnoteRef/> self-mark");
+    }
+    println!(
+        "[roundtrip] step 10c OK — one edited note regenerates its part only, siblings verbatim"
+    );
+
+    /* 4. Insert a footnote at the caret → id 4, renumbered markers. */
+    let (with_new, new_id) = c.document.insert_note_at(
+        LogicalPos {
+            path: BlockPath::top(1),
+            offset: "Beta".len() as u32,
+        },
+        NoteKind::Footnote,
+    );
+    if new_id != 4 {
+        bail!("fresh footnote id: {new_id}");
+    }
+    let markers = with_new.note_markers();
+    let m = |id: u32| {
+        markers
+            .get(&NoteAnchor {
+                kind: NoteKind::Footnote,
+                id,
+            })
+            .cloned()
+            .unwrap_or_default()
+    };
+    if (m(1), m(4), m(2), m(3)) != ("1".into(), "2".into(), "3".into(), "4".into()) {
+        bail!(
+            "renumbered markers: 1=`{}` 4=`{}` 2=`{}` 3=`{}`",
+            m(1),
+            m(4),
+            m(2),
+            m(3)
+        );
+    }
+    let bytes_d = write_docx(&c, &with_new).context("write inserted-note doc")?;
+    assert_document_xml_well_formed(&bytes_d)?;
+    let d = read_docx(&bytes_d).context("re-read inserted-note doc")?;
+    if normal(&d.document.footnote_stories) != 4 || d.document.note_references().len() != 6 {
+        bail!(
+            "after insert: {} footnotes / {} references",
+            normal(&d.document.footnote_stories),
+            d.document.note_references().len()
+        );
+    }
+    let fresh_story = &d.document.footnote_stories[&4];
+    if !fresh_story.body[0].as_paragraph().is_some_and(|p| {
+        p.inline_objects
+            .iter()
+            .any(|o| matches!(o.kind, InlineKind::NoteSelfRef { .. }))
+    }) {
+        bail!("inserted footnote body lacks its self-mark");
+    }
+    println!(
+        "[roundtrip] step 10d OK — insert footnote at caret mints id 4, renumbers, round-trips"
+    );
+
+    /* 5. A note-less document synthesizes the part on save. */
+    let fresh = DocumentTree::from_text("fresh document");
+    let (fresh, id) = fresh.insert_note_at(
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: "fresh".len() as u32,
+        },
+        NoteKind::Footnote,
+    );
+    if id != 1 {
+        bail!("first footnote id in a fresh document: {id}");
+    }
+    let fresh_bytes = build_minimal_docx(&fresh).context("build fresh docx")?;
+    assert_document_xml_well_formed(&fresh_bytes)?;
+    let e = read_docx(&fresh_bytes).context("re-read fresh docx")?;
+    let ct = std::str::from_utf8(entry_bytes(&e, "[Content_Types].xml").context("ct")?)?;
+    if !ct.contains("/word/footnotes.xml") {
+        bail!("[Content_Types].xml lacks the synthesized footnotes override");
+    }
+    let rels =
+        std::str::from_utf8(entry_bytes(&e, "word/_rels/document.xml.rels").context("rels")?)?;
+    if !rels.contains("relationships/footnotes") {
+        bail!("document.xml.rels lacks the footnotes relationship");
+    }
+    if normal(&e.document.footnote_stories) != 1 || e.document.note_references().len() != 1 {
+        bail!(
+            "fresh document after save: {} footnotes / {} references",
+            normal(&e.document.footnote_stories),
+            e.document.note_references().len()
+        );
+    }
+    let fn_e = std::str::from_utf8(entry_bytes(&e, "word/footnotes.xml").context("footnotes")?)?;
+    if !fn_e.contains(r#"w:type="separator""#)
+        || !fn_e.contains(r#"w:type="continuationSeparator""#)
+    {
+        bail!("synthesized footnotes.xml lacks Word's stock separators:\n{fn_e}");
+    }
+    println!("[roundtrip] step 10e OK — a fresh document synthesizes footnotes.xml + OPC plumbing");
     Ok(())
 }
 
@@ -836,6 +1233,23 @@ struct PrebuiltFixture {
 
 fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
     vec![
+        PrebuiltFixture {
+            name: "footnotes_endnotes.docx",
+            bytes: build_footnotes_endnotes_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 3,
+                    paragraph_texts: vec![
+                        "Alpha body\u{FFFC} continues".into(),
+                        "Beta body\u{FFFC}\u{FFFC}".into(),
+                        "Gamma body\u{FFFC}\u{FFFC}".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
         PrebuiltFixture {
             name: "style_cascade.docx",
             bytes: build_style_cascade_docx(),

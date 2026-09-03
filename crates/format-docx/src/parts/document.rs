@@ -1310,6 +1310,8 @@ pub fn parse_document_xml_with_warnings(
             columns: engine::ColumnSpec::single(),
             page_num: engine::PageNumType::default(),
             section_type: engine::SectionType::default(),
+            footnote_props: engine::NoteProps::default(),
+            endnote_props: engine::NoteProps::default(),
         });
     }
 
