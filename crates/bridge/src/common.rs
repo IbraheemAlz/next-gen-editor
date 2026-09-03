@@ -175,6 +175,19 @@ pub struct ImageRect {
     /// scale chain in the shell.
     pub width_emu: i64,
     pub height_emu: i64,
+    /// Issue #69 — `true` for a floating (`<wp:anchor>`) image. Floats
+    /// are positioned against a reference frame instead of flowing with
+    /// the text, so the shell's body-drag repositions them through
+    /// `Command::MoveImage`; inline images (`false`) only resize.
+    pub floating: bool,
+    /// Issue #69 — top-left corner of the reference frame the float's
+    /// offsets are measured from, in the same absolute device-px space as
+    /// `rect` (`0.0` for inline images and `simplePos` floats, whose frame
+    /// is the page corner). The shell turns a dragged rect back into
+    /// frame-relative EMU offsets with the pure ratio `width_emu / rect.w`
+    /// — zoom / DPR independent, like the resize handles.
+    pub frame_x: f32,
+    pub frame_y: f32,
 }
 
 /// Document container format.

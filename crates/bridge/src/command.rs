@@ -187,6 +187,21 @@ pub enum Command {
         width_emu: i64,
         height_emu: i64,
     },
+    /// Issue #69 — reposition the FLOATING (`<wp:anchor>`) image anchored
+    /// at `(path, at)`: both positioning axes become fixed EMU offsets
+    /// (`<wp:posOffset>`) inside their CURRENT reference frames
+    /// (`relativeFrom` is preserved; an `<wp:align>` / percentage
+    /// placement is replaced, and `simplePos` is switched off — exactly
+    /// what Word does the moment an aligned object is dragged). Drives the
+    /// body-drag of the image overlay. Replies `Event::Error` when the
+    /// address holds no floating image — inline images flow with the text
+    /// and have no free position.
+    MoveImage {
+        path: BlockPath,
+        at: u32,
+        offset_h_emu: i64,
+        offset_v_emu: i64,
+    },
 
     /* Selection */
     SetSelection {

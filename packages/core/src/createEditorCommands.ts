@@ -162,6 +162,18 @@ export interface EditorCommands {
         widthEmu: number,
         heightEmu: number,
     ): Promise<Event>;
+    /** Issue #69 — reposition the FLOATING (`<wp:anchor>`) image at
+     *  `(path, at)`: both axes become fixed EMU offsets inside their
+     *  current reference frames (`relativeFrom` preserved; an alignment /
+     *  percentage placement is replaced, `simplePos` switched off). The
+     *  engine answers `ERROR` for an inline image — only rects with
+     *  `ImageRect.floating` accept a move. */
+    moveImage(
+        path: BlockPath,
+        at: number,
+        offsetHEmu: number,
+        offsetVEmu: number,
+    ): Promise<Event>;
     /** Issue #44 — query every inline image's on-canvas rect + resize
      *  address. Resolve the `Event` and read `images` when it is an
      *  `IMAGE_RECTS` reply. */
@@ -471,6 +483,14 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 at,
                 width_emu: widthEmu,
                 height_emu: heightEmu,
+            }),
+        moveImage: (path, at, offsetHEmu, offsetVEmu) =>
+            dispatch({
+                type: 'MOVE_IMAGE',
+                path,
+                at,
+                offset_h_emu: offsetHEmu,
+                offset_v_emu: offsetVEmu,
             }),
         getImageRects: () => dispatch({ type: 'GET_IMAGE_RECTS' }),
 

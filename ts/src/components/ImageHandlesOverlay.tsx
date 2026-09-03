@@ -1,4 +1,5 @@
 /* Issue #44 — interactive image resize handles.
+ * Issue #69 — body-drag repositioning of FLOATING images.
  *
  * When an inline image is selected (`store.selectedImage()`, set by the
  * pointer path on an image click), this overlay draws a bounding outline
@@ -16,7 +17,16 @@
  *   - Engine dispatches are coalesced to one per animation frame; the
  *     final size is flushed synchronously on pointerup.
  *
- * Corner handles keep aspect ratio; edge handles stretch a single axis. */
+ * Corner handles keep aspect ratio; edge handles stretch a single axis.
+ *
+ * Floating images (`ImageRectCss.floating`, a `<wp:anchor>` picture) also
+ * get a body-drag layer: pressing inside the outline and dragging moves
+ * the outline optimistically, and pointerup commits ONE `MOVE_IMAGE` with
+ * the new frame-relative offsets in EMU — `(newOrigin - frameOrigin) ×
+ * widthEmu / rect.w`, the same zoom / DPR-free ratio the resize path
+ * uses, so the shell never reconstructs the layout scale chain. Inline
+ * images have no body layer (their sentinel flows with the text; a press
+ * on the body still reaches the canvas and keeps the image selected). */
 import { For, Show, createSignal } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
 import type { EngineStore, ImageRectCss } from '../state/engine-store';
@@ -53,6 +63,8 @@ export function ImageHandlesOverlay(props: {
 }) {
     /* Optimistic size during a drag, in CSS px — null when not dragging. */
     const [liveSize, setLiveSize] = createSignal<{ w: number; h: number } | null>(null);
+    /* Issue #69 — optimistic translation during a body drag (CSS px). */
+    const [liveOffset, setLiveOffset] = createSignal<{ dx: number; dy: number } | null>(null);
 
     /** The selected image's rect, if it exists and sits on THIS page. */
     const selected = (): ImageRectCss | undefined => {
@@ -86,12 +98,65 @@ export function ImageHandlesOverlay(props: {
         const live = liveSize();
         const w = live ? live.w : im.rect.w;
         const h = live ? live.h : im.rect.h;
+        const off = liveOffset();
         return {
-            left: im.rect.x,
-            top: im.rect.y - props.store.pageTopCss(props.pageIdx),
+            left: im.rect.x + (off ? off.dx : 0),
+            top: im.rect.y - props.store.pageTopCss(props.pageIdx) + (off ? off.dy : 0),
             w,
             h,
         };
+    };
+
+    /** Issue #69 — body drag of a floating image: move, then commit ONE
+     *  `MOVE_IMAGE` on release (one undo entry, like the resize path). */
+    const startMove = (e: PointerEvent): void => {
+        const im = selected();
+        if (!im || !im.floating) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const addr = { path: im.path, at: im.at };
+        const startX = e.clientX;
+        const startY = e.clientY;
+        /* px → EMU: the image's own extent gives the exact ratio. */
+        const emuPerPx = im.widthEmu / Math.max(1, im.rect.w);
+        let dx = 0;
+        let dy = 0;
+        const target = e.currentTarget as HTMLElement;
+        try {
+            target.setPointerCapture(e.pointerId);
+        } catch {
+            /* non-fatal — the window listeners below still fire */
+        }
+        const onMove = (ev: PointerEvent): void => {
+            dx = ev.clientX - startX;
+            dy = ev.clientY - startY;
+            setLiveOffset({ dx, dy });
+        };
+        const onUp = (ev: PointerEvent): void => {
+            try {
+                target.releasePointerCapture?.(ev.pointerId);
+            } catch {
+                /* capture may never have been granted — ignore */
+            }
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+            setLiveOffset(null);
+            if (dx === 0 && dy === 0) return; // a plain click keeps the selection
+            /* New top-left, frame-relative, in CSS px → EMU. */
+            const offXPx = im.rect.x + dx - im.frameX;
+            const offYPx = im.rect.y + dy - im.frameY;
+            void props.client
+                .dispatch({
+                    type: 'MOVE_IMAGE',
+                    path: addr.path,
+                    at: addr.at,
+                    offset_h_emu: Math.round(offXPx * emuPerPx),
+                    offset_v_emu: Math.round(offYPx * emuPerPx),
+                })
+                .catch((err: unknown) => console.error('moveImage failed', err));
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
     };
 
     const startDrag = (handle: HandleDef, e: PointerEvent): void => {
@@ -186,6 +251,13 @@ export function ImageHandlesOverlay(props: {
                         height: `${b().h}px`,
                     }}
                 >
+                    <Show when={selected()?.floating}>
+                        <div
+                            class="image-body-drag"
+                            title="Drag to reposition the floating image"
+                            onPointerDown={startMove}
+                        />
+                    </Show>
                     <For each={HANDLES}>
                         {(handle) => (
                             <div

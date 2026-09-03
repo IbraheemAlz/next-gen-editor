@@ -182,7 +182,11 @@ fn collect_table_floats(
                     cell_w,
                     FloatAnchorRef::Body {
                         block: block_idx,
-                        cell: Some(CellAnchorRef { row: r, col: c, inner }),
+                        cell: Some(CellAnchorRef {
+                            row: r,
+                            col: c,
+                            inner,
+                        }),
                     },
                     out,
                 );
@@ -415,7 +419,11 @@ mod tests {
             height: 16.0,
             width: 20.0,
             runs: vec![VisualRun {
-                glyphs: vec![glyph(0, 10.0, None), glyph(1, 0.0, Some(fg)), glyph(4, 10.0, None)],
+                glyphs: vec![
+                    glyph(0, 10.0, None),
+                    glyph(1, 0.0, Some(fg)),
+                    glyph(4, 10.0, None),
+                ],
                 font: "f".into(),
                 direction: ShapingDirection::Ltr,
                 source_range: 0..5,
@@ -482,7 +490,13 @@ mod tests {
         /* column = content area: x0 = 80; paragraph top = 50 + 100. */
         assert_eq!(f.origin, Point { x: 110.0, y: 155.0 });
         assert_eq!(f.frame_origin, Point { x: 80.0, y: 150.0 });
-        assert_eq!(f.size, Size { width: 100.0, height: 50.0 });
+        assert_eq!(
+            f.size,
+            Size {
+                width: 100.0,
+                height: 50.0
+            }
+        );
         assert_eq!(f.at, 1, "sentinel byte offset");
         assert_eq!(f.rel_id, "rId9");
         assert_eq!(f.z_order, 7);
@@ -518,11 +532,17 @@ mod tests {
             FloatOffsetPx::Fraction(0.5),
         );
         let odd = page(
-            vec![LayoutBlock::Paragraph(para_with_float(Point::default(), inside))],
+            vec![LayoutBlock::Paragraph(para_with_float(
+                Point::default(),
+                inside,
+            ))],
             1,
         );
         let even = page(
-            vec![LayoutBlock::Paragraph(para_with_float(Point::default(), inside))],
+            vec![LayoutBlock::Paragraph(para_with_float(
+                Point::default(),
+                inside,
+            ))],
             2,
         );
         let fo = &resolve_page_floats(&odd, ColumnLayout::default())[0];
@@ -588,12 +608,15 @@ mod tests {
 
     #[test]
     fn paragraphs_without_sentinels_yield_no_floats() {
-        let mut p = para_with_float(Point::default(), spec(
-            HRelativeFrom::Page,
-            FloatOffsetPx::Px(0.0),
-            VRelativeFrom::Page,
-            FloatOffsetPx::Px(0.0),
-        ));
+        let mut p = para_with_float(
+            Point::default(),
+            spec(
+                HRelativeFrom::Page,
+                FloatOffsetPx::Px(0.0),
+                VRelativeFrom::Page,
+                FloatOffsetPx::Px(0.0),
+            ),
+        );
         for run in &mut p.lines[0].runs {
             for g in &mut run.glyphs {
                 g.float = None;

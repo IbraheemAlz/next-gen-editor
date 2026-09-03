@@ -137,6 +137,18 @@
     z-index: 2;
 }
 
+/* Issue #69 — floating-image body layer: the only part of the outline
+   box that captures the pointer, so a press inside a `<wp:anchor>` picture
+   starts a move instead of reaching the canvas. Absent for inline images. */
+.image-body-drag {
+    position: absolute;
+    inset: 0;
+    cursor: move;
+    pointer-events: auto;
+    touch-action: none;
+    z-index: 2;
+}
+
 .image-handle {
     position: absolute;
     width: 10px;

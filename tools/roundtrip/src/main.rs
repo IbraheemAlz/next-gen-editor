@@ -181,6 +181,7 @@ fn run_default() -> Result<()> {
     );
 
     run_grab_bag_survival()?;
+    run_floating_anchor_survival()?;
 
     println!("\nPASS");
     Ok(())
@@ -469,6 +470,260 @@ fn run_grab_bag_survival() -> Result<()> {
         bail!("paragraph grab bag did not survive the round-trip: {ppr_a:?} vs {ppr_b:?}");
     }
     println!("[roundtrip] step 9 OK — grab bags survive dirty regeneration byte-for-byte");
+    Ok(())
+}
+
+/* ============================================ floating anchors (#69) ==== */
+
+/// Issue #69 — the `word/document.xml` of the floating-picture fixture,
+/// authored in the writer's own canonical shape (Word's `CT_Anchor` child
+/// order, compact, `xml:space="preserve"`) so a regenerated paragraph is
+/// byte-identical to its source except for the edit itself. The anchor
+/// exercises a fixed EMU offset (`<wp:posOffset>`), a Word-2010 percentage
+/// offset (`<wp14:pctPosVOffset>`, root-bound `wp14`), an empty wrap
+/// element and a `<wp:docPr>` with a `descr` — the two children that ride
+/// the model verbatim.
+fn floating_anchor_document_xml() -> String {
+    concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        "\n",
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+        r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+        r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+        r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+        r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+        r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing">"#,
+        "<w:body>",
+        r#"<w:p><w:r><w:t xml:space="preserve">before</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">float </w:t></w:r>"#,
+        "<w:r><w:drawing>",
+        r#"<wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" "#,
+        r#"relativeHeight="251659264" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">"#,
+        r#"<wp:simplePos x="0" y="0"/>"#,
+        r#"<wp:positionH relativeFrom="column"><wp:posOffset>914400</wp:posOffset></wp:positionH>"#,
+        r#"<wp:positionV relativeFrom="paragraph"><wp14:pctPosVOffset>25000</wp14:pctPosVOffset></wp:positionV>"#,
+        r#"<wp:extent cx="914400" cy="457200"/>"#,
+        r#"<wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+        r#"<wp:wrapSquare wrapText="bothSides"/>"#,
+        r#"<wp:docPr id="7" name="Picture 7" descr="floating fixture"/>"#,
+        "<wp:cNvGraphicFramePr/>",
+        "<a:graphic>",
+        r#"<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+        "<pic:pic>",
+        r#"<pic:nvPicPr><pic:cNvPr id="0" name="Image"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+        "<pic:blipFill>",
+        r#"<a:blip r:embed="rId5"/>"#,
+        "<a:stretch><a:fillRect/></a:stretch>",
+        "</pic:blipFill>",
+        "<pic:spPr>",
+        r#"<a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>"#,
+        r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>"#,
+        "</pic:spPr>",
+        "</pic:pic>",
+        "</a:graphicData>",
+        "</a:graphic>",
+        "</wp:anchor></w:drawing></w:r>",
+        r#"<w:r><w:t xml:space="preserve">here</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p>"#,
+        "<w:sectPr/></w:body></w:document>",
+    )
+    .to_string()
+}
+
+/// Issue #69 fixture: three paragraphs, the middle one anchoring a
+/// floating picture (`<wp:anchor>`) whose blob lives at
+/// `word/media/image1.png` (the 8-byte PNG signature — the reader stores
+/// bytes, decoding happens in the browser). Rides the `--fixtures`
+/// passthrough at drift 0 and the default harness's step 10.
+fn build_floating_image_anchor_docx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+    let document_xml = floating_anchor_document_xml();
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+    let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>"#;
+    let png_signature: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, body) in [
+            ("[Content_Types].xml", content_types.as_bytes()),
+            ("_rels/.rels", dot_rels.as_bytes()),
+            ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+            ("word/document.xml", document_xml.as_bytes()),
+            ("word/media/image1.png", png_signature),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// Issue #69 — step 10: open the floating-picture fixture, check the
+/// anchor lowered into the typed model, edit the anchor paragraph BEFORE
+/// the sentinel (so the anchor byte shifts), save, and require that the
+/// regenerated `document.xml` is EXACTLY the source with the insert
+/// applied — the `<wp:anchor>` (attributes, both positioning axes, the
+/// wp14 percentage element, the verbatim wrap + docPr) survives byte-for-
+/// byte, and a second read still sees a floating picture at the shifted
+/// offset. Then move the float and check the offsets land in the file.
+fn run_floating_anchor_survival() -> Result<()> {
+    use engine::{BlockPath, FloatOffset, HRelativeFrom, LogicalPos, VRelativeFrom, WrapKind};
+
+    let fixture_bytes = build_floating_image_anchor_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read floating fixture")?;
+    let doc_a_tree = &archive_a.document;
+    if doc_a_tree.paragraph_text(1) != Some("float \u{FFFC}here") {
+        bail!(
+            "floating fixture text mismatch: {:?}",
+            doc_a_tree.paragraph_text(1)
+        );
+    }
+    let para = doc_a_tree
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .nth(1)
+        .context("anchor paragraph")?;
+    let obj = para.inline_objects.first().context("one inline object")?;
+    let anchor = obj
+        .anchor
+        .as_deref()
+        .context("the picture must be floating")?;
+    if obj.at != 6
+        || anchor.position_h.relative_from != HRelativeFrom::Column
+        || anchor.position_h.offset != FloatOffset::Emu(914_400)
+        || anchor.position_v.relative_from != VRelativeFrom::Paragraph
+        || anchor.position_v.offset != FloatOffset::PercentMilli(25_000)
+        || anchor.wrap != WrapKind::Square
+        || anchor.dist_left_emu != 114_300
+        || anchor.relative_height != 251_659_264
+    {
+        bail!(
+            "floating fixture anchor lowered wrongly: at={} {anchor:?}",
+            obj.at
+        );
+    }
+    if doc_a_tree.count_floating_images() != 1 {
+        bail!("expected exactly one floating image");
+    }
+
+    /* Edit BEFORE the sentinel: "flo|at " — the anchor byte must shift. */
+    let pos = LogicalPos {
+        path: BlockPath::top(1),
+        offset: 3,
+    };
+    let edited = doc_a_tree.insert_text(pos, INSERT_TEXT);
+    let expected_para = format!("flo{INSERT_TEXT}at \u{FFFC}here");
+    if edited.paragraph_text(1) != Some(expected_para.as_str()) {
+        bail!("in-memory edit wrong: {:?}", edited.paragraph_text(1));
+    }
+    let edited_bytes = write_docx(&archive_a, &edited).context("write edited floating")?;
+    assert_document_xml_well_formed(&edited_bytes).context("edited floating .docx")?;
+
+    /* Siblings (rels, content types, the media blob) verbatim. */
+    let archive_b = read_docx(&edited_bytes).context("re-read edited floating")?;
+    for (name, bytes) in &archive_a.other_entries {
+        let same = archive_b
+            .other_entries
+            .iter()
+            .any(|(n, b)| n == name && b == bytes);
+        if !same {
+            bail!("floating fixture: sibling `{name}` drifted");
+        }
+    }
+
+    /* Exact expected output: source + the insert, nothing else. */
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let doc_b = String::from_utf8(extract_doc_xml(&edited_bytes)?).context("utf8 output")?;
+    let expected = doc_a.replacen(
+        r#"<w:t xml:space="preserve">float </w:t>"#,
+        &format!(r#"<w:t xml:space="preserve">flo{INSERT_TEXT}at </w:t>"#),
+        1,
+    );
+    if doc_b != expected {
+        bail!(
+            "regenerated document.xml is not source + edit\n--- expected ---\n{expected}\n--- got ---\n{doc_b}"
+        );
+    }
+    let drift = (doc_b.len() as isize - doc_a.len() as isize).unsigned_abs();
+    println!(
+        "[roundtrip] floating document.xml: {} -> {} bytes (Δ {} B, inserted {} B)",
+        doc_a.len(),
+        doc_b.len(),
+        drift,
+        INSERT_TEXT.len()
+    );
+    if drift > 2 * INSERT_TEXT.len() {
+        bail!(
+            "floating document.xml drift {drift} B exceeds bound {} B",
+            2 * INSERT_TEXT.len()
+        );
+    }
+
+    /* The re-read picture is still floating, at the shifted sentinel. */
+    let para_b = archive_b
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .nth(1)
+        .context("anchor paragraph after edit")?;
+    let obj_b = para_b.inline_objects.first().context("object survives")?;
+    if obj_b.at != 6 + INSERT_TEXT.len() as u32 || obj_b.anchor.as_deref() != Some(anchor) {
+        bail!(
+            "anchor did not survive the edit: at={} {:?}",
+            obj_b.at,
+            obj_b.anchor
+        );
+    }
+
+    /* A move writes fixed EMU offsets on both axes (the percentage
+    placement is replaced) inside the SAME frames; simplePos stays off. */
+    let moved = edited.move_floating_image_at(&BlockPath::top(1), obj_b.at, 1_828_800, 91_440);
+    let moved_bytes = write_docx(&archive_a, &moved).context("write moved floating")?;
+    let doc_c = String::from_utf8(extract_doc_xml(&moved_bytes)?).context("utf8 moved")?;
+    let needle_h = r#"<wp:positionH relativeFrom="column"><wp:posOffset>1828800</wp:posOffset></wp:positionH>"#;
+    let needle_v = r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>91440</wp:posOffset></wp:positionV>"#;
+    if !doc_c.contains(needle_h) || !doc_c.contains(needle_v) || doc_c.contains("pctPosVOffset") {
+        bail!("moved anchor offsets did not land in document.xml:\n{doc_c}");
+    }
+    let archive_c = read_docx(&moved_bytes).context("re-read moved floating")?;
+    let anchor_c = archive_c
+        .document
+        .blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .nth(1)
+        .and_then(|p| p.inline_objects.first())
+        .and_then(|o| o.anchor.as_deref())
+        .cloned()
+        .context("moved picture still floating")?;
+    if anchor_c.position_h.offset != FloatOffset::Emu(1_828_800)
+        || anchor_c.position_v.offset != FloatOffset::Emu(91_440)
+        || anchor_c.wrap_xml != anchor.wrap_xml
+        || anchor_c.doc_pr_xml != anchor.doc_pr_xml
+    {
+        bail!("moved anchor re-read wrongly: {anchor_c:?}");
+    }
+    println!("[roundtrip] step 10 OK — floating anchor survives edit + move byte-for-byte");
     Ok(())
 }
 
@@ -836,6 +1091,25 @@ struct PrebuiltFixture {
 
 fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
     vec![
+        /* Issue #69 — a `<wp:anchor>` floating picture; passthrough drift 0
+        on a zero-edit resave, exact regeneration in step 10. */
+        PrebuiltFixture {
+            name: "floating_image_anchor.docx",
+            bytes: build_floating_image_anchor_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 3,
+                    paragraph_texts: vec![
+                        "before".into(),
+                        "float \u{FFFC}here".into(),
+                        "after".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
         PrebuiltFixture {
             name: "style_cascade.docx",
             bytes: build_style_cascade_docx(),

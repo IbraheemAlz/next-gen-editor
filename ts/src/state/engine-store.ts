@@ -143,6 +143,15 @@ export interface ImageRectCss {
     rect: Rect; // CSS px, document-absolute
     widthEmu: number;
     heightEmu: number;
+    /** Issue #69 — `true` for a floating (`<wp:anchor>`) image: the body
+     *  drags to reposition it (`MOVE_IMAGE`); inline images only resize. */
+    floating: boolean;
+    /** Issue #69 — top-left of the float's reference frame, CSS px,
+     *  document-absolute (same space as `rect`; 0,0 for inline images).
+     *  A dragged rect converts back to frame-relative EMU offsets with the
+     *  pure ratio `widthEmu / rect.w`, like the resize handles. */
+    frameX: number;
+    frameY: number;
 }
 export interface ImageAddr {
     path: BlockPath;
@@ -334,6 +343,9 @@ export function createEngineStore(client: EngineClient) {
                 rect: toCssRect(im.rect, dpr),
                 widthEmu: im.width_emu,
                 heightEmu: im.height_emu,
+                floating: im.floating,
+                frameX: im.frame_x / dpr,
+                frameY: im.frame_y / dpr,
             }));
             setImageRectsSig(rects);
             const sel = selectedImageSig();

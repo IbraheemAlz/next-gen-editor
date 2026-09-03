@@ -5380,13 +5380,17 @@ impl DocumentTree {
     }
 
     /// Issue #69 — reposition the FLOATING image anchored at `(path, at)`
-    /// to fixed offsets inside its current reference frames: both axes
-    /// become `FloatOffset::Emu` (an `<wp:align>` / percentage placement
-    /// is replaced, exactly as Word converts an aligned object to an
-    /// absolute offset the moment it is dragged) and `simplePos` is
-    /// switched off so the axes are what the layout reads. The reference
-    /// frames (`relative_from`) are preserved. A no-op (structural clone)
-    /// when the offset holds no floating image.
+    /// to fixed offsets inside its reference frames: both axes become
+    /// `FloatOffset::Emu` (an `<wp:align>` / percentage placement is
+    /// replaced, exactly as Word converts an aligned object to an absolute
+    /// offset the moment it is dragged) and `simplePos` is switched off so
+    /// the axes are what the layout reads. The reference frames
+    /// (`relative_from`) are preserved — EXCEPT for a `simplePos` object,
+    /// whose only frame was the page corner: the layout reports its frame
+    /// origin as the page's top-left, the shell hands back page-relative
+    /// offsets, so both axes are re-based onto `Page` to keep the object
+    /// where it was dropped. A no-op (structural clone) when the offset
+    /// holds no floating image.
     pub fn move_floating_image_at(
         &self,
         path: &BlockPath,
@@ -5401,6 +5405,10 @@ impl DocumentTree {
                     && matches!(io.kind, InlineKind::Image { .. })
                     && let Some(anchor) = io.anchor.as_mut()
                 {
+                    if anchor.simple_pos {
+                        anchor.position_h.relative_from = HRelativeFrom::Page;
+                        anchor.position_v.relative_from = VRelativeFrom::Page;
+                    }
                     anchor.position_h.offset = FloatOffset::Emu(offset_h_emu);
                     anchor.position_v.offset = FloatOffset::Emu(offset_v_emu);
                     anchor.simple_pos = false;
@@ -7641,19 +7649,16 @@ mod tests {
     }
 
     #[test]
-    fn move_floating_image_sets_fixed_offsets_and_clears_simple_pos() {
+    fn move_floating_image_sets_fixed_offsets_and_keeps_the_frames() {
         let anchor = FloatAnchor {
             position_h: HPosition {
                 relative_from: HRelativeFrom::Margin,
                 offset: FloatOffset::Align(FloatAlign::Center),
             },
             position_v: VPosition {
-                relative_from: VRelativeFrom::Page,
+                relative_from: VRelativeFrom::Paragraph,
                 offset: FloatOffset::PercentMilli(25_000),
             },
-            simple_pos: true,
-            simple_pos_x_emu: 10,
-            simple_pos_y_emu: 20,
             ..FloatAnchor::default()
         };
         let d = floating_image_doc(anchor).move_floating_image_at(&BlockPath::top(0), 2, 111, 222);
@@ -7666,12 +7671,40 @@ mod tests {
             HRelativeFrom::Margin,
             "the reference frame is preserved — only the offset moves"
         );
-        assert_eq!(a.position_v.relative_from, VRelativeFrom::Page);
-        assert!(!a.simple_pos, "a drag replaces simplePos with the axes");
+        assert_eq!(a.position_v.relative_from, VRelativeFrom::Paragraph);
+        assert!(!a.simple_pos);
         assert!(
             d.blocks[0].as_paragraph().unwrap().dirty,
             "a move dirties the paragraph so the writer regenerates the anchor"
         );
+    }
+
+    /// A `simplePos` object was positioned from the page corner; the shell
+    /// hands back page-relative offsets, so the move must re-base both axes
+    /// onto the `Page` frame (else the object would jump on its first drag).
+    #[test]
+    fn move_floating_image_rebases_simple_pos_onto_the_page_frame() {
+        let anchor = FloatAnchor {
+            position_h: HPosition {
+                relative_from: HRelativeFrom::Margin,
+                offset: FloatOffset::Align(FloatAlign::Center),
+            },
+            position_v: VPosition {
+                relative_from: VRelativeFrom::Paragraph,
+                offset: FloatOffset::Emu(5),
+            },
+            simple_pos: true,
+            simple_pos_x_emu: 10,
+            simple_pos_y_emu: 20,
+            ..FloatAnchor::default()
+        };
+        let d = floating_image_doc(anchor).move_floating_image_at(&BlockPath::top(0), 2, 111, 222);
+        let a = first_object(&d).anchor.as_deref().expect("still floating");
+        assert!(!a.simple_pos, "a drag replaces simplePos with the axes");
+        assert_eq!(a.position_h.relative_from, HRelativeFrom::Page);
+        assert_eq!(a.position_v.relative_from, VRelativeFrom::Page);
+        assert_eq!(a.position_h.offset, FloatOffset::Emu(111));
+        assert_eq!(a.position_v.offset, FloatOffset::Emu(222));
     }
 
     #[test]
@@ -7714,7 +7747,10 @@ mod tests {
         );
         let obj = first_object(&d);
         assert_eq!(obj.at, 1, "sentinel shifted by the deleted byte");
-        assert!(obj.is_floating(), "the anchor must travel with its sentinel");
+        assert!(
+            obj.is_floating(),
+            "the anchor must travel with its sentinel"
+        );
         /* Insert text before it: shifts right, still floating. */
         let d = d.insert_text(
             LogicalPos {

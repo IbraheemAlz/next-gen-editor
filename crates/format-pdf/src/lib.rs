@@ -800,6 +800,14 @@ fn show_run(
     };
     let mut pen = 0.0_f32;
     for glyph in &run.glyphs {
+        /* Issue #69 — a floating object's sentinel glyph reserves no
+        width and shows nothing in the line (the object is positioned
+        from `PageBox::floats`); skip it so a font that maps U+FFFC to a
+        real glyph never prints a zero-advance mark. */
+        if glyph.float.is_some() {
+            pen += glyph.x_advance;
+            continue;
+        }
         let gx = run_x + pen + glyph.x_offset;
         /* Invert the y axis: PDF origin is bottom-left. `<w:vertAlign>`
         baseline shift lifts (positive) / drops (negative) the run. */

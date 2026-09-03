@@ -42,8 +42,12 @@ pub struct InlineObjectInfo {
 /// superscript.
 #[derive(Debug, Clone)]
 pub enum InlineObjectInfoKind {
-    Image { rel_id: String },
-    FootnoteMarker { text: String },
+    Image {
+        rel_id: String,
+    },
+    FootnoteMarker {
+        text: String,
+    },
     /// Issue #69 — a FLOATING image (`<wp:anchor>`). The sentinel glyph
     /// reserves no width; `width_px` / `height_px` on the owning
     /// [`InlineObjectInfo`] are the object's own extent, carried to the

@@ -1651,6 +1651,35 @@ fn apply_hyperlink_overlay(
     out
 }
 
+/// Issue #69 — lower an engine `FloatAnchor` (EMU, thousandths of a
+/// percent, `simplePos` flag + coordinates) into the layout's resolved-
+/// unit `FloatSpec` at the current scale: `px = emu_to_pt(emu) × scale`,
+/// `PercentMilli(50_000)` ⇒ `Fraction(0.5)`, `simple_pos` ⇒ a page-
+/// absolute `Point`. Frames, z-order and the layering flags pass through.
+fn float_spec_from_anchor(anchor: &engine::FloatAnchor, scale: f32) -> layout::FloatSpec {
+    let px = |emu: i64| engine::emu_to_pt(emu) * scale;
+    let lower = |offset: engine::FloatOffset| match offset {
+        engine::FloatOffset::Emu(emu) => layout::FloatOffsetPx::Px(px(emu)),
+        engine::FloatOffset::Align(align) => layout::FloatOffsetPx::Align(align),
+        engine::FloatOffset::PercentMilli(milli) => {
+            layout::FloatOffsetPx::Fraction(milli as f32 / 100_000.0)
+        }
+    };
+    layout::FloatSpec {
+        h_frame: anchor.position_h.relative_from,
+        h_offset: lower(anchor.position_h.offset),
+        v_frame: anchor.position_v.relative_from,
+        v_offset: lower(anchor.position_v.offset),
+        simple_pos: anchor.simple_pos.then(|| layout::Point {
+            x: px(anchor.simple_pos_x_emu),
+            y: px(anchor.simple_pos_y_emu),
+        }),
+        z_order: anchor.relative_height,
+        behind_doc: anchor.behind_doc,
+        hidden: anchor.hidden,
+    }
+}
+
 /// Phase 7 — build the layout-side inline object table for one paragraph.
 /// EMU dimensions become layout pixels at the current scale: 914400 EMU is
 /// one inch, one inch is 72 pt, so `px = emu * scale / 12700`. The
@@ -1672,8 +1701,18 @@ fn build_inline_object_infos(
                 at: obj.at,
                 width_px: engine::emu_to_pt(*width_emu) * scale,
                 height_px: engine::emu_to_pt(*height_emu) * scale,
-                kind: layout::paragraph::InlineObjectInfoKind::Image {
-                    rel_id: rel_id.clone(),
+                /* Issue #69 — a `<wp:anchor>` image floats: the sentinel
+                reserves no width and the positioning spec rides to the
+                paginator (`layout::floats`) with EMUs already scaled to
+                layout px. `<wp:inline>` keeps the Phase 7 in-line box. */
+                kind: match obj.anchor.as_deref() {
+                    Some(anchor) => layout::paragraph::InlineObjectInfoKind::FloatingImage {
+                        rel_id: rel_id.clone(),
+                        spec: float_spec_from_anchor(anchor, scale),
+                    },
+                    None => layout::paragraph::InlineObjectInfoKind::Image {
+                        rel_id: rel_id.clone(),
+                    },
                 },
             },
             engine::InlineKind::FootnoteRef { display_number, .. } => {
@@ -1994,6 +2033,48 @@ fn paragraph_layout_key(
             Some(engine::VertAlign::Baseline) => 1u8.hash(&mut h),
             Some(engine::VertAlign::Superscript) => 2u8.hash(&mut h),
             Some(engine::VertAlign::Subscript) => 3u8.hash(&mut h),
+        }
+    }
+    /* Issue #69 (and #44) — inline objects are layout inputs: an inline
+    image's EMU extent sets the box the line reserves, a footnote marker
+    its label width, and a floating image's anchor spec rides its sentinel
+    glyph into pagination. Undo / redo / recover swap whole trees WITHOUT
+    the explicit `layout_cache.clear()` the resize / move commands do, so
+    the key itself must see every one of them or a moved float snaps back
+    to its stale box after `Undo`. */
+    (para.inline_objects.len() as u64).hash(&mut h);
+    for io in &para.inline_objects {
+        io.at.hash(&mut h);
+        match &io.kind {
+            engine::InlineKind::Image {
+                rel_id,
+                width_emu,
+                height_emu,
+            } => {
+                1u8.hash(&mut h);
+                rel_id.hash(&mut h);
+                width_emu.hash(&mut h);
+                height_emu.hash(&mut h);
+            }
+            engine::InlineKind::FootnoteRef { id, display_number } => {
+                2u8.hash(&mut h);
+                id.hash(&mut h);
+                display_number.hash(&mut h);
+            }
+        }
+        match io.anchor.as_deref() {
+            None => 0u8.hash(&mut h),
+            Some(a) => {
+                1u8.hash(&mut h);
+                a.position_h.hash(&mut h);
+                a.position_v.hash(&mut h);
+                a.simple_pos.hash(&mut h);
+                a.simple_pos_x_emu.hash(&mut h);
+                a.simple_pos_y_emu.hash(&mut h);
+                a.relative_height.hash(&mut h);
+                a.behind_doc.hash(&mut h);
+                a.hidden.hash(&mut h);
+            }
         }
     }
     /* `engine::Alignment` / `text_pipeline::Alignment` carry no `Hash` derive —
@@ -3770,6 +3851,9 @@ fn collect_paragraph_image_rects(
                         the EMU extent. */
                         width_emu: 0,
                         height_emu: 0,
+                        floating: false,
+                        frame_x: 0.0,
+                        frame_y: 0.0,
                     });
                 }
                 pen += g.x_advance;
@@ -5050,6 +5134,12 @@ impl Engine {
                 width_emu,
                 height_emu,
             } => self.do_resize_image(path, at, width_emu, height_emu),
+            Command::MoveImage {
+                path,
+                at,
+                offset_h_emu,
+                offset_v_emu,
+            } => self.do_move_image(path, at, offset_h_emu, offset_v_emu),
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => self.do_select_all(),
@@ -7267,6 +7357,55 @@ impl Engine {
                         );
                     }
                 }
+            }
+            /* Issue #69 — floating images were positioned by the
+            paginator (`PageBox::floats`, page-relative px). Map each
+            anchor back to a body block path so the shell can select and
+            drag it. Header / footer floats are painted but not
+            addressable from the body story — skipped here, like the
+            band's inline images. */
+            for f in &page.floats {
+                let path = match f.anchor {
+                    layout::FloatAnchorRef::Body { block, cell } => {
+                        let Some(bp) = paths.get(block) else {
+                            continue;
+                        };
+                        match cell {
+                            None => engine_to_bridge_path(bp.clone()),
+                            Some(c) => BridgeBlockPath {
+                                steps: vec![
+                                    BridgePathStep::Block {
+                                        idx: bp.last_block_index().unwrap_or(0),
+                                    },
+                                    BridgePathStep::Cell {
+                                        row: c.row as u32,
+                                        col: c.col as u32,
+                                    },
+                                    BridgePathStep::Block {
+                                        idx: c.inner as u32,
+                                    },
+                                ],
+                            },
+                        }
+                    }
+                    layout::FloatAnchorRef::Header | layout::FloatAnchorRef::Footer => continue,
+                };
+                out.push(bridge::ImageRect {
+                    path,
+                    at: f.at,
+                    rel_id: f.rel_id.clone(),
+                    rect: BridgeRect {
+                        x: f.origin.x,
+                        y: page_top + f.origin.y,
+                        w: f.size.width,
+                        h: f.size.height,
+                    },
+                    width_emu: 0,
+                    height_emu: 0,
+                    floating: true,
+                    frame_x: f.frame_origin.x,
+                    frame_y: page_top + f.frame_origin.y,
+                });
             }
             page_top += page.size.height + gap;
         }
@@ -10721,6 +10860,54 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// `Command::MoveImage` (issue #69) — reposition the floating image
+    /// at `(path, at)` to fixed EMU offsets inside its current reference
+    /// frames ([`engine::DocumentTree::move_floating_image_at`]). The
+    /// paragraph layout LRU is cleared because the anchor spec rides the
+    /// sentinel glyph, then the page is re-paginated (floats are resolved
+    /// at page flush) and repainted. An address that holds no floating
+    /// image is an honest `Event::Error`, never a silent no-op — the
+    /// shell only offers the body-drag on `ImageRect.floating` rects.
+    fn do_move_image(
+        &mut self,
+        path: BridgeBlockPath,
+        at: u32,
+        offset_h_emu: i64,
+        offset_v_emu: i64,
+    ) -> Event {
+        let epath = bridge_to_engine_path(path);
+        let is_floating_image = self
+            .undo
+            .current()
+            .paragraph_at_path(&epath)
+            .is_some_and(|p| {
+                p.inline_objects.iter().any(|io| {
+                    io.at == at
+                        && io.is_floating()
+                        && matches!(io.kind, engine::InlineKind::Image { .. })
+                })
+            });
+        if !is_floating_image {
+            return Event::Error {
+                message: "MoveImage: no floating image at that address — inline images \
+                          flow with the text and have no free position (issue #69)"
+                    .into(),
+            };
+        }
+        let new_doc =
+            self.undo
+                .current()
+                .move_floating_image_at(&epath, at, offset_h_emu, offset_v_emu);
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
     /// `Command::SetColumns` (Sprint 2 UI Edition) — set the multi-
     /// column layout on the section containing `at`. Mutates
     /// `Section.columns` via [`engine::DocumentTree::set_section_columns_at`]
@@ -13759,6 +13946,166 @@ mod tests {
         assert!(
             after > before * 3.0,
             "quadrupling the EMU width must widen the laid-out rect (before {before}, after {after})"
+        );
+    }
+
+    /* ---------------------------------------------------------------
+    Issue #69 — floating (`<wp:anchor>`) images.
+    --------------------------------------------------------------- */
+
+    fn floating_image_doc(anchor: engine::FloatAnchor) -> DocumentTree {
+        let mut doc = DocumentTree::from_text("a\u{FFFC}b");
+        if let Some(p) = doc.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(engine::InlineObject {
+                at: 1,
+                kind: engine::InlineKind::Image {
+                    rel_id: "nge_float_1".to_string(),
+                    width_emu: 914_400,
+                    height_emu: 457_200,
+                },
+                anchor: Some(Box::new(anchor)),
+            });
+        }
+        doc
+    }
+
+    fn inline_image_doc() -> DocumentTree {
+        let mut doc = DocumentTree::from_text("\u{FFFC}");
+        if let Some(p) = doc.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(engine::InlineObject {
+                at: 0,
+                kind: engine::InlineKind::Image {
+                    rel_id: "nge_img_1".to_string(),
+                    width_emu: 914_400,
+                    height_emu: 457_200,
+                },
+                anchor: None,
+            });
+        }
+        doc
+    }
+
+    /// `image_geometry()` surfaces a float positioned against its frame:
+    /// column (= the content area, cross-checked against an inline image
+    /// that starts its paragraph) + 1 in horizontally, paragraph top +
+    /// 0.5 in vertically; `floating` is set and the frame origin rides
+    /// along for the shell's drag math.
+    #[test]
+    fn image_geometry_exposes_floating_image_rects() {
+        let anchor = engine::FloatAnchor {
+            position_h: engine::HPosition {
+                relative_from: engine::HRelativeFrom::Column,
+                offset: engine::FloatOffset::Emu(914_400),
+            },
+            position_v: engine::VPosition {
+                relative_from: engine::VRelativeFrom::Paragraph,
+                offset: engine::FloatOffset::Emu(457_200),
+            },
+            ..engine::FloatAnchor::default()
+        };
+        let engine = test_engine_with_doc(floating_image_doc(anchor));
+        let rects = engine.image_geometry().expect("image geometry");
+        assert_eq!(rects.len(), 1, "exactly one image rect");
+        let img = &rects[0];
+        assert!(img.floating, "a <wp:anchor> picture reports floating");
+        assert_eq!(img.at, 1);
+        assert_eq!(img.rel_id, "nge_float_1");
+        assert_eq!(img.path.steps, vec![BridgePathStep::Block { idx: 0 }]);
+        assert_eq!((img.width_emu, img.height_emu), (914_400, 457_200));
+        let inch = engine::emu_to_pt(914_400) * 2.0; // test scale = 2
+        assert!(
+            (img.rect.w - inch).abs() < 0.01,
+            "1 in wide: {:?}",
+            img.rect
+        );
+        assert!((img.rect.h - inch / 2.0).abs() < 0.01);
+        assert!(
+            (img.rect.x - (img.frame_x + inch)).abs() < 0.01,
+            "1 in right of the column frame: {img:?}"
+        );
+        assert!(
+            (img.rect.y - (img.frame_y + inch / 2.0)).abs() < 0.01,
+            "0.5 in below the paragraph top: {img:?}"
+        );
+        /* The column frame IS the content area: an inline image at the
+        start of a paragraph sits exactly there. */
+        let inline = test_engine_with_doc(inline_image_doc());
+        let inline_rect = &inline.image_geometry().expect("inline geometry")[0];
+        assert!(!inline_rect.floating);
+        assert!((inline_rect.rect.x - img.frame_x).abs() < 0.01);
+        assert!(img.frame_x > 0.0 && img.frame_y > 0.0);
+    }
+
+    /// `Command::MoveImage` shifts the float by the new offsets (frames
+    /// preserved), rejects an inline image with an honest error, and
+    /// `Undo` restores the old position.
+    #[test]
+    fn move_image_dispatch_shifts_the_float_and_rejects_inline() {
+        let mut engine = test_engine_with_doc(floating_image_doc(engine::FloatAnchor::default()));
+        let before = engine.image_geometry().expect("geom")[0].clone();
+        let evt = engine.do_move_image(BridgeBlockPath::top(0), 1, 914_400, 457_200);
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let after = engine.image_geometry().expect("geom")[0].clone();
+        let inch = engine::emu_to_pt(914_400) * 2.0;
+        assert!(
+            (after.rect.x - before.rect.x - inch).abs() < 0.01,
+            "{before:?} → {after:?}"
+        );
+        assert!((after.rect.y - before.rect.y - inch / 2.0).abs() < 0.01);
+        assert_eq!(after.frame_x, before.frame_x, "the frame is preserved");
+        assert_eq!(after.frame_y, before.frame_y);
+        assert!(after.floating);
+        /* Undo is one step. */
+        let evt = engine.do_undo();
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let undone = engine.image_geometry().expect("geom")[0].clone();
+        assert!((undone.rect.x - before.rect.x).abs() < 0.01);
+
+        let mut inline = test_engine_with_doc(inline_image_doc());
+        let evt = inline.do_move_image(BridgeBlockPath::top(0), 0, 1, 1);
+        assert!(
+            matches!(evt, Event::Error { .. }),
+            "an inline image has no free position: {evt:?}"
+        );
+    }
+
+    /// No wrap yet: a floating image's sentinel reserves no width and grows
+    /// no line — the caret geometry of "a\u{FFFC}b"+float equals "ab"'s,
+    /// while the SAME image inline widens the line (so the test
+    /// discriminates).
+    #[test]
+    fn floating_image_leaves_text_geometry_unchanged() {
+        let plain = test_engine_with_doc(DocumentTree::from_text("ab"));
+        let floated = test_engine_with_doc(floating_image_doc(engine::FloatAnchor::default()));
+        let g0 = plain.document_geometry().expect("geom");
+        let g1 = floated.document_geometry().expect("geom");
+        assert_eq!(g0.len(), 1);
+        assert_eq!(g1.len(), 1);
+        assert_eq!(g0[0].height, g1[0].height, "the line does not grow");
+        let end = |g: &LineGeom| g.slots.iter().map(|s| s.x).fold(f32::MIN, f32::max);
+        assert!(
+            (end(&g0[0]) - end(&g1[0])).abs() < 0.01,
+            "line end unchanged: {} vs {}",
+            end(&g0[0]),
+            end(&g1[0])
+        );
+        let mut inline_doc = DocumentTree::from_text("a\u{FFFC}b");
+        if let Some(p) = inline_doc.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(engine::InlineObject {
+                at: 1,
+                kind: engine::InlineKind::Image {
+                    rel_id: "nge_img_1".to_string(),
+                    width_emu: 914_400,
+                    height_emu: 457_200,
+                },
+                anchor: None,
+            });
+        }
+        let inline = test_engine_with_doc(inline_doc);
+        let g2 = inline.document_geometry().expect("geom");
+        assert!(
+            end(&g2[0]) > end(&g0[0]) + 10.0,
+            "the inline image DOES widen the line"
         );
     }
 
