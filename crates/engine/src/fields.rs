@@ -233,7 +233,11 @@ impl Field {
     pub fn evaluate_in(&self, env: &FieldEnv) -> Option<String> {
         match self.typed() {
             TypedField::Page => env.page.as_ref().and_then(|p| p.current.clone()),
-            TypedField::NumPages => env.page.as_ref().and_then(|p| p.total).map(|t| t.to_string()),
+            TypedField::NumPages => env
+                .page
+                .as_ref()
+                .and_then(|p| p.total)
+                .map(|t| t.to_string()),
             TypedField::Date { picture } => env.date.map(|_| {
                 render_date_time_picture(
                     picture.as_deref().unwrap_or("M/d/yyyy"),
@@ -328,7 +332,10 @@ pub fn render_date_time_picture(
             }};
         }
         emit!("yyyy", date.map(|(y, _, _)| format!("{y:04}")));
-        emit!("yy", date.map(|(y, _, _)| format!("{:02}", y.rem_euclid(100))));
+        emit!(
+            "yy",
+            date.map(|(y, _, _)| format!("{:02}", y.rem_euclid(100)))
+        );
         emit!("MM", date.map(|(_, m, _)| format!("{m:02}")));
         emit!("M", date.map(|(_, m, _)| m.to_string()));
         emit!("dd", date.map(|(_, _, d)| format!("{d:02}")));
@@ -341,11 +348,19 @@ pub fn render_date_time_picture(
         emit!("m", clock.map(|(_, m)| m.to_string()));
         emit!(
             "am/pm",
-            clock.map(|(h, _)| if h < 12 { "am".to_string() } else { "pm".to_string() })
+            clock.map(|(h, _)| if h < 12 {
+                "am".to_string()
+            } else {
+                "pm".to_string()
+            })
         );
         emit!(
             "AM/PM",
-            clock.map(|(h, _)| if h < 12 { "AM".to_string() } else { "PM".to_string() })
+            clock.map(|(h, _)| if h < 12 {
+                "AM".to_string()
+            } else {
+                "PM".to_string()
+            })
         );
         let ch = rest.chars().next().expect("non-empty rest");
         out.push(ch);
@@ -372,8 +387,16 @@ impl Paragraph {
         self.fields
             .iter()
             .position(|f| f.start < off && off < f.end)
-            .or_else(|| self.fields.iter().position(|f| f.end == off && f.start < f.end))
-            .or_else(|| self.fields.iter().position(|f| f.start == off && f.start < f.end))
+            .or_else(|| {
+                self.fields
+                    .iter()
+                    .position(|f| f.end == off && f.start < f.end)
+            })
+            .or_else(|| {
+                self.fields
+                    .iter()
+                    .position(|f| f.start == off && f.start < f.end)
+            })
     }
 
     /// Field whose result range is exactly `[lo, hi)`.
@@ -538,15 +561,27 @@ impl DocumentTree {
     /// Derived document for the field-code view — every paragraph in
     /// the body, in table cells and in every part swapped for
     /// [`Paragraph::with_field_codes`]. Layout + geometry run on this
-    /// tree while Alt+F9 is on; it is never stored or saved.
+    /// tree while Alt+F9 is on; it is never stored or saved. The field
+    /// overlays survive, remapped over the code text (see
+    /// [`Self::map_paragraphs`] for a caller that wants them stripped
+    /// so the paginator does not re-evaluate the displayed codes).
     pub fn to_code_view(&self) -> DocumentTree {
+        self.map_paragraphs(&|p| p.with_field_codes())
+    }
+
+    /// Structural map over every paragraph (body, table cells, every
+    /// header and footer part). Block structure and paths are preserved
+    /// exactly, so a path into `self` addresses the mapped paragraph in
+    /// the result. Doc-wide resources (styles, numbering, media,
+    /// settings) are shared.
+    pub fn map_paragraphs(&self, f: &impl Fn(&Paragraph) -> Paragraph) -> DocumentTree {
         let mut next = self.clone();
-        next.blocks = map_paragraphs_deep(&self.blocks, &|p| p.with_field_codes());
+        next.blocks = map_paragraphs_deep(&self.blocks, f);
         for (_, blocks) in next.headers.iter_mut() {
-            *blocks = map_paragraphs_deep_slice(blocks, &|p| p.with_field_codes());
+            *blocks = map_paragraphs_deep_slice(blocks, f);
         }
         for (_, blocks) in next.footers.iter_mut() {
-            *blocks = map_paragraphs_deep_slice(blocks, &|p| p.with_field_codes());
+            *blocks = map_paragraphs_deep_slice(blocks, f);
         }
         next
     }
@@ -562,6 +597,32 @@ impl DocumentTree {
         let index = para.field_index_at(at.offset)?;
         let mut blocks = self.blocks.clone();
         crate::mutate_paragraph_in_top(&mut blocks, &at.path, |p| {
+            *p = p.with_field_instruction(index, instruction);
+        })?;
+        let mut next = self.clone();
+        next.blocks = blocks;
+        Some(next)
+    }
+
+    /// Index-addressed variant of [`Self::set_field_instruction`] for
+    /// callers that resolved the field against a DERIVED paragraph (the
+    /// field-code view) — indices are stable across
+    /// [`Paragraph::with_field_codes`], offsets are not. `None` when
+    /// `path` addresses no paragraph, `index` no field, or the
+    /// instruction is blank.
+    pub fn set_field_instruction_at(
+        &self,
+        path: &BlockPath,
+        index: usize,
+        instruction: &str,
+    ) -> Option<Self> {
+        if instruction.trim().is_empty() {
+            return None;
+        }
+        let para = self.paragraph_at_path(path)?;
+        para.fields.get(index)?;
+        let mut blocks = self.blocks.clone();
+        crate::mutate_paragraph_in_top(&mut blocks, path, |p| {
             *p = p.with_field_instruction(index, instruction);
         })?;
         let mut next = self.clone();
@@ -774,7 +835,10 @@ fn visit_block(bi: u32, block: &Block, f: &mut impl FnMut(BlockPath, &Paragraph)
     }
 }
 
-fn map_paragraphs_deep(blocks: &Vector<Block>, f: &impl Fn(&Paragraph) -> Paragraph) -> Vector<Block> {
+fn map_paragraphs_deep(
+    blocks: &Vector<Block>,
+    f: &impl Fn(&Paragraph) -> Paragraph,
+) -> Vector<Block> {
     blocks.iter().map(|b| map_block(b, f)).collect()
 }
 
@@ -848,14 +912,20 @@ mod tests {
     #[test]
     fn typed_dispatch_and_code_text() {
         assert_eq!(field(0, 1, "PAGE").typed(), TypedField::Page);
-        assert_eq!(field(0, 1, "NUMPAGES \\* Arabic").typed(), TypedField::NumPages);
+        assert_eq!(
+            field(0, 1, "NUMPAGES \\* Arabic").typed(),
+            TypedField::NumPages
+        );
         assert_eq!(
             field(0, 1, "DATE \\@ \"yyyy\"").typed(),
             TypedField::Date {
                 picture: Some("yyyy".into())
             }
         );
-        assert_eq!(field(0, 1, "TIME").typed(), TypedField::Time { picture: None });
+        assert_eq!(
+            field(0, 1, "TIME").typed(),
+            TypedField::Time { picture: None }
+        );
         assert_eq!(
             field(0, 1, "FILENAME \\p").typed(),
             TypedField::FileName { with_path: true }
@@ -886,18 +956,32 @@ mod tests {
             author: Some("Ibrahim".into()),
         };
         assert_eq!(field(0, 1, "PAGE").evaluate_in(&env).as_deref(), Some("iv"));
-        assert_eq!(field(0, 1, "NUMPAGES").evaluate_in(&env).as_deref(), Some("12"));
-        assert_eq!(field(0, 1, "DATE").evaluate_in(&env).as_deref(), Some("9/1/2026"));
-        assert_eq!(field(0, 1, "TIME").evaluate_in(&env).as_deref(), Some("2:05 pm"));
         assert_eq!(
-            field(0, 1, "TIME \\@ \"HH:mm\"").evaluate_in(&env).as_deref(),
+            field(0, 1, "NUMPAGES").evaluate_in(&env).as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            field(0, 1, "DATE").evaluate_in(&env).as_deref(),
+            Some("9/1/2026")
+        );
+        assert_eq!(
+            field(0, 1, "TIME").evaluate_in(&env).as_deref(),
+            Some("2:05 pm")
+        );
+        assert_eq!(
+            field(0, 1, "TIME \\@ \"HH:mm\"")
+                .evaluate_in(&env)
+                .as_deref(),
             Some("14:05")
         );
         assert_eq!(
             field(0, 1, "FILENAME").evaluate_in(&env).as_deref(),
             Some("report.docx")
         );
-        assert_eq!(field(0, 1, "AUTHOR").evaluate_in(&env).as_deref(), Some("Ibrahim"));
+        assert_eq!(
+            field(0, 1, "AUTHOR").evaluate_in(&env).as_deref(),
+            Some("Ibrahim")
+        );
         assert_eq!(field(0, 1, "REF x").evaluate_in(&env), None);
 
         /* Missing inputs leave the cached result standing. */
@@ -914,11 +998,20 @@ mod tests {
         let d = Some((2026, 7, 5));
         let c = Some((9, 7));
         assert_eq!(render_date_time_picture("h:mm am/pm", d, c), "9:07 am");
-        assert_eq!(render_date_time_picture("hh:mm AM/PM", d, Some((0, 0))), "12:00 AM");
+        assert_eq!(
+            render_date_time_picture("hh:mm AM/PM", d, Some((0, 0))),
+            "12:00 AM"
+        );
         assert_eq!(render_date_time_picture("H:m", d, Some((23, 9))), "23:9");
-        assert_eq!(render_date_time_picture("d/M/yyyy H:mm", d, c), "5/7/2026 9:07");
+        assert_eq!(
+            render_date_time_picture("d/M/yyyy H:mm", d, c),
+            "5/7/2026 9:07"
+        );
         /* Time tokens without a clock pass through verbatim. */
-        assert_eq!(render_date_time_picture("d/M/yyyy HH:mm", d, None), "5/7/2026 HH:mm");
+        assert_eq!(
+            render_date_time_picture("d/M/yyyy HH:mm", d, None),
+            "5/7/2026 HH:mm"
+        );
         /* Date tokens without a date pass through verbatim. */
         assert_eq!(render_date_time_picture("yyyy h", None, c), "yyyy 9");
     }
@@ -1006,7 +1099,10 @@ mod tests {
         assert_eq!(visited, vec!["Body/0", "Footer(\"rF\")/0"]);
         let body = out.paragraph_at_path(&BlockPath::top(0)).unwrap();
         assert_eq!(body.text, "Page 9 end");
-        assert!(!body.dirty, "an unchanged result must not dirty the paragraph");
+        assert!(
+            !body.dirty,
+            "an unchanged result must not dirty the paragraph"
+        );
         assert!(body.source_xml.is_some());
         let Block::Paragraph(fp) = &out.footers["rF"][0] else {
             panic!()
@@ -1055,6 +1151,35 @@ mod tests {
     }
 
     #[test]
+    fn set_field_instruction_at_is_index_addressed() {
+        let mut doc = DocumentTree::from_text("Page 9 of 12");
+        doc.blocks[0] = Block::Paragraph(Paragraph {
+            text: "Page 9 of 12".into(),
+            fields: vec![field(5, 6, "PAGE"), field(10, 12, "NUMPAGES")],
+            ..Default::default()
+        });
+        let out = doc
+            .set_field_instruction_at(&BlockPath::top(0), 1, "NUMPAGES \\* Arabic")
+            .expect("second field");
+        let p = out.paragraph_at_path(&BlockPath::top(0)).unwrap();
+        assert_eq!(p.fields[0].instruction, "PAGE");
+        assert_eq!(p.fields[1].instruction, "NUMPAGES \\* Arabic");
+        assert_eq!(p.text, "Page 9 of 12");
+        assert!(
+            doc.set_field_instruction_at(&BlockPath::top(0), 2, "X")
+                .is_none()
+        );
+        assert!(
+            doc.set_field_instruction_at(&BlockPath::top(0), 0, " ")
+                .is_none()
+        );
+        assert!(
+            doc.set_field_instruction_at(&BlockPath::top(3), 0, "X")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn to_code_view_transforms_body_and_parts() {
         let mut doc = DocumentTree::from_text("p 1");
         doc.blocks[0] = Block::Paragraph(Paragraph {
@@ -1072,7 +1197,10 @@ mod tests {
         );
         assert!(doc.has_any_fields());
         let cv = doc.to_code_view();
-        assert_eq!(cv.paragraph_at_path(&BlockPath::top(0)).unwrap().text, "p { PAGE }");
+        assert_eq!(
+            cv.paragraph_at_path(&BlockPath::top(0)).unwrap().text,
+            "p { PAGE }"
+        );
         let Block::Paragraph(hp) = &cv.headers["rH"][0] else {
             panic!()
         };

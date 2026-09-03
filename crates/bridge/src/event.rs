@@ -304,9 +304,10 @@ pub enum Event {
         /// the band on the anchor page, and gates non-story controls.
         editing_story: Option<BridgeStoryRef>,
         /// Issue #77 — `true` while the Alt+F9 field-code view is on.
-        /// Fields then display `{ INSTRUCTION }` codes instead of
-        /// results; `range` / `caret` / `rects` are expressed in that
-        /// display text.
+        /// Fields then PAINT `{ INSTRUCTION }` codes instead of results;
+        /// `caret` / `rects` are the pixel geometry of that code text,
+        /// while `range` (like every `LogicalPos` on the wire) stays a
+        /// SOURCE position.
         field_code_view: bool,
         /// Issue #77 — the field the selection addresses: the one the
         /// selection covers EXACTLY (a click inside a field selects it
@@ -478,10 +479,12 @@ pub struct BridgeFieldRef {
     pub instruction: String,
     /// Upper-cased leading keyword (`PAGE`, `DATE`, `TOC`, …).
     pub keyword: String,
-    /// Start of the field's range in the CURRENT display text (source
-    /// result text, or the `{ … }` code text in code view).
+    /// Start of the field's cached-result range — a SOURCE position,
+    /// the same space as `SelectionChanged.range` (unchanged by the
+    /// code view). `SetSelection { range: start..end }` selects the
+    /// field; `SetFieldInstruction { at: end }` addresses it.
     pub start: LogicalPos,
-    /// End of that range.
+    /// End of that range (one past the last result byte).
     pub end: LogicalPos,
     /// `true` when the selection covers the field exactly.
     pub selected: bool,

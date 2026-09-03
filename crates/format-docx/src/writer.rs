@@ -4644,7 +4644,10 @@ mod tests {
             ("word/document.xml", document_xml),
             ("docProps/core.xml", core_xml),
         ]);
-        assert_eq!(parsed.document.settings.author.as_deref(), Some("Ibrahim Z."));
+        assert_eq!(
+            parsed.document.settings.author.as_deref(),
+            Some("Ibrahim Z.")
+        );
         let bytes = write_docx(&parsed, &parsed.document).expect("write");
         let reparsed = read_docx(&bytes).expect("re-read");
         let core = reparsed
@@ -4654,7 +4657,10 @@ mod tests {
             .map(|(_, b)| b.clone())
             .expect("core.xml passes through");
         assert_eq!(core, core_xml.as_bytes());
-        assert_eq!(reparsed.document.settings.author.as_deref(), Some("Ibrahim Z."));
+        assert_eq!(
+            reparsed.document.settings.author.as_deref(),
+            Some("Ibrahim Z.")
+        );
         /* A document without the part reports no author. */
         let plain = read_docx_from_parts(&[("word/document.xml", document_xml)]);
         assert_eq!(plain.document.settings.author, None);

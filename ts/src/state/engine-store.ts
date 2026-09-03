@@ -86,6 +86,16 @@ export function editingStoryForPointer(): BridgeStoryRef | undefined {
     return editingStorySig();
 }
 
+/* Issue #77 — the Alt+F9 field-code view flag, mirrored from every
+ * `SelectionChanged` so the key handler can toggle it without a
+ * round-trip (the engine owns the state; this is the last broadcast). */
+const [fieldCodeViewSig, setFieldCodeViewSig] = createSignal(false);
+
+/** Issue #77 — `true` while field codes are shown (read at key time). */
+export function fieldCodeViewForKeys(): boolean {
+    return fieldCodeViewSig();
+}
+
 /**
  * Which margin band a PAGE-LOCAL device-px Y lands in on page `idx`,
  * or `null` for the content area / before the first paginated paint
@@ -365,6 +375,7 @@ export function createEngineStore(client: EngineClient) {
             setSelectionKind(ev.selection_kind);
             setListIlvl(ev.list_ilvl);
             setEditingStorySig(ev.editing_story);
+            setFieldCodeViewSig(ev.field_code_view);
         } else if (ev.type === 'PAINTED') {
             /* Phase 6b — paginator reach. The engine emits
                `document_height` (device px) and `page_count` on every
@@ -489,6 +500,8 @@ export function createEngineStore(client: EngineClient) {
         refreshImageRects,
         /* Phase 3 (#39) — active story for overlays + control gating. */
         editingStory: editingStorySig,
+        /* Issue #77 — Alt+F9 field-code view flag. */
+        fieldCodeView: fieldCodeViewSig,
         marginGeometry,
         /** CSS-px top of page `idx` — engine-exact once a paginated paint
          *  reported geometry; uniform-A4 fallback before that. */

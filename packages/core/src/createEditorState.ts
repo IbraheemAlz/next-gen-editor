@@ -22,6 +22,7 @@ import type {
     AttrsMixed,
     BridgeCellBorders,
     BridgeStoryRef,
+    BridgeFieldRef,
     BridgeCellProperties,
     BridgeIndent,
     BridgeSectionGeometry,
@@ -142,6 +143,20 @@ export interface EditorState {
      * users by design).
      */
     editingStory: Accessor<BridgeStoryRef | undefined>;
+    /**
+     * Issue #77 — `true` while the Alt+F9 field-code view is on: fields
+     * PAINT `{ INSTRUCTION }` codes in place of results. Pure display
+     * state — every `LogicalPos` on the wire stays a source position.
+     */
+    fieldCodeView: Accessor<boolean>;
+    /**
+     * Issue #77 — the field the selection addresses: the one it covers
+     * exactly (`selected: true` — a click inside a field selects it
+     * whole), else the field a collapsed caret touches. `undefined`
+     * away from any field. Drives the field-code editor and the
+     * "Update fields" affordance in `FieldButtons`.
+     */
+    fieldAtCaret: Accessor<BridgeFieldRef | undefined>;
 }
 
 export function createEditorState(): EditorState {
@@ -180,6 +195,9 @@ export function createEditorState(): EditorState {
         createSignal<BridgeCellBorders | undefined>(undefined);
     const [editingStory, setEditingStory] =
         createSignal<BridgeStoryRef | undefined>(undefined);
+    const [fieldCodeView, setFieldCodeView] = createSignal(false);
+    const [fieldAtCaret, setFieldAtCaret] =
+        createSignal<BridgeFieldRef | undefined>(undefined);
 
     const unsubscribe = engine.subscribe((evt: Event) => {
         switch (evt.type) {
@@ -202,6 +220,8 @@ export function createEditorState(): EditorState {
                 setIsTrackingChanges(evt.is_tracking_changes);
                 setParagraphBorders(evt.paragraph_borders);
                 setEditingStory(evt.editing_story);
+                setFieldCodeView(evt.field_code_view);
+                setFieldAtCaret(evt.field_at_caret);
                 break;
             }
             case 'UNDO_STATE_CHANGED': {
@@ -270,5 +290,7 @@ export function createEditorState(): EditorState {
         isTrackingChanges,
         paragraphBorders,
         editingStory,
+        fieldCodeView,
+        fieldAtCaret,
     };
 }

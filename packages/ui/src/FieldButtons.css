@@ -43,3 +43,123 @@
     background: var(--nge-color-primary);
     color: #ffffff;
 }
+
+/* Issue #77 — field-code toggle, addressed-field chip, code editor. */
+.nge-fields__toggle {
+    gap: var(--nge-space-1);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.nge-fields__toggle--on {
+    background: var(--nge-color-primary);
+    color: #ffffff;
+}
+
+.nge-fields__toggle-label {
+    font-family: inherit;
+}
+
+.nge-fields__chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+    margin-inline-start: var(--nge-space-1);
+    padding: 2px var(--nge-space-2);
+    border: 1px solid var(--nge-color-border);
+    border-radius: 999px;
+    background: var(--nge-color-surface);
+    color: var(--nge-color-text);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.nge-fields__chip-key {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+.nge-fields__chip-btn {
+    padding: 0 var(--nge-space-1);
+    border: none;
+    background: none;
+    color: var(--nge-color-primary);
+    font-size: 11px;
+    cursor: pointer;
+    text-decoration: underline;
+}
+
+.nge-fields__sep {
+    height: 1px;
+    margin: var(--nge-space-1) 0;
+    background: var(--nge-color-border);
+}
+
+.nge-fields__item:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.nge-fields__item:disabled:hover {
+    background: none;
+    color: var(--nge-color-text);
+}
+
+.nge-fields__item--active {
+    font-weight: 600;
+}
+
+.nge-fields__kbd {
+    margin-inline-start: auto;
+    padding: 0 var(--nge-space-1);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10px;
+    opacity: 0.8;
+}
+
+.nge-fields__editor {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: var(--nge-z-popover);
+    display: flex;
+    flex-direction: column;
+    gap: var(--nge-space-2);
+    min-width: 320px;
+    padding: var(--nge-space-2);
+    background: var(--nge-color-surface);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-md);
+}
+
+.nge-fields__editor-label {
+    display: flex;
+    flex-direction: column;
+    gap: var(--nge-space-1);
+    font-size: 11px;
+    color: var(--nge-color-text);
+}
+
+.nge-fields__input {
+    width: 100%;
+    padding: var(--nge-space-1) var(--nge-space-2);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    background: var(--nge-color-bg);
+    color: var(--nge-color-text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+}
+
+.nge-fields__editor-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--nge-space-1);
+}
+
+.nge-fields__editor-btn {
+    font-size: 12px;
+}

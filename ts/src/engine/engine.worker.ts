@@ -796,6 +796,9 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
             year: now.getFullYear(),
             month: now.getMonth() + 1,
             day: now.getDate(),
+            /* Issue #77 — the clock half TIME fields resolve against. */
+            hour: now.getHours(),
+            minute: now.getMinutes(),
         } as Command);
         /* Report worker-context cross-origin isolation (D2.3) + the chosen
            renderer (Backlog #4) in the reply. */
@@ -841,6 +844,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             year: now.getFullYear(),
             month: now.getMonth() + 1,
             day: now.getDate(),
+            hour: now.getHours(),
+            minute: now.getMinutes(),
         });
         /* Issue #85 — base snapshot + replayed tail, inside the engine. */
         const evt = await dispatch({

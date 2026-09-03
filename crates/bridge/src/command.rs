@@ -552,18 +552,22 @@ pub enum Command {
     /// full pagination; the rest read the render environment.
     UpdateFields,
     /// Issue #77 — Alt+F9: toggle the field-code view. While enabled
-    /// every field renders its `{ INSTRUCTION }` code in place of the
-    /// result (body + stories); selection/caret geometry is expressed
-    /// in that display text and the engine maps mutations back to the
-    /// source document. A pure display state — never persisted.
+    /// every field PAINTS its `{ INSTRUCTION }` code in place of the
+    /// result (body + stories). Logical positions (`LogicalPos` in
+    /// every command and in `SelectionChanged.range`) stay SOURCE
+    /// positions — the engine maps them onto the displayed code text
+    /// for pixel geometry only, which the atomic-field invariant makes
+    /// exact (a caret is never strictly inside a field in either view).
+    /// A pure display state — never persisted, never saved.
     SetFieldCodeView {
         enabled: bool,
     },
     /// Issue #77 — replace the instruction (field code) of the field
     /// the caret at `at` addresses (strictly inside, ending at, or
-    /// starting at `at`). The cached result stays until the next
-    /// update (Word parity). Rejected with `Event::Error` when `at`
-    /// addresses no field or `instruction` is blank.
+    /// starting at `at`; see `SelectionChanged.field_at_caret`). The
+    /// cached result stays until the next update (Word parity); the
+    /// selection is preserved. Rejected with `Event::Error` when `at`
+    /// addresses no field or `instruction` is blank. Body or story.
     SetFieldInstruction {
         at: LogicalPos,
         instruction: String,
