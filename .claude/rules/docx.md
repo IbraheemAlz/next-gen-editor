@@ -166,6 +166,17 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   (remapped) text offset between runs. Comment anchors are deliberately
   NOT markers (tree-level `comment_ranges`; a verbatim copy could
   resurrect a deleted comment).
+- **Content spans (issue #244).** A complex field with no result that
+  the model does not represent (legacy form fields: `FORMCHECKBOX`,
+  `FORMDROPDOWN`, an empty `FORMTEXT`, `<w:ffData>` in the begin
+  `fldChar`) is ONE marker with `MarkerRole::Content`: the whole `begin …
+  end` run range (balanced, root-bound), replacing the markers captured
+  inside it (name bookmark, text-less runs). Kept out of the field model.
+  A field nested in another field's *instruction* is never a span of its
+  own (only the enclosing field's span may keep it). Content markers are
+  Tier 3: when the offsets go stale they are still written, at the offset
+  clamped to the text, and `write_docx_with_notes` reports
+  `WriteNote::StaleMarkupClamped` (verbatim markers stay dropped).
 - Offsets are remapped by `insert_text`, `delete_text`, `split_at`,
   `concat`, inline-object splices and the revision accept/reject helper;
   `SourceMarkup::text_len` makes any other text edit go *stale* (runs /

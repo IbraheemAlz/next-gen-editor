@@ -1515,6 +1515,51 @@ pub struct SourceMarker {
     pub at: u32,
     #[serde(with = "serde_bytes")]
     pub xml: Vec<u8>,
+    /// What the bytes are to the writer (issue #244). Skipped when
+    /// [`MarkerRole::Verbatim`], so a pre-#244 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "MarkerRole::is_verbatim")]
+    pub role: MarkerRole,
+}
+
+impl SourceMarker {
+    /// A [`MarkerRole::Verbatim`] marker.
+    pub fn verbatim(at: u32, xml: Vec<u8>) -> Self {
+        Self {
+            at,
+            xml,
+            role: MarkerRole::Verbatim,
+        }
+    }
+}
+
+/// Issue #244 — how the writer treats a [`SourceMarker`].
+///
+/// - [`Self::Verbatim`]: positioned formatting-neutral markup (`proofErr`,
+///   bookmarks, pretty-print whitespace). Written only while the
+///   paragraph's offsets are in sync — a stale marker is dropped rather
+///   than misplaced.
+/// - [`Self::Content`]: unmodeled paragraph *content* kept whole, e.g. a
+///   zero-result legacy form field (`FORMCHECKBOX` / `FORMDROPDOWN` — the
+///   `fldChar begin … end` byte range, `<w:ffData>` included). PRD Tier 3:
+///   never dropped — when the offsets go stale it is still written, at its
+///   offset clamped to the text (a best-effort position beats losing the
+///   control).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub enum MarkerRole {
+    #[default]
+    Verbatim,
+    Content,
+}
+
+impl MarkerRole {
+    pub fn is_verbatim(&self) -> bool {
+        matches!(self, Self::Verbatim)
+    }
+
+    /// `true` for markup that must survive stale offsets.
+    pub fn must_survive(&self) -> bool {
+        !self.is_verbatim()
+    }
 }
 
 /// Issues #199 / #106 — attribute-level grab bag + in-paragraph source
@@ -1687,7 +1732,7 @@ impl SourceMarkup {
                 } else {
                     right.markers.push(SourceMarker {
                         at: mk.at - at,
-                        xml: mk.xml.clone(),
+                        ..mk.clone()
                     });
                 }
             }
@@ -1739,7 +1784,7 @@ impl SourceMarkup {
         for mk in &t.markers {
             out.markers.push(SourceMarker {
                 at: mk.at + head_len,
-                xml: mk.xml.clone(),
+                ..mk.clone()
             });
         }
         Some(Box::new(out))
@@ -14944,6 +14989,7 @@ mod source_markup_tests {
         SourceMarker {
             at,
             xml: b"<w:proofErr/>".to_vec(),
+            ..SourceMarker::default()
         }
     }
 

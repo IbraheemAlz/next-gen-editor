@@ -4,6 +4,7 @@
 //! `word/document.xml` is regenerated.
 
 use crate::error::DocxError;
+use crate::error::WriteNote;
 use crate::opc::archive::{
     COMMENTS_EXTENDED_XML, COMMENTS_XML, DOC_XML, DocxArchive, ENDNOTES_XML, FOOTNOTES_XML,
     NUMBERING_XML, RELS_XML, STYLES_XML, root_attributes,
@@ -848,7 +849,11 @@ fn serialize_paragraph(
         .chars()
         .any(|c| c == '\u{2028}' || c == '\u{000C}');
     let has_source_runs = markup.is_some_and(|m| {
-        m.offsets_valid(para.text.len()) && !(m.runs.is_empty() && m.markers.is_empty())
+        if m.offsets_valid(para.text.len()) {
+            !(m.runs.is_empty() && m.markers.is_empty())
+        } else {
+            m.markers.iter().any(|mk| mk.role.must_survive())
+        }
     });
     if para.spans.is_empty()
         && para.inline_objects.is_empty()
@@ -1079,13 +1084,7 @@ fn emit_styled_runs_with_objects(
         .as_deref()
         .filter(|m| m.offsets_valid(len));
     let source_runs: &[SourceRun] = markup.map_or(&[], |m| m.runs.as_slice());
-    let mut markers: Vec<(usize, &[u8])> = markup.map_or_else(Vec::new, |m| {
-        m.markers
-            .iter()
-            .map(|mk| ((mk.at as usize).min(len), mk.xml.as_slice()))
-            .collect()
-    });
-    markers.sort_by_key(|(at, _)| *at);
+    let markers = positioned_markers(para);
     let mut marker_cursor = 0usize;
     for r in source_runs {
         for b in [r.start as usize, r.end as usize] {
@@ -1412,6 +1411,57 @@ fn emit_styled_runs_with_objects(
     for (_, xml) in markers.iter().skip(marker_cursor) {
         push_utf8(xml, out);
     }
+}
+
+/// Issues #199 / #244 — the paragraph's source markers to re-emit, as
+/// `(text offset, bytes)` in emission order. In sync with the text: every
+/// marker at its offset. Stale (an edit path that does not remap the
+/// markup): only the markup that must never be lost
+/// ([`engine::MarkerRole::must_survive`] — a legacy form field) at its
+/// offset clamped to the text and floored to a char boundary, and the
+/// write records a [`WriteNote::StaleMarkupClamped`].
+fn positioned_markers(para: &Paragraph) -> Vec<(usize, &[u8])> {
+    let len = para.text.len();
+    let Some(m) = para.source_markup.as_deref() else {
+        return Vec::new();
+    };
+    let valid = m.offsets_valid(len);
+    let mut out: Vec<(usize, &[u8])> = m
+        .markers
+        .iter()
+        .filter(|mk| valid || mk.role.must_survive())
+        .map(|mk| {
+            let mut at = (mk.at as usize).min(len);
+            while !para.text.is_char_boundary(at) {
+                at -= 1;
+            }
+            (at, mk.xml.as_slice())
+        })
+        .collect();
+    if !valid && !out.is_empty() {
+        note(WriteNote::StaleMarkupClamped {
+            markers: out.len() as u32,
+        });
+    }
+    /* Stable: markers sharing an offset keep their source order. */
+    out.sort_by_key(|(at, _)| *at);
+    out
+}
+
+thread_local! {
+    /// Issues #244 / #245 — the best-effort decisions of the running
+    /// [`write_docx_with_notes`].
+    /// `None` outside it (nothing collects, nothing accumulates).
+    static WRITE_NOTES: std::cell::RefCell<Option<Vec<WriteNote>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn note(n: WriteNote) {
+    WRITE_NOTES.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut() {
+            v.push(n);
+        }
+    });
 }
 
 /// Issue #81 — one end of a multi-paragraph field.
@@ -2472,8 +2522,23 @@ fn geometry_is_stock_a4(g: &engine::PageGeometry) -> bool {
 /// Repack `archive`'s sibling entries verbatim + a freshly serialized
 /// `word/document.xml` from `doc`. Returns the assembled `.docx` bytes.
 pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    write_docx_with_notes(archive, doc).map(|(bytes, _)| bytes)
+}
+
+/// [`write_docx`], also returning the writer's best-effort decisions
+/// ([`WriteNote`]): unmodeled content kept at a clamped position because
+/// the paragraph's source offsets went stale, a content control widened to
+/// stay well-formed around a regenerated wrapper. Never an error — the
+/// content was written.
+pub fn write_docx_with_notes(
+    archive: &DocxArchive,
+    doc: &DocumentTree,
+) -> Result<(Vec<u8>, Vec<WriteNote>), DocxError> {
     let _source_scope = AgainstSourceScope::enter(true);
-    write_docx_inner(archive, doc)
+    let outer = WRITE_NOTES.with(|c| c.borrow_mut().replace(Vec::new()));
+    let res = write_docx_inner(archive, doc);
+    let notes = WRITE_NOTES.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
+    res.map(|bytes| (bytes, notes.unwrap_or_default()))
 }
 
 /// [`write_docx`] without choosing whether recorded source markup is
@@ -6553,7 +6618,7 @@ mod tests {
     }
 
     /// A minimal `.docx` from a `styles.xml` + `document.xml` pair.
-    fn build_docx_with_styles(styles_xml: &str, document_xml: &str) -> Vec<u8> {
+    pub(super) fn build_docx_with_styles(styles_xml: &str, document_xml: &str) -> Vec<u8> {
         let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -8202,7 +8267,7 @@ mod tests {
         r#"<w:p><w:r><w:t>tail</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#,
     );
 
-    fn document_xml_of(bytes: &[u8]) -> String {
+    pub(super) fn document_xml_of(bytes: &[u8]) -> String {
         let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut f = z.by_name("word/document.xml").unwrap();
         let mut s = String::new();
@@ -9114,3 +9179,8 @@ mod tests {
         assert!(out.contains(r#"w:rsidR="00A1B2C3""#), "{out}");
     }
 }
+
+/// Issues #244 / #245 / #246 — positioned verbatim spans.
+#[cfg(test)]
+#[path = "writer_inline_span_tests.rs"]
+mod inline_span_tests;

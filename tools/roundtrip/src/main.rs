@@ -29,6 +29,8 @@
 //!
 //! Exit 0 on PASS, non-zero on FAIL.
 
+mod inline_spans;
+
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
 use format_docx::writer::build_minimal_docx;
@@ -294,6 +296,7 @@ fn run_default() -> Result<()> {
     run_style_bidi_roundtrip()?;
     run_part_scoped_media_roundtrip()?;
     run_source_markup_roundtrip()?;
+    inline_spans::run_form_fields_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

@@ -210,6 +210,41 @@ fn handle_fld_char(
     }
 }
 
+/// Issue #244 — what [`track_field_span`] needs to know about one
+/// `<w:fldChar>` event, sampled around [`handle_fld_char`].
+struct FieldSpanCtx<'a> {
+    /// `field_stack.len()` before the event.
+    depth_before: usize,
+    /// The field stack after the event.
+    stack: &'a [FieldBuilder],
+    /// Text offset of the event.
+    here: u32,
+    /// The open run produced no text before the event.
+    run_text_empty: bool,
+    /// The event turned a field into a model overlay.
+    modeled: bool,
+}
+
+/// Issue #244 — feed one `<w:fldChar>` to the paragraph's markup capture
+/// so a field with no result (a legacy form field: `FORMCHECKBOX`,
+/// `FORMDROPDOWN`, an empty `FORMTEXT`, carrying `<w:ffData>`) survives a
+/// regeneration as ONE verbatim content span instead of vanishing. A
+/// `begin` is eligible when its run has no text before it and every
+/// enclosing field is already in its result part (a field nested in an
+/// instruction stays inside that instruction).
+fn track_field_span(e: &BytesStart<'_>, markup: &mut MarkupCapture, cx: FieldSpanCtx<'_>) {
+    let kind = attr_val(e, b"w:fldCharType").unwrap_or_default();
+    match kind.trim() {
+        "begin" if cx.stack.len() > cx.depth_before => {
+            let enclosing = &cx.stack[..cx.stack.len() - 1];
+            let eligible = cx.run_text_empty && enclosing.iter().all(|f| f.cached_start.is_some());
+            markup.field_begin(cx.here, cx.stack.len(), eligible);
+        }
+        "end" if cx.depth_before > 0 => markup.field_end(cx.depth_before, cx.here, cx.modeled),
+        _ => {}
+    }
+}
+
 /// Issue #120 — the self-contained elements a `<w:body>` / `<w:tc>` may
 /// hold between two blocks (ECMA-376 §17.2.2 `EG_RunLevelElements` at
 /// block level, plus `<w:altChunk>`) that the typed model does not
@@ -1199,6 +1234,9 @@ pub fn parse_document_xml_with_warnings(
                         attribute value lives on the start tag's `w:fldCharType`
                         attribute. `Start(...)` and `Empty(...)` both end up
                         here — match `Empty` below as well for completeness. */
+                        let depth_before = field_stack.len();
+                        let fields_before = para_fields.len();
+                        let here = (para_text.len() + run_text.len()) as u32;
                         handle_fld_char(
                             &e,
                             &mut field_stack,
@@ -1210,6 +1248,19 @@ pub fn parse_document_xml_with_warnings(
                             },
                             &mut para_fields,
                             &mut out_blocks,
+                        );
+                        /* Issue #244 — a zero-result field (legacy form
+                        field) is kept whole as a content marker. */
+                        track_field_span(
+                            &e,
+                            &mut markup,
+                            FieldSpanCtx {
+                                depth_before,
+                                stack: &field_stack,
+                                here,
+                                run_text_empty: run_text.is_empty(),
+                                modeled: para_fields.len() != fields_before,
+                            },
                         );
                     }
                     b"w:fldSimple" => {
@@ -1565,6 +1616,9 @@ pub fn parse_document_xml_with_warnings(
                         identical. Nothing to record here. */
                     }
                     b"w:fldChar" => {
+                        let depth_before = field_stack.len();
+                        let fields_before = para_fields.len();
+                        let here = (para_text.len() + run_text.len()) as u32;
                         handle_fld_char(
                             &e,
                             &mut field_stack,
@@ -1576,6 +1630,19 @@ pub fn parse_document_xml_with_warnings(
                             },
                             &mut para_fields,
                             &mut out_blocks,
+                        );
+                        /* Issue #244 — a zero-result field (legacy form
+                        field) is kept whole as a content marker. */
+                        track_field_span(
+                            &e,
+                            &mut markup,
+                            FieldSpanCtx {
+                                depth_before,
+                                stack: &field_stack,
+                                here,
+                                run_text_empty: run_text.is_empty(),
+                                modeled: para_fields.len() != fields_before,
+                            },
                         );
                     }
                     b"w:rPr" if in_ppr && !in_run => {

@@ -37,8 +37,8 @@
 
 use crate::schema::grab_bag::{NamespaceScope, bound_by_root};
 use engine::{
-    ListItem, ParaProperties, SourceAttr, SourceMarker, SourceMarkup, SourcePPr, SourceRun,
-    SpanStyle,
+    ListItem, MarkerRole, ParaProperties, SourceAttr, SourceMarker, SourceMarkup, SourcePPr,
+    SourceRun, SpanStyle,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -164,6 +164,53 @@ pub struct MarkupCapture {
     runs: Vec<SourceRun>,
     markers: Vec<SourceMarker>,
     run: Option<RunCapture>,
+    /// Issue #244 — complex fields begun in this paragraph, innermost last.
+    field_spans: Vec<FieldSpanCapture>,
+    /// Issue #244 — a zero-result field whose `end` fldChar sits in the
+    /// open run: kept whole when that run closes without text.
+    field_due: Option<DueFieldSpan>,
+}
+
+/// Issue #244 — one complex field begun inside the current paragraph.
+struct FieldSpanCapture {
+    depth: usize,
+    at: u32,
+    /// Byte offset of the `<w:r` holding the `begin`; `None` when the
+    /// field is not eligible to be kept whole.
+    xml_start: Option<usize>,
+    /// `markers.len()` when the field began: markers captured inside the
+    /// field are replaced by the whole span.
+    marker_mark: usize,
+}
+
+struct DueFieldSpan {
+    xml_start: usize,
+    at: u32,
+    marker_mark: usize,
+}
+
+/// `true` when `frag` is a sequence of complete, balanced elements (every
+/// end tag closes the element its start opened, nothing is left open), so
+/// it can be re-emitted between two runs without breaking the part.
+pub fn is_balanced_fragment(frag: &[u8]) -> bool {
+    let mut reader = Reader::from_reader(frag);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => stack.push(e.name().as_ref().to_vec()),
+            Ok(Event::End(e)) => {
+                if stack.pop().as_deref() != Some(e.name().as_ref()) {
+                    return false;
+                }
+            }
+            Ok(Event::Eof) => return stack.is_empty(),
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        buf.clear();
+    }
 }
 
 impl MarkupCapture {
@@ -210,7 +257,7 @@ impl MarkupCapture {
         if !self.content_seen {
             self.content_seen = true;
             for ws in std::mem::take(&mut self.pending_ws) {
-                self.markers.push(SourceMarker { at, xml: ws });
+                self.markers.push(SourceMarker::verbatim(at, ws));
             }
         }
     }
@@ -221,7 +268,7 @@ impl MarkupCapture {
             return;
         }
         if self.content_seen {
-            self.markers.push(SourceMarker { at, xml: frag });
+            self.markers.push(SourceMarker::verbatim(at, frag));
         } else {
             self.pending_ws.push(frag);
         }
@@ -234,7 +281,7 @@ impl MarkupCapture {
         }
         self.content(at);
         if bound_by_root(&frag, ns) {
-            self.markers.push(SourceMarker { at, xml: frag });
+            self.markers.push(SourceMarker::verbatim(at, frag));
         }
     }
 
@@ -311,6 +358,8 @@ impl MarkupCapture {
     /// `</w:r>` of a run that produced text bytes `[start, end)` with the
     /// resolved span `style`.
     pub fn close_text_run(&mut self, start: u32, end: u32, style: &SpanStyle) {
+        /* Text after the `end` fldChar in the same run: not a clean span. */
+        self.field_due = None;
         if let Some(r) = self.run.take() {
             self.runs.push(SourceRun {
                 start,
@@ -328,15 +377,80 @@ impl MarkupCapture {
     /// (text offset `at`): unless it held modeled content, the whole run
     /// is kept verbatim as a marker.
     pub fn close_textless_run(&mut self, xml: &[u8], end: usize, at: u32, ns: &NamespaceScope) {
-        if let Some(r) = self.run.take()
-            && !r.has_modeled
+        let Some(r) = self.run.take() else {
+            return;
+        };
+        /* Issue #244 — the run holding the `end` fldChar of a zero-result
+        field: the whole `begin … end` range becomes ONE content marker,
+        replacing the markers captured inside it (the textless runs, the
+        form field's name bookmark). */
+        if let Some(span) = self.field_due.take()
+            && span.at == at
+            && let Some(frag) = xml.get(span.xml_start..end)
+            && frag.starts_with(b"<w:r")
+            && is_balanced_fragment(frag)
+            && bound_by_root(frag, ns)
+        {
+            self.markers.truncate(span.marker_mark);
+            self.markers.push(SourceMarker {
+                at,
+                xml: frag.to_vec(),
+                role: MarkerRole::Content,
+            });
+            return;
+        }
+        if !r.has_modeled
             && let Some(frag) = xml.get(r.xml_start..end)
             && frag.starts_with(b"<w:r")
             && bound_by_root(frag, ns)
         {
-            self.markers.push(SourceMarker {
+            self.markers.push(SourceMarker::verbatim(at, frag.to_vec()));
+        }
+    }
+
+    /// Issue #244 — a `<w:fldChar w:fldCharType="begin">` inside the open
+    /// run, at text offset `at`; `depth` is the field nesting depth it
+    /// opened (1 = outermost). `eligible` is false when the run already
+    /// produced text before the `begin` or an enclosing field is still in
+    /// its instruction part (a field nested in an instruction must stay
+    /// inside it; only the enclosing field's own span may keep it).
+    pub fn field_begin(&mut self, at: u32, depth: usize, eligible: bool) {
+        if !self.open {
+            return;
+        }
+        let xml_start = match self.run.as_ref() {
+            Some(r) if eligible => Some(r.xml_start),
+            _ => None,
+        };
+        self.field_spans.push(FieldSpanCapture {
+            depth,
+            at,
+            xml_start,
+            marker_mark: self.markers.len(),
+        });
+    }
+
+    /// Issue #244 — the `end` fldChar of the field at nesting `depth`, at
+    /// text offset `at`. `modeled` is true when the reader turned the
+    /// field into a model overlay (it has a result, or it is a TOC): only
+    /// an UNMODELED zero-result field is kept whole, at the close of the
+    /// run holding its `end`.
+    pub fn field_end(&mut self, depth: usize, at: u32, modeled: bool) {
+        self.field_due = None;
+        while self.field_spans.last().is_some_and(|f| f.depth > depth) {
+            self.field_spans.pop();
+        }
+        if self.field_spans.last().is_some_and(|f| f.depth == depth)
+            && let Some(span) = self.field_spans.pop()
+            && let Some(xml_start) = span.xml_start
+            && !modeled
+            && span.at == at
+            && self.run.is_some()
+        {
+            self.field_due = Some(DueFieldSpan {
+                xml_start,
                 at,
-                xml: frag.to_vec(),
+                marker_mark: span.marker_mark,
             });
         }
     }

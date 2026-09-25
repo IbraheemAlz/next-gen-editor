@@ -485,10 +485,19 @@ mod tests {
                 lead: b"<w:lastRenderedPageBreak/>".to_vec(),
                 t_attrs: Some(Vec::new()),
             }],
-            markers: vec![SourceMarker {
-                at: 6,
-                xml: br#"<w:proofErr w:type="spellStart"/>"#.to_vec(),
-            }],
+            markers: vec![
+                SourceMarker {
+                    at: 6,
+                    xml: br#"<w:proofErr w:type="spellStart"/>"#.to_vec(),
+                    ..SourceMarker::default()
+                },
+                SourceMarker {
+                    /* Issue #244 — a content span keeps its role. */
+                    at: 11,
+                    xml: br#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#.to_vec(),
+                    role: crate::MarkerRole::Content,
+                },
+            ],
         };
         let Some(crate::Block::Paragraph(p)) = doc.blocks.get(0).cloned() else {
             panic!("paragraph");
