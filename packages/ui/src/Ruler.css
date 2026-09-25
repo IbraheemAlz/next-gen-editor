@@ -162,6 +162,21 @@
     border-color: var(--nge-color-primary, #2563eb);
 }
 
+/* Issue #145 — a small dot under a leadered tab stop (TOC dot leaders
+ * and friends) so the Ruler exposes the leader, not just preserves it
+ * silently. Purely visual; the leader kind itself only shows in the
+ * tooltip. */
+.nge-ruler__tab[data-leader='true']::after {
+    content: '';
+    position: absolute;
+    left: calc(50% - 1.5px);
+    bottom: -4px;
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--nge-color-text, #333);
+}
+
 /* Local-only preview marker the user sees while dragging a new tab
  * stop into existence. Never tied to engine state. */
 .nge-ruler__ghost {

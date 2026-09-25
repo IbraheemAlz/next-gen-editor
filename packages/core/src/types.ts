@@ -66,6 +66,7 @@ export type {
     BridgeStyleProperties,
     BridgeTabStop,
     BridgeTabKind,
+    BridgeTabLeader,
     BridgeIndent,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
