@@ -1664,9 +1664,17 @@ fn emit_table_shading(
             render/scene.rs paint_table. */
             let content_x = cell_x + cell.padding_left;
             let content_y = cell_y + cell.padding_top;
-            for inner in &cell.content {
-                emit_block_shading(content, page_h, content_x, content_y, inner);
-            }
+            with_cell_clip(
+                content,
+                page_h,
+                row,
+                cell,
+                cell_x,
+                cell_y,
+                |content, inner| {
+                    emit_block_shading(content, page_h, content_x, content_y, inner);
+                },
+            );
         }
     }
 }
@@ -1698,18 +1706,65 @@ fn emit_table_text(
             exactly like render/scene.rs paint_table's content pass. */
             let content_x = cell_x + cell.padding_left;
             let content_y = cell_y + cell.padding_top;
-            for inner in &cell.content {
-                match inner {
+            with_cell_clip(
+                content,
+                page_h,
+                row,
+                cell,
+                cell_x,
+                cell_y,
+                |content, inner| match inner {
                     LayoutBlock::Paragraph(p) => {
                         emit_paragraph_text(content, page_h, content_x, content_y, p, res);
                     }
                     LayoutBlock::Table(nested) => {
                         emit_table_text(content, page_h, content_x, content_y, nested, res);
                     }
-                }
-            }
+                },
+            );
         }
     }
+}
+
+/// Issue #169 — emit one cell's content blocks, clipped to the cell rect
+/// when its row is `<w:trHeight w:hRule="exact">` (the row does not grow,
+/// so content overflows it). Lines starting at or past the cell bottom
+/// are dropped (`LayoutBlock::clip_lines_at`, the same cut the renderer
+/// makes) and the straddling line is cut by the clip path. Rows that grow
+/// to fit pass straight through, byte-identical to the unclipped path.
+fn with_cell_clip(
+    content: &mut Content,
+    page_h: f32,
+    row: &layout::TableRowBox,
+    cell: &layout::TableCellBox,
+    cell_x: f32,
+    cell_y: f32,
+    mut emit: impl FnMut(&mut Content, &LayoutBlock),
+) {
+    if !row.exact_height {
+        for inner in &cell.content {
+            emit(content, inner);
+        }
+        return;
+    }
+    content.save_state();
+    content.rect(
+        cell_x,
+        page_h - (cell_y + cell.size.height),
+        cell.size.width,
+        cell.size.height,
+    );
+    content.clip_nonzero();
+    content.end_path();
+    let limit = cell.size.height - cell.padding_top;
+    for inner in &cell.content {
+        match inner.clip_lines_at(limit) {
+            Some(clipped) => emit(content, &clipped),
+            None if inner.origin().y < limit => emit(content, inner),
+            None => {}
+        }
+    }
+    content.restore_state();
 }
 
 /// Pass 3 — every cell edge + the outer-table perimeter as PDF strokes.
@@ -1759,9 +1814,17 @@ fn emit_table_borders(
             borders. Same padded content origins as `emit_table_text`. */
             let content_x = cell_x + cell.padding_left;
             let content_y = cell_y + cell.padding_top;
-            for inner in &cell.content {
-                emit_block_borders(content, page_h, content_x, content_y, inner);
-            }
+            with_cell_clip(
+                content,
+                page_h,
+                row,
+                cell,
+                cell_x,
+                cell_y,
+                |content, inner| {
+                    emit_block_borders(content, page_h, content_x, content_y, inner);
+                },
+            );
         }
     }
     let tx1 = tx + t.size.width;
@@ -2265,6 +2328,7 @@ mod tests {
             header: false,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         };
         let table = TableBox {
             origin: layout::Point { x: 0.0, y: 100.0 },
@@ -2374,6 +2438,7 @@ mod tests {
                 header: false,
                 cant_split: false,
                 source_row: 0,
+                exact_height: false,
             };
             let table = TableBox {
                 origin: layout::Point { x: 0.0, y: 100.0 },
@@ -2416,6 +2481,110 @@ mod tests {
             (y0 - y1 - 8.0).abs() < 0.01,
             "padding_top must lower cell text (smaller PDF y): unpadded {y0}, padded {y1}"
         );
+    }
+
+    /// Issue #169 — an exact-height row clips its cell content: the cell
+    /// rect becomes a clip path (`W n`) and the lines starting below the
+    /// row are not emitted at all; a row that grows to fit emits every
+    /// line with no clip.
+    #[test]
+    fn exact_height_row_clips_cell_content() {
+        fn page(stack: &FontStack, exact: bool) -> PageBox {
+            let para = layout_paragraph(ParagraphConfig {
+                text: "aa bb cc",
+                fonts: stack,
+                spans: &[plain_span("aa bb cc".len() as u32)],
+                base_direction: ShapingDirection::Ltr,
+                max_width: 30.0,
+                line_height: 22.0,
+                line_height_exact: true,
+                alignment: Alignment::Start,
+                indent_start_px: 0.0,
+                indent_end_px: 0.0,
+                first_line_indent_px: 0.0,
+                hanging_indent_px: 0.0,
+                marker_text: None,
+                px_size_for_marker: 22.0,
+                inline_objects: &[],
+                tab_stops_px: &[],
+            });
+            assert_eq!(para.lines.len(), 3, "one word per line");
+            let h = if exact { 30.0 } else { para.size.height };
+            let cell = layout::TableCellBox {
+                origin: layout::Point { x: 0.0, y: 0.0 },
+                size: layout::Size {
+                    width: 200.0,
+                    height: h,
+                },
+                grid_span: 1,
+                v_merge: engine::VMergeRole::None,
+                borders: engine::default_word_borders(),
+                shading: None,
+                content: vec![LayoutBlock::Paragraph(para)],
+                padding_left: 0.0,
+                padding_top: 0.0,
+                padding_right: 0.0,
+                padding_bottom: 0.0,
+                content_offset: 0,
+            };
+            let row = layout::TableRowBox {
+                origin: layout::Point { x: 0.0, y: 0.0 },
+                size: layout::Size {
+                    width: 200.0,
+                    height: h,
+                },
+                cells: vec![cell],
+                header: false,
+                cant_split: exact,
+                source_row: 0,
+                exact_height: exact,
+            };
+            let table = TableBox {
+                origin: layout::Point { x: 0.0, y: 100.0 },
+                size: layout::Size {
+                    width: 200.0,
+                    height: h,
+                },
+                columns: vec![200.0],
+                rows: vec![row],
+                outer_borders: engine::default_word_borders(),
+                placement_dx: 0.0,
+            };
+            PageBox {
+                size: Size {
+                    width: 595.0,
+                    height: 842.0,
+                },
+                margins: Margins::uniform(72.0),
+                blocks: vec![LayoutBlock::Table(table)],
+                header: None,
+                footer: None,
+                header_offset: 36.0,
+                footer_offset: 36.0,
+                footnotes: layout::NoteBand::default(),
+                endnotes: layout::NoteBand::default(),
+                hf_role: layout::HeaderRole::Default,
+                page_number: 1,
+                floats: Vec::new(),
+            }
+        }
+        fn ops(content: &[u8], op: &str) -> usize {
+            String::from_utf8_lossy(content)
+                .split_whitespace()
+                .filter(|t| *t == op)
+                .count()
+        }
+        let stack = liberation_stack();
+        let fo = test_font_objs(&["liberation"]);
+        let exact = build_content(&page(&stack, true), &fo, &stack);
+        let grown = build_content(&page(&stack, false), &fo, &stack);
+        /* One clip per content pass (shading, text, borders). */
+        assert_eq!(ops(&exact, "W"), 3, "the exact cell is clipped");
+        assert_eq!(ops(&grown, "W"), 0, "a growing row is not clipped");
+        /* 30 pt of a 3 × 22 pt paragraph: lines 1-2 start inside the row
+        (line 2 straddles and is cut by the clip), line 3 is dropped. */
+        let (te, tg) = (ops(&exact, "Tm"), ops(&grown, "Tm"));
+        assert!(te > 0 && te < tg, "exact {te} vs grown {tg} glyph matrices");
     }
 
     /// Issue #79 — a `<w:bidiVisual>` table (mirrored by
@@ -2483,6 +2652,7 @@ mod tests {
                 header: false,
                 cant_split: false,
                 source_row: 0,
+                exact_height: false,
             };
             let mut table = TableBox {
                 origin: layout::Point { x: 0.0, y: 100.0 },
@@ -3412,6 +3582,7 @@ mod tests {
                 header: i == 0,
                 cant_split: false,
                 source_row: i as u32,
+                exact_height: false,
             })
             .collect();
         let table = TableBox {
@@ -3530,6 +3701,7 @@ mod tests {
                 header: false,
                 cant_split: false,
                 source_row: i,
+                exact_height: false,
             }
         };
         /* 698 pt body: a 650 pt first row leaves 48 pt — two of the

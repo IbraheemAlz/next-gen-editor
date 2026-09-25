@@ -514,10 +514,13 @@ pub enum Command {
         count: u8,
         gutter_pt: f32,
     },
-    /// Sprint 2 (UI Edition) — flip `ParaProperties.page_break_before`
-    /// on the paragraph that contains `at`. The paginator already
-    /// understands the flag (rendered from `<w:pageBreakBefore>` on
-    /// `.docx` load); this command lets the editor author one.
+    /// Word's `Ctrl+Enter` — insert a manual page break (U+000C FORM
+    /// FEED, saved as `<w:br w:type="page"/>`) at the caret, replacing
+    /// a non-empty selection like typed text; with a collapsed (or no)
+    /// selection the break lands at `at`. Issue #75: it no longer flips
+    /// `ParaProperties.page_break_before` (the paragraph-format
+    /// property, which the paginator honours on its own). Rejected with
+    /// `Event::Error` inside a table cell and in header/footer stories.
     InsertPageBreak {
         at: LogicalPos,
     },
@@ -527,8 +530,8 @@ pub enum Command {
     /// full `<w:sectPr>` payload, and the following section begins per
     /// `kind` (Word semantics: `<w:type>` describes how the section it
     /// opens starts relative to the previous one). Distinct from
-    /// `InsertPageBreak`, which is a paragraph render hint with no
-    /// geometry of its own. Rejected with `Event::Error` when `at`
+    /// `InsertPageBreak`, which inserts a manual page break (FORM FEED)
+    /// inside the current section. Rejected with `Event::Error` when `at`
     /// sits inside a table cell (Word-parity there is deferred).
     InsertSectionBreak {
         at: LogicalPos,

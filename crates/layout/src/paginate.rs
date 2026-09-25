@@ -808,6 +808,18 @@ impl Paginator {
     /// footnote(s) get rolled back, the page closes, and the block is
     /// re-tried on a fresh page (where its footnotes start a new band).
     pub fn push_block(&mut self, mut block: LayoutBlock, before: f32, after: f32) {
+        /* Issue #75 — `<w:pageBreakBefore/>`: close the page first when
+        it already carries content (Word never breaks at a page top).
+        Bounded by construction: one flush per top-level block, and the
+        flushed page held content, so no empty page is ever minted. Past
+        the watchdog's page cap (stage c) nothing breaks pages. */
+        if let LayoutBlock::Paragraph(p) = &block
+            && p.flow.page_break_before
+            && !self.capped
+            && !self.cur_blocks.is_empty()
+        {
+            self.force_page_break();
+        }
         /* Issue #87 — one top-level block is the watchdog's window:
         churn counters and the escalation stage restart here. */
         self.watchdog.begin_block();
@@ -2866,9 +2878,10 @@ pub fn split_paragraph_at_line(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: para.keep_next,
-        /* A continuation has no gap above it. */
+        /* A continuation has no gap above it, and never re-breaks. */
         flow: ParaFlow {
             space_before: 0.0,
+            page_break_before: false,
             ..para.flow
         },
     };
@@ -2956,9 +2969,10 @@ pub fn split_paragraph_at_line_index(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: para.keep_next,
-        /* A continuation has no gap above it. */
+        /* A continuation has no gap above it, and never re-breaks. */
         flow: ParaFlow {
             space_before: 0.0,
+            page_break_before: false,
             ..para.flow
         },
     };
@@ -3510,6 +3524,100 @@ mod tests {
         let mut p = fake_paragraph(n, line_height);
         p.page_break_after_line = vec![break_after];
         p
+    }
+
+    /// Issue #75 — stamp `<w:pageBreakBefore/>` on a fake paragraph.
+    fn page_break_before(mut p: ParagraphBox) -> ParagraphBox {
+        p.flow.page_break_before = true;
+        p
+    }
+
+    fn paragraphs_per_page(pages: &[PageBox]) -> Vec<usize> {
+        pages.iter().map(|p| p.blocks.len()).collect()
+    }
+
+    /// Issue #75 — the flagged paragraph opens a fresh page; its
+    /// `space_before` still applies at the new page top (the paginator
+    /// never suppresses it for any other page-top block either).
+    #[test]
+    fn page_break_before_starts_a_new_page() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(paragraphs_per_page(&pages), vec![1, 1]);
+        assert_eq!(pages[1].blocks[0].origin().y, 0.0);
+    }
+
+    /// Issue #75 — Word never breaks at a page top: a flagged first
+    /// paragraph, a flagged paragraph right after a forced break and a
+    /// flagged first paragraph of a new section add no page.
+    #[test]
+    fn page_break_before_at_a_page_top_is_a_no_op() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        pag.force_page_break();
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        pag.start_new_section(geom, HeaderBands::default(), HeaderBands::default(), false);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(paragraphs_per_page(&pages), vec![1, 1, 1]);
+    }
+
+    /// Issue #75 — in a multi-column section the flag breaks to the next
+    /// PAGE (not the next column), and a flagged paragraph that itself
+    /// spans pages breaks once: its split tail never re-breaks.
+    #[test]
+    fn page_break_before_skips_columns_and_breaks_once() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.set_columns(2, 12.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(paragraphs_per_page(&pages), vec![1, 1]);
+        assert_eq!(pages[1].blocks[0].origin().x, 0.0, "column 0 of page 2");
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(80, 16.0))),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        let lines: usize = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .map(|b| match b {
+                LayoutBlock::Paragraph(p) => p.lines.len(),
+                LayoutBlock::Table(_) => 0,
+            })
+            .sum();
+        assert_eq!(lines, 82, "no line lost");
+        let per_page = (a4_geometry().content_height() / 16.0).floor() as usize;
+        assert_eq!(pages.len(), 1 + 80usize.div_ceil(per_page));
     }
 
     #[test]
@@ -4346,6 +4454,7 @@ mod tests {
                 header,
                 cant_split: false,
                 source_row: out_rows.len() as u32,
+                exact_height: false,
             });
             y += h;
         }
@@ -4488,6 +4597,18 @@ mod tests {
         );
         pag.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), 0.0, 0.0);
         finish("form_feed", pag);
+
+        /* Issue #75 — `<w:pageBreakBefore/>` alone, no FORM FEED: the
+        flagged paragraph opens page 2, the one after it follows it. */
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(3, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(5, 16.0))),
+            6.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("page_break_before", pag);
 
         let headers = HeaderBands {
             default: Some(fake_band_tall(9, 100.0)),
@@ -4654,6 +4775,9 @@ mod tests {
         ),
         ("continuous_balance", 0x4223f896a4f3452c, &[]),
         ("form_feed", 0x9cc8e34c49eb9a4e, &[]),
+        /* Issue #75 — `<w:pageBreakBefore/>` alone (new fixture, recorded
+        on the #75 paginator; every value above/below is unchanged). */
+        ("page_break_before", 0x000c3f543ec6f6a7, &[]),
         ("intruding_bands_title_pg", 0xd740800cab2c8c6d, &[]),
         ("footnotes", 0xd598c54612629596, &[]),
         ("sections_and_forced_breaks", 0xc92c5638ce1f2440, &[]),
@@ -5589,6 +5713,7 @@ mod tests {
             header,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 
@@ -5922,6 +6047,7 @@ mod tests {
             header: false,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 
@@ -6111,6 +6237,7 @@ mod tests {
             header: false,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 

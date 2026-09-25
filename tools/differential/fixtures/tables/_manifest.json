@@ -12,6 +12,12 @@
       "generator": "differential-native --gen-fixtures (hand-written OOXML)",
       "word_pdf": null,
       "word_pdf_status": "PENDING"
+    },
+    "exact_row_table.docx": {
+      "description": "Issue #169 <w:trHeight w:hRule> oracle: a 2-column bordered table (exact 14pt line pitch, zero cell top/bottom margins) whose second row is hRule=exact 840 twips (42pt) holding 6 lines in cell A — the row stays 42pt and lines 4-6 are clipped (not painted; our PDF drops them from the content stream too); the third row carries the same 6 lines under hRule=atLeast 840 and grows to 84pt. Explicit A4 pgSz. Expected 1 page, rows 14/42/84/14pt.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
     }
   }
 }

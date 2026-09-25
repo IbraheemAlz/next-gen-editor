@@ -4115,13 +4115,22 @@ fn layout_table_box(
             x += cell_width;
             col_cursor += span;
         }
-        /* Apply row min-height from `<w:trHeight>` if present. */
+        /* `<w:trHeight>`: `atLeast` is a floor under the measured
+        content height; `exact` (issue #169) IS the row height — the
+        content is clipped to it at paint time (`exact_height`). A
+        non-positive exact value has no height to honour and keeps the
+        content height (nothing clipped away to zero). */
+        let mut exact_height = false;
         if let Some(rh) = row.props.height {
             match rh {
-                engine::RowHeight::AtLeast { twips } | engine::RowHeight::Exact { twips } => {
+                engine::RowHeight::AtLeast { twips } => {
                     row_height = row_height.max(twips_to_layout_px(twips, scale));
                 }
-                engine::RowHeight::Auto => {}
+                engine::RowHeight::Exact { twips } if twips > 0 => {
+                    row_height = twips_to_layout_px(twips, scale);
+                    exact_height = true;
+                }
+                engine::RowHeight::Exact { .. } | engine::RowHeight::Auto => {}
             }
         }
         /* Stamp final row height onto every cell. */
@@ -4171,6 +4180,7 @@ fn layout_table_box(
             cant_split: row.props.cant_split
                 || matches!(row.props.height, Some(engine::RowHeight::Exact { .. })),
             source_row: rows_out.len() as u32,
+            exact_height,
         });
         y += row_height;
     }
@@ -8871,6 +8881,12 @@ impl Engine {
                             .props
                             .widow_control_on(doc.settings.widow_control_default);
                         after_keep_next = para.props.keep_next_on();
+                        /* Issue #75 — `<w:pageBreakBefore/>` (resolved
+                        through the style cascade like keepNext). Only
+                        this body-story loop stamps it: cell, header /
+                        footer, note and text-box paragraphs are laid
+                        out elsewhere and ignore it, as Word does. */
+                        para_box.flow.page_break_before = para.props.page_break_before;
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(
@@ -15296,20 +15312,51 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::InsertPageBreak` (Sprint 2 UI Edition) — flip
-    /// `ParaProperties.page_break_before` on the paragraph at `at`.
+    /// `Command::InsertPageBreak` — Word's `Ctrl+Enter`: insert a
+    /// manual page break (U+000C FORM FEED, which the writer emits as
+    /// `<w:br w:type="page"/>` and the paginator honours through
+    /// `page_break_after_line`) at the caret, replacing any non-empty
+    /// selection exactly like typed text (with a collapsed or absent
+    /// selection the break lands at `at`). Issue #75: this used to flip
+    /// `ParaProperties.page_break_before` — the *paragraph-format*
+    /// property (Word's "Page break before" checkbox), not what
+    /// `Ctrl+Enter` authors — which also broke before the whole caret
+    /// paragraph instead of at the caret. The property itself is now
+    /// honoured by the paginator for imported documents.
+    ///
+    /// Rejected inside a table cell (Word never paginates a cell's
+    /// FORM FEED; the paginator only scans body paragraphs), so the
+    /// Breaks menu greys the entry there and this error is the
+    /// Honest-UX backstop. Header/footer stories are rejected earlier
+    /// by `story_gate`.
     fn do_insert_page_break(&mut self, at: BridgeLogicalPos) -> Event {
-        let new_doc = self
-            .undo
-            .current()
-            .set_page_break_before(to_engine_pos(at), true);
-        self.undo.push(new_doc);
-        self.announce(AnnouncementPriority::Polite, "Page break inserted");
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
+        let at = self.with_selection_doc(|d| clamp_pos(d, at));
+        /* A non-empty selection is replaced, as typing would; a collapsed
+        (or absent) one yields to the explicit `at`. */
+        let replacing = self
+            .selection
+            .as_ref()
+            .filter(|sel| sel.anchor != sel.caret)
+            .map(|sel| ordered(sel.anchor.clone(), sel.caret.clone()));
+        let (start, end) = replacing.clone().unwrap_or((at.clone(), at.clone()));
+        if start.path.steps.len() != 1 || end.path.steps.len() != 1 {
+            return Event::Error {
+                message: "InsertPageBreak: page breaks inside table cells are not supported".into(),
+            };
         }
-        self.selection_changed()
+        if replacing.is_none() {
+            self.selection = Some(SelectionState {
+                anchor: at.clone(),
+                caret: at.clone(),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            });
+        }
+        let evt = self.do_insert_text_interactive(at, "\u{000C}".into());
+        if !matches!(evt, Event::Error { .. }) {
+            self.announce(AnnouncementPriority::Polite, "Page break inserted");
+        }
+        evt
     }
 
     /// `Command::InsertSectionBreak` (Phase 3, #40) — split the caret
@@ -21566,6 +21613,164 @@ mod tests {
         d
     }
 
+    /// Issue #75 — body doc whose second paragraph carries ONLY
+    /// `<w:pageBreakBefore/>` (no FORM FEED anywhere).
+    fn page_break_before_doc(first: &str, second: &str) -> DocumentTree {
+        let mut d = DocumentTree::from_text(first);
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: second.into(),
+                props: engine::ParaProperties {
+                    page_break_before: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        d
+    }
+
+    fn page_source_ids(pages: &[PageBox]) -> Vec<Vec<u32>> {
+        pages
+            .iter()
+            .map(|p| {
+                p.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        LayoutBlock::Paragraph(pb) => Some(pb.source_paragraph_id),
+                        LayoutBlock::Table(_) => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Issue #75 acceptance — `<w:pageBreakBefore/>` reaches the
+    /// paginator: the flagged paragraph opens page 2.
+    #[test]
+    fn page_break_before_paragraph_opens_a_new_page() {
+        let engine = test_engine_with_doc(page_break_before_doc("alpha beta", "gamma delta"));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("pages");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+
+        /* Imported: the same doc through `<w:pageBreakBefore/>` XML. */
+        let bytes =
+            format_docx::build_minimal_docx(&page_break_before_doc("alpha beta", "gamma delta"))
+                .expect("write");
+        let archive = format_docx::read_docx(&bytes).expect("read");
+        let engine = test_engine_with_doc(archive.document);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+    }
+
+    /// Issue #75 — Word never breaks at a page top: a flagged FIRST
+    /// paragraph (and a flagged paragraph right after a next-page
+    /// section break) does not mint an empty page.
+    #[test]
+    fn page_break_before_at_a_page_top_is_a_no_op() {
+        let mut d = page_break_before_doc("alpha", "beta");
+        if let engine::Block::Paragraph(p) = &mut d.blocks[0] {
+            p.props.page_break_before = true;
+        }
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+
+        /* The first paragraph of a next-page section: the section
+        already flushed, so the flag adds nothing. */
+        let mut d = DocumentTree::from_text("alpha beta").insert_section_break_at(
+            engine::LogicalPos {
+                path: engine::BlockPath::top(0),
+                offset: 5,
+            },
+            engine::SectionType::NextPage,
+        );
+        assert_eq!(d.blocks.len(), 2, "the break splits the paragraph in two");
+        if let engine::Block::Paragraph(p) = &mut d.blocks[1] {
+            p.props.page_break_before = true;
+        }
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+    }
+
+    /// Issue #75 — `Command::InsertPageBreak` is Word's `Ctrl+Enter`: a
+    /// FORM FEED at the caret (saved as `<w:br w:type="page"/>`), not the
+    /// paragraph-format flag; the text after it starts page 2.
+    #[test]
+    fn insert_page_break_inserts_a_form_feed_at_the_caret() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("alpha beta"));
+        let evt = engine.do_insert_page_break(bpos_top(0, 5));
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let doc = engine.undo.current().clone();
+        let engine::Block::Paragraph(p) = &doc.blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "alpha\u{000C} beta");
+        assert!(!p.props.page_break_before, "the format flag stays off");
+        let sel = engine.selection.clone().expect("selection");
+        assert_eq!(sel.caret, bpos_top(0, 6), "caret lands after the break");
+        assert!(
+            engine
+                .pending_announcements
+                .iter()
+                .any(|(_, m)| m == "Page break inserted")
+        );
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(
+            pages.len(),
+            2,
+            "the break splits the paragraph across pages"
+        );
+
+        /* Saved as a real `<w:br w:type="page"/>`. */
+        let bytes = format_docx::build_minimal_docx(&doc).expect("write");
+        let back = format_docx::read_docx(&bytes).expect("read");
+        let engine::Block::Paragraph(p) = &back.document.blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "alpha\u{000C} beta");
+        assert!(!p.props.page_break_before);
+    }
+
+    /// Issue #75 — a table-cell caret is rejected loudly (Word never
+    /// paginates a cell's page break); the Breaks menu greys out there.
+    #[test]
+    fn insert_page_break_is_rejected_in_a_table_cell() {
+        let mut d = DocumentTree::from_text("intro");
+        d.blocks
+            .push_back(engine::Block::Table(one_row_table(vec![cell_with_text(
+                "cell",
+            )])));
+        let mut engine = test_engine_with_doc(d);
+        let cell_pos = BridgeLogicalPos {
+            path: BridgeBlockPath {
+                steps: vec![
+                    BridgePathStep::Block { idx: 1 },
+                    BridgePathStep::Cell { row: 0, col: 0 },
+                    BridgePathStep::Block { idx: 0 },
+                ],
+            },
+            offset: 2,
+        };
+        engine.selection = Some(SelectionState {
+            anchor: cell_pos.clone(),
+            caret: cell_pos.clone(),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let evt = engine.do_insert_page_break(cell_pos);
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(!engine.undo.can_undo(), "a rejected break pushes no edit");
+        let engine::Block::Table(t) = &engine.undo.current().blocks[1] else {
+            panic!("table expected");
+        };
+        let engine::Block::Paragraph(p) = &t.rows[0].cells[0].blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "cell");
+    }
+
     fn band_glyph_count(band: &layout::HeaderFooterBox) -> usize {
         let mut n = 0;
         band.for_each_paragraph(&mut |p| {
@@ -22912,6 +23117,110 @@ mod tests {
         d
     }
 
+    /// Issue #169 — "intro", a 2-cell table whose first row is
+    /// `<w:trHeight w:val="800">` under `rule` (40 px at scale 1) with a
+    /// long cell A that wraps far past it, a plain second row, "outro".
+    fn exact_row_doc(exact: bool) -> DocumentTree {
+        let mut t = one_row_table(vec![
+            cell_with_text(&"overflowing exact row content ".repeat(12)),
+            cell_with_text("short"),
+        ]);
+        t.rows[0].props.height = Some(if exact {
+            engine::RowHeight::Exact { twips: 800 }
+        } else {
+            engine::RowHeight::AtLeast { twips: 800 }
+        });
+        t.rows.push(engine::TableRow {
+            props: engine::RowProperties::default(),
+            cells: vec![cell_with_text("next A"), cell_with_text("next B")],
+        });
+        let mut d = DocumentTree::from_text("intro");
+        d.blocks.push_back(engine::Block::Table(t));
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "outro".into(),
+                ..Default::default()
+            }));
+        d
+    }
+
+    fn glyph_runs(pages: &[PageBox]) -> usize {
+        render::scene::build_document_scene(pages, 0.0)
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::DrawGlyphRun(_)))
+            .count()
+    }
+
+    /// Issue #169 acceptance — an exact row keeps its declared height
+    /// (the content does not grow it), is flagged for clipping, and the
+    /// scene clips both its cells and drops the lines below the row;
+    /// the same content under `atLeast` grows the row and paints every
+    /// line unclipped.
+    #[test]
+    fn exact_height_row_is_fixed_and_clipped() {
+        let engine = test_engine_with_doc(exact_row_doc(true));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("exact");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let t = first_table(&pages);
+        let declared = twips_to_layout_px(800, 1.0);
+        assert_eq!(t.rows[0].size.height, declared);
+        assert!(t.rows[0].exact_height && t.rows[0].cant_split);
+        assert!(!t.rows[1].exact_height);
+        let content: f32 = t.rows[0].cells[0]
+            .content
+            .iter()
+            .map(|b| b.size().height)
+            .sum();
+        assert!(content > 2.0 * declared, "the cell content overflows");
+        for c in &t.rows[0].cells {
+            assert_eq!(c.size.height, declared);
+        }
+        assert_eq!(
+            t.rows[1].origin.y, declared,
+            "the next row follows the fixed row"
+        );
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let clips = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 2, "one clip per cell of the exact row");
+
+        let grown = test_engine_with_doc(exact_row_doc(false));
+        let (grown_pages, _, _, _) = grown.build_pages(1.0, false, None).expect("atLeast");
+        let g = first_table(&grown_pages);
+        assert!(
+            g.rows[0].size.height > 2.0 * declared,
+            "atLeast grows to fit"
+        );
+        assert!(!g.rows[0].exact_height);
+        assert!(
+            glyph_runs(&pages) < glyph_runs(&grown_pages),
+            "lines past the exact row are not painted"
+        );
+        let clips = render::scene::build_document_scene(&grown_pages, 0.0)
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 0, "a growing row needs no clip");
+
+        /* PDF: the clipped export is valid and smaller (dropped lines). */
+        let fonts = test_font_stack();
+        let mut exact_pdf = Vec::new();
+        format_pdf::export_pdf(
+            &pages,
+            &fonts,
+            &[],
+            format_pdf::PdfProfile::Plain,
+            &mut exact_pdf,
+        )
+        .expect("pdf");
+        assert!(exact_pdf.starts_with(b"%PDF"));
+    }
+
     /// Issue #95 — stamp `<w:widowControl>` onto every top-level
     /// paragraph (`None` = unspecified, Word's default ON).
     fn with_widow_control(mut doc: DocumentTree, widow: Option<bool>) -> DocumentTree {
@@ -22966,9 +23275,23 @@ mod tests {
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
         out.push(("two_page_form_feed", pages, info.degradations));
 
+        /* Issue #75 — the same two pages from `<w:pageBreakBefore/>`
+        alone (no FORM FEED). */
+        let engine = test_engine_with_doc(with_widow_control(
+            page_break_before_doc("alpha beta gamma", "delta epsilon"),
+            widow,
+        ));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("pbb");
+        out.push(("two_page_break_before", pages, info.degradations));
+
         let engine = test_engine_with_doc(with_widow_control(table_doc(), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
         out.push(("autofit_table", pages, info.degradations));
+
+        /* Issue #169 — an overflowing `<w:trHeight w:hRule="exact">` row. */
+        let engine = test_engine_with_doc(with_widow_control(exact_row_doc(true), widow));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("exact row");
+        out.push(("exact_row_overflow_table", pages, info.degradations));
 
         let engine = test_engine_with_doc(with_widow_control(prose_doc(300), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
@@ -23125,7 +23448,13 @@ mod tests {
         ("50p_full_x2", 0xf565e610ffdbc22d),
         ("50p_band_2000_x2", 0x3b2d3d53655395a1),
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        /* Issue #75 — `<w:pageBreakBefore/>` alone (new fixture, recorded
+        on the #75 adapter; every other value is unchanged by it). */
+        ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
+        /* Issue #169 — an overflowing exact-height row, recorded on the
+        #169 adapter (new fixture; every other value is unchanged). */
+        ("exact_row_overflow_table", 0x33d0f55718ea079f),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),
         /* Issue #79 — recorded with the `<w:bidiVisual>` mirror in place
@@ -23148,7 +23477,9 @@ mod tests {
         ("50p_full_x2", 0xa7f584534ce2ac6f),
         ("50p_band_2000_x2", 0x25ddf363691ee633),
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
+        ("exact_row_overflow_table", 0x33d0f55718ea079f),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),
     ];

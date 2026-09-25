@@ -304,7 +304,8 @@ fn paint_floats(page: &PageBox, top: f32, behind: bool, cmds: &mut Vec<DisplayCm
 /// shape rect, then the outline on top. The clip is belt and braces:
 /// Canvas2D blits glyphs with `put_image_data`, which ignores the clip,
 /// so lines starting at or past the shape's bottom edge are also culled
-/// here (line-granular overflow clip, exact on Vello / PDF).
+/// here, and (issue #169) the Canvas2D backend crops the blits of the
+/// line straddling the edge to the active clip; exact on Vello / PDF.
 ///
 /// `(base_x, base_y)` is the absolute origin `f.origin` is relative to:
 /// the page's top-left for a page float, the parent box's content rect
@@ -336,7 +337,7 @@ fn paint_text_box(f: &layout::FloatBox, base_x: f32, base_y: f32, cmds: &mut Vec
         cmds.push(DisplayCmd::PushClip { rect });
         paint_frame_floats(tb, content_x, content_y, true, cmds);
         for block in &tb.blocks {
-            match clip_block_lines(block, limit) {
+            match block.clip_lines_at(limit) {
                 Some(clipped) => paint_block(&clipped, content_x, content_y, cmds),
                 None if block.origin().y < limit => paint_block(block, content_x, content_y, cmds),
                 None => {}
@@ -390,26 +391,6 @@ fn paint_frame_floats(
     }
 }
 
-/// Issue #83 — a paragraph block with every line that starts at or past
-/// `limit` (container-relative y) removed; `None` when nothing needs
-/// cutting (or the block is a table, which is kept or dropped whole).
-fn clip_block_lines(block: &LayoutBlock, limit: f32) -> Option<LayoutBlock> {
-    let LayoutBlock::Paragraph(p) = block else {
-        return None;
-    };
-    let keep = p
-        .lines
-        .iter()
-        .take_while(|l| p.origin.y + l.origin.y < limit)
-        .count();
-    if keep == p.lines.len() {
-        return None;
-    }
-    let mut cut = p.clone();
-    cut.lines.truncate(keep);
-    Some(LayoutBlock::Paragraph(cut))
-}
-
 /// Recursive dispatcher — handles top-level page blocks *and* cell
 /// content (Phase 5 PR 2: a table cell can carry paragraphs + nested
 /// tables). `base_x` / `base_y` is the parent container's content
@@ -456,8 +437,35 @@ fn paint_table(t: &TableBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd
             doesn't render flush against the border. */
             let content_x = cell_x + cell.padding_left;
             let content_y = cell_y + cell.padding_top;
-            for inner in &cell.content {
-                paint_block(inner, content_x, content_y, cmds);
+            if row.exact_height {
+                /* Issue #169 — `<w:trHeight w:hRule="exact">`: the row
+                does not grow, so overflowing content is clipped to the
+                cell rect (Word's rendering). Lines starting at or past
+                the cell bottom are dropped outright; the Canvas2D
+                backend crops the straddling line's glyph blits to the
+                clip, Vello / PDF clip exactly. */
+                let rect = Rect::new(
+                    cell_x as f64,
+                    cell_y as f64,
+                    (cell_x + cell.size.width) as f64,
+                    (cell_y + cell.size.height) as f64,
+                );
+                let limit = cell.size.height - cell.padding_top;
+                cmds.push(DisplayCmd::PushClip { rect });
+                for inner in &cell.content {
+                    match inner.clip_lines_at(limit) {
+                        Some(clipped) => paint_block(&clipped, content_x, content_y, cmds),
+                        None if inner.origin().y < limit => {
+                            paint_block(inner, content_x, content_y, cmds)
+                        }
+                        None => {}
+                    }
+                }
+                cmds.push(DisplayCmd::PopClip);
+            } else {
+                for inner in &cell.content {
+                    paint_block(inner, content_x, content_y, cmds);
+                }
             }
         }
     }
