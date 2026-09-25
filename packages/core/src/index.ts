@@ -67,6 +67,7 @@ export type {
     ImageBlob,
     ImageRect,
     ImageWrapMode,
+    TextBoxHop,
     SelectionModifier,
     MoveDirection,
     BridgeBorderStyle,

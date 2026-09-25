@@ -4820,15 +4820,27 @@ impl DocumentTree {
     /// Issue #44 — count of inline images across the whole document
     /// (body + table cells). Lets the shell skip its `GetImageRects`
     /// refresh for image-free documents. Cheap O(paragraphs) walk.
+    ///
+    /// Issue #206 — pictures inside text-box stories (and boxes nested in
+    /// them) count too: the image-geometry query lists them, so a document
+    /// whose only pictures live in a box must still trigger the refresh.
+    /// The walk is bounded by the tree's own (finite) story nesting.
     pub fn count_inline_images(&self) -> u32 {
-        let mut n = 0u32;
-        walk_paragraphs(&self.blocks, &mut |p| {
+        fn count(p: &Paragraph, n: &mut u32) {
             for io in &p.inline_objects {
-                if matches!(io.kind, InlineKind::Image { .. }) {
-                    n = n.saturating_add(1);
+                match &io.kind {
+                    InlineKind::Image { .. } => *n = n.saturating_add(1),
+                    InlineKind::TextBox { story, .. } => {
+                        for b in &story.body {
+                            walk_block(b, &mut |sp: &Paragraph| count(sp, n));
+                        }
+                    }
+                    _ => {}
                 }
             }
-        });
+        }
+        let mut n = 0u32;
+        walk_paragraphs(&self.blocks, &mut |p| count(p, &mut n));
         n
     }
 
@@ -4868,8 +4880,9 @@ impl DocumentTree {
     ///
     /// Issue #73 — includes REFERENCED header/footer stories, like
     /// [`Self::character_count`]. `count_inline_images` deliberately
-    /// stays body-only: the shell's image-rect/selection pipeline is
-    /// body-scoped, and the count gates exactly that pipeline.
+    /// stays body-only (body + text-box stories, issue #206): the shell's
+    /// image-rect/selection pipeline is body-scoped, and the count gates
+    /// exactly that pipeline.
     pub fn word_count(&self) -> u32 {
         let mut n = 0u32;
         let mut count = |p: &Paragraph| {
@@ -7405,6 +7418,43 @@ impl DocumentTree {
                 InlineKind::TextBox { story, .. } if io.at == at => Some(story.as_ref()),
                 _ => None,
             })
+    }
+
+    /// Issue #206 — the story tree a chain of text-box hops addresses:
+    /// each `(host, at)` names the box anchored at byte `at` of the
+    /// paragraph `host`, rooted in the previous hop's story (the first in
+    /// this tree). An empty chain is this tree itself. `None` when a hop
+    /// holds no text box. The chain is walked once per hop, so its length
+    /// bounds the descent.
+    pub fn text_box_story_tree(&self, hops: &[(BlockPath, u32)]) -> Option<Self> {
+        match hops.split_first() {
+            None => Some(self.clone()),
+            Some(((host, at), rest)) => {
+                let story = self.text_box_at(host, *at)?;
+                DocumentTree::from_blocks(story.body.clone()).text_box_story_tree(rest)
+            }
+        }
+    }
+
+    /// Issue #206 — run the model edit `f` inside the story a chain of
+    /// text-box hops addresses ([`Self::text_box_story_tree`]) and write
+    /// the edited story back up the chain through
+    /// [`Self::with_updated_text_box`] (each box on the chain goes dirty;
+    /// a top-level host keeps its passthrough bytes). An empty chain runs
+    /// `f` on this tree. `None` when a hop holds no text box.
+    pub fn with_text_box_story_edit(
+        &self,
+        hops: &[(BlockPath, u32)],
+        f: impl FnOnce(&DocumentTree) -> DocumentTree,
+    ) -> Option<Self> {
+        match hops.split_first() {
+            None => Some(f(self)),
+            Some(((host, at), rest)) => {
+                let story = DocumentTree::from_blocks(self.text_box_at(host, *at)?.body.clone());
+                let edited = story.with_text_box_story_edit(rest, f)?;
+                Some(self.with_updated_text_box(host, *at, edited.blocks.iter().cloned().collect()))
+            }
+        }
     }
 
     /// Issue #83 — replace the story of the text box at `(host, at)` and
@@ -10256,6 +10306,32 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(d.count_inline_images(), 2);
+        /* Issue #206 — a picture inside a text box's story counts too. */
+        let (boxed, host, at) = d.insert_text_box_at(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            914_400,
+            914_400,
+        );
+        let mut story = DocumentTree::from_text("\u{FFFC}");
+        if let Some(Block::Paragraph(p)) = story.blocks.get_mut(0) {
+            p.inline_objects.push(InlineObject {
+                at: 0,
+                kind: InlineKind::Image {
+                    rel_id: "c".into(),
+                    width_emu: 1,
+                    height_emu: 1,
+                },
+                anchor: None,
+                source_xml: None,
+            });
+        }
+        let boxed = boxed.with_updated_text_box(&host, at, story.blocks.iter().cloned().collect());
+        assert_eq!(boxed.count_inline_images(), 3);
+        let tree = boxed.text_box_story_tree(&[(host, at)]).expect("story");
+        assert_eq!(tree.count_inline_images(), 1);
     }
 
     /// Issue #80 — typing before an inline anchor slides it right with
