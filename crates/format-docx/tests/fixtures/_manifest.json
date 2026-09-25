@@ -314,7 +314,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     }
   }

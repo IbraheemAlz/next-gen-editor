@@ -56,11 +56,18 @@ const INSERT_TEXT: &str = " تم التعديل";
 /// SOURCE bytes — byte-for-byte what `format_docx::writer::emit_sect_pr`
 /// itself would write for stock A4 geometry, so it is not a semantic
 /// change. See `ppr_fixtures` for the one exception (`pPr_bidi_rtl.docx`)
-/// and `run_gen_seed` / `prebuilt_fixtures` for the three fixtures this
-/// module deliberately leaves alone because their generator functions are
-/// SHARED with a `run_default()` exact-byte-equality assertion
-/// (`grab_bag_exotic.docx`, `floating_image_anchor.docx`,
-/// `footnotes_endnotes.docx`).
+/// and `run_gen_seed` / `prebuilt_fixtures` for the fixtures this module
+/// deliberately leaves alone because their generator functions are SHARED
+/// with a `run_default()` exact-byte-equality assertion that compares a
+/// resave against the pinned SOURCE text (`grab_bag_exotic.docx`,
+/// `floating_image_anchor.docx`, `footnotes_endnotes.docx`,
+/// `table_cell_runs.docx`, `image_wrap_modes.docx`) — the writer's
+/// trailing-sectPr compaction (`sect_pr_compaction_delta`) would desync
+/// those comparisons. `w14_paraid_word.docx` is the one exception THAT
+/// IS pinned despite sharing a generator with a `run_default()` step:
+/// its assertion compares two fresh resaves of the same edited tree
+/// against EACH OTHER, not against the pinned source, so both sides
+/// compact identically and the comparison still holds.
 const A4_SECT_PR_EXPLICIT: &str = concat!(
     "<w:sectPr>",
     r#"<w:pgSz w:w="11906" w:h="16838"/>"#,
@@ -1485,9 +1492,10 @@ fn w14_paraid_document_xml() -> String {
             r#"<w:tc><w:p w14:paraId="4D5E6F70" w14:textId="3B4C5D6E"><w:r><w:t xml:space="preserve">cell b</w:t></w:r></w:p></w:tc>"#,
             "</w:tr></w:tbl>",
             r#"<w:p w14:paraId="5E6F7081" w14:textId="4C5D6E7F"><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p>"#,
-            "<w:sectPr/></w:body></w:document>",
+            "{sect_pr}</w:body></w:document>",
         ),
         root = WORD_ROOT_OPEN,
+        sect_pr = A4_SECT_PR_EXPLICIT,
     )
 }
 
@@ -2196,7 +2204,12 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             },
         },
         /* Issue #82 — one floating picture per wrap mode; passthrough
-        drift 0 on a zero-edit resave, exact regeneration in step 14. */
+        drift 0 on a zero-edit resave, exact regeneration in step 14
+        (`run_wrap_modes_roundtrip` compares a resave against the pinned
+        source by exact string equality). Issue #109's pgSz pin is
+        deliberately NOT applied here for the same reason as
+        `grab_bag_exotic.docx` / `table_cell_runs.docx` above — the
+        writer's trailing-sectPr compaction would desync that comparison. */
         PrebuiltFixture {
             name: "image_wrap_modes.docx",
             bytes: build_image_wrap_modes_docx(),
@@ -2413,8 +2426,12 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         under a second and the outer table rides the passthrough at drift 0
         whatever depth the typed model stops at. */
         /* Issue #100 — Word-shaped `w14:paraId` on every paragraph, bound
-        only on the root. Passthrough at drift 0; step 12 saves it through
-        the UI path. */
+        only on the root. Passthrough writer, but step 12 compares two
+        FRESH saves of the same edited tree (the UI path vs the archive
+        path) rather than the pinned source, so pinning A4 pgSz (issue
+        #109) here only adds the usual `sect_pr_compaction_delta()` —
+        both save paths compact it identically, so `doc_ui == doc_archive`
+        still holds. */
         PrebuiltFixture {
             name: "w14_paraid_word.docx",
             bytes: build_w14_paraid_docx(),
@@ -2429,11 +2446,20 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         "after".into(),
                     ],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         /* Issue #101 — mixed run formatting + a picture inside table
-        cells. Passthrough at drift 0; step 13 edits both cells. */
+        cells. Passthrough at drift 0; step 13 edits both cells and
+        requires the regenerated document.xml equal SOURCE + edits
+        exactly (`run_table_cell_runs_survival`'s `expected =
+        doc_a.replacen(...)`). Issue #109's pgSz pin is deliberately
+        NOT applied here — same reasoning as `grab_bag_exotic.docx` /
+        `floating_image_anchor.docx` / `footnotes_endnotes.docx` above:
+        the writer's trailing-sectPr compaction would desync that exact
+        comparison, and fixing it is out of this change's scope. */
         PrebuiltFixture {
             name: "table_cell_runs.docx",
             bytes: build_table_cell_runs_docx(),
