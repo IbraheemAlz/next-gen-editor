@@ -302,3 +302,72 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
         logComplete: prunedThrough === 0,
     };
 }
+
+/* ===================================================================
+   Issue #240 — the GPU-renderer crash-loop streak, persisted.
+
+   #99 bounds consecutive worker traps on Vello within one EngineClient;
+   a failure that takes the whole TAB down (or a reload mid-loop) started
+   a fresh client from zero. The streak lives in the `meta` store beside
+   the event log — origin-wide, like the GPU it describes — so the next
+   boot can honour it. `openEventLog` never clears it.
+   =================================================================== */
+
+/** The persisted streak (`meta` row `renderer-streak`). */
+export interface RendererStreak {
+    /** The backend the failing generations painted with (`"vello"`). */
+    renderer: string;
+    /** Consecutive generations on `renderer` that ended in a trap, or in
+     *  a tab death (see `live`). Reset once a generation stays up. */
+    count: number;
+    /** When the streak last changed (ms since the epoch) — the decay
+     *  clock. */
+    at: number;
+    /** A generation on `renderer` is running and has neither proved
+     *  stable nor shut down cleanly. Still `true` at the next boot ⇒ that
+     *  generation died with its tab: it counts as one more failure. */
+    live: boolean;
+    /** Identifies the `live` generation; a clean shutdown leaves it in
+     *  `localStorage` (see `EngineClient`), which un-counts it. */
+    token?: string;
+}
+
+const STREAK_ID = 'renderer-streak';
+
+export async function loadRendererStreak(): Promise<RendererStreak | undefined> {
+    const db = await getDb();
+    const tx = db.transaction('meta', 'readonly');
+    const req = tx.objectStore('meta').get(STREAK_ID);
+    await txDone(tx);
+    const row = req.result as Partial<RendererStreak> | undefined;
+    if (
+        !row ||
+        typeof row.renderer !== 'string' ||
+        typeof row.count !== 'number' ||
+        typeof row.at !== 'number'
+    ) {
+        return undefined;
+    }
+    const streak: RendererStreak = {
+        renderer: row.renderer,
+        count: row.count,
+        at: row.at,
+        live: row.live === true,
+    };
+    if (typeof row.token === 'string') streak.token = row.token;
+    return streak;
+}
+
+export async function saveRendererStreak(streak: RendererStreak): Promise<void> {
+    const db = await getDb();
+    const tx = db.transaction('meta', 'readwrite');
+    tx.objectStore('meta').put({ id: STREAK_ID, ...streak });
+    await txDone(tx);
+}
+
+export async function clearRendererStreak(): Promise<void> {
+    const db = await getDb();
+    const tx = db.transaction('meta', 'readwrite');
+    tx.objectStore('meta').delete(STREAK_ID);
+    await txDone(tx);
+}

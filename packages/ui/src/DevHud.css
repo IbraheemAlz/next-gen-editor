@@ -63,3 +63,18 @@
 .nge-hud__warn {
     color: var(--nge-color-warning);
 }
+
+/* Issue #240 — "retry the GPU renderer" action under the fallback row. */
+.nge-hud__retry {
+    padding: 2px var(--nge-space-2);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-sm);
+    background: var(--nge-color-surface-alt);
+    color: var(--nge-color-text);
+    font: 500 var(--nge-font-size-xs)/1.4 var(--nge-font-ui);
+    cursor: pointer;
+}
+
+.nge-hud__retry:hover {
+    border-color: var(--nge-color-warning);
+}

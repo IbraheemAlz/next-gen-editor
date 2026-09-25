@@ -44,6 +44,9 @@ type ClientInitMsg = {
     documentId: string;
     /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
     mockBackend?: 'vello';
+    /** Issue #240 — a crash loop on the GPU backend persisted across
+     *  reloads: boot on Canvas2D without probing it. */
+    forceRenderer?: 'canvas2d';
 };
 type ClientRecoverMsg = {
     id: number;
@@ -860,7 +863,12 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
            (WebGPU) when a GPU device is available, else the Canvas2D fallback.
            transferControlToOffscreen is one-shot, so this choice is permanent
            for the canvas (Backlog #4). */
-        const probe = await probeBackend(msg.mockBackend);
+        /* Issue #240 — unless the client forces Canvas2D after a crash
+           loop that spanned reloads: then no probe at all. */
+        const probed = msg.forceRenderer !== 'canvas2d';
+        const probe = probed
+            ? await probeBackend(msg.mockBackend)
+            : { renderer: 'canvas2d', mocked: false };
         const renderer = probe.renderer;
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
@@ -887,6 +895,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
             ok: true,
             crossOriginIsolated: self.crossOriginIsolated,
             renderer,
+            probed,
         });
     } catch (e: unknown) {
         replyError(msg.id, e);
