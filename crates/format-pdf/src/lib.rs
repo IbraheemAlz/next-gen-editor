@@ -64,14 +64,17 @@
 //! the `behindDoc` group before any text, the in-front group last, each
 //! sorted by `relativeHeight`. Each distinct media payload is written
 //! once and shared by every page that references it. JPEG passes through
-//! as `/DCTDecode` (dimensions from the SOF marker); PNG is decoded in pure
-//! Rust (`png` crate) and re-deflated. Transparency rule: plain output and
-//! PDF/A-2u carry PNG alpha as an `/SMask`; PDF/A-1b (which forbids
+//! as `/DCTDecode` (dimensions from the SOF marker); PNG, GIF (first frame,
+//! issue #189) and WebP (lossy + lossless, issue #189) are decoded in pure
+//! Rust (`png` / `gif` / `image-webp`; the latter two behind the default
+//! `gif` / `webp` features) and re-deflated. Transparency rule: plain
+//! output and PDF/A-2u carry alpha as an `/SMask`; PDF/A-1b (which forbids
 //! `/SMask`) and PDF/X-3:2003 (which forbids transparency) composite every
 //! pixel onto opaque white instead. No per-image ICC profile is embedded —
 //! samples are `DeviceRGB` / `DeviceGray` under the document's sRGB output
-//! intent; a CMYK JPEG is embedded only in plain output. GIF / WebP / EMF /
-//! WMF and corrupt or oversized images are skipped with a [`PdfWarning`].
+//! intent; a CMYK JPEG is embedded only in plain output. EMF / WMF (and GIF /
+//! WebP with their feature off) and corrupt or oversized images are skipped
+//! with a [`PdfWarning`].
 //!
 //! # Stream compression & text extraction
 //!

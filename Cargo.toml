@@ -80,6 +80,12 @@ flate2 = "1"
 # Issue #121 — PNG decode for PDF image XObjects. Pure Rust (MIT OR
 # Apache-2.0), already in the wasm graph via `vello`, so no new crates.
 png = "0.18"
+# Issue #189 — GIF (first frame) and WebP (lossy + lossless) decode for PDF
+# image XObjects. Both pure Rust, MIT OR Apache-2.0, no `std::fs` / threads.
+# `gif` without its default `color_quant` (encoder-side quantizer only).
+# Consumed only by `format-pdf` behind its `gif` / `webp` features.
+gif = { version = "0.14", default-features = false, features = ["std"] }
+image-webp = "0.2"
 
 # Errors / logging
 thiserror = "1"
