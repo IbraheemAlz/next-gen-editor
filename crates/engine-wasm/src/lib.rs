@@ -1040,9 +1040,9 @@ impl Engine {
     /// Phase 7 — list every inline-image media blob the document carries,
     /// keyed by media key (issue #188: the resolved target path for an
     /// imported picture, the minted id for an inserted one — the same key
-    /// the display list's `DrawImage.rel_id` names). The TS shell consumes
-    /// this list once after `OpenDocx`, decodes each blob into an
-    /// `ImageBitmap` via the browser, and installs the result via
+    /// the display list's `DrawImage.media_key` names, issue #224). The TS
+    /// shell consumes this list once after `OpenDocx`, decodes each blob
+    /// into an `ImageBitmap` via the browser, and installs the result via
     /// [`Engine::register_image`]. Returns an array of
     /// `{ rel_id, mime, bytes }` objects.
     pub fn media_entries(&self) -> Result<JsValue, JsValue> {
@@ -5147,6 +5147,7 @@ fn collect_paragraph_image_rects(
                         path: path.clone(),
                         at: run.source_range.start + g.cluster,
                         rel_id: rel.to_string(),
+                        media_key: rel.to_string(),
                         rect: BridgeRect {
                             x: x0,
                             y: y0,
@@ -5218,6 +5219,7 @@ fn collect_text_box_image_rects(
             path: engine_to_bridge_path(host),
             at: nf.at,
             rel_id: nf.rel_id.clone(),
+            media_key: nf.rel_id.clone(),
             rect: BridgeRect {
                 x: cx + nf.origin.x,
                 y: cy + nf.origin.y,
@@ -6083,18 +6085,21 @@ fn push_run(runs: &mut Vec<A11yRun>, text: &str, s: u32, e: u32, style: SpanStyl
                 .unwrap_or(engine::UnderlineStyle::None)
                 .is_visible(),
             note_ref: None,
+            object: None,
         });
     }
 }
 
 /// Split a paragraph into gap-free accessibility runs by its style spans.
 ///
-/// Issue #203 — `subs` are the paragraph's note marks (each a U+FFFC
-/// placeholder byte offset, the display text, the optional note link):
-/// each placeholder is replaced by its own run carrying the marker text
-/// (and `note_ref` for a reference), styled like the span it sits in.
-/// Without `subs` the output is exactly the pre-#203 run list.
-fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
+/// Issue #203 / #215 — `subs` are the paragraph's sentinel marks (each a
+/// U+FFFC placeholder byte offset, the display text, and the optional note
+/// / object link): each placeholder is replaced by its own run carrying
+/// the mark's text (empty for an inline object — see
+/// [`A11ySentinelMark::object`]) and its `note_ref` / `object`, styled
+/// like the span it sits in. Without `subs` the output is exactly the
+/// pre-#203 run list.
+fn a11y_runs(para: &engine::Paragraph, subs: &[A11ySentinelMark]) -> Vec<A11yRun> {
     let len = para.text.len() as u32;
     let mut runs: Vec<A11yRun> = Vec::new();
     let push = |runs: &mut Vec<A11yRun>, s: u32, e: u32, style: SpanStyle| {
@@ -6110,6 +6115,7 @@ fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
                     .unwrap_or(engine::UnderlineStyle::None)
                     .is_visible(),
                 note_ref: m.note_ref.clone(),
+                object: m.object.clone(),
             });
             cursor = (m.at + A11Y_PLACEHOLDER_LEN).min(e);
         }
@@ -6125,14 +6131,19 @@ fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
     runs
 }
 
-/// UTF-8 length of the U+FFFC object placeholder a note mark occupies.
+/// UTF-8 length of the U+FFFC object placeholder a sentinel mark occupies.
 const A11Y_PLACEHOLDER_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
 
-/// Issue #203 — one note mark inside a paragraph, for [`a11y_runs`].
-struct A11yNoteMark {
+/// Issue #203 / #215 — one U+FFFC sentinel's replacement inside a
+/// paragraph, for [`a11y_runs`]: a note reference / self-mark (`note_ref`
+/// or bare marker `text`), or (issue #215) an inline image / text box
+/// (`object`, `text` empty — the object IS the run). Exactly one of
+/// `note_ref` / `object` is ever set.
+struct A11ySentinelMark {
     at: u32,
     text: String,
     note_ref: Option<bridge::A11yNoteRef>,
+    object: Option<bridge::A11yObjectRef>,
 }
 
 /// Issue #203 — the note context of a body walk: the document (for the
@@ -6176,14 +6187,19 @@ fn note_ref_anchor(kind: &engine::InlineKind) -> Option<engine::NoteAnchor> {
     }
 }
 
-/// Issue #203 — the note marks of `p` in `scope`: reference marks when
-/// the walk carries a note context (the body), the self-mark when the
-/// walk is a note story's body. Only real U+FFFC placeholders qualify.
-fn a11y_note_marks(p: &engine::Paragraph, scope: A11yScope<'_>) -> Vec<A11yNoteMark> {
-    let mut marks: Vec<A11yNoteMark> = Vec::new();
-    if scope.notes.is_none() && scope.self_marker.is_none() {
-        return marks;
-    }
+/// Issue #203 / #215 — the sentinel marks of `p` in `scope`: a note
+/// reference mark / self-mark when the walk carries a note context (only
+/// then — see [`A11yNotes`]), and (unconditionally, any scope) an inline
+/// image or text box. Only real U+FFFC placeholders qualify. `path` is
+/// [`push_a11y_paragraph`]'s own path string for `p`, so a text-box
+/// mark's `id` matches the region [`push_a11y_text_boxes`] builds for the
+/// SAME box.
+fn a11y_inline_marks(
+    p: &engine::Paragraph,
+    scope: A11yScope<'_>,
+    path: &str,
+) -> Vec<A11ySentinelMark> {
+    let mut marks: Vec<A11ySentinelMark> = Vec::new();
     for io in &p.inline_objects {
         if !p
             .text
@@ -6192,26 +6208,60 @@ fn a11y_note_marks(p: &engine::Paragraph, scope: A11yScope<'_>) -> Vec<A11yNoteM
         {
             continue;
         }
-        if let Some(notes) = scope.notes
-            && let Some(anchor) = note_ref_anchor(&io.kind)
-        {
-            let note_ref = notes.doc.note_story(anchor).map(|_| bridge::A11yNoteRef {
-                kind: a11y_note_kind(anchor.kind),
-                id: a11y_note_id(anchor),
-            });
-            marks.push(A11yNoteMark {
-                at: io.at,
-                text: notes.markers.get(&anchor).cloned().unwrap_or_default(),
-                note_ref,
-            });
-        } else if let Some(marker) = scope.self_marker
-            && matches!(io.kind, engine::InlineKind::NoteSelfRef { .. })
-        {
-            marks.push(A11yNoteMark {
-                at: io.at,
-                text: marker.to_string(),
-                note_ref: None,
-            });
+        match &io.kind {
+            engine::InlineKind::Image { .. } => {
+                let id = io.kind.image_media_key().unwrap_or_default().to_string();
+                let (name, descr) = io.image_label().unwrap_or((None, None));
+                marks.push(A11ySentinelMark {
+                    at: io.at,
+                    text: String::new(),
+                    note_ref: None,
+                    object: Some(bridge::A11yObjectRef {
+                        kind: bridge::A11yObjectKind::Image,
+                        id,
+                        alt: descr.or(name),
+                    }),
+                });
+            }
+            engine::InlineKind::TextBox { .. } => {
+                let id = format!("{}{path}@{}", scope.id_prefix, io.at);
+                let (name, descr) = io.text_box_label().unwrap_or((None, None));
+                marks.push(A11ySentinelMark {
+                    at: io.at,
+                    text: String::new(),
+                    note_ref: None,
+                    object: Some(bridge::A11yObjectRef {
+                        kind: bridge::A11yObjectKind::TextBox,
+                        id,
+                        alt: descr.or(name),
+                    }),
+                });
+            }
+            _ => {
+                if let Some(notes) = scope.notes
+                    && let Some(anchor) = note_ref_anchor(&io.kind)
+                {
+                    let note_ref = notes.doc.note_story(anchor).map(|_| bridge::A11yNoteRef {
+                        kind: a11y_note_kind(anchor.kind),
+                        id: a11y_note_id(anchor),
+                    });
+                    marks.push(A11ySentinelMark {
+                        at: io.at,
+                        text: notes.markers.get(&anchor).cloned().unwrap_or_default(),
+                        note_ref,
+                        object: None,
+                    });
+                } else if let Some(marker) = scope.self_marker
+                    && matches!(io.kind, engine::InlineKind::NoteSelfRef { .. })
+                {
+                    marks.push(A11ySentinelMark {
+                        at: io.at,
+                        text: marker.to_string(),
+                        note_ref: None,
+                        object: None,
+                    });
+                }
+            }
         }
     }
     marks.sort_by_key(|m| m.at);
@@ -6404,7 +6454,7 @@ fn push_a11y_paragraph(
     out.push(A11yNode::Paragraph(A11yParagraph {
         direction,
         resolved_direction,
-        runs: a11y_runs(p, &a11y_note_marks(p, scope)),
+        runs: a11y_runs(p, &a11y_inline_marks(p, scope, path)),
     }));
     push_a11y_text_boxes(out, p, direction, scope, path);
     /* Issue #203 — the footnotes FIRST referenced in this paragraph
@@ -10725,6 +10775,7 @@ impl Engine {
                     path,
                     at: f.at,
                     rel_id: f.rel_id.clone(),
+                    media_key: f.rel_id.clone(),
                     rect: BridgeRect {
                         x: f.origin.x,
                         y: page_top + f.origin.y,
@@ -17144,6 +17195,7 @@ mod tests {
                 italic: false,
                 underline: false,
                 note_ref: None,
+                object: None,
             }],
         })
     }
@@ -20721,7 +20773,7 @@ mod tests {
         let draw = cmds
             .iter()
             .position(|c| {
-                matches!(c, render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdBoxPic")
+                matches!(c, render::scene::DisplayCmd::DrawImage { media_key, .. } if media_key == "rIdBoxPic")
             })
             .expect("story picture paints");
         let pop = cmds
@@ -21069,7 +21121,7 @@ mod tests {
         let scene = render::scene::build_document_scene(&pages, 0.0);
         assert!(scene.cmds.iter().any(|c| matches!(
             c,
-            render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdInnerPic"
+            render::scene::DisplayCmd::DrawImage { media_key, .. } if media_key == "rIdInnerPic"
         )));
     }
 
@@ -26181,6 +26233,9 @@ mod toc_pdf_export_tests;
 
 #[cfg(test)]
 mod a11y_note_tests;
+
+#[cfg(test)]
+mod a11y_object_tests;
 
 #[cfg(test)]
 mod part_media_tests;
