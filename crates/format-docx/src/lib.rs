@@ -24,6 +24,8 @@ pub mod parts;
 pub mod reader;
 pub mod schema;
 pub mod style_resolver;
+#[doc(hidden)]
+pub mod test_fixtures;
 pub mod writer;
 
 pub use error::{DocxError, DocxWarning};

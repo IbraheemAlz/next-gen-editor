@@ -86,6 +86,19 @@ png = "0.18"
 # Consumed only by `format-pdf` behind its `gif` / `webp` features.
 gif = { version = "0.14", default-features = false, features = ["std"] }
 image-webp = "0.2"
+# Issue #207 — TIFF decode for PDF image XObjects (BMP is a small
+# hand-written decoder in `format-pdf::image`, no crate). Pure Rust (MIT),
+# pulling in `jpeg-decoder` (default-features off, so its `rayon` feature —
+# threads, unavailable on wasm32-unknown-unknown — never activates),
+# `flate2` and `weezl` (both already workspace deps) plus tiny
+# `crc32fast`/`cfg-if`/`simd-adler32`/`adler2` (MIT/Apache-2.0/0BSD).
+# Probed wasm32 cost (see crates/format-pdf/src/image.rs's module doc):
+# ≈ +214 KB raw / +73 KB gzip upper bound, well under the ~150 KB gzip
+# threshold for defaulting it on. Pinned to 0.9 (not the newer 0.11, which
+# pulls in `zune-jpeg` + CCITT `fax` + `zerocopy` for a materially larger
+# footprint we don't need). Consumed only by `format-pdf` behind its `tiff`
+# feature.
+tiff = "0.9"
 
 # Errors / logging
 thiserror = "1"
