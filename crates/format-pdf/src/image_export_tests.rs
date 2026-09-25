@@ -652,3 +652,99 @@ fn shared_image_across_pages_is_embedded_once() {
     assert_eq!(report.images_embedded, 3);
     assert_eq!(images(&objects(&pdf)).len(), 4);
 }
+
+/// Issue #197 — floats anchored in a text-box story (a picture in the
+/// box, and a picture in a box nested in it) are embedded and placed at
+/// the parent's content origin + their content-relative offset.
+#[test]
+fn pictures_in_text_box_stories_are_embedded_and_placed() {
+    let stack = liberation_stack();
+    let mut page = image_page(&stack);
+    page.floats.clear();
+    let frame = |floats: Vec<FloatBox>| layout::TextBoxFrame {
+        source: layout::TextBoxGlyph {
+            story: Arc::new(engine::TextBoxStory::default()),
+            key: 0,
+            insets: [10.0, 5.0, 10.0, 5.0],
+            v_align: engine::TextBoxVAlign::Top,
+            fill: None,
+            outline: None,
+            inline: false,
+        },
+        blocks: Vec::new(),
+        floats,
+    };
+    let pic = |rel: &str, x: f32, y: f32| {
+        float(
+            rel,
+            false,
+            Point { x, y },
+            Size {
+                width: 40.0,
+                height: 25.0,
+            },
+            1,
+        )
+    };
+    let mut inner = float(
+        "",
+        false,
+        Point { x: 100.0, y: 60.0 },
+        Size {
+            width: 80.0,
+            height: 60.0,
+        },
+        2,
+    );
+    inner.text_box = Some(Box::new(frame(vec![pic("rIdJpg", 3.0, 4.0)])));
+    let mut outer = float(
+        "",
+        false,
+        Point { x: 50.0, y: 100.0 },
+        Size {
+            width: 220.0,
+            height: 150.0,
+        },
+        1,
+    );
+    outer.text_box = Some(Box::new(frame(vec![pic("rIdFloat", 20.0, 30.0), inner])));
+    page.floats.push(outer);
+    let mut pdf = Vec::new();
+    let report = export_pdf_with_media(
+        std::slice::from_ref(&page),
+        &stack,
+        &[TEXT],
+        &media(),
+        PdfProfile::Plain,
+        &mut pdf,
+    )
+    .expect("export");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(
+        report.images_embedded, 3,
+        "the nested picture reuses the inline JPEG"
+    );
+    let objs = objects(&pdf);
+    let content = page_content(&objs);
+    let close = |a: [f32; 6], b: [f32; 6]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.01);
+    /* Paint-walk order names the inline PNG Im0, inline JPEG Im1, then
+    the story picture (rIdFloat) Im2; the nested picture reuses Im1. */
+    /* Outer content origin (60, 105) + (20, 30): bottom-left y =
+    842 - (135 + 25). */
+    let fl = placements(&content, "Im2");
+    assert_eq!(fl.len(), 1);
+    assert!(
+        close(fl[0], [40.0, 0.0, 0.0, 25.0, 80.0, 682.0]),
+        "{:?}",
+        fl[0]
+    );
+    /* Nested content origin = (60 + 100 + 10, 105 + 60 + 5) = (170, 170)
+    + (3, 4): bottom-left y = 842 - (174 + 25). */
+    let nested = placements(&content, "Im1");
+    assert_eq!(nested.len(), 2, "inline JPEG + nested story picture");
+    assert!(
+        close(nested[1], [40.0, 0.0, 0.0, 25.0, 173.0, 643.0]),
+        "{:?}",
+        nested[1]
+    );
+}

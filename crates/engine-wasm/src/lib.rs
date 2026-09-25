@@ -2126,19 +2126,23 @@ struct TextBoxLayoutCtx<'a> {
     page_number: u32,
 }
 
-/// `true` when `blocks` (table cells included) carry a text box — the
-/// cheap model-side gate that keeps a box without nested boxes on the
-/// exact pre-#165 single pass.
-fn story_has_text_box(blocks: &[engine::Block]) -> bool {
+/// `true` when `blocks` (table cells included) carry an object the
+/// story frame resolves as a float of the box: a text box (any
+/// placement) while `boxes` (the nesting depth is under the cap), or —
+/// issue #197, at any depth — a floating picture. The cheap model-side
+/// gate that keeps a plain story on the exact pre-#165 single pass.
+fn story_has_frame_float(blocks: &[engine::Block], boxes: bool) -> bool {
     blocks.iter().any(|b| match b {
-        engine::Block::Paragraph(p) => p
-            .inline_objects
-            .iter()
-            .any(|io| matches!(io.kind, engine::InlineKind::TextBox { .. })),
-        engine::Block::Table(t) => t
-            .rows
-            .iter()
-            .any(|r| r.cells.iter().any(|c| story_has_text_box(&c.blocks))),
+        engine::Block::Paragraph(p) => p.inline_objects.iter().any(|io| match io.kind {
+            engine::InlineKind::TextBox { .. } => boxes,
+            engine::InlineKind::Image { .. } => io.is_floating(),
+            _ => false,
+        }),
+        engine::Block::Table(t) => t.rows.iter().any(|r| {
+            r.cells
+                .iter()
+                .any(|c| story_has_frame_float(&c.blocks, boxes))
+        }),
     })
 }
 
@@ -2189,7 +2193,8 @@ fn lay_text_box_frame(
     let mut plan = layout::WrapPlan::new();
     let mut blocks = lay(&plan, cache);
     let mut nested: Vec<layout::FloatBox> = Vec::new();
-    if depth < MAX_TEXT_BOX_LAYOUT_DEPTH && story_has_text_box(&story.body) {
+    let boxes = depth < MAX_TEXT_BOX_LAYOUT_DEPTH;
+    if story_has_frame_float(&story.body, boxes) {
         let size = layout::Size {
             width: inner_w,
             height: inner_h,
@@ -2208,9 +2213,10 @@ fn lay_text_box_frame(
             }
             let mut page = layout::story_frame_page(blocks, size, ctx.page_number);
             let mut floats = layout::resolve_page_floats(&page, layout::ColumnLayout::default());
-            /* Only nested TEXT BOXES are in scope: a floating picture in
-            a story is neither painted nor wrapped (pre-#165 behaviour). */
-            floats.retain(|nf| nf.text_box.is_some());
+            /* Nested text boxes (under the cap) and — issue #197 —
+            floating pictures: both are floats of the box story. A box
+            past the cap keeps its place in the story unresolved. */
+            floats.retain(|nf| boxes || nf.text_box.is_none());
             page.floats = floats;
             page
         };
@@ -2239,7 +2245,7 @@ fn lay_text_box_frame(
                 p.source_paragraph_id = id;
             }
         }
-        for nf in nested.iter_mut() {
+        for nf in nested.iter_mut().filter(|nf| nf.text_box.is_some()) {
             lay_text_box_frame(nf, ctx, cache, None, depth + 1, notes);
         }
     }
@@ -18575,6 +18581,162 @@ mod tests {
     }
 
     const PINNED_NESTED_TEXT_BOXES: u64 = 0x0effc1fd111fcc44;
+
+    /// Issue #197 — a 0.75" × 0.5" square-wrapped floating picture
+    /// anchored at the head of a story paragraph.
+    fn story_float_image(rel: &str) -> engine::InlineObject {
+        engine::InlineObject {
+            at: 0,
+            kind: engine::InlineKind::Image {
+                rel_id: rel.to_string(),
+                width_emu: 685_800,
+                height_emu: 457_200,
+            },
+            anchor: Some(Box::new(engine::FloatAnchor {
+                dist_right_emu: 57_150,
+                wrap: engine::WrapKind::Square,
+                ..engine::FloatAnchor::default()
+            })),
+        }
+    }
+
+    /// Issue #197 — a body paragraph hosting a 3" × 2" floating box whose
+    /// story opens with a floating picture (square wrap) followed by a
+    /// long run of prose; the picture's bytes live in the document media.
+    fn boxed_float_image_doc() -> DocumentTree {
+        let story_text = format!(
+            "\u{FFFC}{}",
+            "Story text wraps beside the picture inside the box. ".repeat(3)
+        );
+        let mut story = DocumentTree::from_text(&story_text);
+        if let Some(p) = story.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(story_float_image("rIdBoxPic"));
+        }
+        let story_body: Vec<engine::Block> = story.blocks.iter().cloned().collect();
+        let prose = "Body text wraps around the framed picture box. ".repeat(6);
+        let doc = DocumentTree::from_blocks(vec![plain_para(&prose), plain_para("Tail")]);
+        let (doc, h0, a0) = doc.insert_text_box_at(
+            EnginePos {
+                path: EngineBlockPath::top(0),
+                offset: 0,
+            },
+            2_743_200,
+            1_828_800,
+        );
+        let mut doc = doc.with_updated_text_box(&h0, a0, story_body);
+        doc.media.insert(
+            "rIdBoxPic".into(),
+            engine::ImageBlob {
+                content_type: "image/jpeg".to_string(),
+                data: format_pdf::test_images::jpeg(24, 16, 3),
+            },
+        );
+        doc
+    }
+
+    /// Issue #197 — a floating picture anchored in a text-box story is a
+    /// float of the box's content rect: it resolves into the frame's
+    /// `floats`, the story wraps around it (square wrap), the scene draws
+    /// it inside the box clip, and the PDF embeds + paints it. Pinned.
+    #[test]
+    fn floating_picture_in_text_box_story_wraps_and_paints() {
+        let engine = test_engine_with_doc(boxed_float_image_doc());
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let outer = pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("box float");
+        let tb = outer.text_box.as_deref().expect("frame");
+        assert_eq!(tb.floats.len(), 1, "the story picture resolves");
+        let pic = &tb.floats[0];
+        assert!(pic.text_box.is_none());
+        assert_eq!(pic.rel_id, "rIdBoxPic");
+        let (origin, content) = outer.text_box_content_rect().expect("content rect");
+        assert!(pic.origin.x >= -0.01 && pic.origin.y >= -0.01);
+        assert!(pic.origin.x + pic.size.width <= content.width + 0.5);
+        assert!((pic.size.width - 54.0).abs() < 0.5, "0.75in = 54pt");
+        /* Square wrap: story lines beside the picture start right of it. */
+        let sp = tb.blocks[0].as_paragraph().expect("story paragraph");
+        assert!(
+            sp.lines
+                .iter()
+                .any(|l| l.segments.first().is_some_and(|s| s.x0 >= pic.size.width)),
+            "some story band starts right of the picture"
+        );
+        /* Scene: the picture draws inside the box clip, at the content
+        origin + its content-relative offset (page float origins are
+        page-relative, so no extra base on page 0). */
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let cmds = &scene.cmds;
+        let clip = cmds
+            .iter()
+            .position(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .expect("box clip");
+        let draw = cmds
+            .iter()
+            .position(|c| {
+                matches!(c, render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdBoxPic")
+            })
+            .expect("story picture paints");
+        let pop = cmds
+            .iter()
+            .position(|c| matches!(c, render::scene::DisplayCmd::PopClip))
+            .expect("pop");
+        assert!(clip < draw && draw < pop, "inside the box clip");
+        if let render::scene::DisplayCmd::DrawImage { rect, .. } = &cmds[draw] {
+            let want_x = f64::from(origin.x + pic.origin.x);
+            let want_y = f64::from(origin.y + pic.origin.y);
+            assert!((rect.x0 - want_x).abs() < 0.01, "{} vs {want_x}", rect.x0);
+            assert!((rect.y0 - want_y).abs() < 0.01, "{} vs {want_y}", rect.y0);
+        }
+        /* PDF: the picture is embedded and painted. */
+        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(PdfConformance::A2u) else {
+            panic!("engine pdf export");
+        };
+        let count = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(count(b"/Subtype /Image"), 1, "story picture embedded");
+        let fp = layout::geometry_fingerprint(&pages);
+        if std::env::var_os("NGE_PRINT_WRAP_FINGERPRINTS").is_some() {
+            eprintln!("ENGINE BOXED FLOAT IMAGE FINGERPRINT = {fp:#x}");
+        }
+        assert_eq!(fp, PINNED_BOXED_FLOAT_IMAGE);
+    }
+
+    const PINNED_BOXED_FLOAT_IMAGE: u64 = 0xce020097437da437;
+
+    /// Issue #197 — a picture in a NESTED box's story (level two) resolves
+    /// too: the nesting cap bounds box recursion, not pictures.
+    #[test]
+    fn floating_picture_in_nested_box_story_resolves() {
+        let mut doc = nested_text_box_doc();
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0)
+            && let engine::InlineKind::TextBox { story, .. } = &mut p.inline_objects[0].kind
+            && let Some(engine::Block::Paragraph(sp)) = story.body.get_mut(0)
+            && let engine::InlineKind::TextBox { story: inner, .. } = &mut sp.inline_objects[0].kind
+        {
+            let mut level2 = DocumentTree::from_text("\u{FFFC}pic");
+            if let Some(ip) = level2.blocks[0].as_paragraph_mut() {
+                ip.inline_objects.push(story_float_image("rIdInnerPic"));
+            }
+            inner.body = level2.blocks.iter().cloned().collect();
+        } else {
+            panic!("fixture shape");
+        }
+        let engine = test_engine_with_doc(doc);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let otb = pages[0].floats[0].text_box.as_deref().expect("outer");
+        let itb = otb.floats[0].text_box.as_deref().expect("nested");
+        assert_eq!(itb.floats.len(), 1);
+        assert_eq!(itb.floats[0].rel_id, "rIdInnerPic");
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        assert!(scene.cmds.iter().any(|c| matches!(
+            c,
+            render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdInnerPic"
+        )));
+    }
 
     /// A box nested past the layout cap (only a hand-built tree can carry
     /// one) keeps its place in its parent story but is not resolved —

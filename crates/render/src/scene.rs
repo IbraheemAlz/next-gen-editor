@@ -334,7 +334,7 @@ fn paint_text_box(f: &layout::FloatBox, base_x: f32, base_y: f32, cmds: &mut Vec
         /* Content-relative y past which nothing is visible. */
         let limit = f.origin.y + f.size.height - origin.y;
         cmds.push(DisplayCmd::PushClip { rect });
-        paint_nested_text_boxes(tb, content_x, content_y, true, cmds);
+        paint_frame_floats(tb, content_x, content_y, true, cmds);
         for block in &tb.blocks {
             match clip_block_lines(block, limit) {
                 Some(clipped) => paint_block(&clipped, content_x, content_y, cmds),
@@ -342,7 +342,7 @@ fn paint_text_box(f: &layout::FloatBox, base_x: f32, base_y: f32, cmds: &mut Vec
                 None => {}
             }
         }
-        paint_nested_text_boxes(tb, content_x, content_y, false, cmds);
+        paint_frame_floats(tb, content_x, content_y, false, cmds);
         cmds.push(DisplayCmd::PopClip);
     }
     if let Some(([r, g, b, a], w)) = tb.source.outline
@@ -356,9 +356,11 @@ fn paint_text_box(f: &layout::FloatBox, base_x: f32, base_y: f32, cmds: &mut Vec
     }
 }
 
-/// Issue #165 — one z-order group (`behind` = the `behindDoc` group) of
-/// the boxes nested in `tb`'s story, at the parent's content origin.
-fn paint_nested_text_boxes(
+/// Issue #165 / #197 — one z-order group (`behind` = the `behindDoc`
+/// group) of the floats anchored in `tb`'s story — nested boxes and
+/// floating pictures — at the parent's content origin, inside the
+/// parent's clip.
+fn paint_frame_floats(
     tb: &layout::TextBoxFrame,
     content_x: f32,
     content_y: f32,
@@ -371,11 +373,20 @@ fn paint_nested_text_boxes(
     let mut group: Vec<&layout::FloatBox> = tb
         .floats
         .iter()
-        .filter(|f| f.text_box.is_some() && f.behind_doc == behind && !f.hidden)
+        .filter(|f| f.behind_doc == behind && !f.hidden)
         .collect();
     group.sort_by_key(|f| f.z_order);
     for f in group {
-        paint_text_box(f, content_x, content_y, cmds);
+        if f.text_box.is_some() {
+            paint_text_box(f, content_x, content_y, cmds);
+        } else if f.size.width > 0.0 && f.size.height > 0.0 {
+            let x0 = (content_x + f.origin.x) as f64;
+            let y0 = (content_y + f.origin.y) as f64;
+            cmds.push(DisplayCmd::DrawImage {
+                rect: Rect::new(x0, y0, x0 + f.size.width as f64, y0 + f.size.height as f64),
+                rel_id: f.rel_id.clone(),
+            });
+        }
     }
 }
 
