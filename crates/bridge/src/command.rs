@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
 use crate::common::{
-    Alignment, BlockPath, Color, Direction, DocFormat, LogicalPos, LogicalRange, Point, Rect,
-    UnderlineStyle, VerticalScript,
+    Alignment, BlockPath, Color, Direction, DocFormat, ImageWrapMode, LogicalPos, LogicalRange,
+    Point, Rect, UnderlineStyle, VerticalScript,
 };
 
 /// A command issued to the engine. Serialized internally-tagged
@@ -201,6 +201,17 @@ pub enum Command {
         at: u32,
         offset_h_emu: i64,
         offset_v_emu: i64,
+    },
+    /// Issue #82 — set the text-wrap mode of the FLOATING image anchored
+    /// at `(path, at)` (Word's "Wrap Text" menu): the body text is cut
+    /// around it per the mode on the next layout. Side rule, distances
+    /// and an existing wrap polygon are kept. Replies `Event::Error` when
+    /// the address holds no floating image (inline ↔ floating conversion
+    /// is not a wrap mode).
+    SetImageWrap {
+        path: BlockPath,
+        at: u32,
+        wrap: ImageWrapMode,
     },
 
     /* Selection */

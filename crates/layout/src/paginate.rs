@@ -1439,19 +1439,23 @@ impl Paginator {
         every line's notes reserved (a plain paragraph reproduces
         `split_paragraph_at_line`'s cut exactly). Notes of the head's
         lines commit here; the tail's re-collect when it lands. */
-        let items: Vec<FlowItem> = para
-            .lines
-            .iter()
-            .map(|l| FlowItem {
-                bottom: l.origin.y + l.height,
-                anchors: anchors_on_line(l),
-            })
-            .collect();
+        /* Issue #82 — the lines of one wrap band (a line cut into
+        segments by a float) share a baseline: they are ONE flow item, so
+        neither the budget nor a note reservation can split a band across
+        pages. `line_ends[k]` is the line count through item `k`. A
+        paragraph without cut bands has one item per line (unchanged). */
+        let (items, line_ends) = band_flow_items(&para.lines);
         let plan = self.fit_items(&items, remaining, self.cur_blocks.is_empty());
         let (head, tail) = if para.lines.is_empty() {
             (Some(para.clone()), None)
         } else {
-            split_paragraph_at_line_index(&para, plan.count)
+            let lines = plan
+                .count
+                .checked_sub(1)
+                .and_then(|k| line_ends.get(k))
+                .copied()
+                .unwrap_or(0);
+            split_paragraph_at_line_index(&para, lines)
         };
         if head.is_some() {
             self.commit_plan(plan);
@@ -2183,6 +2187,33 @@ pub fn collect_note_anchors(block: &LayoutBlock) -> Vec<(NoteAnchor, String)> {
 }
 
 /// The note references anchored on one line, in run order.
+/// Issue #82 — group a paragraph's lines into flow items: consecutive
+/// lines of one wrap band (non-empty `segments`, same `origin.y`) merge
+/// into a single item carrying all their note anchors. Returns the items
+/// and, per item, the cumulative line count through it.
+fn band_flow_items(lines: &[LineBox]) -> (Vec<FlowItem>, Vec<usize>) {
+    let mut items: Vec<FlowItem> = Vec::with_capacity(lines.len());
+    let mut ends: Vec<usize> = Vec::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        let same_band = i > 0
+            && !l.segments.is_empty()
+            && !lines[i - 1].segments.is_empty()
+            && lines[i - 1].origin.y == l.origin.y;
+        if same_band && let (Some(item), Some(end)) = (items.last_mut(), ends.last_mut()) {
+            item.bottom = item.bottom.max(l.origin.y + l.height);
+            item.anchors.extend(anchors_on_line(l));
+            *end = i + 1;
+            continue;
+        }
+        items.push(FlowItem {
+            bottom: l.origin.y + l.height,
+            anchors: anchors_on_line(l),
+        });
+        ends.push(i + 1);
+    }
+    (items, ends)
+}
+
 fn anchors_on_line(line: &LineBox) -> Vec<(NoteAnchor, String)> {
     let mut out = Vec::new();
     for run in &line.runs {
@@ -2650,6 +2681,46 @@ mod tests {
         pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
         let pages = pag.finish();
         assert_eq!(pages.len(), 1);
+    }
+
+    /// Issue #82 — the lines of one wrap band share a baseline and are one
+    /// flow item: a page split never separates them, whatever the budget.
+    #[test]
+    fn paginator_never_splits_a_wrap_band_across_pages() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+        /* 120 bands of two segment lines each, 17 px tall — the content
+        height is not a multiple of 17, so a per-line cut would land
+        mid-band on some page. Offset the paragraph by 5 px too. */
+        let mut para = fake_paragraph(240, 17.0);
+        for (i, l) in para.lines.iter_mut().enumerate() {
+            l.origin.y = (i / 2) as f32 * 17.0;
+            l.segments = vec![
+                crate::boxes::LineSegment { x0: 0.0, x1: 80.0 },
+                crate::boxes::LineSegment {
+                    x0: 120.0,
+                    x1: 200.0,
+                },
+            ];
+            l.segment = i % 2;
+        }
+        para.size.height = 120.0 * 17.0;
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 5.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(para), 0.0, 0.0);
+        let pages = pag.finish();
+        assert!(pages.len() >= 3);
+        let mut total = 0;
+        for page in &pages {
+            for p in page.blocks.iter().filter_map(LayoutBlock::as_paragraph) {
+                if p.lines.first().is_some_and(|l| l.segments.is_empty()) {
+                    continue;
+                }
+                assert_eq!(p.lines.len() % 2, 0, "a band was split");
+                assert_eq!(p.lines[0].segment, 0, "a fragment opens mid-band");
+                total += p.lines.len();
+            }
+        }
+        assert_eq!(total, 240, "nothing dropped");
     }
 
     #[test]

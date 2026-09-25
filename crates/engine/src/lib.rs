@@ -1486,11 +1486,11 @@ pub struct VPosition {
     pub offset: FloatOffset,
 }
 
-/// Issue #69 — the text-wrap mode a floating object declares
+/// Issue #69 / #82 — the text-wrap mode a floating object declares
 /// (`<wp:wrapNone>`, `<wp:wrapSquare>`, `<wp:wrapTight>`,
-/// `<wp:wrapThrough>`, `<wp:wrapTopAndBottom>`). Parsed and round-tripped
-/// now; layout treats every mode as "text unaffected" until the text-wrap
-/// epic (issue #82) teaches the line builder about cutouts.
+/// `<wp:wrapThrough>`, `<wp:wrapTopAndBottom>`). `None` is "behind text"
+/// or "in front of text" depending on [`FloatAnchor::behind_doc`]; every
+/// other mode cuts the lines it overlaps (layout `crate::wrap`).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WrapKind {
     #[default]
@@ -1499,6 +1499,17 @@ pub enum WrapKind {
     Tight,
     Through,
     TopAndBottom,
+}
+
+/// Issue #82 — which side(s) of a square / tight / through object text
+/// may flow on (`wrapText`, ECMA-376 §20.4.3.7 `ST_WrapText`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WrapText {
+    #[default]
+    BothSides,
+    Left,
+    Right,
+    Largest,
 }
 
 /// Issue #69 — the `<wp:anchor>` placement of a floating object. Mirrors
@@ -1537,8 +1548,15 @@ pub struct FloatAnchor {
     pub dist_bottom_emu: i64,
     pub dist_left_emu: i64,
     pub dist_right_emu: i64,
-    /// Declared wrap mode (issue #82 consumes it; layout ignores it now).
+    /// Declared wrap mode (issue #82 — layout cuts text around it).
     pub wrap: WrapKind,
+    /// Issue #82 — `wrapText` of a square / tight / through wrap element.
+    pub wrap_text: WrapText,
+    /// Issue #82 — the `<wp:wrapPolygon>` of a tight / through wrap, in
+    /// Word's 21600-unit shape space (`(21600, 21600)` is the object's
+    /// bottom-right corner), `<wp:start>` first. `None` when the element
+    /// carried no polygon (layout falls back to the bounding box).
+    pub wrap_polygon: Option<Vec<(i64, i64)>>,
     /// Verbatim source bytes of the wrap element (`<wp:wrapSquare …/>`,
     /// `<wp:wrapTight>…<wp:wrapPolygon>…</wp:wrapTight>`) for
     /// byte-faithful regeneration. `None` for engine-authored anchors —
@@ -1570,6 +1588,8 @@ impl Default for FloatAnchor {
             dist_left_emu: 0,
             dist_right_emu: 0,
             wrap: WrapKind::None,
+            wrap_text: WrapText::BothSides,
+            wrap_polygon: None,
             wrap_xml: None,
             doc_pr_xml: None,
         }
@@ -6034,6 +6054,43 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #82 — set the wrap mode of the FLOATING image anchored at
+    /// `(path, at)`: `wrap` is the declared mode, `behind_doc` picks
+    /// "behind text" vs "in front of text" (only meaningful with
+    /// `WrapKind::None`; any other mode paints in front, as Word does).
+    /// The verbatim wrap element is dropped when the mode changes — the
+    /// writer then synthesizes it from the typed fields (a tight / through
+    /// switch gets Word's default full-rectangle polygon unless the
+    /// object already carried one). Side rule and distances are kept. A
+    /// no-op (structural clone) when the offset holds no floating image.
+    pub fn set_floating_image_wrap_at(
+        &self,
+        path: &BlockPath,
+        at: u32,
+        wrap: WrapKind,
+        behind_doc: bool,
+    ) -> Self {
+        let mut blocks = self.blocks.clone();
+        let _ = mutate_paragraph_in_top(&mut blocks, path, |para| {
+            for io in &mut para.inline_objects {
+                if io.at == at
+                    && matches!(io.kind, InlineKind::Image { .. })
+                    && let Some(anchor) = io.anchor.as_mut()
+                {
+                    if anchor.wrap != wrap {
+                        anchor.wrap = wrap;
+                        anchor.wrap_xml = None;
+                    }
+                    anchor.behind_doc = matches!(wrap, WrapKind::None) && behind_doc;
+                }
+            }
+        });
+        Self {
+            blocks,
+            ..self.clone()
+        }
+    }
+
     /// Issue #69 — count the floating (`<wp:anchor>`) images in the body.
     pub fn count_floating_images(&self) -> u32 {
         let mut n = 0u32;
@@ -8503,6 +8560,38 @@ mod tests {
         assert!(!first_object(&moved).is_floating());
         assert_eq!(moved.count_floating_images(), 0);
         assert_eq!(moved.count_inline_images(), 1);
+    }
+
+    /// Issue #82 — the wrap setter changes the mode, drops the verbatim
+    /// element only when the mode changed, keeps side rule + distances,
+    /// and ties `behind_doc` to wrap-none.
+    #[test]
+    fn set_floating_image_wrap_switches_modes_and_layering() {
+        let d = floating_image_doc(FloatAnchor {
+            wrap: WrapKind::Square,
+            wrap_text: WrapText::Left,
+            dist_left_emu: 12_700,
+            wrap_xml: Some("<wp:wrapSquare wrapText=\"left\"/>".into()),
+            ..FloatAnchor::default()
+        });
+        let same = d.set_floating_image_wrap_at(&BlockPath::top(0), 2, WrapKind::Square, true);
+        let a = first_object(&same).anchor.as_deref().unwrap();
+        assert!(
+            a.wrap_xml.is_some(),
+            "unchanged mode keeps the verbatim element"
+        );
+        assert!(!a.behind_doc, "only wrap-none can sit behind the text");
+        let behind = d.set_floating_image_wrap_at(&BlockPath::top(0), 2, WrapKind::None, true);
+        let a = first_object(&behind).anchor.as_deref().unwrap();
+        assert_eq!(a.wrap, WrapKind::None);
+        assert!(a.behind_doc);
+        assert!(a.wrap_xml.is_none());
+        assert_eq!((a.wrap_text, a.dist_left_emu), (WrapText::Left, 12_700));
+        let front = behind.set_floating_image_wrap_at(&BlockPath::top(0), 2, WrapKind::None, false);
+        assert!(!first_object(&front).anchor.as_deref().unwrap().behind_doc);
+        /* Wrong offset: structural no-op. */
+        let none = d.set_floating_image_wrap_at(&BlockPath::top(0), 0, WrapKind::None, false);
+        assert_eq!(first_object(&none), first_object(&d));
     }
 
     #[test]

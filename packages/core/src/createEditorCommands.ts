@@ -32,6 +32,7 @@ import type {
     PdfConformance,
     ImageBlob,
     ImageFit,
+    ImageWrapMode,
     MoveDirection,
     LogicalPos,
     LogicalRange,
@@ -174,6 +175,13 @@ export interface EditorCommands {
         offsetHEmu: number,
         offsetVEmu: number,
     ): Promise<Event>;
+    /** Issue #82 — set the text-wrap mode of the FLOATING image at
+     *  `(path, at)` (Word's "Wrap Text" menu: square, tight, through,
+     *  top-and-bottom, behind text, in front of text). The body text is
+     *  cut around the image on the next layout. The engine answers
+     *  `ERROR` for an inline image — only rects with `ImageRect.floating`
+     *  have a wrap mode (`ImageRect.wrap`). */
+    setImageWrap(path: BlockPath, at: number, wrap: ImageWrapMode): Promise<Event>;
     /** Issue #44 — query every inline image's on-canvas rect + resize
      *  address. Resolve the `Event` and read `images` when it is an
      *  `IMAGE_RECTS` reply. */
@@ -517,6 +525,7 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 offset_h_emu: offsetHEmu,
                 offset_v_emu: offsetVEmu,
             }),
+        setImageWrap: (path, at, wrap) => dispatch({ type: 'SET_IMAGE_WRAP', path, at, wrap }),
         getImageRects: () => dispatch({ type: 'GET_IMAGE_RECTS' }),
 
         insertTable: (at, rows, cols) =>

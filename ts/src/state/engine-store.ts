@@ -16,6 +16,7 @@ import type {
     BridgeStoryRef,
     Direction,
     Event,
+    ImageWrapMode,
     LogicalPos,
     LogicalRange,
     Rect,
@@ -162,6 +163,9 @@ export interface ImageRectCss {
      *  pure ratio `widthEmu / rect.w`, like the resize handles. */
     frameX: number;
     frameY: number;
+    /** Issue #82 — the floating image's text-wrap mode (`undefined` for
+     *  an inline image); drives the image toolbar's wrap picker. */
+    wrap: ImageWrapMode | undefined;
 }
 export interface ImageAddr {
     path: BlockPath;
@@ -356,6 +360,7 @@ export function createEngineStore(client: EngineClient) {
                 floating: im.floating,
                 frameX: im.frame_x / dpr,
                 frameY: im.frame_y / dpr,
+                wrap: im.wrap,
             }));
             setImageRectsSig(rects);
             const sel = selectedImageSig();

@@ -58,6 +58,23 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "image_wrap_modes.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 11,
+      "asserts": {
+        "paragraph_count": 5,
+        "paragraph_texts": [
+          "square ￼text",
+          "tight ￼text",
+          "through ￼text",
+          "topbottom ￼text",
+          "behind ￼text"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "list_bullet_numbered.docx": {
       "generator": "handcrafted",
       "phase_introduced": 4,

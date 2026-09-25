@@ -185,6 +185,7 @@ fn run_default() -> Result<()> {
     run_notes_roundtrip()?;
     run_ui_save_root_bindings()?;
     run_table_cell_runs_survival()?;
+    run_wrap_modes_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -539,9 +540,14 @@ fn floating_anchor_document_xml() -> String {
 /// bytes, decoding happens in the browser). Rides the `--fixtures`
 /// passthrough at drift 0 and the default harness's step 10.
 fn build_floating_image_anchor_docx() -> Vec<u8> {
+    pack_docx_with_png(&floating_anchor_document_xml())
+}
+
+/// A minimal OPC package around `document_xml` with one image part
+/// (`rId5` → `word/media/image1.png`, the 8-byte PNG signature).
+fn pack_docx_with_png(document_xml: &str) -> Vec<u8> {
     use std::io::Write;
     use zip::write::{SimpleFileOptions, ZipWriter};
-    let document_xml = floating_anchor_document_xml();
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -727,6 +733,239 @@ fn run_floating_anchor_survival() -> Result<()> {
         bail!("moved anchor re-read wrongly: {anchor_c:?}");
     }
     println!("[roundtrip] step 10 OK — floating anchor survives edit + move byte-for-byte");
+    Ok(())
+}
+
+/* ============================================== text wrap (#82) ==== */
+
+/// Issue #82 — one `<wp:anchor>` picture paragraph of the wrap fixture.
+fn wrap_anchor_paragraph(label: &str, attrs: &str, wrap: &str, id: u32) -> String {
+    format!(
+        concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">{label} </w:t></w:r><w:r><w:drawing>"#,
+            r#"<wp:anchor {attrs}simplePos="0" relativeHeight="251659264" behindDoc="{behind}" locked="0" layoutInCell="1" allowOverlap="1">"#,
+            r#"<wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="column"><wp:posOffset>914400</wp:posOffset></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+            r#"<wp:extent cx="914400" cy="457200"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+            "{wrap}",
+            r#"<wp:docPr id="{id}" name="Picture {id}"/><wp:cNvGraphicFramePr/>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+            r#"<pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="Image"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+            r#"<pic:blipFill><a:blip r:embed="rId5"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+            r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>"#,
+            r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>"#,
+            "</a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>",
+            r#"<w:r><w:t xml:space="preserve">text</w:t></w:r></w:p>"#,
+        ),
+        label = label,
+        attrs = attrs,
+        behind = u8::from(label == "behind"),
+        wrap = wrap,
+        id = id,
+    )
+}
+
+/// The five wrap children the fixture plants, one per paragraph, with
+/// their anchor-level distances and layering flags. Tight carries an
+/// EDITED polygon (a triangle) that the model must keep.
+const WRAP_CASES: &[(&str, &str, &str)] = &[
+    (
+        "square",
+        r#"distT="0" distB="0" distL="114300" distR="228600" "#,
+        r#"<wp:wrapSquare wrapText="largest"/>"#,
+    ),
+    (
+        "tight",
+        r#"distT="0" distB="0" distL="91440" distR="91440" "#,
+        concat!(
+            r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="1">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="21600" y="0"/><wp:lineTo x="10800" y="21600"/>"#,
+            r#"<wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>"#
+        ),
+    ),
+    (
+        "through",
+        r#"distT="0" distB="0" distL="0" distR="0" "#,
+        concat!(
+            r#"<wp:wrapThrough wrapText="right"><wp:wrapPolygon edited="0">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/>"#,
+            r#"<wp:lineTo x="21600" y="0"/><wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapThrough>"#
+        ),
+    ),
+    (
+        "topbottom",
+        r#"distT="45720" distB="91440" distL="0" distR="0" "#,
+        r#"<wp:wrapTopAndBottom/>"#,
+    ),
+    (
+        "behind",
+        r#"distT="0" distB="0" distL="0" distR="0" "#,
+        r#"<wp:wrapNone/>"#,
+    ),
+];
+
+fn wrap_modes_document_xml() -> String {
+    let mut body = String::new();
+    for (i, (label, attrs, wrap)) in WRAP_CASES.iter().enumerate() {
+        body.push_str(&wrap_anchor_paragraph(label, attrs, wrap, 10 + i as u32));
+    }
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+            r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+            r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+            r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+            r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing">"#,
+            "<w:body>{body}<w:sectPr/></w:body></w:document>",
+        ),
+        body = body
+    )
+}
+
+/// Issue #82 fixture: one floating picture per wrap mode. Rides the
+/// `--fixtures` passthrough at drift 0 and the default harness's step 14.
+fn build_image_wrap_modes_docx() -> Vec<u8> {
+    pack_docx_with_png(&wrap_modes_document_xml())
+}
+
+/// Issue #82 — step 14: wrap mode + distances round-trip.
+/// (a) every wrap child lowers into typed fields (kind, side rule,
+/// polygon, the four distances, `behindDoc`); (b) a dirty-paragraph
+/// save of every anchor paragraph regenerates `document.xml` as EXACTLY
+/// the source plus the edits — the verbatim wrap elements survive
+/// byte-for-byte; (c) a wrap-mode change regenerates that one element
+/// from the model (Square → Tight gets Word's default polygon; the
+/// distances and side rule persist) and re-reads as the new mode.
+fn run_wrap_modes_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos, WrapKind, WrapText};
+
+    let fixture = build_image_wrap_modes_docx();
+    let archive = read_docx(&fixture).context("read wrap fixture")?;
+    let anchors = |d: &DocumentTree| -> Vec<engine::FloatAnchor> {
+        d.blocks
+            .iter()
+            .filter_map(engine::Block::as_paragraph)
+            .filter_map(|p| p.inline_objects.first())
+            .filter_map(|o| o.anchor.as_deref().cloned())
+            .collect()
+    };
+    let a = anchors(&archive.document);
+    if a.len() != WRAP_CASES.len() {
+        bail!(
+            "wrap fixture: expected {} floats, got {}",
+            WRAP_CASES.len(),
+            a.len()
+        );
+    }
+    let expect: [(WrapKind, WrapText, usize, [i64; 4], bool); 5] = [
+        (
+            WrapKind::Square,
+            WrapText::Largest,
+            0,
+            [0, 0, 114_300, 228_600],
+            false,
+        ),
+        (
+            WrapKind::Tight,
+            WrapText::BothSides,
+            4,
+            [0, 0, 91_440, 91_440],
+            false,
+        ),
+        (WrapKind::Through, WrapText::Right, 5, [0, 0, 0, 0], false),
+        (
+            WrapKind::TopAndBottom,
+            WrapText::BothSides,
+            0,
+            [45_720, 91_440, 0, 0],
+            false,
+        ),
+        (WrapKind::None, WrapText::BothSides, 0, [0, 0, 0, 0], true),
+    ];
+    for (i, (got, (kind, text, poly, dist, behind))) in a.iter().zip(expect).enumerate() {
+        let d = [
+            got.dist_top_emu,
+            got.dist_bottom_emu,
+            got.dist_left_emu,
+            got.dist_right_emu,
+        ];
+        if got.wrap != kind
+            || got.wrap_text != text
+            || got.wrap_polygon.as_ref().map_or(0, Vec::len) != poly
+            || d != dist
+            || got.behind_doc != behind
+        {
+            bail!("wrap fixture anchor {i} lowered wrongly: {got:?}");
+        }
+    }
+    println!("[roundtrip] step 14a OK — five wrap modes lower into typed fields");
+
+    /* (b) Dirty every anchor paragraph (insert before its sentinel). */
+    let mut edited = archive.document.clone();
+    for i in 0..WRAP_CASES.len() {
+        edited = edited.insert_text(
+            LogicalPos {
+                path: BlockPath::top(i as u32),
+                offset: 0,
+            },
+            INSERT_TEXT,
+        );
+    }
+    let bytes = write_docx(&archive, &edited).context("write edited wrap fixture")?;
+    assert_document_xml_well_formed(&bytes).context("edited wrap .docx")?;
+    let src = String::from_utf8(extract_doc_xml(&fixture)?).context("utf8 source")?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 output")?;
+    let mut want = src.clone();
+    for (label, _, _) in WRAP_CASES {
+        want = want.replacen(
+            &format!(r#"<w:t xml:space="preserve">{label} </w:t>"#),
+            &format!(r#"<w:t xml:space="preserve">{INSERT_TEXT}{label} </w:t>"#),
+            1,
+        );
+    }
+    if out != want {
+        bail!(
+            "wrap fixture: regenerated document.xml is not source + edits\n--- expected ---\n{want}\n--- got ---\n{out}"
+        );
+    }
+    let reread = read_docx(&bytes).context("re-read edited wrap fixture")?;
+    if anchors(&reread.document) != a {
+        bail!("wrap fixture: anchors drifted through a dirty save");
+    }
+    println!("[roundtrip] step 14b OK — dirty save keeps all five wrap elements byte-for-byte");
+
+    /* (c) Square → Tight on the first picture. */
+    let at = edited
+        .paragraph_at_path(&BlockPath::top(0))
+        .and_then(|p| p.inline_objects.first())
+        .map(|o| o.at)
+        .context("square picture")?;
+    let switched =
+        edited.set_floating_image_wrap_at(&BlockPath::top(0), at, WrapKind::Tight, false);
+    let bytes_c = write_docx(&archive, &switched).context("write switched wrap")?;
+    assert_document_xml_well_formed(&bytes_c).context("switched wrap .docx")?;
+    let doc_c = String::from_utf8(extract_doc_xml(&bytes_c)?).context("utf8 switched")?;
+    if doc_c.contains(r#"<wp:wrapSquare wrapText="largest"/>"#)
+        || !doc_c.contains(r#"<wp:wrapTight wrapText="largest"><wp:wrapPolygon edited="0">"#)
+    {
+        bail!("wrap switch did not regenerate the element:\n{doc_c}");
+    }
+    let c = anchors(&read_docx(&bytes_c).context("re-read switched")?.document);
+    if c[0].wrap != WrapKind::Tight
+        || c[0].wrap_text != WrapText::Largest
+        || c[0].wrap_polygon.as_ref().map(Vec::len) != Some(5)
+        || (c[0].dist_left_emu, c[0].dist_right_emu) != (114_300, 228_600)
+        || c[1..] != a[1..]
+    {
+        bail!("wrap switch re-read wrongly: {:?}", c[0]);
+    }
+    println!(
+        "[roundtrip] step 14c OK — a wrap-mode change regenerates one element, distances kept"
+    );
     Ok(())
 }
 
@@ -1840,6 +2079,24 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         "float \u{FFFC}here".into(),
                         "after".into(),
                     ],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        /* Issue #82 — one floating picture per wrap mode; passthrough
+        drift 0 on a zero-edit resave, exact regeneration in step 14. */
+        PrebuiltFixture {
+            name: "image_wrap_modes.docx",
+            bytes: build_image_wrap_modes_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 5,
+                    paragraph_texts: WRAP_CASES
+                        .iter()
+                        .map(|(label, _, _)| format!("{label} \u{FFFC}text"))
+                        .collect(),
                 },
                 roundtrip: RoundtripBounds::default(),
             },

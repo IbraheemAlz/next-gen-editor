@@ -25,6 +25,9 @@ export { SuperSubButtons } from './SuperSubButtons';
 export { InsertImageButton } from './InsertImageButton';
 export type { InsertImageButtonProps } from './InsertImageButton';
 
+export { ImageWrapPicker } from './ImageWrapPicker';
+export type { ImageWrapPickerProps, ImageWrapTarget } from './ImageWrapPicker';
+
 export { TrackChangesSidebar } from './TrackChangesSidebar';
 export type { TrackChangesSidebarProps } from './TrackChangesSidebar';
 

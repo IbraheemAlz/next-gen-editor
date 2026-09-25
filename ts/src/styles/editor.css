@@ -149,6 +149,16 @@
     z-index: 2;
 }
 
+/* Issue #82 — the image toolbar (wrap picker) floats just above the
+   selected picture; unlike the outline it takes the pointer. */
+.image-toolbar {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 8px);
+    pointer-events: auto;
+    z-index: 3;
+}
+
 .image-handle {
     position: absolute;
     width: 10px;

@@ -11,6 +11,8 @@ pub mod paginate;
 pub mod paragraph;
 pub mod watchdog;
 pub mod wrap;
+#[cfg(test)]
+mod wrap_fixtures;
 
 pub use boxes::{
     CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FloatWrap,
@@ -24,7 +26,9 @@ pub use paginate::{
     FOOTNOTE_SEPARATOR_HEIGHT_PT, HeaderBands, HeaderRole, NoteBody,
     PageGeometry as PaginatePageGeometry, Paginator, collect_note_anchors, split_paragraph_at_line,
 };
-pub use paragraph::{InlineObjectInfo, ParagraphConfig, layout_paragraph};
+pub use paragraph::{
+    InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
+};
 pub use watchdog::{
     BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation, Watchdog,
     geometry_fingerprint, verify_prefix,

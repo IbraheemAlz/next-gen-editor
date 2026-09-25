@@ -99,7 +99,7 @@ pub enum DegradeReason {
     /// a fixpoint: the float configuration oscillated (watchdog stage b)
     /// or the pass cap was hit; the moving objects were frozen / the
     /// current pages accepted.
-    WrapConvergenceCap,
+    WrapOscillation,
     /// Issue #82 — a tight / through wrap object carried no usable
     /// `<wp:wrapPolygon>`; its bounding box was used (square wrap).
     WrapPolygonFallback,
@@ -120,7 +120,7 @@ impl DegradeReason {
             DegradeReason::CacheMismatch => "CACHE_MISMATCH",
             DegradeReason::AutofitCap => "AUTOFIT_CAP",
             DegradeReason::WrapObjectFrozen => "WRAP_OBJECT_FROZEN",
-            DegradeReason::WrapConvergenceCap => "WRAP_CONVERGENCE_CAP",
+            DegradeReason::WrapOscillation => "WRAP_OSCILLATION",
             DegradeReason::WrapPolygonFallback => "WRAP_POLYGON_FALLBACK",
         }
     }
@@ -519,6 +519,17 @@ fn hash_paragraph(h: &mut impl Hasher, p: &ParagraphBox) {
         hash_f32(h, l.height);
         hash_f32(h, l.width);
         l.source_start.hash(h);
+        /* Issue #82 — line segments join the fingerprint ONLY when a
+        float cut the band, so every float-free pinned value is unchanged
+        by construction. */
+        if !l.segments.is_empty() {
+            (l.segments.len() as u64).hash(h);
+            for s in &l.segments {
+                hash_f32(h, s.x0);
+                hash_f32(h, s.x1);
+            }
+            l.segment.hash(h);
+        }
         (l.runs.len() as u64).hash(h);
         for r in &l.runs {
             r.source_range.start.hash(h);

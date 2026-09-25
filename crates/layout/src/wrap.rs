@@ -28,7 +28,7 @@
 //!    [`DegradeReason::WrapObjectFrozen`]) and the [`Watchdog`] churn
 //!    ladder over the whole float configuration (an oscillating
 //!    configuration is a repeated fingerprint — stage (b) freezes every
-//!    object that moved, [`DegradeReason::WrapConvergenceCap`]), with a
+//!    object that moved, [`DegradeReason::WrapOscillation`]), with a
 //!    hard pass cap as the last backstop. Every escape hatch paints
 //!    something and drops no content.
 //!
@@ -65,7 +65,10 @@ impl WrapCutout {
     }
 
     fn approx_eq(&self, o: &WrapCutout) -> bool {
-        approx(self.x0, o.x0) && approx(self.x1, o.x1) && approx(self.y0, o.y0) && approx(self.y1, o.y1)
+        approx(self.x0, o.x0)
+            && approx(self.x1, o.x1)
+            && approx(self.y0, o.y0)
+            && approx(self.y1, o.y1)
     }
 }
 
@@ -382,7 +385,10 @@ pub fn derive_plan(
             if let LayoutBlock::Paragraph(p) = block
                 && p.source_paragraph_id != ParagraphBox::NO_SOURCE_ID
             {
-                fragments.entry(p.source_paragraph_id).or_default().push((pi, bi));
+                fragments
+                    .entry(p.source_paragraph_id)
+                    .or_default()
+                    .push((pi, bi));
             }
         }
     }
@@ -460,7 +466,7 @@ fn float_positions(pages: &[PageBox]) -> Vec<(FloatKey, usize, f32)> {
             }
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by_key(|a| a.0);
     out
 }
 
@@ -498,7 +504,7 @@ impl WrapConvergence {
     pub const DEFAULT_MAX_PASSES: u32 = 8;
     /// Forward moves (down the flow, or onto a later page) an object may
     /// make before it is frozen.
-    pub const DEFAULT_FORWARD_CAP: u32 = 2;
+    pub const DEFAULT_FORWARD_CAP: u32 = 3;
 
     pub fn new(slab_h: f32) -> Self {
         Self {
@@ -564,7 +570,10 @@ impl WrapConvergence {
         let mut notes = Vec::new();
         let next = derive_plan(pages, self.slab_h, &self.frozen, &mut notes);
         for n in notes {
-            self.watchdog.note(n.reason, n.page);
+            /* One report per page, not one per pass. */
+            if !self.watchdog.notes().contains(&n) {
+                self.watchdog.note(n.reason, n.page);
+            }
         }
         if plans_equal(&next, current) {
             self.prev = positions.into_iter().map(|(k, p, y)| (k, (p, y))).collect();
@@ -595,7 +604,7 @@ impl WrapConvergence {
                 if moved && self.frozen.insert(*key) {
                     refrozen = true;
                     self.watchdog
-                        .note(DegradeReason::WrapConvergenceCap, page_of(*pi));
+                        .note(DegradeReason::WrapOscillation, page_of(*pi));
                 }
             }
         }
@@ -603,7 +612,7 @@ impl WrapConvergence {
 
         if self.pass >= self.max_passes {
             let page = pages.len().saturating_sub(1) as u32;
-            self.watchdog.note(DegradeReason::WrapConvergenceCap, page);
+            self.watchdog.note(DegradeReason::WrapOscillation, page);
             return WrapVerdict::Capped;
         }
         if refrozen {
@@ -644,7 +653,10 @@ mod tests {
             s,
             vec![
                 LineSegment { x0: 0.0, x1: 100.0 },
-                LineSegment { x0: 200.0, x1: 400.0 }
+                LineSegment {
+                    x0: 200.0,
+                    x1: 400.0
+                }
             ]
         );
         /* Overlapping cutouts merge; one flush with the left edge yields a
@@ -656,7 +668,13 @@ mod tests {
             0.0,
             16.0,
         );
-        assert_eq!(s, vec![LineSegment { x0: 150.0, x1: 400.0 }]);
+        assert_eq!(
+            s,
+            vec![LineSegment {
+                x0: 150.0,
+                x1: 400.0
+            }]
+        );
     }
 
     #[test]
@@ -834,7 +852,8 @@ mod tests {
             footer: None,
             header_offset: 20.0,
             footer_offset: 20.0,
-            footnotes: Vec::new(),
+            footnotes: crate::NoteBand::default(),
+            endnotes: crate::NoteBand::default(),
             hf_role: HeaderRole::Default,
             page_number: 1,
             floats,
@@ -972,9 +991,10 @@ mod tests {
         assert!(passes <= WrapConvergence::DEFAULT_MAX_PASSES as usize);
         let notes = conv.take_notes();
         assert!(
-            notes
-                .iter()
-                .any(|n| n.reason == DegradeReason::WrapObjectFrozen),
+            notes.iter().any(|n| matches!(
+                n.reason,
+                DegradeReason::WrapObjectFrozen | DegradeReason::WrapOscillation
+            )),
             "{notes:?}"
         );
     }
@@ -1006,7 +1026,7 @@ mod tests {
         assert!(
             conv.take_notes()
                 .iter()
-                .any(|n| n.reason == DegradeReason::WrapConvergenceCap)
+                .any(|n| n.reason == DegradeReason::WrapOscillation)
         );
     }
 

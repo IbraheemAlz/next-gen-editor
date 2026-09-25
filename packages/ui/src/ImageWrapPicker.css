@@ -1,0 +1,51 @@
+/* Issue #82 — the image toolbar's text-wrap picker. */
+.nge-image-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+    padding: var(--nge-space-1);
+    background: var(--nge-color-bg);
+    border: 1px solid var(--nge-color-border);
+    border-radius: var(--nge-radius-md);
+    box-shadow: var(--nge-shadow-md);
+    white-space: nowrap;
+}
+
+.nge-image-wrap__label {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 0 var(--nge-space-1);
+    color: var(--nge-color-text);
+}
+
+.nge-image-wrap__btn {
+    min-width: 26px;
+    justify-content: center;
+}
+
+.nge-image-wrap__btn--on {
+    background: var(--nge-color-primary);
+    color: var(--nge-color-bg);
+}
+
+.nge-image-wrap__btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.nge-image-wrap__glyph {
+    font-size: 14px;
+    line-height: 1;
+}
+
+.nge-image-wrap__badge {
+    padding: 2px 6px;
+    background: rgba(217, 119, 6, 0.12);
+    border: 1px solid var(--nge-color-warning);
+    color: var(--nge-color-warning);
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
