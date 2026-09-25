@@ -95,6 +95,16 @@ export function emptyPatch(): TextAttrsPatch {
     };
 }
 
+/** Issue #221 — canonical empty `DocumentDefaults`, every field
+ *  `undefined`. `exactOptionalPropertyTypes` requires both keys present
+ *  (as a value or explicit `undefined`) on any object typed as
+ *  `DocumentDefaults`, so a partial override spreads onto this — e.g.
+ *  `{ ...emptyDocumentDefaults(), page_size: 'Letter' }` — the same
+ *  pattern `emptyPatch()` provides for `TextAttrsPatch`. */
+export function emptyDocumentDefaults(): DocumentDefaults {
+    return { page_size: undefined, widow_control: undefined };
+}
+
 export interface EditorCommands {
     /* Lifecycle */
     requestStats(): Promise<Event>;
@@ -902,17 +912,23 @@ function build(
             }
             /* Issue #221 — an explicit `opts.defaults` wins; otherwise
                fall back to the host's `<EngineProvider documentDefaults>`
-               default. Neither set ⇒ `defaults: undefined`, the pre-#221
-               wire shape. */
+               default. Neither set ⇒ the `defaults` key is left off the
+               wire object entirely (the pre-#221 shape) — `defaults` on
+               `Command::OpenDocument` is `#[tsify(optional)]`, so under
+               `exactOptionalPropertyTypes` the key must be OMITTED, not
+               set to `undefined` (see `getSelectionAsClipboard` above for
+               the same pattern with `include_docx`). */
             const defaults = opts?.defaults ?? documentDefaults;
             return dispatch(
-                {
-                    type: 'OPEN_DOCUMENT',
-                    bytes,
-                    format: 'docx',
-                    name: name ?? undefined,
-                    defaults: defaults ?? undefined,
-                },
+                defaults === undefined
+                    ? { type: 'OPEN_DOCUMENT', bytes, format: 'docx', name: name ?? undefined }
+                    : {
+                          type: 'OPEN_DOCUMENT',
+                          bytes,
+                          format: 'docx',
+                          name: name ?? undefined,
+                          defaults,
+                      },
                 [bytes.buffer as ArrayBuffer],
             );
         },

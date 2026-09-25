@@ -21,6 +21,7 @@ export {
     DEFAULT_TOC_SWITCHES,
     STYLE_PRESETS,
     emptyPatch,
+    emptyDocumentDefaults,
 } from './createEditorCommands';
 export type { EditorCommands, ParagraphStyleId } from './createEditorCommands';
 

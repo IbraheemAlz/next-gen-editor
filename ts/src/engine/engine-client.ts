@@ -665,9 +665,15 @@ export class EngineClient {
         name?: string,
         defaults?: DocumentDefaults,
     ): Promise<Event> {
-        return this.dispatch({ type: 'OPEN_DOCUMENT', bytes, format, name, defaults }, [
-            bytes.buffer as ArrayBuffer,
-        ]);
+        /* `defaults` on `Command::OpenDocument` is `#[tsify(optional)]`;
+           under `exactOptionalPropertyTypes` the key must be OMITTED when
+           unset, not set to `undefined`. */
+        return this.dispatch(
+            defaults === undefined
+                ? { type: 'OPEN_DOCUMENT', bytes, format, name }
+                : { type: 'OPEN_DOCUMENT', bytes, format, name, defaults },
+            [bytes.buffer as ArrayBuffer],
+        );
     }
 
     /**
