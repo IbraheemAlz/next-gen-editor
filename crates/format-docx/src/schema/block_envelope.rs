@@ -27,7 +27,39 @@
 //! the container, a closer whose opener was lost is skipped, and a
 //! duplicated opener (a split paragraph) opens once.
 
-use engine::{Block, BodyFragment, BodyPassthrough};
+use engine::{Block, BodyFragment, BodyPassthrough, TableCell, TableRow};
+
+/// Anything a [`BlockEnvelopes`] tracker attaches passthrough markup to:
+/// a block of a block container (`<w:body>`, `<w:tc>`), and — issue
+/// #248 — a row of a `<w:tbl>` or a cell of a `<w:tr>` (a `<w:sdt>`
+/// wrapping table rows / cells, whitespace and markers between them).
+pub trait PassthroughSlot {
+    fn passthrough_slot(&mut self) -> &mut Option<Box<BodyPassthrough>>;
+}
+
+impl PassthroughSlot for Block {
+    fn passthrough_slot(&mut self) -> &mut Option<Box<BodyPassthrough>> {
+        self.body_xml_mut()
+    }
+}
+
+impl PassthroughSlot for TableRow {
+    fn passthrough_slot(&mut self) -> &mut Option<Box<BodyPassthrough>> {
+        &mut self
+            .source_markup
+            .get_or_insert_with(Default::default)
+            .body_xml
+    }
+}
+
+impl PassthroughSlot for TableCell {
+    fn passthrough_slot(&mut self) -> &mut Option<Box<BodyPassthrough>> {
+        &mut self
+            .source_markup
+            .get_or_insert_with(Default::default)
+            .body_xml
+    }
+}
 
 /// One block-level container (`<w:sdt>` / `<w:customXml>`) the reader is
 /// currently inside.
@@ -171,7 +203,12 @@ impl BlockEnvelopes {
 
     /// The innermost envelope element ended at byte offset `end`. `blocks`
     /// is the container's block list the inner blocks were pushed to.
-    pub fn close_container(&mut self, xml: &[u8], end: usize, blocks: &mut [Block]) {
+    pub fn close_container<T: PassthroughSlot>(
+        &mut self,
+        xml: &[u8],
+        end: usize,
+        blocks: &mut [T],
+    ) {
         let Some(top) = self.stack.pop() else {
             return;
         };
@@ -200,7 +237,7 @@ impl BlockEnvelopes {
                 into its `before`. */
                 let patched = blocks
                     .get_mut(top.blocks_at_open)
-                    .and_then(|b| b.body_xml_mut().as_deref_mut())
+                    .and_then(|b| b.passthrough_slot().as_deref_mut())
                     .and_then(|bx| {
                         bx.before.iter_mut().find_map(|f| match f {
                             BodyFragment::Open { id, .. } if *id == top.id => Some(f),
@@ -216,7 +253,7 @@ impl BlockEnvelopes {
                         };
                         if let Some(last_block) = blocks.last_mut() {
                             last_block
-                                .body_xml_mut()
+                                .passthrough_slot()
                                 .get_or_insert_with(Default::default)
                                 .after
                                 .push(BodyFragment::Close { id: top.id });
@@ -258,7 +295,7 @@ impl BlockEnvelopes {
     /// whitespace after the last block) attaches AFTER the last block.
     /// Unclosed envelopes degrade to their verbatim placeholder-less
     /// markers: nothing is emitted for them.
-    pub fn finish(&mut self, blocks: &mut [Block]) {
+    pub fn finish<T: PassthroughSlot>(&mut self, blocks: &mut [T]) {
         self.stack.clear();
         let pending: Vec<BodyFragment> = std::mem::take(&mut self.pending)
             .into_iter()
@@ -268,7 +305,7 @@ impl BlockEnvelopes {
             return;
         }
         if let Some(last) = blocks.last_mut() {
-            last.body_xml_mut()
+            last.passthrough_slot()
                 .get_or_insert_with(Default::default)
                 .after
                 .extend(pending);

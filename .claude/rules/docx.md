@@ -219,7 +219,7 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   `nests_with`): a pair that would cross one is widened to a fixpoint and
   the markers are emitted in a constructed order, noted as
   `WriteNote::InlineWrapperWidened`. Row / cell-level `sdt` inside a
-  regenerated table are NOT covered (table markup, #248).
+  regenerated table ride the table markup (#248, below).
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`
@@ -247,13 +247,56 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   release build (runs / markers ignored, never misplaced); test builds
   (`engine` feature `markup-assert`, on in `cfg(test)` and engine-wasm's
   dev-deps) assert on every `UndoStack::push` that nothing went stale.
+- **Start-tag whitespace (issue #248).** `SourceAttr::ws` keeps the
+  whitespace before an attribute when it is not one space (a `<w:p>` /
+  `<w:tr>` start tag broken over several lines); `attrs_xml` re-emits it.
 - `tools/corpus-native` reports `edit_check.source_bytes_rewritten` (bytes
   of the original the edited save rewrote; 0 = pure insertion) — the
   primary bound since issue #251, see "Round-trip diff bounds" above — next
   to the informational size-delta bound, and (when `> 0`) a cheap
   `rewrite_cause` tag (`hyperlink` / `comment anchor` / `form field` /
   `sdt` / `fldSimple` / `move` / `table` / `rPr` / `other`) tracking the
-  corpus against issues #242–#249.
+  corpus against issues #242–#249. Two one-byte shapes are tagged first,
+  by shape (issue #248): `empty <w:p/>` (#267 — typing into a
+  self-closing paragraph rewrites its `/`) and `t preserve` (a bare
+  `<w:t>` gaining `xml:space="preserve"` — two insertions the
+  single-region metric reports as one rewritten `>`).
+
+## Table source markup (issue #248)
+
+A *regenerated* (dirty) table stays byte-close to its source through
+`Table::source_markup` / `TableRow::source_markup` /
+`TableCell::source_markup` (`engine::TableSourceMarkup`,
+`RowSourceMarkup`, `CellSourceMarkup`; captured by `parts::table`,
+replayed by `writer::regenerate_table` / `emit_table_row` /
+`emit_table_cell`):
+
+- `<w:tbl>` / `<w:tr>` / `<w:tc>` attributes (row rsids,
+  `w14:paraId`) re-emit verbatim.
+- Each property element (`<w:tblPr>`, `<w:tblGrid>`, `<w:trPr>`,
+  `<w:tcPr>`) is an `engine::SourceElement<T>`: `lead` (the whitespace
+  before it, always re-emitted with the element), the source bytes and
+  the model they produced. The bytes are re-emitted only while the live
+  model equals `model` and only inside `write_docx` (the #199 rule);
+  otherwise the element regenerates and adopts its unchanged empty
+  children's source spelling (`PrChildren::adopt`). `<w:tblGrid>` bytes
+  carry `<w:tblGridChange>` (the reader no longer appends its history
+  columns to the live grid).
+- `<w:tblPrEx>` (#103) is unmodeled: captured whole (its borders no
+  longer overwrite the table's) and always re-emitted, first in `<w:tr>`.
+- Between rows and between cells, the reader runs one `BlockEnvelopes`
+  tracker per level (generic over `schema::block_envelope::
+  PassthroughSlot`: blocks, rows, cells): whitespace, range markers and
+  `<w:sdt>` / `<w:customXml>` wrappers around rows or cells ride the
+  row's / cell's `body_xml` (`before` / `after`), and the writer keeps
+  them balanced with an `EnvelopeStack` per level — exactly the #120
+  block-level mechanism.
+- Nothing is offset- or index-anchored: the markup lives ON the row /
+  cell objects, so every table command (row / column insert + delete,
+  merge, split, cell typing) carries it with the content it describes; a
+  fresh row / cell has none and is written plainly; the property bytes
+  re-verify at every write. Never add an index-keyed side table.
+- Harness: `tools/roundtrip` step 30 (`table_source_markup.docx`).
 
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.

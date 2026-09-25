@@ -459,6 +459,7 @@ pub fn read_docx_with_settings(
                 based_on: def.based_on.clone(),
                 para: def.para.clone(),
                 run: def.run.clone(),
+                next: def.next.clone(),
             },
         );
     }

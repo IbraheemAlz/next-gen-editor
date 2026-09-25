@@ -5999,6 +5999,42 @@ fn selection_rects_geom(
     rects
 }
 
+/// Issue #276 — typing over (or replacing) a non-empty selection gives the
+/// new text the formatting of the FIRST replaced character, as Word does —
+/// and as the toolbar already reports for a range (`attrs_at` reads the
+/// selection start). `None` for a collapsed caret (plain insertion inherits
+/// the character before the caret inside `DocumentTree::insert_text`) or
+/// when the selection starts at a paragraph end (nothing replaced there).
+fn replaced_text_style(
+    doc: &DocumentTree,
+    start: &BridgeLogicalPos,
+    end: &BridgeLogicalPos,
+) -> Option<SpanStyle> {
+    if start == end {
+        return None;
+    }
+    let p = doc.paragraph_at_path(&bridge_to_engine_path(start.path.clone()))?;
+    ((start.offset as usize) < p.text.len()).then(|| p.style_at(start.offset))
+}
+
+/// Issue #276 — apply [`replaced_text_style`]'s result to the `len` bytes
+/// just inserted at `start`.
+fn restyle_replacement(
+    doc: DocumentTree,
+    style: Option<SpanStyle>,
+    start: &BridgeLogicalPos,
+    len: usize,
+) -> DocumentTree {
+    match style {
+        Some(style) if len > 0 => doc.set_span_style(
+            to_engine_pos(start.clone()),
+            start.offset + len as u32,
+            style,
+        ),
+        _ => doc,
+    }
+}
+
 /// Order two positions into document order (path, then offset).
 fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, BridgeLogicalPos) {
     use core::cmp::Ordering;
@@ -11658,7 +11694,6 @@ impl Engine {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
         };
-        let probe = self.attrs_probe(&start, &end);
         Event::SelectionChanged {
             range: BridgeLogicalRange {
                 start: start.clone(),
@@ -11675,7 +11710,7 @@ impl Engine {
             rects,
             /* A collapsed caret reflects any armed pending style; a real
             selection reports the document's own attributes (Backlog #11). */
-            attrs_at_caret: self.attrs_at(probe, start == end),
+            attrs_at_caret: self.attrs_at(start.clone(), start == end),
             paragraph_alignment: self.paragraph_alignment_at(&sel.caret.path),
             paragraph_style_id: self.with_selection_doc(|d| {
                 d.paragraph_at_path(&bridge_to_engine_path(sel.caret.path.clone()))
@@ -12153,31 +12188,19 @@ impl Engine {
         Some(head)
     }
 
-    /// The offset whose style the toolbar should reflect: the selection start
-    /// for a range, or the char before a collapsed caret (the style typing
-    /// there would extend). `style_at(caret)` alone reads the char *after* the
-    /// caret, which is unstyled right after formatting a selection.
-    fn attrs_probe(&self, start: &BridgeLogicalPos, end: &BridgeLogicalPos) -> BridgeLogicalPos {
-        if start != end || start.offset == 0 {
-            return start.clone();
-        }
-        let engine_path = bridge_to_engine_path(start.path.clone());
-        let prev = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path)
-                .map_or(start.offset, |p| p.prev_offset(start.offset))
-        });
-        BridgeLogicalPos {
-            path: start.path.clone(),
-            offset: prev,
-        }
-    }
-
     /// Resolved text attributes at `pos`. Spans carry size + colour + the
     /// bold/italic/underline flags; `strike`, `bg_color`, `script` and
-    /// `language` default until those land. When `apply_pending` is set (a
-    /// collapsed caret), any armed sticky style is overlaid so the toolbar
-    /// previews what the next keystroke will adopt (Backlog #11).
-    fn attrs_at(&self, pos: BridgeLogicalPos, apply_pending: bool) -> TextAttrs {
+    /// `language` default until those land.
+    ///
+    /// `collapsed` (a caret, not a range): the toolbar previews what the
+    /// next keystroke will produce — issue #276: the very style
+    /// `DocumentTree::insert_text` continues (`Paragraph::typing_style_at`:
+    /// the character before the caret, at the paragraph start the one
+    /// after it, never an inline-object anchor's), with any armed sticky
+    /// style overlaid (Backlog #11). A range reports its first character
+    /// — which is also what typing over it produces.
+    fn attrs_at(&self, pos: BridgeLogicalPos, collapsed: bool) -> TextAttrs {
+        let apply_pending = collapsed;
         let engine_path = bridge_to_engine_path(pos.path.clone());
         /* Issue #29 — fold the paragraph's style-chain run base UNDER
         the direct span style so the toolbar reads the same cascaded
@@ -12186,8 +12209,13 @@ impl Engine {
         let mut style = self.with_selection_doc(|doc| {
             doc.paragraph_at_path(&engine_path)
                 .map_or_else(SpanStyle::default, |p| {
+                    let direct = if collapsed {
+                        p.typing_style_at(pos.offset)
+                    } else {
+                        p.style_at(pos.offset)
+                    };
                     doc.resolve_style_run_cascade(p.style_id.as_deref())
-                        .merged_with(p.style_at(pos.offset))
+                        .merged_with(direct)
                 })
         });
         if apply_pending && let Some(pending) = self.pending_format.as_ref() {
@@ -12317,12 +12345,14 @@ impl Engine {
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
         };
+        let replaced = replaced_text_style(&temp, &start, &end);
         let base = if start == end {
             temp
         } else {
             temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
+        let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,
@@ -13852,6 +13882,7 @@ impl Engine {
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
+        let replaced = replaced_text_style(self.undo.current(), &start, &end);
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
@@ -13879,6 +13910,7 @@ impl Engine {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
         let inserted_end = start.offset + text.len() as u32;
+        new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         /* Sticky formatting (Backlog #11): overlay any armed pending style
         onto the just-inserted run. It is intentionally NOT cleared here — it
         stays armed across consecutive keystrokes so a whole typed run shares
@@ -13917,6 +13949,7 @@ impl Engine {
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
+        let replaced = replaced_text_style(self.undo.current(), &start, &end);
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
@@ -13936,6 +13969,7 @@ impl Engine {
         } else {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
+        let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,
@@ -17833,6 +17867,7 @@ mod tests {
                 id: "Heading1".into(),
                 name: "Heading 1".into(),
                 based_on: None,
+                next: None,
                 para: engine::ParaProperties::default(),
                 run: engine::SpanStyle {
                     bold: Some(true),
@@ -18516,6 +18551,7 @@ mod tests {
                 body_xml: None,
                 source_markup: None,
             })],
+            source_markup: None,
         }
     }
 
@@ -18526,10 +18562,12 @@ mod tests {
             rows: vec![engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells,
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }
     }
 
@@ -21744,11 +21782,14 @@ mod tests {
                         text: "cell".into(),
                         ..Default::default()
                     })],
+                    source_markup: None,
                 }],
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         let mut engine = test_engine_with_doc(doc);
         let cell_path = BridgeBlockPath {
@@ -23344,6 +23385,7 @@ mod tests {
         let cell = |text: &str| engine::TableCell {
             props: engine::CellProperties::default(),
             blocks: vec![engine::Block::Paragraph(rtl(text))],
+            source_markup: None,
         };
         let mut d = DocumentTree::from_text("");
         d.blocks.set(0, engine::Block::Paragraph(rtl("intro")));
@@ -23351,6 +23393,7 @@ mod tests {
             .map(|r| engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells: (1..=3).map(|c| cell(&format!("r{r}c{c}"))).collect(),
+                source_markup: None,
             })
             .collect();
         d.blocks.push_back(engine::Block::Table(engine::Table {
@@ -23364,6 +23407,7 @@ mod tests {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(rtl("outro")));
         d
@@ -23395,8 +23439,10 @@ mod tests {
                     .map(|c| engine::TableCell {
                         props: engine::CellProperties::default(),
                         blocks: vec![engine::Block::Paragraph(para(&format!("r{r}c{c}")))],
+                        source_markup: None,
                     })
                     .collect(),
+                source_markup: None,
             })
             .collect();
         d.blocks.push_back(engine::Block::Table(engine::Table {
@@ -23413,6 +23459,7 @@ mod tests {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(para("outro")));
         d
@@ -23787,6 +23834,7 @@ mod tests {
         t.rows.push(engine::TableRow {
             props: engine::RowProperties::default(),
             cells: vec![cell_with_text("next A"), cell_with_text("next B")],
+            source_markup: None,
         });
         let mut d = DocumentTree::from_text("intro");
         d.blocks.push_back(engine::Block::Table(t));
@@ -24064,6 +24112,7 @@ mod tests {
             t.rows.push(engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells: vec![cell_with_text(&format!("row {i}"))],
+                source_markup: None,
             });
         }
         d.blocks.push_back(engine::Block::Table(t));
@@ -25912,9 +25961,41 @@ mod snapshot_tests {
     /// so paragraph 1 lands as a fully-contained middle paragraph of
     /// `DocumentTree::slice` — cloned verbatim, `style_id` intact.
     /// Selecting *within* a single paragraph goes through
-    /// `Paragraph::split_at` instead, which drops `style_id` on both
-    /// halves unconditionally (issue discovered by this task; see the
-    /// final report's "Discovered gaps").
+    /// `Paragraph::split_at`, which keeps `style_id` since issue #277 —
+    /// see `clipboard_docx_fragment_of_a_sub_range_keeps_the_style`.
+    /// Issue #277 — a copy of a sub-range INSIDE one styled paragraph
+    /// (`slice` → `Paragraph::split_at` twice) keeps the paragraph style:
+    /// `split_at` used to clear `style_id` on both halves, so the fragment
+    /// carried a bare paragraph even though #213 shipped the style table.
+    #[test]
+    fn clipboard_docx_fragment_of_a_sub_range_keeps_the_style() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        assert_eq!(e.undo.current().paragraph_text(1), Some("first item"));
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(1, 2),
+            caret: bpos_top(1, 8),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload { docx_fragment, .. } = e.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        let reread = format_docx::read_docx(&docx_fragment).expect("re-read fragment");
+        assert_eq!(reread.document.paragraph_text(0), Some("rst it"));
+        assert_eq!(
+            reread
+                .document
+                .nth_paragraph(0)
+                .unwrap()
+                .style_id
+                .as_deref(),
+            Some("ListParagraph"),
+            "a sub-range copy keeps the paragraph style"
+        );
+        assert!(reread.document.styles.contains_key("ListParagraph"));
+    }
+
     #[test]
     fn clipboard_docx_fragment_carries_the_source_packages_styles() {
         let mut e = opened_engine(PACKAGE_FIXTURE);
@@ -26225,6 +26306,9 @@ mod mutation_signal_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;
+
+#[cfg(test)]
+mod para_style_edit_tests;
 
 /// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
 /// `format_pdf::export_pdf` path, end to end (not the #144 acceptance

@@ -71,19 +71,53 @@ fn para_key(p: &Paragraph) -> usize {
     p as *const Paragraph as usize
 }
 
-/// Every block of `blocks`, table cells included, parents first.
-fn walk_blocks<'a>(blocks: impl IntoIterator<Item = &'a Block>, f: &mut dyn FnMut(&'a Block)) {
+/// Every block of `blocks`, parents first. A table the writer re-emits
+/// from its source bytes (clean) is not descended into: `f` sees its bytes
+/// whole. A regenerated table's row / cell passthrough markup (issue #248
+/// — whitespace, range markers, row / cell `sdt` ends between them) goes
+/// to `frag`, then its cells are walked.
+fn walk_blocks<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    f: &mut dyn FnMut(&'a Block),
+    frag: &mut dyn FnMut(&'a engine::BodyPassthrough),
+) {
     for b in blocks {
         f(b);
-        if let Block::Table(t) = b {
+        if let Block::Table(t) = b
+            && (t.dirty || t.source_xml.is_none())
+        {
             for row in &t.rows {
+                if let Some(bx) = row
+                    .source_markup
+                    .as_deref()
+                    .and_then(|m| m.body_xml.as_deref())
+                {
+                    frag(bx);
+                }
                 for cell in &row.cells {
-                    walk_blocks(&cell.blocks, f);
+                    if let Some(bx) = cell
+                        .source_markup
+                        .as_deref()
+                        .and_then(|m| m.body_xml.as_deref())
+                    {
+                        frag(bx);
+                    }
+                    walk_blocks(&cell.blocks, f, frag);
                 }
             }
         }
     }
 }
+
+/// Every comment anchor in the `Verbatim` fragments of `bx`.
+fn scan_passthrough(bx: &engine::BodyPassthrough, out: &mut HashSet<(CommentAnchorKind, u32)>) {
+    for frag in bx.before.iter().chain(bx.after.iter()) {
+        if let engine::BodyFragment::Verbatim { xml } = frag {
+            scan_fragment(xml, out);
+        }
+    }
+}
+
 /// Cheap pre-filter before [`scan_fragment`].
 fn mentions_comment(xml: &[u8]) -> bool {
     xml.windows(9).any(|w| w == b"w:comment")
@@ -162,47 +196,59 @@ impl CommentPlan {
             anchors.sort_by_key(|a| (a.at, a.rank));
         }
         /* What verbatim bytes already carry. */
-        let mut present = HashSet::new();
-        walk_blocks(doc.blocks.iter(), &mut |b| {
-            if let Some(bx) = b.body_xml() {
-                for frag in bx.before.iter().chain(bx.after.iter()) {
-                    if let engine::BodyFragment::Verbatim { xml } = frag {
-                        scan_fragment(xml, &mut present);
+        let present = RefCell::new(HashSet::new());
+        walk_blocks(
+            doc.blocks.iter(),
+            &mut |b| {
+                let mut present = present.borrow_mut();
+                let present = &mut *present;
+                if let Some(bx) = b.body_xml() {
+                    scan_passthrough(bx, present);
+                }
+                let p = match b {
+                    Block::Paragraph(p) => p,
+                    Block::Table(t) => {
+                        /* A clean table re-emits its source bytes whole. */
+                        if !t.dirty
+                            && let Some(src) = t.source_xml.as_deref()
+                            && mentions_comment(src)
+                        {
+                            scan_fragment(src, present);
+                        }
+                        return;
+                    }
+                };
+                /* A clean paragraph re-emits its source bytes whole. */
+                if !p.dirty
+                    && let Some(src) = p.source_xml.as_deref()
+                {
+                    if mentions_comment(src) {
+                        scan_fragment(src, present);
+                    }
+                    return;
+                }
+                let Some(m) = p.source_markup.as_deref() else {
+                    return;
+                };
+                let valid = m.offsets_valid(p.text.len());
+                for mk in &m.markers {
+                    match mk.comment {
+                        Some(c) if valid && plan.verified(p, mk.at, c) => {
+                            present.insert((c.kind, c.id));
+                        }
+                        /* Issues #244 / #245 — markup the writer always keeps
+                        (a form field's `begin … end` span, a content control's
+                        ends) may hold anchors of its own. */
+                        None if mk.role.must_survive() && mentions_comment(&mk.xml) => {
+                            scan_fragment(&mk.xml, present);
+                        }
+                        _ => {}
                     }
                 }
-            }
-            let Block::Paragraph(p) = b else {
-                return;
-            };
-            /* A clean paragraph re-emits its source bytes whole. */
-            if !p.dirty
-                && let Some(src) = p.source_xml.as_deref()
-            {
-                if mentions_comment(src) {
-                    scan_fragment(src, &mut present);
-                }
-                return;
-            }
-            let Some(m) = p.source_markup.as_deref() else {
-                return;
-            };
-            let valid = m.offsets_valid(p.text.len());
-            for mk in &m.markers {
-                match mk.comment {
-                    Some(c) if valid && plan.verified(p, mk.at, c) => {
-                        present.insert((c.kind, c.id));
-                    }
-                    /* Issues #244 / #245 — markup the writer always keeps
-                    (a form field's `begin … end` span, a content control's
-                    ends) may hold anchors of its own. */
-                    None if mk.role.must_survive() && mentions_comment(&mk.xml) => {
-                        scan_fragment(&mk.xml, &mut present);
-                    }
-                    _ => {}
-                }
-            }
-        });
-        plan.present = present;
+            },
+            &mut |bx| scan_passthrough(bx, &mut present.borrow_mut()),
+        );
+        plan.present = present.into_inner();
         plan
     }
 

@@ -55,9 +55,18 @@ pub fn raw_attrs(e: &BytesStart, ns: &NamespaceScope) -> Vec<SourceAttr> {
         .flatten()
         .filter_map(|a| a.key.as_ref().strip_prefix(b"xmlns:").map(<[u8]>::to_vec))
         .collect();
+    let leads = attr_leading_whitespace(e.attributes_raw());
     let mut out = Vec::new();
     for a in e.attributes().with_checks(false).flatten() {
         let key = a.key.as_ref();
+        /* Issue #248 — the whitespace the source wrote before this
+        attribute (a start tag broken over several lines). */
+        let ws = leads
+            .iter()
+            .find(|(k, _)| k.as_slice() == key)
+            .map(|(_, w)| w.as_slice())
+            .filter(|w| *w != b" ")
+            .map(|w| String::from_utf8_lossy(w).into_owned());
         let bound = match key.iter().position(|&b| b == b':') {
             None => true,
             Some(i) => {
@@ -76,15 +85,66 @@ pub fn raw_attrs(e: &BytesStart, ns: &NamespaceScope) -> Vec<SourceAttr> {
         out.push(SourceAttr {
             name: String::from_utf8_lossy(key).into_owned(),
             value,
+            ws,
         });
     }
     out
 }
 
-/// ` name="value"` for every attribute, in order.
+/// Issue #248 — `(qualified name, preceding whitespace)` of every
+/// attribute in a raw start-tag attribute region (quick-xml's
+/// `attributes_raw`: everything after the element name). A tolerant
+/// scanner: quoted values may hold any byte, a malformed tail stops the
+/// scan (the attributes before it keep their whitespace, the rest fall
+/// back to one space).
+fn attr_leading_whitespace(raw: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let ws_start = i;
+        while i < raw.len() && raw[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let ws = &raw[ws_start..i];
+        let name_start = i;
+        while i < raw.len() && raw[i] != b'=' && !raw[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if name_start == i || ws.is_empty() {
+            break;
+        }
+        let name = &raw[name_start..i];
+        while i < raw.len() && raw[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if raw.get(i) != Some(&b'=') {
+            break;
+        }
+        i += 1;
+        while i < raw.len() && raw[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let Some(&quote) = raw.get(i).filter(|q| **q == b'"' || **q == b'\'') else {
+            break;
+        };
+        i += 1;
+        while i < raw.len() && raw[i] != quote {
+            i += 1;
+        }
+        if i >= raw.len() {
+            break;
+        }
+        i += 1;
+        out.push((name.to_vec(), ws.to_vec()));
+    }
+    out
+}
+
+/// ` name="value"` for every attribute, in order (the source whitespace
+/// before an attribute when it was not one space, issue #248).
 pub fn attrs_xml(attrs: &[SourceAttr], out: &mut String) {
     for a in attrs {
-        out.push(' ');
+        out.push_str(a.ws.as_deref().unwrap_or(" "));
         out.push_str(&a.name);
         out.push_str("=\"");
         out.push_str(&a.value);

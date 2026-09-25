@@ -27,7 +27,7 @@ use crate::schema::source_markup::{
 use crate::style_resolver::StyleResolver;
 use engine::{
     Block, DocumentEnvelope, DocumentTree, HeaderFooterRefs, HeaderFooterRole, ListItem,
-    PageGeometry, ParaProperties, Paragraph, Section, SpanStyle, StyleRun, Table,
+    PageGeometry, ParaProperties, Paragraph, Section, SpanStyle, StyleRun,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -2083,21 +2083,16 @@ pub fn parse_document_xml_with_warnings(
                             cells silently drop list bindings + paragraph
                             styles, breaking visual fidelity on numbered
                             tables. */
-                            let (grid, props, rows) = source_xml
+                            let parsed = source_xml
                                 .as_deref()
                                 .map(|b| {
                                     parse_table_bytes_with_warnings(b, resolver, &ns, warnings)
                                         .unwrap_or_default()
                                 })
                                 .unwrap_or_default();
-                            out_blocks.push(Block::Table(Table {
-                                grid,
-                                props,
-                                rows,
-                                dirty: false,
-                                source_xml,
-                                body_xml: envelopes.take_before(),
-                            }));
+                            out_blocks.push(Block::Table(
+                                parsed.into_table(source_xml, envelopes.take_before()),
+                            ));
                             envelopes.note_block_end(tbl_end_byte);
                         }
                     }
