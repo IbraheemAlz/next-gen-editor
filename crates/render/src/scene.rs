@@ -289,11 +289,79 @@ fn paint_floats(page: &PageBox, top: f32, behind: bool, cmds: &mut Vec<DisplayCm
         }
         let x0 = f.origin.x as f64;
         let y0 = (top + f.origin.y) as f64;
+        if f.text_box.is_some() {
+            paint_text_box(f, top, cmds);
+            continue;
+        }
         cmds.push(DisplayCmd::DrawImage {
             rect: Rect::new(x0, y0, x0 + f.size.width as f64, y0 + f.size.height as f64),
             rel_id: f.rel_id.clone(),
         });
     }
+}
+
+/// Issue #83 — paint one text box: shape fill, the story clipped to the
+/// shape rect, then the outline on top. The clip is belt and braces:
+/// Canvas2D blits glyphs with `put_image_data`, which ignores the clip,
+/// so lines starting at or past the shape's bottom edge are also culled
+/// here (line-granular overflow clip, exact on Vello / PDF).
+fn paint_text_box(f: &layout::FloatBox, top: f32, cmds: &mut Vec<DisplayCmd>) {
+    let Some(tb) = f.text_box.as_deref() else {
+        return;
+    };
+    let x0 = f.origin.x as f64;
+    let y0 = (top + f.origin.y) as f64;
+    let rect = Rect::new(x0, y0, x0 + f.size.width as f64, y0 + f.size.height as f64);
+    if let Some([r, g, b, a]) = tb.source.fill {
+        cmds.push(DisplayCmd::FillRect {
+            rect,
+            paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+        });
+    }
+    if let Some((origin, _)) = f.text_box_content_rect() {
+        let base_x = origin.x;
+        let base_y = top + origin.y;
+        /* Content-relative y past which nothing is visible. */
+        let limit = f.origin.y + f.size.height - origin.y;
+        cmds.push(DisplayCmd::PushClip { rect });
+        for block in &tb.blocks {
+            match clip_block_lines(block, limit) {
+                Some(clipped) => paint_block(&clipped, base_x, base_y, cmds),
+                None if block.origin().y < limit => paint_block(block, base_x, base_y, cmds),
+                None => {}
+            }
+        }
+        cmds.push(DisplayCmd::PopClip);
+    }
+    if let Some(([r, g, b, a], w)) = tb.source.outline
+        && w > 0.0
+    {
+        cmds.push(DisplayCmd::StrokeRect {
+            rect,
+            paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
+            width: w as f64,
+        });
+    }
+}
+
+/// Issue #83 — a paragraph block with every line that starts at or past
+/// `limit` (container-relative y) removed; `None` when nothing needs
+/// cutting (or the block is a table, which is kept or dropped whole).
+fn clip_block_lines(block: &LayoutBlock, limit: f32) -> Option<LayoutBlock> {
+    let LayoutBlock::Paragraph(p) = block else {
+        return None;
+    };
+    let keep = p
+        .lines
+        .iter()
+        .take_while(|l| p.origin.y + l.origin.y < limit)
+        .count();
+    if keep == p.lines.len() {
+        return None;
+    }
+    let mut cut = p.clone();
+    cut.lines.truncate(keep);
+    Some(LayoutBlock::Paragraph(cut))
 }
 
 /// Recursive dispatcher — handles top-level page blocks *and* cell

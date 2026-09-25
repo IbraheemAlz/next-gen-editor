@@ -279,6 +279,25 @@ fn emit_inline_object(obj: &InlineObject, media: &Media<'_>, out: &mut String) {
             out.push_str("</sup>");
         }
         InlineKind::NoteSelfRef { .. } => {}
+        /* Issue #83 — a text box exports as an outlined inline-block
+        frame holding its story's paragraph text. */
+        InlineKind::TextBox {
+            width_emu, story, ..
+        } => {
+            let w_px = emu_to_css_px(*width_emu);
+            out.push_str(&format!(
+                "<span style=\"display:inline-block;border:1px solid #000;padding:4px;width:{w_px}px\">"
+            ));
+            for (i, b) in story.body.iter().enumerate() {
+                if let engine::Block::Paragraph(p) = b {
+                    if i > 0 {
+                        out.push_str("<br>");
+                    }
+                    escape_text_into(&p.text.replace('\u{FFFC}', ""), out);
+                }
+            }
+            out.push_str("</span>");
+        }
     }
 }
 

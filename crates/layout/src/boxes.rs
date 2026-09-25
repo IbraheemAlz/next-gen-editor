@@ -209,6 +209,56 @@ pub struct PositionedGlyph {
 /// Issue #69 — the floating-object payload a sentinel glyph carries into
 /// pagination. Sizes are layout px (already scaled); the positioning
 /// spec is frame-relative and resolved once the anchor's page is known.
+/// Issue #83 — the text box a float sentinel carries: the story (shared,
+/// laid out after pagination into [`TextBoxFrame::blocks`] at the box's
+/// inner width), the shape's paint + inset geometry in layout px, and a
+/// content `key` (a hash of the story + shape) that stands in for the
+/// story in equality — two glyphs with equal keys paint the same box.
+#[derive(Debug, Clone)]
+pub struct TextBoxGlyph {
+    pub story: std::sync::Arc<engine::TextBoxStory>,
+    pub key: u64,
+    /// `[left, top, right, bottom]` insets in layout px.
+    pub insets: [f32; 4],
+    pub v_align: engine::TextBoxVAlign,
+    pub fill: Option<[u8; 4]>,
+    /// Outline colour + stroke width (layout px).
+    pub outline: Option<([u8; 4], f32)>,
+    /// `true` for a `<wp:inline>` text box: the sentinel reserves the
+    /// box's width and grows the line, and the box paints at the glyph.
+    pub inline: bool,
+}
+
+impl PartialEq for TextBoxGlyph {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.insets == other.insets
+            && self.v_align == other.v_align
+            && self.fill == other.fill
+            && self.outline == other.outline
+            && self.inline == other.inline
+    }
+}
+
+/// Issue #83 — a positioned text box: its [`TextBoxGlyph`] plus the laid
+/// out story. `blocks` origins are relative to the box's CONTENT rect
+/// (the float rect inset by `source.insets`), with the vertical-anchor
+/// offset already folded into each block's `origin.y` — the renderer is
+/// a pure traversal. Lines past the content rect are clipped at paint.
+#[derive(Debug, Clone)]
+pub struct TextBoxFrame {
+    pub source: TextBoxGlyph,
+    pub blocks: Vec<LayoutBlock>,
+}
+
+impl PartialEq for TextBoxFrame {
+    /// The laid-out blocks are a pure function of `source` and the box
+    /// width, so the source decides equality.
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FloatGlyph {
     /// Archive relationship id of the image blob to paint.
@@ -220,6 +270,8 @@ pub struct FloatGlyph {
     /// Issue #82 — the wrap contract (kind, side, distances, polygon)
     /// the page assembler turns into line cutouts.
     pub wrap: FloatWrap,
+    /// Issue #83 — `Some` when the floating object is a text box.
+    pub text_box: Option<Box<TextBoxGlyph>>,
 }
 
 /// Issue #69 — one positioning axis of a float in layout units. Mirrors
@@ -301,6 +353,28 @@ pub struct FloatBox {
     /// the wrap plan (`crate::wrap::derive_plan`) can register this
     /// object's cutouts against every paragraph it overlaps.
     pub wrap: FloatWrap,
+    /// Issue #83 — the text box this float is (`None` for a picture).
+    pub text_box: Option<Box<TextBoxFrame>>,
+}
+
+impl FloatBox {
+    /// Issue #83 — page-relative top-left and size of a text box's
+    /// content rect (the float rect inset by the shape's insets). `None`
+    /// for a picture.
+    pub fn text_box_content_rect(&self) -> Option<(Point, Size)> {
+        let tb = self.text_box.as_deref()?;
+        let [l, t, r, b] = tb.source.insets;
+        Some((
+            Point {
+                x: self.origin.x + l,
+                y: self.origin.y + t,
+            },
+            Size {
+                width: (self.size.width - l - r).max(0.0),
+                height: (self.size.height - t - b).max(0.0),
+            },
+        ))
+    }
 }
 
 /// A maximal run of glyphs sharing one font, direction, and style — the unit

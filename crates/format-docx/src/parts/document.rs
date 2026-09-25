@@ -13,6 +13,7 @@
 
 use crate::error::{DocxError, DocxWarning};
 use crate::parts::table::parse_table_bytes_with_warnings;
+use crate::parts::textbox;
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
 use crate::schema::ct_rpr::{apply_rpr, attr_val, fold_rpr_fragment, rpr_child_is_modeled};
 use crate::schema::grab_bag::{
@@ -533,6 +534,23 @@ pub fn parse_document_xml_with_warnings(
     let mut cur_anchor: Option<Box<engine::FloatAnchor>> = None;
     let mut anchor_axis: Option<AnchorAxis> = None;
     let mut anchor_offset: Option<(AnchorOffsetKind, String)> = None;
+    /* Issue #83 — text box accumulators. `<wps:wsp>` inside a drawing
+    opens `cur_tb`; `<wps:bodyPr>` / `<wps:spPr>` fill its insets,
+    vertical anchor, fill and outline; `<w:txbxContent>` parses into its
+    story (`textbox::parse_story`) and records the element's byte range.
+    On `</w:drawing>` a shape that carried a story becomes an
+    `InlineKind::TextBox` with the drawing's bytes as its verbatim
+    container — or, inside `<mc:AlternateContent>`, the whole
+    choice+fallback element (sealed on its end tag, with the VML
+    fallback's `<w:txbxContent>` ranges folded in so an edit rewrites
+    both). A bare VML `<w:pict>` text box parses through
+    `textbox::parse_vml`. */
+    let mut drawing_start: usize = 0;
+    let mut cur_tb: Option<Box<engine::TextBoxStory>> = None;
+    let mut cur_tb_has_story = false;
+    let mut cur_tb_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut alt_start: Option<usize> = None;
+    let mut alt_text_box: Option<(usize, Vec<(usize, usize)>)> = None;
 
     /* Phase 7 — `<w:hyperlink>` overlays. Word lays paragraph text out
     paragraph-flat with `<w:hyperlink>` spanning a contiguous slice of
@@ -629,6 +647,76 @@ pub fn parse_document_xml_with_warnings(
                 — only its inner story is skipped. Modeling text boxes is
                 issue #83. */
                 match name.as_ref() {
+                    /* Issue #83 — the story of the text box being read. */
+                    b"w:txbxContent" if in_drawing && cur_tb.is_some() => {
+                        let start = prev_pos;
+                        let frag = capture_subtree(xml, start, &mut reader, &e)?;
+                        let end = reader.buffer_position() as usize;
+                        if !cur_tb_has_story
+                            && let Some(f) = frag.as_deref()
+                            && let Some(blocks) = textbox::parse_story(f, resolver, &ns)
+                            && let Some(tb) = cur_tb.as_mut()
+                        {
+                            tb.body = blocks;
+                            cur_tb_has_story = true;
+                        }
+                        cur_tb_ranges.push((start, end));
+                        prev_pos = end;
+                        buf.clear();
+                        continue;
+                    }
+                    /* Issue #83 — the VML duplicate of a text box read in
+                    this AlternateContent's choice: keep its story ranges
+                    so a regenerated container rewrites both. */
+                    b"mc:Fallback" if alt_text_box.is_some() => {
+                        let start = prev_pos;
+                        let frag = capture_subtree(xml, start, &mut reader, &e)?;
+                        if let (Some(f), Some((_, ranges))) =
+                            (frag.as_deref(), alt_text_box.as_mut())
+                        {
+                            for (s, e) in textbox::element_ranges(f, b"w:txbxContent") {
+                                ranges.push((start + s, start + e));
+                            }
+                        }
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    /* Issue #83 — a bare VML text box (`<w:pict>` with a
+                    `<v:textbox>`, no DrawingML choice). */
+                    b"w:pict" if in_run && alt_start.is_none() => {
+                        let start = prev_pos;
+                        let frag = capture_subtree(xml, start, &mut reader, &e)?;
+                        let end = reader.buffer_position() as usize;
+                        if let Some(f) = frag
+                            && let Some(vml) = textbox::parse_vml(&f, resolver, &ns)
+                            && let Ok(src) = String::from_utf8(f.clone())
+                        {
+                            let mut story = vml.story;
+                            story.story_ranges = textbox::element_ranges(&f, b"w:txbxContent")
+                                .into_iter()
+                                .map(|(s, e)| (s as u32, e as u32))
+                                .collect();
+                            story.source_xml = Some(src);
+                            story.host_range = p_start_byte
+                                .filter(|p| *p <= start)
+                                .map(|p| ((start - p) as u32, (end - p) as u32));
+                            let at = (para_text.len() + run_text.len()) as u32;
+                            run_text.push('\u{FFFC}');
+                            para_inline_objects.push(engine::InlineObject {
+                                at,
+                                kind: engine::InlineKind::TextBox {
+                                    width_emu: vml.width_emu,
+                                    height_emu: vml.height_emu,
+                                    story: Box::new(story),
+                                },
+                                anchor: vml.anchor,
+                            });
+                        }
+                        prev_pos = end;
+                        buf.clear();
+                        continue;
+                    }
                     b"w:txbxContent" | b"w:pict" | b"mc:Fallback" => {
                         let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
                         prev_pos = reader.buffer_position() as usize;
@@ -695,6 +783,28 @@ pub fn parse_document_xml_with_warnings(
                         cur_drawing_rel_id = None;
                         cur_drawing_cx = None;
                         cur_drawing_cy = None;
+                        drawing_start = prev_pos;
+                        cur_tb = None;
+                        cur_tb_has_story = false;
+                        cur_tb_ranges.clear();
+                    }
+                    b"mc:AlternateContent" if alt_start.is_none() => {
+                        alt_start = Some(prev_pos);
+                        alt_text_box = None;
+                    }
+                    b"wps:wsp" if in_drawing => {
+                        cur_tb = Some(Box::default());
+                    }
+                    b"wps:bodyPr" if cur_tb.is_some() => {
+                        if let Some(tb) = cur_tb.as_mut() {
+                            textbox::apply_body_pr(&e, tb);
+                        }
+                    }
+                    b"wps:spPr" if cur_tb.is_some() => {
+                        let frag = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        if let (Some(f), Some(tb)) = (frag.as_deref(), cur_tb.as_mut()) {
+                            textbox::apply_sp_pr(f, tb);
+                        }
                     }
                     b"wp:inline" if in_drawing => {
                         in_wp_inline = true;
@@ -859,6 +969,17 @@ pub fn parse_document_xml_with_warnings(
                     }
                     b"a:blip" if in_drawing => {
                         cur_drawing_rel_id = attr_val(&e, b"r:embed");
+                    }
+                    /* Issue #83 — `<wps:bodyPr …/>` / `<a:spAutoFit/>`. */
+                    b"wps:bodyPr" if cur_tb.is_some() => {
+                        if let Some(tb) = cur_tb.as_mut() {
+                            textbox::apply_body_pr(&e, tb);
+                        }
+                    }
+                    b"a:spAutoFit" if cur_tb.is_some() => {
+                        if let Some(tb) = cur_tb.as_mut() {
+                            tb.auto_fit = true;
+                        }
                     }
                     b"wp:simplePos" if in_wp_anchor => {
                         if let Some(a) = cur_anchor.as_mut() {
@@ -1191,6 +1312,54 @@ pub fn parse_document_xml_with_warnings(
                     b"w:drawing" => {
                         if in_drawing
                             && (in_wp_inline || in_wp_anchor)
+                            && cur_tb_has_story
+                            && let Some(mut tb) = cur_tb.take()
+                            && let (Some(cx), Some(cy)) = (cur_drawing_cx, cur_drawing_cy)
+                        {
+                            /* Issue #83 — a shape with a story: a text box
+                            on the same U+FFFC anchor an image uses. */
+                            let end = reader.buffer_position() as usize;
+                            let at = (para_text.len() + run_text.len()) as u32;
+                            run_text.push('\u{FFFC}');
+                            if alt_start.is_some() {
+                                /* Sealed on `</mc:AlternateContent>`. */
+                                alt_text_box = Some((
+                                    para_inline_objects.len(),
+                                    std::mem::take(&mut cur_tb_ranges),
+                                ));
+                            } else {
+                                tb.source_xml = xml
+                                    .get(drawing_start..end)
+                                    .and_then(|b| std::str::from_utf8(b).ok())
+                                    .map(str::to_string);
+                                tb.story_ranges = cur_tb_ranges
+                                    .drain(..)
+                                    .map(|(s, e)| {
+                                        ((s - drawing_start) as u32, (e - drawing_start) as u32)
+                                    })
+                                    .collect();
+                                tb.host_range = p_start_byte
+                                    .filter(|p| *p <= drawing_start)
+                                    .map(|p| ((drawing_start - p) as u32, (end - p) as u32));
+                            }
+                            para_inline_objects.push(engine::InlineObject {
+                                at,
+                                kind: engine::InlineKind::TextBox {
+                                    width_emu: cx,
+                                    height_emu: cy,
+                                    story: tb,
+                                },
+                                anchor: if in_wp_anchor {
+                                    cur_anchor.take()
+                                } else {
+                                    None
+                                },
+                            });
+                            cur_drawing_rel_id = None;
+                            cur_drawing_cx = None;
+                            cur_drawing_cy = None;
+                        } else if in_drawing
+                            && (in_wp_inline || in_wp_anchor)
                             && let Some(rid) = cur_drawing_rel_id.take()
                             && let (Some(cx), Some(cy)) =
                                 (cur_drawing_cx.take(), cur_drawing_cy.take())
@@ -1228,6 +1397,35 @@ pub fn parse_document_xml_with_warnings(
                         cur_anchor = None;
                         anchor_axis = None;
                         anchor_offset = None;
+                        cur_tb = None;
+                        cur_tb_has_story = false;
+                        cur_tb_ranges.clear();
+                    }
+                    b"mc:AlternateContent" => {
+                        /* Issue #83 — seal a text box read in this
+                        element's choice: the whole AlternateContent is
+                        its verbatim container. */
+                        if let Some(start) = alt_start.take() {
+                            let end = reader.buffer_position() as usize;
+                            if let Some((idx, mut ranges)) = alt_text_box.take()
+                                && let Some(io) = para_inline_objects.get_mut(idx)
+                                && let engine::InlineKind::TextBox { story, .. } = &mut io.kind
+                            {
+                                ranges.sort_unstable();
+                                story.source_xml = xml
+                                    .get(start..end)
+                                    .and_then(|b| std::str::from_utf8(b).ok())
+                                    .map(str::to_string);
+                                story.story_ranges = ranges
+                                    .into_iter()
+                                    .filter(|(s, e)| *s >= start && *e <= end)
+                                    .map(|(s, e)| ((s - start) as u32, (e - start) as u32))
+                                    .collect();
+                                story.host_range = p_start_byte
+                                    .filter(|p| *p <= start)
+                                    .map(|p| ((start - p) as u32, (end - p) as u32));
+                            }
+                        }
                     }
                     b"w:fldSimple" => {
                         /* Issue #43 — seal the compact field. A result-
@@ -1811,10 +2009,14 @@ mod tests {
             r#"<wp:extent cx="100" cy="100"/><wp:wrapNone/><wp:docPr id="1" name="Text Box 1"/>"#,
             r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
             r#"<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm>"#,
+            r#"<a:solidFill><a:srgbClr val="FFFF00"/></a:solidFill>"#,
+            r#"<a:ln w="12700"><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></a:ln></wps:spPr>"#,
             r#"<wps:txbx><w:txbxContent>"#,
             r#"<w:p><w:r><w:t>inside the box</w:t></w:r></w:p>"#,
             r#"<w:p><w:r><w:t>second box line</w:t></w:r></w:p>"#,
-            r#"</w:txbxContent></wps:txbx></wps:wsp>"#,
+            r#"</w:txbxContent></wps:txbx>"#,
+            r#"<wps:bodyPr lIns="0" tIns="12700" rIns="0" bIns="0" anchor="ctr"><a:spAutoFit/></wps:bodyPr></wps:wsp>"#,
             r#"</a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>"#,
             r#"<w:r><w:t>b</w:t></w:r></w:p>"#,
             r#"<w:p><w:r><w:t>second</w:t></w:r></w:p>"#,
@@ -1822,19 +2024,145 @@ mod tests {
         let tree = parse_body(body);
         assert_eq!(tree.blocks.len(), 2, "only the two body paragraphs");
         let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
-        assert_eq!(p0.text, "ab");
-        assert!(p0.inline_objects.is_empty(), "a text box is not a picture");
+        assert_eq!(p0.text, "a\u{FFFC}b");
         let src = p0
             .source_xml
             .as_deref()
             .expect("passthrough capture intact");
         assert!(src.starts_with(b"<w:p>") && src.ends_with(b"</w:p>"));
+        let src = std::str::from_utf8(src).unwrap();
         assert!(
-            std::str::from_utf8(src).unwrap().contains("inside the box"),
+            src.contains("inside the box"),
             "the drawing rides the enclosing paragraph's verbatim bytes"
         );
         let p1 = tree.blocks[1].as_paragraph().expect("paragraph 1");
         assert_eq!(p1.text, "second");
+
+        /* Issue #83 — the shape is modeled as a floating text box. */
+        assert_eq!(p0.inline_objects.len(), 1);
+        let obj = &p0.inline_objects[0];
+        assert_eq!(obj.at, 1);
+        assert!(obj.anchor.is_some(), "a <wp:anchor> text box floats");
+        let engine::InlineKind::TextBox {
+            width_emu,
+            height_emu,
+            story,
+        } = &obj.kind
+        else {
+            panic!("expected a text box, got {:?}", obj.kind);
+        };
+        assert_eq!((*width_emu, *height_emu), (100, 100));
+        let texts: Vec<&str> = story
+            .body
+            .iter()
+            .filter_map(Block::as_paragraph)
+            .map(|p| p.text.as_str())
+            .collect();
+        assert_eq!(texts, ["inside the box", "second box line"]);
+        assert_eq!(story.fill, Some([0xff, 0xff, 0, 0xff]));
+        assert_eq!(
+            story.outline,
+            Some(engine::ShapeOutline {
+                color: [0, 0, 0xff, 0xff],
+                width_emu: 12_700
+            })
+        );
+        assert_eq!(
+            (
+                story.inset_left_emu,
+                story.inset_top_emu,
+                story.inset_right_emu,
+                story.inset_bottom_emu
+            ),
+            (0, 12_700, 0, 0)
+        );
+        assert_eq!(story.v_align, engine::TextBoxVAlign::Center);
+        assert!(story.auto_fit);
+        assert!(!story.dirty);
+        let container = story.source_xml.as_deref().expect("verbatim container");
+        assert!(container.starts_with("<w:drawing>") && container.ends_with("</w:drawing>"));
+        assert_eq!(story.story_ranges.len(), 1);
+        let (s0, e0) = story.story_ranges[0];
+        assert!(container[s0 as usize..e0 as usize].starts_with("<w:txbxContent>"));
+        let (hs, he) = story.host_range.expect("host range");
+        assert_eq!(&src[hs as usize..he as usize], container);
+    }
+
+    /// Issue #83 — a bare VML `<w:pict>` text box models its geometry from
+    /// the shape's CSS-ish `style` + attributes.
+    #[test]
+    fn vml_pict_text_box_parses_geometry_and_story() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t>a</w:t></w:r><w:r><w:pict>"#,
+            r##"<v:shape xmlns:v="urn:schemas-microsoft-com:vml" id="s1" type="#_x0000_t202" "##,
+            r#"style="position:absolute;margin-left:10pt;margin-top:20pt;width:100pt;height:50pt;z-index:3;mso-position-horizontal-relative:page;v-text-anchor:bottom" "#,
+            r##"fillcolor="#ff0000" strokeweight="2pt">"##,
+            r#"<v:textbox inset="1pt,2pt,3pt,4pt"><w:txbxContent><w:p><w:r><w:t>vml text</w:t></w:r></w:p></w:txbxContent></v:textbox>"#,
+            r#"<w10:wrap xmlns:w10="urn:schemas-microsoft-com:office:word" type="square"/>"#,
+            r#"</v:shape></w:pict></w:r></w:p>"#,
+        );
+        let tree = parse_body(body);
+        let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
+        assert_eq!(p0.text, "a\u{FFFC}");
+        let obj = &p0.inline_objects[0];
+        let engine::InlineKind::TextBox {
+            width_emu,
+            height_emu,
+            story,
+        } = &obj.kind
+        else {
+            panic!("expected a text box");
+        };
+        assert_eq!((*width_emu, *height_emu), (1_270_000, 635_000));
+        assert_eq!(story.fill, Some([0xff, 0, 0, 0xff]));
+        assert_eq!(story.outline.map(|o| o.width_emu), Some(25_400));
+        assert_eq!(story.inset_left_emu, 12_700);
+        assert_eq!(story.inset_bottom_emu, 50_800);
+        assert_eq!(story.v_align, engine::TextBoxVAlign::Bottom);
+        let a = obj.anchor.as_deref().expect("absolute ⇒ floating");
+        assert_eq!(a.position_h.relative_from, engine::HRelativeFrom::Page);
+        assert_eq!(a.position_h.offset, engine::FloatOffset::Emu(127_000));
+        assert_eq!(a.position_v.offset, engine::FloatOffset::Emu(254_000));
+        assert_eq!(a.wrap, engine::WrapKind::Square);
+        assert_eq!(a.relative_height, 3);
+        let container = story.source_xml.as_deref().expect("container");
+        assert!(container.starts_with("<w:pict>"));
+        assert_eq!(story.story_ranges.len(), 1);
+    }
+
+    /// Issue #83 self-defense — text boxes nested inside text boxes (Word
+    /// never writes them; attacker input can) stop being modeled at the
+    /// nesting cap instead of recursing without bound.
+    #[test]
+    fn nested_text_boxes_stop_at_the_nesting_cap() {
+        fn wrap_in_box(inner: &str) -> String {
+            format!(
+                concat!(
+                    r#"<w:p><w:r><w:drawing><wp:inline><wp:extent cx="10" cy="10"/>"#,
+                    r#"<a:graphic><a:graphicData><wps:wsp><wps:txbx><w:txbxContent>{}"#,
+                    r#"</w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic>"#,
+                    r#"</wp:inline></w:drawing></w:r></w:p>"#
+                ),
+                inner
+            )
+        }
+        let mut body = String::from("<w:p><w:r><w:t>core</w:t></w:r></w:p>");
+        for _ in 0..40 {
+            body = wrap_in_box(&body);
+        }
+        let tree = parse_body(&body);
+        let mut depth = 0;
+        let mut para = tree.blocks[0].as_paragraph().cloned();
+        while let Some(p) = para {
+            match p.inline_objects.first().map(|o| &o.kind) {
+                Some(engine::InlineKind::TextBox { story, .. }) => {
+                    depth += 1;
+                    para = story.body.first().and_then(Block::as_paragraph).cloned();
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(depth as u32, crate::parts::textbox::MAX_TEXT_BOX_NESTING);
     }
 
     /// The `mc:AlternateContent` shape: the Choice carries the DrawingML
@@ -1865,9 +2193,29 @@ mod tests {
         let tree = parse_body(body);
         assert_eq!(tree.blocks.len(), 1);
         let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
-        assert_eq!(p0.text, "ab");
-        assert!(p0.inline_objects.is_empty());
+        assert_eq!(p0.text, "a\u{FFFC}b");
         assert!(p0.source_xml.is_some(), "passthrough capture intact");
+        /* Issue #83 — ONE text box (the choice); its container is the
+        whole AlternateContent and both story elements are splice
+        targets, so an edit rewrites the choice and the VML fallback. */
+        assert_eq!(p0.inline_objects.len(), 1);
+        let engine::InlineKind::TextBox { story, .. } = &p0.inline_objects[0].kind else {
+            panic!("expected a text box");
+        };
+        let texts: Vec<&str> = story
+            .body
+            .iter()
+            .filter_map(Block::as_paragraph)
+            .map(|p| p.text.as_str())
+            .collect();
+        assert_eq!(texts, ["choice text"]);
+        let container = story.source_xml.as_deref().expect("container");
+        assert!(container.starts_with("<mc:AlternateContent"));
+        assert!(container.ends_with("</mc:AlternateContent>"));
+        assert_eq!(story.story_ranges.len(), 2);
+        for (s, e) in &story.story_ranges {
+            assert!(container[*s as usize..*e as usize].starts_with("<w:txbxContent>"));
+        }
     }
 
     /// The same document WITHOUT a BOM is the control — identical capture.

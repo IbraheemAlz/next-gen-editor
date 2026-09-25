@@ -1889,8 +1889,111 @@ fn build_inline_object_infos(
                     anchor: None,
                 },
             },
+            /* Issue #83 — a text box rides the float path (an in-line
+            one pinned to its own glyph: character / line frames at zero
+            offset, no wrap). Its story is laid out after pagination
+            (`attach_text_box_frames`), when the box's page is final. */
+            engine::InlineKind::TextBox {
+                width_emu,
+                height_emu,
+                story,
+            } => {
+                let glyph =
+                    text_box_glyph(story, *width_emu, *height_emu, obj.anchor.is_none(), scale);
+                let (spec, wrap) = match obj.anchor.as_deref() {
+                    Some(anchor) => (
+                        float_spec_from_anchor(anchor, scale),
+                        float_wrap_from_anchor(anchor, scale),
+                    ),
+                    None => (
+                        layout::FloatSpec {
+                            h_frame: engine::HRelativeFrom::Character,
+                            h_offset: layout::FloatOffsetPx::Px(0.0),
+                            v_frame: engine::VRelativeFrom::Line,
+                            v_offset: layout::FloatOffsetPx::Align(engine::FloatAlign::Top),
+                            simple_pos: None,
+                            z_order: 0,
+                            behind_doc: false,
+                            hidden: false,
+                        },
+                        layout::FloatWrap::default(),
+                    ),
+                };
+                layout::paragraph::InlineObjectInfo {
+                    at: obj.at,
+                    width_px: engine::emu_to_pt(*width_emu) * scale,
+                    height_px: engine::emu_to_pt(*height_emu) * scale,
+                    kind: layout::paragraph::InlineObjectInfoKind::TextBox {
+                        spec,
+                        wrap,
+                        text_box: Box::new(glyph),
+                    },
+                }
+            }
         })
         .collect()
+}
+
+/// Issue #83 / #69 — the body block path of the paragraph a float is
+/// anchored in (`paths` = the page's block paths). `None` for header /
+/// footer anchors, which no body path addresses.
+fn float_host_path(paths: &[EngineBlockPath], f: &layout::FloatBox) -> Option<EngineBlockPath> {
+    match f.anchor {
+        layout::FloatAnchorRef::Body { block, cell } => {
+            let bp = paths.get(block)?;
+            match cell {
+                None => Some(bp.clone()),
+                Some(c) => Some(
+                    EngineBlockPath::top(bp.last_block_index()?)
+                        .push(EnginePathStep::Cell {
+                            row: c.row as u32,
+                            col: c.col as u32,
+                        })
+                        .push(EnginePathStep::Block(c.inner as u32)),
+                ),
+            }
+        }
+        layout::FloatAnchorRef::Header | layout::FloatAnchorRef::Footer => None,
+    }
+}
+
+/// Issue #83 — content key of a text box: the story (through its
+/// snapshot encoding, which is deterministic) plus the shape extent.
+/// Keys the paragraph layout cache and stands in for the story in
+/// [`layout::TextBoxGlyph`] equality.
+fn text_box_key(story: &engine::TextBoxStory, width_emu: i64, height_emu: i64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    width_emu.hash(&mut h);
+    height_emu.hash(&mut h);
+    story.content_hash().hash(&mut h);
+    h.finish()
+}
+
+/// Issue #83 — lower a text box's shape into the layout glyph payload
+/// (insets / outline width in layout px at `scale`).
+fn text_box_glyph(
+    story: &engine::TextBoxStory,
+    width_emu: i64,
+    height_emu: i64,
+    inline: bool,
+    scale: f32,
+) -> layout::TextBoxGlyph {
+    let px = |emu: i64| engine::emu_to_pt(emu) * scale;
+    layout::TextBoxGlyph {
+        story: Arc::new(story.clone()),
+        key: text_box_key(story, width_emu, height_emu),
+        insets: [
+            px(story.inset_left_emu),
+            px(story.inset_top_emu),
+            px(story.inset_right_emu),
+            px(story.inset_bottom_emu),
+        ],
+        v_align: story.v_align,
+        fill: story.fill,
+        outline: story.outline.map(|o| (o.color, px(o.width_emu).max(0.0))),
+        inline,
+    }
 }
 
 /// Issue #29 — the slice of the style table span materialization needs
@@ -2265,6 +2368,16 @@ fn paragraph_layout_key(
                 4u8.hash(&mut h);
                 matches!(kind, engine::NoteKind::Endnote).hash(&mut h);
             }
+            /* Issue #83 — the story rides the sentinel glyph, so its
+            content is a layout input of the HOST paragraph. */
+            engine::InlineKind::TextBox {
+                width_emu,
+                height_emu,
+                story,
+            } => {
+                5u8.hash(&mut h);
+                text_box_key(story, *width_emu, *height_emu).hash(&mut h);
+            }
         }
         match io.anchor.as_deref() {
             None => 0u8.hash(&mut h),
@@ -2278,6 +2391,16 @@ fn paragraph_layout_key(
                 a.relative_height.hash(&mut h);
                 a.behind_doc.hash(&mut h);
                 a.hidden.hash(&mut h);
+                /* Issue #83 — text boxes carry their wrap contract on the
+                glyph (images get theirs through the wrap plan only). */
+                if matches!(io.kind, engine::InlineKind::TextBox { .. }) {
+                    a.wrap.hash(&mut h);
+                    a.wrap_text.hash(&mut h);
+                    a.dist_top_emu.hash(&mut h);
+                    a.dist_bottom_emu.hash(&mut h);
+                    a.dist_left_emu.hash(&mut h);
+                    a.dist_right_emu.hash(&mut h);
+                }
             }
         }
     }
@@ -2380,7 +2503,7 @@ fn paragraph_layout_key(
                 3u8.hash(&mut h);
                 sctx.note_self_mark.hash(&mut h);
             }
-            engine::InlineKind::Image { .. } => {}
+            engine::InlineKind::Image { .. } | engine::InlineKind::TextBox { .. } => {}
         }
     }
     cfg.font_id.hash(&mut h);
@@ -6671,7 +6794,105 @@ impl Engine {
             .3
             .degradations
             .extend(conv.take_notes().into_iter().map(bridge_degradation));
+        /* Issue #83 — the boxes are final: lay every text box's story
+        into its content rect. */
+        self.attach_text_box_frames(
+            &mut built.0,
+            &built.1,
+            &built.2,
+            &doc,
+            scale,
+            with_composition,
+        );
         Ok(built)
+    }
+
+    /// Issue #83 — `(host paragraph path, anchor byte)` of the text box
+    /// whose story is being edited, if any.
+    fn active_text_box(&self) -> Option<(EngineBlockPath, u32)> {
+        None
+    }
+
+    /// Issue #83 — lay out the story of every text box float on `pages`
+    /// into its [`layout::TextBoxFrame`]: the story's blocks at the
+    /// content-rect width through the SAME cached paragraph / table
+    /// pipeline the body and the notes use, stacked from `y = 0`, then
+    /// shifted by the vertical anchor (`Center` / `Bottom` split the
+    /// spare height; an overflowing story stays top-anchored and is
+    /// clipped at paint). The ACTIVE text-box story previews the live IME
+    /// composition. Floats are resolved already, so nothing here can
+    /// move a box or re-trigger wrap — a single pass by construction.
+    fn attach_text_box_frames(
+        &self,
+        pages: &mut [PageBox],
+        fonts: &FontStack,
+        paths: &[Vec<EngineBlockPath>],
+        doc: &DocumentTree,
+        scale: f32,
+        with_composition: bool,
+    ) {
+        let Some(cfg) = self.layout_cfg.clone() else {
+            return;
+        };
+        if !pages
+            .iter()
+            .any(|p| p.floats.iter().any(|f| f.text_box.is_some()))
+        {
+            return;
+        }
+        let sctx = StyleContext::of(doc);
+        let mut cache = self.layout_cache.borrow_mut();
+        let active = self.active_text_box();
+        for (pi, page) in pages.iter_mut().enumerate() {
+            let page_paths = paths.get(pi).map(Vec::as_slice).unwrap_or(&[]);
+            for f in page.floats.iter_mut() {
+                let host = float_host_path(page_paths, f);
+                let (fat, width) = (f.at, f.size.width);
+                let Some(tb) = f.text_box.as_deref_mut() else {
+                    continue;
+                };
+                let [l, t, r, b] = tb.source.insets;
+                let inner_w = (width - l - r).max(1.0);
+                let inner_h = (f.size.height - t - b).max(0.0);
+                let comp = if with_composition
+                    && active
+                        .as_ref()
+                        .is_some_and(|(h, a)| Some(h) == host.as_ref() && *a == fat)
+                {
+                    self.composition.as_ref()
+                } else {
+                    None
+                };
+                let mut blocks = layout_note_blocks(
+                    &tb.source.story.body,
+                    inner_w,
+                    fonts,
+                    &cfg,
+                    scale,
+                    sctx,
+                    &mut cache,
+                    comp,
+                );
+                let used = blocks
+                    .iter()
+                    .map(|bk| bk.origin().y + bk.size().height)
+                    .fold(0.0_f32, f32::max);
+                let spare = (inner_h - used).max(0.0);
+                let shift = match tb.source.v_align {
+                    engine::TextBoxVAlign::Top => 0.0,
+                    engine::TextBoxVAlign::Center => spare / 2.0,
+                    engine::TextBoxVAlign::Bottom => spare,
+                };
+                if shift > 0.0 {
+                    for bk in &mut blocks {
+                        let mut o = bk.origin();
+                        o.y += shift;
+                        bk.set_origin(o);
+                    }
+                }
+                tb.blocks = blocks;
+            }
+        }
     }
 
     /// One layout pass of [`Self::build_pages_of`] against the wrap
@@ -7762,6 +7983,48 @@ impl Engine {
                 }
             }
         }
+        /* Issue #83 — text-box stories join the table last: every box
+        instance appends its story's texts and stamps its laid-out
+        paragraphs in the same walk order. */
+        let mut tb_texts: Vec<String> = Vec::new();
+        for page in pages.iter_mut() {
+            for f in page.floats.iter_mut() {
+                let Some(tb) = f.text_box.as_deref_mut() else {
+                    continue;
+                };
+                let mut next = (para_texts.len() + tb_texts.len()) as u32;
+                let mut texts: Vec<&str> = Vec::new();
+                for b in &tb.source.story.body {
+                    walk_block_texts(b, &mut texts);
+                }
+                tb_texts.extend(texts.into_iter().map(str::to_string));
+                for lb in tb.blocks.iter_mut() {
+                    match lb {
+                        LayoutBlock::Paragraph(p) => {
+                            p.source_paragraph_id = next;
+                            next += 1;
+                        }
+                        LayoutBlock::Table(t) => {
+                            for row in t.rows.iter_mut() {
+                                for cell in row.cells.iter_mut() {
+                                    if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                                        continue;
+                                    }
+                                    layout::boxes::for_each_paragraph_in_blocks_mut(
+                                        &mut cell.content,
+                                        &mut |p| {
+                                            p.source_paragraph_id = next;
+                                            next += 1;
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        para_texts.extend(tb_texts.iter().map(String::as_str));
         let mut bytes: Vec<u8> = Vec::new();
         if let Err(e) =
             format_pdf::export_pdf(&pages, &font_stack, &para_texts, profile, &mut bytes)
@@ -8661,6 +8924,12 @@ impl Engine {
             addressable from the body story — skipped here, like the
             band's inline images. */
             for f in &page.floats {
+                /* Issue #83 — text boxes are stories, not pictures: they
+                are entered by click (`route_text_box_click`), never
+                selected / resized as images. */
+                if f.text_box.is_some() {
+                    continue;
+                }
                 let path = match f.anchor {
                     layout::FloatAnchorRef::Body { block, cell } => {
                         let Some(bp) = paths.get(block) else {
@@ -16173,6 +16442,211 @@ mod tests {
     }
 
     const PINNED_SQUARE_WRAP_X2: u64 = 0xe26a96b1e1df3649;
+
+    /* ------------------------ Issue #83 — text boxes ------------------------ */
+
+    /// Two floating text boxes with square wrap: an LTR box at the left of
+    /// the first (LTR) paragraph's column, and an RTL box aligned right in
+    /// the second (RTL, Arabic) paragraph.
+    fn text_box_doc() -> DocumentTree {
+        let prose = "Body text wraps around the framed story while the paragraph \
+                     keeps going for several more lines of ordinary prose. "
+            .repeat(5);
+        let arabic = "هذا نص عربي يلتف حول صندوق النص على اليمين ويستمر لعدة أسطر أخرى. ".repeat(5);
+        let para = |text: &str, rtl: bool| {
+            engine::Block::Paragraph(engine::Paragraph {
+                text: text.to_string(),
+                props: engine::ParaProperties {
+                    direction: rtl.then_some(engine::TextDirection::Rtl),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        let doc = DocumentTree::from_blocks(vec![para(&prose, false), para(&arabic, true)]);
+        let story = |text: &str, rtl: bool| vec![para(text, rtl)];
+        let (doc, h0, a0) = doc.insert_text_box_at(
+            EnginePos {
+                path: EngineBlockPath::top(0),
+                offset: 0,
+            },
+            1_371_600,
+            685_800,
+        );
+        let doc = doc.with_updated_text_box(&h0, a0, story("Box one frames a short story.", false));
+        let (doc, h1, a1) = doc.insert_text_box_at(
+            EnginePos {
+                path: EngineBlockPath::top(1),
+                offset: 0,
+            },
+            1_371_600,
+            685_800,
+        );
+        let mut doc = doc.with_updated_text_box(&h1, a1, story("صندوق نص من اليمين", true));
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(1)
+            && let Some(a) = p.inline_objects[0].anchor.as_mut()
+        {
+            a.position_h.offset = engine::FloatOffset::Align(engine::FloatAlign::Right);
+        }
+        doc
+    }
+
+    fn text_box_engine() -> Engine {
+        let mut engine = test_engine_with_doc(text_box_doc());
+        let bytes = include_bytes!("../../../ts/fonts/NotoNaskhArabic-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("test-arabic".to_string(), bytes).expect("arabic font");
+        engine
+            .fonts
+            .insert("test-arabic".to_string(), Arc::new(font));
+        engine
+    }
+
+    /// Both boxes resolve to floats carrying a laid-out story; the body
+    /// text wraps around them (square wrap cuts its bands); the RTL story
+    /// lays out right-to-left; the scene paints fill, clipped story and
+    /// outline; the PDF exporter accepts the frames. Geometry pinned.
+    #[test]
+    fn text_boxes_lay_out_their_stories_and_wrap_body_text() {
+        let engine = text_box_engine();
+        let (pages, fonts, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let boxes: Vec<&layout::FloatBox> = pages
+            .iter()
+            .flat_map(|p| p.floats.iter())
+            .filter(|f| f.text_box.is_some())
+            .collect();
+        assert_eq!(boxes.len(), 2, "two text box floats");
+        for f in &boxes {
+            let tb = f.text_box.as_deref().expect("frame");
+            let p = tb.blocks[0].as_paragraph().expect("story paragraph");
+            assert!(!p.lines.is_empty() && !p.lines[0].runs.is_empty());
+            let (origin, size) = f.text_box_content_rect().expect("content rect");
+            assert!(
+                origin.x > f.origin.x && size.width < f.size.width,
+                "insets applied"
+            );
+        }
+        let rtl = boxes[1].text_box.as_deref().expect("rtl frame");
+        assert_eq!(
+            rtl.blocks[0].as_paragraph().expect("p").direction,
+            ShapingDirection::Rtl
+        );
+        /* The right-aligned box sits at the column's right edge. */
+        let page = &pages[0];
+        let right_edge = page.size.width - page.margins.right;
+        assert!((boxes[1].origin.x + boxes[1].size.width - right_edge).abs() < 0.5);
+        /* Square wrap: the first paragraph's bands beside the left box
+        start to the right of it. */
+        let p0 = page.blocks[0].as_paragraph().expect("p0");
+        assert!(
+            p0.lines.iter().any(|l| l
+                .segments
+                .first()
+                .is_some_and(|s| s.x0 >= boxes[0].size.width)),
+            "some band starts right of the left box"
+        );
+        /* Scene: fill + outline + a clipped story per box. */
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let clips = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 2);
+        let strokes = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::StrokeRect { .. }))
+            .count();
+        assert!(strokes >= 2);
+        let mut pdf = Vec::new();
+        format_pdf::export_pdf(&pages, &fonts, &[], format_pdf::PdfProfile::Plain, &mut pdf)
+            .expect("pdf");
+        assert!(pdf.starts_with(b"%PDF"));
+        /* Pinned: a change here moves the text-box goldens. */
+        let fp = layout::geometry_fingerprint(&pages);
+        if std::env::var_os("NGE_PRINT_WRAP_FINGERPRINTS").is_some() {
+            eprintln!("ENGINE TEXT BOX FINGERPRINT = {fp:#x}");
+        }
+        assert_eq!(fp, PINNED_TEXT_BOXES_X1);
+    }
+
+    const PINNED_TEXT_BOXES_X1: u64 = 0x36dc281bfc45e4a1;
+
+    /// An overflowing story is clipped at the shape's bottom edge (lines
+    /// past it are culled from the scene) and a centred story shifts down
+    /// by half the spare height.
+    #[test]
+    fn text_box_story_valign_and_overflow_clip() {
+        let mut doc = text_box_doc();
+        let host = EngineBlockPath::top(0);
+        let long: Vec<engine::Block> = (0..12)
+            .map(|i| {
+                engine::Block::Paragraph(engine::Paragraph {
+                    text: format!("overflow line {i}"),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        doc = doc.with_updated_text_box(&host, 0, long);
+        let engine = text_box_engine();
+        let mut engine = engine;
+        engine.undo = UndoStack::new(doc.clone(), 100);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("layout");
+        let f = pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("box");
+        let tb = f.text_box.as_deref().expect("frame");
+        assert_eq!(tb.blocks.len(), 12, "every story block is laid out");
+        let scene = render::scene::build_document_scene(&pages[..1], 0.0);
+        let painted_runs = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::DrawGlyphRun(_)))
+            .count();
+        let runs_in = |blocks: &[LayoutBlock]| -> usize {
+            blocks
+                .iter()
+                .filter_map(LayoutBlock::as_paragraph)
+                .map(|p| p.lines.iter().map(|l| l.runs.len()).sum::<usize>())
+                .sum()
+        };
+        let every_run = runs_in(&pages[0].blocks)
+            + pages[0]
+                .floats
+                .iter()
+                .filter_map(|g| g.text_box.as_deref())
+                .map(|t| runs_in(&t.blocks))
+                .sum::<usize>();
+        assert!(painted_runs < every_run, "overflowing lines are culled");
+
+        /* Centre a one-line story: its block shifts down. */
+        let mut doc = text_box_doc();
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0)
+            && let engine::InlineKind::TextBox { story, .. } = &mut p.inline_objects[0].kind
+        {
+            story.v_align = engine::TextBoxVAlign::Center;
+            story.body = vec![engine::Block::Paragraph(engine::Paragraph {
+                text: "Hi".into(),
+                ..Default::default()
+            })];
+        }
+        engine.undo = UndoStack::new(doc, 100);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("layout");
+        let f = pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("box");
+        let tb = f.text_box.as_deref().expect("frame");
+        let (_, inner) = f.text_box_content_rect().expect("rect");
+        let b = &tb.blocks[0];
+        let spare = inner.height - b.size().height;
+        assert!(spare > 1.0);
+        assert!((b.origin().y - spare / 2.0).abs() < 0.01);
+    }
 
     /// `Command::SetImageWrap` switches the mode (one undo step), the
     /// behind / in-front modes stop cutting text, the image rect reports

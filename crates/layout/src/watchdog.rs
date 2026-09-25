@@ -450,6 +450,15 @@ pub fn geometry_fingerprint(pages: &[PageBox]) -> u64 {
                 f.at.hash(&mut h);
                 f.z_order.hash(&mut h);
                 f.behind_doc.hash(&mut h);
+                /* Issue #83 — a text box pins its laid-out story; a
+                picture hashes nothing more, so pre-#83 values hold. */
+                if let Some(tb) = f.text_box.as_deref() {
+                    0x7b_u8.hash(&mut h);
+                    (tb.blocks.len() as u64).hash(&mut h);
+                    for b in &tb.blocks {
+                        hash_block(&mut h, b);
+                    }
+                }
             }
         }
     }

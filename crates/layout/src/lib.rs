@@ -18,7 +18,7 @@ pub use boxes::{
     CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FloatWrap,
     FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, LineSegment,
     MarkerBox, NoteBand, PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TableBox,
-    TableCellBox, TableRowBox, TextAttrs, VisualRun, WrapSide,
+    TableCellBox, TableRowBox, TextAttrs, TextBoxFrame, TextBoxGlyph, VisualRun, WrapSide,
 };
 pub use floats::{ColumnLayout, resolve_page_floats};
 pub use page::{A4Page, Margins};
