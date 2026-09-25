@@ -292,7 +292,7 @@ mod tests {
             .map(|c| face.glyph_id(c).expect("glyph"))
             .collect();
         assert!(
-            blocks.iter().any(|b| *b == expected),
+            blocks.contains(&expected),
             "expected {expected:?} among decoded blocks {blocks:?}"
         );
     }

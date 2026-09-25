@@ -114,16 +114,13 @@ Fixture 1 — inline images (PNG + JPEG + BMP, issue #121 / #189 / #207).
 ==================================================================== */
 
 fn images_fixture_doc() -> DocumentTree {
-    let mut doc =
-        DocumentTree::from_text("Photo gallery — PNG, JPEG and BMP samples follow: ");
+    let mut doc = DocumentTree::from_text("Photo gallery — PNG, JPEG and BMP samples follow: ");
     let path = EngineBlockPath::top(0);
 
     const PNG_W: u32 = 6;
     const PNG_H: u32 = 4;
     let png_pixels: Vec<u8> = (0..PNG_H)
-        .flat_map(|y| {
-            (0..PNG_W).flat_map(move |x| [(30 * x) as u8, (50 * y) as u8, 210, 255])
-        })
+        .flat_map(|y| (0..PNG_W).flat_map(move |x| [(30 * x) as u8, (50 * y) as u8, 210, 255]))
         .collect();
     let png_bytes = format_pdf::test_images::png_rgba(PNG_W, PNG_H, &png_pixels);
 
@@ -312,9 +309,7 @@ fn generate_arabic_kashida_pdf_validate_fixture() {
     on the line is Arabic-script, the Mixed split otherwise) — this
     fixture's pure-Arabic text guarantees at least one of the two. */
     let (pages, ..) = engine.build_pages(1.0, false, None).expect("layout");
-    let para = pages[0].blocks[0]
-        .as_paragraph()
-        .expect("paragraph block");
+    let para = pages[0].blocks[0].as_paragraph().expect("paragraph block");
     assert!(para.lines.len() >= 2, "must wrap to exercise justification");
     assert_exports_cleanly(&engine, "arabic-kashida");
 
@@ -328,7 +323,10 @@ fn generate_arabic_kashida_pdf_validate_fixture() {
         .document
         .nth_paragraph(0)
         .expect("round-tripped paragraph");
-    assert_eq!(reread_p.direct_overrides.alignment, Some(engine::Alignment::Justify));
+    assert_eq!(
+        reread_p.direct_overrides.alignment,
+        Some(engine::Alignment::Justify)
+    );
     write_corpus_fixture("arabic-kashida", &bytes);
 }
 
@@ -343,9 +341,18 @@ fn notes_fixture_doc() -> DocumentTree {
     );
     let path = EngineBlockPath::top(0);
 
-    let text = doc.paragraph_at_path(&path).expect("paragraph").text.clone();
-    let footnote_at = text.find("archive").expect("fixture text contains 'archive'") as u32;
-    let (doc, fid) = doc.insert_note_at(EnginePos::new(path.clone(), footnote_at), engine::NoteKind::Footnote);
+    let text = doc
+        .paragraph_at_path(&path)
+        .expect("paragraph")
+        .text
+        .clone();
+    let footnote_at = text
+        .find("archive")
+        .expect("fixture text contains 'archive'") as u32;
+    let (doc, fid) = doc.insert_note_at(
+        EnginePos::new(path.clone(), footnote_at),
+        engine::NoteKind::Footnote,
+    );
     let mut fbody = engine::Paragraph {
         text: "\u{FFFC} Primary source: internal records, cross-checked against three \
                independent archives."
@@ -361,16 +368,26 @@ fn notes_fixture_doc() -> DocumentTree {
         anchor: None,
         source_xml: None,
     });
-    let doc =
-        doc.with_updated_note_story(engine::NoteKind::Footnote, fid as i32, vec![engine::Block::Paragraph(fbody)]);
+    let doc = doc.with_updated_note_story(
+        engine::NoteKind::Footnote,
+        fid as i32,
+        vec![engine::Block::Paragraph(fbody)],
+    );
 
     /* Re-derive the offset from the LIVE (post-footnote-insert) text — the
     footnote's own U+FFFC sentinel shifted every later byte offset, and
     re-finding rather than hand-computing the shift keeps this immune to
     that detail changing. */
-    let text2 = doc.paragraph_at_path(&path).expect("paragraph").text.clone();
-    let endnote_at = text2.find("appendix").expect("fixture text contains 'appendix'") as u32;
-    let (doc, eid) = doc.insert_note_at(EnginePos::new(path, endnote_at), engine::NoteKind::Endnote);
+    let text2 = doc
+        .paragraph_at_path(&path)
+        .expect("paragraph")
+        .text
+        .clone();
+    let endnote_at = text2
+        .find("appendix")
+        .expect("fixture text contains 'appendix'") as u32;
+    let (doc, eid) =
+        doc.insert_note_at(EnginePos::new(path, endnote_at), engine::NoteKind::Endnote);
     let mut ebody = engine::Paragraph {
         text: "\u{FFFC} See Appendix C for the full transcript and translation notes.".to_string(),
         dirty: true,
@@ -384,7 +401,11 @@ fn notes_fixture_doc() -> DocumentTree {
         anchor: None,
         source_xml: None,
     });
-    doc.with_updated_note_story(engine::NoteKind::Endnote, eid as i32, vec![engine::Block::Paragraph(ebody)])
+    doc.with_updated_note_story(
+        engine::NoteKind::Endnote,
+        eid as i32,
+        vec![engine::Block::Paragraph(ebody)],
+    )
 }
 
 #[test]
@@ -439,8 +460,7 @@ fn text_box_fixture_doc() -> DocumentTree {
         .find("callout")
         .expect("fixture text contains 'callout'") as u32;
     /* 2in × 1in, Word's own EMU unit. */
-    let (doc, _host, at) =
-        doc.insert_text_box_at(EnginePos::new(path, offset), 1_828_800, 914_400);
+    let (doc, _host, at) = doc.insert_text_box_at(EnginePos::new(path, offset), 1_828_800, 914_400);
 
     let mut blocks: Vec<engine::Block> = doc.blocks.iter().cloned().collect();
     let engine::Block::Paragraph(p) = &mut blocks[0] else {
