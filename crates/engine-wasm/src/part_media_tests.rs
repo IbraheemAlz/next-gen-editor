@@ -108,7 +108,7 @@ fn each_part_paints_its_own_picture_on_canvas_and_in_pdf() {
     }
     assert_ne!(doc.media[&header.0].data, doc.media[&body.0].data);
 
-    let Event::PdfExported { bytes, .. } = engine.do_export_pdf(PdfConformance::A2u) else {
+    let Event::PdfExported { bytes, .. } = engine.do_export_pdf(format_pdf::PdfProfile::A2u) else {
         panic!("engine pdf export");
     };
     let count = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
