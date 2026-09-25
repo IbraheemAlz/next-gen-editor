@@ -61,7 +61,8 @@ const INSERT_TEXT: &str = " تم التعديل";
 /// with a `run_default()` exact-byte-equality assertion that compares a
 /// resave against the pinned SOURCE text (`grab_bag_exotic.docx`,
 /// `floating_image_anchor.docx`, `footnotes_endnotes.docx`,
-/// `table_cell_runs.docx`, `image_wrap_modes.docx`) — the writer's
+/// `table_cell_runs.docx`, `image_wrap_modes.docx`, `toc_word_shape.docx`)
+/// — the writer's
 /// trailing-sectPr compaction (`sect_pr_compaction_delta`) would desync
 /// those comparisons. `w14_paraid_word.docx` is the one exception THAT
 /// IS pinned despite sharing a generator with a `run_default()` step:
@@ -2580,7 +2581,13 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         },
         /* Issue #81 — Word's multi-paragraph TOC shape (hyperlinked
         entries, nested PAGEREFs, dot leaders, `_Toc*` bookmarks).
-        Passthrough at drift 0; step 15 edits + regenerates it. */
+        Passthrough at drift 0; step 15 edits + regenerates it. Issue
+        #109's pgSz pin is deliberately NOT applied here — same reasoning
+        as `grab_bag_exotic.docx` et al above: step 15a's untouched-save
+        check (`run_toc_roundtrip`) is `extract_doc_xml(&bytes)? !=
+        extract_doc_xml(&fixture)?`, an exact comparison against the
+        pinned source with no edit to account for the writer's
+        trailing-sectPr compaction. */
         PrebuiltFixture {
             name: "toc_word_shape.docx",
             bytes: build_toc_word_shape_docx(),
