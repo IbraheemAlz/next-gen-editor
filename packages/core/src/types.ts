@@ -58,6 +58,9 @@ export type {
     A11yTree,
     A11yPatch,
     A11yTextBox,
+    A11yNote,
+    A11yNoteKind,
+    A11yNoteRef,
     AnnouncementPriority,
     BridgeSectionGeometry,
     BridgeCellProperties,
@@ -66,6 +69,7 @@ export type {
     BridgeStyleProperties,
     BridgeTabStop,
     BridgeTabKind,
+    BridgeTabLeader,
     BridgeIndent,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
