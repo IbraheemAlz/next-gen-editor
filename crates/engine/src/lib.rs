@@ -1131,14 +1131,41 @@ pub struct NoteAnchor {
     pub id: u32,
 }
 
-/// Issue #80 — one body-order note reference: the top-level block that
-/// carries it, the anchor, and whether the author supplied a custom
-/// mark (`w:customMarkFollows` — the sequence skips it).
+/// Issue #278 — the story container a note reference sits in. The
+/// numbering walk visits every container that paints; consumers that
+/// care (the a11y mirror, tests) key on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum NoteContainer {
+    /// A top-level body paragraph.
+    #[default]
+    Body,
+    /// A paragraph inside a body table cell (any nesting depth).
+    TableCell,
+    /// A paragraph inside a text-box story (any nesting depth, cells of
+    /// a table inside the story included) anchored in the body.
+    TextBox,
+    /// A header part (its cells and text boxes included).
+    Header,
+    /// A footer part (its cells and text boxes included).
+    Footer,
+}
+
+/// Issue #80 — one document-order note reference: the top-level block
+/// that carries it, the anchor, and whether the author supplied a
+/// custom mark (`w:customMarkFollows` — the sequence skips it).
+///
+/// Issue #278 — `container` says where the reference sits. For a
+/// reference in a table cell or a text box, `top_block` is the
+/// top-level block hosting the cell / the box's anchor paragraph; for a
+/// header / footer reference it is the `start_block` of the first
+/// section whose pages paint that part (the band opens that section's
+/// first page, so it numbers ahead of the section's body references).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoteReference {
     pub top_block: u32,
     pub anchor: NoteAnchor,
     pub custom_mark: bool,
+    pub container: NoteContainer,
 }
 
 /// Address of a `Block` inside a `DocumentTree`. Walks from the root
@@ -5245,16 +5272,99 @@ impl DocumentTree {
         found
     }
 
-    /// Every body note reference in document order — top-level blocks in
-    /// sequence, table cells depth-first. The single walk the numbering,
-    /// the paginator's note-body table and the writer's "referenced
-    /// notes only" filter all key on.
+    /// Every note reference in document order — the single walk the
+    /// numbering, the paginator's note-body table, the a11y mirror and
+    /// the HTML export all key on.
+    ///
+    /// Issue #278 — every story container that paints is walked, not
+    /// just top-level body paragraphs: top-level blocks in sequence,
+    /// table cells depth-first (nested tables included), each text-box
+    /// story at its anchor's position in the host paragraph (nested
+    /// boxes recursively), and the header / footer parts the sections
+    /// paint. A part is walked ONCE, ahead of the body of the first
+    /// section that shows it, in the order its pages show the roles
+    /// (`first` under `titlePg`, then `default` / `even` by page parity;
+    /// the header before the footer of the same role) — Word numbers a
+    /// header note with the first page it appears on. A role the section
+    /// never paints (`first` without `titlePg`, `even` without
+    /// `evenAndOddHeaders`) and a part no section references contribute
+    /// nothing here; the writer's keep-list is
+    /// [`Self::all_note_reference_anchors`].
     pub fn note_references(&self) -> Vec<NoteReference> {
         let mut out = Vec::new();
-        for (idx, b) in self.blocks.iter().enumerate() {
-            walk_block_note_refs(b, idx as u32, &mut out);
+        if self.headers.is_empty() && self.footers.is_empty() {
+            for (idx, b) in self.blocks.iter().enumerate() {
+                walk_block_note_refs(b, idx as u32, NoteContainer::Body, &mut out);
+            }
+            return out;
         }
+        let sections = self.effective_sections();
+        let resolved = resolve_hf_inheritance(&sections);
+        let even_and_odd = self.settings.even_and_odd_headers;
+        let mut seen_headers: Vec<&str> = Vec::new();
+        let mut seen_footers: Vec<&str> = Vec::new();
+        let mut next_section = 0usize;
+        let n_blocks = self.blocks.len() as u32;
+        let mut emit_sections_up_to = |block: u32, out: &mut Vec<NoteReference>| {
+            while let Some(s) = sections.get(next_section) {
+                if s.start_block > block {
+                    break;
+                }
+                let (h, f) = &resolved[next_section];
+                let at = s.start_block.min(n_blocks);
+                for role in painted_hf_roles(s.title_pg, even_and_odd) {
+                    for (refs, parts, seen, container) in [
+                        (h, &self.headers, &mut seen_headers, NoteContainer::Header),
+                        (f, &self.footers, &mut seen_footers, NoteContainer::Footer),
+                    ] {
+                        let Some(rid) = refs.resolve(role) else {
+                            continue;
+                        };
+                        let Some((key, blocks)) = parts.get_key_value(rid) else {
+                            continue;
+                        };
+                        if seen.contains(&key.as_str()) {
+                            continue;
+                        }
+                        seen.push(key.as_str());
+                        for b in blocks {
+                            walk_block_note_refs(b, at, container, out);
+                        }
+                    }
+                }
+                next_section += 1;
+            }
+        };
+        for (idx, b) in self.blocks.iter().enumerate() {
+            emit_sections_up_to(idx as u32, &mut out);
+            walk_block_note_refs(b, idx as u32, NoteContainer::Body, &mut out);
+        }
+        emit_sections_up_to(u32::MAX, &mut out);
         out
+    }
+
+    /// Issue #278 — every note any story of the document references,
+    /// painted or not: [`Self::note_references`] plus the references in
+    /// header / footer parts no painted role shows (an unreferenced part,
+    /// a `first` slot without `titlePg`). The writer's "referenced notes
+    /// only" filter keeps exactly these — a part that survives the save
+    /// must never lose the note it points at.
+    pub fn all_note_reference_anchors(&self) -> std::collections::HashSet<NoteAnchor> {
+        let mut out: Vec<NoteReference> = Vec::new();
+        for (idx, b) in self.blocks.iter().enumerate() {
+            walk_block_note_refs(b, idx as u32, NoteContainer::Body, &mut out);
+        }
+        for (parts, container) in [
+            (&self.headers, NoteContainer::Header),
+            (&self.footers, NoteContainer::Footer),
+        ] {
+            for blocks in parts.values() {
+                for b in blocks {
+                    walk_block_note_refs(b, 0, container, &mut out);
+                }
+            }
+        }
+        out.into_iter().map(|r| r.anchor).collect()
     }
 
     /// Resolved `<w:footnotePr>` / `<w:endnotePr>` for `kind`: the
@@ -10793,10 +10903,57 @@ fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) -> 
 /// Issue #80 — collect every note reference inside `block` (cells
 /// depth-first) in source order, stamped with the TOP-LEVEL block index
 /// `top` so numbering can resolve the owning section.
-fn walk_block_note_refs(block: &Block, top: u32, out: &mut Vec<NoteReference>) {
+/// Issue #278 — the note references inside a free-standing block list (a
+/// text-box story, a note body, a header part), in story order, tagged
+/// `container` and hosted by top-level block 0. Layout uses it to carry
+/// a text box's references on its sentinel glyph.
+pub fn note_references_in_blocks(blocks: &[Block], container: NoteContainer) -> Vec<NoteReference> {
+    let mut out = Vec::new();
+    for b in blocks {
+        walk_block_note_refs(b, 0, container, &mut out);
+    }
+    out
+}
+
+/// Issue #278 — the header / footer roles a section's pages paint, in
+/// the order its pages show them: `first` (under `titlePg`) on page 1,
+/// then `default` on odd pages and `even` (under `evenAndOddHeaders`) on
+/// even ones — `even` comes before `default` exactly when page 1 is the
+/// title page.
+fn painted_hf_roles(title_pg: bool, even_and_odd: bool) -> Vec<HeaderFooterRole> {
+    let mut roles = Vec::with_capacity(3);
+    if title_pg {
+        roles.push(HeaderFooterRole::First);
+        if even_and_odd {
+            roles.push(HeaderFooterRole::Even);
+        }
+        roles.push(HeaderFooterRole::Default);
+    } else {
+        roles.push(HeaderFooterRole::Default);
+        if even_and_odd {
+            roles.push(HeaderFooterRole::Even);
+        }
+    }
+    roles
+}
+
+/// Issue #80 / #278 — append the note references in `block` (hosted by
+/// top-level block `top`, sitting in `container`) in document order:
+/// a paragraph's inline objects by anchor offset — a text box's story
+/// is walked at its anchor's position — and a table's cells row-major,
+/// depth-first. Recursion follows the model's own nesting (cells in
+/// cells, boxes in boxes), which the reader bounds.
+fn walk_block_note_refs(
+    block: &Block,
+    top: u32,
+    container: NoteContainer,
+    out: &mut Vec<NoteReference>,
+) {
     match block {
         Block::Paragraph(p) => {
-            for obj in &p.inline_objects {
+            let mut objs: Vec<&InlineObject> = p.inline_objects.iter().collect();
+            objs.sort_by_key(|o| o.at);
+            for obj in objs {
                 let (anchor, custom_mark) = match &obj.kind {
                     InlineKind::FootnoteRef {
                         id,
@@ -10818,22 +10975,37 @@ fn walk_block_note_refs(block: &Block, top: u32, out: &mut Vec<NoteReference>) {
                         },
                         *custom_mark_follows,
                     ),
-                    InlineKind::Image { .. }
-                    | InlineKind::NoteSelfRef { .. }
-                    | InlineKind::TextBox { .. } => continue,
+                    InlineKind::TextBox { story, .. } => {
+                        let inner = match container {
+                            NoteContainer::Body | NoteContainer::TableCell => {
+                                NoteContainer::TextBox
+                            }
+                            other => other,
+                        };
+                        for b in &story.body {
+                            walk_block_note_refs(b, top, inner, out);
+                        }
+                        continue;
+                    }
+                    InlineKind::Image { .. } | InlineKind::NoteSelfRef { .. } => continue,
                 };
                 out.push(NoteReference {
                     top_block: top,
                     anchor,
                     custom_mark,
+                    container,
                 });
             }
         }
         Block::Table(t) => {
+            let inner = match container {
+                NoteContainer::Body => NoteContainer::TableCell,
+                other => other,
+            };
             for row in &t.rows {
                 for cell in &row.cells {
                     for b in &cell.blocks {
-                        walk_block_note_refs(b, top, out);
+                        walk_block_note_refs(b, top, inner, out);
                     }
                 }
             }

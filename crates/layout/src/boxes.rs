@@ -242,6 +242,14 @@ pub struct TextBoxGlyph {
     /// `true` for a `<wp:inline>` text box: the sentinel reserves the
     /// box's width and grows the line, and the box paints at the glyph.
     pub inline: bool,
+    /// Issue #278 — the note references inside the story (nested boxes
+    /// and story tables included), in story order, with the display
+    /// marker each was shaped with. The story is laid out only after
+    /// pagination, so the paginator reserves these notes' band space on
+    /// the line carrying the SENTINEL — a box's notes land on the page
+    /// its anchor paragraph lands on. Empty for every story without a
+    /// reference (the nominal path).
+    pub note_anchors: Vec<(engine::NoteAnchor, String)>,
 }
 
 impl PartialEq for TextBoxGlyph {
@@ -252,6 +260,7 @@ impl PartialEq for TextBoxGlyph {
             && self.fill == other.fill
             && self.outline == other.outline
             && self.inline == other.inline
+            && self.note_anchors == other.note_anchors
     }
 }
 

@@ -30,6 +30,7 @@
 //! Exit 0 on PASS, non-zero on FAIL.
 
 mod inline_spans;
+mod note_containers;
 mod revisions;
 mod table_markup;
 
@@ -331,6 +332,7 @@ fn run_default() -> Result<()> {
     table_markup::run_table_markup_roundtrip()?;
     revisions::run_tracked_moves_roundtrip()?;
     revisions::run_paragraph_mark_revisions_roundtrip()?;
+    note_containers::run_note_containers_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

@@ -4249,11 +4249,14 @@ fn build_notes_xml(
         engine::NoteKind::Endnote => ("w:endnotes", "w:endnote"),
     };
     let stories = doc.note_stories(kind);
+    /* Issue #278 — every story's references count (cells, text boxes,
+    and every header / footer part — painted or not): a note referenced
+    only from a header must survive the save its part survives. */
     let referenced: std::collections::HashSet<u32> = doc
-        .note_references()
-        .iter()
-        .filter(|r| r.anchor.kind == kind)
-        .map(|r| r.anchor.id)
+        .all_note_reference_anchors()
+        .into_iter()
+        .filter(|a| a.kind == kind)
+        .map(|a| a.id)
         .collect();
     let mut has_image = false;
     let mut has_link = false;

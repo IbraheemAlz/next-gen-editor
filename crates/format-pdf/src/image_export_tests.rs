@@ -670,6 +670,7 @@ fn pictures_in_text_box_stories_are_embedded_and_placed() {
             fill: None,
             outline: None,
             inline: false,
+            note_anchors: Vec::new(),
         },
         blocks: Vec::new(),
         floats,

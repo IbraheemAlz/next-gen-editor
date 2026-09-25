@@ -2259,8 +2259,14 @@ fn build_inline_object_infos(
                 height_emu,
                 story,
             } => {
-                let glyph =
-                    text_box_glyph(story, *width_emu, *height_emu, obj.anchor.is_none(), scale);
+                let glyph = text_box_glyph(
+                    story,
+                    *width_emu,
+                    *height_emu,
+                    obj.anchor.is_none(),
+                    scale,
+                    sctx,
+                );
                 let (spec, wrap) = match obj.anchor.as_deref() {
                     Some(anchor) => (
                         float_spec_from_anchor(anchor, scale),
@@ -2585,12 +2591,18 @@ fn stamp_text_box_texts(tb: &mut layout::TextBoxFrame, base: usize, texts: &mut 
 
 /// Issue #83 — lower a text box's shape into the layout glyph payload
 /// (insets / outline width in layout px at `scale`).
+///
+/// Issue #278 — the glyph also carries the note references inside the
+/// story with their display markers (`sctx`), so the paginator reserves
+/// their band space on the anchor line (the story itself is laid out
+/// only after pagination).
 fn text_box_glyph(
     story: &engine::TextBoxStory,
     width_emu: i64,
     height_emu: i64,
     inline: bool,
     scale: f32,
+    sctx: StyleContext,
 ) -> layout::TextBoxGlyph {
     let px = |emu: i64| engine::emu_to_pt(emu) * scale;
     layout::TextBoxGlyph {
@@ -2606,7 +2618,29 @@ fn text_box_glyph(
         fill: story.fill,
         outline: story.outline.map(|o| (o.color, px(o.width_emu).max(0.0))),
         inline,
+        note_anchors: text_box_note_anchors(story, sctx),
     }
+}
+
+/// Issue #278 — the note references inside a text-box story (nested
+/// boxes and story tables included), in story order, each with the
+/// display marker its reference mark is shaped with (empty under a
+/// custom mark, exactly as `build_inline_object_infos` shapes it).
+fn text_box_note_anchors(
+    story: &engine::TextBoxStory,
+    sctx: StyleContext,
+) -> Vec<(engine::NoteAnchor, String)> {
+    engine::note_references_in_blocks(&story.body, engine::NoteContainer::TextBox)
+        .into_iter()
+        .map(|r| {
+            let mark = if r.custom_mark {
+                String::new()
+            } else {
+                sctx.note_marker_text(r.anchor)
+            };
+            (r.anchor, mark)
+        })
+        .collect()
 }
 
 /// Issue #29 — the slice of the style table span materialization needs
@@ -3161,7 +3195,18 @@ fn paragraph_layout_key(
                 3u8.hash(&mut h);
                 sctx.note_self_mark.hash(&mut h);
             }
-            engine::InlineKind::Image { .. } | engine::InlineKind::TextBox { .. } => {}
+            /* Issue #278 — a box's story references ride its sentinel
+            glyph with their markers (`text_box_note_anchors`). Nothing
+            is mixed in for a story without one, so every existing key
+            is unchanged. */
+            engine::InlineKind::TextBox { story, .. } => {
+                for (anchor, mark) in text_box_note_anchors(story, sctx) {
+                    4u8.hash(&mut h);
+                    anchor.hash(&mut h);
+                    mark.hash(&mut h);
+                }
+            }
+            engine::InlineKind::Image { .. } => {}
         }
     }
     cfg.font_id.hash(&mut h);
@@ -3533,7 +3578,10 @@ fn note_table_at<'t>(
 
 /// Issue #80 — the endnotes referenced by top-level blocks in
 /// `[start, end)`, in reference order (deduped), paired with their laid
-/// out bodies — the paginator's trailing-band input.
+/// out bodies — the paginator's trailing-band input. Issue #278 — a
+/// reference in a cell or a text box counts at its host block, one in a
+/// header / footer part at the start block of the first section painting
+/// the part, so those endnotes trail with the rest.
 fn endnote_entries_for(
     doc: &DocumentTree,
     start: u32,
@@ -6619,7 +6667,10 @@ fn push_a11y_text_boxes(
                 id_prefix: &inner_prefix,
                 path_prefix: "",
                 depth: scope.depth + 1,
-                notes: None,
+                /* Issue #278 — a box's story references are the
+                document's: they read as their markers and their
+                footnote regions follow the story paragraph. */
+                notes: scope.notes,
                 self_marker: None,
             },
         );
@@ -8533,6 +8584,15 @@ impl Engine {
                 .extend(conv.degraded.into_iter().map(bridge_degradation));
             b
         };
+        /* Issue #278 — the labels the pages were painted with (the
+        document-order markers, relabelled per page under `eachPage`):
+        a reference mark inside a text box story shapes the same label
+        its band entry shows. */
+        let frame_markers = if restart_rules.is_empty() {
+            doc.note_markers()
+        } else {
+            page_restart_note_markers(&doc.note_markers(), &restart_rules, &built.0)
+        };
         /* Issue #83 — the boxes are final: lay every text box's story
         into its content rect. */
         let nested_notes = self.attach_text_box_frames(
@@ -8542,6 +8602,7 @@ impl Engine {
             &doc,
             scale,
             with_composition,
+            &frame_markers,
         );
         built
             .3
@@ -8579,6 +8640,7 @@ impl Engine {
     /// loop, and the nested story is laid out recursively (bounded by
     /// [`MAX_TEXT_BOX_LAYOUT_DEPTH`]). Returns the nested wrap loops'
     /// degradation notes (empty on the nominal path).
+    #[allow(clippy::too_many_arguments)]
     fn attach_text_box_frames(
         &self,
         pages: &mut [PageBox],
@@ -8587,6 +8649,7 @@ impl Engine {
         doc: &DocumentTree,
         scale: f32,
         with_composition: bool,
+        note_markers: &HashMap<engine::NoteAnchor, String>,
     ) -> Vec<layout::LayoutDegradation> {
         let Some(cfg) = self.layout_cfg.clone() else {
             return Vec::new();
@@ -8597,7 +8660,7 @@ impl Engine {
         {
             return Vec::new();
         }
-        let sctx = StyleContext::of(doc);
+        let sctx = StyleContext::of(doc).with_note_markers(note_markers);
         let mut cache = self.layout_cache.borrow_mut();
         let active = self.active_text_box();
         let mut notes: Vec<layout::LayoutDegradation> = Vec::new();
@@ -9024,6 +9087,14 @@ impl Engine {
                     section.title_pg,
                     doc.settings.even_and_odd_headers,
                 )
+                /* Issue #278 — a header / footer note an earlier
+                section's pages already carry is not placed again. */
+                .with_placed_band_notes(emitted_pages.iter().flat_map(|p| {
+                    p.footnotes.entries.iter().map(|e| engine::NoteAnchor {
+                        kind: e.kind,
+                        id: e.id,
+                    })
+                }))
                 .with_note_bodies(note_bodies)
                 .with_continuation_notice(continuation_notice)
                 /* Issue #43 / #77 — DATE / TIME / FILENAME / AUTHOR
@@ -14424,6 +14495,12 @@ impl Engine {
                     direction,
                     A11yScope {
                         id_prefix: &id_prefix,
+                        /* Issue #278 — header / footer references are
+                        numbered with the document's notes: marks read
+                        as their markers and a footnote not already
+                        mirrored after a body reference gets its region
+                        after the band paragraph. */
+                        notes: Some(&notes),
                         ..A11yScope::BODY
                     },
                 ),
@@ -26438,6 +26515,11 @@ mod a11y_note_tests;
 
 #[cfg(test)]
 mod a11y_object_tests;
+
+/// Issue #278 — note references in cells, text boxes and header /
+/// footer bands: numbering, band placement, a11y, HTML export.
+#[cfg(test)]
+mod note_container_tests;
 
 #[cfg(test)]
 mod part_media_tests;
