@@ -84,5 +84,6 @@ export type { InsertTableButtonProps } from './InsertTableButton';
 export { HeaderFooterButtons } from './HeaderFooterButtons';
 export { FieldButtons } from './FieldButtons';
 export { NoteButtons } from './NoteButtons';
+export { TextBoxButton } from './TextBoxButton';
 export { HistoryButtons } from './HistoryButtons';
 export { CapsButtons } from './CapsButtons';

@@ -61,7 +61,8 @@ const INSERT_TEXT: &str = " تم التعديل";
 /// with a `run_default()` exact-byte-equality assertion that compares a
 /// resave against the pinned SOURCE text (`grab_bag_exotic.docx`,
 /// `floating_image_anchor.docx`, `footnotes_endnotes.docx`,
-/// `table_cell_runs.docx`, `image_wrap_modes.docx`, `toc_word_shape.docx`)
+/// `table_cell_runs.docx`, `image_wrap_modes.docx`, `toc_word_shape.docx`,
+/// `text_boxes_wrap.docx`)
 /// — the writer's
 /// trailing-sectPr compaction (`sect_pr_compaction_delta`) would desync
 /// those comparisons. `w14_paraid_word.docx` is the one exception THAT
