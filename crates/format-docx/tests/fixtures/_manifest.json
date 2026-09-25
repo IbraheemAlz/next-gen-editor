@@ -1,5 +1,23 @@
 {
   "fixtures": {
+    "body_level_passthrough.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 6,
+        "paragraph_texts": [
+          "intro",
+          "first inside",
+          "second inside",
+          "nested inside",
+          "",
+          "after"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "bom_utf8_passthrough.docx": {
       "generator": "handcrafted",
       "phase_introduced": 10,
@@ -11,7 +29,21 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 144
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "drawing_objects_preserved.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "a ￼￼￼ z",
+          "pic ￼ end"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
       }
     },
     "floating_image_anchor.docx": {

@@ -15605,6 +15605,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -15754,6 +15755,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -15790,6 +15792,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -16935,6 +16938,7 @@ mod tests {
                 direct_overrides: engine::ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             })],
         }
     }
@@ -16949,6 +16953,7 @@ mod tests {
             }],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }
     }
 
@@ -17891,6 +17896,7 @@ mod tests {
                     height_emu: 457_200, // 0.5 inch
                 },
                 anchor: None,
+                source_xml: None,
             });
         }
         let engine = test_engine_with_doc(doc);
@@ -17937,6 +17943,7 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: None,
+                source_xml: None,
             });
         }
         let mut engine = test_engine_with_doc(doc);
@@ -17965,6 +17972,7 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: Some(Box::new(anchor)),
+                source_xml: None,
             });
         }
         doc
@@ -17981,6 +17989,7 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: None,
+                source_xml: None,
             });
         }
         doc
@@ -18006,6 +18015,7 @@ mod tests {
                     height_emu: 228_600,
                 },
                 anchor,
+                source_xml: None,
             };
         let behind = engine::FloatAnchor {
             behind_doc: true,
@@ -18168,6 +18178,7 @@ mod tests {
                     wrap,
                     ..engine::FloatAnchor::default()
                 })),
+                source_xml: None,
             });
         }
         doc
@@ -18597,6 +18608,7 @@ mod tests {
                 wrap: engine::WrapKind::Square,
                 ..engine::FloatAnchor::default()
             })),
+            source_xml: None,
         }
     }
 
@@ -19024,6 +19036,7 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: None,
+                source_xml: None,
             });
         }
         let inline = test_engine_with_doc(inline_doc);
@@ -19077,6 +19090,7 @@ mod tests {
             }],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         let mut engine = test_engine_with_doc(doc);
         let cell_path = BridgeBlockPath {
@@ -20376,6 +20390,7 @@ mod tests {
             rows,
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(rtl("outro")));
         d
@@ -20424,6 +20439,7 @@ mod tests {
             rows,
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(para("outro")));
         d

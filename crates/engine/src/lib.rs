@@ -97,6 +97,22 @@ impl Block {
             Block::Paragraph(_) => None,
         }
     }
+
+    /// Issue #120 — the block-level passthrough markup around this block.
+    pub fn body_xml(&self) -> Option<&BodyPassthrough> {
+        match self {
+            Block::Paragraph(p) => p.body_xml.as_deref(),
+            Block::Table(t) => t.body_xml.as_deref(),
+        }
+    }
+
+    /// Issue #120 — mutable slot for the block-level passthrough markup.
+    pub fn body_xml_mut(&mut self) -> &mut Option<Box<BodyPassthrough>> {
+        match self {
+            Block::Paragraph(p) => &mut p.body_xml,
+            Block::Table(t) => &mut t.body_xml,
+        }
+    }
 }
 
 /// Normalize a wire-supplied byte `offset` into `text` (issue #115) —
@@ -249,6 +265,13 @@ pub struct DocumentTree {
     /// them from, so the reader records them here. Empty for an
     /// engine-authored document.
     pub part_root_attrs: std::collections::BTreeMap<String, Vec<(String, String)>>,
+    /// Issue #112 — the source `word/document.xml`'s prolog, root start
+    /// tag, `<w:body>` tag and tail, verbatim (see [`DocumentEnvelope`]).
+    /// Every writer path re-emits them so a zero-edit resave is
+    /// byte-identical; empty (synthesized header) for an engine-authored
+    /// document. Rides the tree — like [`Self::document_root_attrs`] —
+    /// because the live editor saves without the source archive.
+    pub document_envelope: DocumentEnvelope,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -327,7 +350,7 @@ pub struct CommentRange {
 /// - `1440 twips / 20 = 72.0 pt`    ← Word default 1-inch margins
 ///
 /// Aspect ratio 841.9 / 595.3 = 1.4143, matching ISO 216's `1 : √2`.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(default)]
 pub struct PageGeometry {
     pub width: f32,
@@ -620,6 +643,10 @@ pub struct Section {
     pub footnote_props: NoteProps,
     /// Issue #80 — `<w:sectPr><w:endnotePr>` overrides.
     pub endnote_props: NoteProps,
+    /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes this section
+    /// was read from (see [`SectionProps::source_xml`]).
+    #[serde(default, with = "serde_bytes")]
+    pub source_xml: Option<Vec<u8>>,
 }
 
 /// Audit gap A.M11 — `<w:pgNumType>` descriptor.
@@ -763,7 +790,7 @@ impl Section {
 /// desync (the pre-Phase-3 `Vec<Section>` range-stamping never
 /// re-indexed on block-count changes, corrupting multi-section docs on
 /// the first edit).
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct SectionProps {
     pub geometry: PageGeometry,
@@ -785,6 +812,17 @@ pub struct SectionProps {
     pub footnote_props: NoteProps,
     /// Issue #80 — `<w:endnotePr>` overrides.
     pub endnote_props: NoteProps,
+    /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes these
+    /// properties were read from. The `.docx` writer re-emits them
+    /// verbatim as long as a re-parse of the bytes still yields these
+    /// exact properties (a *verified* passthrough: `<w:docGrid>`,
+    /// `w:rsidSect`, `w:gutter`, `<w:cols w:space>` and every other
+    /// unmodeled child survive a zero-edit resave), and regenerates from
+    /// the typed fields the moment page setup, a header reference or the
+    /// section type was changed in the editor. `None` for an
+    /// engine-authored section. Ignored by equality-of-properties checks.
+    #[serde(default, with = "serde_bytes")]
+    pub source_xml: Option<Vec<u8>>,
 }
 
 impl SectionProps {
@@ -802,6 +840,16 @@ impl SectionProps {
             section_type: self.section_type,
             footnote_props: self.footnote_props,
             endnote_props: self.endnote_props,
+            source_xml: self.source_xml,
+        }
+    }
+
+    /// Issue #112 — the typed properties only, `source_xml` cleared: what
+    /// the writer compares a re-parse of the source bytes against.
+    pub fn without_source(&self) -> Self {
+        Self {
+            source_xml: None,
+            ..self.clone()
         }
     }
 }
@@ -818,6 +866,7 @@ impl From<&Section> for SectionProps {
             section_type: s.section_type,
             footnote_props: s.footnote_props,
             endnote_props: s.endnote_props,
+            source_xml: s.source_xml.clone(),
         }
     }
 }
@@ -1327,6 +1376,148 @@ impl GrabBag {
     }
 }
 
+/// Issue #120 — one piece of block-level (`<w:body>` / `<w:tc>` child)
+/// markup that is not a paragraph or a table and that the typed model does
+/// not represent: a `<w:bookmarkStart/>` between two paragraphs, a
+/// `<w:sdt>` content-control envelope around a run of blocks, the
+/// whitespace of a pretty-printed part. The reader attaches these to the
+/// neighbouring block ([`BodyPassthrough`]) and the `.docx` writer
+/// re-emits them verbatim around that block, clean or regenerated.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum BodyFragment {
+    /// Self-contained markup emitted as-is (`<w:bookmarkStart …/>`, a
+    /// `<w:sdt>` whose content holds no block, inter-block whitespace).
+    Verbatim {
+        #[serde(with = "serde_bytes")]
+        xml: Vec<u8>,
+    },
+    /// Opens an envelope around this block and the ones that follow it
+    /// up to the matching [`Self::Close`]: `open_xml` is everything from
+    /// the container's start tag through the last byte before its first
+    /// inner block (`<w:sdt><w:sdtPr>…</w:sdtPr><w:sdtContent>`),
+    /// `close_xml` everything after its last inner block through its end
+    /// tag (`</w:sdtContent></w:sdt>`). The writer keeps a stack, so an
+    /// envelope whose other end was lost to an edit still closes
+    /// (well-formedness is never at the mercy of an edit) and a closer
+    /// without an opener is skipped.
+    Open {
+        id: u32,
+        #[serde(with = "serde_bytes")]
+        open_xml: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        close_xml: Vec<u8>,
+    },
+    /// Closes envelope `id` after this block.
+    Close { id: u32 },
+}
+
+/// Issue #120 — the block-level passthrough markup that surrounds one
+/// block: `before` is emitted ahead of the block's own XML, `after`
+/// behind it, both in source order. Boxed behind an `Option` on
+/// [`Paragraph`] / [`Table`] so the common case costs a pointer.
+///
+/// Travel rules mirror the paragraph mark: a split keeps `before` on the
+/// left half and `after` on the right (the envelope keeps wrapping both),
+/// a merge keeps the head's `before` and the tail's `after`, and
+/// clipboard fragments carry none (a paste never transplants a content
+/// control's envelope).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct BodyPassthrough {
+    pub before: Vec<BodyFragment>,
+    pub after: Vec<BodyFragment>,
+}
+
+impl BodyPassthrough {
+    pub fn is_empty(&self) -> bool {
+        self.before.is_empty() && self.after.is_empty()
+    }
+
+    /// The `before` half only (for the left side of a split).
+    pub fn before_only(this: &Option<Box<Self>>) -> Option<Box<Self>> {
+        this.as_deref().filter(|b| !b.before.is_empty()).map(|b| {
+            Box::new(Self {
+                before: b.before.clone(),
+                after: Vec::new(),
+            })
+        })
+    }
+
+    /// The `after` half only (for the right side of a split).
+    pub fn after_only(this: &Option<Box<Self>>) -> Option<Box<Self>> {
+        this.as_deref().filter(|b| !b.after.is_empty()).map(|b| {
+            Box::new(Self {
+                before: Vec::new(),
+                after: b.after.clone(),
+            })
+        })
+    }
+
+    /// Both blocks' markup, for a merge: `before` = head's then tail's,
+    /// `after` = head's then tail's. Markup that sat BETWEEN the two
+    /// (a bookmark, an empty content control, a closer / opener pair)
+    /// has no boundary to sit on any more and moves to the merged
+    /// block's edges instead of being dropped — an envelope grows to
+    /// cover the merge, it never loses its content control.
+    pub fn merged(head: &Option<Box<Self>>, tail: &Option<Box<Self>>) -> Option<Box<Self>> {
+        let mut before = head
+            .as_deref()
+            .map(|b| b.before.clone())
+            .unwrap_or_default();
+        before.extend(
+            tail.as_deref()
+                .map(|b| b.before.clone())
+                .unwrap_or_default(),
+        );
+        let mut after = head.as_deref().map(|b| b.after.clone()).unwrap_or_default();
+        after.extend(tail.as_deref().map(|b| b.after.clone()).unwrap_or_default());
+        (!before.is_empty() || !after.is_empty()).then(|| Box::new(Self { before, after }))
+    }
+}
+
+/// Issue #112 — the bytes of a source `word/document.xml` that surround
+/// the block list: everything the writer used to synthesize and that
+/// therefore drifted on every zero-edit resave (Word ends its XML
+/// declaration with `\r\n`, declares `xmlns:wpc` before `xmlns:w`, …).
+/// Captured by the `.docx` reader, re-emitted verbatim by every writer
+/// path (the live editor saves from the tree alone); empty for an
+/// engine-authored document, in which case the writer synthesizes the
+/// stock header and footer exactly as before.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct DocumentEnvelope {
+    /// Everything before the root start tag: BOM, XML declaration, the
+    /// newline after it, comments.
+    #[serde(with = "serde_bytes")]
+    pub prolog: Vec<u8>,
+    /// The root start tag itself (`<w:document …>`), attribute order and
+    /// spelling intact. The writer adds any binding a regenerated element
+    /// needs that the source root lacks (a picture pasted into a document
+    /// whose root never declared `wp:`).
+    #[serde(with = "serde_bytes")]
+    pub root_tag: Vec<u8>,
+    /// Bytes between the root start tag and the `<w:body>` start tag
+    /// (whitespace in a pretty-printed part).
+    #[serde(with = "serde_bytes")]
+    pub root_to_body: Vec<u8>,
+    /// The `<w:body …>` start tag.
+    #[serde(with = "serde_bytes")]
+    pub body_tag: Vec<u8>,
+    /// Everything after the trailing body-level `<w:sectPr>` (or the last
+    /// block when there is none): `</w:body>`, `</w:document>` and any
+    /// whitespace around them, to EOF.
+    #[serde(with = "serde_bytes")]
+    pub tail: Vec<u8>,
+}
+
+impl DocumentEnvelope {
+    /// `true` when the reader captured a usable envelope (root + body
+    /// tags + tail); an engine-authored document has none.
+    pub fn is_captured(&self) -> bool {
+        !self.root_tag.is_empty() && !self.body_tag.is_empty() && !self.tail.is_empty()
+    }
+}
+
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
@@ -1609,6 +1800,20 @@ pub struct InlineObject {
     /// pre-#69 snapshot envelope (format version 1) readable.
     #[serde(default)]
     pub anchor: Option<Box<FloatAnchor>>,
+    /// Issue #119 — the run-level source element this object was read
+    /// from, verbatim: the whole `<w:drawing>`, `<mc:AlternateContent>`
+    /// (DrawingML choice + VML fallback), `<w:pict>` or `<w:object>`.
+    /// The `.docx` writer re-emits it byte-for-byte while it still
+    /// describes the object (same picture, extent and anchor — verified
+    /// against a re-scan at write time) and regenerates from the typed
+    /// fields only once the object was resized or moved. It is the ONLY
+    /// representation of a text box, shape, chart, SmartArt or OLE object
+    /// (`InlineKind::Image` with an empty `rel_id`): the extent is
+    /// modeled so layout reserves the box, the content is not (text
+    /// boxes are issue #83), and such an object is always written from
+    /// these bytes. `None` for engine-authored objects.
+    #[serde(default, with = "serde_bytes")]
+    pub source_xml: Option<Vec<u8>>,
 }
 
 impl InlineObject {
@@ -2478,6 +2683,13 @@ pub struct Paragraph {
     /// `source_xml` untouched.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
+    /// Issue #120 — block-level passthrough markup surrounding this
+    /// paragraph in its source part (a `<w:sdt>` content-control envelope,
+    /// `<w:bookmarkStart/>` between paragraphs, inter-block whitespace).
+    /// See [`BodyPassthrough`] for the travel rules; the `.docx` writer
+    /// emits it around the paragraph whether the paragraph is clean or
+    /// regenerated.
+    pub body_xml: Option<Box<BodyPassthrough>>,
 }
 
 /// Issue #81 — one paragraph-scoped bookmark. `id` is the source
@@ -2571,6 +2783,7 @@ impl Paragraph {
             paragraph must never dissolve its section break. */
             section_end: self.section_end.clone(),
             bookmarks: self.bookmarks.clone(),
+            body_xml: self.body_xml.clone(),
         }
     }
 
@@ -2715,6 +2928,7 @@ impl Paragraph {
                         at: o.at - gap,
                         kind: o.kind.clone(),
                         anchor: o.anchor.clone(),
+                        source_xml: o.source_xml.clone(),
                     })
                 } else {
                     None
@@ -2749,6 +2963,7 @@ impl Paragraph {
             an in-paragraph character deletion. */
             section_end: self.section_end.clone(),
             bookmarks: self.bookmarks.clone(),
+            body_xml: self.body_xml.clone(),
         }
     }
 
@@ -2826,6 +3041,7 @@ impl Paragraph {
                     at: o.at - at,
                     kind: o.kind.clone(),
                     anchor: o.anchor.clone(),
+                    source_xml: o.source_xml.clone(),
                 });
             }
         }
@@ -2852,6 +3068,10 @@ impl Paragraph {
                 /* Issue #81 — paragraph-scoped bookmarks anchor at the
                 paragraph START, which the left half keeps. */
                 bookmarks: self.bookmarks.clone(),
+                /* Issue #120 — the leading envelope markup stays with the
+                left half, the trailing markup moves right with the mark:
+                a content control wrapping the paragraph wraps both halves. */
+                body_xml: BodyPassthrough::before_only(&self.body_xml),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -2872,6 +3092,7 @@ impl Paragraph {
                 the right half, so a section marker travels with it. */
                 section_end: self.section_end.clone(),
                 bookmarks: Vec::new(),
+                body_xml: BodyPassthrough::after_only(&self.body_xml),
             },
         )
     }
@@ -2923,6 +3144,7 @@ impl Paragraph {
                 at: o.at + shift,
                 kind: o.kind.clone(),
                 anchor: o.anchor.clone(),
+                source_xml: o.source_xml.clone(),
             });
         }
         Paragraph {
@@ -2949,6 +3171,11 @@ impl Paragraph {
             section's properties). Do not "fix" this to self.*. */
             section_end: other.section_end.clone(),
             bookmarks,
+            /* Issue #120 — the merged block sits where both did: it keeps
+            the HEAD's leading envelope markup and the TAIL's trailing
+            markup, so a content control wrapping both still wraps the
+            merge. */
+            body_xml: BodyPassthrough::merged(&self.body_xml, &other.body_xml),
         }
     }
 
@@ -3055,6 +3282,7 @@ impl Paragraph {
                 at: map_start(o.at),
                 kind: o.kind.clone(),
                 anchor: o.anchor.clone(),
+                source_xml: o.source_xml.clone(),
             })
             .collect();
         out
@@ -3358,6 +3586,9 @@ pub struct Table {
     /// `None` for engine-synthesised tables.
     #[serde(with = "serde_bytes")]
     pub source_xml: Option<Vec<u8>>,
+    /// Issue #120 — block-level passthrough markup surrounding this table
+    /// (see [`Paragraph::body_xml`]).
+    pub body_xml: Option<Box<BodyPassthrough>>,
 }
 
 /* ===================================================================
@@ -3570,6 +3801,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3593,6 +3825,7 @@ impl DocumentTree {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         }));
         Self {
             blocks,
@@ -3617,6 +3850,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3641,6 +3875,7 @@ impl DocumentTree {
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             }));
         }
         Self {
@@ -3666,6 +3901,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3699,6 +3935,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3732,6 +3969,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3818,6 +4056,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -4085,6 +4324,7 @@ impl DocumentTree {
             at: 0,
             kind: InlineKind::NoteSelfRef { kind },
             anchor: None,
+            source_xml: None,
         });
         /* Word styles note bodies `FootnoteText` / `EndnoteText`; adopt
         the style when the document defines it so the body picks up the
@@ -4841,6 +5081,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4928,6 +5169,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4959,6 +5201,7 @@ impl DocumentTree {
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             }));
             return Self {
                 blocks,
@@ -4983,6 +5226,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -5060,6 +5304,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5121,6 +5366,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5159,6 +5405,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5216,6 +5463,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5279,6 +5527,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5347,6 +5596,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5484,6 +5734,7 @@ impl DocumentTree {
             settings_dirty: split.settings_dirty,
             document_root_attrs: split.document_root_attrs.clone(),
             part_root_attrs: split.part_root_attrs.clone(),
+            document_envelope: split.document_envelope.clone(),
         }
     }
 
@@ -5590,6 +5841,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5672,6 +5924,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5739,6 +5992,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         };
         (doc, new_id)
     }
@@ -5818,6 +6072,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         };
         Some((doc, new_id))
     }
@@ -5876,6 +6131,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5910,6 +6166,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5997,6 +6254,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6096,6 +6354,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6203,6 +6462,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6259,6 +6519,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6318,6 +6579,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6374,6 +6636,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6498,6 +6761,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6571,6 +6835,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6623,6 +6888,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -6738,6 +7004,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6793,6 +7060,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -7085,6 +7353,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -7125,6 +7394,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -7252,6 +7522,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -7288,6 +7559,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -7319,6 +7591,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -7479,6 +7752,7 @@ impl DocumentTree {
                     settings_dirty: self.settings_dirty,
                     document_root_attrs: self.document_root_attrs.clone(),
                     part_root_attrs: self.part_root_attrs.clone(),
+                    document_envelope: self.document_envelope.clone(),
                 }
                 .with_list_markers_refreshed(),
                 caret,
@@ -7529,6 +7803,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -7726,6 +8001,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -7859,6 +8135,7 @@ impl DocumentTree {
             save. */
             dirty: true,
             source_xml: None,
+            body_xml: None,
         };
         let mut blocks = self.blocks.clone();
         let insert_at = (idx as usize).min(blocks.len());
@@ -7898,6 +8175,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -7934,6 +8212,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -8233,6 +8512,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 }
@@ -8651,6 +8931,9 @@ fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u
 /// part of the document.
 fn strip_section_marker(mut p: Paragraph) -> Paragraph {
     p.section_end = None;
+    /* Issue #120 — a clipboard fragment never transplants the block-level
+    envelope markup (a content control's `<w:sdt>`, a bookmark) either. */
+    p.body_xml = None;
     p
 }
 
@@ -8711,6 +8994,7 @@ fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) {
         at: off,
         kind,
         anchor: None,
+        source_xml: None,
     });
     para.inline_objects.sort_by_key(|i| i.at);
     para.dirty = true;
@@ -8772,7 +9056,10 @@ fn strip_section_markers(blocks: Vec<Block>) -> Vec<Block> {
         .into_iter()
         .map(|b| match b {
             Block::Paragraph(p) => Block::Paragraph(strip_section_marker(p)),
-            table => table,
+            Block::Table(mut t) => {
+                t.body_xml = None;
+                Block::Table(t)
+            }
         })
         .collect()
 }
@@ -9389,6 +9676,7 @@ mod tests {
                     height_emu: 0,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9408,6 +9696,7 @@ mod tests {
                     height_emu: 914_400,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9436,6 +9725,7 @@ mod tests {
                     height_emu: 100,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9471,6 +9761,7 @@ mod tests {
                     height_emu: 914_400,
                 },
                 anchor: Some(Box::new(anchor)),
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9553,6 +9844,7 @@ mod tests {
                     height_emu: 100,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9663,6 +9955,7 @@ mod tests {
                 behind_doc: true,
                 ..FloatAnchor::default()
             })),
+            source_xml: None,
         };
         let bytes = rmp_serde::to_vec_named(&obj).expect("encode");
         let back: InlineObject = rmp_serde::from_slice(&bytes).expect("decode");
@@ -9684,6 +9977,7 @@ mod tests {
                         height_emu: 1,
                     },
                     anchor: None,
+                    source_xml: None,
                 },
                 InlineObject {
                     at: 3,
@@ -9693,6 +9987,7 @@ mod tests {
                         height_emu: 1,
                     },
                     anchor: None,
+                    source_xml: None,
                 },
             ],
             ..Default::default()
@@ -9713,6 +10008,7 @@ mod tests {
                     custom_mark_follows: false,
                 },
                 anchor: None,
+                source_xml: None,
             },
             InlineObject {
                 at: 7,
@@ -9721,6 +10017,7 @@ mod tests {
                     custom_mark_follows: false,
                 },
                 anchor: None,
+                source_xml: None,
             },
         ];
         let after = d.insert_text(
@@ -9802,6 +10099,7 @@ mod tests {
             ],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         assert_eq!(d.to_plain_text(), "a\tb\nc\td");
     }
@@ -10580,6 +10878,7 @@ mod tests {
             }],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         let cell_pos = LogicalPos::new(
             BlockPath::top(1)
@@ -10651,6 +10950,7 @@ mod tests {
             }],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         let path = BlockPath {
             steps: vec![
@@ -11035,6 +11335,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -11063,6 +11364,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -11088,6 +11390,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -11191,6 +11494,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -11230,6 +11534,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -11726,6 +12031,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -11771,6 +12077,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -11815,6 +12122,7 @@ mod tests {
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -11837,6 +12145,7 @@ mod tests {
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             },
         ];
         let (out, caret) = doc.insert_rich(
@@ -12346,6 +12655,7 @@ mod tests {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();
@@ -12967,6 +13277,7 @@ mod text_box_label_tests {
                     ..FloatAnchor::default()
                 })
             }),
+            source_xml: None,
         }
     }
 
@@ -13006,6 +13317,7 @@ mod text_box_label_tests {
                 kind: NoteKind::Footnote,
             },
             anchor: None,
+            source_xml: None,
         };
         assert_eq!(pic.text_box_label(), None);
     }
