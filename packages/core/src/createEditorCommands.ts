@@ -419,8 +419,16 @@ export interface EditorCommands {
 
     /* I/O */
     /** Open a `.docx` byte buffer (passed zero-copy as a Transferable).
-     *  Engine ships only `Docx`; HTML / PlainText return error events. */
-    openDocument(bytes: Uint8Array, name?: string): Promise<Event>;
+     *  Engine ships only `Docx`; HTML / PlainText return error events.
+     *  Issue #239 — `opts.initialZoom`, when given, dispatches `SET_ZOOM`
+     *  before `OPEN_DOCUMENT` so a host can request a starting zoom from
+     *  this one call; the engine queues it even if no `RenderPage` has
+     *  run yet. */
+    openDocument(
+        bytes: Uint8Array,
+        name?: string,
+        opts?: { initialZoom?: number },
+    ): Promise<Event>;
     saveDocument(format: DocFormat): Promise<Event>;
     saveDocx(): Promise<Event>;
     exportPdf(conformance: PdfConformance): Promise<Event>;
@@ -837,8 +845,13 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 },
             }),
 
-        openDocument: (bytes, name) =>
-            dispatch(
+        openDocument: async (bytes, name, opts) => {
+            /* Issue #239 — queued by the engine even if no `RenderPage`
+               has run yet, so this is safe regardless of boot order. */
+            if (opts?.initialZoom !== undefined) {
+                await dispatch({ type: 'SET_ZOOM', scale: opts.initialZoom });
+            }
+            return dispatch(
                 {
                     type: 'OPEN_DOCUMENT',
                     bytes,
@@ -846,7 +859,8 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                     name: name ?? undefined,
                 },
                 [bytes.buffer as ArrayBuffer],
-            ),
+            );
+        },
         saveDocument: (format) => dispatch({ type: 'SAVE_DOCUMENT', format }),
         saveDocx: () => dispatch({ type: 'SAVE_DOCX' }),
         exportPdf: (conformance) => dispatch({ type: 'EXPORT_PDF', conformance }),

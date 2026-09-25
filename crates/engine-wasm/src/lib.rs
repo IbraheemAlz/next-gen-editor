@@ -902,6 +902,18 @@ pub struct Engine {
     /// replacing a hand-kept per-command allowlist; `Event::Painted`
     /// carries it too.
     mutation_seq: u64,
+    /// Issue #239 — a `SetZoom` sent before the first `RenderPage` has no
+    /// `layout_cfg` to fold into and no selection either (`render_page`
+    /// always resets it), so it used to be silently dropped. Stashed
+    /// here instead; `render_page` composes it into the fresh config
+    /// (`cfg.zoom = pending_zoom.take().unwrap_or(cfg.zoom)`), and
+    /// `user_zoom()` reports it in the meantime so a `SelectionChanged`
+    /// emitted before any `RenderPage` (there is none in practice, but
+    /// `do_recover`'s replay reads `user_zoom()` too) never lies. `None`
+    /// once a `RenderPage` has consumed it.
+    pending_zoom: Option<f32>,
+    /// Issue #239 — the `SetDeviceScale` mirror of `pending_zoom`.
+    pending_base_scale: Option<f32>,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -956,6 +968,8 @@ fn assemble_engine(
         last_command_ms: 0.0,
         last_paint_ms: 0.0,
         mutation_seq: 0,
+        pending_zoom: None,
+        pending_base_scale: None,
     }
 }
 
@@ -7268,8 +7282,20 @@ impl Engine {
     /// Reset the document + undo stack to a single paragraph of `text`, cache
     /// `cfg` so subsequent InsertText/Undo/Redo commands repaint without
     /// re-specifying params, then paint the first frame.
-    fn render_page(&mut self, text: String, cfg: RenderConfig) -> Event {
+    fn render_page(&mut self, text: String, mut cfg: RenderConfig) -> Event {
         self.install_undo_stack(UndoStack::new(DocumentTree::from_text(&text), 100));
+        /* Issue #239 — a `SetZoom` / `SetDeviceScale` sent before this,
+        the engine's first `RenderPage`, had no layout config to fold into
+        and was stashed as pending (see `do_set_zoom` / `do_set_device_scale`).
+        Compose it into the fresh config now instead of dropping it, so
+        `scale = base_scale × zoom` holds from the very first paint. */
+        if let Some(base) = self.pending_base_scale.take() {
+            cfg.base_scale = base;
+        }
+        if let Some(zoom) = self.pending_zoom.take() {
+            cfg.zoom = zoom;
+        }
+        cfg.scale = cfg.base_scale * cfg.zoom;
         self.layout_cfg = Some(cfg);
         /* A RenderPage reset is a fresh document; a surviving selection
         or IME preview from the previous session would be load-bearing
@@ -7537,6 +7563,11 @@ impl Engine {
         self.fonts.clear();
         self.install_undo_stack(UndoStack::new(DocumentTree::new(), UNDO_CAP));
         self.layout_cfg = None;
+        /* Issue #239 — a pending pre-`RenderPage` zoom belongs to the
+        session that just crashed; `do_recover`'s own tail-scan (below)
+        re-derives whatever the replayed log wants from scratch. */
+        self.pending_zoom = None;
+        self.pending_base_scale = None;
         self.selection = None;
         self.composition = None;
         self.pending_format = None;
@@ -7672,9 +7703,15 @@ impl Engine {
     }
 
     /// Issue #52 — the user zoom fraction the engine renders at; `1.0`
-    /// (the `RenderPage` default) before any layout config exists.
+    /// (the `RenderPage` default) before any layout config exists AND no
+    /// zoom is pending. Issue #239 — a `SetZoom` sent before the first
+    /// `RenderPage` has no config to live in yet but IS queued
+    /// (`pending_zoom`); report it here so it is never invisible in the
+    /// gap between the `SetZoom` and the `RenderPage` that consumes it.
     fn user_zoom(&self) -> f32 {
-        self.layout_cfg.as_ref().map_or(1.0, |c| c.zoom)
+        self.layout_cfg
+            .as_ref()
+            .map_or_else(|| self.pending_zoom.unwrap_or(1.0), |c| c.zoom)
     }
 
     /// Issue #66 — the backend this instance actually paints with.
@@ -14981,10 +15018,19 @@ impl Engine {
     /// a full repaint. Clamped to `[0.25, 4.0]` and COMPOSED with the
     /// boot `base_scale` (`scale = base_scale × zoom`) so zooming
     /// never clobbers DPI scaling and zoom `1.0` restores the exact
-    /// boot rendering. `RenderPage` must have cached a `layout_cfg`
-    /// first (a fresh engine before any render has no scale to
-    /// mutate — return a no-op `selection_changed` so the caller
-    /// still sees a reply).
+    /// boot rendering.
+    ///
+    /// Issue #239 — before the first `RenderPage`, there is no
+    /// `layout_cfg` to mutate (a fresh engine has no scale) AND no
+    /// selection either (`render_page` always resets it), so this used
+    /// to route through `selection_changed()` and answer with a
+    /// misleading `Event::Error` ("no active selection") for what was
+    /// actually a successful command whose effect just hadn't landed
+    /// yet. Stash the value instead; `render_page` composes it into the
+    /// fresh config on the very first paint, and answer with
+    /// `Event::ZoomPending` — honest about there being no layout
+    /// config yet, rather than fabricating selection/caret geometry
+    /// over a document that doesn't exist.
     ///
     /// Issue #186 — a NaN/±∞ `zoom` is rejected with a typed
     /// `Event::Error` before `.clamp()` ever sees it (`f32::clamp`
@@ -14997,12 +15043,15 @@ impl Engine {
             };
         }
         let zoom = zoom.clamp(0.25, 4.0);
-        if let Some(cfg) = self.layout_cfg.as_mut() {
-            cfg.zoom = zoom;
-            cfg.scale = cfg.base_scale * zoom;
-        } else {
-            return self.selection_changed();
-        }
+        let Some(cfg) = self.layout_cfg.as_mut() else {
+            self.pending_zoom = Some(zoom);
+            return Event::ZoomPending {
+                zoom,
+                device_scale: self.pending_base_scale,
+            };
+        };
+        cfg.zoom = zoom;
+        cfg.scale = cfg.base_scale * zoom;
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15017,6 +15066,8 @@ impl Engine {
     /// the mirror image of `do_set_zoom`. The wider clamp admits real
     /// device ratios (dpr up to ~6 × the 4/3 CSS-pt factor).
     ///
+    /// Issue #239 — same pre-`RenderPage` pending path as `do_set_zoom`.
+    ///
     /// Issue #186 — same NaN/±∞ rejection as `do_set_zoom`.
     fn do_set_device_scale(&mut self, scale: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(scale) {
@@ -15025,12 +15076,15 @@ impl Engine {
             };
         }
         let base = scale.clamp(0.5, 8.0);
-        if let Some(cfg) = self.layout_cfg.as_mut() {
-            cfg.base_scale = base;
-            cfg.scale = base * cfg.zoom;
-        } else {
-            return self.selection_changed();
-        }
+        let Some(cfg) = self.layout_cfg.as_mut() else {
+            self.pending_base_scale = Some(base);
+            return Event::ZoomPending {
+                zoom: self.pending_zoom.unwrap_or(1.0),
+                device_scale: Some(base),
+            };
+        };
+        cfg.base_scale = base;
+        cfg.scale = base * cfg.zoom;
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -16332,6 +16386,8 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -17178,6 +17234,8 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -17235,6 +17293,8 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -17283,6 +17343,8 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -17408,6 +17470,8 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -17954,6 +18018,8 @@ mod tests {
                 last_command_ms: 0.0,
                 last_paint_ms: 0.0,
                 mutation_seq: 0,
+                pending_zoom: None,
+                pending_base_scale: None,
             }
         }
 
@@ -21536,6 +21602,8 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
         }
     }
 
@@ -24797,6 +24865,94 @@ mod snapshot_tests {
         };
         assert_eq!(renderer, "canvas2d");
         assert_eq!(renderer_downgrade, Some(downgrade));
+    }
+
+    /// Issue #239 — `SetZoom` sent before the engine's first `RenderPage`
+    /// used to be silently dropped: `do_set_zoom` found no `layout_cfg`
+    /// to mutate and fell through to `selection_changed()`, which
+    /// errored ("no active selection" — `render_page` is what seeds
+    /// one). It is now queued (`Event::ZoomPending`) and composed into
+    /// the config `render_page` builds, so `RenderPage`'s own first
+    /// paint already reflects it — `SET_ZOOM 1.5` → `RENDER_PAGE` →
+    /// painted page height is 150 % of the zoom-1.0 page height.
+    #[test]
+    fn set_zoom_before_render_page_is_queued_and_applied_on_first_render() {
+        let mut e = engine();
+        assert!(
+            e.layout_cfg.is_none(),
+            "a fresh engine has no layout config"
+        );
+        assert!(
+            e.selection.is_none(),
+            "render_page seeds the selection, not boot"
+        );
+
+        let queued = apply(&mut e, Command::SetZoom { scale: 1.5 });
+        match queued {
+            Event::ZoomPending { zoom, device_scale } => {
+                assert_eq!(zoom, 1.5);
+                assert_eq!(device_scale, None, "no SetDeviceScale queued yet");
+            }
+            other => panic!("expected ZoomPending, got {other:?}"),
+        }
+        assert_eq!(e.pending_zoom, Some(1.5), "stashed, not dropped");
+        assert_eq!(
+            e.user_zoom(),
+            1.5,
+            "user_zoom() reports the pending value even with no layout_cfg yet"
+        );
+
+        /* A real font so layout actually shapes the seed text — page
+        SIZE is independent of shaping, but every other RenderPage-driven
+        test in this file loads one, and there is no reason for this one
+        to be the exception. */
+        let font_bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        assert!(matches!(
+            apply(
+                &mut e,
+                Command::LoadFont {
+                    id: "test-latin".into(),
+                    bytes: font_bytes,
+                },
+            ),
+            Event::FontLoaded { .. }
+        ));
+
+        let rendered = apply(
+            &mut e,
+            Command::RenderPage {
+                text: "hello".into(),
+                font_id: "test-latin".into(),
+                base_direction: "LTR".into(),
+                px_size: 16.0,
+                line_height: 24.0,
+                align: "START".into(),
+                /* `.max(1.0)` composes to `base_scale = 1.0`, so
+                `scale = base_scale × zoom` is exactly the pending zoom —
+                no DPR noise in the assertion below. */
+                device_pixel_ratio: Some(1.0),
+            },
+        );
+        let Event::PageRendered { page_height, .. } = rendered else {
+            panic!("expected PageRendered, got {rendered:?}");
+        };
+        /* A4 height (`layout::A4Page::a4()`) is 841.9 pt; at the queued
+        150 % zoom (composed with the 1.0 base scale from
+        `device_pixel_ratio: Some(1.0)`) the painted page is 150 % of
+        that — not the un-zoomed 841.9 the pre-#239 drop would have left
+        it at. */
+        let expected_height = 841.9_f32 * 1.5;
+        assert!(
+            (page_height - expected_height).abs() < 0.5,
+            "page_height {page_height} should be ~{expected_height} (150% of A4), \
+             not the un-zoomed 841.9 the old drop would have produced"
+        );
+        assert_eq!(e.pending_zoom, None, "consumed by render_page");
+        let cfg = e.layout_cfg.as_ref().expect("render_page seeded a config");
+        assert_eq!(cfg.zoom, 1.5);
+        assert_eq!(cfg.base_scale, 1.0);
+        assert_eq!(cfg.scale, 1.5);
+        assert_eq!(e.user_zoom(), 1.5, "now read straight off the real config");
     }
 
     #[test]

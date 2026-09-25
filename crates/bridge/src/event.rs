@@ -354,8 +354,33 @@ pub enum Event {
         /// `RenderPage`). `SetZoom` / `SetDeviceScale` answer with this
         /// event, so every zoom control mirrors the ENGINE's value — one
         /// source of truth instead of one local signal per widget.
+        /// Issue #239 — that's true once a `RenderPage` has run; a
+        /// `SetZoom` / `SetDeviceScale` sent BEFORE the first one answers
+        /// with `Event::ZoomPending` instead (there is no selection yet
+        /// to build this event around).
         #[serde(default = "default_zoom")]
         zoom: f32,
+    },
+    /// Issue #239 — reply to `SetZoom` / `SetDeviceScale` when no
+    /// `RenderPage` has run yet: there is no layout config to fold the
+    /// value into, and no selection either (`render_page` always resets
+    /// it), so answering with `SelectionChanged` would mean fabricating
+    /// a selection over a document that doesn't exist yet. The engine
+    /// stashes the value and composes it into the config the first
+    /// `RenderPage` builds; this reply reports the (clamped) value
+    /// directly instead of a misleading `Event::Error` for what is
+    /// actually a successful, queued command.
+    ZoomPending {
+        /// The pending user-zoom fraction — the value just set by
+        /// `SetZoom`, or the previously-queued one when this reply
+        /// answers a `SetDeviceScale`.
+        zoom: f32,
+        /// The pending device scale, when one has been queued (by a
+        /// `SetDeviceScale`, this one or an earlier one); `None` if only
+        /// zoom has been set so far.
+        #[serde(default)]
+        #[tsify(optional)]
+        device_scale: Option<f32>,
     },
 
     /* IME */
