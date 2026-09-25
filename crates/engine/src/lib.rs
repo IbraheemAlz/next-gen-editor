@@ -2277,6 +2277,37 @@ impl InlineObject {
             .and_then(|tag| xml_attr(tag, "alt"));
         Some((None, alt))
     }
+
+    /// Issue #215 — the accessible `(name, description)` of a picture,
+    /// mirroring [`Self::text_box_label`]: its `<wp:docPr name descr>`
+    /// (read from the anchor's verbatim `doc_pr_xml` for a float, else
+    /// from the object's OWN verbatim `source_xml` — an inline picture
+    /// keeps it there), or the VML `<v:shape alt>` as the description for
+    /// a bare VML picture. Blank values are `None`; `None` for anything
+    /// but an image.
+    pub fn image_label(&self) -> Option<(Option<String>, Option<String>)> {
+        if !matches!(self.kind, InlineKind::Image { .. }) {
+            return None;
+        }
+        let source = || {
+            self.source_xml
+                .as_deref()
+                .and_then(|b| core::str::from_utf8(b).ok())
+        };
+        let from_anchor = self
+            .anchor
+            .as_deref()
+            .and_then(|a| a.doc_pr_xml.as_deref())
+            .and_then(|x| start_tag(x, "<wp:docPr"));
+        let from_source = || source().and_then(|x| start_tag(x, "<wp:docPr"));
+        if let Some(tag) = from_anchor.or_else(from_source) {
+            return Some((xml_attr(tag, "name"), xml_attr(tag, "descr")));
+        }
+        let alt = source()
+            .and_then(|x| start_tag(x, "<v:shape"))
+            .and_then(|tag| xml_attr(tag, "alt"));
+        Some((None, alt))
+    }
 }
 
 /// Issue #165 — the first start tag in `xml` opening with `open` (e.g.
@@ -14286,6 +14317,74 @@ mod text_box_label_tests {
             source_xml: None,
         };
         assert_eq!(pic.text_box_label(), None);
+    }
+}
+
+#[cfg(test)]
+mod image_label_tests {
+    use super::*;
+
+    fn image(anchor_doc_pr: Option<&str>, source: Option<&str>) -> InlineObject {
+        InlineObject {
+            at: 0,
+            kind: InlineKind::Image {
+                rel_id: "rId1".to_string(),
+                width_emu: 914_400,
+                height_emu: 914_400,
+                media_key: None,
+            },
+            anchor: anchor_doc_pr.map(|x| {
+                Box::new(FloatAnchor {
+                    doc_pr_xml: Some(x.to_string()),
+                    ..FloatAnchor::default()
+                })
+            }),
+            source_xml: source.map(|s| s.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn anchor_doc_pr_names_and_describes_the_picture() {
+        let io = image(
+            Some(r#"<wp:docPr id="4" name="Diagram" descr="A flow diagram"/>"#),
+            None,
+        );
+        assert_eq!(
+            io.image_label(),
+            Some((
+                Some("Diagram".to_string()),
+                Some("A flow diagram".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn inline_picture_reads_the_doc_pr_from_its_own_source() {
+        let src = r#"<w:drawing><wp:inline><wp:docPr id="2" name="Logo" descr="Company logo"/></wp:inline></w:drawing>"#;
+        let io = image(None, Some(src));
+        assert_eq!(
+            io.image_label(),
+            Some((Some("Logo".to_string()), Some("Company logo".to_string())))
+        );
+    }
+
+    #[test]
+    fn vml_alt_is_the_description_and_non_images_have_no_label() {
+        let src = r#"<w:pict><v:shape id="s" alt="Scanned page"><v:imagedata/></v:shape></w:pict>"#;
+        assert_eq!(
+            image(None, Some(src)).image_label(),
+            Some((None, Some("Scanned page".to_string())))
+        );
+        assert_eq!(image(None, None).image_label(), Some((None, None)));
+        let tb = InlineObject {
+            at: 0,
+            kind: InlineKind::NoteSelfRef {
+                kind: NoteKind::Footnote,
+            },
+            anchor: None,
+            source_xml: None,
+        };
+        assert_eq!(tb.image_label(), None);
     }
 }
 
