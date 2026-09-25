@@ -331,7 +331,11 @@ fn toc_survives_regenerate_layout_and_pdf_export() {
     calls for it regardless, and it must leave a correct TOC correct. */
     let evt = engine.do_update_fields();
     assert!(!matches!(evt, Event::Error { .. }), "UpdateFields: {evt:?}");
-    assert_eq!(entry_texts(&engine), want_texts, "UpdateFields must not disturb a current TOC");
+    assert_eq!(
+        entry_texts(&engine),
+        want_texts,
+        "UpdateFields must not disturb a current TOC"
+    );
 
     /* Real layout: every entry line carries exactly one dot-leader tab
     glyph, and its tiled dot count is derived from the SAME geometry
@@ -339,12 +343,13 @@ fn toc_survives_regenerate_layout_and_pdf_export() {
     position + `page.margins` + `para.origin` + `line.origin`
     (`.claude/rules/render.md`'s accumulation invariant), the run's own
     `px_size`, and the face's own period advance. */
-    let (pages, font_stack, _paths, info) =
-        engine.build_pages(1.0, false, None).expect("layout");
+    let (pages, font_stack, _paths, info) = engine.build_pages(1.0, false, None).expect("layout");
     assert!(info.degradations.is_empty(), "{:?}", info.degradations);
     assert!(pages.len() >= 2, "fixture must span at least two pages");
 
-    let face = font_stack.face("test-latin").expect("test-latin face loaded");
+    let face = font_stack
+        .face("test-latin")
+        .expect("test-latin face loaded");
     let dot_gid = face.glyph_id('.').expect("liberation shapes '.'");
 
     let mut expected_dot_counts = Vec::with_capacity(expected_entries.len());
@@ -487,7 +492,8 @@ fn generate_toc_leaders_pdf_validate_fixture() {
     let evt = engine.do_update_fields();
     assert!(!matches!(evt, Event::Error { .. }), "UpdateFields: {evt:?}");
 
-    let Event::DocumentSaved { bytes, .. } = engine.save_docx_bytes("toc-leaders fixture generator")
+    let Event::DocumentSaved { bytes, .. } =
+        engine.save_docx_bytes("toc-leaders fixture generator")
     else {
         panic!("SaveDocument must succeed");
     };

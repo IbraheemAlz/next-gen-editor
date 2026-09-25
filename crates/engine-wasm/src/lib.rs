@@ -18996,9 +18996,10 @@ mod tests {
         let engine = test_engine_with_doc(doc);
         let count =
             |pdf: &[u8], needle: &[u8]| pdf.windows(needle.len()).filter(|w| *w == needle).count();
-        for (profile, images, smasks) in
-            [(format_pdf::PdfProfile::A2u, 4, 1), (format_pdf::PdfProfile::A1b, 3, 0)]
-        {
+        for (profile, images, smasks) in [
+            (format_pdf::PdfProfile::A2u, 4, 1),
+            (format_pdf::PdfProfile::A1b, 3, 0),
+        ] {
             let Event::PdfExported { bytes, .. } = engine.do_export_pdf(profile) else {
                 panic!("ExportPdf must succeed");
             };
@@ -19527,7 +19528,8 @@ mod tests {
         format_pdf::export_pdf(&pages, &fonts, &[], format_pdf::PdfProfile::Plain, &mut pdf)
             .expect("pdf");
         assert!(pdf.starts_with(b"%PDF"));
-        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(format_pdf::PdfProfile::A2u) else {
+        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(format_pdf::PdfProfile::A2u)
+        else {
             panic!("engine pdf export");
         };
         assert!(bytes.starts_with(b"%PDF"));
@@ -19653,7 +19655,8 @@ mod tests {
             assert!((rect.y0 - want_y).abs() < 0.01, "{} vs {want_y}", rect.y0);
         }
         /* PDF: the picture is embedded and painted. */
-        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(format_pdf::PdfProfile::A2u) else {
+        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(format_pdf::PdfProfile::A2u)
+        else {
             panic!("engine pdf export");
         };
         let count = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
