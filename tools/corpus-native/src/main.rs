@@ -447,7 +447,6 @@ fn main() -> ExitCode {
         }
 
         if let Some(ec) = &rec.edit_check {
-            edit_checked += 1;
             if ec.fidelity_ok {
                 fidelity_ok_count += 1;
             }
