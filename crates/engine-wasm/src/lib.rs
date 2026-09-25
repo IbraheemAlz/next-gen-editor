@@ -3319,6 +3319,33 @@ fn build_note_bodies(
     (bodies, notice)
 }
 
+/// Issue #130 — one note table: the referenced note bodies laid out at
+/// one content width, plus the continuation notice at that width.
+type NoteTable = (
+    HashMap<engine::NoteAnchor, layout::NoteBody>,
+    Option<layout::NoteBody>,
+);
+
+/// Issue #130 — the note table for `width` (layout px), laid out on
+/// first use and memoised in `tables` by the width's bits for the rest
+/// of the pass: a note is laid out once per distinct section width.
+#[allow(clippy::too_many_arguments)]
+fn note_table_at<'t>(
+    tables: &'t mut HashMap<u32, NoteTable>,
+    width: f32,
+    doc: &DocumentTree,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    active_comp: Option<(engine::NoteAnchor, &CompositionState)>,
+) -> &'t NoteTable {
+    tables.entry(width.to_bits()).or_insert_with(|| {
+        build_note_bodies(doc, width, fonts, cfg, scale, sctx, cache, active_comp)
+    })
+}
+
 /// Issue #80 — the endnotes referenced by top-level blocks in
 /// `[start, end)`, in reference order (deduped), paired with their laid
 /// out bodies — the paginator's trailing-band input.
@@ -8135,17 +8162,15 @@ impl Engine {
         split paragraphs (head + tail) share the same id and resolve
         to the same source string. */
         let mut next_para_id: u32 = 0;
-        /* Issue #80 — lay every referenced note story out once at the
-        first section's content width (notes flow against the page they
-        reference into; a per-section width is a follow-up) and hand
-        the table to every paginator. Endnotes reuse the same bodies as
-        the trailing band's input. */
-        let note_width = sections
-            .first()
-            .map_or(engine::PageGeometry::a4().content_width(), |s| {
-                s.geometry.content_width()
-            })
-            * scale;
+        /* Issue #80 / #130 — every referenced note story is laid out at
+        the content width of the section that owns the page it lands on:
+        one table per distinct section width, built lazily the first time
+        a section of that width opens (`note_tables`, keyed by the width's
+        bits — the per-(note, width) cache; the paragraph LRU underneath
+        keeps it warm across paints). A single-width document builds
+        exactly one table at the first section's width, as before.
+        Endnotes reuse the table of the section they trail. */
+        let mut note_tables: HashMap<u32, NoteTable> = HashMap::new();
         /* The active note previews the live IME composition. */
         let note_comp = match (&self.active_story, composition) {
             (StoryTarget::Note { kind, id, .. }, Some(c)) => u32::try_from(*id)
@@ -8153,16 +8178,13 @@ impl Engine {
                 .map(|id| (engine::NoteAnchor { kind: *kind, id }, c)),
             _ => None,
         };
-        let (note_bodies, continuation_notice) = build_note_bodies(
-            &doc,
-            note_width,
-            &font_stack,
-            &cfg,
-            scale,
-            sctx,
-            &mut cache,
-            note_comp,
-        );
+        /* The width of the table the live paginator draws from. */
+        let mut note_width = sections
+            .first()
+            .map_or(engine::PageGeometry::a4().content_width(), |s| {
+                s.geometry.content_width()
+            })
+            * scale;
         let mut endnotes_placed: std::collections::HashSet<engine::NoteAnchor> =
             std::collections::HashSet::new();
         /* Each top-level block is covered by at most one effective section. The
@@ -8404,7 +8426,41 @@ impl Engine {
                     doc.resolved_note_props(engine::NoteKind::Footnote, Some(section))
                         .position,
                 );
+                /* Issue #130 — the page now flushes with this section's
+                geometry: notes committed from here on lay out at its
+                width (a same-width swap keeps the installed table). */
+                let w = section.geometry.content_width() * scale;
+                if w.to_bits() != note_width.to_bits() {
+                    note_width = w;
+                    let (bodies, notice) = note_table_at(
+                        &mut note_tables,
+                        note_width,
+                        &doc,
+                        &font_stack,
+                        &cfg,
+                        scale,
+                        sctx,
+                        &mut cache,
+                        note_comp,
+                    )
+                    .clone();
+                    pag.set_note_bodies(bodies, notice);
+                }
             } else {
+                /* Issue #130 — this section's note table. */
+                note_width = section.geometry.content_width() * scale;
+                let (note_bodies, continuation_notice) = note_table_at(
+                    &mut note_tables,
+                    note_width,
+                    &doc,
+                    &font_stack,
+                    &cfg,
+                    scale,
+                    sctx,
+                    &mut cache,
+                    note_comp,
+                )
+                .clone();
                 let mut pag = Paginator::new(
                     geom,
                     headers,
@@ -8412,8 +8468,8 @@ impl Engine {
                     section.title_pg,
                     doc.settings.even_and_odd_headers,
                 )
-                .with_note_bodies(note_bodies.clone())
-                .with_continuation_notice(continuation_notice.clone())
+                .with_note_bodies(note_bodies)
+                .with_continuation_notice(continuation_notice)
                 /* Issue #43 / #77 — DATE / TIME / FILENAME / AUTHOR
                 resolve against the shell-injected environment; the
                 field-code view freezes every field at its code text. */
@@ -8704,7 +8760,18 @@ impl Engine {
                     &doc,
                     section.start_block,
                     section.end_block,
-                    &note_bodies,
+                    &note_table_at(
+                        &mut note_tables,
+                        note_width,
+                        &doc,
+                        &font_stack,
+                        &cfg,
+                        scale,
+                        sctx,
+                        &mut cache,
+                        note_comp,
+                    )
+                    .0,
                     &note_markers,
                     &mut endnotes_placed,
                 );
@@ -8720,7 +8787,18 @@ impl Engine {
                 &doc,
                 0,
                 u32::MAX,
-                &note_bodies,
+                &note_table_at(
+                    &mut note_tables,
+                    note_width,
+                    &doc,
+                    &font_stack,
+                    &cfg,
+                    scale,
+                    sctx,
+                    &mut cache,
+                    note_comp,
+                )
+                .0,
                 &note_markers,
                 &mut endnotes_placed,
             );
@@ -18456,6 +18534,129 @@ mod tests {
             .map(|r| r.glyphs.len())
             .sum();
         assert_eq!(body_glyphs, "Alpha\u{FFFC} body text".chars().count());
+    }
+
+    /* ================================================================
+    Issue #130 — note bodies lay out at the content width of the section
+    that owns their page.
+    ================================================================ */
+
+    const LONG_NOTE: &str = "This footnote is deliberately long so that it wraps across \
+        several lines at any reasonable content width, which makes the width it was laid \
+        out at visible in the geometry of its band entry on the page.";
+
+    /// A portrait A4 section (block 0) then a landscape A4 section
+    /// (block 1), each carrying one footnote with a long body.
+    fn portrait_then_landscape_with_footnotes() -> Engine {
+        let mut d = DocumentTree::from_text("Portrait section body text.");
+        let portrait = d.body_section.clone();
+        if let Some(engine::Block::Paragraph(p)) = d.blocks.get_mut(0) {
+            p.section_end = Some(Box::new(portrait));
+        }
+        d.blocks.push_back(para_of(
+            "Landscape section body text.",
+            engine::ParaProperties::default(),
+        ));
+        let g = &mut d.body_section.geometry;
+        std::mem::swap(&mut g.width, &mut g.height);
+        let mut engine = test_engine_with_doc(d);
+        for block in [0_u32, 1] {
+            let evt = engine.do_insert_note(bpos_top(block, 8), engine::NoteKind::Footnote);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+            let caret = engine.selection.as_ref().unwrap().caret.clone();
+            let typed = engine.do_insert_text_interactive(caret, LONG_NOTE.to_string());
+            assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+            engine.do_exit_header_footer();
+        }
+        engine
+    }
+
+    /// Acceptance (#130): each note fills ITS section's content width —
+    /// the landscape note is not squeezed into the portrait width — and
+    /// the fixture is pinned by `geometry_fingerprint`.
+    #[test]
+    fn footnotes_lay_out_at_their_own_sections_content_width() {
+        let engine = portrait_then_landscape_with_footnotes();
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        assert_eq!(pages.len(), 2, "one page per section");
+        assert!(
+            pages[1].size.width > pages[0].size.width,
+            "page 2 is landscape"
+        );
+        let mut widths = Vec::new();
+        for page in &pages {
+            let content_w = page.size.width - page.margins.left - page.margins.right;
+            assert_eq!(page.footnotes.entries.len(), 1, "one note per page");
+            let entry = &page.footnotes.entries[0];
+            let para = entry.blocks[0].as_paragraph().expect("note paragraph");
+            assert!(
+                (para.size.width - content_w).abs() < 0.01,
+                "note box {} != content width {content_w}",
+                para.size.width
+            );
+            assert!(para.lines.len() >= 2, "the note wraps");
+            /* Filled: the first (wrapped) line reaches close to the
+            section's measure — within one long word of it. */
+            let first = &para.lines[0];
+            assert!(
+                first.width > content_w - 80.0 && first.width <= content_w + 0.01,
+                "first line {} does not fill {content_w}",
+                first.width
+            );
+            widths.push(first.width);
+        }
+        let portrait_w = pages[0].size.width - pages[0].margins.left - pages[0].margins.right;
+        assert!(
+            widths[1] > portrait_w,
+            "the landscape note runs past the portrait measure ({} vs {portrait_w})",
+            widths[1]
+        );
+        let fp = layout::geometry_fingerprint(&pages);
+        eprintln!("NOTE WIDTH FINGERPRINT portrait_then_landscape = {fp:#x}");
+        assert_eq!(
+            fp, PINNED_NOTE_SECTION_WIDTHS,
+            "note width fixture geometry changed"
+        );
+    }
+
+    /// Recorded on this change via `--nocapture` (issue #130).
+    const PINNED_NOTE_SECTION_WIDTHS: u64 = 0xd6cfac1cc9cef805;
+
+    /// Issue #130 — a CONTINUOUS break into a section with wider margins
+    /// swaps the note table in place: the page flushes with the second
+    /// section's geometry, so its note lays out at that (narrower)
+    /// measure rather than the first section's.
+    #[test]
+    fn continuous_section_swaps_the_note_width_in_place() {
+        let mut d = DocumentTree::from_text("First section body text.");
+        let first = d.body_section.clone();
+        if let Some(engine::Block::Paragraph(p)) = d.blocks.get_mut(0) {
+            p.section_end = Some(Box::new(first));
+        }
+        d.blocks.push_back(para_of(
+            "Second section body text.",
+            engine::ParaProperties::default(),
+        ));
+        d.body_section.section_type = engine::SectionType::Continuous;
+        d.body_section.geometry.margin_left += 72.0;
+        d.body_section.geometry.margin_right += 72.0;
+        let narrow = d.body_section.geometry.content_width();
+        let mut engine = test_engine_with_doc(d);
+        let evt = engine.do_insert_note(bpos_top(1, 6), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        engine.do_insert_text_interactive(caret, LONG_NOTE.to_string());
+        engine.do_exit_header_footer();
+        let (pages, ..) = engine.build_pages(1.0, false, None).expect("layout");
+        assert_eq!(pages.len(), 1, "a continuous break shares the page");
+        let entry = pages[0].footnotes.entries.first().expect("the note");
+        let para = entry.blocks[0].as_paragraph().expect("note paragraph");
+        assert!(
+            (para.size.width - narrow).abs() < 0.01,
+            "note box {} != the second section's measure {narrow}",
+            para.size.width
+        );
     }
 
     /* ================================================================

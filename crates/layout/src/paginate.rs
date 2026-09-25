@@ -639,6 +639,20 @@ impl Paginator {
         self
     }
 
+    /// Issue #130 — swap the note body table (and the continuation
+    /// notice) in place, for a continuous section break into a section of
+    /// a different content width: notes committed from here on use the
+    /// new section's bodies. Notes already committed to the page (or
+    /// carried to the next one) keep the blocks they were placed with.
+    pub fn set_note_bodies(
+        &mut self,
+        bodies: HashMap<NoteAnchor, NoteBody>,
+        notice: Option<NoteBody>,
+    ) {
+        self.note_bodies = bodies;
+        self.continuation_notice = notice.filter(|n| !n.is_empty());
+    }
+
     /// Issue #80 — `<w:footnotePr><w:pos>` for the active section.
     /// `SectEnd` / `DocEnd` are meaningless for footnotes and behave as
     /// `BeneathText` (Word's observed reading).
