@@ -290,7 +290,7 @@ Engine backlog" references a real issue.
 - `cargo run -p roundtrip --release` — PASS.
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
 - `pnpm exec playwright test` (from `ts/`) — the full e2e suite in `ts/e2e/`
-  (51 specs across 25 files, `workers: 1`, ~1.3 min locally) all green.
+  (`workers: 1`, well under a minute locally) all green.
   **Blocking since issue #230**: `ci.yml`'s `e2e` job reuses the `wasm`
   job's build (`actions/upload-artifact` / `download-artifact` of
   `crates/engine-wasm/pkg` — TS imports it by relative path, no npm
