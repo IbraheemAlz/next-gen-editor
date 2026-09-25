@@ -268,6 +268,18 @@ impl PageGeometry {
         Self::from_twips(11906, 16838, 1440, 1440, 1440, 1440, 720, 720)
     }
 
+    /// US Letter (8.5 × 11 in) with the same 1-inch margins / 0.5-inch
+    /// header-footer offsets `a4()` uses — `Word.exe` stamps identical
+    /// margins regardless of `pgSz`. Issue #109 — the second preset a host
+    /// can select via [`DefaultPageSize::Letter`] for the `<w:sectPr>`
+    /// fallback.
+    ///
+    /// - `12240 twips / 20 = 612.0 pt` ← page width
+    /// - `15840 twips / 20 = 792.0 pt` ← page height
+    pub const fn letter() -> Self {
+        Self::from_twips(12240, 15840, 1440, 1440, 1440, 1440, 720, 720)
+    }
+
     /// Build a `PageGeometry` from OOXML twips directly. 1 twip = 1/20 pt.
     /// Used by the `<w:pgSz>` / `<w:pgMar>` parser to preserve exact
     /// integer round-trip; in-code default constructors call this with
@@ -308,6 +320,32 @@ impl PageGeometry {
 impl Default for PageGeometry {
     fn default() -> Self {
         Self::a4()
+    }
+}
+
+/// Issue #109 — the fallback page-size preset a `.docx` reader falls back
+/// to when a `<w:sectPr>` omits `<w:pgSz>` (ECMA-376 requires it, but the
+/// Apache POI / docx4j "wild document" corpus ships files that skip it).
+/// This used to be a hard-coded `PageGeometry::a4()` inside
+/// `format-docx`'s `SectPrAccum::into_geometry`; it now rides
+/// [`DocumentSettings::default_page_size`] so an embedding host can
+/// request `Letter` (via `format_docx::read_docx_with_settings`) instead
+/// of patching the parser. `#[default]` stays `A4` — every pinned
+/// `layout::geometry_fingerprint` fixture assumes it, and `read_docx`
+/// (the A4 convenience wrapper) is unchanged.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DefaultPageSize {
+    #[default]
+    A4,
+    Letter,
+}
+
+impl DefaultPageSize {
+    pub const fn geometry(self) -> PageGeometry {
+        match self {
+            DefaultPageSize::A4 => PageGeometry::a4(),
+            DefaultPageSize::Letter => PageGeometry::letter(),
+        }
     }
 }
 
@@ -714,6 +752,14 @@ pub struct DocumentSettings {
     /// regenerates the core-properties part (it rides the OPC
     /// passthrough), so `None` on documents without one.
     pub author: Option<String>,
+    /// Issue #109 — the [`DefaultPageSize`] a `.docx` reader was asked to
+    /// fall back to for any `<w:sectPr>` that omits `<w:pgSz>`. This is
+    /// never read FROM the archive (OOXML has no such setting — Word
+    /// always stamps `pgSz` explicitly); it records what the *host*
+    /// requested via `format_docx::read_docx_with_settings` so the value
+    /// stays inspectable after parsing. `read_docx` (unchanged) always
+    /// leaves this at the `#[default]` `A4`.
+    pub default_page_size: DefaultPageSize,
 }
 
 /// Address of a `Block` inside a `DocumentTree`. Walks from the root
