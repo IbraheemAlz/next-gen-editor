@@ -84,6 +84,48 @@ The `tools/roundtrip/` harness asserts:
   `grab_bag_exotic.docx` and asserts the regenerated `document.xml` is
   byte-identical to the source plus the inserted text.
 
+## Zero-edit resave is byte-identical (issues #112 / #119 / #120)
+
+The real-document corpus (`tools/corpus-native`, `--dump-drift DIR` writes
+the original / resaved `document.xml` of every drifting document) is the
+gate: a no-edit `read_docx → write_docx` must reproduce `word/document.xml`
+byte for byte. The mechanisms, all verbatim bytes the reader captures and
+the writer replays:
+
+- **Document envelope** (`DocumentTree::document_envelope`): prolog (BOM,
+  declaration, the CRLF after it), the root start tag in its source
+  attribute order, the `<w:body>` tag and the tail. The writer never
+  re-orders or re-synthesizes them for a document read from `.docx`; it
+  only appends a binding the emitted body uses *unbound*
+  (`grab_bag::unbound_prefixes` — `a` / `pic` declared inline on
+  `<a:graphic>` / `<pic:pic>` do not count). Lives on the tree because the
+  live editor saves from the tree alone.
+- **Block-level passthrough** (`Paragraph::body_xml` / `Table::body_xml`,
+  `schema::block_envelope`): a `<w:sdt>` / `<w:customXml>` envelope becomes
+  `BodyFragment::Open` on its first inner block and `Close` on its last —
+  the inner blocks stay ordinary body blocks; bookmarks, `proofErr`, range
+  markers, comments/PIs and pretty-print whitespace between blocks ride
+  `Verbatim` on the following block. The writer's `EnvelopeStack` keeps
+  every envelope balanced whatever an edit did to its ends (a closer whose
+  opener was deleted is skipped; an unclosed envelope closes at the
+  container end). Travel rules: split keeps `before` left and `after`
+  right, merge keeps both blocks' markup, clipboard fragments carry none.
+  Never re-add an index-keyed side table for these.
+- **Self-closing `<w:p …/>`** is one `Empty` event: both walkers
+  (`parts::document`, `parts::table`) must handle it, or the paragraph
+  vanishes.
+- **Verified passthroughs.** A `<w:sectPr>`'s bytes
+  (`SectionProps::source_xml`) and a run-level object's bytes
+  (`InlineObject::source_xml` — `<w:drawing>`, `<mc:AlternateContent>`,
+  `<w:pict>`, `<w:object>`; `schema::drawing::scan_drawing` lowers them)
+  are re-emitted only while a re-parse of the bytes still yields the live
+  typed fields; a page-setup change or a resize / drag regenerates. An
+  object with no picture (shape, chart, OLE) has no regeneration and is
+  ALWAYS written from its bytes — never dropped. Text boxes are stories
+  (`InlineKind::TextBox`, issue #83) and splice through `parts::textbox`.
+- Known exception: a part with two `<w:body>` elements (POI's
+  `MultipleBodyBug.docx`) gets the synthesized header.
+
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.
 - Phase 2+ will introduce `Run` model with bold/italic/font/size. Add corresponding XML emission only when the parser reads them too.
