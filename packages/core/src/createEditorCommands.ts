@@ -299,6 +299,15 @@ export interface EditorCommands {
     /** Issue #80 — endnote twin of `insertFootnote`; endnotes collect
      *  at section / document end per `<w:endnotePr><w:pos>`. */
     insertEndnote(at?: LogicalPos): Promise<Event>;
+    /** Issue #83 — insert a floating text box anchored at the caret
+     *  (body paragraphs only; the engine rejects table cells and story
+     *  carets with `Event::Error`). Extent in EMU (914400 per inch),
+     *  default 2" × 1". The box gets Word's "Draw Text Box" defaults
+     *  (white fill, 0.75 pt outline, square wrap) and the engine ENTERS
+     *  its story, so `state.editingStory()?.area` becomes `'TextBox'`;
+     *  a click outside the box or `exitHeaderFooter()` returns to the
+     *  body. */
+    insertTextBox(widthEmu?: number, heightEmu?: number, at?: LogicalPos): Promise<Event>;
     setParagraphBorders(
         borders: BridgeCellBorders,
         range?: LogicalRange,
@@ -664,6 +673,13 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             dispatch({ type: 'INSERT_FOOTNOTE', at: at ?? currentCaret() }),
         insertEndnote: (at) =>
             dispatch({ type: 'INSERT_ENDNOTE', at: at ?? currentCaret() }),
+        insertTextBox: (widthEmu = 1_828_800, heightEmu = 914_400, at) =>
+            dispatch({
+                type: 'INSERT_TEXT_BOX',
+                at: at ?? currentCaret(),
+                width_emu: widthEmu,
+                height_emu: heightEmu,
+            }),
         setParagraphBorders: (borders, range) =>
             dispatch({
                 type: 'SET_PARAGRAPH_BORDERS',

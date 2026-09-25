@@ -16,3 +16,4 @@ pub mod rels;
 pub mod settings;
 pub mod styles;
 pub mod table;
+pub mod textbox;
