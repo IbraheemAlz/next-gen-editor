@@ -9492,9 +9492,12 @@ impl DocumentTree {
     /// becomes the visual owner: its `grid_span` widens to cover the
     /// column range, every cell directly below in the column range
     /// becomes `VMergeRole::Continue`. Horizontal partners (same row,
-    /// columns to the right) are *removed* and their widths summed
-    /// into the owner's `grid_span`. PR 3 minimum implementation —
-    /// PR 3b extends for non-rectangular merges.
+    /// columns to the right) are *removed*, their widths summed into the
+    /// owner's `grid_span`; a continuation row's own cell is emptied to a
+    /// single blank paragraph. Issue #263 — none of that content is
+    /// dropped: every merged-away cell's blocks are appended into the
+    /// owner, in row-major order (Word's behaviour), by
+    /// [`Self::merge_cells_unmapped`].
     pub fn merge_cells(
         &self,
         table_path: BlockPath,
@@ -9513,29 +9516,61 @@ impl DocumentTree {
         } else {
             (to_col, from_col)
         };
-        /* Issue #253 — mirror the merge on the PRE-mutation shape: per
-        affected row, the cells `c0 + 1 ..= c0 + drop` are removed (their
-        anchors — and those of the vertical continuation cells — collapse
-        onto the end of the merged owner `(r0, c0)`), cells past them shift
-        left by `drop`. */
+        /* Issue #253 / #263 — mirror the merge on the PRE-mutation shape:
+        per affected row, the cells `c0 + 1 ..= c0 + drop` are removed and
+        (issue #263) a continuation row's own `c0` cell is also emptied —
+        every one of those cells' blocks lands, whole, inside the owner
+        `(r0, c0)`. `absorbed` records exactly where: `cursor` walks the
+        SAME row-major order `merge_cells_unmapped` appends in (row r0's
+        horizontal partners, then each continuation row's own cell
+        followed by its horizontal partners), so an anchor at block `k` of
+        an absorbed cell lands on block `cursor + k` of the owner. Cells
+        past the merged range shift left by `drop`. */
         let remap = self.mutated_table_shape(&table_path).and_then(|(tp, t)| {
             let rcount = t.rows.len() as u32;
-            let last = (t.rows.get(r0 as usize)?.cells.len() as u32).checked_sub(1)?;
+            let owner_row = t.rows.get(r0 as usize)?;
+            let last = (owner_row.cells.len() as u32).checked_sub(1)?;
             if c0 > last {
                 return None;
             }
+            let mut cursor = owner_row
+                .cells
+                .get(c0 as usize)
+                .map_or(0, |c| c.blocks.len() as u32);
+            let mut absorbed: Vec<(u32, u32, u32)> = Vec::new();
             /* (row, cells dropped) for the owner row and each continuation. */
-            let mut drops = vec![(r0, c1.min(last) - c0)];
-            for r in (r0 + 1)..=r1.min(rcount.saturating_sub(1)) {
-                let len = t.rows[r as usize].cells.len() as u32;
-                if c0 < len {
-                    drops.push((r, c1.min(len - 1) - c0));
-                }
+            let mut drops = Vec::new();
+            let c1_r0 = c1.min(last);
+            for c in (c0 + 1)..=c1_r0 {
+                let len = owner_row
+                    .cells
+                    .get(c as usize)
+                    .map_or(0, |cell| cell.blocks.len() as u32);
+                absorbed.push((r0, c, cursor));
+                cursor += len;
             }
-            Some((tp, drops))
+            drops.push((r0, c1_r0 - c0));
+            for r in (r0 + 1)..=r1.min(rcount.saturating_sub(1)) {
+                let row = &t.rows[r as usize];
+                let len = row.cells.len() as u32;
+                if c0 >= len {
+                    continue;
+                }
+                let own_len = row.cells[c0 as usize].blocks.len() as u32;
+                absorbed.push((r, c0, cursor));
+                cursor += own_len;
+                let c1_r = c1.min(len - 1);
+                for c in (c0 + 1)..=c1_r {
+                    let clen = row.cells[c as usize].blocks.len() as u32;
+                    absorbed.push((r, c, cursor));
+                    cursor += clen;
+                }
+                drops.push((r, c1_r - c0));
+            }
+            Some((tp, drops, absorbed))
         });
         let mut out = self.merge_cells_unmapped(table_path, r0, r1, c0, c1);
-        if let Some((tp, drops)) = remap {
+        if let Some((tp, drops, absorbed)) = remap {
             out.remap_table_cells(&tp, |row, col| {
                 let Some(&(_, drop)) = drops.iter().find(|(r, _)| *r == row) else {
                     return CellMove::Keep;
@@ -9544,10 +9579,20 @@ impl DocumentTree {
                 if col < c0 || owner {
                     CellMove::Keep
                 } else if col <= c0 + drop {
-                    CellMove::Collapse {
-                        row: r0,
-                        col: c0,
-                        at_end: true,
+                    match absorbed.iter().find(|(r, c, _)| *r == row && *c == col) {
+                        Some(&(_, _, block_offset)) => CellMove::Absorbed {
+                            row: r0,
+                            col: c0,
+                            block_offset,
+                        },
+                        /* Defensive fallback; every merged-away cell the
+                        classification reaches this branch for is also in
+                        `absorbed` by construction. */
+                        None => CellMove::Collapse {
+                            row: r0,
+                            col: c0,
+                            at_end: true,
+                        },
                     }
                 } else {
                     CellMove::To {
@@ -9560,6 +9605,12 @@ impl DocumentTree {
         out
     }
 
+    /// Issue #263 — physically restructure the table AND carry every
+    /// merged-away cell's blocks into the owner `(r0, c0)`, row-major
+    /// (owner row's horizontal partners, left to right, then each
+    /// continuation row's own cell followed by ITS horizontal partners) —
+    /// [`Self::merge_cells`]'s `absorbed` list mirrors this exact order so
+    /// a comment anchor lands on the same paragraph its text moved to.
     fn merge_cells_unmapped(
         &self,
         table_path: BlockPath,
@@ -9594,31 +9645,47 @@ impl DocumentTree {
             } else {
                 VMergeRole::Restart
             };
+            /* Issue #263 — Word appends every merged-away cell's blocks
+            into the owner instead of discarding them. `remove` always
+            takes whatever now sits right after the owner, so this loop
+            already visits the horizontal partners left to right. */
+            let mut appended: Vec<Block> = Vec::new();
             for _ in 0..drop_count {
                 if (c0 as usize + 1) < top_row.cells.len() {
-                    top_row.cells.remove(c0 as usize + 1);
+                    appended.extend(top_row.cells.remove(c0 as usize + 1).blocks);
                 }
             }
+            top_row.cells[c0 as usize].blocks.extend(appended);
             /* Vertical: rows r0+1..=r1 collapse to Word's on-disk shape —
             ONE cell per continuation row spanning the merged columns
             (`gridSpan = span`, `vMerge` continue), horizontal partners
             physically removed exactly like the top row. Anything else
             double-counts grid columns in the layout cursor walk and
             diverges from what the .docx reader produces for the same
-            merge authored in Word. */
+            merge authored in Word. Issue #263 — the continuation cell's
+            OWN blocks move into the owner too (Word never leaves content
+            behind a `vMerge="continue"` cell); it is left with a single
+            blank paragraph, same as a fresh cell elsewhere in the tree. */
             for r in (r0 + 1)..=r1.min(rcount - 1) {
-                let row = &mut t.rows[r as usize];
-                if (c0 as usize) >= row.cells.len() {
+                if (c0 as usize) >= t.rows[r as usize].cells.len() {
                     continue;
                 }
+                let row = &mut t.rows[r as usize];
+                let mut appended = std::mem::replace(
+                    &mut row.cells[c0 as usize].blocks,
+                    vec![Block::Paragraph(Paragraph::default())],
+                );
                 row.cells[c0 as usize].props.v_merge = VMergeRole::Continue;
                 row.cells[c0 as usize].props.grid_span = span.max(1);
                 let drop_count = (c1.min(row.cells.len() as u32 - 1) - c0) as usize;
                 for _ in 0..drop_count {
                     if (c0 as usize + 1) < row.cells.len() {
-                        row.cells.remove(c0 as usize + 1);
+                        appended.extend(row.cells.remove(c0 as usize + 1).blocks);
                     }
                 }
+                t.rows[r0 as usize].cells[c0 as usize]
+                    .blocks
+                    .extend(appended);
             }
         })
     }
