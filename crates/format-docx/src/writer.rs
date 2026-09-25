@@ -782,8 +782,8 @@ impl Drop for InheritedDirectionsScope {
 /// Publish `doc`'s cascade directions for this write. Only when the
 /// written file carries `styles.xml` (`styles_travel`): without the
 /// style table the inherited direction exists nowhere else in the file,
-/// so the resolved value stays baked on the paragraph (issue #134's
-/// style-less save path).
+/// so the resolved value stays baked on the paragraph (an engine-authored
+/// `build_minimal_docx` package without a dirty style table).
 fn publish_inherited_directions(
     doc: &DocumentTree,
     styles_travel: bool,
@@ -6290,9 +6290,14 @@ mod tests {
             reread.nth_paragraph(1).unwrap().props.direction,
             Some(TextDirection::Ltr)
         );
-        /* The style-less live save path (issue #134 drops styles.xml)
-        keeps baking the resolved direction — the only place it could
-        survive — so the reread still reads RTL. */
+        /* The UI save path (`save_docx`, #134) writes against the source
+        package, styles.xml included: no inherited bidi either. */
+        let ui = document_xml_of(&save_docx(&edited).expect("ui save"));
+        let p0 = ui.split("</w:p>").find(|p| p.contains("XWord")).unwrap();
+        assert!(!p0.contains("<w:bidi"), "ui save leaked: {p0}");
+        /* An engine-authored minimal package carries no styles.xml: the
+        resolved direction stays baked — the only place it could survive
+        — so the reread still reads RTL. */
         let minimal = build_minimal_docx(&edited).expect("minimal");
         let reread = read_docx(&minimal).expect("reread minimal").document;
         assert_eq!(

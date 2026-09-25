@@ -2374,7 +2374,7 @@ fn build_style_bidi_docx() -> Vec<u8> {
     build_styled_docx(STYLE_BIDI_STYLES_XML, &document_xml)
 }
 
-/// Issue #202 — step 21: paragraph direction inherited from a style.
+/// Issue #202 — step 23: paragraph direction inherited from a style.
 ///
 /// a. `bidi` resolves through the `basedOn` chain on read (RTL although
 ///    the text starts with a Latin word) without becoming a direct
@@ -2408,14 +2408,14 @@ fn run_style_bidi_roundtrip() -> Result<()> {
             dirs(&archive_a.document)
         );
     }
-    println!("[roundtrip] step 21a OK — bidi resolves through basedOn, direct off wins");
+    println!("[roundtrip] step 23a OK — bidi resolves through basedOn, direct off wins");
 
     let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
     let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
     if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
         bail!("untouched style-bidi document drifted");
     }
-    println!("[roundtrip] step 21b OK — untouched save byte-identical");
+    println!("[roundtrip] step 23b OK — untouched save byte-identical");
 
     let edited = archive_a.document.insert_text(
         LogicalPos {
@@ -2439,7 +2439,7 @@ fn run_style_bidi_roundtrip() -> Result<()> {
     }
     let drift = expected_xml.len() - doc_a.len();
     println!(
-        "[roundtrip] step 21c OK — edited style-RTL paragraph gains no direct <w:bidi/>, re-reads RTL (Δ {drift} B)"
+        "[roundtrip] step 23c OK — edited style-RTL paragraph gains no direct <w:bidi/>, re-reads RTL (Δ {drift} B)"
     );
     Ok(())
 }
@@ -3699,7 +3699,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             },
         },
         /* Issue #202 — style-inherited paragraph direction. Passthrough
-        at drift 0; the default harness's step 21 edits the style-RTL
+        at drift 0; the default harness's step 23 edits the style-RTL
         paragraph. */
         PrebuiltFixture {
             name: "pPr_bidi_style.docx",
