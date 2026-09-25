@@ -544,6 +544,22 @@ pub enum Command {
         at: LogicalPos,
         kind: FieldKind,
     },
+    /// Issue #80 — author a footnote referenced at `at` (a body
+    /// paragraph; rejected with `Event::Error` inside table cells and
+    /// while a story is being edited). The engine splices the reference
+    /// anchor, creates the note story (one paragraph opening with the
+    /// self-mark), renumbers every later marker, and ENTERS the new
+    /// note so typing lands in it — `SelectionChanged.editing_story`
+    /// reports `area: Footnote`. `ExitHeaderFooter` returns to the body
+    /// at the reference.
+    InsertFootnote {
+        at: LogicalPos,
+    },
+    /// Issue #80 — endnote twin of [`Command::InsertFootnote`]; the note
+    /// collects at section / document end per `<w:endnotePr><w:pos>`.
+    InsertEndnote {
+        at: LogicalPos,
+    },
     /// Issue #43 — install the render-time date DATE fields resolve
     /// against. The worker injects today's date right after INIT (the
     /// engine core never reads a wall clock — determinism for tests
@@ -812,12 +828,20 @@ pub enum SectionBreakKind {
 }
 
 /// Phase 3 (#39) — which margin band a header/footer command targets.
+/// Issue #80 widened it to every editable STORY: `Footnote` / `Endnote`
+/// name a note story on `SelectionChanged.editing_story` (entered by
+/// clicking into a note band or by `InsertFootnote` / `InsertEndnote`;
+/// left with `ExitHeaderFooter`). `EnterHeaderFooter` rejects the two
+/// note areas with `Event::Error` — notes are entered by content, not
+/// by page zone.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum HeaderFooterArea {
     #[default]
     Header,
     Footer,
+    Footnote,
+    Endnote,
 }
 
 /// Issue #43 — the field kinds [`Command::InsertField`] authors.

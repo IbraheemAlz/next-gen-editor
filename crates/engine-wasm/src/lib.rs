@@ -539,6 +539,43 @@ enum StoryTarget {
         section_block: u32,
         role: engine::HeaderFooterRole,
     },
+    /// Issue #80 — a footnote / endnote story. Selection paths are
+    /// story-rooted (`Block(i)` = the note body's i-th block); geometry
+    /// comes from every band entry the paginator emitted for the note
+    /// (a split note spans pages). Entered by clicking into a note band
+    /// or by `InsertFootnote` / `InsertEndnote`; left with
+    /// `ExitHeaderFooter`.
+    Note {
+        kind: engine::NoteKind,
+        /// The story's OOXML `w:id` (key into the engine's story map).
+        id: i32,
+        /// Anchor page (0-based): where the note was entered.
+        page: u32,
+        /// Top-level block of the body paragraph carrying the reference
+        /// (section-scoped reads resolve the section through it).
+        section_block: u32,
+    },
+}
+
+/// Issue #80 — which part a story transaction writes back to. Header /
+/// footer parts and note stories share one merge path
+/// (`commit_story_edit`, `story_mutate`).
+enum StoryPart {
+    Header(String),
+    Footer(String),
+    Note(engine::NoteKind, i32),
+}
+
+impl StoryPart {
+    /// The real tree with `blocks` written into this part (dirty for the
+    /// writer; stray section markers stripped).
+    fn write_blocks(&self, real: &DocumentTree, blocks: Vec<engine::Block>) -> DocumentTree {
+        match self {
+            StoryPart::Header(rid) => real.with_updated_header_part(rid, blocks),
+            StoryPart::Footer(rid) => real.with_updated_footer_part(rid, blocks),
+            StoryPart::Note(kind, id) => real.with_updated_note_story(*kind, *id, blocks),
+        }
+    }
 }
 
 /// One laid-out line flattened for pointer hit-testing and caret/selection
@@ -1732,7 +1769,9 @@ fn build_inline_object_infos(
     para: &engine::Paragraph,
     cfg: &RenderConfig,
     scale: f32,
+    sctx: StyleContext,
 ) -> Vec<layout::paragraph::InlineObjectInfo> {
+    let _ = cfg;
     para.inline_objects
         .iter()
         .map(|obj| match &obj.kind {
@@ -1758,22 +1797,52 @@ fn build_inline_object_infos(
                     },
                 },
             },
-            engine::InlineKind::FootnoteRef { display_number, .. } => {
-                /* Phase 8a — footnote markers reserve a small fixed
-                width sized to the body font: ~0.45 em per digit at
-                the body size. The renderer paints the number as a
-                superscript at the glyph's pen position. */
-                let label = display_number.to_string();
-                let em = cfg.px_size * scale;
-                let width = em * 0.45 * (label.len() as f32).max(1.0);
-                let height = em * 0.7;
+            /* Issue #80 — note references shape their document-order
+            marker (`"1"`, `"iv"`, …) as real superscript glyphs at
+            layout time (`layout::paragraph::shape_note_marker`); the
+            anchor rides the first glyph so the paginator can reserve
+            the note's band space when the line is placed. Width /
+            height are measured by the shaper, not reserved here. */
+            engine::InlineKind::FootnoteRef {
+                id,
+                custom_mark_follows,
+            }
+            | engine::InlineKind::EndnoteRef {
+                id,
+                custom_mark_follows,
+            } => {
+                let anchor = engine::NoteAnchor {
+                    kind: if matches!(obj.kind, engine::InlineKind::FootnoteRef { .. }) {
+                        engine::NoteKind::Footnote
+                    } else {
+                        engine::NoteKind::Endnote
+                    },
+                    id: *id,
+                };
+                let text = if *custom_mark_follows {
+                    String::new()
+                } else {
+                    sctx.note_marker_text(anchor)
+                };
                 layout::paragraph::InlineObjectInfo {
                     at: obj.at,
-                    width_px: width,
-                    height_px: height,
-                    kind: layout::paragraph::InlineObjectInfoKind::FootnoteMarker { text: label },
+                    width_px: 0.0,
+                    height_px: 0.0,
+                    kind: layout::paragraph::InlineObjectInfoKind::NoteMarker {
+                        text,
+                        anchor: Some(anchor),
+                    },
                 }
             }
+            engine::InlineKind::NoteSelfRef { .. } => layout::paragraph::InlineObjectInfo {
+                at: obj.at,
+                width_px: 0.0,
+                height_px: 0.0,
+                kind: layout::paragraph::InlineObjectInfoKind::NoteMarker {
+                    text: sctx.note_self_mark.unwrap_or("").to_string(),
+                    anchor: None,
+                },
+            },
         })
         .collect()
 }
@@ -1786,18 +1855,48 @@ fn build_inline_object_infos(
 struct StyleContext<'a> {
     styles: &'a std::collections::HashMap<String, engine::ParagraphStyle>,
     run_defaults: &'a engine::SpanStyle,
+    /// Issue #80 — document-order display markers per referenced note
+    /// (`DocumentTree::note_markers`). `None` (callers outside a paint)
+    /// falls back to the OOXML id, which Word keeps equal to the display
+    /// number in the common case.
+    note_markers: Option<&'a HashMap<engine::NoteAnchor, String>>,
+    /// Issue #80 — the marker the `NoteSelfRef` heading a note body
+    /// paints; set only while laying out that note's blocks.
+    note_self_mark: Option<&'a str>,
 }
 
-impl StyleContext<'_> {
-    fn of(doc: &engine::DocumentTree) -> StyleContext<'_> {
+impl<'a> StyleContext<'a> {
+    fn of(doc: &'a engine::DocumentTree) -> StyleContext<'a> {
         StyleContext {
             styles: &doc.styles,
             run_defaults: &doc.style_run_defaults,
+            note_markers: None,
+            note_self_mark: None,
         }
     }
 
     fn run_base(&self, style_id: Option<&str>) -> engine::SpanStyle {
         engine::resolve_run_cascade(self.styles, self.run_defaults, style_id)
+    }
+
+    /// Issue #80 — thread the paint's resolved note markers.
+    fn with_note_markers(mut self, markers: &'a HashMap<engine::NoteAnchor, String>) -> Self {
+        self.note_markers = Some(markers);
+        self
+    }
+
+    /// Issue #80 — the self-mark for one note body's layout.
+    fn with_self_mark(mut self, mark: &'a str) -> Self {
+        self.note_self_mark = Some(mark);
+        self
+    }
+
+    /// Issue #80 — display text of a body reference's marker.
+    fn note_marker_text(&self, anchor: engine::NoteAnchor) -> String {
+        match self.note_markers.and_then(|m| m.get(&anchor)) {
+            Some(text) => text.clone(),
+            None => anchor.id.to_string(),
+        }
     }
 }
 
@@ -2099,10 +2198,26 @@ fn paragraph_layout_key(
                 width_emu.hash(&mut h);
                 height_emu.hash(&mut h);
             }
-            engine::InlineKind::FootnoteRef { id, display_number } => {
+            engine::InlineKind::FootnoteRef {
+                id,
+                custom_mark_follows,
+            } => {
                 2u8.hash(&mut h);
                 id.hash(&mut h);
-                display_number.hash(&mut h);
+                custom_mark_follows.hash(&mut h);
+            }
+            engine::InlineKind::EndnoteRef {
+                id,
+                custom_mark_follows,
+            } => {
+                3u8.hash(&mut h);
+                id.hash(&mut h);
+                custom_mark_follows.hash(&mut h);
+            }
+            /* Issue #80 — the self-mark's resolved text is mixed in below. */
+            engine::InlineKind::NoteSelfRef { kind } => {
+                4u8.hash(&mut h);
+                matches!(kind, engine::NoteKind::Endnote).hash(&mut h);
             }
         }
         match io.anchor.as_deref() {
@@ -2193,6 +2308,35 @@ fn paragraph_layout_key(
     for s in &para.props.tab_stops {
         s.position_pt.to_bits().hash(&mut h);
     }
+    /* Issue #80 — note markers are shaped into the line, so the
+    resolved display text of every reference (and the self-mark of a
+    note body) is a layout input: inserting a note renumbers every
+    later reference without touching its paragraph's text. */
+    for obj in &para.inline_objects {
+        match &obj.kind {
+            engine::InlineKind::FootnoteRef { id, .. } => {
+                1u8.hash(&mut h);
+                sctx.note_marker_text(engine::NoteAnchor {
+                    kind: engine::NoteKind::Footnote,
+                    id: *id,
+                })
+                .hash(&mut h);
+            }
+            engine::InlineKind::EndnoteRef { id, .. } => {
+                2u8.hash(&mut h);
+                sctx.note_marker_text(engine::NoteAnchor {
+                    kind: engine::NoteKind::Endnote,
+                    id: *id,
+                })
+                .hash(&mut h);
+            }
+            engine::InlineKind::NoteSelfRef { .. } => {
+                3u8.hash(&mut h);
+                sctx.note_self_mark.hash(&mut h);
+            }
+            engine::InlineKind::Image { .. } => {}
+        }
+    }
     cfg.font_id.hash(&mut h);
     matches!(cfg.base_direction, ShapingDirection::Rtl).hash(&mut h);
     cfg.px_size.to_bits().hash(&mut h);
@@ -2246,99 +2390,260 @@ fn resolve_line_height(
     }
 }
 
-/// Phase 8a — walk every body paragraph in document order, mirror the
-/// `InlineKind::FootnoteRef` id → display_number mapping the parser
-/// assigned, then lay out each referenced footnote's body paragraph(s)
-/// into a single combined `ParagraphBox`. The paginator keys its
-/// `with_footnote_bodies` lookup by display_number — the same number
-/// that lives on every footnote-marker glyph — so layout never sees
-/// the OOXML `w:id`.
-fn build_footnote_bodies(
-    doc: &DocumentTree,
-    font_stack: &FontStack,
+/// Issue #80 — lay out one note story's blocks at `content_width` into
+/// a stacked block list (origins from `y = 0`), through the SAME cached
+/// paragraph + table pipeline the body uses. `sctx` carries the display
+/// number the story's `NoteSelfRef` paints (`StyleContext::with_self_mark`);
+/// `do_export_pdf` stamps `source_paragraph_id`s later so the PDF
+/// `/ToUnicode` table covers note glyphs.
+#[allow(clippy::too_many_arguments)]
+fn layout_note_blocks(
+    blocks: &[engine::Block],
+    content_width: f32,
+    fonts: &FontStack,
     cfg: &RenderConfig,
     scale: f32,
-) -> std::collections::HashMap<u32, ParagraphBox> {
-    let mut by_display: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for block in doc.blocks.iter() {
-        walk_block_for_footnote_refs(block, &mut by_display);
-    }
-    let mut out: std::collections::HashMap<u32, ParagraphBox> = std::collections::HashMap::new();
-    /* Footnote body width — content width of the default A4 section;
-    section-specific page widths are a follow-up (the table is built
-    once per document, not once per section, since footnotes flow
-    against the section they reference into). */
-    let body_width = engine::PageGeometry::a4().content_width() * scale;
-    for (display, w_id) in &by_display {
-        let Some(paragraphs) = doc.footnotes.get(w_id) else {
-            continue;
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    composition: Option<&CompositionState>,
+) -> Vec<LayoutBlock> {
+    let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
+    let mut y = 0.0_f32;
+    for (block_idx, block) in blocks.iter().enumerate() {
+        let mut lb = match block {
+            engine::Block::Paragraph(para) => {
+                /* Issue #80 — inline IME preview inside the note being
+                edited. The composition's `at` path is STORY-rooted
+                (`Block(i)` = the note body's i-th block); the caller
+                only passes it for the ACTIVE note. */
+                let comp = composition.filter(|c| {
+                    bridge_to_engine_path(c.at.path.clone())
+                        == EngineBlockPath::top(block_idx as u32)
+                        && !c.text.is_empty()
+                        && (c.at.offset as usize) <= para.text.len()
+                        && para.text.is_char_boundary(c.at.offset as usize)
+                });
+                let mut p = match comp {
+                    Some(c) => layout_note_paragraph_with_composition(
+                        para,
+                        c,
+                        fonts,
+                        cfg,
+                        scale,
+                        content_width,
+                        sctx,
+                    ),
+                    None => {
+                        layout_paragraph_cached(para, fonts, cfg, scale, content_width, sctx, cache)
+                    }
+                };
+                /* Field ranges would be stale against the preview text. */
+                p.fields = if comp.is_some() {
+                    Vec::new()
+                } else {
+                    para.fields
+                        .iter()
+                        .map(|f| layout::LayoutField {
+                            byte_range: f.start..f.end,
+                            instruction: f.instruction.clone(),
+                            evaluated_text: None,
+                        })
+                        .collect()
+                };
+                p.borders = para.props.borders.clone();
+                p.shading = para.props.shading;
+                LayoutBlock::Paragraph(p)
+            }
+            engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
+                t,
+                content_width,
+                fonts,
+                cfg,
+                scale,
+                sctx,
+                cache,
+            )),
         };
-        /* Flatten the footnote's per-`<w:p>` plain text into one body
-        paragraph so the band lays out a single block per footnote.
-        Rich body formatting + multi-paragraph footnote bodies ship
-        with the Phase 8c sprint. */
-        let joined: String = paragraphs.join(" ");
-        let combined = format!("{display}. {joined}");
-        let spans = [StyleSpan {
-            start: 0,
-            end: combined.len() as u32,
-            px_size: cfg.px_size * scale * 0.85,
-            color: [0, 0, 0, 255],
-            bold: false,
-            italic: false,
-            underline: engine::UnderlineStyle::None,
-            strike: false,
-            bg_color: None,
-            font_family: None,
-            caps_transform: false,
-            baseline_shift_px: 0.0,
-        }];
-        let p = layout_paragraph(ParagraphConfig {
-            text: &combined,
-            fonts: font_stack,
-            spans: &spans,
-            base_direction: first_strong_direction(&combined).unwrap_or(cfg.base_direction),
-            max_width: body_width,
-            line_height: cfg.line_height * scale * 0.85,
-            line_height_exact: false,
-            alignment: cfg.alignment,
-            indent_start_px: 0.0,
-            indent_end_px: 0.0,
-            first_line_indent_px: 0.0,
-            hanging_indent_px: 0.0,
-            marker_text: None,
-            px_size_for_marker: cfg.px_size * scale * 0.85,
-            inline_objects: &[],
-            tab_stops_px: &[],
-        });
-        out.insert(*display, p);
+        let before = match block {
+            engine::Block::Paragraph(p) => twips_to_layout_px(p.props.spacing.before_twips, scale),
+            engine::Block::Table(_) => 0.0,
+        };
+        let after = match block {
+            engine::Block::Paragraph(p) => twips_to_layout_px(p.props.spacing.after_twips, scale),
+            engine::Block::Table(_) => 0.0,
+        };
+        y += before;
+        let mut o = lb.origin();
+        o.x = 0.0;
+        o.y = y;
+        lb.set_origin(o);
+        y += lb.size().height + after;
+        out.push(lb);
     }
     out
 }
 
-/// Phase 8a — recursive walker that fills `by_display[display_number] = w_id`.
-fn walk_block_for_footnote_refs(
-    block: &engine::Block,
-    by_display: &mut std::collections::HashMap<u32, u32>,
-) {
-    match block {
-        engine::Block::Paragraph(p) => {
-            for obj in &p.inline_objects {
-                if let engine::InlineKind::FootnoteRef { id, display_number } = &obj.kind {
-                    by_display.insert(*display_number, *id);
-                }
-            }
-        }
-        engine::Block::Table(t) => {
-            for row in &t.rows {
-                for cell in &row.cells {
-                    for b in &cell.blocks {
-                        walk_block_for_footnote_refs(b, by_display);
-                    }
-                }
-            }
+/// Issue #80 — lay out one note paragraph with the live IME composition
+/// spliced in at `c.at.offset` (uncached: the preview is transient).
+/// Unlike the body / band preview paths, the paragraph's inline objects
+/// ride along (shifted past the preview text) so the note's self-mark
+/// keeps painting while the user composes behind it.
+fn layout_note_paragraph_with_composition(
+    para: &engine::Paragraph,
+    c: &CompositionState,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    max_width: f32,
+    sctx: StyleContext,
+) -> ParagraphBox {
+    let off = c.at.offset as usize;
+    let ins = c.text.len() as u32;
+    let mut text = String::with_capacity(para.text.len() + c.text.len());
+    text.push_str(&para.text[..off]);
+    text.push_str(&c.text);
+    text.push_str(&para.text[off..]);
+    let spans = apply_revision_overlay(
+        apply_hyperlink_overlay(
+            composition_layout_spans(para, sctx, off as u32, ins, cfg.px_size, scale),
+            &para.hyperlinks,
+            [0, 0, 0, 255],
+        ),
+        &para.revisions,
+        [0, 0, 0, 255],
+    );
+    let mut infos = build_inline_object_infos(para, cfg, scale, sctx);
+    for info in &mut infos {
+        if info.at as usize >= off {
+            info.at += ins;
         }
     }
+    let base_direction = resolve_base_direction(para, cfg);
+    let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
+    let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    layout_paragraph(ParagraphConfig {
+        text: &text,
+        fonts,
+        spans: &spans,
+        base_direction,
+        max_width,
+        line_height: lh_px,
+        line_height_exact: lh_exact,
+        alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+        indent_start_px: ind_s,
+        indent_end_px: ind_e,
+        first_line_indent_px: ind_fl,
+        hanging_indent_px: ind_h,
+        marker_text: para.resolved_marker.clone(),
+        px_size_for_marker: cfg.px_size * scale,
+        inline_objects: &infos,
+        tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+    })
+}
+
+/// Issue #80 — the per-paint note tables the paginator consumes: every
+/// REFERENCED note story laid out at `content_width` keyed by its anchor,
+/// plus the document's `continuationNotice` story (if any). Special
+/// separator stories are never laid out — the paginator draws its own
+/// rules.
+#[allow(clippy::too_many_arguments)]
+fn build_note_bodies(
+    doc: &DocumentTree,
+    content_width: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    active_comp: Option<(engine::NoteAnchor, &CompositionState)>,
+) -> (
+    HashMap<engine::NoteAnchor, layout::NoteBody>,
+    Option<layout::NoteBody>,
+) {
+    let mut bodies: HashMap<engine::NoteAnchor, layout::NoteBody> = HashMap::new();
+    for r in doc.note_references() {
+        if bodies.contains_key(&r.anchor) {
+            continue;
+        }
+        let Some(story) = doc.note_story(r.anchor) else {
+            continue;
+        };
+        if story.note_type != engine::NoteType::Normal {
+            continue;
+        }
+        let mark = sctx.note_marker_text(r.anchor);
+        let comp = active_comp
+            .filter(|(anchor, _)| *anchor == r.anchor)
+            .map(|(_, c)| c);
+        let blocks = layout_note_blocks(
+            &story.body,
+            content_width,
+            fonts,
+            cfg,
+            scale,
+            sctx.with_self_mark(&mark),
+            cache,
+            comp,
+        );
+        bodies.insert(r.anchor, blocks);
+    }
+    let notice = doc
+        .special_note(
+            engine::NoteKind::Footnote,
+            engine::NoteType::ContinuationNotice,
+        )
+        .filter(|n| {
+            n.body.iter().any(|b| match b {
+                engine::Block::Paragraph(p) => !p.text.is_empty(),
+                engine::Block::Table(_) => true,
+            })
+        })
+        .map(|n| {
+            layout_note_blocks(
+                &n.body,
+                content_width,
+                fonts,
+                cfg,
+                scale,
+                sctx.with_self_mark(""),
+                cache,
+                None,
+            )
+        });
+    (bodies, notice)
+}
+
+/// Issue #80 — the endnotes referenced by top-level blocks in
+/// `[start, end)`, in reference order (deduped), paired with their laid
+/// out bodies — the paginator's trailing-band input.
+fn endnote_entries_for(
+    doc: &DocumentTree,
+    start: u32,
+    end: u32,
+    bodies: &HashMap<engine::NoteAnchor, layout::NoteBody>,
+    markers: &HashMap<engine::NoteAnchor, String>,
+    placed: &mut std::collections::HashSet<engine::NoteAnchor>,
+) -> Vec<(engine::NoteAnchor, String, layout::NoteBody)> {
+    let mut out = Vec::new();
+    for r in doc.note_references() {
+        if r.anchor.kind != engine::NoteKind::Endnote
+            || r.top_block < start
+            || r.top_block >= end
+            || placed.contains(&r.anchor)
+        {
+            continue;
+        }
+        let Some(body) = bodies.get(&r.anchor) else {
+            continue;
+        };
+        placed.insert(r.anchor);
+        let mark = markers
+            .get(&r.anchor)
+            .cloned()
+            .unwrap_or_else(|| r.anchor.id.to_string());
+        out.push((r.anchor, mark, body.clone()));
+    }
+    out
 }
 
 /// Phase 2 audit (gap D.1 follow-up) — lay out one section's header
@@ -3535,7 +3840,7 @@ fn layout_paragraph_cached(
     );
     let base_direction = resolve_base_direction(para, cfg);
     let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
-    let inline_infos = build_inline_object_infos(para, cfg, scale);
+    let inline_infos = build_inline_object_infos(para, cfg, scale, sctx);
     let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
     let para_cfg = ParagraphConfig {
         text: &para.text,
@@ -5048,9 +5353,17 @@ impl Engine {
                 None
             }
             _ => Some(Event::Error {
-                message: "This action isn't available while editing a header or footer \
-                          — exit the header/footer first."
-                    .into(),
+                message: match &self.active_story {
+                    StoryTarget::Note { .. } => {
+                        "This action isn't available while editing a footnote or endnote \
+                         — click back into the document body first."
+                    }
+                    _ => {
+                        "This action isn't available while editing a header or footer \
+                         — exit the header/footer first."
+                    }
+                }
+                .into(),
             }),
         }
     }
@@ -5324,6 +5637,8 @@ impl Engine {
             Command::SetTitlePage { enabled } => self.do_set_title_page(enabled),
             Command::SetEvenOddHeaders { enabled } => self.do_set_even_odd_headers(enabled),
             Command::InsertField { at, kind } => self.do_insert_field(at, kind),
+            Command::InsertFootnote { at } => self.do_insert_note(at, engine::NoteKind::Footnote),
+            Command::InsertEndnote { at } => self.do_insert_note(at, engine::NoteKind::Endnote),
             Command::SetRenderDate {
                 year,
                 month,
@@ -5708,6 +6023,22 @@ impl Engine {
         tree) then re-run the SAME resolution enter used. */
         let (is_header, section_block, role) = match &self.active_story {
             StoryTarget::Body => return,
+            StoryTarget::Note { .. } => {
+                /* Issue #80 — the note either still exists (clamp the
+                selection to its body) or was undone away (exit). */
+                if self.story_blocks().is_none() {
+                    self.exit_story_to_body();
+                } else if let Some(sel) = self.selection.clone() {
+                    let clamped = self.with_selection_doc(|d| SelectionState {
+                        anchor: clamp_pos(d, sel.anchor),
+                        caret: clamp_pos(d, sel.caret),
+                        ideal_x: None,
+                        kind: sel.kind,
+                    });
+                    self.selection = Some(clamped);
+                }
+                return;
+            }
             StoryTarget::Header {
                 section_block,
                 role,
@@ -5729,14 +6060,14 @@ impl Engine {
                     StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                         rid != &resolved
                     }
-                    StoryTarget::Body => false,
+                    StoryTarget::Body | StoryTarget::Note { .. } => false,
                 };
                 if stale {
                     match &mut self.active_story {
                         StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                             *rid = resolved;
                         }
-                        StoryTarget::Body => {}
+                        StoryTarget::Body | StoryTarget::Note { .. } => {}
                     }
                 }
                 if self.story_blocks().is_none() {
@@ -6234,7 +6565,10 @@ impl Engine {
 
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
-        let sctx = StyleContext::of(&doc);
+        /* Issue #80 — document-order note markers are a layout input
+        (shaped into every reference and self-mark). */
+        let note_markers = doc.note_markers();
+        let sctx = StyleContext::of(&doc).with_note_markers(&note_markers);
         let mut cache = self.layout_cache.borrow_mut();
         let composition = if with_composition {
             self.composition.as_ref()
@@ -6251,12 +6585,36 @@ impl Engine {
         split paragraphs (head + tail) share the same id and resolve
         to the same source string. */
         let mut next_para_id: u32 = 0;
-        /* Phase 8a — pre-resolve the footnote-body table the paginator
-        uses to grow the bottom band. The paginator keys by *display
-        number* (the marker text it sees on glyphs); we discover the
-        OOXML w:id → display_number mapping by scanning every body
-        paragraph's `InlineKind::FootnoteRef`. */
-        let footnote_bodies = build_footnote_bodies(&doc, &font_stack, &cfg, scale);
+        /* Issue #80 — lay every referenced note story out once at the
+        first section's content width (notes flow against the page they
+        reference into; a per-section width is a follow-up) and hand
+        the table to every paginator. Endnotes reuse the same bodies as
+        the trailing band's input. */
+        let note_width = sections
+            .first()
+            .map_or(engine::PageGeometry::a4().content_width(), |s| {
+                s.geometry.content_width()
+            })
+            * scale;
+        /* The active note previews the live IME composition. */
+        let note_comp = match (&self.active_story, composition) {
+            (StoryTarget::Note { kind, id, .. }, Some(c)) => u32::try_from(*id)
+                .ok()
+                .map(|id| (engine::NoteAnchor { kind: *kind, id }, c)),
+            _ => None,
+        };
+        let (note_bodies, continuation_notice) = build_note_bodies(
+            &doc,
+            note_width,
+            &font_stack,
+            &cfg,
+            scale,
+            sctx,
+            &mut cache,
+            note_comp,
+        );
+        let mut endnotes_placed: std::collections::HashSet<engine::NoteAnchor> =
+            std::collections::HashSet::new();
         /* Each top-level block is covered by at most one effective section. The
         paginator runs once across the whole document; section boundaries
         trigger a hard page break + geometry swap. */
@@ -6342,7 +6700,8 @@ impl Engine {
         let story_comp: Option<(&str, bool)> = match &self.active_story {
             StoryTarget::Header { rid, .. } => Some((rid.as_str(), true)),
             StoryTarget::Footer { rid, .. } => Some((rid.as_str(), false)),
-            StoryTarget::Body => None,
+            /* Issue #80 — a note previews through `build_note_bodies`. */
+            StoryTarget::Body | StoryTarget::Note { .. } => None,
         };
         'outer: for (sect_idx, section) in sections.iter().enumerate() {
             let geom = scaled_paginator_geometry(section.geometry, scale);
@@ -6404,7 +6763,8 @@ impl Engine {
                         footer: None,
                         header_offset: filler_geom.2,
                         footer_offset: filler_geom.3,
-                        footnotes: Vec::new(),
+                        footnotes: layout::NoteBand::default(),
+                        endnotes: layout::NoteBand::default(),
                         hf_role: layout::HeaderRole::Default,
                         page_number: incoming,
                         floats: Vec::new(),
@@ -6481,6 +6841,10 @@ impl Engine {
                 );
                 let doc_offset = emitted_pages.len() as u32;
                 pag.set_page_numbering(section.page_num, doc_offset);
+                pag.set_footnote_position(
+                    doc.resolved_note_props(engine::NoteKind::Footnote, Some(section))
+                        .position,
+                );
             } else {
                 let mut pag = Paginator::new(
                     geom,
@@ -6489,7 +6853,8 @@ impl Engine {
                     section.title_pg,
                     doc.settings.even_and_odd_headers,
                 )
-                .with_footnote_bodies(footnote_bodies.clone())
+                .with_note_bodies(note_bodies.clone())
+                .with_continuation_notice(continuation_notice.clone())
                 /* Issue #43 / #77 — DATE / TIME / FILENAME / AUTHOR
                 resolve against the shell-injected environment; the
                 field-code view freezes every field at its code text. */
@@ -6503,6 +6868,11 @@ impl Engine {
                 / formatted numbers. */
                 let doc_offset = emitted_pages.len() as u32;
                 pag.set_page_numbering(section.page_num, doc_offset);
+                /* Issue #80 — `<w:footnotePr><w:pos>` for this section. */
+                pag.set_footnote_position(
+                    doc.resolved_note_props(engine::NoteKind::Footnote, Some(section))
+                        .position,
+                );
                 paginator = Some(pag);
                 page_paths.clear();
                 page_paths.push(Vec::new());
@@ -6561,7 +6931,12 @@ impl Engine {
                         processed_blocks += 1;
                     }
                     engine::Block::Paragraph(para) => {
-                        let comp = composition.and_then(|c| {
+                        /* A story's composition path is STORY-rooted —
+                        it must never splice into the body block that
+                        happens to share its index (issue #80 review). */
+                        let body_comp =
+                            composition.filter(|_| matches!(self.active_story, StoryTarget::Body));
+                        let comp = body_comp.and_then(|c| {
                             if bridge_to_engine_path(c.at.path.clone()) != para_path
                                 || c.text.is_empty()
                             {
@@ -6686,6 +7061,39 @@ impl Engine {
                     }
                 }
             }
+            /* Issue #80 — `<w:endnotePr><w:pos w:val="sectEnd"/>`: this
+            section's endnotes trail its last block. */
+            let endnote_pos = doc
+                .resolved_note_props(engine::NoteKind::Endnote, Some(section))
+                .position;
+            if endnote_pos == engine::NotePosition::SectEnd
+                && let Some(pag) = paginator.as_mut()
+            {
+                let entries = endnote_entries_for(
+                    &doc,
+                    section.start_block,
+                    section.end_block,
+                    &note_bodies,
+                    &note_markers,
+                    &mut endnotes_placed,
+                );
+                pag.push_trailing_notes(entries);
+            }
+        }
+        /* Issue #80 — document-end endnotes (the default position):
+        every endnote not collected at a section end trails the body.
+        A culled (viewport) build never reaches the document end, so
+        it never places them — the full layout does. */
+        if !culled && let Some(pag) = paginator.as_mut() {
+            let entries = endnote_entries_for(
+                &doc,
+                0,
+                u32::MAX,
+                &note_bodies,
+                &note_markers,
+                &mut endnotes_placed,
+            );
+            pag.push_trailing_notes(entries);
         }
         if let Some(p) = paginator.take() {
             let (mut pages, notes) = p.finish_with_notes();
@@ -6709,7 +7117,7 @@ impl Engine {
         let story_skip: Option<(u32, bool)> = match &self.active_story {
             StoryTarget::Header { page, .. } => Some((*page, true)),
             StoryTarget::Footer { page, .. } => Some((*page, false)),
-            StoryTarget::Body => None,
+            StoryTarget::Body | StoryTarget::Note { .. } => None,
         };
         /* Issue #77 — `Codes` has nothing resolved to splice; `Probe`
         must keep the `evaluated_text` markers the restamp reads back. */
@@ -6741,7 +7149,8 @@ impl Engine {
                 footer: None,
                 header_offset: default_geom.header_offset,
                 footer_offset: default_geom.footer_offset,
-                footnotes: Vec::new(),
+                footnotes: layout::NoteBand::default(),
+                endnotes: layout::NoteBand::default(),
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
                 floats: Vec::new(),
@@ -6781,7 +7190,8 @@ impl Engine {
             footer: None,
             header_offset: 0.0,
             footer_offset: 0.0,
-            footnotes: Vec::new(),
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
@@ -7086,6 +7496,106 @@ impl Engine {
                 });
             }
         }
+        /* Issue #80 — note stories join the table too (footnotes then
+        endnotes, id-ascending), and every band entry is stamped from
+        its story's base plus the paragraphs before the block the entry
+        opens with (`first_block_index`); a continuation-notice tail on
+        a cut entry maps to the notice story. */
+        let mut note_bases: HashMap<engine::NoteAnchor, u32> = HashMap::new();
+        let mut notice_base: Option<u32> = None;
+        for kind in [engine::NoteKind::Footnote, engine::NoteKind::Endnote] {
+            let mut ids: Vec<i32> = doc.note_stories(kind).keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                let Some(story) = doc.note_stories(kind).get(&id) else {
+                    continue;
+                };
+                match story.note_type {
+                    engine::NoteType::Normal if id >= 0 => {
+                        note_bases.insert(
+                            engine::NoteAnchor {
+                                kind,
+                                id: id as u32,
+                            },
+                            para_texts.len() as u32,
+                        );
+                    }
+                    engine::NoteType::ContinuationNotice
+                        if kind == engine::NoteKind::Footnote && notice_base.is_none() =>
+                    {
+                        notice_base = Some(para_texts.len() as u32);
+                    }
+                    _ => continue,
+                }
+                for b in &story.body {
+                    walk_block_texts(b, &mut para_texts);
+                }
+            }
+        }
+        let notice_len = doc
+            .special_note(
+                engine::NoteKind::Footnote,
+                engine::NoteType::ContinuationNotice,
+            )
+            .map_or(0, |n| n.body.len());
+        for page in pages.iter_mut() {
+            for band in [&mut page.footnotes, &mut page.endnotes] {
+                for entry in band.entries.iter_mut() {
+                    let anchor = engine::NoteAnchor {
+                        kind: entry.kind,
+                        id: entry.id,
+                    };
+                    let (Some(&base), Some(story)) =
+                        (note_bases.get(&anchor), doc.note_story(anchor))
+                    else {
+                        continue;
+                    };
+                    let mut skipped: Vec<&str> = Vec::new();
+                    for b in story.body.iter().take(entry.first_block_index as usize) {
+                        walk_block_texts(b, &mut skipped);
+                    }
+                    let mut next = base + skipped.len() as u32;
+                    let story_blocks = if entry.continues_on_next && notice_len > 0 {
+                        entry.blocks.len().saturating_sub(notice_len)
+                    } else {
+                        entry.blocks.len()
+                    };
+                    for (i, lb) in entry.blocks.iter_mut().enumerate() {
+                        if i == story_blocks {
+                            match notice_base {
+                                Some(nb) => next = nb,
+                                None => break,
+                            }
+                        }
+                        let mut stamp = |p: &mut ParagraphBox| {
+                            p.source_paragraph_id = next;
+                            next += 1;
+                        };
+                        match lb {
+                            LayoutBlock::Paragraph(p) => stamp(p),
+                            LayoutBlock::Table(t) => {
+                                let mut cursor = next;
+                                for row in t.rows.iter_mut() {
+                                    for cell in row.cells.iter_mut() {
+                                        if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                                            continue;
+                                        }
+                                        layout::boxes::for_each_paragraph_in_blocks_mut(
+                                            &mut cell.content,
+                                            &mut |p| {
+                                                p.source_paragraph_id = cursor;
+                                                cursor += 1;
+                                            },
+                                        );
+                                    }
+                                }
+                                next = cursor;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut bytes: Vec<u8> = Vec::new();
         if let Err(e) =
             format_pdf::export_pdf(&pages, &font_stack, &para_texts, profile, &mut bytes)
@@ -7246,6 +7756,9 @@ impl Engine {
             StoryTarget::Body => None,
             StoryTarget::Header { rid, .. } => doc.headers.get(rid).cloned(),
             StoryTarget::Footer { rid, .. } => doc.footers.get(rid).cloned(),
+            StoryTarget::Note { kind, id, .. } => {
+                doc.note_stories(*kind).get(id).map(|s| s.body.clone())
+            }
         }
     }
 
@@ -7668,6 +8181,26 @@ impl Engine {
     fn bridge_story_ref(&self) -> Option<bridge::BridgeStoryRef> {
         let (area, rid, page, section_block, role) = match &self.active_story {
             StoryTarget::Body => return None,
+            /* Issue #80 — a note story: `rid` carries the note id, the
+            slot fields take their defaults (no inheritance for notes). */
+            StoryTarget::Note {
+                kind,
+                id,
+                page,
+                section_block,
+            } => {
+                return Some(bridge::BridgeStoryRef {
+                    area: match kind {
+                        engine::NoteKind::Footnote => bridge::HeaderFooterArea::Footnote,
+                        engine::NoteKind::Endnote => bridge::HeaderFooterArea::Endnote,
+                    },
+                    rid: id.to_string(),
+                    page: *page,
+                    role: bridge::BridgeHfRole::Default,
+                    linked: false,
+                    section_index: self.section_index_of_block(*section_block) as u32,
+                });
+            }
             StoryTarget::Header {
                 rid,
                 page,
@@ -7846,6 +8379,7 @@ impl Engine {
         match &self.active_story {
             StoryTarget::Header { page, .. } => return self.story_geometry(*page, true),
             StoryTarget::Footer { page, .. } => return self.story_geometry(*page, false),
+            StoryTarget::Note { kind, id, .. } => return self.note_geometry(*kind, *id),
             StoryTarget::Body => {}
         }
         /* `false` — hit-test + caret geometry run on committed document
@@ -8147,6 +8681,13 @@ impl Engine {
     /// keystroke that enters the serialized queue after the click is
     /// guaranteed to execute against the just-clicked caret.
     fn do_place_caret_at_point(&mut self, page_idx: u32, at: BridgePoint) -> Event {
+        /* Issue #80 — a press inside a note band switches the story
+        (Word: the footnote area is just another place the caret can
+        go); a press in the body while a note is open returns to the
+        body. Header/footer stories keep their own zone protocol. */
+        if let Err(e) = self.route_note_click(page_idx, at) {
+            return *e;
+        }
         let pos = match self.do_hit_test_in_page(page_idx, at) {
             Event::HitResult { pos } => pos,
             other => return other,
@@ -8897,7 +9438,8 @@ impl Engine {
         EnterHeaderFooter time. */
         let top_idx = match &self.active_story {
             StoryTarget::Header { section_block, .. }
-            | StoryTarget::Footer { section_block, .. } => *section_block,
+            | StoryTarget::Footer { section_block, .. }
+            | StoryTarget::Note { section_block, .. } => *section_block,
             StoryTarget::Body => match path.steps.first()? {
                 BridgePathStep::Block { idx } => *idx,
                 BridgePathStep::Cell { .. } => return None,
@@ -9306,9 +9848,10 @@ impl Engine {
     /// Issue #72 — blocks travel whole: a table inserted in the story
     /// tree lands in the part instead of being silently dropped.
     fn commit_story_edit(&mut self, mutated: &DocumentTree, caret: BridgeLogicalPos) -> Event {
-        let (rid, is_header) = match &self.active_story {
-            StoryTarget::Header { rid, .. } => (rid.clone(), true),
-            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+        let target = match &self.active_story {
+            StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
+            StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
+            StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
             StoryTarget::Body => {
                 return Event::Error {
                     message: "commit_story_edit outside a story".into(),
@@ -9324,11 +9867,7 @@ impl Engine {
         let real = self.undo.current();
         /* `with_updated_*_part` strips any stray `section_end` marker —
         a part can never masquerade as a section-boundary carrier. */
-        let new_real = if is_header {
-            real.with_updated_header_part(&rid, blocks)
-        } else {
-            real.with_updated_footer_part(&rid, blocks)
-        };
+        let new_real = target.write_blocks(real, blocks);
         self.undo.push(new_real);
         let caret = self.with_selection_doc(|d| clamp_pos(d, caret));
         self.caret_affinity = CaretAffinity::default();
@@ -9487,9 +10026,10 @@ impl Engine {
         );
         /* Keep the selection (a formatting change should not collapse
         it) — commit manually rather than through commit_story_edit. */
-        let (rid, is_header) = match &self.active_story {
-            StoryTarget::Header { rid, .. } => (rid.clone(), true),
-            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+        let target = match &self.active_story {
+            StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
+            StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
+            StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
             StoryTarget::Body => unreachable!("guarded by caller"),
         };
         let mut blocks: Vec<engine::Block> = new_doc.blocks.iter().cloned().collect();
@@ -9497,11 +10037,7 @@ impl Engine {
             blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
         }
         let real = self.undo.current();
-        let new_real = if is_header {
-            real.with_updated_header_part(&rid, blocks)
-        } else {
-            real.with_updated_footer_part(&rid, blocks)
-        };
+        let new_real = target.write_blocks(real, blocks);
         self.undo.push(new_real);
         self.selection = Some(SelectionState {
             anchor: start,
@@ -9544,6 +10080,292 @@ impl Engine {
     /// past materialize-on-enter). Drop back to body editing.
     fn story_vanished(&mut self) -> Event {
         self.exit_story_to_body();
+        self.selection_changed()
+    }
+
+    /// Issue #80 — the paginator's band entries for note `(kind, id)` on
+    /// every laid-out page, flattened into story-rooted line geometry:
+    /// entry block `j` is story block `first_block_index + j`, so a note
+    /// cut across pages hit-tests both fragments against the same body
+    /// (like a split body paragraph). Blocks past the story's own length
+    /// (the appended continuation notice) are not caret targets.
+    fn note_geometry(&self, kind: engine::NoteKind, id: i32) -> Result<Vec<LineGeom>, Box<Event>> {
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        let story_len = self
+            .undo
+            .current()
+            .note_stories(kind)
+            .get(&id)
+            .map_or(0, |s| s.body.len() as u32);
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell
+            .as_ref()
+            .expect("ensure_layout_snapshot populated the memo");
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let mut geom: Vec<LineGeom> = Vec::new();
+        let mut page_top = 0.0_f32;
+        for page in &snap.pages {
+            let content_x = page.margins.left;
+            let content_w = page.size.width - page.margins.left - page.margins.right;
+            for band in [&page.footnotes, &page.endnotes] {
+                for entry in &band.entries {
+                    if entry.kind != kind || i32::try_from(entry.id) != Ok(id) {
+                        continue;
+                    }
+                    let entry_top = page_top + band.y + entry.origin.y;
+                    let entry_x = content_x + entry.origin.x;
+                    for (j, block) in entry.blocks.iter().enumerate() {
+                        let idx = entry.first_block_index + j as u32;
+                        if idx >= story_len {
+                            break;
+                        }
+                        match block {
+                            LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
+                                para_box,
+                                entry_x,
+                                entry_top,
+                                entry_x,
+                                content_w,
+                                &BridgeBlockPath {
+                                    steps: vec![BridgePathStep::Block { idx }],
+                                },
+                                &mut geom,
+                            ),
+                            LayoutBlock::Table(table_box) => collect_table_line_geom(
+                                table_box,
+                                idx,
+                                entry_x + table_box.origin.x,
+                                entry_top + table_box.origin.y,
+                                &mut geom,
+                            ),
+                        }
+                    }
+                }
+            }
+            page_top += page.size.height + gap;
+        }
+        Ok(geom)
+    }
+
+    /// Issue #80 — the note band entry under a PAGE-LOCAL device-px
+    /// point on page `page_idx`, if any.
+    fn note_entry_at(&self, page_idx: u32, at: BridgePoint) -> Option<engine::NoteAnchor> {
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell.as_ref()?;
+        let page = snap.pages.get(page_idx as usize)?;
+        let content_x = page.margins.left;
+        let content_w = page.size.width - page.margins.left - page.margins.right;
+        for band in [&page.footnotes, &page.endnotes] {
+            for entry in &band.entries {
+                let x0 = content_x + entry.origin.x;
+                let y0 = band.y + entry.origin.y;
+                let y1 = y0 + entry.content_height();
+                if at.x >= x0 && at.x <= x0 + content_w && at.y >= y0 && at.y <= y1 {
+                    return Some(engine::NoteAnchor {
+                        kind: entry.kind,
+                        id: entry.id,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Issue #80 — story routing for a pointer press: enter the note
+    /// under the point (from the body or from another note), or leave a
+    /// note when the press lands outside every band. Header/footer
+    /// stories are untouched (their zone protocol lives in the shell).
+    fn route_note_click(&mut self, page_idx: u32, at: BridgePoint) -> Result<(), Box<Event>> {
+        if matches!(
+            self.active_story,
+            StoryTarget::Header { .. } | StoryTarget::Footer { .. }
+        ) {
+            return Ok(());
+        }
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        match self.note_entry_at(page_idx, at) {
+            Some(anchor) => {
+                let already = matches!(
+                    &self.active_story,
+                    StoryTarget::Note { kind, id, .. }
+                        if *kind == anchor.kind && i32::try_from(anchor.id) == Ok(*id)
+                );
+                if !already {
+                    let section_block = self.note_reference_block(anchor);
+                    self.enter_note_story(anchor, page_idx, section_block);
+                }
+            }
+            None => {
+                if matches!(self.active_story, StoryTarget::Note { .. }) {
+                    self.exit_story_to_body();
+                    self.announce(AnnouncementPriority::Polite, "Returned to document body");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Issue #80 — the top-level body block carrying the first reference
+    /// to `anchor` (0 for a dangling note).
+    fn note_reference_block(&self, anchor: engine::NoteAnchor) -> u32 {
+        self.undo
+            .current()
+            .note_references()
+            .iter()
+            .find(|r| r.anchor == anchor)
+            .map_or(0, |r| r.top_block)
+    }
+
+    /// Issue #80 — switch the caret into note `anchor`: stash the body
+    /// selection (when coming from the body), re-root the selection at
+    /// the note's first paragraph just past the self-mark (and its
+    /// following space, Word's caret home), announce.
+    fn enter_note_story(&mut self, anchor: engine::NoteAnchor, page: u32, section_block: u32) {
+        if !self.story_active() {
+            self.stashed_body_selection = self.selection.clone();
+        }
+        self.active_story = StoryTarget::Note {
+            kind: anchor.kind,
+            id: anchor.id as i32,
+            page,
+            section_block,
+        };
+        let home = self
+            .story_doc()
+            .as_ref()
+            .and_then(|d| {
+                let path = d.path_to_first_paragraph_deep()?;
+                let para = d.paragraph_at_path(&path)?;
+                let mut offset = 0u32;
+                if para.inline_objects.first().is_some_and(|o| {
+                    o.at == 0 && matches!(o.kind, engine::InlineKind::NoteSelfRef { .. })
+                }) {
+                    offset = '\u{FFFC}'.len_utf8() as u32;
+                    if para.text[offset as usize..].starts_with(' ') {
+                        offset += 1;
+                    }
+                }
+                Some(BridgeLogicalPos {
+                    path: engine_to_bridge_path(path),
+                    offset,
+                })
+            })
+            .unwrap_or_else(|| bpos_top(0, 0));
+        self.selection = Some(SelectionState {
+            anchor: home.clone(),
+            caret: home,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.caret_affinity = CaretAffinity::default();
+        self.pending_format = None;
+        let marker = self
+            .undo
+            .current()
+            .note_markers()
+            .get(&anchor)
+            .cloned()
+            .unwrap_or_else(|| anchor.id.to_string());
+        let what = match anchor.kind {
+            engine::NoteKind::Footnote => "footnote",
+            engine::NoteKind::Endnote => "endnote",
+        };
+        self.announce(
+            AnnouncementPriority::Polite,
+            format!("Editing {what} {marker}"),
+        );
+    }
+
+    /// Issue #80 — 0-based index of the laid-out page whose vertical
+    /// span (page + inter-page gap) contains document-absolute `y`.
+    fn page_index_at_y(&self, y: f32) -> u32 {
+        let snap_cell = self.layout_snapshot.borrow();
+        let Some(snap) = snap_cell.as_ref() else {
+            return 0;
+        };
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let mut top = 0.0_f32;
+        for (i, page) in snap.pages.iter().enumerate() {
+            let bottom = top + page.size.height + gap;
+            if y < bottom {
+                return i as u32;
+            }
+            top = bottom;
+        }
+        snap.pages.len().saturating_sub(1) as u32
+    }
+
+    /// `Command::InsertFootnote` / `Command::InsertEndnote` (issue #80)
+    /// — splice a reference at `at`, mint the story, then enter it so
+    /// typing lands in the note. One undo step (the insert); entering
+    /// is caret state. Body paragraphs only — the story gate rejects a
+    /// story caret, table cells are a follow-up (notes inside tables).
+    fn do_insert_note(&mut self, at: BridgeLogicalPos, kind: engine::NoteKind) -> Event {
+        let what = match kind {
+            engine::NoteKind::Footnote => "footnote",
+            engine::NoteKind::Endnote => "endnote",
+        };
+        if self.story_active() {
+            return Event::Error {
+                message: format!(
+                    "Insert {what}: notes can only be inserted from the document body"
+                ),
+            };
+        }
+        if at.path.steps.len() != 1 {
+            return Event::Error {
+                message: format!("Insert {what}: notes inside table cells aren't supported yet"),
+            };
+        }
+        let pos = to_engine_pos(at.clone());
+        let doc = self.undo.current();
+        if doc.paragraph_at_path(&pos.path).is_none() {
+            return Event::Error {
+                message: format!("Insert {what}: the caret does not address a paragraph"),
+            };
+        }
+        let (new_doc, id) = doc.insert_note_at(pos, kind);
+        self.undo.push(new_doc);
+        self.invalidate_layout_snapshot();
+        /* The body caret lands right after the new reference so exiting
+        the note returns there. */
+        let caret = BridgeLogicalPos {
+            path: at.path.clone(),
+            offset: at.offset + '\u{FFFC}'.len_utf8() as u32,
+        };
+        let caret = clamp_pos(self.undo.current(), caret);
+        self.caret_affinity = CaretAffinity::default();
+        self.pending_format = None;
+        self.selection = Some(SelectionState {
+            anchor: caret.clone(),
+            caret: caret.clone(),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        /* Anchor page = the page the reference line landed on. */
+        let page = match self.document_geometry() {
+            Ok(geom) => geom
+                .iter()
+                .find(|l| {
+                    l.path == caret.path
+                        && l.start_byte <= caret.offset
+                        && caret.offset <= l.end_byte
+                })
+                .map_or(0, |l| self.page_index_at_y(l.y_top)),
+            Err(e) => return *e,
+        };
+        let section_block = match at.path.steps.first() {
+            Some(BridgePathStep::Block { idx }) => *idx,
+            _ => 0,
+        };
+        let anchor = engine::NoteAnchor { kind, id };
+        self.enter_note_story(anchor, page, section_block);
         self.selection_changed()
     }
 
@@ -9638,6 +10460,16 @@ impl Engine {
     ///   content on a structurally unrelated section and mismatched
     ///   Word's titlePg materialization), as ONE undo entry.
     fn do_enter_header_footer(&mut self, page: u32, area: bridge::HeaderFooterArea) -> Event {
+        if matches!(
+            area,
+            bridge::HeaderFooterArea::Footnote | bridge::HeaderFooterArea::Endnote
+        ) {
+            return Event::Error {
+                message: "EnterHeaderFooter: notes are entered by clicking into the note \
+                          or with InsertFootnote / InsertEndnote, not by page zone"
+                    .into(),
+            };
+        }
         let is_header = matches!(area, bridge::HeaderFooterArea::Header);
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
         if let Err(e) = self.ensure_layout_snapshot(self.scale(), false, target_y) {
@@ -9685,7 +10517,12 @@ impl Engine {
                 new_rid
             }
         };
-        self.stashed_body_selection = self.selection.clone();
+        /* The BODY selection is what exit restores: switching from one
+        story to another (band → band, note → band) keeps the original
+        stash instead of overwriting it with a story-rooted path. */
+        if !self.story_active() {
+            self.stashed_body_selection = self.selection.clone();
+        }
         self.active_story = if is_header {
             StoryTarget::Header {
                 rid,
@@ -9751,7 +10588,7 @@ impl Engine {
     /// Previous" toggle for the active story's (section, area, role).
     fn do_set_header_footer_link(&mut self, linked: bool) -> Event {
         let (is_header, page, section_block, role, cur_rid) = match &self.active_story {
-            StoryTarget::Body => {
+            StoryTarget::Body | StoryTarget::Note { .. } => {
                 return Event::Error {
                     message: "SetHeaderFooterLink: no header or footer is being edited".into(),
                 };
@@ -9805,7 +10642,7 @@ impl Engine {
                 StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                     *rid = new_rid;
                 }
-                StoryTarget::Body => {}
+                StoryTarget::Body | StoryTarget::Note { .. } => {}
             }
             self.dirty.invalidate(full_page_rect(self.scale()));
             self.announce(
@@ -9830,7 +10667,7 @@ impl Engine {
                         StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                             *rid = resolved;
                         }
-                        StoryTarget::Body => {}
+                        StoryTarget::Body | StoryTarget::Note { .. } => {}
                     }
                     /* The inherited part may be shorter — clamp. */
                     if let Some(sel) = self.selection.clone() {
@@ -9930,6 +10767,9 @@ impl Engine {
                 *section_block,
                 Some((*page, bridge::HeaderFooterArea::Footer)),
             ),
+            /* Issue #80 — a note story anchors the toggle to the
+            reference's section but never re-anchors (no band slot). */
+            StoryTarget::Note { section_block, .. } => (*section_block, None),
             StoryTarget::Body => {
                 let block = self
                     .selection
@@ -10025,9 +10865,10 @@ impl Engine {
         caret: BridgeLogicalPos,
         preserve_selection: bool,
     ) -> Event {
-        let (rid, is_header) = match &self.active_story {
-            StoryTarget::Header { rid, .. } => (rid.clone(), true),
-            StoryTarget::Footer { rid, .. } => (rid.clone(), false),
+        let target = match &self.active_story {
+            StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
+            StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
+            StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
             StoryTarget::Body => {
                 return Event::Error {
                     message: "story_mutate outside a story".into(),
@@ -10043,11 +10884,7 @@ impl Engine {
             blocks.push(engine::Block::Paragraph(engine::Paragraph::default()));
         }
         let real = self.undo.current();
-        let mut new_real = if is_header {
-            real.with_updated_header_part(&rid, blocks)
-        } else {
-            real.with_updated_footer_part(&rid, blocks)
-        };
+        let mut new_real = target.write_blocks(real, blocks);
         /* Carry back doc-wide resources the mutation may have touched.
         numbering: ToggleList mints num ids on the story tree's CLONE —
         losing them dangles every new list_item (#72's documented
@@ -12718,6 +13555,7 @@ mod tests {
             synthetic,
             inline_image_rel_id: None,
             inline_footnote_marker: None,
+            inline_note_anchor: None,
             inline_object_height: 0.0,
             float: None,
         };
@@ -13421,6 +14259,8 @@ mod tests {
         StyleContext {
             styles: Box::leak(Box::default()),
             run_defaults: Box::leak(Box::default()),
+            note_markers: None,
+            note_self_mark: None,
         }
     }
 
@@ -13448,6 +14288,8 @@ mod tests {
         let sctx = StyleContext {
             styles: &styles,
             run_defaults: &run_defaults,
+            note_markers: None,
+            note_self_mark: None,
         };
         let mut para = engine::Paragraph {
             text: "hello world".into(),
@@ -14579,6 +15421,244 @@ mod tests {
             undo_depth,
             before + 1,
             "an interactive edit must push exactly one new snapshot"
+        );
+    }
+
+    /* ================================================================
+    Issue #80 — note stories: insert, enter, edit, exit, undo guard.
+    ================================================================ */
+
+    fn note_story_text(engine: &Engine, kind: engine::NoteKind, id: i32) -> String {
+        engine
+            .undo
+            .current()
+            .note_stories(kind)
+            .get(&id)
+            .and_then(|s| s.body.first())
+            .and_then(engine::Block::as_paragraph)
+            .map(|p| p.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// `InsertFootnote` splices the reference, mints story 1 and ENTERS
+    /// it; typing lands in the note (not the body); `ExitHeaderFooter`
+    /// returns to the body right after the reference; the marker of a
+    /// second, earlier footnote renumbers the first.
+    #[test]
+    fn insert_footnote_enters_the_note_and_types_into_it() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let at = bpos_top(0, "Alpha".len() as u32);
+        let evt = engine.do_insert_note(at, engine::NoteKind::Footnote);
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        let story = editing_story.as_ref().expect("the note story is active");
+        assert_eq!(story.area, bridge::HeaderFooterArea::Footnote);
+        assert_eq!(story.rid, "1");
+        assert!(matches!(
+            engine.active_story,
+            StoryTarget::Note {
+                kind: engine::NoteKind::Footnote,
+                id: 1,
+                ..
+            }
+        ));
+        let body0 = engine.undo.current().paragraph_text(0).unwrap().to_string();
+        assert_eq!(body0, "Alpha\u{FFFC} body text", "reference anchor spliced");
+        /* Caret home: past the self-mark + its space. */
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret.offset, 4);
+        assert_eq!(
+            note_story_text(&engine, engine::NoteKind::Footnote, 1),
+            "\u{FFFC} "
+        );
+
+        let typed = engine.do_insert_text_interactive(caret, "note text".to_string());
+        assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+        assert_eq!(
+            note_story_text(&engine, engine::NoteKind::Footnote, 1),
+            "\u{FFFC} note text",
+            "typing lands in the note story"
+        );
+        assert_eq!(
+            engine.undo.current().paragraph_text(0).unwrap(),
+            "Alpha\u{FFFC} body text",
+            "the body is untouched"
+        );
+        assert!(
+            engine.undo.current().notes_dirty.footnotes,
+            "the part is dirty for the writer"
+        );
+        let geom = engine.document_geometry().expect("note geometry");
+        assert!(
+            !geom.is_empty(),
+            "the note body hit-tests through its band entry"
+        );
+
+        let exited = engine.do_exit_header_footer();
+        let Event::SelectionChanged { editing_story, .. } = &exited else {
+            panic!("{exited:?}");
+        };
+        assert!(editing_story.is_none());
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret.path.steps, vec![BridgePathStep::Block { idx: 0 }]);
+        assert_eq!(caret.offset, 8, "body caret sits right after the reference");
+
+        /* A second footnote EARLIER in the body renumbers the first. */
+        let evt = engine.do_insert_note(bpos_top(0, 0), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let markers = engine.undo.current().note_markers();
+        let m = |id: u32| {
+            markers[&engine::NoteAnchor {
+                kind: engine::NoteKind::Footnote,
+                id,
+            }]
+                .clone()
+        };
+        assert_eq!((m(2), m(1)), ("1".to_string(), "2".to_string()));
+    }
+
+    /// Undo past the insert removes the story; the validity guard exits
+    /// the note back to the body instead of writing into a ghost.
+    #[test]
+    fn undo_past_note_insert_exits_the_story() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Endnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        assert!(matches!(engine.active_story, StoryTarget::Note { .. }));
+        let evt = engine.do_undo();
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(
+            matches!(engine.active_story, StoryTarget::Body),
+            "the note vanished with the undo — back in the body"
+        );
+        assert_eq!(
+            engine.undo.current().paragraph_text(0).unwrap(),
+            "Alpha body text"
+        );
+        assert!(engine.undo.current().endnote_stories.is_empty());
+    }
+
+    /// Story gate: inserting a note from inside a note (or a header) is
+    /// rejected; the message names the note.
+    #[test]
+    fn notes_cannot_nest() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let gated = engine.story_gate(&Command::InsertFootnote { at: bpos_top(0, 0) });
+        let Some(Event::Error { message }) = gated else {
+            panic!("expected a gate rejection, got {gated:?}");
+        };
+        assert!(message.contains("footnote or endnote"), "{message}");
+        let direct = engine.do_insert_note(bpos_top(0, 0), engine::NoteKind::Endnote);
+        assert!(matches!(direct, Event::Error { .. }));
+    }
+
+    /// Clicking inside the footnote band enters that note; clicking the
+    /// body while a note is open returns to the body.
+    #[test]
+    fn clicking_a_note_band_switches_the_story_and_back() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        engine.do_exit_header_footer();
+        assert!(matches!(engine.active_story, StoryTarget::Body));
+        /* Locate the band entry on page 0 from the layout snapshot. */
+        let (band_y, entry_h, x) = {
+            let snap_cell = engine.layout_snapshot.borrow();
+            let snap = snap_cell.as_ref().expect("snapshot");
+            let page = &snap.pages[0];
+            let entry = page
+                .footnotes
+                .entries
+                .first()
+                .expect("the note is on page 1");
+            (
+                page.footnotes.y + entry.origin.y,
+                entry.content_height(),
+                page.margins.left + 5.0,
+            )
+        };
+        let in_band = BridgePoint {
+            x,
+            y: band_y + entry_h * 0.5,
+        };
+        let evt = engine.do_place_caret_at_point(0, in_band);
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert_eq!(
+            editing_story.as_ref().map(|s| s.area),
+            Some(bridge::HeaderFooterArea::Footnote),
+            "a press in the band enters the note"
+        );
+        /* Press on the body's first line → back to the body. */
+        let body_point = BridgePoint {
+            x,
+            y: engine.undo.current().body_section.geometry.margin_top * engine.scale() + 4.0,
+        };
+        let evt = engine.do_place_caret_at_point(0, body_point);
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert!(
+            editing_story.is_none(),
+            "a press in the body leaves the note"
+        );
+        assert!(matches!(engine.active_story, StoryTarget::Body));
+    }
+
+    /// Issue #80 — the IME preview renders inside the ACTIVE note (its
+    /// band entry widens by the composed text) and never leaks into the
+    /// body block that shares the story-rooted path index.
+    #[test]
+    fn ime_preview_renders_inside_the_active_note_only() {
+        fn ink_width(p: &ParagraphBox) -> f32 {
+            p.lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .flat_map(|r| r.glyphs.iter())
+                .map(|g| g.x_advance)
+                .sum()
+        }
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let widths = |engine: &Engine| {
+            let (pages, ..) = engine
+                .build_pages(engine.scale(), true, None)
+                .expect("layout");
+            let page = &pages[0];
+            let note = match page
+                .footnotes
+                .entries
+                .first()
+                .expect("note entry")
+                .blocks
+                .first()
+            {
+                Some(LayoutBlock::Paragraph(p)) => ink_width(p),
+                other => panic!("{other:?}"),
+            };
+            let body = match page.blocks.first() {
+                Some(LayoutBlock::Paragraph(p)) => ink_width(p),
+                other => panic!("{other:?}"),
+            };
+            (note, body)
+        };
+        let (note0, body0) = widths(&engine);
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        engine.do_begin_composition(caret);
+        engine.do_update_composition("wide preview".to_string(), None);
+        let (note1, body1) = widths(&engine);
+        assert!(
+            note1 > note0 + 1.0,
+            "the note band previews the composition ({note0} -> {note1})"
+        );
+        assert!(
+            (body1 - body0).abs() < 0.01,
+            "the body block sharing the story path is untouched ({body0} -> {body1})"
         );
     }
 
@@ -16352,7 +17432,8 @@ mod tests {
             footer: None,
             header_offset: 36.0,
             footer_offset: 36.0,
-            footnotes: Vec::new(),
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),

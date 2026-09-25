@@ -38,7 +38,13 @@ export const HeaderFooterButtons: Component = () => {
     const state = createEditorState();
 
     const ready = createMemo(() => state.selection() !== undefined);
-    const story = () => state.editingStory();
+    /* Issue #80 — `editingStory()` also names footnote / endnote
+       stories; this cluster only manages the margin bands (a note's
+       Close lives in NoteButtons). */
+    const story = () => {
+        const s = state.editingStory();
+        return s && (s.area === 'Header' || s.area === 'Footer') ? s : undefined;
+    };
 
     /** 0-based page the caret sits on — engine-exact page tops when a
      *  paginated paint has reported them, else page 0. */

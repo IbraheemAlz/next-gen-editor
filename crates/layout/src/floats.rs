@@ -386,6 +386,7 @@ mod tests {
             synthetic: false,
             inline_image_rel_id: None,
             inline_footnote_marker: None,
+            inline_note_anchor: None,
             inline_object_height: 0.0,
             float: float.map(Box::new),
         }
@@ -467,7 +468,8 @@ mod tests {
             footer: None,
             header_offset: 20.0,
             footer_offset: 20.0,
-            footnotes: Vec::new(),
+            footnotes: Default::default(),
+            endnotes: Default::default(),
             hf_role: crate::boxes::HeaderRole::Default,
             page_number,
             floats: Vec::new(),

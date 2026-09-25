@@ -8,7 +8,7 @@
 //! is the geometry vocabulary, `peniko` the paint vocabulary.
 
 use kurbo::{Affine, Rect};
-use layout::{LayoutBlock, PageBox, ParagraphBox, TableBox};
+use layout::{LayoutBlock, NoteBand, PageBox, ParagraphBox, TableBox};
 use peniko::{Brush, Color};
 
 /// Font identifier — a key into the engine's font map.
@@ -194,34 +194,15 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
             paint_block(block, content_x, content_y, &mut cmds);
         }
 
-        /* Phase 8a — footnote band. Sits above the bottom margin, just
-        below the last body line; separated from the body by a thin
-        horizontal rule that visually distinguishes footnotes from
-        regular text. Heights were already reserved by the paginator,
-        so the entries always fit. */
-        if !page.footnotes.is_empty() {
-            let mut band_height = 0.0_f32;
-            for entry in &page.footnotes {
-                band_height += entry.paragraph.size.height;
-            }
-            let band_bottom = top + page.size.height - page.margins.bottom;
-            let band_top = band_bottom - band_height;
-            /* Separator rule — 30% of the content width, 0.75 pt tall. */
-            let rule_w = (page.size.width - page.margins.left - page.margins.right) * 0.3;
-            let rule_y = band_top - 6.0;
-            cmds.push(DisplayCmd::FillRect {
-                rect: Rect::new(
-                    content_x as f64,
-                    rule_y as f64,
-                    (content_x + rule_w) as f64,
-                    (rule_y + 0.75) as f64,
-                ),
-                paint: Paint::solid(Color::from_rgba8(0x55, 0x55, 0x55, 0xff)),
-            });
-            for entry in &page.footnotes {
-                paint_paragraph(&entry.paragraph, content_x, band_top, &mut cmds);
-            }
-        }
+        /* Issue #80 — note bands. The paginator owns placement
+        (`NoteBand::y`, page-relative) and already reserved the heights,
+        so entries always fit; the endnote band trails the body, the
+        footnote band sits at the page bottom (or beneath the text).
+        Each opens with a separator rule: 30 % of the content width for
+        a fresh band, full width when the band continues a note cut on
+        the previous page (Word's continuation separator). */
+        paint_note_band(&page.endnotes, page, top, content_x, &mut cmds);
+        paint_note_band(&page.footnotes, page, top, content_x, &mut cmds);
 
         if let Some(hf) = &page.footer {
             let band_top = top + page.footer_band_top();
@@ -239,6 +220,44 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         top += page.size.height + gap;
     }
     DisplayList { cmds }
+}
+
+/// Issue #80 — paint one note band: separator rule + every entry's
+/// blocks through the body's own block painter.
+fn paint_note_band(
+    band: &NoteBand,
+    page: &PageBox,
+    page_top: f32,
+    content_x: f32,
+    cmds: &mut Vec<DisplayCmd>,
+) {
+    if band.is_empty() {
+        return;
+    }
+    let band_top = page_top + band.y;
+    let content_w = page.size.width - page.margins.left - page.margins.right;
+    let rule_w = if band.continuation {
+        content_w
+    } else {
+        content_w * 0.3
+    };
+    let rule_y = band_top - 6.0;
+    cmds.push(DisplayCmd::FillRect {
+        rect: Rect::new(
+            content_x as f64,
+            rule_y as f64,
+            (content_x + rule_w) as f64,
+            (rule_y + 0.75) as f64,
+        ),
+        paint: Paint::solid(Color::from_rgba8(0x55, 0x55, 0x55, 0xff)),
+    });
+    for entry in &band.entries {
+        let entry_top = band_top + entry.origin.y;
+        let entry_x = content_x + entry.origin.x;
+        for block in &entry.blocks {
+            paint_block(block, entry_x, entry_top, cmds);
+        }
+    }
 }
 
 /// Issue #69 — paint one z-order group of a page's floating objects.
@@ -488,12 +507,10 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                 from text glyphs so the renderer routes them through
                 `DisplayCmd::DrawImage` instead of `DrawGlyphRun`. */
                 let mut images: Vec<(f64, f64, f64, f64, String)> = Vec::new();
-                /* Phase 8a — footnote markers paint as a small colored
-                rectangle (the OOXML default superscript-number glyph
-                isn't shaped — Phase 8b adds true superscript text).
-                The rectangle is drawn at the marker's reserved width,
-                rising from the baseline. */
-                let mut footnote_markers: Vec<(f64, f64, f64, f64)> = Vec::new();
+                /* Issue #80 — note markers are real superscript glyphs
+                now (shaped by `layout::paragraph::shape_note_marker`
+                into their own run with a raised baseline), so they
+                paint through the ordinary glyph path below. */
                 for glyph in &run.glyphs {
                     /* Issue #69 — a FLOATING object's sentinel reserves no
                     width and paints nothing in the line: the object itself
@@ -516,15 +533,6 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                         pen += glyph.x_advance;
                         continue;
                     }
-                    if glyph.inline_footnote_marker.is_some() {
-                        let x0 = (line_x as f64) + (pen as f64);
-                        let x1 = x0 + (glyph.x_advance as f64);
-                        let y1 = baseline - (glyph.inline_object_height as f64) * 0.2;
-                        let y0 = y1 - (glyph.inline_object_height as f64) * 0.8;
-                        footnote_markers.push((x0, y0, x1, y1));
-                        pen += glyph.x_advance;
-                        continue;
-                    }
                     /* glyph id 0 is .notdef — advance the pen, draw nothing. */
                     if glyph.id != 0 {
                         glyphs.push(RunGlyph {
@@ -540,12 +548,6 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                     cmds.push(DisplayCmd::DrawImage {
                         rect: Rect::new(x0, y0, x1, y1),
                         rel_id,
-                    });
-                }
-                for (x0, y0, x1, y1) in footnote_markers {
-                    cmds.push(DisplayCmd::FillRect {
-                        rect: Rect::new(x0, y0, x1, y1),
-                        paint: Paint::solid(Color::from_rgba8(0x05, 0x63, 0xC1, 0xFF)),
                     });
                 }
 

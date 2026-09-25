@@ -122,11 +122,18 @@ pub struct PositionedGlyph {
     /// this string at the glyph's pen position with `x_advance` as the
     /// physical width. The text glyph itself is **not** drawn.
     pub inline_image_rel_id: Option<String>,
-    /// Phase 8a — when set, this glyph anchors a footnote reference; the
-    /// renderer paints the marker text (e.g. `"1"`, `"2"`) as a
-    /// superscript at the glyph's pen position with `x_advance` as the
-    /// reserved width.
+    /// Phase 8a / issue #80 — when set, this glyph is the FIRST glyph of
+    /// a note marker (`"1"`, `"iv"`, …): the marker text itself. The
+    /// marker's digits are shaped into real glyphs at layout time (this
+    /// glyph plus `synthetic` continuation glyphs sharing its cluster), so
+    /// the renderer paints them like any run; the field is metadata for
+    /// the paginator and hit-testing.
     pub inline_footnote_marker: Option<String>,
+    /// Issue #80 — the note this marker REFERENCES (body text only). `None`
+    /// on the self-mark heading a note body and on every non-marker glyph.
+    /// The paginator reserves the note's band space when the line carrying
+    /// this glyph is placed.
+    pub inline_note_anchor: Option<engine::NoteAnchor>,
     /// Phase 7 — physical height of the anchored inline object in layout
     /// pixels. Folded into the line's ascent so the line grows to host
     /// the image without clipping.
@@ -507,12 +514,18 @@ pub struct PageBox {
     /// `<w:pgMar w:footer>`: distance from the page's bottom edge to the
     /// footer band's bottom.
     pub footer_offset: f32,
-    /// Phase 8a — footnote band. Each entry is the laid-out body of one
-    /// `<w:footnote>` whose `<w:footnoteReference>` lands somewhere in
-    /// this page's body content. Painted above the bottom margin in
-    /// emission order, separated from the body by a thin horizontal
-    /// rule. Origins are relative to the band's top-left.
-    pub footnotes: Vec<FootnoteEntry>,
+    /// Phase 8a / issue #80 — footnote band. Each entry is the laid-out
+    /// body (or the page's share of a split body) of one `<w:footnote>`
+    /// whose `<w:footnoteReference>` lands in this page's body content —
+    /// plus, at the head of the band, the continuation of a note split
+    /// off the previous page. Painted in band order below the body at
+    /// [`NoteBand::y`], separated from it by a rule.
+    pub footnotes: NoteBand,
+    /// Issue #80 — endnote band: the notes `<w:endnotePr><w:pos>` collects
+    /// at this section's / the document's end. Flows beneath the body's
+    /// last line (never page-bottom anchored) and continues onto the
+    /// following pages like a footnote continuation.
+    pub endnotes: NoteBand,
     /// Issue #74 — the header/footer slot this page resolved at flush
     /// time. Enter-header/footer derives the double-clicked page's
     /// role from this instead of re-deriving parity in a second place.
@@ -555,14 +568,96 @@ impl PageBox {
     }
 }
 
-/// Phase 8a — one laid-out footnote inside a [`PageBox::footnotes`] band.
-/// The marker text (e.g. `"1"`) is painted at the entry's leading edge so
-/// the reader can tie body text to footnote.
+/// Issue #80 — one note band on a page: the entries in band order plus
+/// where the band sits. `y` is page-relative (top edge of the FIRST
+/// entry; the separator rule paints above it). THE single source of band
+/// placement: paint, PDF and note hit-testing all read it, so pixels and
+/// caret geometry cannot diverge.
+#[derive(Debug, Clone, Default)]
+pub struct NoteBand {
+    pub entries: Vec<FootnoteEntry>,
+    /// Page-relative Y of `entries[0]`'s top. `0.0` when empty.
+    pub y: f32,
+    /// `true` when the band opens with a note continued from the
+    /// previous page: the separator paints as the full-width
+    /// continuation rule instead of the short one.
+    pub continuation: bool,
+}
+
+impl NoteBand {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Total laid-out height of the band's entries (no separator gap).
+    pub fn content_height(&self) -> f32 {
+        self.entries
+            .iter()
+            .map(|e| e.origin.y + e.content_height())
+            .fold(0.0, f32::max)
+    }
+
+    /// Every paragraph box in the band, recursing through table cells.
+    pub fn for_each_paragraph<'a>(&'a self, f: &mut impl FnMut(&'a ParagraphBox)) {
+        for e in &self.entries {
+            e.for_each_paragraph(f);
+        }
+    }
+
+    /// Mutable twin of [`Self::for_each_paragraph`].
+    pub fn for_each_paragraph_mut(&mut self, f: &mut impl FnMut(&mut ParagraphBox)) {
+        for e in &mut self.entries {
+            e.for_each_paragraph_mut(f);
+        }
+    }
+}
+
+/// Phase 8a / issue #80 — one laid-out note inside a [`NoteBand`]: the
+/// note's block model laid out at the content width, with the self-mark
+/// shaped into the first paragraph. `origin` is band-relative; block
+/// origins are entry-relative.
 #[derive(Debug, Clone)]
 pub struct FootnoteEntry {
+    /// The note's OOXML `w:id` (a key into the engine's story map).
     pub id: u32,
+    pub kind: engine::NoteKind,
+    /// The displayed number (`"1"`, `"iv"`, …) — informational; the
+    /// glyphs already carry it.
     pub marker: String,
-    pub paragraph: ParagraphBox,
+    pub origin: Point,
+    pub blocks: Vec<LayoutBlock>,
+    /// Story-block index of `blocks[0]` inside the note body — `0` for a
+    /// whole note or a head; a continuation resumes at the block the
+    /// split cut (a mid-paragraph cut repeats that block's index, the
+    /// fragment's glyph clusters being offsets into the full text).
+    /// Note hit-testing maps entry block `j` to story block
+    /// `first_block_index + j`.
+    pub first_block_index: u32,
+    /// This entry continues a note whose head sat on the previous page.
+    pub continued_from_previous: bool,
+    /// This entry is the head of a note that continues on the next page
+    /// (its blocks may end with the continuation-notice story).
+    pub continues_on_next: bool,
+}
+
+impl FootnoteEntry {
+    /// Deepest block bottom edge, entry-relative.
+    pub fn content_height(&self) -> f32 {
+        self.blocks
+            .iter()
+            .map(|b| b.origin().y + b.size().height)
+            .fold(0.0, f32::max)
+    }
+
+    /// Every paragraph box in the entry, recursing through table cells.
+    pub fn for_each_paragraph<'a>(&'a self, f: &mut impl FnMut(&'a ParagraphBox)) {
+        for_each_paragraph_in_blocks(&self.blocks, f);
+    }
+
+    /// Mutable twin of [`Self::for_each_paragraph`].
+    pub fn for_each_paragraph_mut(&mut self, f: &mut impl FnMut(&mut ParagraphBox)) {
+        for_each_paragraph_in_blocks_mut(&mut self.blocks, f);
+    }
 }
 
 /// A laid-out header / footer band. Issue #72 widened it from a flat

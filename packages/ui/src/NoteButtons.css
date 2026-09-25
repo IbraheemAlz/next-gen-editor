@@ -1,0 +1,26 @@
+/* Issue #80 — footnote / endnote toolbar entry points. */
+.nge-notes {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--nge-space-1);
+}
+
+.nge-notes__btn {
+    gap: var(--nge-space-1);
+}
+
+.nge-notes__btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.nge-notes__icon {
+    font-size: 12px;
+    line-height: 1;
+    color: var(--nge-color-primary);
+}
+
+.nge-notes__btn--close {
+    background: var(--nge-color-primary);
+    color: var(--nge-color-bg);
+}

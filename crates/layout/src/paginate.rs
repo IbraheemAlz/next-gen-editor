@@ -21,12 +21,13 @@
 //! paginator itself only knows about overflow.
 
 use crate::boxes::{
-    FootnoteEntry, HeaderFooterBox, LayoutBlock, LineBox, PageBox, ParagraphBox, Point, Size,
-    TableBox, TableRowBox,
+    FootnoteEntry, HeaderFooterBox, LayoutBlock, LineBox, NoteBand, PageBox, ParagraphBox, Point,
+    Size, TableBox, TableRowBox,
 };
 use crate::page::Margins;
 use crate::watchdog::{BlockFingerprint, DegradeReason, DegradeStage, LayoutDegradation, Watchdog};
-use std::collections::HashMap;
+use engine::{NoteAnchor, NotePosition};
+use std::collections::{HashMap, VecDeque};
 
 /// Per-role header / footer bands the paginator picks from for each
 /// page (Phase 2 audit — C.1 / C.2 / C.3). `default` covers pages
@@ -65,6 +66,97 @@ impl HeaderBands {
 /// pt at scale=1. The renderer multiplies by `scale` if it needs device
 /// pixels.
 pub const FOOTNOTE_SEPARATOR_HEIGHT_PT: f32 = 12.0;
+
+/* ============================================================
+Issue #80 — footnote / endnote space negotiation.
+
+The protocol (clean-room design notes: PRD_LIBREOFFICE §4C, the
+"deadline" rule; PRD_ONLYOFFICE §4.7, per-line reservation):
+
+- Reservation is PER LINE (per row for tables), not per block. When a
+  line carrying a note reference is placed, its note reserves band
+  space at the page bottom, shrinking the body budget for every later
+  line. The reference line must itself fit above its own note — the
+  deadline — so a note can never push its reference off the page.
+- A note that does not fit whole under its reference line SPLITS at a
+  line / row boundary: at least one line of it stays with the
+  reference, the remainder carries over and opens the next page's band
+  as a continuation (the continuation-notice story, when the document
+  ships one, closes the cut). A continuation may take at most
+  `1 - NOTE_BODY_RESERVE_FRACTION` of a fresh page so every page keeps
+  some body text (Word never emits a notes-only page) and a body block
+  always finds room to make measurable progress.
+- References travel with the fragment that holds their line (issue
+  #92): the fitter decides the split index WITH the notes counted, so
+  there is no commit-then-roll-back — a head keeps the notes of its own
+  lines, a tail re-collects its own when it is re-pushed.
+- Endnotes are a trailing story: [`Paginator::push_trailing_notes`]
+  stacks them beneath the body at section / document end, splitting
+  across pages the same way.
+
+Termination (issue #87): no negotiation loop re-pushes a block. The only
+loop is the carry-over drain — each page consumes at least one line of
+the carried note (the waiver clips a line that is taller than the
+allowance and reports `FootnoteOverflow`) — plus the page cap, which
+dumps the carry whole. Every escape hatch paints the note, clipped.
+============================================================ */
+
+/// Issue #80 — the laid-out blocks of one note story, stacked from
+/// `y = 0` at the band's content width. The engine lays every referenced
+/// story out once per paint; the paginator only splits and places.
+pub type NoteBody = Vec<LayoutBlock>;
+
+/// Issue #80 — share of a fresh page's body budget a note CONTINUATION
+/// leaves to the body (see the module protocol note).
+pub const NOTE_BODY_RESERVE_FRACTION: f32 = 0.2;
+
+/// Issue #80 — one note committed to the page being filled.
+#[derive(Debug, Clone)]
+struct PendingNote {
+    anchor: NoteAnchor,
+    marker: String,
+    /// Blocks placed on this page, stacked from `y = 0`; ends with the
+    /// continuation-notice story when the note continues.
+    blocks: Vec<LayoutBlock>,
+    height: f32,
+    /// Story-block index of `blocks[0]` (see
+    /// [`FootnoteEntry::first_block_index`]).
+    first_block_index: u32,
+    continued_from_previous: bool,
+    continues_on_next: bool,
+}
+
+/// Issue #80 — the remainder of a split note, waiting for the next
+/// page's band.
+#[derive(Debug, Clone)]
+struct NoteCarry {
+    anchor: NoteAnchor,
+    marker: String,
+    blocks: Vec<LayoutBlock>,
+    /// Story-block index of `blocks[0]`.
+    first_block_index: u32,
+    /// The blocks continue a note whose head sat on an earlier page.
+    continued: bool,
+}
+
+/// Issue #80 — one flow item the fitter walks (a body line or a table
+/// row) with the note references anchored on it.
+struct FlowItem {
+    /// Bottom edge of the item, block-relative.
+    bottom: f32,
+    anchors: Vec<(NoteAnchor, String)>,
+}
+
+/// Issue #80 — the fitter's verdict for one block's items.
+struct FitPlan {
+    /// Items `[0, count)` fit, with their notes reserved.
+    count: usize,
+    notes: Vec<PendingNote>,
+    carry: Vec<NoteCarry>,
+    /// The first-item waiver clipped a note (reported as
+    /// `FootnoteOverflow` when the plan commits).
+    clipped: bool,
+}
 
 /// Issue #87 — stage (c) of the watchdog ladder: the hard cap on pages
 /// one paginator emits. Past it the remaining flow is appended to the
@@ -135,17 +227,33 @@ pub struct Paginator {
     cur_y: f32,
     /// Finished pages.
     pages: Vec<PageBox>,
-    /// Phase 8a — pre-laid-out footnote bodies keyed by `w:id`. The
-    /// engine builds these once per document with the same paragraph
-    /// layout pipeline the body uses; the paginator only does lookups.
-    footnote_bodies: HashMap<u32, ParagraphBox>,
-    /// Phase 8a — footnote ids already accumulated on the current page
-    /// (in emission order; deduped). Drained on `flush_page`.
-    cur_footnote_ids: Vec<u32>,
-    /// Phase 8a — total height already consumed by the current page's
-    /// footnote band, including the separator gap. Subtracted from
-    /// the content budget so the body never overruns the band.
+    /// Issue #80 — pre-laid-out note bodies keyed by `(kind, w:id)`.
+    /// The engine builds these once per paint with the same block
+    /// layout pipeline the body uses; the paginator only splits and
+    /// places.
+    note_bodies: HashMap<NoteAnchor, NoteBody>,
+    /// Issue #80 — the laid-out `continuationNotice` story, appended
+    /// to a note's head when it is cut. `None` ⇒ no notice.
+    continuation_notice: Option<NoteBody>,
+    /// Issue #80 — `<w:footnotePr><w:pos>`: page bottom (default) or
+    /// beneath the body's last line.
+    footnote_position: NotePosition,
+    /// Issue #80 — footnotes committed to the current page, in band
+    /// order (a carried continuation first, then reference order).
+    cur_notes: Vec<PendingNote>,
+    /// Issue #80 — total height the current page's footnote band
+    /// consumes, separator gap included. Subtracted from the body
+    /// budget so the body never overruns the band.
     cur_footnote_height: f32,
+    /// Issue #80 — note remainders waiting to open the next page's
+    /// footnote band. Applied in `flush_page`, drained by `finish`.
+    footnote_carry: Vec<NoteCarry>,
+    /// Issue #80 — endnotes committed to the current page (trailing
+    /// band beneath the body) and the content-relative Y its first
+    /// entry opens at.
+    cur_endnotes: Vec<PendingNote>,
+    cur_endnote_band_y: f32,
+    cur_endnote_band_continuation: bool,
     /// Audit gap A.M11 — `<w:pgNumType>` for the active section.
     /// PAGE-field evaluator translates the doc-wide page number into
     /// (start + (doc_page - section_start_page)) when `start` is
@@ -201,9 +309,15 @@ impl Paginator {
             cur_section_start_idx: 0,
             cur_y: 0.0,
             pages: Vec::new(),
-            footnote_bodies: HashMap::new(),
-            cur_footnote_ids: Vec::new(),
+            note_bodies: HashMap::new(),
+            continuation_notice: None,
+            footnote_position: NotePosition::PageBottom,
+            cur_notes: Vec::new(),
             cur_footnote_height: 0.0,
+            footnote_carry: Vec::new(),
+            cur_endnotes: Vec::new(),
+            cur_endnote_band_y: 0.0,
+            cur_endnote_band_continuation: false,
             page_num: engine::PageNumType::default(),
             doc_page_offset: 0,
             field_env: engine::FieldEnv::default(),
@@ -497,13 +611,30 @@ impl Paginator {
         self.header_intrusion(self.page_role())
     }
 
-    /// Phase 8a — install the per-document footnote body table. The
-    /// paginator looks each `<w:footnoteReference w:id="N"/>` up here
-    /// when it scans a freshly-pushed paragraph and grows the footnote
-    /// band before deciding whether the paragraph still fits.
-    pub fn with_footnote_bodies(mut self, bodies: HashMap<u32, ParagraphBox>) -> Self {
-        self.footnote_bodies = bodies;
+    /// Issue #80 — install the per-document note body table. The
+    /// paginator looks each reference anchor up here when it places
+    /// the line carrying it and grows the footnote band before
+    /// deciding whether the next line still fits.
+    pub fn with_note_bodies(mut self, bodies: HashMap<NoteAnchor, NoteBody>) -> Self {
+        self.note_bodies = bodies;
         self
+    }
+
+    /// Issue #80 — install the laid-out `continuationNotice` story
+    /// (appended to a note's head on the page where it is cut).
+    pub fn with_continuation_notice(mut self, notice: Option<NoteBody>) -> Self {
+        self.continuation_notice = notice.filter(|n| !n.is_empty());
+        self
+    }
+
+    /// Issue #80 — `<w:footnotePr><w:pos>` for the active section.
+    /// `SectEnd` / `DocEnd` are meaningless for footnotes and behave as
+    /// `BeneathText` (Word's observed reading).
+    pub fn set_footnote_position(&mut self, position: NotePosition) {
+        self.footnote_position = match position {
+            NotePosition::PageBottom => NotePosition::PageBottom,
+            _ => NotePosition::BeneathText,
+        };
     }
 
     /// Y cursor within the current page's content area (parent-relative).
@@ -686,44 +817,17 @@ impl Paginator {
             return;
         }
 
-        /* Phase 8a — gather every NEW footnote referenced by this block
-        (already-on-page refs don't grow the band) and provisionally
-        commit their heights to the budget. We undo the commit if the
-        block ends up forced onto a new page. */
-        let new_refs: Vec<u32> = collect_footnote_refs(&block)
-            .into_iter()
-            .filter(|id| !self.cur_footnote_ids.contains(id))
-            .collect();
-        let (added_height, added_separator) = self.try_consume_footnotes(&new_refs);
-
-        let remaining = self.geometry.content_height()
-            - self.cur_y
-            - self.cur_footnote_height
-            - self.footer_intrusion(self.page_role());
+        let remaining = self.body_budget();
         let block_height = block.size().height;
 
-        /* Issue #87 — footnote negotiation is one-shot (commit, check,
-        roll back), so it cannot loop; but a band that leaves NO body
-        budget on a fresh page can never be satisfied by any later page
-        either. Bouncing the block forward would drop the footnote on
-        the floor (the rollback below discards the refs while the head
-        that carries them stays here). Keep the band, place the block
-        atomically over it and say so. */
-        if remaining < 0.0 && !new_refs.is_empty() && self.cur_blocks.is_empty() {
-            let page = self.cur_page_index();
-            self.watchdog.note(DegradeReason::FootnoteOverflow, page);
-            self.place_atomic(block, after);
-            return;
-        }
-
-        /* Paragraphs always run through the line-splitter when they
-        don't fit — even when the current page is empty — so a single
-        oversize paragraph turns into N pages, not one overflowing
-        bag of content. Tables stay atomic on an empty page: the
-        line-splitter doesn't apply, and a table taller than a full
-        page is a rare authoring decision the user took deliberately.
-        `push_paragraph_split` carries its own termination guard for
-        the pathological single-line-bigger-than-page case. */
+        /* Paragraphs always run through the line-fitter: issue #80
+        reserves note-band space PER LINE (the reference line must fit
+        above its own note), so even a paragraph that fits by height
+        alone may split once its notes are counted. A paragraph that
+        does not fit turns into N pages, not one overflowing bag of
+        content. Tables stay atomic on an empty page: the line-splitter
+        doesn't apply, and a table taller than a full page is a rare
+        authoring decision the user took deliberately. */
         let is_paragraph = matches!(block, LayoutBlock::Paragraph(_));
         let atomic_overflow_ok = !is_paragraph && self.cur_blocks.is_empty();
         /* Phase 2 audit (gap A.12) — paragraphs carrying a forced
@@ -737,100 +841,479 @@ impl Paginator {
         } else {
             false
         };
-        if (block_height <= remaining || atomic_overflow_ok) && !has_forced_break {
-            /* Issue #87 — an atomic table taller than the budget clips
-            past the bottom margin. Same placement as before; now the
-            paint says so. */
-            if block_height > remaining {
-                let page = self.cur_page_index();
-                self.watchdog.note(DegradeReason::OversizeLine, page);
-            }
-            /* Audit gap A.H2 — origin.x carries the column offset for
-            multi-column sections (zero for single-column, preserving
-            the legacy "page-wide" behaviour). */
-            self.place_atomic(block, after);
-            return;
-        }
-        /* Rollback footnote provisional commit only for the
-        budget-overflow branch — a forced break still keeps its
-        footnote refs on the current page (the head lands here, the
-        tail starts a new page where its own footnotes accumulate
-        anew). */
-        if !has_forced_break {
-            /* Overflow. Roll back the provisional footnote commit
-            before retrying: the refs belong to the block, the block
-            is going to the next page, and they should land in that
-            page's band. */
-            self.rollback_footnotes(&new_refs, added_height, added_separator);
-        }
-
-        /* Pure block-level (a table on a non-empty page that doesn't
-        fit) is the easy case: flush, retry. Paragraphs split at line
-        boundaries (`push_paragraph_split` also handles the forced
-        page-break path). */
         match block {
-            LayoutBlock::Paragraph(p) => self.push_paragraph_split(p, after, observe),
-            LayoutBlock::Table(t) => self.push_table_split(t, after, observe),
-        }
-    }
-
-    /// Provisional footnote commit. Returns `(extra_height_added,
-    /// added_separator)` so [`Self::rollback_footnotes`] can undo it on
-    /// an overflow path.
-    fn try_consume_footnotes(&mut self, new_refs: &[u32]) -> (f32, bool) {
-        if new_refs.is_empty() {
-            return (0.0, false);
-        }
-        let mut extra = 0.0_f32;
-        let added_separator = self.cur_footnote_ids.is_empty();
-        if added_separator {
-            extra += FOOTNOTE_SEPARATOR_HEIGHT_PT;
-        }
-        for id in new_refs {
-            if let Some(body) = self.footnote_bodies.get(id) {
-                extra += body.size.height;
+            LayoutBlock::Paragraph(p) => {
+                /* The nominal note-free fast path is byte-identical to
+                the pre-#80 "fits whole" step; the fitter takes over as
+                soon as a line carries a reference. */
+                if !has_forced_break && block_height <= remaining && !paragraph_has_note_anchors(&p)
+                {
+                    self.place_atomic(LayoutBlock::Paragraph(p), after);
+                    return;
+                }
+                self.push_paragraph_split(p, remaining, after, observe)
             }
-            self.cur_footnote_ids.push(*id);
+            LayoutBlock::Table(t) => {
+                /* Issue #80 — the table's notes are reserved as a block:
+                a table that fits by height but not with its notes moves
+                like one that does not fit. */
+                let anchors = collect_note_anchors(&LayoutBlock::Table(t.clone()));
+                let plan = self.fit_items(
+                    &[FlowItem {
+                        bottom: block_height,
+                        anchors,
+                    }],
+                    remaining,
+                    atomic_overflow_ok,
+                );
+                if plan.count == 1 || atomic_overflow_ok {
+                    /* Issue #87 — an atomic table taller than the budget
+                    clips past the bottom margin. Same placement as
+                    before; now the paint says so. */
+                    if block_height > remaining {
+                        let page = self.cur_page_index();
+                        self.watchdog.note(DegradeReason::OversizeLine, page);
+                    }
+                    self.commit_plan(plan);
+                    /* Audit gap A.H2 — origin.x carries the column offset
+                    for multi-column sections (zero for single-column,
+                    preserving the legacy "page-wide" behaviour). */
+                    self.place_atomic(LayoutBlock::Table(t), after);
+                    return;
+                }
+                self.push_table_split(t, after, observe);
+            }
         }
-        self.cur_footnote_height += extra;
-        (extra, added_separator)
     }
 
-    fn rollback_footnotes(&mut self, new_refs: &[u32], extra: f32, added_separator: bool) {
-        if new_refs.is_empty() {
+    /// Issue #80 — the vertical room left for body content in the
+    /// current column: the content height minus the cursor, the footnote
+    /// band and the footer's intrusion.
+    fn body_budget(&self) -> f32 {
+        self.geometry.content_height()
+            - self.cur_y
+            - self.cur_footnote_height
+            - self.footer_intrusion(self.page_role())
+    }
+
+    /// Issue #80 — the deadline fitter. Walks `items` (lines or rows) in
+    /// order and decides how many fit in `remaining` once the notes
+    /// anchored on them are reserved at the page bottom. Notes already on
+    /// the page (or earlier in the plan) reserve nothing. The first item
+    /// whose notes do not fit whole splits the offending note — at least
+    /// one line stays under the reference — and closes the band; if not
+    /// even one line fits, the item moves forward, unless it is the first
+    /// item of a fresh page (`fresh`), where the rule is waived and the
+    /// first line is clipped (`FootnoteOverflow`) so the flow terminates.
+    fn fit_items(&self, items: &[FlowItem], remaining: f32, fresh: bool) -> FitPlan {
+        let mut plan = FitPlan {
+            count: 0,
+            notes: Vec::new(),
+            carry: Vec::new(),
+            clipped: false,
+        };
+        let mut reserve = 0.0_f32;
+        let mut band_open = !self.cur_notes.is_empty();
+        let notice_h = self
+            .continuation_notice
+            .as_deref()
+            .map_or(0.0, blocks_height);
+        for (i, item) in items.iter().enumerate() {
+            let mut bodies: Vec<(NoteAnchor, String, Vec<LayoutBlock>)> = Vec::new();
+            for (anchor, marker) in &item.anchors {
+                let seen = self.cur_notes.iter().any(|n| n.anchor == *anchor)
+                    || plan.notes.iter().any(|n| n.anchor == *anchor)
+                    || bodies.iter().any(|(a, _, _)| a == anchor);
+                if seen {
+                    continue;
+                }
+                /* A dangling id (no story) reserves nothing — Word
+                tolerates those and simply paints no note. */
+                let Some(body) = self.note_bodies.get(anchor) else {
+                    continue;
+                };
+                if body.is_empty() {
+                    continue;
+                }
+                bodies.push((*anchor, marker.clone(), body.clone()));
+            }
+            let sep = if !band_open && !bodies.is_empty() {
+                FOOTNOTE_SEPARATOR_HEIGHT_PT
+            } else {
+                0.0
+            };
+            let need: f32 = sep + bodies.iter().map(|(_, _, b)| blocks_height(b)).sum::<f32>();
+            if item.bottom + reserve + need <= remaining {
+                reserve += need;
+                if !bodies.is_empty() {
+                    band_open = true;
+                }
+                for (anchor, marker, blocks) in bodies {
+                    let height = blocks_height(&blocks);
+                    plan.notes.push(PendingNote {
+                        anchor,
+                        marker,
+                        blocks,
+                        height,
+                        first_block_index: 0,
+                        continued_from_previous: false,
+                        continues_on_next: false,
+                    });
+                }
+                plan.count = i + 1;
+                continue;
+            }
+            /* The item does not fit with its notes whole. A plain item
+            splits the block here; an item with notes may still land if
+            the offending note splits. */
+            if bodies.is_empty() {
+                break;
+            }
+            let waiver = fresh && i == 0 && plan.notes.is_empty();
+            let item_fits = item.bottom + reserve <= remaining;
+            if !item_fits && !waiver {
+                break;
+            }
+            let avail = ((remaining - reserve - item.bottom).max(0.0) - sep).max(0.0);
+            let mut used = 0.0_f32;
+            let mut placed: Vec<PendingNote> = Vec::new();
+            let mut carry: Vec<NoteCarry> = Vec::new();
+            let mut split_done = false;
+            let mut stalled = false;
+            for (anchor, marker, blocks) in bodies {
+                if split_done {
+                    /* A whole note carried behind a split one is not a
+                    continuation: it opens fresh on the next page. */
+                    carry.push(NoteCarry {
+                        anchor,
+                        marker,
+                        blocks,
+                        first_block_index: 0,
+                        continued: false,
+                    });
+                    continue;
+                }
+                let h = blocks_height(&blocks);
+                if used + h <= avail {
+                    placed.push(PendingNote {
+                        anchor,
+                        marker,
+                        blocks,
+                        height: h,
+                        first_block_index: 0,
+                        continued_from_previous: false,
+                        continues_on_next: false,
+                    });
+                    used += h;
+                    continue;
+                }
+                let budget = avail - used - notice_h;
+                let (mut head, mut tail, mut tail_first) = if budget > 0.0 {
+                    split_note_blocks(&blocks, budget)
+                } else {
+                    (Vec::new(), blocks.clone(), 0)
+                };
+                if head.is_empty() {
+                    if waiver && placed.is_empty() {
+                        /* First line of a fresh page: nothing later could
+                        ever host it either. Clip the note's first slice
+                        under the line and say so. */
+                        let (h0, t0, f0) = first_note_slice(&blocks);
+                        head = h0;
+                        tail = t0;
+                        tail_first = f0;
+                        plan.clipped = true;
+                    } else {
+                        stalled = true;
+                        break;
+                    }
+                }
+                let continues = !tail.is_empty();
+                if continues {
+                    if let Some(notice) = self.continuation_notice.as_deref() {
+                        append_stacked(&mut head, notice);
+                    }
+                    carry.push(NoteCarry {
+                        anchor,
+                        marker: marker.clone(),
+                        blocks: tail,
+                        first_block_index: tail_first,
+                        continued: true,
+                    });
+                }
+                let hh = blocks_height(&head);
+                placed.push(PendingNote {
+                    anchor,
+                    marker,
+                    blocks: head,
+                    height: hh,
+                    first_block_index: 0,
+                    continued_from_previous: false,
+                    continues_on_next: continues,
+                });
+                used += hh;
+                split_done = true;
+            }
+            if stalled {
+                /* The item moves forward with its notes. */
+                break;
+            }
+            plan.notes.extend(placed);
+            plan.carry = carry;
+            plan.count = i + 1;
+            /* The band is full (or the waiver fired): nothing below this
+            item can fit on the page. */
+            break;
+        }
+        plan
+    }
+
+    /// Issue #80 — commit a fitter plan to the page: the notes join the
+    /// band (separator gap when it opens), the carry waits for the next
+    /// page, and a clip is reported.
+    fn commit_plan(&mut self, plan: FitPlan) {
+        if plan.notes.is_empty() && plan.carry.is_empty() && !plan.clipped {
             return;
         }
-        /* Remove from the tail — the provisional push appended them in
-        order, so the unwind pops the same ids. Defensive `retain`
-        guards against duplicates the caller might pass. */
-        for id in new_refs.iter().rev() {
-            if let Some(pos) = self.cur_footnote_ids.iter().rposition(|x| x == id) {
-                self.cur_footnote_ids.remove(pos);
-            }
+        if self.cur_notes.is_empty() && !plan.notes.is_empty() {
+            self.cur_footnote_height += FOOTNOTE_SEPARATOR_HEIGHT_PT;
         }
-        self.cur_footnote_height -= extra;
-        if added_separator && self.cur_footnote_ids.is_empty() {
-            /* `extra` already includes the separator; nothing else to do. */
+        for n in plan.notes {
+            self.cur_footnote_height += n.height;
+            self.cur_notes.push(n);
         }
-        if self.cur_footnote_height < 0.0 {
-            self.cur_footnote_height = 0.0;
+        self.footnote_carry.extend(plan.carry);
+        if plan.clipped {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::FootnoteOverflow, page);
         }
     }
 
-    /// Issue #87 — un-commit footnotes a relocated keep-chain carried:
-    /// the ids leave this page's band (they re-commit on the page the
-    /// chain lands on) and the band height shrinks accordingly.
-    fn uncommit_footnotes(&mut self, ids: &[u32]) {
-        for id in ids {
-            if let Some(pos) = self.cur_footnote_ids.iter().rposition(|x| x == id) {
-                self.cur_footnote_ids.remove(pos);
-                let h = self.footnote_bodies.get(id).map_or(0.0, |b| b.size.height);
-                self.cur_footnote_height -= h;
+    /// Issue #80 / #87 — un-commit the notes a relocated keep-chain
+    /// carried: the anchors leave this page's band (they re-commit on
+    /// the page the chain lands on, from the chain's own glyphs) and
+    /// any carry they produced is dropped — the full body re-collects.
+    fn uncommit_notes(&mut self, anchors: &[NoteAnchor]) {
+        if anchors.is_empty() {
+            return;
+        }
+        self.cur_notes.retain(|n| !anchors.contains(&n.anchor));
+        self.footnote_carry.retain(|c| !anchors.contains(&c.anchor));
+        self.recompute_footnote_height();
+    }
+
+    fn recompute_footnote_height(&mut self) {
+        self.cur_footnote_height = if self.cur_notes.is_empty() {
+            0.0
+        } else {
+            FOOTNOTE_SEPARATOR_HEIGHT_PT + self.cur_notes.iter().map(|n| n.height).sum::<f32>()
+        };
+    }
+
+    /// Issue #80 — open a fresh page's footnote band with the carried
+    /// continuation(s). The continuation may take at most
+    /// `1 - NOTE_BODY_RESERVE_FRACTION` of the body budget; what does not
+    /// fit is split again and carried on. Progress is guaranteed: a
+    /// slice that cannot be split further is placed whole and clipped
+    /// (`FootnoteOverflow`). Past the page cap the carry lands whole.
+    fn apply_footnote_carry(&mut self) {
+        if self.footnote_carry.is_empty() {
+            return;
+        }
+        let carry = std::mem::take(&mut self.footnote_carry);
+        let budget =
+            (self.geometry.content_height() - self.cur_y - self.footer_intrusion(self.page_role()))
+                .max(0.0);
+        let allowance = if self.capped {
+            f32::INFINITY
+        } else {
+            (budget * (1.0 - NOTE_BODY_RESERVE_FRACTION) - FOOTNOTE_SEPARATOR_HEIGHT_PT).max(0.0)
+        };
+        let notice_h = self
+            .continuation_notice
+            .as_deref()
+            .map_or(0.0, blocks_height);
+        let mut used = 0.0_f32;
+        let mut rest: Vec<NoteCarry> = Vec::new();
+        let mut split_done = false;
+        for c in carry {
+            if split_done {
+                rest.push(c);
+                continue;
+            }
+            let h = blocks_height(&c.blocks);
+            if used + h <= allowance {
+                self.cur_notes.push(PendingNote {
+                    anchor: c.anchor,
+                    marker: c.marker,
+                    blocks: c.blocks,
+                    height: h,
+                    first_block_index: c.first_block_index,
+                    continued_from_previous: c.continued,
+                    continues_on_next: false,
+                });
+                used += h;
+                continue;
+            }
+            let split_budget = allowance - used - notice_h;
+            let (mut head, mut tail, mut tail_first) = if split_budget > 0.0 {
+                split_note_blocks(&c.blocks, split_budget)
+            } else {
+                (Vec::new(), c.blocks.clone(), 0)
+            };
+            if head.is_empty() {
+                let (h0, t0, f0) = first_note_slice(&c.blocks);
+                head = h0;
+                tail = t0;
+                tail_first = f0;
+                let page = self.cur_page_index();
+                self.watchdog.note(DegradeReason::FootnoteOverflow, page);
+            }
+            let continues = !tail.is_empty();
+            if continues {
+                if let Some(notice) = self.continuation_notice.as_deref() {
+                    append_stacked(&mut head, notice);
+                }
+                rest.push(NoteCarry {
+                    anchor: c.anchor,
+                    marker: c.marker.clone(),
+                    blocks: tail,
+                    first_block_index: c.first_block_index + tail_first,
+                    continued: true,
+                });
+            }
+            let hh = blocks_height(&head);
+            self.cur_notes.push(PendingNote {
+                anchor: c.anchor,
+                marker: c.marker,
+                blocks: head,
+                height: hh,
+                first_block_index: c.first_block_index,
+                continued_from_previous: c.continued,
+                continues_on_next: continues,
+            });
+            used += hh;
+            split_done = true;
+        }
+        self.footnote_carry = rest;
+        self.recompute_footnote_height();
+    }
+
+    /// Issue #80 — append note stories as a TRAILING band beneath the
+    /// body (endnotes at section / document end). Entries stack in the
+    /// given order below the current cursor with the separator gap; a
+    /// note that does not fit splits at a line boundary and continues
+    /// at the top of the next page (the continuation separator paints
+    /// full-width). Multi-column sections drop below their deepest
+    /// column first — the band spans the content width.
+    pub fn push_trailing_notes(&mut self, notes: Vec<(NoteAnchor, String, NoteBody)>) {
+        if notes.is_empty() {
+            return;
+        }
+        if self.column_count > 1 {
+            let deepest = self.cur_blocks[self.cur_section_start_idx.min(self.cur_blocks.len())..]
+                .iter()
+                .map(|b| b.origin().y + b.size().height)
+                .fold(0.0_f32, f32::max);
+            self.cur_y = self.cur_y.max(deepest);
+            self.cur_column_index = 0;
+        }
+        let notice_h = self
+            .continuation_notice
+            .as_deref()
+            .map_or(0.0, blocks_height);
+        let mut queue: VecDeque<NoteCarry> = notes
+            .into_iter()
+            .filter(|(_, _, b)| !b.is_empty())
+            .map(|(anchor, marker, blocks)| NoteCarry {
+                anchor,
+                marker,
+                blocks,
+                first_block_index: 0,
+                continued: false,
+            })
+            .collect();
+        while let Some(c) = queue.pop_front() {
+            let band_open = !self.cur_endnotes.is_empty();
+            let sep = if band_open {
+                0.0
+            } else {
+                FOOTNOTE_SEPARATOR_HEIGHT_PT
+            };
+            let remaining = self.body_budget() - sep;
+            let h = blocks_height(&c.blocks);
+            if h <= remaining || self.capped {
+                self.place_endnote(c, h, sep, false);
+                continue;
+            }
+            let split_budget = remaining - notice_h;
+            let (mut head, mut tail, mut tail_first) = if split_budget > 0.0 {
+                split_note_blocks(&c.blocks, split_budget)
+            } else {
+                (Vec::new(), c.blocks.clone(), 0)
+            };
+            if head.is_empty() {
+                let fresh = self.cur_blocks.is_empty() && !band_open && self.cur_notes.is_empty();
+                if !fresh {
+                    /* Nothing of it fits here: close the page and retry on
+                    a fresh one (the fresh page always makes progress). */
+                    queue.push_front(c);
+                    self.flush_page();
+                    continue;
+                }
+                let (h0, t0, f0) = first_note_slice(&c.blocks);
+                head = h0;
+                tail = t0;
+                tail_first = f0;
+                let page = self.cur_page_index();
+                self.watchdog.note(DegradeReason::FootnoteOverflow, page);
+            }
+            let continues = !tail.is_empty();
+            if continues {
+                if let Some(notice) = self.continuation_notice.as_deref() {
+                    append_stacked(&mut head, notice);
+                }
+                queue.push_front(NoteCarry {
+                    anchor: c.anchor,
+                    marker: c.marker.clone(),
+                    blocks: tail,
+                    first_block_index: c.first_block_index + tail_first,
+                    continued: true,
+                });
+            }
+            let hh = blocks_height(&head);
+            let cut = NoteCarry {
+                anchor: c.anchor,
+                marker: c.marker,
+                blocks: head,
+                first_block_index: c.first_block_index,
+                continued: c.continued,
+            };
+            self.place_endnote(cut, hh, sep, continues);
+            if continues {
+                self.flush_page();
             }
         }
-        if self.cur_footnote_ids.is_empty() || self.cur_footnote_height < 0.0 {
-            self.cur_footnote_height = 0.0;
+    }
+
+    /// Issue #80 — stack one endnote entry (or slice) onto the current
+    /// page's trailing band and advance the cursor past it.
+    fn place_endnote(&mut self, c: NoteCarry, height: f32, sep: f32, continues: bool) {
+        if self.cur_endnotes.is_empty() {
+            self.cur_endnote_band_y = self.cur_y + sep;
+            self.cur_endnote_band_continuation = c.continued;
+            self.cur_y = self.cur_endnote_band_y;
         }
+        self.cur_endnotes.push(PendingNote {
+            anchor: c.anchor,
+            marker: c.marker,
+            blocks: c.blocks,
+            height,
+            first_block_index: c.first_block_index,
+            continued_from_previous: c.continued,
+            continues_on_next: continues,
+        });
+        self.cur_y += height;
     }
 
     /// Place `block` at the cursor in the current column, whatever its
@@ -884,8 +1367,12 @@ impl Paginator {
             return Vec::new();
         }
         let chain: Vec<LayoutBlock> = self.cur_blocks.drain(start..).collect();
-        let ids: Vec<u32> = chain.iter().flat_map(collect_footnote_refs).collect();
-        self.uncommit_footnotes(&ids);
+        let anchors: Vec<NoteAnchor> = chain
+            .iter()
+            .flat_map(collect_note_anchors)
+            .map(|(a, _)| a)
+            .collect();
+        self.uncommit_notes(&anchors);
         chain
     }
 
@@ -902,7 +1389,13 @@ impl Paginator {
         self.push_block_inner(block, 0.0, after, observe);
     }
 
-    fn push_paragraph_split(&mut self, para: ParagraphBox, after: f32, observe: bool) {
+    fn push_paragraph_split(
+        &mut self,
+        para: ParagraphBox,
+        remaining: f32,
+        after: f32,
+        observe: bool,
+    ) {
         /* Phase 2 audit (gap A.12) — forced page break path. If the
         paragraph carries a `\u{000C}` FORM FEED (the reader's
         mapping of `<w:br w:type="page"/>`), the earliest line index
@@ -942,11 +1435,27 @@ impl Paginator {
             return;
         }
 
-        let remaining = self.geometry.content_height()
-            - self.cur_y
-            - self.cur_footnote_height
-            - self.footer_intrusion(self.page_role());
-        let (head, tail) = split_paragraph_at_line(&para, remaining);
+        /* Issue #80 — the deadline fitter decides the split index WITH
+        every line's notes reserved (a plain paragraph reproduces
+        `split_paragraph_at_line`'s cut exactly). Notes of the head's
+        lines commit here; the tail's re-collect when it lands. */
+        let items: Vec<FlowItem> = para
+            .lines
+            .iter()
+            .map(|l| FlowItem {
+                bottom: l.origin.y + l.height,
+                anchors: anchors_on_line(l),
+            })
+            .collect();
+        let plan = self.fit_items(&items, remaining, self.cur_blocks.is_empty());
+        let (head, tail) = if para.lines.is_empty() {
+            (Some(para.clone()), None)
+        } else {
+            split_paragraph_at_line_index(&para, plan.count)
+        };
+        if head.is_some() {
+            self.commit_plan(plan);
+        }
 
         match (head, tail) {
             (None, Some(tail)) if self.cur_blocks.is_empty() => {
@@ -1027,13 +1536,28 @@ impl Paginator {
         footer intrusion) already consumed budget. The old bare
         `content_height()` here silently seated rows into the footer
         band on intruded pages. */
-        let budget = self.geometry.content_height()
-            - self.cur_y
-            - self.cur_footnote_height
-            - self.footer_intrusion(self.page_role());
-        for row in table.rows.iter() {
+        let budget = self.body_budget();
+        /* Issue #80 — rows are the fitter's items here: a row's notes
+        reserve band space when the row lands, and the first row is
+        forced (clipping) so an oversize row cannot loop. */
+        let mut bottom = 0.0_f32;
+        let items: Vec<FlowItem> = table
+            .rows
+            .iter()
+            .map(|r| {
+                bottom += r.size.height;
+                FlowItem {
+                    bottom,
+                    anchors: anchors_in_row(r),
+                }
+            })
+            .collect();
+        let plan = self.fit_items(&items, budget, true);
+        let head_count = plan.count.max(1).min(table.rows.len());
+        self.commit_plan(plan);
+        for (idx, row) in table.rows.iter().enumerate() {
             let row_h = row.size.height;
-            if head_height + row_h <= budget || head_rows.is_empty() {
+            if idx < head_count {
                 let mut r = row.clone();
                 r.origin.y = head_height;
                 head_rows.push(r);
@@ -1200,28 +1724,6 @@ impl Paginator {
         /* L2.3 (#8) — `cur_blocks` was just emptied; the next push
         starts the section's first-on-this-page block at index 0. */
         self.cur_section_start_idx = 0;
-        /* Phase 8a — materialize the page's footnote band. The reserved
-        height was already subtracted from the body budget during
-        `push_block`, so the band fits without overflow. Entries are in
-        emission order (the order their refs first appeared in body
-        content), each shifted to its own Y inside the band. */
-        let mut footnotes: Vec<FootnoteEntry> = Vec::with_capacity(self.cur_footnote_ids.len());
-        let mut band_y = 0.0_f32;
-        for (idx, id) in self.cur_footnote_ids.iter().enumerate() {
-            if let Some(body) = self.footnote_bodies.get(id).cloned() {
-                let mut p = body;
-                p.origin = Point { x: 0.0, y: band_y };
-                band_y += p.size.height;
-                footnotes.push(FootnoteEntry {
-                    id: *id,
-                    marker: (idx + 1).to_string(),
-                    paragraph: p,
-                });
-            }
-        }
-        self.cur_footnote_ids.clear();
-        self.cur_footnote_height = 0.0;
-
         /* Pick the role *before* pushing the page — `page_role` reads
         `pages.len()` to derive the 1-based page number, and the
         increment happens at `push`. Clone the resolved band slot;
@@ -1229,6 +1731,53 @@ impl Paginator {
         let role = self.page_role();
         let mut header = self.headers.resolve(role).cloned();
         let mut footer = self.footers.resolve(role).cloned();
+
+        /* Issue #80 — materialize the page's note bands. The reserved
+        heights were already subtracted from the body budget as lines
+        were placed, so the bands fit without overflow. Footnote entries
+        are in band order (a carried continuation first, then the order
+        their references were placed), each at its own Y inside the
+        band; the band's page-relative Y is THE placement paint, PDF and
+        hit-testing share. */
+        let band_content_h: f32 = self.cur_notes.iter().map(|n| n.height).sum();
+        let body_bottom = blocks
+            .iter()
+            .map(|b| b.origin().y + b.size().height)
+            .fold(0.0_f32, f32::max);
+        let footnote_band_y = if self.cur_notes.is_empty() {
+            0.0
+        } else {
+            match self.footnote_position {
+                NotePosition::PageBottom => {
+                    self.geometry.height
+                        - self.geometry.margins.bottom
+                        - self.footer_intrusion(role)
+                        - band_content_h
+                }
+                _ => self.geometry.margins.top + body_bottom + FOOTNOTE_SEPARATOR_HEIGHT_PT,
+            }
+        };
+        let footnote_band_continuation = self
+            .cur_notes
+            .first()
+            .is_some_and(|n| n.continued_from_previous);
+        let mut footnotes = NoteBand {
+            entries: materialize_band(std::mem::take(&mut self.cur_notes)),
+            y: footnote_band_y,
+            continuation: footnote_band_continuation,
+        };
+        self.cur_footnote_height = 0.0;
+        let mut endnotes = NoteBand {
+            y: if self.cur_endnotes.is_empty() {
+                0.0
+            } else {
+                self.geometry.margins.top + self.cur_endnote_band_y
+            },
+            continuation: self.cur_endnote_band_continuation,
+            entries: materialize_band(std::mem::take(&mut self.cur_endnotes)),
+        };
+        self.cur_endnote_band_y = 0.0;
+        self.cur_endnote_band_continuation = false;
 
         /* Phase 2 audit (gap D.1) — PAGE field evaluation. The page
         number we're about to emit is `pages.len() + 1` (1-based).
@@ -1280,6 +1829,17 @@ impl Paginator {
                 });
             }
         }
+        for band in [&mut footnotes, &mut endnotes] {
+            band.for_each_paragraph_mut(&mut |p| {
+                Self::evaluate_fields_on_paragraph(
+                    p,
+                    doc_page,
+                    page_num,
+                    section_start_doc_page,
+                    &env,
+                );
+            });
+        }
 
         /* Even an empty page is emitted on an explicit `force_page_break`
         / `start_new_section` — the renderer paints the blank sheet so a
@@ -1300,6 +1860,7 @@ impl Paginator {
             header_offset: self.geometry.header_offset,
             footer_offset: self.geometry.footer_offset,
             footnotes,
+            endnotes,
             /* Issues #70/#74/#43 — which band slot this page resolved
             and the formatted number it displays. Enter-header/footer
             derives the double-clicked page's role from `hf_role`; the
@@ -1337,6 +1898,10 @@ impl Paginator {
             self.watchdog.note(DegradeReason::PageCap, page);
             self.watchdog.escalate_to(DegradeStage::ForceValidate);
         }
+        /* Issue #80 — a note cut on the page just closed opens this
+        page's band (after the cap check, so a capped flow dumps the
+        carry whole). */
+        self.apply_footnote_carry();
     }
 
     /// [`Self::finish`] plus every degradation note the watchdog
@@ -1351,7 +1916,18 @@ impl Paginator {
     /// Always returns at least one page so the renderer has somewhere to
     /// draw the empty document.
     pub fn finish(mut self) -> Vec<PageBox> {
-        if !self.cur_blocks.is_empty() || self.pages.is_empty() {
+        if !self.cur_blocks.is_empty()
+            || self.pages.is_empty()
+            || !self.cur_notes.is_empty()
+            || !self.cur_endnotes.is_empty()
+        {
+            self.flush_page();
+        }
+        /* Issue #80 — drain a continuation that outlived the body: each
+        flush applies the carry to a fresh band and consumes at least
+        one line of it (or dumps it whole past the page cap), so the
+        loop is bounded by the note's own height. */
+        while !self.cur_notes.is_empty() || !self.footnote_carry.is_empty() {
             self.flush_page();
         }
         /* Phase 2 audit (gap D.1) — NUMPAGES second pass. The first
@@ -1389,54 +1965,259 @@ impl Paginator {
             if let Some(hf) = page.footer.as_mut() {
                 hf.for_each_paragraph_mut(&mut stamp);
             }
+            page.footnotes.for_each_paragraph_mut(&mut stamp);
+            page.endnotes.for_each_paragraph_mut(&mut stamp);
         }
         self.pages
     }
 }
 
-/// Phase 8a — scan a laid-out block for footnote reference anchors.
-/// Returns the display number of every footnote the block touches, in
-/// document order, with duplicates preserved (the paginator dedupes).
-///
-/// The glyph stores the marker text (the 1-based display number); the
-/// engine adapter keys its `with_footnote_bodies` map by the *same*
-/// numbers — it does the OOXML `w:id` ↔ display_number rebinding
-/// before handing the table to the paginator, so the layout layer
-/// never sees the raw `w:id`.
-pub fn collect_footnote_refs(block: &LayoutBlock) -> Vec<u32> {
-    let mut out: Vec<u32> = Vec::new();
-    match block {
-        LayoutBlock::Paragraph(p) => collect_in_paragraph(p, &mut out),
-        LayoutBlock::Table(t) => collect_in_table(t, &mut out),
+/// Issue #80 — turn the page's committed notes into band entries stacked
+/// from the band's top.
+fn materialize_band(notes: Vec<PendingNote>) -> Vec<FootnoteEntry> {
+    let mut out = Vec::with_capacity(notes.len());
+    let mut y = 0.0_f32;
+    for n in notes {
+        out.push(FootnoteEntry {
+            id: n.anchor.id,
+            kind: n.anchor.kind,
+            marker: n.marker,
+            origin: Point { x: 0.0, y },
+            blocks: n.blocks,
+            first_block_index: n.first_block_index,
+            continued_from_previous: n.continued_from_previous,
+            continues_on_next: n.continues_on_next,
+        });
+        y += n.height;
     }
     out
 }
 
-fn collect_in_paragraph(p: &ParagraphBox, out: &mut Vec<u32>) {
-    for line in &p.lines {
-        for run in &line.runs {
-            for g in &run.glyphs {
-                if let Some(marker) = g.inline_footnote_marker.as_deref()
-                    && let Ok(id) = marker.parse::<u32>()
-                {
-                    out.push(id);
-                }
-            }
-        }
+/// Deepest bottom edge of a stacked block list.
+fn blocks_height(blocks: &[LayoutBlock]) -> f32 {
+    blocks
+        .iter()
+        .map(|b| b.origin().y + b.size().height)
+        .fold(0.0_f32, f32::max)
+}
+
+/// Re-stack `blocks` from `y = 0` at `x = 0`; returns the total height.
+fn restack_blocks(blocks: &mut [LayoutBlock]) -> f32 {
+    let mut y = 0.0_f32;
+    for b in blocks.iter_mut() {
+        b.set_origin(Point { x: 0.0, y });
+        y += b.size().height;
+    }
+    y
+}
+
+/// Append `extra` (cloned) below `head`, stacked.
+fn append_stacked(head: &mut Vec<LayoutBlock>, extra: &[LayoutBlock]) {
+    let mut y = blocks_height(head);
+    for b in extra {
+        let mut c = b.clone();
+        c.set_origin(Point { x: 0.0, y });
+        y += c.size().height;
+        head.push(c);
     }
 }
 
-fn collect_in_table(t: &TableBox, out: &mut Vec<u32>) {
-    for row in &t.rows {
-        for cell in &row.cells {
-            for inner in &cell.content {
-                match inner {
-                    LayoutBlock::Paragraph(p) => collect_in_paragraph(p, out),
-                    LayoutBlock::Table(nested) => collect_in_table(nested, out),
+/// Issue #80 — cut a stacked note body at the deepest line / row
+/// boundary within `budget`. Whole blocks that fit go to the head; the
+/// first block that does not is split (paragraphs at a line, tables at a
+/// row); everything after it goes to the tail, re-stacked from `y = 0`.
+/// The head may come back empty (nothing fits) and the tail empty
+/// (everything fits). The third value is the input index of the block
+/// the tail opens with (a cut block repeats its own index).
+fn split_note_blocks(
+    blocks: &[LayoutBlock],
+    budget: f32,
+) -> (Vec<LayoutBlock>, Vec<LayoutBlock>, u32) {
+    let mut head: Vec<LayoutBlock> = Vec::new();
+    let mut tail: Vec<LayoutBlock> = Vec::new();
+    let mut y = 0.0_f32;
+    let mut tail_first = 0u32;
+    let mut iter = blocks.iter().enumerate();
+    for (idx, b) in iter.by_ref() {
+        let h = b.size().height;
+        tail_first = idx as u32;
+        if y + h <= budget {
+            let mut c = b.clone();
+            c.set_origin(Point { x: 0.0, y });
+            head.push(c);
+            y += h;
+            tail_first = idx as u32 + 1;
+            continue;
+        }
+        match b {
+            LayoutBlock::Paragraph(p) => {
+                let (hd, tl) = split_paragraph_at_line(p, budget - y);
+                if let Some(mut hd) = hd {
+                    hd.origin = Point { x: 0.0, y };
+                    head.push(LayoutBlock::Paragraph(hd));
+                }
+                if let Some(tl) = tl {
+                    tail.push(LayoutBlock::Paragraph(tl));
+                }
+            }
+            LayoutBlock::Table(t) => {
+                let (hd, tl) = split_table_rows(t, budget - y);
+                if let Some(mut hd) = hd {
+                    hd.origin = Point { x: 0.0, y };
+                    head.push(LayoutBlock::Table(hd));
+                }
+                if let Some(tl) = tl {
+                    tail.push(LayoutBlock::Table(tl));
                 }
             }
         }
+        break;
     }
+    tail.extend(iter.map(|(_, b)| b.clone()));
+    restack_blocks(&mut tail);
+    (head, tail, tail_first)
+}
+
+/// Issue #80 — the smallest slice a note body can yield: the first line
+/// of its first paragraph (or the first row of its first table, or the
+/// whole first block when it cannot be split). The progress guarantee
+/// of every carry-over loop. The third value is the tail's first block
+/// index (0 when the first block was cut, 1 when it went whole).
+fn first_note_slice(blocks: &[LayoutBlock]) -> (Vec<LayoutBlock>, Vec<LayoutBlock>, u32) {
+    let Some(first) = blocks.first() else {
+        return (Vec::new(), Vec::new(), 0);
+    };
+    let (mut head, mut tail): (Vec<LayoutBlock>, Vec<LayoutBlock>) = match first {
+        LayoutBlock::Paragraph(p) => {
+            let (hd, tl) = split_paragraph_at_line_index(p, 1);
+            (
+                hd.into_iter().map(LayoutBlock::Paragraph).collect(),
+                tl.into_iter().map(LayoutBlock::Paragraph).collect(),
+            )
+        }
+        LayoutBlock::Table(t) => {
+            let (hd, tl) = split_table_rows_at(t, 1);
+            (
+                hd.into_iter().map(LayoutBlock::Table).collect(),
+                tl.into_iter().map(LayoutBlock::Table).collect(),
+            )
+        }
+    };
+    if head.is_empty() {
+        head.push(first.clone());
+    }
+    let tail_first = if tail.is_empty() { 1 } else { 0 };
+    tail.extend(blocks[1..].iter().cloned());
+    restack_blocks(&mut head);
+    restack_blocks(&mut tail);
+    (head, tail, tail_first)
+}
+
+/// Split a table at the deepest row boundary within `budget`.
+fn split_table_rows(t: &TableBox, budget: f32) -> (Option<TableBox>, Option<TableBox>) {
+    let mut n = 0usize;
+    let mut y = 0.0_f32;
+    for r in &t.rows {
+        if y + r.size.height > budget {
+            break;
+        }
+        y += r.size.height;
+        n += 1;
+    }
+    split_table_rows_at(t, n)
+}
+
+/// Split a table so rows `[0, n)` form the head and `[n, ..)` the tail
+/// (each re-stacked from `y = 0`; no header-row repeat — notes are not
+/// the body).
+fn split_table_rows_at(t: &TableBox, n: usize) -> (Option<TableBox>, Option<TableBox>) {
+    if n == 0 {
+        return (None, Some(t.clone()));
+    }
+    if n >= t.rows.len() {
+        return (Some(t.clone()), None);
+    }
+    let build = |rows: &[TableRowBox]| {
+        let mut y = 0.0_f32;
+        let rows: Vec<TableRowBox> = rows
+            .iter()
+            .map(|r| {
+                let mut rr = r.clone();
+                rr.origin.y = y;
+                y += rr.size.height;
+                rr
+            })
+            .collect();
+        TableBox {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: t.size.width,
+                height: y,
+            },
+            columns: t.columns.clone(),
+            rows,
+            outer_borders: t.outer_borders.clone(),
+        }
+    };
+    (Some(build(&t.rows[..n])), Some(build(&t.rows[n..])))
+}
+
+/// Issue #80 — scan a laid-out block for note reference anchors. Returns
+/// `(anchor, marker text)` for every reference the block carries, in
+/// document order, duplicates preserved (the fitter dedupes).
+pub fn collect_note_anchors(block: &LayoutBlock) -> Vec<(NoteAnchor, String)> {
+    let mut out: Vec<(NoteAnchor, String)> = Vec::new();
+    match block {
+        LayoutBlock::Paragraph(p) => {
+            for line in &p.lines {
+                out.extend(anchors_on_line(line));
+            }
+        }
+        LayoutBlock::Table(t) => {
+            for row in &t.rows {
+                out.extend(anchors_in_row(row));
+            }
+        }
+    }
+    out
+}
+
+/// The note references anchored on one line, in run order.
+fn anchors_on_line(line: &LineBox) -> Vec<(NoteAnchor, String)> {
+    let mut out = Vec::new();
+    for run in &line.runs {
+        for g in &run.glyphs {
+            if let Some(anchor) = g.inline_note_anchor {
+                out.push((anchor, g.inline_footnote_marker.clone().unwrap_or_default()));
+            }
+        }
+    }
+    out
+}
+
+/// The note references anchored anywhere in one table row (cells
+/// depth-first; a vertically merged continuation cell repeats its
+/// origin's content and is skipped).
+fn anchors_in_row(row: &TableRowBox) -> Vec<(NoteAnchor, String)> {
+    let mut out = Vec::new();
+    for cell in &row.cells {
+        if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+            continue;
+        }
+        for inner in &cell.content {
+            out.extend(collect_note_anchors(inner));
+        }
+    }
+    out
+}
+
+/// `true` when any line of `p` carries a note reference.
+fn paragraph_has_note_anchors(p: &ParagraphBox) -> bool {
+    p.lines.iter().any(|l| {
+        l.runs
+            .iter()
+            .any(|r| r.glyphs.iter().any(|g| g.inline_note_anchor.is_some()))
+    })
 }
 
 /// Split `para` so the head fits within `budget` pt of vertical space.
@@ -1705,6 +2486,7 @@ mod tests {
             synthetic: false,
             inline_image_rel_id: None,
             inline_footnote_marker: None,
+            inline_note_anchor: None,
             inline_object_height: 0.0,
             float: float.map(Box::new),
         };
@@ -2956,8 +3738,39 @@ mod tests {
         }
     }
 
-    /// A one-line paragraph whose only glyph anchors footnote `id`.
+    /// An `n_lines` paragraph whose FIRST line anchors footnote `id`.
     fn fake_paragraph_with_footnote_ref(id: u32, n_lines: usize, line_height: f32) -> ParagraphBox {
+        fake_paragraph_with_footnote_ref_on_line(id, 0, n_lines, line_height)
+    }
+
+    fn fn_anchor(id: u32) -> NoteAnchor {
+        NoteAnchor {
+            kind: engine::NoteKind::Footnote,
+            id,
+        }
+    }
+
+    /// Issue #80 — note bodies keyed by footnote id: each a single
+    /// `n_lines × line_height` paragraph.
+    fn fake_note_bodies(specs: &[(u32, usize, f32)]) -> HashMap<NoteAnchor, NoteBody> {
+        let mut out = HashMap::new();
+        for (id, n, h) in specs {
+            out.insert(
+                fn_anchor(*id),
+                vec![LayoutBlock::Paragraph(fake_paragraph(*n, *h))],
+            );
+        }
+        out
+    }
+
+    /// An `n_lines` paragraph whose line `line_idx` anchors footnote `id`
+    /// (issue #92 fixtures put the reference deep inside the paragraph).
+    fn fake_paragraph_with_footnote_ref_on_line(
+        id: u32,
+        line_idx: usize,
+        n_lines: usize,
+        line_height: f32,
+    ) -> ParagraphBox {
         let mut p = fake_paragraph(n_lines, line_height);
         let glyph = crate::boxes::PositionedGlyph {
             id: 0,
@@ -2969,10 +3782,11 @@ mod tests {
             synthetic: false,
             inline_image_rel_id: None,
             inline_footnote_marker: Some(id.to_string()),
+            inline_note_anchor: Some(fn_anchor(id)),
             inline_object_height: 0.0,
             float: None,
         };
-        p.lines[0].runs.push(crate::boxes::VisualRun {
+        p.lines[line_idx].runs.push(crate::boxes::VisualRun {
             glyphs: vec![glyph],
             font: "f".to_string(),
             direction: ShapingDirection::Ltr,
@@ -3064,10 +3878,8 @@ mod tests {
         pag.push_block(LayoutBlock::Paragraph(fake_paragraph(100, 16.0)), 0.0, 0.0);
         finish("intruding_bands_title_pg", pag);
 
-        let mut bodies = HashMap::new();
-        bodies.insert(1, fake_paragraph(3, 14.0));
-        bodies.insert(2, fake_paragraph(2, 14.0));
-        let mut pag = Paginator::with_default_bands(geom, None, None).with_footnote_bodies(bodies);
+        let bodies = fake_note_bodies(&[(1, 3, 14.0), (2, 2, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
         pag.push_block(
             LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 3, 16.0)),
             0.0,
@@ -3131,7 +3943,7 @@ mod tests {
         ("continuous_balance", 0x4223f896a4f3452c, &[]),
         ("form_feed", 0x9cc8e34c49eb9a4e, &[]),
         ("intruding_bands_title_pg", 0xd740800cab2c8c6d, &[]),
-        ("footnotes", 0x7f99643a17eaa915, &[]),
+        ("footnotes", 0xd598c54612629596, &[]),
         ("sections_and_forced_breaks", 0xc92c5638ce1f2440, &[]),
         (
             "tables_move_whole_and_atomic",
@@ -3367,17 +4179,117 @@ mod tests {
         }
     }
 
-    /// Footnote taller than a page: its band leaves no body budget on any
-    /// page. The old flow bounced the paragraph forward and lost the
-    /// footnote; now the block is placed over the band on the fresh page,
-    /// the footnote paints, and the flow continues.
+    /// Issue #80 — a footnote taller than a page splits: the reference
+    /// line keeps the head of the note (as much as fits under it), every
+    /// following page opens its band with a continuation capped at
+    /// `1 - NOTE_BODY_RESERVE_FRACTION` of the body budget so body text
+    /// keeps flowing, and the drain terminates without a degradation.
     #[test]
-    fn footnote_taller_than_a_page_terminates_and_paints() {
+    fn footnote_taller_than_a_page_splits_with_continuations_and_paints() {
         let t0 = Instant::now();
         let geom = a4_geometry();
-        let mut bodies = HashMap::new();
-        bodies.insert(1, fake_paragraph(1, 2000.0));
-        let mut pag = Paginator::with_default_bands(geom, None, None).with_footnote_bodies(bodies);
+        let bodies = fake_note_bodies(&[(1, 125, 16.0)]); // 2000 pt of note
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 3, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert!(notes.is_empty(), "no degradation: {notes:?}");
+        assert!(pages.len() >= 3, "the note spans pages: {}", pages.len());
+        assert_eq!(
+            pages[0].blocks.len(),
+            1,
+            "the referencing paragraph painted"
+        );
+        assert_eq!(pages[0].footnotes.entries.len(), 1);
+        assert_eq!(pages[0].footnotes.entries[0].id, 1);
+        assert!(pages[0].footnotes.entries[0].continues_on_next);
+        assert!(!pages[0].footnotes.continuation);
+        assert!(
+            pages[1].footnotes.continuation,
+            "page 2 opens with the continuation"
+        );
+        assert!(pages[1].footnotes.entries[0].continued_from_previous);
+        assert!(
+            !pages[1].blocks.is_empty(),
+            "body text keeps flowing on a continuation page"
+        );
+        let total_note_lines: usize = pages
+            .iter()
+            .flat_map(|p| p.footnotes.entries.iter())
+            .flat_map(|e| e.blocks.iter())
+            .map(|b| b.as_paragraph().map_or(0, |p| p.lines.len()))
+            .sum();
+        assert_eq!(
+            total_note_lines, 125,
+            "every note line painted exactly once"
+        );
+        let total_body_lines: usize = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .map(|b| b.as_paragraph().map_or(0, |p| p.lines.len()))
+            .sum();
+        assert_eq!(total_body_lines, 43, "no body line dropped or duplicated");
+        for p in &pages {
+            let band_h: f32 = p.footnotes.content_height();
+            if !p.footnotes.is_empty() {
+                assert!(
+                    (p.footnotes.y + band_h - (p.size.height - p.margins.bottom)).abs() < 0.01,
+                    "band bottom-anchored at the margin"
+                );
+                let body_bottom = p
+                    .blocks
+                    .iter()
+                    .map(|b| b.origin().y + b.size().height)
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    p.margins.top + body_bottom
+                        <= p.footnotes.y - FOOTNOTE_SEPARATOR_HEIGHT_PT + 0.01,
+                    "body never overruns the band"
+                );
+            }
+        }
+    }
+
+    /// Issue #80 — the nominal `footnotes` fixture's shape (its pinned
+    /// fingerprint moved with the entry schema; this pins the geometry
+    /// in words): note 1 rides page 1 under paragraph A, the 40-line
+    /// paragraph splits 37/3 around the 54 pt band, note 2 rides page 2.
+    #[test]
+    fn nominal_footnotes_fixture_places_each_note_on_its_reference_page() {
+        let (_, pages, notes) = nominal_fixtures()
+            .into_iter()
+            .find(|(n, _, _)| *n == "footnotes")
+            .expect("fixture");
+        assert!(notes.is_empty());
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].blocks.len(), 2);
+        assert_eq!(pages[0].blocks[1].as_paragraph().unwrap().lines.len(), 37);
+        assert_eq!(pages[0].footnotes.entries.len(), 1);
+        assert_eq!(pages[0].footnotes.entries[0].id, 1);
+        assert_eq!(pages[0].footnotes.entries[0].marker, "1");
+        let geom = a4_geometry();
+        assert!((pages[0].footnotes.y - (geom.height - geom.margins.bottom - 42.0)).abs() < 0.01);
+        assert_eq!(pages[1].blocks.len(), 3);
+        assert_eq!(pages[1].footnotes.entries.len(), 1);
+        assert_eq!(pages[1].footnotes.entries[0].id, 2);
+        assert!(pages[1].endnotes.is_empty());
+    }
+
+    /// Issue #80 — the waiver: the first line of a fresh page carries a
+    /// note whose single line is taller than the page. Nothing later
+    /// could host it either, so it is clipped under the line and
+    /// reported (`FootnoteOverflow`); the flow continues.
+    #[test]
+    fn unsplittable_oversize_footnote_clips_and_reports() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(1, 1, 2000.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
         pag.push_block(
             LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 3, 16.0)),
             0.0,
@@ -3387,19 +4299,240 @@ mod tests {
         let (pages, notes) = pag.finish_with_notes();
         assert!(t0.elapsed() < adversarial_budget());
         assert_eq!(pages.len(), 2);
+        /* The deadline rule still holds under the waiver: only the
+        reference line stays above the (clipped) band; the paragraph's
+        other two lines flow on. */
+        assert_eq!(pages[0].blocks.len(), 1, "the referencing line painted");
+        assert_eq!(pages[0].blocks[0].as_paragraph().unwrap().lines.len(), 1);
         assert_eq!(
-            pages[0].blocks.len(),
-            1,
-            "the referencing paragraph painted"
-        );
-        assert_eq!(
-            pages[0].footnotes.len(),
+            pages[0].footnotes.entries.len(),
             1,
             "its footnote painted (clipped)"
         );
-        assert_eq!(pages[0].footnotes[0].id, 1);
-        assert_eq!(pages[1].blocks.len(), 1, "the flow continued");
+        assert_eq!(pages[0].footnotes.entries[0].id, 1);
+        assert!(
+            !pages[0].footnotes.entries[0].continues_on_next,
+            "nothing left to carry"
+        );
+        assert_eq!(
+            pages[1].blocks.len(),
+            2,
+            "the flow continued: tail + next paragraph"
+        );
+        assert!(pages[1].footnotes.is_empty());
         assert_eq!(reasons(&notes), vec![DegradeReason::FootnoteOverflow]);
+    }
+
+    /// Issue #92 — a reference on the 5th line of a paragraph that
+    /// splits after line 3: the note lands on the page holding the
+    /// TAIL, never dropped.
+    #[test]
+    fn reference_in_tail_lands_its_note_on_the_tail_page() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(7, 2, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
+        /* Fill the page so the next paragraph has room for exactly three
+        16 pt lines: content height 842 - 72 - 72 = 698 → 43 lines of 16
+        leaves 10 pt; 40 lines leave 58 pt → 3 lines fit. */
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref_on_line(7, 4, 8, 16.0)),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].blocks.len(), 2);
+        assert_eq!(
+            pages[0].blocks[1].as_paragraph().unwrap().lines.len(),
+            3,
+            "head"
+        );
+        assert!(
+            pages[0].footnotes.is_empty(),
+            "the head does not own the note"
+        );
+        assert_eq!(
+            pages[1].blocks[0].as_paragraph().unwrap().lines.len(),
+            5,
+            "tail"
+        );
+        assert_eq!(
+            pages[1].footnotes.entries.len(),
+            1,
+            "the tail's page hosts the note"
+        );
+        assert_eq!(pages[1].footnotes.entries[0].id, 7);
+    }
+
+    /// Issue #92 — a reference on line 2 of a paragraph whose lines 4+
+    /// overflow: the note stays with the HEAD and shrinks the head's
+    /// budget (the deadline), so the head loses a line to make room.
+    #[test]
+    fn reference_in_head_keeps_its_note_and_shrinks_the_head() {
+        let geom = a4_geometry();
+        /* 38 body lines leave 90 pt. Without the note five 16 pt lines
+        fit (80); with the reference on line 2 the 28 pt note + 12 pt
+        separator are reserved from that line on, so only three do
+        (48 + 40 = 88 ≤ 90 < 64 + 40). */
+        let bodies = fake_note_bodies(&[(3, 2, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(38, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref_on_line(3, 1, 8, 16.0)),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        let head = pages[0].blocks[1].as_paragraph().unwrap();
+        assert_eq!(
+            head.lines.len(),
+            3,
+            "deadline: the band ate two lines of room"
+        );
+        assert_eq!(
+            pages[0].footnotes.entries.len(),
+            1,
+            "the head's page hosts the note"
+        );
+        assert_eq!(pages[0].footnotes.entries[0].id, 3);
+        assert!(pages[1].footnotes.is_empty());
+        assert_eq!(pages[1].blocks[0].as_paragraph().unwrap().lines.len(), 5);
+        /* Band geometry: bottom-anchored, 40 pt tall, body above it. */
+        let p = &pages[0];
+        assert!((p.footnotes.y - (geom.height - geom.margins.bottom - 28.0)).abs() < 0.01);
+        assert!(
+            p.margins.top + head.origin.y + head.size.height
+                <= p.footnotes.y - FOOTNOTE_SEPARATOR_HEIGHT_PT + 0.01
+        );
+    }
+
+    /// Issue #80 — a note that does not fit whole under its reference
+    /// line splits: at least one note line stays, the rest opens the next
+    /// page's band with a continuation; the continuation-notice story
+    /// closes the cut.
+    #[test]
+    fn note_splits_under_its_reference_with_a_notice() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(1, 6, 14.0)]); // 84 pt note
+        let notice = vec![LayoutBlock::Paragraph(fake_paragraph(1, 10.0))];
+        let mut pag = Paginator::with_default_bands(geom, None, None)
+            .with_note_bodies(bodies)
+            .with_continuation_notice(Some(notice));
+        /* 40 lines leave 58 pt: the 16 pt reference line + 12 pt gap +
+        10 pt notice leave 20 pt → one 14 pt note line stays. */
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 1, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].blocks.len(), 2, "the reference line stayed");
+        let head = &pages[0].footnotes.entries[0];
+        assert!(head.continues_on_next);
+        assert_eq!(head.blocks.len(), 2, "one note slice + the notice");
+        assert_eq!(head.blocks[0].as_paragraph().unwrap().lines.len(), 1);
+        assert!((head.content_height() - 24.0).abs() < 0.01);
+        assert!(pages[1].footnotes.continuation);
+        let cont = &pages[1].footnotes.entries[0];
+        assert!(cont.continued_from_previous && !cont.continues_on_next);
+        assert_eq!(cont.blocks[0].as_paragraph().unwrap().lines.len(), 5);
+        assert_eq!(
+            pages[1].blocks.len(),
+            1,
+            "the following paragraph flowed to page 2"
+        );
+    }
+
+    /// Issue #80 — endnotes are a trailing band beneath the body; a
+    /// page may carry both a footnote band and an endnote band, and a
+    /// long endnote continues at the top of the next page.
+    #[test]
+    fn endnotes_trail_the_body_and_continue_across_pages() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(1, 2, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 30, 16.0)),
+            0.0,
+            0.0,
+        );
+        let en = |id: u32| NoteAnchor {
+            kind: engine::NoteKind::Endnote,
+            id,
+        };
+        pag.push_trailing_notes(vec![
+            (
+                en(1),
+                "i".to_string(),
+                vec![LayoutBlock::Paragraph(fake_paragraph(2, 14.0))],
+            ),
+            (
+                en(2),
+                "ii".to_string(),
+                vec![LayoutBlock::Paragraph(fake_paragraph(30, 14.0))],
+            ),
+        ]);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        let p0 = &pages[0];
+        assert_eq!(p0.footnotes.entries.len(), 1, "footnote band on page 1");
+        assert_eq!(p0.endnotes.entries.len(), 2, "both endnotes open on page 1");
+        assert_eq!(p0.endnotes.entries[0].kind, engine::NoteKind::Endnote);
+        assert!(!p0.endnotes.entries[0].continues_on_next);
+        assert!(
+            p0.endnotes.entries[1].continues_on_next,
+            "the long one is cut"
+        );
+        /* 30 body lines = 480 pt; the endnote band opens 12 pt below. */
+        assert!((p0.endnotes.y - (geom.margins.top + 480.0 + 12.0)).abs() < 0.01);
+        /* Endnote band + footnote band never overlap: endnotes end above
+        the footnote band's separator. */
+        let en_bottom = p0.endnotes.y + p0.endnotes.content_height();
+        assert!(en_bottom <= p0.footnotes.y - FOOTNOTE_SEPARATOR_HEIGHT_PT + 0.01);
+        let p1 = &pages[1];
+        assert!(p1.endnotes.continuation);
+        assert_eq!(p1.endnotes.entries.len(), 1);
+        assert!(p1.endnotes.entries[0].continued_from_previous);
+        assert_eq!(p1.endnotes.entries[0].id, 2);
+        assert_eq!(
+            p1.endnotes.entries[0].first_block_index, 0,
+            "cut inside block 0"
+        );
+        let total: usize = pages
+            .iter()
+            .flat_map(|p| p.endnotes.entries.iter())
+            .filter(|e| e.id == 2)
+            .flat_map(|e| e.blocks.iter())
+            .map(|b| b.as_paragraph().map_or(0, |p| p.lines.len()))
+            .sum();
+        assert_eq!(total, 30, "every endnote line painted once");
+    }
+
+    /// Issue #80 — `beneathText` pins the band right under the body's
+    /// last line instead of the bottom margin.
+    #[test]
+    fn beneath_text_position_places_the_band_under_the_body() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(1, 2, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
+        pag.set_footnote_position(NotePosition::BeneathText);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 5, 16.0)),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 1);
+        assert!((pages[0].footnotes.y - (geom.margins.top + 80.0 + 12.0)).abs() < 0.01);
     }
 
     /// Stage (c): the page cap. Past it the flow is appended to the

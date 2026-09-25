@@ -42,7 +42,7 @@
 //! self-defense refactor is provably output-identical on the nominal
 //! path.
 
-use crate::boxes::{LayoutBlock, PageBox, ParagraphBox, TableBox};
+use crate::boxes::{FootnoteEntry, LayoutBlock, NoteBand, PageBox, ParagraphBox, TableBox};
 use std::hash::{Hash, Hasher};
 
 /// Escalation ladder. Ordered: a later stage is a stronger response.
@@ -411,11 +411,14 @@ pub fn geometry_fingerprint(pages: &[PageBox]) -> u64 {
         for b in &page.blocks {
             hash_block(&mut h, b);
         }
-        (page.footnotes.len() as u64).hash(&mut h);
-        for f in &page.footnotes {
-            f.id.hash(&mut h);
-            f.marker.hash(&mut h);
-            hash_paragraph(&mut h, &f.paragraph);
+        (page.footnotes.entries.len() as u64).hash(&mut h);
+        /* Issue #80 — band placement + entry geometry are pinned only
+        when a band exists, so note-free documents keep their pre-#80
+        fingerprints bit-for-bit. */
+        hash_note_band(&mut h, &page.footnotes);
+        if !page.endnotes.is_empty() {
+            (page.endnotes.entries.len() as u64).hash(&mut h);
+            hash_note_band(&mut h, &page.endnotes);
         }
         /* Issue #69 — floating objects join the fingerprint ONLY when
         present, so every pre-#69 pinned value (documents without floats)
@@ -435,6 +438,32 @@ pub fn geometry_fingerprint(pages: &[PageBox]) -> u64 {
         }
     }
     h.finish()
+}
+
+fn hash_note_band(h: &mut impl Hasher, band: &NoteBand) {
+    if band.is_empty() {
+        return;
+    }
+    hash_f32(h, band.y);
+    band.continuation.hash(h);
+    for f in &band.entries {
+        hash_note_entry(h, f);
+    }
+}
+
+fn hash_note_entry(h: &mut impl Hasher, f: &FootnoteEntry) {
+    f.id.hash(h);
+    f.first_block_index.hash(h);
+    f.marker.hash(h);
+    (f.kind == engine::NoteKind::Endnote).hash(h);
+    hash_f32(h, f.origin.x);
+    hash_f32(h, f.origin.y);
+    f.continued_from_previous.hash(h);
+    f.continues_on_next.hash(h);
+    (f.blocks.len() as u64).hash(h);
+    for b in &f.blocks {
+        hash_block(h, b);
+    }
 }
 
 fn hash_f32(h: &mut impl Hasher, v: f32) {
@@ -700,7 +729,8 @@ mod tests {
             footer: None,
             header_offset: 20.0,
             footer_offset: 20.0,
-            footnotes: Vec::new(),
+            footnotes: NoteBand::default(),
+            endnotes: NoteBand::default(),
             hf_role: crate::boxes::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),

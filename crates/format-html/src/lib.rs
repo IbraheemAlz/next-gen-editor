@@ -28,7 +28,7 @@ pub fn to_html(doc: &DocumentTree) -> String {
         "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\
          <title>Document</title></head><body dir=\"auto\">",
     );
-    emit_blocks(&doc.blocks_slice(), &doc.media, &mut out);
+    emit_blocks(&doc.blocks_slice(), &Media::of(doc), &mut out);
     out.push_str("</body></html>");
     out
 }
@@ -38,7 +38,7 @@ pub fn to_html(doc: &DocumentTree) -> String {
 /// rules as `to_html` for paragraphs, tables, and inline images.
 pub fn to_html_fragment(doc: &DocumentTree) -> String {
     let mut out = String::with_capacity(512);
-    emit_blocks(&doc.blocks_slice(), &doc.media, &mut out);
+    emit_blocks(&doc.blocks_slice(), &Media::of(doc), &mut out);
     out
 }
 
@@ -46,9 +46,24 @@ pub fn to_html_fragment(doc: &DocumentTree) -> String {
 /* Block dispatch                                                        */
 /* --------------------------------------------------------------------- */
 
-type Media = std::collections::HashMap<String, engine::ImageBlob>;
+/// Document-scoped export context: the media table inline images
+/// resolve against plus (issue #80) the document-order note markers so
+/// a footnote reference exports its displayed number, not its OOXML id.
+struct Media<'a> {
+    blobs: &'a std::collections::HashMap<String, engine::ImageBlob>,
+    markers: std::collections::HashMap<engine::NoteAnchor, String>,
+}
 
-fn emit_blocks(blocks: &[Block], media: &Media, out: &mut String) {
+impl<'a> Media<'a> {
+    fn of(doc: &'a DocumentTree) -> Self {
+        Self {
+            blobs: &doc.media,
+            markers: doc.note_markers(),
+        }
+    }
+}
+
+fn emit_blocks(blocks: &[Block], media: &Media<'_>, out: &mut String) {
     for b in blocks {
         match b {
             Block::Paragraph(p) => emit_paragraph(p, media, out),
@@ -69,7 +84,7 @@ fn dir_attr(dir: Option<TextDirection>) -> &'static str {
     }
 }
 
-fn emit_paragraph(p: &Paragraph, media: &Media, out: &mut String) {
+fn emit_paragraph(p: &Paragraph, media: &Media<'_>, out: &mut String) {
     out.push_str("<p");
     out.push_str(dir_attr(p.props.direction));
     out.push('>');
@@ -116,7 +131,7 @@ fn emit_paragraph(p: &Paragraph, media: &Media, out: &mut String) {
 /// 3-byte U+FFFC; we split the text emit around it.
 fn emit_text_segment(
     p: &Paragraph,
-    media: &Media,
+    media: &Media<'_>,
     obj_idx: &mut usize,
     lo: usize,
     hi: usize,
@@ -238,22 +253,36 @@ fn color_to_hex(c: [u8; 4]) -> String {
 /* Inline objects                                                        */
 /* --------------------------------------------------------------------- */
 
-fn emit_inline_object(obj: &InlineObject, media: &Media, out: &mut String) {
+fn emit_inline_object(obj: &InlineObject, media: &Media<'_>, out: &mut String) {
     match &obj.kind {
         InlineKind::Image {
             rel_id,
             width_emu,
             height_emu,
         } => emit_image(rel_id, *width_emu, *height_emu, media, out),
-        InlineKind::FootnoteRef { display_number, .. } => {
+        InlineKind::FootnoteRef { id, .. } | InlineKind::EndnoteRef { id, .. } => {
+            /* Issue #80 — the displayed number is derived in document
+            order; a dangling reference (no marker) falls back to the id. */
+            let anchor = engine::NoteAnchor {
+                kind: if matches!(obj.kind, InlineKind::FootnoteRef { .. }) {
+                    engine::NoteKind::Footnote
+                } else {
+                    engine::NoteKind::Endnote
+                },
+                id: *id,
+            };
             out.push_str("<sup>");
-            out.push_str(&display_number.to_string());
+            match media.markers.get(&anchor) {
+                Some(m) => escape_text_into(m, out),
+                None => out.push_str(&id.to_string()),
+            }
             out.push_str("</sup>");
         }
+        InlineKind::NoteSelfRef { .. } => {}
     }
 }
 
-fn emit_image(rel_id: &str, width_emu: i64, height_emu: i64, media: &Media, out: &mut String) {
+fn emit_image(rel_id: &str, width_emu: i64, height_emu: i64, media: &Media<'_>, out: &mut String) {
     let w_px = emu_to_css_px(width_emu);
     let h_px = emu_to_css_px(height_emu);
     out.push_str("<img alt=\"\"");
@@ -264,7 +293,7 @@ fn emit_image(rel_id: &str, width_emu: i64, height_emu: i64, media: &Media, out:
         out.push_str(&format!(" height=\"{h_px}\""));
     }
     out.push_str(" src=\"");
-    match media.get(rel_id) {
+    match media.blobs.get(rel_id) {
         Some(blob) if !blob.data.is_empty() => {
             out.push_str("data:");
             escape_attr_into(&blob.content_type, out);
@@ -293,7 +322,7 @@ fn emu_to_css_px(emu: i64) -> i64 {
 /* Tables                                                                */
 /* --------------------------------------------------------------------- */
 
-fn emit_table(t: &Table, media: &Media, out: &mut String) {
+fn emit_table(t: &Table, media: &Media<'_>, out: &mut String) {
     out.push_str("<table style=\"border-collapse:collapse;\">");
     /* Pre-compute, for every (row, cell) emit-decision, the rowspan that
     a `VMergeRole::Restart` cell should carry. A Restart cell consumes
@@ -339,7 +368,7 @@ fn continue_run_below(t: &Table, r: usize, c: usize) -> u32 {
     span
 }
 
-fn emit_table_cell(cell: &engine::TableCell, media: &Media, rowspan: u32, out: &mut String) {
+fn emit_table_cell(cell: &engine::TableCell, media: &Media<'_>, rowspan: u32, out: &mut String) {
     out.push_str("<td");
     let colspan = u32::from(cell.props.grid_span.max(1));
     if colspan > 1 {

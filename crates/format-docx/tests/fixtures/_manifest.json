@@ -29,6 +29,21 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "footnotes_endnotes.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 11,
+      "asserts": {
+        "paragraph_count": 3,
+        "paragraph_texts": [
+          "Alpha body￼ continues",
+          "Beta body￼￼",
+          "Gamma body￼￼"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "grab_bag_exotic.docx": {
       "generator": "handcrafted",
       "phase_introduced": 9,

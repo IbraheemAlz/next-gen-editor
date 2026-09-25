@@ -5,11 +5,13 @@
 
 use crate::error::DocxError;
 use crate::opc::archive::{
-    COMMENTS_EXTENDED_XML, COMMENTS_XML, DOC_XML, DocxArchive, NUMBERING_XML, RELS_XML, STYLES_XML,
+    COMMENTS_EXTENDED_XML, COMMENTS_XML, DOC_XML, DocxArchive, ENDNOTES_XML, FOOTNOTES_XML,
+    NUMBERING_XML, RELS_XML, STYLES_XML, root_attributes,
 };
 use crate::parts::comments::{
     build_comments_extended_xml, build_comments_extended_xml_with_overrides, build_comments_xml,
 };
+use crate::parts::footnotes::emit_note_pr;
 use crate::parts::numbering::build_numbering_xml;
 use crate::schema::ct_ppr::ppr_child_rank;
 use crate::schema::ct_rpr::rpr_child_rank;
@@ -1026,14 +1028,38 @@ fn emit_inline_object(obj: &InlineObject, out: &mut String) {
         },
         InlineKind::FootnoteRef {
             id,
-            display_number: _,
+            custom_mark_follows,
+        }
+        | InlineKind::EndnoteRef {
+            id,
+            custom_mark_follows,
         } => {
-            /* Phase 8a footnote reference — round-trip via the engine's
-            existing `<w:footnoteReference>` emission. */
-            out.push_str(&format!(
-                "<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>\
-                 <w:footnoteReference w:id=\"{id}\"/></w:r>"
-            ));
+            /* Phase 8a / issue #80 — note reference. The number is not
+            stored (layout derives it), so the element carries only the
+            id and the custom-mark flag; Word styles the run through
+            `FootnoteReference` — the explicit superscript keeps the mark
+            raised in readers without that style. */
+            let elem = if matches!(obj.kind, InlineKind::FootnoteRef { .. }) {
+                "w:footnoteReference"
+            } else {
+                "w:endnoteReference"
+            };
+            out.push_str("<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr><");
+            out.push_str(elem);
+            if *custom_mark_follows {
+                out.push_str(" w:customMarkFollows=\"1\"");
+            }
+            out.push_str(&format!(" w:id=\"{id}\"/></w:r>"));
+        }
+        InlineKind::NoteSelfRef { kind } => {
+            /* Issue #80 — the self-mark heading a note body. */
+            let elem = match kind {
+                engine::NoteKind::Footnote => "w:footnoteRef",
+                engine::NoteKind::Endnote => "w:endnoteRef",
+            };
+            out.push_str("<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr><");
+            out.push_str(elem);
+            out.push_str("/></w:r>");
         }
     }
 }
@@ -1505,6 +1531,8 @@ fn build_document_xml_with_root(
         || trailing.columns.is_multi()
         || trailing.page_num != engine::PageNumType::default()
         || trailing.section_type != engine::SectionType::default()
+        || !trailing.footnote_props.is_empty()
+        || !trailing.endnote_props.is_empty()
         || !geometry_is_stock_a4(&trailing.geometry);
     if needs_full {
         emit_sect_pr(&trailing, &mut out);
@@ -1601,6 +1629,9 @@ fn emit_sect_pr(props: &engine::SectionProps, out: &mut String) {
     out.push_str("<w:sectPr>");
     emit_hf_references("w:headerReference", &props.header_refs, out);
     emit_hf_references("w:footerReference", &props.footer_refs, out);
+    /* Issue #80 — CT_SectPr order: footnotePr, endnotePr precede type. */
+    emit_note_pr("w:footnotePr", &props.footnote_props, out);
+    emit_note_pr("w:endnotePr", &props.endnote_props, out);
     emit_sect_type(props.section_type, out);
     let g = &props.geometry;
     let tw = |pt: f32| (pt * 20.0).round() as i64;
@@ -1759,6 +1790,41 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             None
         };
         let synth_settings = !settings_already_present && settings_bytes.is_some();
+        /* Issue #80 — regenerate a note part when the engine touched a
+        story (`notes_dirty` flips on add / edit / remove, `NoteStory::dirty`
+        per entry) OR when the engine holds referenced notes but the
+        archive never carried the part (a fresh document saved through
+        `build_minimal_docx`). Untouched parts ride the passthrough. */
+        let notes_plan =
+            |kind: engine::NoteKind, entry: &str, dirty: bool| -> (bool, Option<Vec<u8>>) {
+                let existing = archive.other_entries.iter().find(|(n, _)| n == entry);
+                let present = existing.is_some();
+                let stories = doc.note_stories(kind);
+                let any_normal = stories
+                    .values()
+                    .any(|s| s.note_type == engine::NoteType::Normal);
+                let regen = dirty || stories.values().any(|s| s.dirty) || (!present && any_normal);
+                if !regen {
+                    return (present, None);
+                }
+                let root_attrs: Vec<(String, String)> = match existing {
+                    Some((_, bytes)) => root_attributes(bytes),
+                    None => archive.document_root_attrs.clone(),
+                };
+                (present, Some(build_notes_xml(kind, doc, &root_attrs)))
+            };
+        let (footnotes_present, footnotes_bytes) = notes_plan(
+            engine::NoteKind::Footnote,
+            FOOTNOTES_XML,
+            doc.notes_dirty.footnotes,
+        );
+        let (endnotes_present, endnotes_bytes) = notes_plan(
+            engine::NoteKind::Endnote,
+            ENDNOTES_XML,
+            doc.notes_dirty.endnotes,
+        );
+        let synth_footnotes = !footnotes_present && footnotes_bytes.is_some();
+        let synth_endnotes = !endnotes_present && endnotes_bytes.is_some();
         let numbering_already_present = archive
             .other_entries
             .iter()
@@ -1791,6 +1857,12 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             hyperlink_next += 1;
         }
         if synth_settings {
+            hyperlink_next += 1;
+        }
+        if synth_footnotes {
+            hyperlink_next += 1;
+        }
+        if synth_endnotes {
             hyperlink_next += 1;
         }
         let (hyperlink_rid_by_target, new_hyperlink_rel_entries) =
@@ -1982,6 +2054,15 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                 && let Some(new_bytes) = styles_bytes.as_deref()
             {
                 zip.write_all(new_bytes)?;
+            } else if name == FOOTNOTES_XML
+                && let Some(new_bytes) = footnotes_bytes.as_deref()
+            {
+                /* Issue #80 — an edited note part. */
+                zip.write_all(new_bytes)?;
+            } else if name == ENDNOTES_XML
+                && let Some(new_bytes) = endnotes_bytes.as_deref()
+            {
+                zip.write_all(new_bytes)?;
             } else if let Some(new_bytes) = hf_replacements.get(name.as_str()) {
                 /* Phase 3 (#39) — an edited imported header/footer part. */
                 zip.write_all(new_bytes)?;
@@ -1995,7 +2076,12 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                 /* Issue #74 — patched-in-place settings.xml. */
                 zip.write_all(new_bytes)?;
             } else if name == "[Content_Types].xml"
-                && (synth_comments || synth_extended || synth_hf || synth_settings)
+                && (synth_comments
+                    || synth_extended
+                    || synth_hf
+                    || synth_settings
+                    || synth_footnotes
+                    || synth_endnotes)
             {
                 let raw = std::str::from_utf8(bytes)?;
                 let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
@@ -2039,13 +2125,33 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                             Cow::Owned(s) => Cow::Owned(s),
                         };
                 }
+                /* Issue #80 — fresh note parts. */
+                for (on, part_name, content_type) in [
+                    (
+                        synth_footnotes,
+                        "/word/footnotes.xml",
+                        FOOTNOTES_CONTENT_TYPE,
+                    ),
+                    (synth_endnotes, "/word/endnotes.xml", ENDNOTES_CONTENT_TYPE),
+                ] {
+                    if !on {
+                        continue;
+                    }
+                    patched = match inject_content_type_override(&patched, part_name, content_type)
+                    {
+                        Cow::Borrowed(_) => patched,
+                        Cow::Owned(s) => Cow::Owned(s),
+                    };
+                }
                 zip.write_all(patched.as_bytes())?;
             } else if name == RELS_XML
                 && (synth_comments
                     || synth_extended
                     || needs_hyperlink_rels_splice
                     || synth_hf
-                    || synth_settings)
+                    || synth_settings
+                    || synth_footnotes
+                    || synth_endnotes)
             {
                 let raw = std::str::from_utf8(bytes)?;
                 let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
@@ -2087,6 +2193,22 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                         inject_doc_rel(&patched, &rid, SETTINGS_REL_TYPE, "settings.xml", None);
                     if let Cow::Owned(s) = new {
                         patched = Cow::Owned(s);
+                        next += 1;
+                    }
+                }
+                /* Issue #80 — one Relationship per fresh note part. */
+                for (on, rel_type, target) in [
+                    (synth_footnotes, FOOTNOTES_REL_TYPE, "footnotes.xml"),
+                    (synth_endnotes, ENDNOTES_REL_TYPE, "endnotes.xml"),
+                ] {
+                    if !on {
+                        continue;
+                    }
+                    let rid = format!("rId{next}");
+                    let new = inject_doc_rel(&patched, &rid, rel_type, target, None);
+                    if let Cow::Owned(s) = new {
+                        patched = Cow::Owned(s);
+                        next += 1;
                     }
                 }
                 /* Issue #60 — splice one `<Relationship TargetMode="External">`
@@ -2141,6 +2263,16 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         Content_Types + rels were patched in the write loop above. */
         if !extended_already_present && let Some(new_bytes) = extended_bytes.as_deref() {
             zip.start_file(COMMENTS_EXTENDED_XML, opts)?;
+            zip.write_all(new_bytes)?;
+        }
+        /* Issue #80 — append fresh note parts. Content_Types + rels were
+        patched in the write loop above. */
+        if synth_footnotes && let Some(new_bytes) = footnotes_bytes.as_deref() {
+            zip.start_file(FOOTNOTES_XML, opts)?;
+            zip.write_all(new_bytes)?;
+        }
+        if synth_endnotes && let Some(new_bytes) = endnotes_bytes.as_deref() {
+            zip.start_file(ENDNOTES_XML, opts)?;
             zip.write_all(new_bytes)?;
         }
         /* Issue #60 — a document with zero prior relationships (no
@@ -2365,6 +2497,17 @@ const HEADER_REL_TYPE: &str =
 const FOOTER_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
 
+/* Issue #80 — OPC plumbing for the note parts (synthesized only when the
+archive never carried one and the engine authored a note). */
+const FOOTNOTES_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
+const ENDNOTES_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
+const FOOTNOTES_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes";
+const ENDNOTES_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes";
+
 /* Issue #74 — settings.xml OPC identity (synthesized only when the
 archive never carried one). */
 const SETTINGS_PART_NAME: &str = "/word/settings.xml";
@@ -2511,6 +2654,122 @@ fn build_hf_xml(
     }
     out.push_str("</");
     out.push_str(tag);
+    out.push('>');
+    out.into_bytes()
+}
+
+/// Issue #80 — serialize `word/footnotes.xml` / `word/endnotes.xml` from
+/// the engine's story map. Entries emit in ascending `w:id` order (Word's
+/// own layout: the `-1` / `0` separator sentinels first). A clean entry
+/// with captured source bytes passes through verbatim; a dirty one (or an
+/// engine-authored one) regenerates from its block model, where clean
+/// paragraphs still ride their own `source_xml`. Normal notes no body
+/// reference addresses any more are dropped — Word would otherwise show
+/// orphaned notes — while the special separator stories always survive;
+/// a part synthesized from scratch gets Word's two stock separators.
+fn build_notes_xml(
+    kind: engine::NoteKind,
+    doc: &DocumentTree,
+    root_attrs: &[(String, String)],
+) -> Vec<u8> {
+    let (root, entry) = match kind {
+        engine::NoteKind::Footnote => ("w:footnotes", "w:footnote"),
+        engine::NoteKind::Endnote => ("w:endnotes", "w:endnote"),
+    };
+    let stories = doc.note_stories(kind);
+    let referenced: std::collections::HashSet<u32> = doc
+        .note_references()
+        .iter()
+        .filter(|r| r.anchor.kind == kind)
+        .map(|r| r.anchor.id)
+        .collect();
+    let mut has_image = false;
+    let mut has_link = false;
+    for s in stories.values() {
+        for_each_hf_paragraph(&s.body, &mut |p| {
+            has_image |= p
+                .inline_objects
+                .iter()
+                .any(|o| matches!(o.kind, InlineKind::Image { .. }));
+            has_link |= !p.hyperlinks.is_empty();
+        });
+    }
+    let mut out = String::with_capacity(1024);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+    out.push('<');
+    out.push_str(root);
+    out.push_str(" xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"");
+    if has_image {
+        out.push_str(
+            " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\
+             \u{20}xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"\
+             \u{20}xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"\
+             \u{20}xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"",
+        );
+    } else if has_link {
+        out.push_str(
+            " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+        );
+    }
+    let extra = extra_root_attrs(&out, root_attrs);
+    out.push_str(&extra);
+    out.push('>');
+    let has_separator = stories
+        .values()
+        .any(|s| s.note_type == engine::NoteType::Separator);
+    let has_continuation = stories
+        .values()
+        .any(|s| s.note_type == engine::NoteType::ContinuationSeparator);
+    if !has_separator {
+        out.push_str(&format!(
+            "<{entry} w:type=\"separator\" w:id=\"-1\"><w:p><w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:r><w:separator/></w:r></w:p></{entry}>"
+        ));
+    }
+    if !has_continuation {
+        out.push_str(&format!(
+            "<{entry} w:type=\"continuationSeparator\" w:id=\"0\"><w:p><w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></{entry}>"
+        ));
+    }
+    let mut ids: Vec<i32> = stories.keys().copied().collect();
+    ids.sort_unstable();
+    /* Hyperlinks inside regenerated note paragraphs would need a
+    part-local rels row; none is minted yet (they degrade to plain
+    text on the regenerate path — clean paragraphs keep theirs). */
+    let no_links: HashMap<String, String> = HashMap::new();
+    for id in ids {
+        let Some(story) = stories.get(&id) else {
+            continue;
+        };
+        if story.note_type == engine::NoteType::Normal && !referenced.contains(&(id.max(0) as u32))
+        {
+            continue;
+        }
+        if !story.dirty
+            && let Some(src) = story.source_xml.as_deref()
+        {
+            out.push_str(&String::from_utf8_lossy(src));
+            continue;
+        }
+        out.push('<');
+        out.push_str(entry);
+        match story.note_type {
+            engine::NoteType::Normal => {}
+            engine::NoteType::Separator => out.push_str(" w:type=\"separator\""),
+            engine::NoteType::ContinuationSeparator => {
+                out.push_str(" w:type=\"continuationSeparator\"")
+            }
+            engine::NoteType::ContinuationNotice => out.push_str(" w:type=\"continuationNotice\""),
+        }
+        out.push_str(&format!(" w:id=\"{id}\">"));
+        for b in &story.body {
+            emit_block(b, &mut out, &no_links);
+        }
+        out.push_str("</");
+        out.push_str(entry);
+        out.push('>');
+    }
+    out.push_str("</");
+    out.push_str(root);
     out.push('>');
     out.into_bytes()
 }
