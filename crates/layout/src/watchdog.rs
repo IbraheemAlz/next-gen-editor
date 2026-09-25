@@ -202,7 +202,7 @@ pub fn converge_page_refs<T: PartialEq + Clone>(
 
 /// Content fingerprint of one placement attempt — what "progress" is
 /// measured against. `units` is the block's consumable content count
-/// (lines for a paragraph, rows for a table); `fresh` records whether
+/// (lines for a paragraph; rows plus cell lines for a table); `fresh` records whether
 /// the attempt started on an empty page. A re-push that consumed nothing
 /// has the same `units`; the same content attempted twice on a fresh
 /// page is a proof of non-progress, because a fresh page is the most
@@ -222,8 +222,10 @@ impl BlockFingerprint {
                 is_table: false,
                 fresh,
             },
+            /* Issue #91 — rows AND cell lines: a row continued inside
+            its cells keeps its row count but strictly loses lines. */
             LayoutBlock::Table(t) => Self {
-                units: t.rows.len() as u64,
+                units: crate::table_split::table_progress_units(&t.rows),
                 is_table: true,
                 fresh,
             },
