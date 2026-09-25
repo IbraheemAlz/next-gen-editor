@@ -254,9 +254,7 @@ impl Scenario {
             Scenario::TextRangeCharBoundarySplitParagraph => "repro_115_3",
             Scenario::TextRangeCharBoundaryApplyFormatting => "repro_115_4",
             Scenario::TextRangeCharBoundaryInsertText => "repro_115_5",
-            Scenario::TextRangeCharBoundaryCompositionCommit => {
-                "repro_115_composition_overlay"
-            }
+            Scenario::TextRangeCharBoundaryCompositionCommit => "repro_115_composition_overlay",
             Scenario::TableMergeCellsOutOfRange => "repro_116_1",
             Scenario::SelectionClampOutOfRange => "repro_117_1",
             Scenario::SelectionClampAfterUndo => "repro_117_undo_repaint_error",
@@ -1376,8 +1374,7 @@ mod tests {
     /// `EndComposition { commit: true }` instead.
     #[test]
     fn text_range_char_boundary_composition_commit_snaps_instead_of_panicking() {
-        let (engine, events) =
-            apply_scenario(Scenario::TextRangeCharBoundaryCompositionCommit);
+        let (engine, events) = apply_scenario(Scenario::TextRangeCharBoundaryCompositionCommit);
         assert!(engine.selection_is_valid());
         assert!(
             matches!(

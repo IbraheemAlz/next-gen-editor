@@ -8,7 +8,11 @@
 //! - **JPEG** passes through untouched as `/DCTDecode`. Only the frame
 //!   header (`SOF0`/`SOF1`/`SOF2`) is parsed, for width, height, component
 //!   count and sample precision — no pixel decode, no re-encode, no quality
-//!   loss, and the stream is exactly the file's bytes.
+//!   loss, and the stream is exactly the file's bytes. Still bounded by
+//!   [`MAX_IMAGE_PIXELS`] (issue #227's fuzz sweep) even though nothing
+//!   here allocates a pixel buffer for it — SOF0's 16-bit width/height
+//!   fields (up to 65535×65535) would otherwise land unchecked in the
+//!   PDF's `/Width`/`/Height` XObject entries.
 //! - **PNG** is decoded with the `png` crate (already in the wasm graph via
 //!   `vello`), normalized to 8-bit Gray / RGB (palette expanded, 16-bit
 //!   stripped), and re-deflated as `/FlateDecode` samples. Alpha becomes a
@@ -353,6 +357,16 @@ pub fn parse_jpeg_frame(data: &[u8]) -> Result<JpegFrame, ImageSkipReason> {
 
 fn prepare_jpeg(data: &[u8], allow_cmyk: bool) -> Result<PreparedImage, ImageSkipReason> {
     let frame = parse_jpeg_frame(data)?;
+    /* Issue #227 fuzz finding — `/DCTDecode` is a passthrough (no pixel
+    buffer allocated here, unlike every other format), so this was the
+    one decoder never running `check_dimensions`. That does not cost an
+    allocation, but it DOES let a JPEG declare dimensions no other
+    format would be allowed to (SOF0's width/height are 16-bit fields,
+    so up to 65535×65535) into the PDF's `/Width`/`/Height` XObject
+    entries. Apply the same bound every other format already has, for
+    the same reason: a declared size this large is never a real
+    Office-authored image. */
+    check_dimensions("JPEG", frame.width, frame.height)?;
     /* `/DCTDecode` is Huffman baseline / extended / progressive, 8-bit. */
     if !matches!(frame.marker, 0xC0..=0xC2) {
         return Err(ImageSkipReason::UnsupportedEncoding {
@@ -1670,6 +1684,39 @@ mod tests {
         assert!(p.alpha.is_none());
     }
 
+    /// Issue #227 — the `format_pdf_image_decode` fuzz target's own
+    /// invariant check (every successful decode's pixel count must fit
+    /// `MAX_IMAGE_PIXELS`) caught a real gap: `prepare_jpeg` never called
+    /// `check_dimensions`, so SOF0's 16-bit width/height fields could
+    /// declare up to 65535×65535 and sail straight through — no pixel
+    /// buffer is allocated for the DCT-passthrough path, but the
+    /// declared size still lands in the PDF's `/Width`/`/Height` XObject
+    /// entries unchecked. `fuzz/corpus/image_decode/
+    /// jpeg_oversized_dims_sof0.bin` is the minimized fuzz reproducer
+    /// (15616×16388, found within the 2-minute nightly run this issue's
+    /// task required).
+    #[test]
+    fn jpeg_oversized_dimensions_are_rejected_not_passed_through() {
+        let j = jpeg(4, 4, 3);
+        let sof = j.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+        // SOF0 layout after the marker: 2-byte length, 1-byte precision,
+        // then height (2 bytes BE), then width (2 bytes BE).
+        let mut oversized = j.clone();
+        let dims_at = sof + 2 + 2 + 1;
+        oversized[dims_at..dims_at + 2].copy_from_slice(&16388u16.to_be_bytes());
+        oversized[dims_at + 2..dims_at + 4].copy_from_slice(&15616u16.to_be_bytes());
+        assert!(
+            matches!(
+                prepare_image(&oversized, "image/jpeg", AlphaMode::SoftMask, false),
+                Err(ImageSkipReason::TooLarge {
+                    width: 15616,
+                    height: 16388
+                })
+            ),
+            "a JPEG declaring dimensions past MAX_IMAGE_PIXELS must be a typed TooLarge skip"
+        );
+    }
+
     #[test]
     fn jpeg_cmyk_is_profile_gated() {
         let j = jpeg(8, 8, 4);
@@ -1984,7 +2031,8 @@ mod tests {
             &test_images::WEBP_LOSSY_ALPHA_4X4_BLUE[..],
         ] {
             let chunk = riff_first_chunk(fixture, b"VP8 ").expect("fixture has a VP8 chunk");
-            let tag = u32::from(chunk[0]) | (u32::from(chunk[1]) << 8) | (u32::from(chunk[2]) << 16);
+            let tag =
+                u32::from(chunk[0]) | (u32::from(chunk[1]) << 8) | (u32::from(chunk[2]) << 16);
             assert_eq!(tag & 1, 0, "fixture's VP8 frame must be a keyframe");
             let first_partition_size = (tag >> 5) as usize;
             let first_partition = &chunk[10..10 + first_partition_size];

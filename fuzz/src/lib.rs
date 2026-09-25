@@ -200,7 +200,7 @@ pub fn run_format_pdf_image_decode(data: &[u8]) {
     // magic of their own to sniff.
     let content_type =
         CONTENT_TYPES[data.first().copied().unwrap_or(0) as usize % CONTENT_TYPES.len()];
-    let alpha = if data.len() % 2 == 0 {
+    let alpha = if data.len().is_multiple_of(2) {
         format_pdf::AlphaMode::SoftMask
     } else {
         format_pdf::AlphaMode::FlattenOnWhite

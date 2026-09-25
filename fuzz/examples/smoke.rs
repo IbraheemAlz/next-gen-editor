@@ -307,8 +307,7 @@ fn main() {
         if name == "rpc_command" {
             engine_fuzz::command_gen::reset_coverage();
         }
-        let (corpus_panics, sweep_panics) =
-            run_target(name, corpus_dir_name, opts.iterations, run);
+        let (corpus_panics, sweep_panics) = run_target(name, corpus_dir_name, opts.iterations, run);
         corpus_clean &= corpus_panics.is_empty();
         sweep_clean &= sweep_panics.is_empty();
         if name == "rpc_command" {
