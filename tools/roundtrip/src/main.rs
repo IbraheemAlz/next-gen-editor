@@ -292,6 +292,7 @@ fn run_default() -> Result<()> {
     run_package_media_insert()?;
     run_package_ui_save()?;
     run_style_bidi_roundtrip()?;
+    run_part_scoped_media_roundtrip()?;
     run_source_markup_roundtrip()?;
 
     println!("\nPASS");
@@ -2385,7 +2386,7 @@ fn run_table_cell_runs_survival() -> Result<()> {
     let has_pic = c1.inline_objects.iter().any(|o| {
         matches!(
             &o.kind,
-            InlineKind::Image { rel_id, width_emu: 914400, height_emu: 457200 } if rel_id == "rId5"
+            InlineKind::Image { rel_id, width_emu: 914400, height_emu: 457200, .. } if rel_id == "rId5"
         )
     });
     if !has_pic {
@@ -2449,7 +2450,14 @@ fn run_table_cell_runs_survival() -> Result<()> {
         bail!("cell 0 run styles drifted: {styles_a:?} vs {styles_b:?}");
     }
     let c1b = cell_para(&archive_b.document, 1)?;
-    if c1b.inline_objects.len() != 1 || !archive_b.document.media.contains_key("rId5") {
+    /* Issue #188 — media is keyed by the part-resolved target path. */
+    let pic_key = c1b
+        .inline_objects
+        .first()
+        .and_then(|o| o.kind.image_media_key());
+    if c1b.inline_objects.len() != 1
+        || !pic_key.is_some_and(|k| archive_b.document.media.contains_key(k))
+    {
         bail!("cell picture lost on save: {:?}", c1b.inline_objects);
     }
     println!(
@@ -2708,7 +2716,7 @@ fn build_source_markup_docx() -> Vec<u8> {
     build_styled_docx(SOURCE_MARKUP_STYLES_XML, &document_xml)
 }
 
-/// Issues #199 / #106 — step 25: the attribute-level grab bag.
+/// Issues #199 / #106 — step 26: the attribute-level grab bag.
 ///
 /// a. An untouched save is byte-identical.
 /// b. Typing inside a word of the Word-shaped paragraph regenerates it as
@@ -2734,7 +2742,7 @@ fn run_source_markup_roundtrip() -> Result<()> {
     if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
         bail!("untouched source-markup document drifted");
     }
-    println!("[roundtrip] step 25a OK — untouched save byte-identical");
+    println!("[roundtrip] step 26a OK — untouched save byte-identical");
 
     let edited = archive_a
         .document
@@ -2760,7 +2768,7 @@ fn run_source_markup_roundtrip() -> Result<()> {
     }
     let drift = expected_xml.len() - doc_a.len();
     println!(
-        "[roundtrip] step 25b OK — edited Word paragraph is source + insert on both save paths (Δ {drift} B = N)"
+        "[roundtrip] step 26b OK — edited Word paragraph is source + insert on both save paths (Δ {drift} B = N)"
     );
 
     let start = "Hello wrold".len();
@@ -2790,7 +2798,7 @@ fn run_source_markup_roundtrip() -> Result<()> {
     if p0.style_at(start as u32).bold != Some(true) {
         bail!("bold lost on re-read");
     }
-    println!("[roundtrip] step 25c OK — restyled run keeps its rsid and <w:u w:color> (#106)");
+    println!("[roundtrip] step 26c OK — restyled run keeps its rsid and <w:u w:color> (#106)");
     Ok(())
 }
 
@@ -3404,6 +3412,78 @@ fn build_word_package_parts_docx() -> Vec<u8> {
     buf
 }
 
+/// Issue #188 — step 25: relationship ids are scoped per OPC part. The
+/// body, header and footer of the fixture each declare `rId5`: the body's
+/// and the footer's name `image1.jpeg`, the header's `image2.jpeg`.
+/// (a) media is keyed by the part-resolved target (two blobs, the footer
+/// deduped onto the body's) and each picture carries its media key;
+/// (b) an edit of the body text saves through the UI path (`save_docx`,
+/// package present) with every sibling byte-identical and the pictures'
+/// part-local `r:embed="rId5"` untouched, and the re-read resolves each
+/// part's picture to its own blob again.
+fn run_part_scoped_media_roundtrip() -> Result<()> {
+    use format_docx::test_fixtures::part_scoped_media_docx;
+    const BODY: &[u8] = b"\xFF\xD8body-picture";
+    const HEADER: &[u8] = b"\xFF\xD8header-picture";
+    let fixture = part_scoped_media_docx(BODY, HEADER);
+    let archive = read_docx(&fixture).context("read part-scoped media fixture")?;
+    let key_of = |blocks: &[engine::Block]| -> Option<String> {
+        blocks.iter().find_map(|b| {
+            b.as_paragraph()?
+                .inline_objects
+                .iter()
+                .find_map(|io| io.kind.image_media_key().map(str::to_string))
+        })
+    };
+    let check = |doc: &DocumentTree, what: &str| -> Result<()> {
+        let body: Vec<engine::Block> = doc.blocks.iter().cloned().collect();
+        let keys = (
+            key_of(&body),
+            doc.headers.get("rId7").and_then(|b| key_of(b)),
+            doc.footers.get("rId8").and_then(|b| key_of(b)),
+        );
+        let blob = |k: &Option<String>| {
+            k.as_deref()
+                .and_then(|k| doc.media.get(k))
+                .map(|b| b.data.as_slice())
+        };
+        if doc.media.len() != 2
+            || blob(&keys.0) != Some(BODY)
+            || blob(&keys.1) != Some(HEADER)
+            || blob(&keys.2) != Some(BODY)
+        {
+            bail!("step 25 ({what}): part pictures resolve wrong: {keys:?}");
+        }
+        Ok(())
+    };
+    check(&archive.document, "read")?;
+    println!("[roundtrip] step 25a OK — each part's rId5 resolves to its own picture");
+
+    let edited = archive.document.insert_text(
+        engine::LogicalPos {
+            path: engine::BlockPath::top(0),
+            offset: 0,
+        },
+        "Edited ",
+    );
+    let saved = format_docx::save_docx(&edited).context("UI save")?;
+    let (before, after) = (zip_entries(&fixture)?, zip_entries(&saved)?);
+    for (name, bytes) in before.iter().filter(|(n, _)| n != "word/document.xml") {
+        if after.iter().find(|(n, _)| n == name).map(|(_, b)| b) != Some(bytes) {
+            bail!("step 25: sibling {name} drifted");
+        }
+    }
+    let doc_xml = String::from_utf8(extract_doc_xml(&saved)?).context("utf8")?;
+    if !doc_xml.contains(r#"r:embed="rId5""#) {
+        bail!("step 25: the body picture lost its part-local id");
+    }
+    check(&read_docx(&saved).context("re-read")?.document, "re-read")?;
+    println!(
+        "[roundtrip] step 25b OK — UI save keeps siblings byte-identical, the re-read resolves each part"
+    );
+    Ok(())
+}
+
 /// Every `(entry name, bytes)` of a saved package, in archive order.
 fn zip_entries(docx: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     use std::io::Read;
@@ -3614,10 +3694,11 @@ fn run_package_media_insert() -> Result<()> {
         bail!("step 21: gif content-type default missing or duplicated");
     }
     let reread = read_docx(&saved).context("re-read")?;
-    let ids: Vec<String> = reread
+    let para = reread
         .document
         .nth_paragraph(3)
-        .context("re-read paragraph")?
+        .context("re-read paragraph")?;
+    let ids: Vec<String> = para
         .inline_objects
         .iter()
         .filter_map(|io| match &io.kind {
@@ -3625,8 +3706,14 @@ fn run_package_media_insert() -> Result<()> {
             _ => None,
         })
         .collect();
+    /* Issue #188 — the blobs resolve through the part-resolved media key. */
+    let keys: Vec<&str> = para
+        .inline_objects
+        .iter()
+        .filter_map(|io| io.kind.image_media_key())
+        .collect();
     if ids != ["rId9", "rId10", "rId12"]
-        || ids.iter().any(|id| !reread.document.media.contains_key(id))
+        || keys.iter().any(|k| !reread.document.media.contains_key(*k))
     {
         bail!("step 21: re-read picture ids {ids:?}");
     }

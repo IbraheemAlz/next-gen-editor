@@ -7,7 +7,8 @@
 //! its extension. This module plans the additive OPC plumbing:
 //!
 //! * a **new** image is a `doc.media` key that some story references
-//!   (`InlineKind::Image::rel_id`) but that is NOT a relationship id of
+//!   (`InlineKind::Image::rel_id` of a picture WITHOUT a reader-resolved
+//!   `media_key` — issue #188) but that is NOT a relationship id of
 //!   `word/_rels/document.xml.rels` — imported pictures keep their ids and
 //!   their parts byte-identical;
 //! * every new image gets a Word-shaped relationship id `rIdN` above the
@@ -93,15 +94,23 @@ pub(crate) fn media_extension_and_type(content_type: &str) -> (&'static str, &'s
     }
 }
 
-/// Every image `rel_id` referenced by `blocks`, recursing into table cells
-/// (any depth) and text-box stories.
+/// Every engine-keyed image `rel_id` referenced by `blocks`, recursing
+/// into table cells (any depth) and text-box stories. Issue #188 — a
+/// picture carrying a `media_key` was resolved by the reader against its
+/// own part's rels, so its relationship and media part already exist in
+/// the package: only pictures whose `rel_id` IS their media key (engine-
+/// inserted, or a pre-#188 snapshot) are candidates.
 fn collect_image_refs(blocks: &[Block], out: &mut BTreeSet<String>) {
     for b in blocks {
         match b {
             Block::Paragraph(p) => {
                 for io in &p.inline_objects {
                     match &io.kind {
-                        InlineKind::Image { rel_id, .. } if !rel_id.is_empty() => {
+                        InlineKind::Image {
+                            rel_id,
+                            media_key: None,
+                            ..
+                        } if !rel_id.is_empty() => {
                             out.insert(rel_id.clone());
                         }
                         InlineKind::TextBox { story, .. } => collect_image_refs(&story.body, out),
@@ -380,6 +389,7 @@ mod tests {
                     rel_id: id.to_string(),
                     width_emu: 10,
                     height_emu: 10,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -431,6 +441,46 @@ mod tests {
             ids,
             BTreeSet::from(["rId3".to_string(), "rId13".to_string()])
         );
+    }
+
+    /// Issue #188 — a picture the reader resolved against its own part's
+    /// rels (`media_key` set, media keyed by target path) already has its
+    /// relationship and part: never planned, even when its part-local
+    /// `rel_id` is absent from `document.xml.rels`.
+    #[test]
+    fn reader_resolved_pictures_are_not_planned() {
+        let entries = vec![
+            (RELS_XML.to_string(), rels(&[("rId3", "media/image1.png")])),
+            (
+                "word/_rels/header1.xml.rels".to_string(),
+                rels(&[("rId12", "media/image2.png")]),
+            ),
+            ("word/media/image2.png".to_string(), vec![0]),
+        ];
+        let mut doc = DocumentTree::from_paragraphs(["pic".to_string()]);
+        doc.media.insert(
+            "word/media/image2.png".into(),
+            ImageBlob {
+                content_type: "image/png".into(),
+                data: vec![0],
+            },
+        );
+        let mut blocks: Vec<Block> = doc.blocks.iter().cloned().collect();
+        if let Some(Block::Paragraph(p)) = blocks.first_mut() {
+            p.inline_objects.push(engine::InlineObject {
+                at: 0,
+                kind: InlineKind::Image {
+                    rel_id: "rId12".into(),
+                    width_emu: 10,
+                    height_emu: 10,
+                    media_key: Some("word/media/image2.png".into()),
+                },
+                anchor: None,
+                source_xml: None,
+            });
+        }
+        doc.blocks = blocks.into_iter().collect();
+        assert!(plan_new_media(&entries, &doc).is_empty());
     }
 
     #[test]
