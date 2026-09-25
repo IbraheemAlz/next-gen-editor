@@ -987,7 +987,9 @@ impl Engine {
     }
 
     /// Phase 7 — list every inline-image media blob the document carries,
-    /// keyed by archive relationship id (`r:id`). The TS shell consumes
+    /// keyed by media key (issue #188: the resolved target path for an
+    /// imported picture, the minted id for an inserted one — the same key
+    /// the display list's `DrawImage.rel_id` names). The TS shell consumes
     /// this list once after `OpenDocx`, decodes each blob into an
     /// `ImageBitmap` via the browser, and installs the result via
     /// [`Engine::register_image`]. Returns an array of
@@ -2023,10 +2025,16 @@ fn build_inline_object_infos(
     para.inline_objects
         .iter()
         .map(|obj| match &obj.kind {
-            engine::InlineKind::Image {
-                rel_id,
+            /* Issue #188 — layout, the display list, the canvas image
+            cache and the PDF all key pictures by the part-resolved MEDIA
+            key (`word/media/image2.png`), never by the part-scoped
+            `rel_id`: a header's `rId5` and the body's `rId5` may name
+            different targets. The layout fields keep their `rel_id`
+            names for wire stability. */
+            kind @ engine::InlineKind::Image {
                 width_emu,
                 height_emu,
+                ..
             } => layout::paragraph::InlineObjectInfo {
                 at: obj.at,
                 width_px: engine::emu_to_pt(*width_emu) * scale,
@@ -2037,12 +2045,12 @@ fn build_inline_object_infos(
                 layout px. `<wp:inline>` keeps the Phase 7 in-line box. */
                 kind: match obj.anchor.as_deref() {
                     Some(anchor) => layout::paragraph::InlineObjectInfoKind::FloatingImage {
-                        rel_id: rel_id.clone(),
+                        rel_id: kind.image_media_key().unwrap_or_default().to_string(),
                         spec: float_spec_from_anchor(anchor, scale),
                         wrap: float_wrap_from_anchor(anchor, scale),
                     },
                     None => layout::paragraph::InlineObjectInfoKind::Image {
-                        rel_id: rel_id.clone(),
+                        rel_id: kind.image_media_key().unwrap_or_default().to_string(),
                     },
                 },
             },
@@ -2832,9 +2840,12 @@ fn paragraph_layout_key(
                 rel_id,
                 width_emu,
                 height_emu,
+                media_key,
             } => {
                 1u8.hash(&mut h);
                 rel_id.hash(&mut h);
+                /* Issue #188 — the laid-out glyph carries the media key. */
+                media_key.hash(&mut h);
                 width_emu.hash(&mut h);
                 height_emu.hash(&mut h);
             }
@@ -3602,6 +3613,18 @@ fn build_header_footer_box(
                     );
                     (para.text.clone(), spans)
                 };
+                /* Issue #78 / #188 — band pictures (and every other inline
+                object) ride the body's inline-object path; their media
+                keys were resolved against the part's own rels at read
+                time. A composition preview shifts the anchors after it. */
+                let mut inline_infos = build_inline_object_infos(para, cfg, scale, sctx);
+                if let Some(c) = comp {
+                    for info in &mut inline_infos {
+                        if info.at >= c.at.offset {
+                            info.at += c.text.len() as u32;
+                        }
+                    }
+                }
                 let mut p = layout_paragraph(ParagraphConfig {
                     text: &text,
                     fonts,
@@ -3617,7 +3640,7 @@ fn build_header_footer_box(
                     hanging_indent_px: ind_h,
                     marker_text: para.resolved_marker.clone(),
                     px_size_for_marker: cfg.px_size * scale,
-                    inline_objects: &[],
+                    inline_objects: &inline_infos,
                     tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
                 });
                 /* Phase 2 audit (gap D.1) — propagate field overlays so
@@ -18701,7 +18724,8 @@ mod tests {
                 kind: engine::InlineKind::Image {
                     rel_id: "nge_img_1".to_string(),
                     width_emu: 914_400,  // 1 inch
-                    height_emu: 457_200, // 0.5 inch
+                    height_emu: 457_200, // 0.5 inch,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -18749,6 +18773,7 @@ mod tests {
                     rel_id: "nge_img_1".to_string(),
                     width_emu: 457_200,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -18779,6 +18804,7 @@ mod tests {
                     rel_id: "nge_float_1".to_string(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: Some(Box::new(anchor)),
                 source_xml: None,
@@ -18796,6 +18822,7 @@ mod tests {
                     rel_id: "nge_img_1".to_string(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -18822,6 +18849,7 @@ mod tests {
                     rel_id: rel.to_string(),
                     width_emu: 457_200,
                     height_emu: 228_600,
+                    media_key: None,
                 },
                 anchor,
                 source_xml: None,
@@ -18972,6 +19000,7 @@ mod tests {
                     rel_id: "nge_float_1".to_string(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: Some(Box::new(engine::FloatAnchor {
                     position_h: engine::HPosition {
@@ -19411,6 +19440,7 @@ mod tests {
                 rel_id: rel.to_string(),
                 width_emu: 685_800,
                 height_emu: 457_200,
+                media_key: None,
             },
             anchor: Some(Box::new(engine::FloatAnchor {
                 dist_right_emu: 57_150,
@@ -19894,6 +19924,7 @@ mod tests {
                         rel_id: "rIdInlinePic".to_string(),
                         width_emu: 228_600,
                         height_emu: 228_600,
+                        media_key: None,
                     },
                     anchor: None,
                     source_xml: None,
@@ -20413,6 +20444,7 @@ mod tests {
                     rel_id: "nge_img_1".to_string(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -20739,7 +20771,7 @@ mod tests {
 
     /// Shared scaffold: a native Engine over `doc` with a real Latin font
     /// and a cached layout config, mirroring the interactive boot state.
-    fn test_engine_with_doc(doc: DocumentTree) -> Engine {
+    pub(crate) fn test_engine_with_doc(doc: DocumentTree) -> Engine {
         let bytes_font = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
         let font =
             LoadedFont::parse("test-latin".to_string(), bytes_font).expect("parse test font");
@@ -24039,6 +24071,9 @@ mod a11y_direction_tests;
 
 #[cfg(test)]
 mod a11y_note_tests;
+
+#[cfg(test)]
+mod part_media_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

@@ -255,11 +255,20 @@ fn color_to_hex(c: [u8; 4]) -> String {
 
 fn emit_inline_object(obj: &InlineObject, media: &Media<'_>, out: &mut String) {
     match &obj.kind {
+        /* Issue #188 — the blob lives under the part-resolved media key;
+        `rel_id` is only part-local. */
         InlineKind::Image {
             rel_id,
             width_emu,
             height_emu,
-        } => emit_image(rel_id, *width_emu, *height_emu, media, out),
+            media_key,
+        } => emit_image(
+            media_key.as_deref().unwrap_or(rel_id),
+            *width_emu,
+            *height_emu,
+            media,
+            out,
+        ),
         InlineKind::FootnoteRef { id, .. } | InlineKind::EndnoteRef { id, .. } => {
             /* Issue #80 — the displayed number is derived in document
             order; a dangling reference (no marker) falls back to the id. */
@@ -727,6 +736,7 @@ mod tests {
                     rel_id: "rId7".into(),
                     width_emu: 1_905_000,
                     height_emu: 1_524_000,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -756,6 +766,7 @@ mod tests {
                     rel_id: "rIdMissing".into(),
                     width_emu: 0,
                     height_emu: 0,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,

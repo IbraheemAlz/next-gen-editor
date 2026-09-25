@@ -196,7 +196,12 @@ fn cell_paragraphs_read_runs_grab_bags_and_pictures() {
         &c1.inline_objects[..],
         [o] if matches!(&o.kind, InlineKind::Image { rel_id, .. } if rel_id == "rId5")
     ));
-    assert!(archive.document.media.contains_key("rId5"));
+    /* Issue #188 — media is keyed by the part-resolved target path. */
+    let key = c1.inline_objects[0]
+        .kind
+        .image_media_key()
+        .expect("picture");
+    assert!(archive.document.media.contains_key(key), "{key}");
 }
 
 /// Issue #101 — editing one cell regenerates the table; the edited
@@ -247,7 +252,11 @@ fn editing_a_cell_keeps_its_run_properties_and_pictures() {
         let t = back.document.blocks[1].as_table().expect("table");
         let c1 = t.rows[0].cells[1].blocks[0].as_paragraph().expect("cell");
         assert_eq!(c1.inline_objects.len(), 1, "cell picture survives");
-        assert!(back.document.media.contains_key("rId5"));
+        let key = c1.inline_objects[0]
+            .kind
+            .image_media_key()
+            .expect("picture");
+        assert!(back.document.media.contains_key(key), "{key}");
     }
 }
 
