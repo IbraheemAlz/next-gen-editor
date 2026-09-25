@@ -451,6 +451,35 @@ pub struct ParagraphBox {
     /// engine adapter leaves it `false` until the golden corpus is
     /// re-verified with keep-with-next enabled.
     pub keep_next: bool,
+    /// Issues #94 / #95 — the paragraph's pagination properties beyond
+    /// keep-with-next: its resolved before / after spacing (so a block
+    /// the paginator re-places — a relocated keep-with-next chain —
+    /// keeps its gaps) and the keep-lines / widow-control constraints.
+    /// `Default` is "no spacing, no constraint", the historical
+    /// behaviour of every layout-only paragraph.
+    pub flow: ParaFlow,
+}
+
+/// Issues #94 / #95 — per-paragraph pagination inputs carried on the
+/// [`ParagraphBox`] so they survive a re-push (splits, keep-chain
+/// relocation).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ParaFlow {
+    /// Resolved `<w:spacing w:before>` in layout units (scale applied).
+    /// Stamped by [`crate::paginate::Paginator::push_block`] from its
+    /// `before` argument; a split tail carries `0.0` (a continuation
+    /// has no gap above it).
+    pub space_before: f32,
+    /// Resolved `<w:spacing w:after>` in layout units. A split head
+    /// carries `0.0` (its tail owns the gap below the paragraph).
+    pub space_after: f32,
+    /// `<w:keepLines/>` — do not split this paragraph across pages /
+    /// columns when it can move to the next one whole.
+    pub keep_lines: bool,
+    /// `<w:widowControl/>` — a split may not leave a single line on
+    /// either side (Word's default is ON; the engine adapter resolves
+    /// the default, this box-level flag defaults to off).
+    pub widow_control: bool,
 }
 
 impl ParagraphBox {

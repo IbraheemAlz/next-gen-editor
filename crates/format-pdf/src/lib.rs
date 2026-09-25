@@ -2042,6 +2042,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: layout::ParaFlow::default(),
         };
         let page = PageBox {
             size: Size {

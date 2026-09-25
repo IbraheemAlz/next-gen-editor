@@ -360,6 +360,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         borders: None,
         shading: None,
         keep_next: false,
+        flow: crate::boxes::ParaFlow::default(),
     }
 }
 
@@ -522,6 +523,7 @@ pub fn layout_paragraph_wrapped(
         borders: None,
         shading: None,
         keep_next: false,
+        flow: crate::boxes::ParaFlow::default(),
     }
 }
 

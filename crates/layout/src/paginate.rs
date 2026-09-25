@@ -21,8 +21,8 @@
 //! paginator itself only knows about overflow.
 
 use crate::boxes::{
-    FootnoteEntry, HeaderFooterBox, LayoutBlock, LineBox, NoteBand, PageBox, ParagraphBox, Point,
-    Size, TableBox, TableRowBox,
+    FootnoteEntry, HeaderFooterBox, LayoutBlock, LineBox, NoteBand, PageBox, ParaFlow,
+    ParagraphBox, Point, Size, TableBox, TableRowBox,
 };
 use crate::page::Margins;
 use crate::table_split::{
@@ -774,10 +774,17 @@ impl Paginator {
     /// plus its new footnote draw exceeds the budget, the new
     /// footnote(s) get rolled back, the page closes, and the block is
     /// re-tried on a fresh page (where its footnotes start a new band).
-    pub fn push_block(&mut self, block: LayoutBlock, before: f32, after: f32) {
+    pub fn push_block(&mut self, mut block: LayoutBlock, before: f32, after: f32) {
         /* Issue #87 — one top-level block is the watchdog's window:
         churn counters and the escalation stage restart here. */
         self.watchdog.begin_block();
+        /* Issue #94 — the resolved spacing rides the box so a block the
+        paginator re-places later (a relocated keep-with-next chain)
+        gets the same gaps it was placed with. */
+        if let LayoutBlock::Paragraph(p) = &mut block {
+            p.flow.space_before = before;
+            p.flow.space_after = after;
+        }
         self.push_block_inner(block, before, after, true);
     }
 
@@ -1377,15 +1384,35 @@ impl Paginator {
 
     /// Issue #87 — move the block that does not fit to the next column /
     /// page, carrying its keep-with-next chain along. Chain blocks re-enter
-    /// the flow ahead of `block`; their original `before` / `after`
-    /// spacing is not stored on the box and is not re-applied.
+    /// the flow ahead of `block`.
+    ///
+    /// Issue #94 — spacing on re-placement follows the same page-top rule
+    /// as any moved block: whatever lands first in the fresh column (the
+    /// chain head, or `block` itself when there is no chain) opens it
+    /// without its `before` gap — exactly what a block that moves alone
+    /// has always done. Every later chain block and the follower get the
+    /// `before` / `after` stored on their box ([`ParaFlow`]), so the
+    /// relocated run is geometrically identical to a fresh layout of the
+    /// same content opening that column.
     fn advance_with_keep_chain(&mut self, block: LayoutBlock, after: f32, observe: bool) {
         let chain = self.detach_keep_chain();
         self.advance_column_or_flush_page();
-        for b in chain {
-            self.push_block_inner(b, 0.0, 0.0, false);
+        let follower_before = if chain.is_empty() {
+            0.0
+        } else {
+            block_space_before(&block)
+        };
+        for (i, b) in chain.into_iter().enumerate() {
+            let (before, after) = match &b {
+                LayoutBlock::Paragraph(p) => (
+                    if i == 0 { 0.0 } else { p.flow.space_before },
+                    p.flow.space_after,
+                ),
+                LayoutBlock::Table(_) => (0.0, 0.0),
+            };
+            self.push_block_inner(b, before, after, false);
         }
-        self.push_block_inner(block, 0.0, after, observe);
+        self.push_block_inner(block, follower_before, after, observe);
     }
 
     fn push_paragraph_split(
@@ -2507,6 +2534,12 @@ pub fn split_paragraph_at_line(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: false,
+        /* Issues #94 / #95 — the head keeps the gap above the paragraph;
+        the gap below belongs to the tail. */
+        flow: ParaFlow {
+            space_after: 0.0,
+            ..para.flow
+        },
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -2523,8 +2556,22 @@ pub fn split_paragraph_at_line(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: para.keep_next,
+        /* A continuation has no gap above it. */
+        flow: ParaFlow {
+            space_before: 0.0,
+            ..para.flow
+        },
     };
     (Some(head), Some(tail))
+}
+
+/// Issue #94 — the `before` gap stored on a block (tables carry none:
+/// the engine places them without paragraph spacing).
+fn block_space_before(block: &LayoutBlock) -> f32 {
+    match block {
+        LayoutBlock::Paragraph(p) => p.flow.space_before,
+        LayoutBlock::Table(_) => 0.0,
+    }
 }
 
 /// Phase 2 audit (gap A.12) — paragraph splitter that cuts at an
@@ -2577,6 +2624,12 @@ pub fn split_paragraph_at_line_index(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: false,
+        /* Issues #94 / #95 — the head keeps the gap above the paragraph;
+        the gap below belongs to the tail. */
+        flow: ParaFlow {
+            space_after: 0.0,
+            ..para.flow
+        },
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -2593,6 +2646,11 @@ pub fn split_paragraph_at_line_index(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: para.keep_next,
+        /* A continuation has no gap above it. */
+        flow: ParaFlow {
+            space_before: 0.0,
+            ..para.flow
+        },
     };
     (Some(head), Some(tail))
 }
@@ -2673,6 +2731,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: ParaFlow::default(),
         }
     }
 
@@ -2932,6 +2991,7 @@ mod tests {
                 borders: None,
                 shading: None,
                 keep_next: false,
+                flow: ParaFlow::default(),
             })],
             source_rid: None,
         }
@@ -2984,6 +3044,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: ParaFlow::default(),
         }
     }
 
@@ -4476,6 +4537,57 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].blocks.len(), 1);
         assert_eq!(pages[1].blocks.len(), 2, "heading + table together");
+    }
+
+    /// Issue #94 — a relocated keep-with-next chain keeps its paragraph
+    /// spacing: the moved run is geometrically identical to a fresh
+    /// layout of the same content opening the page (the first block
+    /// opens it without its `before` gap — the unchanged page-top rule
+    /// for moved blocks — every later gap is re-applied).
+    #[test]
+    fn relocated_keep_chain_keeps_its_spacing() {
+        let geom = a4_geometry();
+        let (b1, a1, b2, a2, bf, af) = (6.0, 4.0, 8.0, 5.0, 10.0, 3.0);
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        /* 640 pt anchor + (6+16+4) + (8+16+5) = 695; the follower's
+        10 pt gap leaves no room for its first line. */
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), b1, a1);
+        pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), b2, a2);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), bf, af);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].blocks.len(), 1, "the anchor stays");
+
+        let mut fresh = Paginator::with_default_bands(geom, None, None);
+        fresh.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), 0.0, a1);
+        fresh.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), b2, a2);
+        fresh.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), bf, af);
+        fresh.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let reference = fresh.finish();
+        let geom_of = |p: &PageBox| -> Vec<(Point, Size)> {
+            p.blocks.iter().map(|b| (b.origin(), b.size())).collect()
+        };
+        assert_eq!(geom_of(&pages[1]), geom_of(&reference[0]));
+        let y2 = 16.0 + a1 + b2;
+        let y3 = y2 + 16.0 + a2 + bf;
+        let ys: Vec<f32> = pages[1].blocks.iter().map(|b| b.origin().y).collect();
+        assert_eq!(ys, vec![0.0, y2, y3, y3 + 80.0 + af]);
+    }
+
+    /// Issue #94 — the stored spacing follows a split: the head keeps
+    /// the gap above, the tail the gap below.
+    #[test]
+    fn split_halves_carry_the_right_spacing() {
+        let mut p = fake_paragraph(4, 16.0);
+        p.flow.space_before = 7.0;
+        p.flow.space_after = 9.0;
+        let (head, tail) = split_paragraph_at_line_index(&p, 2);
+        let (head, tail) = (head.expect("head"), tail.expect("tail"));
+        assert_eq!((head.flow.space_before, head.flow.space_after), (7.0, 0.0));
+        assert_eq!((tail.flow.space_before, tail.flow.space_after), (0.0, 9.0));
     }
 
     /// Repeated header rows taller than the page (the #7 class: an
