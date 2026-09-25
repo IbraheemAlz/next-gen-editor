@@ -598,6 +598,13 @@ pub fn read_docx_with_settings(
     carry the root bindings too, or every Word paragraph's `w14:paraId`
     is written unbound. */
     document.document_root_attrs = document_root_attrs.clone();
+    /* Issue #134 — the live editor keeps only the tree, so the tree also
+    carries the source package: the UI save path (`writer::save_docx`)
+    re-emits every sibling part through `write_docx` instead of
+    synthesizing a minimal package that drops them. */
+    document.source_package = Some(std::sync::Arc::new(engine::SourcePackage::from_entries(
+        other_entries.iter().cloned(),
+    )));
 
     Ok(DocxArchive {
         other_entries,

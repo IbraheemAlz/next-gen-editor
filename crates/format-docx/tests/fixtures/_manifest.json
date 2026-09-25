@@ -424,6 +424,23 @@
       "roundtrip": {
         "document_xml_drift_bytes": 141
       }
+    },
+    "word_package_parts.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 5,
+        "paragraph_texts": [
+          "Package title",
+          "first item",
+          "commented text",
+          "pictures ￼￼",
+          "last paragraph"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
     }
   }
 }

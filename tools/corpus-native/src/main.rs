@@ -375,6 +375,10 @@ fn main() -> ExitCode {
     let mut noedit_identical = 0usize;
     let mut drift_histogram: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    /* Issue #134 — the UI save path (`format_docx::save_docx`). */
+    let mut ui_checked = 0usize;
+    let mut ui_siblings_identical = 0usize;
+    let mut ui_matches_write_docx = 0usize;
 
     for (i, path) in files.iter().enumerate() {
         let label = path
@@ -413,6 +417,12 @@ fn main() -> ExitCode {
             }
         }
 
+        if let Some(identical) = rec.ui_save_siblings_identical {
+            ui_checked += 1;
+            ui_siblings_identical += usize::from(identical);
+            ui_matches_write_docx += usize::from(rec.ui_save_matches_write_docx == Some(true));
+        }
+
         if let Err(e) = writeln!(
             writer,
             "{}",
@@ -440,6 +450,10 @@ fn main() -> ExitCode {
         "[corpus-native] done: {} documents, ok={ok} error={errors} panic={panicked} crash={crashed} timeout={timed_out}, {:.1}s total",
         files.len(),
         run_start.elapsed().as_secs_f32()
+    );
+    println!(
+        "[corpus-native] UI-path save (#134): siblings byte-identical {ui_siblings_identical}/{ui_checked}, \
+         byte-identical to write_docx {ui_matches_write_docx}/{ui_checked}"
     );
     /* Issue #112 — the drift histogram, largest bucket first. */
     println!(
