@@ -87,7 +87,7 @@
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use layout::{LayoutBlock, PageBox, ParagraphBox, TableBox, VisualRun};
+use layout::{LayoutBlock, PageBox, ParagraphBox, TabLeaderKind, TableBox, VisualRun};
 use pdf_writer::types::{
     CidFontType, FontFlags, OutputIntentSubtype, SystemInfo, TextRenderingMode, TrappingStatus,
     UnicodeCmap,
@@ -239,9 +239,16 @@ struct FontObj {
 /// Content-stream resources the page emitters resolve against: the font
 /// resource table, and (issue #121) each embeddable image's resource name
 /// keyed by relationship id. An image absent from `images` paints nothing.
+///
+/// Issue #144 — `stack` is the loaded-face counterpart of `fonts`: the
+/// tab-leader painter needs an actual glyph id / advance-width lookup
+/// (`LoadedFont::glyph_id` / `glyph_metrics`) for the dot/hyphen/
+/// underscore fill character, which the `(String, FontObj)` resource
+/// table alone cannot answer.
 struct Res<'a> {
     fonts: &'a [(String, FontObj)],
     images: &'a HashMap<String, String>,
+    stack: &'a FontStack,
 }
 
 /// A non-fatal export note (the `DocxWarning` counterpart): the PDF is
@@ -452,6 +459,7 @@ pub fn export_pdf_with_media(
     let res = Res {
         fonts: &font_objs,
         images: &image_names,
+        stack: fonts,
     };
 
     /* Build every page's content stream first — the digest in PDF/A `/ID`
@@ -556,7 +564,7 @@ pub fn export_pdf_with_media(
     /* glyph-id → Unicode per font, harvested across every page. Split
     paragraphs contribute clusters from both halves into the same source
     text — the union is what the CMap actually wants. */
-    let to_unicode = collect_to_unicode_pages(pages, para_texts);
+    let to_unicode = collect_to_unicode_pages(pages, para_texts, fonts);
     for (id, fo) in &font_objs {
         let face = fonts
             .face(id)
@@ -738,12 +746,13 @@ fn collect_frame_image_rels<'a>(
 /// Canvas2D agree on layering: shading sits behind content, borders sit on
 /// top.
 #[cfg(test)]
-fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
+fn build_content(page: &PageBox, font_objs: &[(String, FontObj)], fonts: &FontStack) -> Vec<u8> {
     build_page_content(
         page,
         &Res {
             fonts: font_objs,
             images: &HashMap::new(),
+            stack: fonts,
         },
     )
 }
@@ -1207,6 +1216,60 @@ fn emit_paragraph_text(
     }
     content.end_text();
 
+    /* Issue #144 — tab leaders (`<w:tab w:leader>`, e.g. TOC dot
+    leaders). `show_run` draws nothing for a leadered tab glyph (see
+    above); its fill is painted here instead, outside any `BT`/`ET`
+    block — `re`/`f` (and the leader glyphs' own nested `BT`/`ET`) are
+    not legal *inside* the paragraph's main text object. Dot / hyphen /
+    underscore tile REAL repeated glyphs from the run's own font (so PDF
+    text extraction returns the leader characters, matching what a
+    viewer copies out of Word); heavy / middleDot — and any font that
+    can't shape the fill character — fall back to a plain filled rule,
+    the PDF twin of `render/scene.rs::push_tab_leader`. */
+    for line in &para.lines {
+        let line_x = para_x + line.origin.x;
+        let baseline = para_y + line.origin.y + line.baseline;
+        let mut pen = 0.0_f32;
+        for run in &line.runs {
+            for glyph in &run.glyphs {
+                let x0 = line_x + pen;
+                let x1 = x0 + glyph.x_advance;
+                if let Some(kind) = glyph.leader {
+                    let [r, g, b, _] = run.attrs.color;
+                    content.set_fill_rgb(
+                        f32::from(r) / 255.0,
+                        f32::from(g) / 255.0,
+                        f32::from(b) / 255.0,
+                    );
+                    let mut drew = false;
+                    if let Some(ch) = leader_fill_char(kind)
+                        && let Some(face) = res.stack.face(&run.font)
+                        && let Some((_, fo)) = res.fonts.iter().find(|(id, _)| id == &run.font)
+                    {
+                        let font = LeaderFont {
+                            face,
+                            resource: &fo.resource,
+                            px_size: run.attrs.px_size,
+                        };
+                        drew = emit_tab_leader_glyphs(content, page_h, &font, ch, x0, x1, baseline);
+                    }
+                    if !drew {
+                        emit_tab_leader_rule(
+                            content,
+                            page_h,
+                            kind,
+                            x0,
+                            x1,
+                            baseline,
+                            run.attrs.px_size,
+                        );
+                    }
+                }
+                pen += glyph.x_advance;
+            }
+        }
+    }
+
     /* Decoration fills — over the glyphs, same metrics as
     `render/scene.rs` (underline just below the baseline, strike centred
     ~a quarter em above it, thickness scaling with the px size). Both
@@ -1309,6 +1372,15 @@ fn show_run(
             pen += glyph.x_advance;
             continue;
         }
+        /* Issue #144 — a leadered tab glyph shows nothing here; its
+        leader fill (real repeated glyphs or a rule) is painted by
+        `emit_paragraph_text` in a separate pass once this `BT`/`ET`
+        block closes — `re`/`f` are not legal text-object operators, and
+        a leader glyph's own show needs its own nested text object. */
+        if glyph.leader.is_some() {
+            pen += glyph.x_advance;
+            continue;
+        }
         let gx = run_x + pen + glyph.x_offset;
         /* Invert the y axis: PDF origin is bottom-left. `<w:vertAlign>`
         baseline shift lifts (positive) / drops (negative) the run. */
@@ -1323,6 +1395,143 @@ fn show_run(
         content.set_text_rendering_mode(TextRenderingMode::Fill);
     }
     pen
+}
+
+/// Issue #144 — the Unicode character a "repeated glyph" tab leader tiles.
+/// `None` for the two kinds Word draws as a plain rule instead of a
+/// character run (`Heavy`, `MiddleDot`) — see `emit_tab_leader_rule`.
+fn leader_fill_char(kind: TabLeaderKind) -> Option<char> {
+    match kind {
+        TabLeaderKind::Dot => Some('.'),
+        TabLeaderKind::Hyphen => Some('-'),
+        TabLeaderKind::Underscore => Some('_'),
+        TabLeaderKind::Heavy | TabLeaderKind::MiddleDot => None,
+    }
+}
+
+/// The run font's face + PDF resource name + point size — bundled so
+/// `emit_tab_leader_glyphs` stays under clippy's argument-count lint.
+struct LeaderFont<'a> {
+    face: &'a LoadedFont,
+    resource: &'a str,
+    px_size: f32,
+}
+
+/// Issue #144 — repeat `ch` as REAL shown glyphs across `x0..x1` at
+/// `baseline`, using the font's own glyph advance so consecutive
+/// characters tile without gaps or overlap (the way Word repeats a
+/// leader character). A PDF viewer's text extraction therefore returns
+/// the leader characters themselves, not just ink. Returns `false` when
+/// the font has no glyph for `ch` (or no measurable advance) so the
+/// caller can fall back to `emit_tab_leader_rule` — a leader must never
+/// silently vanish because a font lacks a period.
+///
+/// Must run outside any `BT`/`ET` block: it opens its own nested text
+/// object, which is only legal once the paragraph's main text object has
+/// already been closed with `content.end_text()`.
+fn emit_tab_leader_glyphs(
+    content: &mut Content,
+    page_h: f32,
+    font: &LeaderFont,
+    ch: char,
+    x0: f32,
+    x1: f32,
+    baseline: f32,
+) -> bool {
+    let Some(gid) = font.face.glyph_id(ch) else {
+        return false;
+    };
+    let Ok(metrics) = font.face.glyph_metrics(ch, font.px_size) else {
+        return false;
+    };
+    let step = metrics.advance_width;
+    if step <= 0.0 {
+        return false;
+    }
+    let pad = font.px_size * 0.15;
+    let lo = x0 + pad;
+    let hi = x1 - pad;
+    if hi <= lo {
+        return true;
+    }
+    let mut x = (lo / step).ceil() * step;
+    if x + step > hi {
+        return true;
+    }
+    let gy = page_h - baseline;
+    let bytes = [(gid >> 8) as u8, (gid & 0xff) as u8];
+    content.begin_text();
+    content.set_font(Name(font.resource.as_bytes()), font.px_size);
+    while x + step <= hi {
+        content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, gy]);
+        content.show(Str(&bytes));
+        x += step;
+    }
+    content.end_text();
+    true
+}
+
+/// Issue #144 — the PDF twin of `render/scene.rs::push_tab_leader`: fills
+/// a leadered tab's advance with ink (not real glyphs) using the same
+/// per-kind pattern math. Used for `Heavy` / `MiddleDot` (Word renders
+/// these as a rule, not a repeated character) and as the defensive
+/// fallback when the run's font can't shape the dot/hyphen/underscore
+/// fill character. `re`/`f` are not legal `BT`/`ET` operators, so this
+/// must run outside any open text object.
+fn emit_tab_leader_rule(
+    content: &mut Content,
+    page_h: f32,
+    kind: TabLeaderKind,
+    x0: f32,
+    x1: f32,
+    baseline: f32,
+    px: f32,
+) {
+    let px = px.max(1.0);
+    let pad = px * 0.15;
+    let (lo, hi) = (x0 + pad, x1 - pad);
+    if hi <= lo {
+        return;
+    }
+    let dot = (px * 0.08).max(1.0);
+    let rect = |content: &mut Content, a: f32, top: f32, b: f32, bottom: f32| {
+        content.rect(a, page_h - bottom, b - a, bottom - top);
+        content.fill_nonzero();
+    };
+    match kind {
+        TabLeaderKind::Dot | TabLeaderKind::MiddleDot => {
+            let step = px * 0.33;
+            let y = if matches!(kind, TabLeaderKind::Dot) {
+                baseline - dot
+            } else {
+                baseline - px * 0.3
+            };
+            let mut x = (lo / step).ceil() * step;
+            while x + dot <= hi {
+                rect(content, x, y, x + dot, y + dot);
+                x += step;
+            }
+        }
+        TabLeaderKind::Hyphen => {
+            let step = px * 0.4;
+            let dash = px * 0.25;
+            let y = baseline - px * 0.28;
+            let mut x = (lo / step).ceil() * step;
+            while x + dash <= hi {
+                rect(content, x, y, x + dash, y + dot);
+                x += step;
+            }
+        }
+        TabLeaderKind::Underscore | TabLeaderKind::Heavy => {
+            let t = if matches!(kind, TabLeaderKind::Heavy) {
+                dot * 2.0
+            } else {
+                dot
+            };
+            let y = baseline + px * 0.1;
+            rect(content, lo, y, hi, y + t);
+        }
+    }
 }
 
 /// Fill one decoration rectangle given its layout-space top edge. The
@@ -1697,6 +1906,7 @@ fn for_each_paragraph<'a, F: FnMut(&'a ParagraphBox)>(blocks: &'a [LayoutBlock],
 fn collect_to_unicode_pages(
     pages: &[PageBox],
     para_texts: &[&str],
+    fonts: &FontStack,
 ) -> HashMap<String, BTreeMap<u16, Vec<char>>> {
     let mut out: HashMap<String, BTreeMap<u16, Vec<char>>> = HashMap::new();
     for page in pages {
@@ -1713,6 +1923,7 @@ fn collect_to_unicode_pages(
                 for run in &line.runs {
                     let map = out.entry(run.font.clone()).or_default();
                     add_run_mappings(run, text, map);
+                    add_leader_mappings(run, fonts, map);
                 }
             }
         };
@@ -1778,6 +1989,32 @@ fn add_run_mappings(run: &VisualRun, text: &str, map: &mut BTreeMap<u16, Vec<cha
         if !chars.is_empty() {
             map.entry(g.id).or_insert(chars);
         }
+    }
+}
+
+/// Issue #144 — a leadered tab glyph shows a REPEATED FILL CHARACTER (see
+/// `emit_tab_leader_glyphs`), synthesized on the fly rather than shaped by
+/// the layout pass, so it carries no source cluster for `add_run_mappings`
+/// to find. Map its glyph id straight to the fill character so text
+/// extraction returns the dots/hyphens/underscores, matching what a viewer
+/// copies out of a real Word TOC. A no-op for `Heavy` / `MiddleDot`
+/// (`leader_fill_char` returns `None`) or a font that can't shape the fill
+/// character — `emit_tab_leader_rule` paints those as plain ink instead.
+fn add_leader_mappings(run: &VisualRun, fonts: &FontStack, map: &mut BTreeMap<u16, Vec<char>>) {
+    for glyph in &run.glyphs {
+        let Some(kind) = glyph.leader else {
+            continue;
+        };
+        let Some(ch) = leader_fill_char(kind) else {
+            continue;
+        };
+        let Some(face) = fonts.face(&run.font) else {
+            continue;
+        };
+        let Some(gid) = face.glyph_id(ch) else {
+            continue;
+        };
+        map.entry(gid).or_insert_with(|| vec![ch]);
     }
 }
 
@@ -2169,8 +2406,8 @@ mod tests {
         }
         let stack = liberation_stack();
         let fo = test_font_objs(&["liberation"]);
-        let (x0, y0) = first_tm_xy(&build_content(&table_page(&stack, 0.0, 0.0), &fo));
-        let (x1, y1) = first_tm_xy(&build_content(&table_page(&stack, 12.0, 8.0), &fo));
+        let (x0, y0) = first_tm_xy(&build_content(&table_page(&stack, 0.0, 0.0), &fo, &stack));
+        let (x1, y1) = first_tm_xy(&build_content(&table_page(&stack, 12.0, 8.0), &fo, &stack));
         assert!(
             (x1 - x0 - 12.0).abs() < 0.01,
             "padding_left must inset cell text in x: unpadded {x0}, padded {x1}"
@@ -2281,8 +2518,8 @@ mod tests {
         }
         let stack = liberation_stack();
         let fo = test_font_objs(&["liberation"]);
-        let ltr = tm_xs(&build_content(&page(&stack, false), &fo));
-        let rtl = tm_xs(&build_content(&page(&stack, true), &fo));
+        let ltr = tm_xs(&build_content(&page(&stack, false), &fo, &stack));
+        let rtl = tm_xs(&build_content(&page(&stack, true), &fo, &stack));
         assert_eq!(ltr.len(), 3, "{ltr:?}");
         assert_eq!(rtl.len(), 3, "{rtl:?}");
         assert!(ltr[0] < ltr[1] && ltr[1] < ltr[2], "LTR ascends: {ltr:?}");
@@ -2558,12 +2795,195 @@ mod tests {
     fn to_unicode_map_covers_source_chars() {
         let stack = liberation_stack();
         let page = hello_page(&stack);
-        let map = collect_to_unicode_pages(std::slice::from_ref(&page), &["Hello world"]);
+        let map = collect_to_unicode_pages(std::slice::from_ref(&page), &["Hello world"], &stack);
         let liberation = map.get("liberation").expect("liberation font mapped");
         let covered: HashSet<char> = liberation.values().flatten().copied().collect();
         for ch in "Helo wrd".chars() {
             assert!(covered.contains(&ch), "ToUnicode map missing {ch:?}");
         }
+    }
+
+    /* ================================================================
+    Issue #144 — tab leaders (`<w:tab w:leader>`; TOC dot leaders) reach
+    the exported PDF as real, extractable ink.
+    ================================================================ */
+
+    /// One line, a right tab stop near the end, optionally leadered —
+    /// the TOC entry shape ("Entry" + tab + "1").
+    fn page_with_tab_leader(stack: &FontStack, leader: Option<TabLeaderKind>) -> PageBox {
+        let text = "Entry\t1";
+        let mut para = layout_paragraph(ParagraphConfig {
+            text,
+            fonts: stack,
+            spans: &[plain_span(text.len() as u32)],
+            base_direction: ShapingDirection::Ltr,
+            max_width: 300.0,
+            line_height: 22.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 18.0,
+            inline_objects: &[],
+            tab_stops_px: &[(250.0, layout::paragraph::TabKind::Right, leader)],
+        });
+        para.source_paragraph_id = 0;
+        PageBox {
+            size: Size {
+                width: 595.0,
+                height: 842.0,
+            },
+            margins: Margins::uniform(72.0),
+            blocks: vec![LayoutBlock::Paragraph(para)],
+            header: None,
+            footer: None,
+            header_offset: 36.0,
+            footer_offset: 36.0,
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
+            hf_role: layout::HeaderRole::Default,
+            page_number: 1,
+            floats: Vec::new(),
+        }
+    }
+
+    /// The dot-leader tiling in `emit_tab_leader_glyphs` must add exactly
+    /// one more shown glyph each time the tab's advance grows by exactly
+    /// one period's width — the invariant a correctly fixed-pitch tiler
+    /// holds regardless of the exact padding/anchoring constants it uses
+    /// internally. This is the "expected count" half of #144's acceptance
+    /// (the text-extraction half is `tab_leader_dot_glyph_maps_to_unicode_dot`
+    /// below).
+    #[test]
+    fn emit_tab_leader_glyphs_dot_count_scales_with_span() {
+        let stack = liberation_stack();
+        let face = stack.face("liberation").expect("liberation face");
+        let px = 18.0_f32;
+        let step = face
+            .glyph_metrics('.', px)
+            .expect("liberation must shape a period")
+            .advance_width;
+        assert!(step > 0.0);
+        let font = LeaderFont {
+            face,
+            resource: "F0",
+            px_size: px,
+        };
+        let count = |b: &[u8]| b.windows(4).filter(|w| w == b" Tj\n").count();
+
+        let mut narrow = Content::new();
+        assert!(emit_tab_leader_glyphs(
+            &mut narrow,
+            200.0,
+            &font,
+            '.',
+            0.0,
+            300.0,
+            50.0
+        ));
+        let narrow_bytes = narrow.finish().to_vec();
+        let base = count(&narrow_bytes);
+        assert!(base > 0, "a 300 pt tab at 18 px must fit at least one dot");
+
+        let mut wider = Content::new();
+        assert!(emit_tab_leader_glyphs(
+            &mut wider,
+            200.0,
+            &font,
+            '.',
+            0.0,
+            300.0 + step,
+            50.0
+        ));
+        let wider_bytes = wider.finish().to_vec();
+        assert_eq!(
+            count(&wider_bytes),
+            base + 1,
+            "widening the tab by exactly one glyph's advance must show exactly one more dot"
+        );
+
+        /* A tab narrower than the padding shapes nothing (but is not a
+        missing-glyph failure — the caller must not fall back to a rule). */
+        let mut empty = Content::new();
+        assert!(emit_tab_leader_glyphs(
+            &mut empty, 200.0, &font, '.', 0.0, 2.0, 50.0
+        ));
+        assert!(count(&empty.finish()) == 0);
+    }
+
+    /// A leadered right tab adds glyph shows to the content stream that a
+    /// plain (unleadered) tab at the same stop does not — mirrors
+    /// `list_marker_glyphs_reach_the_content_stream`'s technique. A
+    /// document with no leader tabs is byte-for-byte unaffected (every
+    /// pre-existing test in this module still passes unchanged).
+    #[test]
+    fn tab_leader_dot_glyphs_reach_the_content_stream() {
+        let stack = liberation_stack();
+        let leadered = page_with_tab_leader(&stack, Some(TabLeaderKind::Dot));
+        let plain = page_with_tab_leader(&stack, None);
+        let fo = test_font_objs(&["liberation"]);
+        let shows = |c: &[u8]| c.windows(4).filter(|w| w == b" Tj\n").count();
+        let with_leader = shows(&build_content(&leadered, &fo, &stack));
+        let without = shows(&build_content(&plain, &fo, &stack));
+        assert!(
+            with_leader > without,
+            "a leadered tab must add glyph shows: {with_leader} vs {without}"
+        );
+    }
+
+    /// The leader glyph's id is synthesized on the fly (it never rides a
+    /// layout-produced cluster), so `add_run_mappings` alone would leave
+    /// it out of `/ToUnicode` — a viewer would then extract the dots as
+    /// nothing. `collect_to_unicode_pages` must map it straight to `'.'`.
+    #[test]
+    fn tab_leader_dot_glyph_maps_to_unicode_dot() {
+        let stack = liberation_stack();
+        let page = page_with_tab_leader(&stack, Some(TabLeaderKind::Dot));
+        let map = collect_to_unicode_pages(std::slice::from_ref(&page), &["Entry\t1"], &stack);
+        let liberation = map.get("liberation").expect("liberation font mapped");
+        let dot_gid = stack
+            .face("liberation")
+            .expect("liberation face")
+            .glyph_id('.')
+            .expect("liberation must shape a period");
+        assert_eq!(
+            liberation.get(&dot_gid).map(Vec::as_slice),
+            Some(['.'].as_slice()),
+            "the leader glyph id must decode to a literal '.' for text extraction"
+        );
+    }
+
+    /// `Heavy` / `MiddleDot` leaders are Word's plain-rule kinds (see
+    /// `leader_fill_char`): they must reach the content stream as fills
+    /// (`re`/`f`), never as glyph shows, and must not disturb the
+    /// unleadered baseline's show count.
+    #[test]
+    fn tab_leader_heavy_paints_a_rule_not_glyphs() {
+        let stack = liberation_stack();
+        let heavy = page_with_tab_leader(&stack, Some(TabLeaderKind::Heavy));
+        let dot = page_with_tab_leader(&stack, Some(TabLeaderKind::Dot));
+        let plain = page_with_tab_leader(&stack, None);
+        let fo = test_font_objs(&["liberation"]);
+        let heavy_bytes = build_content(&heavy, &fo, &stack);
+        let dot_bytes = build_content(&dot, &fo, &stack);
+        let plain_bytes = build_content(&plain, &fo, &stack);
+        let shows = |c: &[u8]| c.windows(4).filter(|w| w == b" Tj\n").count();
+        let fills = |c: &[u8]| c.windows(4).filter(|w| w == b" re\n").count();
+        assert!(
+            shows(&heavy_bytes) <= shows(&plain_bytes),
+            "a heavy leader must not add glyph shows over the plain tab"
+        );
+        assert!(
+            shows(&dot_bytes) > shows(&heavy_bytes),
+            "a dot leader must add glyph shows a heavy leader does not"
+        );
+        assert!(
+            fills(&heavy_bytes) > fills(&plain_bytes),
+            "a heavy leader must paint a fill rule"
+        );
     }
 
     /// List markers ("1.", "•") must reach the content stream as glyph
@@ -2584,8 +3004,8 @@ mod tests {
         );
         let fo = test_font_objs(&["liberation"]);
         let shows = |c: &[u8]| c.windows(4).filter(|w| w == b" Tj\n").count();
-        let with_marker = shows(&build_content(&marked, &fo));
-        let without = shows(&build_content(&plain, &fo));
+        let with_marker = shows(&build_content(&marked, &fo, &stack));
+        let without = shows(&build_content(&plain, &fo, &stack));
         assert!(
             with_marker > without,
             "marker glyphs must add shows: {with_marker} vs {without}"
@@ -2700,7 +3120,7 @@ mod tests {
             attrs.faux_bold && attrs.faux_italic,
             "regular-only stack must resolve to faux synthesis"
         );
-        let content = build_content(&page, &test_font_objs(&["liberation"]));
+        let content = build_content(&page, &test_font_objs(&["liberation"]), &stack);
         assert!(
             find(&content, b"2 Tr\n").is_some(),
             "faux bold must set fill+stroke text rendering mode"
@@ -2725,7 +3145,7 @@ mod tests {
         span.strike = true;
         span.bg_color = Some([0xFF, 0xEB, 0x78, 0xFF]);
         let page = page_with(&stack, "Hello world", &[span], None);
-        let content = build_content(&page, &test_font_objs(&["liberation"]));
+        let content = build_content(&page, &test_font_objs(&["liberation"]), &stack);
         let bt = find(&content, b"BT\n").expect("text block");
         let et = find(&content, b"ET\n").expect("text block end");
         let first_rect = find(&content, b" re\n").expect("highlight rect");
@@ -2760,8 +3180,8 @@ mod tests {
         let base = page_with(&stack, "Hello world", &[plain_span(11)], None);
         let shifted = page_with(&stack, "Hello world", &[shifted_span], None);
         let fo = test_font_objs(&["liberation"]);
-        let y_base = first_tm_y(&build_content(&base, &fo));
-        let y_shift = first_tm_y(&build_content(&shifted, &fo));
+        let y_base = first_tm_y(&build_content(&base, &fo, &stack));
+        let y_shift = first_tm_y(&build_content(&shifted, &fo, &stack));
         assert!(
             (y_shift - y_base - 5.0).abs() < 0.01,
             "positive shift must lift the glyph in PDF space: base {y_base}, shifted {y_shift}"
@@ -2778,7 +3198,7 @@ mod tests {
         };
         para.shading = Some([0xE8, 0xF0, 0xFF, 0xFF]);
         para.borders = Some(engine::default_word_borders());
-        let content = build_content(&page, &test_font_objs(&["liberation"]));
+        let content = build_content(&page, &test_font_objs(&["liberation"]), &stack);
         let bt = find(&content, b"BT\n").expect("text block");
         let rect = find(&content, b" re\n").expect("shading rect");
         assert!(rect < bt, "paragraph shading must fill behind the text");
@@ -3028,7 +3448,7 @@ mod tests {
                 .collect();
             assert!(rows[0].header, "page {i} opens with the header row");
             painted_body_rows += rows.iter().filter(|r| !r.header).count();
-            let content = build_content(page, &fo);
+            let content = build_content(page, &fo, &stack);
             let text = String::from_utf8_lossy(&content);
             let tms = text.split_whitespace().filter(|t| *t == "Tm").count();
             assert_eq!(
@@ -3143,7 +3563,7 @@ mod tests {
         let per_page: Vec<usize> = pages
             .iter()
             .map(|page| {
-                let content = build_content(page, &fo);
+                let content = build_content(page, &fo, &stack);
                 let text = String::from_utf8_lossy(&content).into_owned();
                 text.split_whitespace().filter(|t| *t == "Tm").count()
             })

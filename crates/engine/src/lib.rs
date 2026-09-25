@@ -2459,6 +2459,21 @@ impl TabLeader {
     }
 }
 
+/// Issue #145 — one incoming `<w:pPr><w:tabs><w:tab>` entry for
+/// [`DocumentTree::set_tab_stops`]. `leader: None` means "keep this
+/// stop's existing leader" — the Ruler (and any other caller) that
+/// does not itself track leaders must not silently clear one every
+/// time it writes a position; `Some(TabLeader::None)` is the explicit
+/// clear. Resolution is positional: patch entry `i` inherits from the
+/// paragraph's *current* `tab_stops[i]` when present, else `TabLeader::
+/// None` (a brand-new stop has nothing to inherit).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabStopPatch {
+    pub position_pt: f32,
+    pub kind: TabKind,
+    pub leader: Option<TabLeader>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TabKind {
     /// Tab cursor jumps to `position_pt`; content lands right of it.
@@ -6638,13 +6653,40 @@ impl DocumentTree {
     /// so the Ruler's drag-end dispatch produces exactly one undo
     /// entry per tab-stop edit (matches Word's "release commits"
     /// behaviour).
-    pub fn set_tab_stops(&self, start: LogicalPos, end: LogicalPos, stops: Vec<TabStop>) -> Self {
+    ///
+    /// Issue #145 — each `stops[i]` is a [`TabStopPatch`]: a `None`
+    /// leader inherits the paragraph's *own current* `tab_stops[i]`
+    /// leader (resolved per paragraph, since a multi-paragraph range
+    /// can carry different existing leaders); an explicit `Some` sets
+    /// or clears it. Without this, replacing the whole `<w:tabs>` list
+    /// on every write silently dropped a TOC entry's dot leader the
+    /// first time its stop was dragged.
+    pub fn set_tab_stops(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        stops: Vec<TabStopPatch>,
+    ) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
         let apply = |para: &mut Paragraph| {
-            para.props.tab_stops = stops.clone();
+            let resolved: Vec<TabStop> = stops
+                .iter()
+                .enumerate()
+                .map(|(i, patch)| TabStop {
+                    position_pt: patch.position_pt,
+                    kind: patch.kind,
+                    leader: patch.leader.unwrap_or_else(|| {
+                        para.props
+                            .tab_stops
+                            .get(i)
+                            .map_or(TabLeader::None, |s| s.leader)
+                    }),
+                })
+                .collect();
+            para.props.tab_stops = resolved.clone();
             /* Sprint 12 (#11) — shadow into direct_overrides. */
-            para.direct_overrides.tab_stops = stops.clone();
+            para.direct_overrides.tab_stops = resolved;
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -12455,6 +12497,89 @@ mod tests {
         );
         let d = d.set_line_spacing(start, end, 0.0);
         assert_eq!(d.blocks[0].as_paragraph().unwrap().props.line_height, None);
+    }
+
+    /// Issue #145 — `SetTabStops` must not clobber an existing leader
+    /// when the wire omits it (a caller that only edits position, like
+    /// the Ruler drag path, and therefore sends `leader: None`). `None`
+    /// inherits per-index from the paragraph's *current* stops; an
+    /// explicit `Some` sets or clears; a genuinely new index (beyond
+    /// the old list) has nothing to inherit and resolves to
+    /// `TabLeader::None`.
+    #[test]
+    fn set_tab_stops_preserves_leader_when_wire_omits_it() {
+        let d = DocumentTree::from_text("hi");
+        let start = LogicalPos::new(BlockPath::top(0), 0);
+        let end = LogicalPos::new(BlockPath::top(0), 2);
+
+        /* Seed a dot-leadered right tab — the TOC entry shape. */
+        let d = d.set_tab_stops(
+            start.clone(),
+            end.clone(),
+            vec![TabStopPatch {
+                position_pt: 400.0,
+                kind: TabKind::Right,
+                leader: Some(TabLeader::Dot),
+            }],
+        );
+        let stop = d.blocks[0].as_paragraph().unwrap().props.tab_stops[0];
+        assert_eq!(stop.leader, TabLeader::Dot);
+
+        /* The Ruler drags the same stop to a new position without
+        itself tracking leaders, so it dispatches `leader: None`. The
+        dot leader must survive — this is the bug #145 fixes. */
+        let d = d.set_tab_stops(
+            start.clone(),
+            end.clone(),
+            vec![TabStopPatch {
+                position_pt: 420.0,
+                kind: TabKind::Right,
+                leader: None,
+            }],
+        );
+        let stop = d.blocks[0].as_paragraph().unwrap().props.tab_stops[0];
+        assert_eq!(stop.position_pt, 420.0, "position must still move");
+        assert_eq!(
+            stop.leader,
+            TabLeader::Dot,
+            "leader must survive an omitted patch"
+        );
+
+        /* An explicit `Some(TabLeader::None)` is the deliberate clear. */
+        let d = d.set_tab_stops(
+            start.clone(),
+            end.clone(),
+            vec![TabStopPatch {
+                position_pt: 420.0,
+                kind: TabKind::Right,
+                leader: Some(TabLeader::None),
+            }],
+        );
+        let stop = d.blocks[0].as_paragraph().unwrap().props.tab_stops[0];
+        assert_eq!(stop.leader, TabLeader::None);
+
+        /* A brand-new stop at an index beyond the old list has nothing
+        to inherit from — `None` must not pick up a stale leader from
+        some other index. */
+        let d = d.set_tab_stops(
+            start,
+            end,
+            vec![
+                TabStopPatch {
+                    position_pt: 100.0,
+                    kind: TabKind::Left,
+                    leader: Some(TabLeader::Hyphen),
+                },
+                TabStopPatch {
+                    position_pt: 420.0,
+                    kind: TabKind::Right,
+                    leader: None,
+                },
+            ],
+        );
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.props.tab_stops[0].leader, TabLeader::Hyphen);
+        assert_eq!(p.props.tab_stops[1].leader, TabLeader::None);
     }
 
     /// Issue #50 — ToggleList must stamp BOTH the marker text and the

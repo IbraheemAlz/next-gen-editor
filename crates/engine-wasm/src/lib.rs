@@ -10969,6 +10969,11 @@ impl Engine {
     /// `<w:tabs>` stops as a wire-shaped `Vec<BridgeTabStop>`. Empty
     /// when the caret is not inside a paragraph or when the paragraph
     /// has no custom tabs (Ruler renders the default grid).
+    ///
+    /// Issue #145 — `leader` always rides back as a concrete `Some` (the
+    /// read-back is not a patch): the Ruler needs the real leader to
+    /// display a TOC entry's dot marker and to carry it forward
+    /// unchanged the next time it dispatches `SetTabStops`.
     fn tab_stops_for_caret(&self, path: &BridgeBlockPath) -> Vec<bridge::BridgeTabStop> {
         let engine_path = bridge_path_to_engine(path);
         self.with_selection_doc(|d| {
@@ -10987,6 +10992,14 @@ impl Engine {
                         engine::TabKind::Decimal => bridge::BridgeTabKind::Decimal,
                         engine::TabKind::Clear => bridge::BridgeTabKind::Clear,
                     },
+                    leader: Some(match s.leader {
+                        engine::TabLeader::None => bridge::BridgeTabLeader::None,
+                        engine::TabLeader::Dot => bridge::BridgeTabLeader::Dot,
+                        engine::TabLeader::Hyphen => bridge::BridgeTabLeader::Hyphen,
+                        engine::TabLeader::Underscore => bridge::BridgeTabLeader::Underscore,
+                        engine::TabLeader::Heavy => bridge::BridgeTabLeader::Heavy,
+                        engine::TabLeader::MiddleDot => bridge::BridgeTabLeader::MiddleDot,
+                    }),
                 })
                 .collect()
         })
@@ -13936,14 +13949,22 @@ impl Engine {
     /// Sprint 11 (#13) — `Command::SetTabStops`. The Ruler dispatches
     /// once on drag-release; the entire stops vector replaces the
     /// paragraph's `<w:pPr><w:tabs>` so one drag = one undo entry.
+    ///
+    /// Issue #145 — `s.leader: None` (the wire default for a caller
+    /// that only edits position) is forwarded as `None` into
+    /// [`engine::TabStopPatch`], which `Engine::set_tab_stops` then
+    /// resolves per paragraph against that paragraph's *own current*
+    /// leader — never hard-defaulted to `TabLeader::None` here, which
+    /// is what used to erase a TOC entry's dot leader on the first
+    /// drag.
     fn do_set_tab_stops(
         &mut self,
         range: BridgeLogicalRange,
         stops: Vec<bridge::BridgeTabStop>,
     ) -> Event {
-        let engine_stops: Vec<engine::TabStop> = stops
+        let engine_stops: Vec<engine::TabStopPatch> = stops
             .into_iter()
-            .map(|s| engine::TabStop {
+            .map(|s| engine::TabStopPatch {
                 position_pt: s.position_pt,
                 kind: match s.kind {
                     bridge::BridgeTabKind::Left => engine::TabKind::Left,
@@ -13952,7 +13973,14 @@ impl Engine {
                     bridge::BridgeTabKind::Decimal => engine::TabKind::Decimal,
                     bridge::BridgeTabKind::Clear => engine::TabKind::Clear,
                 },
-                leader: Default::default(),
+                leader: s.leader.map(|l| match l {
+                    bridge::BridgeTabLeader::None => engine::TabLeader::None,
+                    bridge::BridgeTabLeader::Dot => engine::TabLeader::Dot,
+                    bridge::BridgeTabLeader::Hyphen => engine::TabLeader::Hyphen,
+                    bridge::BridgeTabLeader::Underscore => engine::TabLeader::Underscore,
+                    bridge::BridgeTabLeader::Heavy => engine::TabLeader::Heavy,
+                    bridge::BridgeTabLeader::MiddleDot => engine::TabLeader::MiddleDot,
+                }),
             })
             .collect();
         if self.story_active() {
