@@ -438,6 +438,8 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
     let reason = match d.reason {
         R::OversizeLine => LayoutDegradeReason::OversizeLine,
         R::KeepChainDropped => LayoutDegradeReason::KeepChainDropped,
+        R::KeepLinesDropped => LayoutDegradeReason::KeepLinesDropped,
+        R::WidowControlDropped => LayoutDegradeReason::WidowControlDropped,
         R::HeaderRepeatDropped => LayoutDegradeReason::HeaderRepeatDropped,
         R::FootnoteOverflow => LayoutDegradeReason::FootnoteOverflow,
         R::FrozenPlacement => LayoutDegradeReason::FrozenPlacement,
@@ -18084,6 +18086,90 @@ mod tests {
         assert!(message.contains("footnote or endnote"), "{message}");
         let direct = engine.do_insert_note(bpos_top(0, 0), engine::NoteKind::Endnote);
         assert!(matches!(direct, Event::Error { .. }));
+    }
+
+    /// Issue #180(b) — `attach_block_paths` rebuilds `page_paths` from the
+    /// paginator's emitted pages (issue #95) and PADS any page a trailing
+    /// document-end endnote flushes on its own with an empty `Vec` (the
+    /// endnote band lives in `PageBox::endnotes`, outside `page.blocks`,
+    /// so a body-less page legitimately has zero paths) — nothing
+    /// exercised that directly. A single oversized endnote forces several
+    /// endnote-only pages past the body; every page must still carry a
+    /// path-per-block (`page_paths.len() == pages.len()` in lockstep,
+    /// none missing, none extra) and a hit-test on the LAST page must
+    /// resolve, not panic or mis-map.
+    #[test]
+    fn trailing_endnote_pages_keep_path_parity_and_hit_test_resolves_on_the_last_page() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Body reference point."));
+        let evt = engine.do_insert_note(
+            bpos_top(0, "Body reference point.".len() as u32),
+            engine::NoteKind::Endnote,
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(matches!(
+            engine.active_story,
+            StoryTarget::Note {
+                kind: engine::NoteKind::Endnote,
+                ..
+            }
+        ));
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        /* ~9.7k chars of wrapping prose — several times more than fits
+        one A4 page at 16px/26pt line height, so the trailing band must
+        flush onto multiple fresh pages past the body's single page. */
+        let long_text =
+            "Sphinx of black quartz, judge my vow; pack my box with five dozen liquor jugs. "
+                .repeat(120);
+        let typed = engine.do_insert_text_interactive(caret, long_text);
+        assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+        let exited = engine.do_exit_header_footer();
+        assert!(matches!(exited, Event::SelectionChanged { .. }), "{exited:?}");
+
+        let scale = engine.scale();
+        let (pages, _fonts, page_paths, info) = engine
+            .build_pages(scale, false, None)
+            .expect("document-end endnote layout");
+        assert!(
+            info.degradations.is_empty(),
+            "nominal endnote overflow reported degradations: {:?}",
+            info.degradations
+        );
+        assert!(
+            pages.len() >= 3,
+            "the oversized endnote must overflow onto trailing pages, got {} page(s)",
+            pages.len()
+        );
+        assert_eq!(
+            page_paths.len(),
+            pages.len(),
+            "every page must have a path-list entry — none missing from the \
+             trailing-endnote pad"
+        );
+        for (pi, page) in pages.iter().enumerate() {
+            assert_eq!(
+                page_paths[pi].len(),
+                page.blocks.len(),
+                "page {pi} has {} block(s) but {} path(s)",
+                page.blocks.len(),
+                page_paths[pi].len()
+            );
+        }
+        let last = pages.last().expect("at least one page");
+        assert!(
+            last.blocks.is_empty(),
+            "the last page is pure endnote overflow, carrying no body blocks"
+        );
+        assert!(
+            !last.endnotes.is_empty(),
+            "the last page's content IS the endnote band overflow"
+        );
+
+        let last_page_idx = (pages.len() - 1) as u32;
+        let hit = engine.do_hit_test_in_page(last_page_idx, BridgePoint { x: 10.0, y: 10.0 });
+        assert!(
+            matches!(hit, Event::HitResult { .. }),
+            "hit-testing on the trailing endnote-only page must resolve, got {hit:?}"
+        );
     }
 
     /// Clicking inside the footnote band enters that note; clicking the
