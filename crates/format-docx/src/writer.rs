@@ -1216,6 +1216,9 @@ fn emit_styled_runs_with_objects(
 
     let mut rev_stack: Vec<&Revision> = Vec::new();
     let mut field_stack: Vec<&Field> = Vec::new();
+    /* Issue #246 — per open field, the source closing bytes chosen when
+    it opened (`None`: the standard end run). */
+    let mut field_close: Vec<Option<&[u8]>> = Vec::new();
     let mut hyperlink_stack: Vec<&Hyperlink> = Vec::new();
     let mut next_fallback_id: u32 = 1;
     /* Issues #199 / #106 — the `<w:r>` still open in `sink`: consecutive
@@ -1249,7 +1252,7 @@ fn emit_styled_runs_with_objects(
         fldChar run emits before the surrounding `</w:ins>` close. */
         while let Some(top) = field_stack.last() {
             if (top.end as usize) <= lo {
-                emit_field_epilogue(out);
+                close_field(field_close.pop().flatten(), out);
                 field_stack.pop();
             } else {
                 break;
@@ -1351,7 +1354,7 @@ fn emit_styled_runs_with_objects(
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *f as *const _))
             {
-                emit_field_prologue(&f.instruction, in_del, out);
+                field_close.push(open_field(f, para, in_del, out));
                 field_stack.push(f);
             }
         }
@@ -1410,8 +1413,8 @@ fn emit_styled_runs_with_objects(
     /* Drain whatever is still open. Field epilogues fire before
     revision closes (field wrappers nest inside revision wrappers), and
     hyperlinks — the outermost wrapper — drain last. */
-    while let Some(_top) = field_stack.pop() {
-        emit_field_epilogue(out);
+    while field_stack.pop().is_some() {
+        close_field(field_close.pop().flatten(), out);
     }
     while let Some(top) = rev_stack.pop() {
         emit_revision_close(top.kind, out);
@@ -1675,6 +1678,76 @@ fn note(n: WriteNote) {
             v.push(n);
         }
     });
+}
+
+/// Issue #246 — open a local field in its source form when the source
+/// bytes still spell its instruction ([`engine::FieldSource`]): a
+/// `<w:fldSimple>` start tag (only when the element nests with every
+/// wrapper the writer emits around it, see [`simple_field_nests`]) or
+/// the complex field's source prologue. Otherwise, and inside a
+/// `<w:del>` (the prologue would need `w:delInstrText`), the standard
+/// complex prologue. Returns the closing bytes to pair with it.
+fn open_field<'a>(
+    f: &'a Field,
+    para: &Paragraph,
+    in_del: bool,
+    out: &mut String,
+) -> Option<&'a [u8]> {
+    let src = f
+        .source
+        .as_deref()
+        .filter(|s| !in_del && s.is_current(&f.instruction) && !s.open.is_empty());
+    let simple = |s: &engine::FieldSource| s.open.starts_with(b"<w:fldSimple");
+    match src {
+        Some(s) if simple(s) && simple_field_nests(f, para) => {
+            push_utf8(&s.open, out);
+            Some(s.close.as_slice())
+        }
+        Some(s) if !simple(s) => {
+            push_utf8(&s.open, out);
+            (!s.close.is_empty()).then_some(s.close.as_slice())
+        }
+        /* No source form, a changed instruction, or a simple field that
+        would cross a wrapper: the standard complex form. */
+        _ => {
+            emit_field_prologue(&f.instruction, in_del, out);
+            None
+        }
+    }
+}
+
+/// Issue #246 — close a field opened by [`open_field`].
+fn close_field(close: Option<&[u8]>, out: &mut String) {
+    match close {
+        Some(bytes) => push_utf8(bytes, out),
+        None => emit_field_epilogue(out),
+    }
+}
+
+/// Issue #246 — `true` when a `<w:fldSimple>` element around `f` stays
+/// well-formed among the wrappers the writer emits at shared offsets
+/// (hyperlinks and revisions open before fields and close after them;
+/// other fields nest by range): each is disjoint from `f`, contains it,
+/// strictly lies inside it, or is another field it nests with. A complex
+/// field has no element, so it never needs this.
+fn simple_field_nests(f: &Field, para: &Paragraph) -> bool {
+    let (fs, fe) = (f.start, f.end);
+    let outer_ok = |ws: u32, we: u32| {
+        ws >= we || we <= fs || ws >= fe || (ws <= fs && fe <= we) || (fs < ws && we < fe)
+    };
+    para.hyperlinks.iter().all(|h| outer_ok(h.start, h.end))
+        && para
+            .revisions
+            .iter()
+            .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+            .all(|r| outer_ok(r.start, r.end))
+        && para.fields.iter().filter(|g| g.is_local()).all(|g| {
+            std::ptr::eq(g, f)
+                || g.end <= fs
+                || g.start >= fe
+                || (g.start <= fs && fe <= g.end)
+                || (fs <= g.start && g.end <= fe)
+        })
 }
 
 /// Issue #81 — one end of a multi-paragraph field.
@@ -6452,11 +6525,15 @@ mod tests {
         assert_eq!(f.keyword(), "PAGE");
 
         /* Force regeneration through the writer and verify the
-        wrappers re-emit as the canonical run sequence. */
+        wrappers re-emit as the canonical run sequence. Issue #246 — a
+        field read from `.docx` keeps its source prologue while its
+        instruction is unchanged; drop it to exercise the canonical form. */
+        assert!(f.source.is_some(), "source form captured");
         let mut owned_doc = parsed.document.clone();
         if let Some(engine::Block::Paragraph(p)) = owned_doc.blocks.iter_mut().next() {
             p.dirty = true;
             p.source_xml = None;
+            p.fields[0].source = None;
         }
         let xml = build_document_xml(&owned_doc, &HashMap::new());
         assert!(

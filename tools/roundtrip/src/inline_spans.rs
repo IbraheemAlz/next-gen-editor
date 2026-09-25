@@ -246,3 +246,86 @@ pub(crate) fn run_content_controls_roundtrip() -> Result<()> {
     println!("[roundtrip] step 28d OK — a split inside a control stays well-formed");
     Ok(())
 }
+
+/* ======================================== #246 — simple fields ==== */
+
+/// `FldSimple.docx`'s shape: a spaced `FILENAME` `<w:fldSimple>` with an
+/// rPr on its result run, then a `_GoBack` bookmark; and a complex
+/// `FORMTEXT` field with a result.
+const FLD_SIMPLE: &str = r#"<w:p w14:paraId="5E924D5F" w14:textId="5C251B6F" w:rsidR="00545A56" w:rsidRDefault="006B3937"><w:fldSimple w:instr=" FILENAME   \* MERGEFORMAT "><w:r><w:rPr><w:noProof/></w:rPr><w:t>FldSimple.docx</w:t></w:r></w:fldSimple><w:bookmarkStart w:id="0" w:name="_GoBack"/><w:bookmarkEnd w:id="0"/></w:p>"#;
+const FORM_TEXT: &str = concat!(
+    r#"<w:p><w:r><w:t xml:space="preserve">Name: </w:t></w:r>"#,
+    r#"<w:r w:rsidR="00A1"><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Text1"/><w:enabled/><w:textInput/></w:ffData></w:fldChar></w:r>"#,
+    r#"<w:bookmarkStart w:id="4" w:name="Text1"/>"#,
+    r#"<w:r w:rsidR="00A1"><w:instrText xml:space="preserve"> FORMTEXT </w:instrText></w:r>"#,
+    r#"<w:r w:rsidR="00A1"><w:fldChar w:fldCharType="separate"/></w:r>"#,
+    r#"<w:r w:rsidR="00B2"><w:t>typed</w:t></w:r>"#,
+    r#"<w:r w:rsidR="00A1"><w:fldChar w:fldCharType="end"/></w:r>"#,
+    r#"<w:bookmarkEnd w:id="4"/></w:p>"#,
+);
+
+/// Issue #246 — step 29: fields keep their source form.
+///
+/// a. An untouched save is byte-identical.
+/// b. Edits inside a `<w:fldSimple>` result and inside a complex
+///    `FORMTEXT` result are EXACTLY source + insert on both save paths:
+///    the simple field stays simple (no complex rewrite), the complex
+///    field keeps its `<w:ffData>` prologue and end run, the `_GoBack`
+///    bookmark stays.
+/// c. A field restamp (the live editor's FILENAME resolution splices the
+///    result) keeps the simple form and the `_GoBack` bookmark after it.
+pub(crate) fn run_field_source_form_roundtrip() -> Result<()> {
+    let xml = document(&format!("{FLD_SIMPLE}{FORM_TEXT}"));
+    let archive =
+        read_docx(&build_styled_docx(STYLES_XML, &xml)).context("read fldSimple fixture")?;
+    let untouched = write_docx(&archive, &archive.document).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != xml.as_bytes() {
+        bail!("step 29: untouched field document drifted");
+    }
+    println!("[roundtrip] step 29a OK — untouched save byte-identical");
+
+    assert_pure_insertions(
+        "step 29b",
+        &xml,
+        &archive,
+        &[
+            (
+                0,
+                3,
+                ">FldSimple.docx<",
+                format!(">Fld{INSERT_TEXT}Simple.docx<"),
+            ),
+            (
+                1,
+                "Name: ty".len(),
+                ">typed<",
+                format!(">ty{INSERT_TEXT}ped<"),
+            ),
+        ],
+    )?;
+    println!(
+        "[roundtrip] step 29b OK — fldSimple stays simple, FORMTEXT keeps its ffData (source + insert)"
+    );
+
+    let mut doc = archive.document.clone();
+    let Some(engine::Block::Paragraph(p)) = doc.blocks.get(0).cloned() else {
+        bail!("step 29c: no paragraph");
+    };
+    let mut p = p.with_spliced_range(0, "FldSimple.docx".len() as u32, "Renamed.docx");
+    p.dirty = true;
+    p.source_xml = None;
+    doc.blocks.set(0, engine::Block::Paragraph(p));
+    let expected = xml.replacen(">FldSimple.docx<", ">Renamed.docx<", 1);
+    for bytes in [
+        write_docx(&archive, &doc).context("write restamped")?,
+        format_docx::save_docx(&doc).context("ui save restamped")?,
+    ] {
+        assert_document_xml_well_formed(&bytes).context("step 29c")?;
+        let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+        if out != expected {
+            bail!("step 29c: restamped field lost its form or the _GoBack bookmark\n{out}");
+        }
+    }
+    println!("[roundtrip] step 29c OK — a restamped fldSimple keeps its form and _GoBack");
+    Ok(())
+}

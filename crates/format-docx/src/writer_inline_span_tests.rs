@@ -401,3 +401,144 @@ fn stale_markup_keeps_the_content_control() {
     assert_eq!(out.matches("<w:sdt>").count(), 1, "{out}");
     assert_eq!(notes, vec![WriteNote::StaleMarkupClamped { markers: 2 }]);
 }
+
+/* ============================ issue #246 — simple fields ==== */
+
+/// `FldSimple.docx`'s shape: a `<w:fldSimple>` whose instruction carries
+/// its own spacing, a result run with an rPr, then a `_GoBack` bookmark.
+const FLD_SIMPLE_P: &str = r#"<w:p w14:paraId="5E924D5F" w14:textId="5C251B6F" w:rsidR="00545A56" w:rsidRDefault="006B3937"><w:fldSimple w:instr=" FILENAME   \* MERGEFORMAT "><w:r><w:rPr><w:noProof/></w:rPr><w:t>FldSimple.docx</w:t></w:r></w:fldSimple><w:bookmarkStart w:id="0" w:name="_GoBack"/><w:bookmarkEnd w:id="0"/></w:p>"#;
+
+/// The field remembers its simple form; edits after it, inside its
+/// result and at its start are exactly source + the inserted bytes — the
+/// `<w:fldSimple>` element and the `_GoBack` bookmark survive.
+#[test]
+fn simple_field_keeps_its_form_through_edits() {
+    let (xml, archive) = open(FLD_SIMPLE_P);
+    let p = archive.document.nth_paragraph(0).unwrap();
+    assert_eq!(p.fields.len(), 1);
+    let src = p.fields[0].source.as_deref().expect("source form");
+    assert_eq!(
+        src.open,
+        br#"<w:fldSimple w:instr=" FILENAME   \* MERGEFORMAT ">"#
+    );
+    assert_eq!(src.close, b"</w:fldSimple>");
+    assert_eq!(save(&archive, &archive.document), xml, "zero-edit");
+
+    let end = "FldSimple.docx".len();
+    let edited = archive.document.insert_text(at(0, end), " X");
+    assert_eq!(
+        save(&archive, &edited),
+        xml.replacen(
+            "</w:fldSimple>",
+            /* `insert_text` does not extend the noProof span at its end:
+            the typed text is plain, in its own run. */
+            r#"</w:fldSimple><w:r><w:t xml:space="preserve"> X</w:t></w:r>"#,
+            1
+        )
+    );
+    let edited = archive.document.insert_text(at(0, 3), "INS");
+    assert_eq!(
+        save(&archive, &edited),
+        xml.replacen(">FldSimple.docx<", ">FldINSSimple.docx<", 1)
+    );
+}
+
+/// The #246 drop: a field restamp (`with_spliced_range`, what the live
+/// editor's FILENAME / PAGE resolution calls) used to leave the source
+/// markup stale, so every positioned marker — the `_GoBack` bookmark
+/// after the field — was dropped. The markup now follows the splice.
+#[test]
+fn restamped_simple_field_keeps_its_form_and_the_bookmark_after_it() {
+    let (xml, archive) = open(FLD_SIMPLE_P);
+    let mut doc = archive.document.clone();
+    let Some(engine::Block::Paragraph(p)) = doc.blocks.get(0).cloned() else {
+        panic!("paragraph");
+    };
+    let mut p = p.with_spliced_range(0, "FldSimple.docx".len() as u32, "Renamed.docx");
+    p.dirty = true;
+    p.source_xml = None;
+    assert!(
+        p.source_markup
+            .as_deref()
+            .unwrap()
+            .offsets_valid(p.text.len())
+    );
+    doc.blocks.set(0, engine::Block::Paragraph(p));
+    assert_eq!(
+        save(&archive, &doc),
+        xml.replacen(">FldSimple.docx<", ">Renamed.docx<", 1)
+    );
+}
+
+/// A changed instruction regenerates the standard complex form (the
+/// source bytes spell the old one).
+#[test]
+fn simple_field_with_a_new_instruction_regenerates() {
+    let (_, archive) = open(FLD_SIMPLE_P);
+    let mut doc = archive.document.clone();
+    let Some(engine::Block::Paragraph(mut p)) = doc.blocks.get(0).cloned() else {
+        panic!("paragraph");
+    };
+    p.fields[0].instruction = "PAGE".into();
+    p.dirty = true;
+    p.source_xml = None;
+    doc.blocks.set(0, engine::Block::Paragraph(p));
+    let out = save(&archive, &doc);
+    assert!(!out.contains("<w:fldSimple"), "{out}");
+    assert!(
+        out.contains(r#"<w:fldChar w:fldCharType="begin"/>"#),
+        "{out}"
+    );
+    assert!(out.contains(r#"w:name="_GoBack""#), "{out}");
+}
+
+/// A `<w:fldSimple>` that would cross a regenerated wrapper (a hyperlink
+/// sharing its start but ending inside it) falls back to the complex
+/// form, which has no element to unbalance.
+#[test]
+fn simple_field_crossing_a_wrapper_falls_back_to_the_complex_form() {
+    let body = r#"<w:p><w:fldSimple w:instr="PAGE"><w:hyperlink w:anchor="a"><w:r><w:t>12</w:t></w:r></w:hyperlink><w:r><w:t>345</w:t></w:r></w:fldSimple></w:p>"#;
+    let (_, archive) = open(body);
+    let edited = archive.document.insert_text(at(0, 5), "X");
+    let out = save(&archive, &edited);
+    assert!(!out.contains("<w:fldSimple"), "{out}");
+    assert!(
+        out.contains(r#"<w:fldChar w:fldCharType="begin"/>"#),
+        "{out}"
+    );
+}
+
+/// A complex field WITH a result keeps its source prologue (the begin run
+/// with its `<w:ffData>` — a `FORMTEXT` — the name bookmark, the
+/// instruction runs) and its end run through an edit inside the result.
+#[test]
+fn complex_field_keeps_its_source_prologue_and_end_run() {
+    let field_open = concat!(
+        r#"<w:r w:rsidR="00A1"><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Text1"/><w:enabled/><w:textInput/></w:ffData></w:fldChar></w:r>"#,
+        r#"<w:bookmarkStart w:id="4" w:name="Text1"/>"#,
+        r#"<w:r w:rsidR="00A1"><w:instrText xml:space="preserve"> FORMTEXT </w:instrText></w:r>"#,
+        r#"<w:r w:rsidR="00A1"><w:fldChar w:fldCharType="separate"/></w:r>"#,
+    );
+    let field_close = r#"<w:r w:rsidR="00A1"><w:fldChar w:fldCharType="end"/></w:r>"#;
+    let body = format!(
+        r#"<w:p><w:r><w:t xml:space="preserve">Name: </w:t></w:r>{field_open}<w:r w:rsidR="00B2"><w:t>typed</w:t></w:r>{field_close}<w:bookmarkEnd w:id="4"/></w:p>"#
+    );
+    let (xml, archive) = open(&body);
+    let p = archive.document.nth_paragraph(0).unwrap();
+    assert_eq!(p.fields.len(), 1);
+    assert_eq!(p.fields[0].instruction, "FORMTEXT");
+    let src = p.fields[0].source.as_deref().expect("source form");
+    assert_eq!(src.open, field_open.as_bytes());
+    assert_eq!(src.close, field_close.as_bytes());
+    assert_eq!(save(&archive, &archive.document), xml, "zero-edit");
+    let edited = archive.document.insert_text(at(0, "Name: ty".len()), "INS");
+    assert_eq!(
+        save(&archive, &edited),
+        xml.replacen(">typed<", ">tyINSped<", 1)
+    );
+    let edited = archive.document.insert_text(at(0, 2), "Z");
+    assert_eq!(
+        save(&archive, &edited),
+        xml.replacen("Name: ", "NaZme: ", 1)
+    );
+}

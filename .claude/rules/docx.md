@@ -196,8 +196,20 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`
   whose text already had edge whitespace (`SourceRun::bare_edge_ws`) keeps
   its bare spelling.
+- **Field source form (issue #246).** A field read from `.docx` carries
+  `Field::source` (`engine::FieldSource`): a `<w:fldSimple>`'s start tag
+  + `</w:fldSimple>`, or a complex field's source prologue (begin run —
+  `<w:ffData>` included — through the separate run; the markers captured
+  inside it are dropped, the bytes carry them) + its end run. The writer
+  (`open_field` / `close_field`) re-emits them while the live instruction
+  equals `FieldSource::instruction` and outside a `<w:del>`; a
+  `<w:fldSimple>` only while its element nests with every regenerated
+  wrapper (`simple_field_nests`), else the complex form.
 - Offsets are remapped by `insert_text`, `delete_text`, `split_at`,
-  `concat`, inline-object splices and the revision accept/reject helper;
+  `concat`, inline-object splices, field restamps (`with_spliced_range`
+  → `SourceMarkup::note_replace`, issue #246 — a stale restamp used to
+  drop the `_GoBack` bookmark after a FILENAME field) and the revision
+  accept/reject helper;
   `SourceMarkup::text_len` makes any other text edit go *stale* (runs /
   markers ignored, never misplaced).
 - `tools/corpus-native` reports `edit_check.source_bytes_rewritten` (bytes

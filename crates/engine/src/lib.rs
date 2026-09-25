@@ -1725,6 +1725,51 @@ impl SourceMarkup {
         m.text_len -= gap;
     }
 
+    /// Issue #246 — bytes `[s, e)` of a text `old_len` bytes long were
+    /// replaced by `rep_len` bytes ([`Paragraph::with_spliced_range`] — a
+    /// field result restamp). Mirrors that splice's span mapping: a run
+    /// covering the range keeps covering the replacement, markers before
+    /// or at `s` stay, markers at or after `e` follow the replacement's
+    /// end (a `_GoBack` bookmark right after a restamped field stays
+    /// after it), markers inside collapse to `s`.
+    pub fn note_replace(slot: &mut Option<Box<Self>>, old_len: u32, s: u32, e: u32, rep_len: u32) {
+        let Some(m) = slot.as_deref_mut() else {
+            return;
+        };
+        if m.text_len != old_len || s > e || e > old_len {
+            m.text_len = STALE_TEXT_LEN;
+            return;
+        }
+        let gap = e - s;
+        let map_start = |p: u32| {
+            if p <= s {
+                p
+            } else if p >= e {
+                p - gap + rep_len
+            } else {
+                s
+            }
+        };
+        let map_end = |p: u32| {
+            if p <= s {
+                p
+            } else if p >= e {
+                p - gap + rep_len
+            } else {
+                s + rep_len
+            }
+        };
+        for r in &mut m.runs {
+            r.start = map_start(r.start);
+            r.end = map_end(r.end);
+        }
+        m.runs.retain(|r| r.start < r.end);
+        for mk in &mut m.markers {
+            mk.at = map_start(mk.at);
+        }
+        m.text_len = old_len - gap + rep_len;
+    }
+
     /// Split for [`Paragraph::split_at`] at byte `at` of a text `old_len`
     /// bytes long. The left half keeps the paragraph identity
     /// (`w14:paraId` / `w14:textId`); the right half gets the remaining
@@ -2695,6 +2740,43 @@ pub struct Field {
     /// `None` = the ordinary paragraph-local field (#43 / #77).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<FieldSpan>,
+    /// Issue #246 — the field's source markup, for a field read from
+    /// `.docx`; `None` for an engine-authored one. Skipped when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Box<FieldSource>>,
+}
+
+/// Issue #246 — how a field read from `.docx` was spelled, so a
+/// regenerated paragraph writes it back in the SAME form: a
+/// `<w:fldSimple>` stays simple (instead of growing into a
+/// `fldChar begin / instrText / separate … end` complex field), and a
+/// complex field keeps its source prologue — the begin run with its
+/// `<w:ffData>` (a `FORMTEXT` with a result), rsids, the instruction runs
+/// with their spacing — and its end run.
+///
+/// Verified: the writer uses the bytes only while the field's live
+/// `instruction` still equals the one they produced; an edited
+/// instruction regenerates the standard complex form. The result runs in
+/// between always regenerate from the text.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct FieldSource {
+    /// The (trimmed) instruction the bytes produced.
+    pub instruction: String,
+    /// `<w:fldSimple …>` start tag, or the complex field's runs from the
+    /// begin `fldChar` through the `separate` one.
+    #[serde(with = "serde_bytes")]
+    pub open: Vec<u8>,
+    /// `</w:fldSimple>`, or the complex field's end-`fldChar` run.
+    #[serde(with = "serde_bytes")]
+    pub close: Vec<u8>,
+}
+
+impl FieldSource {
+    /// The source bytes still spell `instruction`.
+    pub fn is_current(&self, instruction: &str) -> bool {
+        self.instruction == instruction
+    }
 }
 
 /// Issue #81 — the multi-paragraph field representation. OOXML lets a
@@ -3806,6 +3888,16 @@ impl Paragraph {
         };
         let mut out = self.clone();
         out.text = text;
+        /* Issue #246 — the source markup follows the splice (a field
+        restamp used to leave it stale, dropping every positioned marker —
+        the `_GoBack` bookmark after a FILENAME field). */
+        SourceMarkup::note_replace(
+            &mut out.source_markup,
+            self.text.len() as u32,
+            start,
+            end,
+            rep_len,
+        );
         out.spans = self
             .spans
             .iter()
@@ -6436,6 +6528,7 @@ impl DocumentTree {
                 end: start + cached.len() as u32,
                 instruction: instruction.to_string(),
                 span: None,
+                source: None,
             });
             para.fields.sort_by_key(|f| f.start);
         });
@@ -14064,6 +14157,7 @@ mod tests {
                 end: 8,
                 instruction: "PAGE".into(),
                 span: None,
+                source: None,
             }],
             ..Default::default()
         };
@@ -14090,6 +14184,7 @@ mod tests {
                 end: 4,
                 instruction: "PAGE".into(),
                 span: None,
+                source: None,
             }],
             ..Default::default()
         };
@@ -14124,6 +14219,7 @@ mod tests {
                     end: 6,
                     instruction: "PAGE".into(),
                     span: None,
+                    source: None,
                 });
             });
             d.blocks = blocks;
@@ -14163,6 +14259,7 @@ mod tests {
                 end: 8,
                 instruction: "NUMPAGES".into(),
                 span: None,
+                source: None,
             }],
             spans: vec![
                 StyleRun {
@@ -14205,6 +14302,7 @@ mod tests {
             end: 1,
             instruction: "DATE \\@ \"dd/MM/yyyy\" \\* MERGEFORMAT".into(),
             span: None,
+            source: None,
         };
         assert_eq!(f.date_picture().as_deref(), Some("dd/MM/yyyy"));
         let bare = Field {
@@ -14212,6 +14310,7 @@ mod tests {
             end: 1,
             instruction: "DATE".into(),
             span: None,
+            source: None,
         };
         assert_eq!(bare.date_picture(), None);
     }

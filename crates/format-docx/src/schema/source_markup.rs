@@ -332,6 +332,35 @@ impl MarkupCapture {
         }
     }
 
+    /// Issue #246 — how many markers the paragraph captured so far.
+    pub fn markers_len(&self) -> usize {
+        self.markers.len()
+    }
+
+    /// Issue #246 — drop the markers `[from, to)` (captured inside a
+    /// field prologue that is now kept verbatim).
+    pub fn drain_markers(&mut self, from: usize, to: usize) {
+        if from < to && to <= self.markers.len() {
+            self.markers.drain(from..to);
+            /* Keep the indexes into `markers` sound. */
+            for sdt in &mut self.sdts {
+                if let Some(o) = sdt.opener {
+                    if o >= to {
+                        sdt.opener = Some(o - (to - from));
+                    } else if o >= from {
+                        sdt.opener = None;
+                        sdt.unusable = true;
+                    }
+                }
+            }
+            for f in &mut self.field_spans {
+                if f.marker_mark > from {
+                    f.marker_mark = f.marker_mark.saturating_sub(to - from).max(from);
+                }
+            }
+        }
+    }
+
     /// Issue #245 — a run-level `<w:sdt>` start tag at byte `start`.
     pub fn sdt_start(&mut self, start: usize) {
         if !self.open || self.run.is_some() {

@@ -527,6 +527,18 @@ mod tests {
             0,
             crate::Block::Paragraph(crate::Paragraph {
                 source_markup: Some(Box::new(markup.clone())),
+                /* Issue #246 — a field's source form travels too. */
+                fields: vec![crate::Field {
+                    start: 0,
+                    end: 5,
+                    instruction: "FILENAME".into(),
+                    span: None,
+                    source: Some(Box::new(crate::FieldSource {
+                        instruction: "FILENAME".into(),
+                        open: br#"<w:fldSimple w:instr=" FILENAME ">"#.to_vec(),
+                        close: b"</w:fldSimple>".to_vec(),
+                    })),
+                }],
                 ..p
             }),
         );
@@ -535,6 +547,7 @@ mod tests {
         let back: Decoded<DocumentTree> = decode(&bytes).unwrap();
         let p0 = back.payload.nth_paragraph(0).unwrap();
         assert_eq!(p0.source_markup.as_deref(), Some(&markup));
+        assert!(p0.fields[0].source.is_some(), "field source form");
         assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
         /* No markup: the pre-#199 encoding, and it decodes to `None`. */
         let back: Decoded<DocumentTree> = decode(&plain).unwrap();
