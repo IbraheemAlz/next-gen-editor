@@ -573,7 +573,11 @@ fn query_cases() -> Vec<Case> {
             "snapshot",
             text_doc,
             vec![],
-            Command::Snapshot { seq: None },
+            Command::Snapshot {
+                seq: None,
+                detach_package: None,
+                known_package_hash: None,
+            },
         ),
         case("images: rects", text_doc, vec![], Command::GetImageRects),
         case(

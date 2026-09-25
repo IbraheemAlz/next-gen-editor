@@ -136,6 +136,11 @@ let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingLogWrites: Promise<unknown> = Promise.resolve();
 /* Issue #85 — fault-injection countdown; `null` = disarmed. */
 let trapAfterCommands: number | null = null;
+/* Issue #212 — content key of the detached source package the event
+   log's `packages` store holds (or is about to: set when the write is
+   issued, cleared if it fails), passed as `known_package_hash` so the
+   engine ships the package bytes only when they changed. */
+let persistedPackageHash: string | undefined;
 
 /* Issue #96 — every OffscreenCanvas this worker generation was handed, by
    page index (0 = the INIT / RECOVER surface). Only the DEV paint probe
@@ -860,6 +865,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
         await openEventLog(msg.documentId);
+        persistedPackageHash = undefined;
         /* Issue #43 — inject today's date so DATE fields resolve at
            layout time (Word updates DATE on open/print). Single
            injection site: the engine core never reads a wall clock, so
@@ -932,6 +938,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                 snapshot: candidate.snapshot,
                 log_tail: tail,
                 ...(msg.rendererDowngrade ? { renderer_downgrade: msg.rendererDowngrade } : {}),
+                /* Issue #212 — the detached package the snapshot names. */
+                ...(candidate.package ? { package: candidate.package } : {}),
             });
             base = candidate;
             const usable =
@@ -951,6 +959,11 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            once the log is long). */
         lastSnapshotAt =
             evt.type === 'RECOVERED' && evt.snapshot_restored ? (base?.seq ?? 0) : 0;
+        /* Issue #212 — the store holds the package the restored snapshot
+           named (the engine re-attached it and primed its key), so the
+           next snapshot need not ship it again. Anything else ships. */
+        persistedPackageHash =
+            lastSnapshotAt > 0 && base?.package !== undefined ? base.packageHash : undefined;
         /* Issue #43 — a recovered engine needs the render date again.
            Dispatched AFTER `RECOVER`: its session reset wipes the clock
            half (TIME fields), so an injection ahead of it was lost. */
@@ -1240,7 +1253,9 @@ function logCommand(cmd: Command): number {
 /**
  * Issue #85 — take an engine snapshot at log position `seq` and persist it
  * (`persistSnapshot` prunes to the newest 3 and drops the command rows
- * they make unreachable). Runs on the serial queue with no command in
+ * they make unreachable). Issue #212 — the snapshot is DETACHED: an
+ * opened `.docx`'s source package rides beside it only when the log
+ * does not hold it yet. Runs on the serial queue with no command in
  * flight — callers are either a command task after its reply, or the
  * queued idle task — so the bytes describe exactly the state after
  * command `seq` and recovery's replay tail starts at `seq + 1`. The
@@ -1250,15 +1265,30 @@ function logCommand(cmd: Command): number {
 async function takeSnapshot(seq: number): Promise<void> {
     if (!engine || seq <= lastSnapshotAt) return;
     try {
-        const evt = await dispatch({ type: 'SNAPSHOT', seq });
+        /* Issue #212 — detached: the retained source package is persisted
+           once per document (`packages` store), not inside every snapshot. */
+        const evt = await dispatch({
+            type: 'SNAPSHOT',
+            seq,
+            detach_package: true,
+            ...(persistedPackageHash !== undefined
+                ? { known_package_hash: persistedPackageHash }
+                : {}),
+        });
         if (evt.type !== 'SNAPSHOT') {
             console.warn('[worker] engine snapshot failed', evt);
             return;
         }
         lastSnapshotAt = seq;
-        const write = persistSnapshot(seq, evt.bytes).catch((e: unknown) =>
-            console.warn('[worker] event-log snapshot failed', e),
-        );
+        const hash = evt.package_hash;
+        const pkg =
+            hash === undefined ? undefined : evt.package ? { hash, bytes: evt.package } : { hash };
+        if (hash !== undefined) persistedPackageHash = hash;
+        const write = persistSnapshot(seq, evt.bytes, pkg).catch((e: unknown) => {
+            console.warn('[worker] event-log snapshot failed', e);
+            /* The package may not have landed: ship it with the next one. */
+            if (persistedPackageHash === hash) persistedPackageHash = undefined;
+        });
         pendingLogWrites = pendingLogWrites.then(() => write);
     } catch (e: unknown) {
         console.warn('[worker] snapshot dispatch failed', e);

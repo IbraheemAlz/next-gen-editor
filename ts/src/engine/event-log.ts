@@ -1,12 +1,19 @@
 /* Phase 2 D2.6 — event log + crash-recovery storage (PHASE_2_BRIDGE_MEMORY.md
  * §10). Native IndexedDB; no external dependency.
  *
- * One origin-scoped database `engine-log` with three object stores:
+ * One origin-scoped database `engine-log` with four object stores:
  *   - commands  (keyPath "seq") — replay-relevant commands, in order; rows
  *                 at/before a pruned snapshot are dropped with it
  *   - snapshots (keyPath "seq") — periodic engine snapshots; pruned to 3
  *   - meta      (keyPath "id")  — bookkeeping (which document is logged,
  *                 how far the command log has been pruned)
+ *   - packages  (keyPath "hash") — issue #212: the opened `.docx`'s retained
+ *                 source package (#134), stored ONCE per document under its
+ *                 content key. Snapshots are taken detached
+ *                 (`Command::Snapshot.detach_package`) and name the package
+ *                 by `packageHash`, so a 2–7 MB package of embedded fonts /
+ *                 OLE parts is not re-written with every snapshot. A package
+ *                 no retained snapshot names is dropped with the pruning.
  *
  * Issue #241 — pruning invariant: a command row is only ever deleted in
  * the same transaction that persists a snapshot, and only when it is at
@@ -18,7 +25,8 @@
 import type { Command } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 const DB_NAME = 'engine-log';
-const DB_VERSION = 1;
+/* v2 (issue #212): the `packages` store + the snapshots `packageHash` index. */
+const DB_VERSION = 2;
 /** Snapshots retained by `persistSnapshot`; older ones are pruned (§10.2). */
 const SNAPSHOTS_KEPT = 3;
 
@@ -30,6 +38,18 @@ interface CommandRow {
 interface SnapshotRow {
     seq: number;
     bytes: Uint8Array;
+    /** Issue #212 — the detached source package this snapshot names. */
+    packageHash?: string;
+}
+interface PackageRow {
+    hash: string;
+    bytes: Uint8Array;
+}
+/** Issue #212 — the detached package a snapshot is persisted with: its
+ *  content key, plus the bytes when the store does not hold them yet. */
+export interface SnapshotPackage {
+    hash: string;
+    bytes?: Uint8Array;
 }
 /** Issue #241 — `meta` row: highest command seq deleted by pruning (0 =
  *  the log is complete from the session's first command). */
@@ -38,6 +58,8 @@ interface PrunedRow {
     through: number;
 }
 const PRUNED_ID = 'pruned';
+/** Issue #212 — snapshots index over `packageHash` (package GC). */
+const PACKAGE_INDEX = 'packageHash';
 
 /** One logged command with its log position. */
 export interface LoggedCommand {
@@ -51,6 +73,12 @@ export interface LoggedCommand {
 export interface RecoveryCandidate {
     seq: number;
     snapshot: Uint8Array;
+    /** Issue #212 — the detached package the snapshot names, and its
+     *  bytes when the `packages` store still holds them (absent → the
+     *  engine restores the document and saves through the minimal
+     *  writer). */
+    packageHash?: string;
+    package?: Uint8Array;
 }
 
 /** Everything `EngineClient.recover()` hands the respawned worker. */
@@ -94,14 +122,29 @@ function openDb(): Promise<IDBDatabase> {
             if (!db.objectStoreNames.contains('commands')) {
                 db.createObjectStore('commands', { keyPath: 'seq' });
             }
-            if (!db.objectStoreNames.contains('snapshots')) {
-                db.createObjectStore('snapshots', { keyPath: 'seq' });
+            const snapshots = db.objectStoreNames.contains('snapshots')
+                ? open.transaction!.objectStore('snapshots')
+                : db.createObjectStore('snapshots', { keyPath: 'seq' });
+            if (!snapshots.indexNames.contains(PACKAGE_INDEX)) {
+                snapshots.createIndex(PACKAGE_INDEX, 'packageHash');
             }
             if (!db.objectStoreNames.contains('meta')) {
                 db.createObjectStore('meta', { keyPath: 'id' });
             }
+            if (!db.objectStoreNames.contains('packages')) {
+                db.createObjectStore('packages', { keyPath: 'hash' });
+            }
         };
-        open.onsuccess = () => resolve(open.result);
+        open.onsuccess = () => {
+            const db = open.result;
+            /* A newer tab upgrading the schema must not be blocked by this
+               connection: let go, the next call re-opens. */
+            db.onversionchange = () => {
+                db.close();
+                dbPromise = null;
+            };
+            resolve(db);
+        };
         open.onerror = () => reject(open.error ?? new Error('IndexedDB open failed'));
         open.onblocked = () => reject(new Error('IndexedDB open blocked by another connection'));
     });
@@ -127,9 +170,10 @@ function getDb(): Promise<IDBDatabase> {
  *  eat a live session's history. */
 export async function openEventLog(documentId: string): Promise<void> {
     const db = await getDb();
-    const tx = db.transaction(['commands', 'snapshots', 'meta'], 'readwrite');
+    const tx = db.transaction(['commands', 'snapshots', 'meta', 'packages'], 'readwrite');
     tx.objectStore('commands').clear();
     tx.objectStore('snapshots').clear();
+    tx.objectStore('packages').clear();
     tx.objectStore('meta').put({ id: 'document', documentId, openedAt: Date.now() });
     tx.objectStore('meta').put({ id: PRUNED_ID, through: 0 } satisfies PrunedRow);
     await txDone(tx);
@@ -144,12 +188,24 @@ export async function appendCommand(seq: number, cmd: Command): Promise<void> {
     await txDone(tx);
 }
 
-/** Persist an engine snapshot, pruning all but the newest `SNAPSHOTS_KEPT`. */
-export async function persistSnapshot(seq: number, bytes: Uint8Array): Promise<void> {
+/** Persist an engine snapshot, pruning all but the newest `SNAPSHOTS_KEPT`.
+ *  Issue #212 — `pkg` names the detached source package the snapshot was
+ *  taken without; its bytes (first snapshot of a document) go to the
+ *  `packages` store in the same transaction, so a snapshot row never
+ *  lands without the package it names. */
+export async function persistSnapshot(
+    seq: number,
+    bytes: Uint8Array,
+    pkg?: SnapshotPackage,
+): Promise<void> {
     const db = await getDb();
-    const tx = db.transaction(['snapshots', 'commands', 'meta'], 'readwrite');
+    const tx = db.transaction(['snapshots', 'commands', 'meta', 'packages'], 'readwrite');
     const store = tx.objectStore('snapshots');
-    const row: SnapshotRow = { seq, bytes };
+    const packages = tx.objectStore('packages');
+    const row: SnapshotRow = pkg ? { seq, bytes, packageHash: pkg.hash } : { seq, bytes };
+    if (pkg?.bytes) {
+        packages.put({ hash: pkg.hash, bytes: pkg.bytes } satisfies PackageRow);
+    }
     store.put(row);
     /* Prune the oldest. getAllKeys() yields keys in ascending `seq` order, so
        everything before the last SNAPSHOTS_KEPT is stale. The deletes are
@@ -186,6 +242,19 @@ export async function persistSnapshot(seq: number, bytes: Uint8Array): Promise<v
                 meta.put({ id: PRUNED_ID, through } satisfies PrunedRow);
             };
         }
+        /* Issue #212 — drop every package no retained snapshot names (a
+           document opened earlier in the session). Requests run in
+           order, so the counts see the deletes above. */
+        const index = store.index(PACKAGE_INDEX);
+        const pkgKeys = packages.getAllKeys();
+        pkgKeys.onsuccess = () => {
+            for (const hash of pkgKeys.result) {
+                const refs = index.count(IDBKeyRange.only(hash));
+                refs.onsuccess = () => {
+                    if (refs.result === 0) packages.delete(hash);
+                };
+            }
+        };
     };
     await txDone(tx);
 }
@@ -200,11 +269,15 @@ export async function persistSnapshot(seq: number, bytes: Uint8Array): Promise<v
  */
 export async function loadRecoveryLog(): Promise<RecoveryLog> {
     const db = await getDb();
-    const tx = db.transaction(['snapshots', 'commands', 'meta'], 'readonly');
+    const tx = db.transaction(['snapshots', 'commands', 'meta', 'packages'], 'readonly');
     const snapReq = tx.objectStore('snapshots').getAll();
     const cmdReq = tx.objectStore('commands').getAll();
     const prunedReq = tx.objectStore('meta').get(PRUNED_ID);
+    const pkgReq = tx.objectStore('packages').getAll();
     await txDone(tx);
+    const packages = new Map(
+        (pkgReq.result as PackageRow[]).map((row) => [row.hash, row.bytes] as const),
+    );
 
     const snapshots = (snapReq.result as SnapshotRow[]).slice().sort((a, b) => b.seq - a.seq);
     const commands = (cmdReq.result as CommandRow[]).map((row) => ({ seq: row.seq, cmd: row.cmd }));
@@ -212,7 +285,15 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
     const newestSnapshotSeq = snapshots[0]?.seq ?? 0;
     return {
         candidates: [
-            ...snapshots.map((row) => ({ seq: row.seq, snapshot: row.bytes })),
+            ...snapshots.map((row): RecoveryCandidate => {
+                const candidate: RecoveryCandidate = { seq: row.seq, snapshot: row.bytes };
+                if (row.packageHash !== undefined) {
+                    candidate.packageHash = row.packageHash;
+                    const pkg = packages.get(row.packageHash);
+                    if (pkg) candidate.package = pkg;
+                }
+                return candidate;
+            }),
             { seq: 0, snapshot: new Uint8Array(0) },
         ],
         commands,

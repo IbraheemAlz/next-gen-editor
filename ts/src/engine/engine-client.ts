@@ -305,7 +305,15 @@ export class EngineClient {
             },
             [
                 canvas,
-                ...new Set(recoveryLog.candidates.map((c) => c.snapshot.buffer as ArrayBuffer)),
+                /* Issue #212 — candidates naming one package share its
+                   bytes: each buffer is transferred once. */
+                ...new Set(
+                    recoveryLog.candidates.flatMap((c) =>
+                        [c.snapshot, c.package]
+                            .filter((b): b is Uint8Array => b !== undefined)
+                            .map((b) => b.buffer as ArrayBuffer),
+                    ),
+                ),
             ],
         );
         if (!r.ok) throw new Error(r.error);
