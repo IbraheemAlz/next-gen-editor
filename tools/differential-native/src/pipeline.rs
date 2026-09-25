@@ -464,6 +464,7 @@ fn build_table_box(
                 padding_top: pad_t,
                 padding_right: pad_r,
                 padding_bottom: pad_b,
+                content_offset: 0,
             });
             col_idx += span;
         }
@@ -481,6 +482,7 @@ fn build_table_box(
             cells: cells_out,
             header: row.props.header,
             cant_split: row.props.cant_split,
+            source_row: rows_out.len() as u32,
         });
         y += row_height;
     }

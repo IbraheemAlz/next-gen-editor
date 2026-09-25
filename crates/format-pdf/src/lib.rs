@@ -1525,6 +1525,7 @@ mod tests {
             padding_top: 0.0,
             padding_right: 0.0,
             padding_bottom: 0.0,
+            content_offset: 0,
         };
         let row = layout::TableRowBox {
             origin: layout::Point { x: 0.0, y: 0.0 },
@@ -1535,6 +1536,7 @@ mod tests {
             cells: vec![cell],
             header: false,
             cant_split: false,
+            source_row: 0,
         };
         let table = TableBox {
             origin: layout::Point { x: 0.0, y: 100.0 },
@@ -1631,6 +1633,7 @@ mod tests {
                 padding_top: pad_top,
                 padding_right: 0.0,
                 padding_bottom: 0.0,
+                content_offset: 0,
             };
             let row = layout::TableRowBox {
                 origin: layout::Point { x: 0.0, y: 0.0 },
@@ -1641,6 +1644,7 @@ mod tests {
                 cells: vec![cell],
                 header: false,
                 cant_split: false,
+                source_row: 0,
             };
             let table = TableBox {
                 origin: layout::Point { x: 0.0, y: 100.0 },
@@ -2315,5 +2319,120 @@ mod tests {
             with_notes.len() > plain.len(),
             "footnote band adds separator rule + glyphs"
         );
+    }
+
+    /// Issue #91 — a table taller than a page is split by the paginator
+    /// into per-page fragments (header row repeated); the PDF painter
+    /// must paint every continuation row exactly like the canvas path:
+    /// each page's content stream carries one text matrix per glyph of
+    /// every row on that page, header clone included, plus cell borders.
+    #[test]
+    fn split_table_continuation_rows_paint_on_every_page() {
+        let stack = liberation_stack();
+        let para = layout_paragraph(ParagraphConfig {
+            text: "hi",
+            fonts: &stack,
+            spans: &[plain_span("hi".len() as u32)],
+            base_direction: ShapingDirection::Ltr,
+            max_width: 200.0,
+            line_height: 22.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 22.0,
+            inline_objects: &[],
+            tab_stops_px: &[],
+        });
+        let glyphs_per_row: usize = para
+            .lines
+            .iter()
+            .flat_map(|l| l.runs.iter())
+            .map(|r| r.glyphs.len())
+            .sum();
+        assert!(glyphs_per_row > 0);
+        let n_rows = 40usize;
+        let rows: Vec<layout::TableRowBox> = (0..n_rows)
+            .map(|i| layout::TableRowBox {
+                origin: layout::Point {
+                    x: 0.0,
+                    y: i as f32 * 30.0,
+                },
+                size: layout::Size {
+                    width: 200.0,
+                    height: 30.0,
+                },
+                cells: vec![layout::TableCellBox {
+                    origin: layout::Point { x: 0.0, y: 0.0 },
+                    size: layout::Size {
+                        width: 200.0,
+                        height: 30.0,
+                    },
+                    grid_span: 1,
+                    v_merge: engine::VMergeRole::None,
+                    borders: engine::default_word_borders(),
+                    shading: None,
+                    content: vec![LayoutBlock::Paragraph(para.clone())],
+                    padding_left: 0.0,
+                    padding_top: 0.0,
+                    padding_right: 0.0,
+                    padding_bottom: 0.0,
+                    content_offset: 0,
+                }],
+                header: i == 0,
+                cant_split: false,
+                source_row: i as u32,
+            })
+            .collect();
+        let table = TableBox {
+            origin: layout::Point::default(),
+            size: layout::Size {
+                width: 200.0,
+                height: n_rows as f32 * 30.0,
+            },
+            columns: vec![200.0],
+            rows,
+            outer_borders: engine::default_word_borders(),
+        };
+        let geom = layout::PaginatePageGeometry {
+            width: 595.0,
+            height: 842.0,
+            margins: Margins::uniform(72.0),
+            header_offset: 36.0,
+            footer_offset: 36.0,
+        };
+        let mut pag = layout::Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Table(table), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2, "1200 pt of rows on a 698 pt body");
+        let fo = test_font_objs(&["liberation"]);
+        let mut painted_body_rows = 0usize;
+        for (i, page) in pages.iter().enumerate() {
+            let rows: Vec<&layout::TableRowBox> = page
+                .blocks
+                .iter()
+                .filter_map(LayoutBlock::as_table)
+                .flat_map(|t| t.rows.iter())
+                .collect();
+            assert!(rows[0].header, "page {i} opens with the header row");
+            painted_body_rows += rows.iter().filter(|r| !r.header).count();
+            let content = build_content(page, &fo);
+            let text = String::from_utf8_lossy(&content);
+            let tms = text.split_whitespace().filter(|t| *t == "Tm").count();
+            assert_eq!(
+                tms,
+                rows.len() * glyphs_per_row,
+                "page {i}: every row (header clone included) paints its glyphs"
+            );
+            assert!(
+                text.split_whitespace().any(|t| t == "S"),
+                "page {i}: cell borders stroke"
+            );
+        }
+        assert_eq!(painted_body_rows, n_rows - 1);
     }
 }

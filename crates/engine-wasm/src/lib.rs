@@ -3353,6 +3353,7 @@ fn layout_table_box(
                 padding_top: pad_top,
                 padding_right: pad_right,
                 padding_bottom: pad_bottom,
+                content_offset: 0,
             });
             x += cell_width;
             col_cursor += span;
@@ -3409,6 +3410,7 @@ fn layout_table_box(
             cells: cells_out,
             header: row.props.header,
             cant_split: row.props.cant_split,
+            source_row: rows_out.len() as u32,
         });
         y += row_height;
     }
@@ -4192,7 +4194,7 @@ fn collect_table_line_geom(
     table_origin_y: f32,
     out: &mut Vec<LineGeom>,
 ) {
-    for (r, row) in table_box.rows.iter().enumerate() {
+    for row in &table_box.rows {
         let row_x = table_origin_x + row.origin.x;
         let row_y = table_origin_y + row.origin.y;
         for (c, cell) in row.cells.iter().enumerate() {
@@ -4210,12 +4212,16 @@ fn collect_table_line_geom(
                         BridgePathStep::Block {
                             idx: table_block_idx,
                         },
+                        /* Issue #91 — a split table's fragments re-base
+                        their rows (and a row split inside its cells
+                        re-bases the cell content): map back to the
+                        model row / cell block. */
                         BridgePathStep::Cell {
-                            row: r as u32,
+                            row: row.source_row,
                             col: c as u32,
                         },
                         BridgePathStep::Block {
-                            idx: block_idx as u32,
+                            idx: cell.content_offset + block_idx as u32,
                         },
                     ],
                 };
@@ -4300,7 +4306,7 @@ fn collect_table_image_rects(
     table_origin_y: f32,
     out: &mut Vec<bridge::ImageRect>,
 ) {
-    for (r, row) in table_box.rows.iter().enumerate() {
+    for row in &table_box.rows {
         let row_x = table_origin_x + row.origin.x;
         let row_y = table_origin_y + row.origin.y;
         for (c, cell) in row.cells.iter().enumerate() {
@@ -4318,12 +4324,16 @@ fn collect_table_image_rects(
                         BridgePathStep::Block {
                             idx: table_block_idx,
                         },
+                        /* Issue #91 — a split table's fragments re-base
+                        their rows (and a row split inside its cells
+                        re-bases the cell content): map back to the
+                        model row / cell block. */
                         BridgePathStep::Cell {
-                            row: r as u32,
+                            row: row.source_row,
                             col: c as u32,
                         },
                         BridgePathStep::Block {
-                            idx: block_idx as u32,
+                            idx: cell.content_offset + block_idx as u32,
                         },
                     ],
                 };
@@ -17677,6 +17687,53 @@ mod tests {
             .expect("prose band");
         out.push(("prose_300_band_1200", pages, info.degradations));
         out
+    }
+
+    /// Issue #91 — a table taller than a page splits at row boundaries
+    /// with its `<w:tblHeader>` row repeated on every page, reports no
+    /// degradation, and every fragment's geometry maps back to the MODEL
+    /// row (`TableRowBox::source_row`): body rows 1..=120 appear exactly
+    /// once and in order across the pages, the header clones map to row 0.
+    #[test]
+    fn split_table_fragments_map_geometry_to_model_rows() {
+        let mut d = DocumentTree::from_text("intro");
+        let mut t = one_row_table(vec![cell_with_text("header")]);
+        t.rows[0].props.header = true;
+        for i in 1..=120 {
+            t.rows.push(engine::TableRow {
+                props: engine::RowProperties::default(),
+                cells: vec![cell_with_text(&format!("row {i}"))],
+            });
+        }
+        d.blocks.push_back(engine::Block::Table(t));
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("pages");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let mut fragments = 0usize;
+        let mut rows_seen: Vec<u32> = Vec::new();
+        for page in &pages {
+            for b in &page.blocks {
+                let LayoutBlock::Table(tb) = b else { continue };
+                fragments += 1;
+                assert!(tb.rows[0].header, "every fragment opens with the header");
+                let mut out = Vec::new();
+                collect_table_line_geom(tb, 1, 0.0, 0.0, &mut out);
+                for g in &out {
+                    match g.path.steps.get(1) {
+                        Some(BridgePathStep::Cell { row, .. }) => rows_seen.push(*row),
+                        other => panic!("cell step expected, got {other:?}"),
+                    }
+                }
+            }
+        }
+        assert!(fragments >= 3, "120 rows span several pages ({fragments})");
+        let body: Vec<u32> = rows_seen.iter().copied().filter(|&r| r != 0).collect();
+        assert_eq!(body, (1..=120).collect::<Vec<u32>>());
+        assert_eq!(
+            rows_seen.iter().filter(|&&r| r == 0).count(),
+            fragments,
+            "one header line per fragment, all mapped to model row 0"
+        );
     }
 
     /// Recorded on the pre-#87 adapter via `--nocapture`.

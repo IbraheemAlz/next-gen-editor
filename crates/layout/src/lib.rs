@@ -9,6 +9,7 @@ pub mod floats;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
+mod table_split;
 pub mod watchdog;
 pub mod wrap;
 #[cfg(test)]
