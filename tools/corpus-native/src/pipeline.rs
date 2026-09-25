@@ -56,6 +56,36 @@ pub struct EditCheck {
     pub document_xml_delta_bytes: u64,
     pub bound_bytes: u64,
     pub within_bound: bool,
+    /// Issue #199 — bytes of the ORIGINAL `document.xml` the edited save
+    /// rewrote: the span between the longest common prefix and suffix of
+    /// the two parts. 0 means the save is a pure insertion (nothing of the
+    /// source was lost or respelled); `document_xml_delta_bytes` alone
+    /// cannot tell (a regeneration that DROPS bytes can hide inside the
+    /// bound).
+    #[serde(default)]
+    pub source_bytes_rewritten: u64,
+    /// Issue #199 — bytes of the edited part inside that span (the
+    /// inserted text plus whatever markup carries it).
+    #[serde(default)]
+    pub edited_region_bytes: u64,
+}
+
+/// Issue #199 — `(original, edited)` lengths of the region between the
+/// longest common prefix and the longest common suffix.
+fn rewritten_region(orig: &[u8], edited: &[u8]) -> (u64, u64) {
+    let prefix = orig.iter().zip(edited).take_while(|(a, b)| a == b).count();
+    let max_suffix = orig.len().min(edited.len()) - prefix;
+    let suffix = orig
+        .iter()
+        .rev()
+        .zip(edited.iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    (
+        (orig.len() - prefix - suffix) as u64,
+        (edited.len() - prefix - suffix) as u64,
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -439,11 +469,22 @@ pub fn run_one(
         {
             let delta = (doc_xml_edited.len() as i64 - doc_xml_orig.len() as i64).unsigned_abs();
             let bound = (EDIT_MARKER.len() as u64) * 2;
+            let (source_bytes_rewritten, edited_region_bytes) =
+                rewritten_region(&doc_xml_orig, &doc_xml_edited);
+            /* Issue #199 — `--dump-drift DIR` also dumps an edited save
+            that breaks the ≤2×N bound or rewrote source bytes, so the
+            regeneration drift can be diffed against the original. */
+            if delta > bound || source_bytes_rewritten > 0 {
+                dump("edit-orig", &doc_xml_orig);
+                dump("edited", &doc_xml_edited);
+            }
             rec.edit_check = Some(EditCheck {
                 inserted_bytes: EDIT_MARKER.len(),
                 document_xml_delta_bytes: delta,
                 bound_bytes: bound,
                 within_bound: delta <= bound,
+                source_bytes_rewritten,
+                edited_region_bytes,
             });
         }
     }
