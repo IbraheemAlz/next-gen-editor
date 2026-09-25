@@ -8,7 +8,7 @@
 # Run (nightly, see .github/workflows/fuzz-nightly.yml):
 #   cargo +nightly fuzz run <target> -- -max_total_time=1800
 #
-# Four structure-aware targets (`src/lib.rs` holds the generators + the
+# Five structure-aware targets (`src/lib.rs` holds the generators + the
 # `run_*` bodies each `fuzz_targets/*.rs` wraps in a `fuzz_target!`):
 #   - docx_reader:      schema-shaped WML in a minimal OPC package -> read_docx
 #   - docx_roundtrip:   read -> write -> read must be stable, never panic
@@ -17,6 +17,11 @@
 #   - layout_paginate:  random paragraph/table/section trees straight into
 #                       the paginator, with a page-count bound as the
 #                       termination watchdog
+#   - format_pdf_image_decode (issue #227): raw bytes -> format_pdf::
+#                       prepare_image for every enabled decoder (PNG/JPEG/
+#                       GIF/WebP/BMP/TIFF, sniffing decides); asserts the
+#                       typed-skip contract (no panic, bounded allocation,
+#                       a successful decode is XObject-ready)
 #
 # `examples/smoke.rs` is a stable-only driver (no libFuzzer/nightly needed)
 # that feeds deterministic pseudo-random inputs + the committed `corpus/`
@@ -47,6 +52,7 @@ path = "src/lib.rs"
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 format-docx = { path = "../crates/format-docx" }
+format-pdf = { path = "../crates/format-pdf" }
 bridge = { path = "../crates/bridge", features = ["arbitrary"] }
 engine = { path = "../crates/engine" }
 engine-wasm = { path = "../crates/engine-wasm", features = ["fuzz-native"] }
@@ -78,6 +84,13 @@ bench = false
 [[bin]]
 name = "layout_paginate"
 path = "fuzz_targets/layout_paginate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_pdf_image_decode"
+path = "fuzz_targets/format_pdf_image_decode.rs"
 test = false
 doc = false
 bench = false
