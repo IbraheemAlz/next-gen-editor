@@ -481,14 +481,7 @@ fn push_escaped_attr(text: &str, out: &mut String) {
 /// Word requires `w:id` on every wrapper, the value must be unique within
 /// the document, but is otherwise opaque.
 fn emit_revision_open(rev: &Revision, fallback_id: u32, out: &mut String) {
-    let tag = match rev.kind {
-        RevisionKind::Insert => "w:ins",
-        RevisionKind::Delete => "w:del",
-        /* FormatChange should never reach the text-wrap path — caller
-        filters it. Defensive default to ins so a stray entry never
-        produces malformed XML. */
-        RevisionKind::FormatChange => "w:ins",
-    };
+    let tag = revision_tag(rev.kind);
     let id = rev.id.unwrap_or(fallback_id);
     out.push_str(&format!("<{tag} w:id=\"{id}\""));
     if !rev.author.is_empty() {
@@ -505,12 +498,24 @@ fn emit_revision_open(rev: &Revision, fallback_id: u32, out: &mut String) {
 }
 
 fn emit_revision_close(kind: RevisionKind, out: &mut String) {
-    let tag = match kind {
+    let tag = revision_tag(kind);
+    out.push_str(&format!("</{tag}>"));
+}
+
+/// The wrapper element of a run-wrapping revision kind.
+fn revision_tag(kind: RevisionKind) -> &'static str {
+    match kind {
         RevisionKind::Insert => "w:ins",
         RevisionKind::Delete => "w:del",
+        /* Issue #247 — tracked moves. `<w:moveFrom>` content keeps
+        `<w:t>` (only `<w:del>` switches to `<w:delText>`). */
+        RevisionKind::MoveFrom => "w:moveFrom",
+        RevisionKind::MoveTo => "w:moveTo",
+        /* FormatChange should never reach the text-wrap path — callers
+        filter it. Defensive default to ins so a stray entry never
+        produces malformed XML. */
         RevisionKind::FormatChange => "w:ins",
-    };
-    out.push_str(&format!("</{tag}>"));
+    }
 }
 
 /// `<w:jc w:val="…"/>` token for an `Alignment`. Word emits writing-direction-
@@ -1157,12 +1162,22 @@ fn emit_styled_runs_with_objects(
     `<w:ins>` / `<w:del>`; `FormatChange` rides on `<w:rPr>` via
     `<w:rPrChange>` (emitted by `serialize_run`'s rPr block, NOT
     here), so the text-wrap stack must filter it out. */
-    let mut sorted_revs: Vec<&Revision> = para
+    let mut sorted_revs: Vec<(usize, &Revision)> = para
         .revisions
         .iter()
-        .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+        .enumerate()
+        .filter(|(_, r)| r.kind.wraps_text())
         .collect();
-    sorted_revs.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    /* Issue #247 — two wrappers over the SAME range (`<w:moveTo><w:del>`
+    in Tika-792) open in source order: the reader records a wrapper when
+    it CLOSES, so the outer one sits later in `revisions`. */
+    sorted_revs.sort_by(|(ia, a), (ib, b)| {
+        a.start
+            .cmp(&b.start)
+            .then(b.end.cmp(&a.end))
+            .then(ib.cmp(ia))
+    });
+    let sorted_revs: Vec<&Revision> = sorted_revs.into_iter().map(|(_, r)| r).collect();
 
     /* Issue #60 — hyperlinks sorted the same way as revisions. Nesting
     model: hyperlinks wrap revisions (`<w:hyperlink><w:ins>...` when a
@@ -1444,7 +1459,7 @@ fn wrapper_ranges(para: &Paragraph) -> Vec<(usize, usize)> {
         .chain(
             para.revisions
                 .iter()
-                .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+                .filter(|r| r.kind.wraps_text())
                 .map(|r| clamp(r.start, r.end)),
         )
         .chain(
@@ -1739,7 +1754,7 @@ fn simple_field_nests(f: &Field, para: &Paragraph) -> bool {
         && para
             .revisions
             .iter()
-            .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+            .filter(|r| r.kind.wraps_text())
             .all(|r| outer_ok(r.start, r.end))
         && para.fields.iter().filter(|g| g.is_local()).all(|g| {
             std::ptr::eq(g, f)
@@ -4725,6 +4740,7 @@ mod tests {
                     date: "2026-01-01T00:00:00Z".into(),
                     id: Some(7),
                     prev_attrs: None,
+                    move_name: None,
                 },
                 Revision {
                     start: 6,
@@ -4734,6 +4750,7 @@ mod tests {
                     date: "2026-01-02T00:00:00Z".into(),
                     id: Some(8),
                     prev_attrs: None,
+                    move_name: None,
                 },
             ],
             fields: Vec::new(),
@@ -6656,6 +6673,7 @@ mod tests {
                 date: String::new(),
                 id: None,
                 prev_attrs: None,
+                move_name: None,
             }],
             fields: Vec::new(),
             style_id: None,

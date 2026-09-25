@@ -31,6 +31,22 @@ export interface TrackChangesSidebarProps {
     title?: string;
 }
 
+/** Issue #247 — the row label of a revision kind. */
+function kindLabel(kind: RevisionSnapshot['kind']): string {
+    switch (kind) {
+        case 'insert':
+            return 'Inserted';
+        case 'delete':
+            return 'Deleted';
+        case 'format':
+            return 'Formatted';
+        case 'move-from':
+            return 'Moved from';
+        case 'move-to':
+            return 'Moved to';
+    }
+}
+
 function fmtDate(iso: string): string {
     if (!iso) return '–';
     const d = new Date(iso);
@@ -133,7 +149,7 @@ export const TrackChangesSidebar: Component<TrackChangesSidebarProps> = (props) 
                             >
                                 <div class="nge-tc__row-head">
                                     <span class={`nge-tc__kind nge-tc__kind--${rev.kind}`}>
-                                        {rev.kind === 'insert' ? 'Inserted' : 'Deleted'}
+                                        {kindLabel(rev.kind)}
                                     </span>
                                     <span class="nge-tc__author">{rev.author || 'Anonymous'}</span>
                                 </div>

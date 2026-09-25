@@ -1167,13 +1167,10 @@ impl Engine {
                         block: block_idx as u32,
                         start: r.start,
                         end: r.end,
-                        kind: match r.kind {
-                            engine::RevisionKind::Insert => "insert",
-                            engine::RevisionKind::Delete => "delete",
-                            engine::RevisionKind::FormatChange => "format",
-                        },
+                        kind: revision_kind_label(r.kind),
                         author: r.author.clone(),
                         date: r.date.clone(),
+                        move_name: r.move_name.clone(),
                     });
                 }
             }
@@ -1254,6 +1251,21 @@ struct RevisionOut {
     kind: &'static str,
     author: String,
     date: String,
+    /// Issue #247 — the move's range name (`MoveFrom` / `MoveTo` only):
+    /// the two halves of one move share it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    move_name: Option<String>,
+}
+
+/// The `revisions_snapshot()` wire label of a revision kind.
+fn revision_kind_label(kind: engine::RevisionKind) -> &'static str {
+    match kind {
+        engine::RevisionKind::Insert => "insert",
+        engine::RevisionKind::Delete => "delete",
+        engine::RevisionKind::FormatChange => "format",
+        engine::RevisionKind::MoveFrom => "move-from",
+        engine::RevisionKind::MoveTo => "move-to",
+    }
 }
 
 #[derive(::serde::Serialize)]
@@ -1850,6 +1862,9 @@ const HYPERLINK_BLUE: [u8; 4] = [0x05, 0x63, 0xC1, 0xFF];
 /// with a later cut.
 const REVISION_INSERT_COLOR: [u8; 4] = [0x00, 0x80, 0x00, 0xFF];
 const REVISION_DELETE_COLOR: [u8; 4] = [0xCC, 0x00, 0x00, 0xFF];
+/// Issue #247 — tracked moves get their own tint (both halves), so a
+/// move reads differently from an unrelated insert / delete pair.
+const REVISION_MOVE_COLOR: [u8; 4] = [0x6A, 0x1B, 0x9A, 0xFF];
 
 /// Phase 8b — overlay each revision range so insertions render with
 /// `underline = true` + the insert colour and deletions render with
@@ -1905,6 +1920,22 @@ fn apply_revision_overlay(
                         sub.strike = true;
                         if sub.color == default_color {
                             sub.color = REVISION_DELETE_COLOR;
+                        }
+                    }
+                    /* Issue #247 — a move's source half reads like a
+                    deletion, its destination like an insertion (double
+                    underline), both in the move tint. Paint-only: glyph
+                    advances do not change. */
+                    engine::RevisionKind::MoveFrom => {
+                        sub.strike = true;
+                        if sub.color == default_color {
+                            sub.color = REVISION_MOVE_COLOR;
+                        }
+                    }
+                    engine::RevisionKind::MoveTo => {
+                        sub.underline = engine::UnderlineStyle::Double;
+                        if sub.color == default_color {
+                            sub.color = REVISION_MOVE_COLOR;
                         }
                     }
                     /* Sprint 14 (#14) — FormatChange has no text-wrap
@@ -3010,6 +3041,12 @@ fn paragraph_layout_key(
         r.start.hash(&mut h);
         r.end.hash(&mut h);
         matches!(r.kind, engine::RevisionKind::Insert).hash(&mut h);
+        /* Issue #247 — the move kinds paint differently from ins / del. */
+        matches!(
+            r.kind,
+            engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo
+        )
+        .hash(&mut h);
     }
     /* Audit gap A.M3 — tab stops affect glyph advances at the line
     builder's post-pass; without them in the key, two paragraphs with
@@ -26340,6 +26377,7 @@ mod wire_validation_tests {
                 date: "d".into(),
                 id: None,
                 prev_attrs: None,
+                move_name: None,
             }],
             hyperlinks: vec![
                 engine::Hyperlink {

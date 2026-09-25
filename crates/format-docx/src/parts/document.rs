@@ -369,6 +369,44 @@ fn track_field_span(e: &BytesStart<'_>, markup: &mut MarkupCapture, cx: FieldSpa
     }
 }
 
+/// Phase 8b / issue #247 — a run-wrapping revision (`<w:ins>`, `<w:del>`,
+/// `<w:moveFrom>`, `<w:moveTo>`) open at the cursor.
+struct RevisionOpen {
+    kind: engine::RevisionKind,
+    author: String,
+    date: String,
+    id: Option<u32>,
+    start: u32,
+    move_name: Option<String>,
+}
+
+/// Issue #247 — one open `<w:moveFromRangeStart>` / `<w:moveToRangeStart>`.
+struct MoveRangeOpen {
+    from: bool,
+    id: Option<String>,
+    name: Option<String>,
+}
+
+/// Issue #247 — track the move ranges open at the cursor from their
+/// (empty) start / end markers.
+fn note_move_range(qname: &[u8], e: &BytesStart<'_>, open: &mut Vec<MoveRangeOpen>) {
+    match qname {
+        b"w:moveFromRangeStart" | b"w:moveToRangeStart" => open.push(MoveRangeOpen {
+            from: qname == b"w:moveFromRangeStart",
+            id: attr_val(e, b"w:id"),
+            name: attr_val(e, b"w:name"),
+        }),
+        b"w:moveFromRangeEnd" | b"w:moveToRangeEnd" => {
+            let from = qname == b"w:moveFromRangeEnd";
+            let id = attr_val(e, b"w:id");
+            if let Some(i) = open.iter().rposition(|r| r.from == from && r.id == id) {
+                open.remove(i);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Issue #120 — the self-contained elements a `<w:body>` / `<w:tc>` may
 /// hold between two blocks (ECMA-376 §17.2.2 `EG_RunLevelElements` at
 /// block level, plus `<w:altChunk>`) that the typed model does not
@@ -916,8 +954,13 @@ pub fn parse_document_xml_with_warnings(
     covering the byte range produced inside. Stack-shaped so a
     nested ins/del (rare but legal — an insertion inside a deletion)
     still resolves correctly. */
-    let mut revision_stack: Vec<(engine::RevisionKind, String, String, Option<u32>, u32)> =
-        Vec::new();
+    let mut revision_stack: Vec<RevisionOpen> = Vec::new();
+    /* Issue #247 — the move ranges open at the cursor
+    (`<w:moveFromRangeStart w:id w:name>` … `<w:moveFromRangeEnd w:id>`,
+    likewise `moveTo`), innermost last: a `<w:moveFrom>` / `<w:moveTo>`
+    wrapper takes the name of the innermost open range of its side. The
+    markers themselves ride the source markup / block envelope verbatim. */
+    let mut open_move_ranges: Vec<MoveRangeOpen> = Vec::new();
     /* Phase 8b — `<w:delText>` is the OOXML synonym for `<w:t>` inside a
     `<w:del>` wrapper. The parser collapses both into `run_text` so
     deleted text rides alongside live content; the `Revision` overlay
@@ -1466,17 +1509,34 @@ pub fn parse_document_xml_with_warnings(
                             .map(<[u8]>::to_vec);
                         fld_simple_stack.push((instr, start, tag));
                     }
-                    b"w:ins" | b"w:del" => {
-                        let kind = if name.as_ref() == b"w:ins" {
-                            engine::RevisionKind::Insert
-                        } else {
-                            engine::RevisionKind::Delete
+                    b"w:ins" | b"w:del" | b"w:moveFrom" | b"w:moveTo" => {
+                        let kind = match name.as_ref() {
+                            b"w:ins" => engine::RevisionKind::Insert,
+                            b"w:del" => engine::RevisionKind::Delete,
+                            b"w:moveFrom" => engine::RevisionKind::MoveFrom,
+                            _ => engine::RevisionKind::MoveTo,
                         };
-                        let author = attr_val(&e, b"w:author").unwrap_or_default();
-                        let date = attr_val(&e, b"w:date").unwrap_or_default();
-                        let id = attr_val(&e, b"w:id").and_then(|v| v.trim().parse().ok());
-                        let start = (para_text.len() + run_text.len()) as u32;
-                        revision_stack.push((kind, author, date, id, start));
+                        /* Issue #247 — a move wrapper names its move by
+                        the innermost open range of its side. */
+                        let move_name = match kind {
+                            engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => {
+                                let from = kind == engine::RevisionKind::MoveFrom;
+                                open_move_ranges
+                                    .iter()
+                                    .rev()
+                                    .find(|r| r.from == from)
+                                    .and_then(|r| r.name.clone())
+                            }
+                            _ => None,
+                        };
+                        revision_stack.push(RevisionOpen {
+                            kind,
+                            author: attr_val(&e, b"w:author").unwrap_or_default(),
+                            date: attr_val(&e, b"w:date").unwrap_or_default(),
+                            id: attr_val(&e, b"w:id").and_then(|v| v.trim().parse().ok()),
+                            start: (para_text.len() + run_text.len()) as u32,
+                            move_name,
+                        });
                     }
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
@@ -1580,6 +1640,9 @@ pub fn parse_document_xml_with_warnings(
                     }
                     _ => {}
                 }
+                /* Issue #247 — move range names (the markers themselves
+                are captured verbatim above / by the block envelope). */
+                note_move_range(name.as_ref(), &e, &mut open_move_ranges);
                 match name.as_ref() {
                     b"w:p" if at_block_level => {
                         /* Issue #120 — a self-closing `<w:p …/>` (an empty
@@ -2084,18 +2147,19 @@ pub fn parse_document_xml_with_warnings(
                     b"w:t" => in_text_elt = false,
                     b"w:delText" => in_del_text_elt = false,
                     b"w:instrText" => in_instr_text = false,
-                    b"w:ins" | b"w:del" => {
-                        if let Some((kind, author, date, id, start)) = revision_stack.pop() {
+                    b"w:ins" | b"w:del" | b"w:moveFrom" | b"w:moveTo" => {
+                        if let Some(open) = revision_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
-                            if end > start {
+                            if end > open.start {
                                 para_revisions.push(engine::Revision {
-                                    start,
+                                    start: open.start,
                                     end,
-                                    kind,
-                                    author,
-                                    date,
-                                    id,
+                                    kind: open.kind,
+                                    author: open.author,
+                                    date: open.date,
+                                    id: open.id,
                                     prev_attrs: None,
+                                    move_name: open.move_name,
                                 });
                             }
                         }

@@ -490,6 +490,7 @@ mod tests {
                 date: "d".into(),
                 id: None,
                 prev_attrs: None,
+                move_name: None,
             });
         }
         d.blocks = blocks;
@@ -520,6 +521,7 @@ mod tests {
             date: "d".into(),
             id: None,
             prev_attrs: None,
+            move_name: None,
         };
         if let Block::Paragraph(p) = &mut blocks[0] {
             p.revisions.push(del(0, 5));

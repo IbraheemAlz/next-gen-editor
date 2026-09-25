@@ -30,6 +30,7 @@
 //! Exit 0 on PASS, non-zero on FAIL.
 
 mod inline_spans;
+mod revisions;
 
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
@@ -326,6 +327,7 @@ fn run_default() -> Result<()> {
     inline_spans::run_form_fields_roundtrip()?;
     inline_spans::run_content_controls_roundtrip()?;
     inline_spans::run_field_source_form_roundtrip()?;
+    revisions::run_tracked_moves_roundtrip()?;
 
     println!("\nPASS");
     Ok(())

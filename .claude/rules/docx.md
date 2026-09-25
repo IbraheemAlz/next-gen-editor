@@ -200,6 +200,15 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   the markers are emitted in a constructed order, noted as
   `WriteNote::InlineWrapperWidened`. Row / cell-level `sdt` inside a
   regenerated table are NOT covered (table markup, #248).
+- **Tracked moves (issue #247).** `<w:moveFrom>` / `<w:moveTo>` are
+  run-wrapping revisions (`RevisionKind::MoveFrom` / `MoveTo`, text
+  semantics of a deletion / insertion; `Revision::move_name` = the
+  enclosing range's `w:name`) regenerated like `<w:ins>` / `<w:del>`
+  (moveFrom content keeps `<w:t>`); two wrappers over the same range
+  nest in source order. The `move*RangeStart/End` markers stay
+  positioned verbatim markers. Untracked `insert_text` carries every
+  revision with its text (shift at / after the start, grow strictly
+  inside).
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

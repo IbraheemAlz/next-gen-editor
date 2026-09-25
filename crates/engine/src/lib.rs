@@ -61,6 +61,8 @@ use serde::{Deserialize, Serialize};
 mod block_remap;
 pub use block_remap::CellMove;
 pub mod fields;
+#[cfg(test)]
+mod revision_tests;
 mod text_remap;
 pub use text_remap::TextEdit;
 pub mod html;
@@ -2848,6 +2850,47 @@ pub enum RevisionKind {
     /// Payload-free here to keep `RevisionKind: Copy`, which a dozen
     /// existing match sites rely on.
     FormatChange,
+    /// Issue #247 — `<w:moveFrom>`: the SOURCE side of a tracked move.
+    /// Text semantics are a deletion's (accept drops it, reject keeps
+    /// it); the reviewer sees it as moved-away text. The source spells
+    /// it with `<w:t>` (not `<w:delText>`). The pairing with its
+    /// destination rides [`Revision::move_name`].
+    MoveFrom,
+    /// Issue #247 — `<w:moveTo>`: the DESTINATION side of a tracked
+    /// move. Text semantics are an insertion's (accept keeps it, reject
+    /// drops it).
+    MoveTo,
+}
+
+impl RevisionKind {
+    /// Issue #247 — `true` when ACCEPTING this revision removes its
+    /// text (`Delete`, `MoveFrom`).
+    pub fn removes_on_accept(self) -> bool {
+        matches!(self, Self::Delete | Self::MoveFrom)
+    }
+
+    /// Issue #247 — `true` when REJECTING this revision removes its
+    /// text (`Insert`, `MoveTo`).
+    pub fn removes_on_reject(self) -> bool {
+        matches!(self, Self::Insert | Self::MoveTo)
+    }
+
+    /// Issue #247 — `true` for the kinds that wrap runs in the source
+    /// (`<w:ins>` / `<w:del>` / `<w:moveFrom>` / `<w:moveTo>`);
+    /// `FormatChange` rides the run's `<w:rPr>` instead.
+    pub fn wraps_text(self) -> bool {
+        !matches!(self, Self::FormatChange)
+    }
+
+    /// Issue #247 — the text is removed by exactly one of accept /
+    /// reject: `accept == true` asks for the accept outcome.
+    pub fn removes_text(self, accept: bool) -> bool {
+        if accept {
+            self.removes_on_accept()
+        } else {
+            self.removes_on_reject()
+        }
+    }
 }
 
 /// Phase 8b — one `<w:ins>` / `<w:del>` / `<w:rPrChange>` overlay on a
@@ -2870,6 +2913,15 @@ pub struct Revision {
     /// original look. `None` for `Insert` / `Delete` revisions where
     /// the attribute is irrelevant.
     pub prev_attrs: Option<SpanStyle>,
+    /// Issue #247 — for a `MoveFrom` / `MoveTo` revision, the `w:name`
+    /// of the enclosing `<w:moveFromRangeStart>` / `<w:moveToRangeStart>`
+    /// (the pair's shared name links a move's two halves). `None` for
+    /// every other kind and for a move read outside a named range. The
+    /// range markers themselves ride the paragraph's source markup as
+    /// positioned verbatim markers. Skipped when `None`, so a pre-#247
+    /// snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_name: Option<String>,
 }
 
 /// Phase 7 — a media blob stashed for the renderer to decode.
@@ -5689,29 +5741,19 @@ impl DocumentTree {
             let pre_text_len = (para.text.len() as u32).saturating_sub(len);
             let off = off_input.min(pre_text_len);
 
-            /* Detect boundary state BEFORE shifting revisions so the
-            classifier sees the pre-insert geometry. */
-            let inside_insert_same_author = para.revisions.iter().any(|r| {
+            /* Detect boundary state on the PRE-insert geometry (the
+            same paragraph of `self`). `insert_text` already shifted the
+            revisions by `len` (issue #247): revisions starting at or
+            after `off` slid right; revisions containing `off` grew. */
+            let pre_revisions = self
+                .paragraph_at_path(&target_path)
+                .map_or(&[][..], |p| p.revisions.as_slice());
+            let inside_insert_same_author = pre_revisions.iter().any(|r| {
                 r.kind == RevisionKind::Insert && r.start < off && off < r.end && r.author == author
             });
-            let inside_delete = para
-                .revisions
+            let inside_delete = pre_revisions
                 .iter()
                 .any(|r| r.kind == RevisionKind::Delete && r.start <= off && off < r.end);
-
-            /* Shift trailing revisions by `len`. Mirrors the span-shift
-            in `insert_text`: revisions starting at or after `off`
-            slide right; revisions containing `off` grow (end +=
-            len). Inline `objects` + `hyperlinks` shifts are deferred
-            to a future sprint — Sprint 14 keeps the surface bounded. */
-            for r in &mut para.revisions {
-                if r.start >= off {
-                    r.start += len;
-                }
-                if r.end > off {
-                    r.end += len;
-                }
-            }
 
             /* If we landed inside a Delete, the shift above grew the
             Delete to span both halves. Split it back into the two
@@ -5735,6 +5777,7 @@ impl DocumentTree {
                             date: r.date.clone(),
                             id: None,
                             prev_attrs: None,
+                            move_name: None,
                         });
                     }
                     /* Right half [off + len, r.end) — note r.end was
@@ -5749,6 +5792,7 @@ impl DocumentTree {
                             date: r.date,
                             id: None,
                             prev_attrs: None,
+                            move_name: None,
                         });
                     }
                 }
@@ -5776,6 +5820,7 @@ impl DocumentTree {
                         date: date.clone(),
                         id: None,
                         prev_attrs: None,
+                        move_name: None,
                     });
                 }
             }
@@ -5901,6 +5946,7 @@ impl DocumentTree {
                     date: date.clone(),
                     id: None,
                     prev_attrs: None,
+                    move_name: None,
                 });
             }
             para.dirty = true;
@@ -5994,6 +6040,7 @@ impl DocumentTree {
                     date: date_local,
                     id: None,
                     prev_attrs: Some(prev_local),
+                    move_name: None,
                 });
                 para.dirty = true;
             });
@@ -6116,14 +6163,28 @@ impl DocumentTree {
             a stale range would repaint the wrong bytes). Typing at a
             field's start boundary stays outside (shift); strictly inside
             grows the field (the cached result was hand-edited — the next
-            resolution overwrites it wholesale). Hyperlinks/revisions
-            keep their pre-existing #56 limitation. */
+            resolution overwrites it wholesale). Hyperlinks keep their
+            pre-existing #56 limitation. */
             for f in &mut para.fields {
                 if f.start >= off {
                     f.start += len;
                     f.end += len;
                 } else if f.end > off {
                     f.end += len;
+                }
+            }
+            /* Issue #247 — tracked-change overlays (a move, an ins / del
+            read from the file) follow their text like a span: typing at
+            a revision's start stays outside it (shift), strictly inside
+            grows it, at its end stays outside. `tracked_insert_text`
+            builds on this shift (a Delete it lands in grows and is split
+            back around the new insertion there). */
+            for r in &mut para.revisions {
+                if r.start >= off {
+                    r.start += len;
+                }
+                if r.end > off {
+                    r.end += len;
                 }
             }
             /* Issue #69 / #80 — inline-object anchors (images, note
@@ -6757,11 +6818,9 @@ impl DocumentTree {
              * helper does not also `retain`-drop it (which would make
              * any post-shift index lookup brittle). */
             let rev = para.revisions.remove(idx);
-            let delete_text = match (rev.kind, accept) {
-                (RevisionKind::Insert, false) => true, // Reject Insert
-                (RevisionKind::Delete, true) => true,  // Accept Delete
-                _ => false,                            // text stays live
-            };
+            /* Reject Insert / MoveTo, accept Delete / MoveFrom (issue
+            #247): the text goes; otherwise it stays live. */
+            let delete_text = rev.kind.removes_text(accept);
             if delete_text {
                 let s = para.snap_offset(rev.start);
                 let e = para.snap_offset(rev.end);
@@ -12412,6 +12471,7 @@ mod tests {
             date: "2026-01-01T00:00:00Z".to_string(),
             id: Some(1),
             prev_attrs: None,
+            move_name: None,
         });
         doc.blocks[0] = Block::Paragraph(para);
 
