@@ -293,6 +293,7 @@ fn run_default() -> Result<()> {
     run_package_ui_save()?;
     run_style_bidi_roundtrip()?;
     run_part_scoped_media_roundtrip()?;
+    run_source_markup_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -2689,6 +2690,118 @@ fn run_style_bidi_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/* ================================= source markup (#199 / #106) ==== */
+
+/// docDefaults with spacing: a writer that bakes resolved properties into
+/// a regenerated paragraph would add a direct `<w:spacing>`.
+const SOURCE_MARKUP_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:pPrDefault><w:pPr><w:spacing w:after="200" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults></w:styles>"#;
+
+/// Word-authored paragraph markup the typed model does not represent:
+/// `w14:paraId` / rsids on `<w:p>`, run rsids on equally formatted runs,
+/// bare `<w:t>`, `<w:proofErr>`, an underline with an unread `w:color`,
+/// a tab inside a text run, a trailing `_GoBack` bookmark, a self-closing
+/// paragraph and a run led by `<w:lastRenderedPageBreak/>`.
+const SOURCE_MARKUP_BODY: &str = concat!(
+    r#"<w:p w14:paraId="1A2B3C4D" w14:textId="77777777" w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3" w:rsidP="00D4E5F6"><w:pPr><w:ind w:left="720"/></w:pPr><w:r w:rsidRPr="00112233"><w:t xml:space="preserve">Hello </w:t></w:r><w:proofErr w:type="spellStart"/><w:r w:rsidR="00445566"><w:t>wrold</w:t></w:r><w:proofErr w:type="spellEnd"/><w:r w:rsidR="00445566"><w:rPr><w:u w:val="single" w:color="FF0000"/></w:rPr><w:t xml:space="preserve"> underlined</w:t></w:r><w:r w:rsidR="00778899"><w:tab/><w:t>tabbed</w:t></w:r><w:bookmarkStart w:id="0" w:name="_GoBack"/><w:bookmarkEnd w:id="0"/></w:p>"#,
+    r#"<w:p w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3"/>"#,
+    r#"<w:p w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3"><w:r><w:lastRenderedPageBreak/><w:t>Second page</w:t></w:r></w:p>"#,
+);
+
+fn build_source_markup_docx() -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="w14"><w:body>{SOURCE_MARKUP_BODY}{BARE_SECT_PR}</w:body></w:document>"#
+    );
+    build_styled_docx(SOURCE_MARKUP_STYLES_XML, &document_xml)
+}
+
+/// Issues #199 / #106 — step 26: the attribute-level grab bag.
+///
+/// a. An untouched save is byte-identical.
+/// b. Typing inside a word of the Word-shaped paragraph regenerates it as
+///    EXACTLY source + the inserted bytes (drift = N, not ≤ 2×N): `<w:p>`
+///    / `<w:r>` / `<w:t>` attributes, `<w:proofErr>`, the source run
+///    boundaries, the tab inside its run, the trailing bookmark and the
+///    verified `<w:pPr>` (no docDefaults spacing baked in) — on both save
+///    paths.
+/// c. Bolding the underlined run regenerates its `<w:rPr>` but the
+///    unchanged `<w:u>` keeps its unread `w:color` (#106), and the run
+///    keeps its rsid.
+fn run_source_markup_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos, SpanStyle};
+
+    let at = |offset: usize| LogicalPos {
+        path: BlockPath::top(0),
+        offset: offset as u32,
+    };
+    let fixture_bytes = build_source_markup_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read source-markup fixture")?;
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
+        bail!("untouched source-markup document drifted");
+    }
+    println!("[roundtrip] step 26a OK — untouched save byte-identical");
+
+    let edited = archive_a
+        .document
+        .insert_text(at("Hello wr".len()), INSERT_TEXT);
+    let expected_xml = doc_a.replacen("wrold", &format!("wr{INSERT_TEXT}old"), 1);
+    for (path, bytes) in [
+        (
+            "write_docx",
+            write_docx(&archive_a, &edited).context("write edited")?,
+        ),
+        (
+            "save_docx",
+            format_docx::save_docx(&edited).context("ui save edited")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&bytes).context("edited source-markup .docx")?;
+        let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+        if xml != expected_xml {
+            bail!(
+                "{path}: edited Word paragraph is not source + edit\n--- expected ---\n{expected_xml}\n--- got ---\n{xml}"
+            );
+        }
+    }
+    let drift = expected_xml.len() - doc_a.len();
+    println!(
+        "[roundtrip] step 26b OK — edited Word paragraph is source + insert on both save paths (Δ {drift} B = N)"
+    );
+
+    let start = "Hello wrold".len();
+    let bolded = archive_a.document.apply_style(
+        at(start),
+        at(start + " underlined".len()),
+        SpanStyle {
+            bold: Some(true),
+            ..SpanStyle::default()
+        },
+    );
+    let bytes = write_docx(&archive_a, &bolded).context("write bolded")?;
+    assert_document_xml_well_formed(&bytes).context("bolded source-markup .docx")?;
+    let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 bolded")?;
+    let run = xml
+        .split("<w:r ")
+        .find(|r| r.contains(" underlined"))
+        .context("bolded run")?;
+    if !(run.starts_with(r#"w:rsidR="00445566">"#)
+        && run.contains("<w:b/>")
+        && run.contains(r#"<w:u w:val="single" w:color="FF0000"/>"#))
+    {
+        bail!("bolded run lost its rsid or the underline's unread w:color: {run}");
+    }
+    let back = read_docx(&bytes).context("re-read bolded")?;
+    let p0 = back.document.nth_paragraph(0).context("p0")?;
+    if p0.style_at(start as u32).bold != Some(true) {
+        bail!("bold lost on re-read");
+    }
+    println!("[roundtrip] step 26c OK — restyled run keeps its rsid and <w:u w:color> (#106)");
+    Ok(())
+}
+
 /* ================================================ table placement (#173) ==== */
 
 /// Issue #173 — step 18: the `<w:jc>` / `<w:tblInd>` round-trip contract
@@ -3904,6 +4017,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         }]),
     };
     vec![

@@ -20,12 +20,13 @@ use crate::schema::ct_rpr::rpr_child_rank;
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
 use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::fragment_qname;
+use crate::schema::source_markup::{adopt_source_children, attrs_xml, text_needs_preserve};
 use crate::schema::wp_anchor::emit_anchor_open;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
     FontFamily, Hyperlink, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph,
-    Revision, RevisionKind, RowHeight, SpanStyle, Table, TableCell, TableRow, TextDirection,
-    UnderlineStyle, VMergeRole,
+    Revision, RevisionKind, RowHeight, SourceMarkup, SourcePPr, SourceRun, SpanStyle, Table,
+    TableCell, TableRow, TextDirection, UnderlineStyle, VMergeRole,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -215,6 +216,16 @@ impl PrChildren {
         }
     }
 
+    /// Issue #106 — let each regenerated empty child adopt its source twin
+    /// from `source` (the raw element this set regenerates) when the twin
+    /// only adds attributes the model does not read
+    /// ([`adopt_source_children`]).
+    fn adopt(&mut self, source: Option<&[u8]>) {
+        if let Some(src) = source {
+            adopt_source_children(&mut self.items, src);
+        }
+    }
+
     /// `<elem>` + children in schema order + `</elem>`. Always emits the
     /// wrapper — every caller has already returned early for the
     /// nothing-to-say case, and an empty `<w:pPr></w:pPr>` is what the
@@ -241,6 +252,13 @@ impl PrChildren {
 /// Issue #84 — grab-bag fragments (`<w:lang>`, `<w:fitText>`, …)
 /// interleave at their own schema rank.
 fn emit_rpr(style: &SpanStyle, out: &mut String) {
+    emit_rpr_adopting(style, None, out);
+}
+
+/// [`emit_rpr`] for a run regenerated from a source `<w:rPr>` (`source`):
+/// regenerated children keep the source spelling of an unchanged element
+/// (issue #106, [`PrChildren::adopt`]).
+fn emit_rpr_adopting(style: &SpanStyle, source: Option<&[u8]>, out: &mut String) {
     if *style == SpanStyle::default() {
         return;
     }
@@ -349,6 +367,7 @@ fn emit_rpr(style: &SpanStyle, out: &mut String) {
         );
     }
     ch.push_bag(&style.grab_bag, rpr_child_rank);
+    ch.adopt(source);
     ch.finish("w:rPr", out);
 }
 
@@ -364,12 +383,71 @@ fn serialize_run(text: &str, style: &SpanStyle, out: &mut String) {
 /// requires the renamed element so the deleted bytes don't display as
 /// live content in readers that strip tracked-change markup.
 fn serialize_run_kind(text: &str, style: &SpanStyle, delete_kind: bool, out: &mut String) {
-    let tag = if delete_kind { "w:delText" } else { "w:t" };
     out.push_str("<w:r>");
     emit_rpr(style, out);
-    out.push_str(&format!("<{tag} xml:space=\"preserve\">"));
+    push_text_element(text, delete_kind, None, out);
+    out.push_str("</w:r>");
+}
+
+/// Issues #199 / #106 — the source run a regenerated run segment lies in,
+/// and whether the segment is the range's first (its leading unmodeled
+/// content is re-emitted there, once).
+#[derive(Clone, Copy)]
+struct RunSource<'a> {
+    run: &'a SourceRun,
+    first: bool,
+}
+
+/// `<w:r …>` start tag + `<w:rPr>` (+ the source run's leading content)
+/// for a run regenerated inside `src`: the source attributes always; the
+/// source `<w:rPr>` bytes verbatim while the style is still the one they
+/// produced (a verified passthrough — the paragraph-mark formatting the
+/// reader folds into a span never leaks into a run that had no rPr),
+/// else a regenerated rPr that adopts the source spelling per child.
+fn open_source_run(style: &SpanStyle, src: Option<RunSource<'_>>, out: &mut String) {
+    let Some(RunSource { run, first }) = src else {
+        out.push_str("<w:r>");
+        emit_rpr(style, out);
+        return;
+    };
+    out.push_str("<w:r");
+    attrs_xml(&run.attrs, out);
+    out.push('>');
+    if run.style == *style && source_bytes_trusted() {
+        if let Some(rpr) = &run.rpr {
+            push_utf8(rpr, out);
+        }
+    } else {
+        emit_rpr_adopting(style, run.rpr.as_deref(), out);
+    }
+    if first {
+        push_utf8(&run.lead, out);
+    }
+}
+
+/// One `<w:t>` (`<w:delText>` inside a deletion) element. Inside a source
+/// run it keeps the source `<w:t>`'s attributes; a source `<w:t>` that had
+/// no `xml:space` gains `preserve` only when the text now has edge
+/// whitespace (the invariant the unconditional `preserve` protects).
+/// Engine-authored runs keep the unconditional `xml:space="preserve"`.
+fn push_text_element(text: &str, delete_kind: bool, src: Option<&SourceRun>, out: &mut String) {
+    let tag = if delete_kind { "w:delText" } else { "w:t" };
+    out.push('<');
+    out.push_str(tag);
+    match src.and_then(|r| r.t_attrs.as_deref()) {
+        Some(attrs) => {
+            if text_needs_preserve(text) && !attrs.iter().any(|a| a.name == "xml:space") {
+                out.push_str(" xml:space=\"preserve\"");
+            }
+            attrs_xml(attrs, out);
+        }
+        None => out.push_str(" xml:space=\"preserve\""),
+    }
+    out.push('>');
     push_escaped(text, out);
-    out.push_str(&format!("</{tag}></w:r>"));
+    out.push_str("</");
+    out.push_str(tag);
+    out.push('>');
 }
 
 /// Escape `&` `<` `>` `"` for an XML attribute value. Quotes matter here
@@ -457,7 +535,7 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
     out.push_str("<w:docDefaults><w:rPrDefault>");
     emit_rpr(&doc.style_run_defaults, &mut out);
     out.push_str("</w:rPrDefault><w:pPrDefault>");
-    emit_ppr(&doc.style_defaults, None, None, None, &mut out);
+    emit_ppr(&doc.style_defaults, None, None, None, None, &mut out);
     out.push_str("</w:pPrDefault></w:docDefaults>");
     let mut ids: Vec<&String> = doc.styles.keys().collect();
     ids.sort();
@@ -473,7 +551,7 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
             push_escaped_attr(parent, &mut out);
             out.push_str("\"/>");
         }
-        emit_ppr(&def.para, None, None, None, &mut out);
+        emit_ppr(&def.para, None, None, None, None, &mut out);
         emit_rpr(&def.run, &mut out);
         out.push_str("</w:style>");
     }
@@ -493,6 +571,7 @@ fn emit_ppr(
     style_id: Option<&str>,
     list_item: Option<engine::ListItem>,
     section_end: Option<&engine::SectionProps>,
+    source: Option<&[u8]>,
     out: &mut String,
 ) {
     if *props == ParaProperties::default()
@@ -698,6 +777,7 @@ fn emit_ppr(
         ch.push(rank(b"w:sectPr"), s);
     }
     ch.push_bag(&props.grab_bag, ppr_child_rank);
+    ch.adopt(source);
     ch.finish("w:pPr", out);
 }
 
@@ -711,7 +791,15 @@ fn serialize_paragraph(
     out: &mut String,
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
-    out.push_str("<w:p>");
+    /* Issues #199 / #106 — the source paragraph's attributes (rsids,
+    `w14:paraId` / `w14:textId`) and markup survive regeneration. */
+    let markup = para.source_markup.as_deref();
+    out.push_str("<w:p");
+    if let Some(m) = markup {
+        attrs_xml(&m.attrs, out);
+    }
+    out.push('>');
+    let source_ppr = markup.and_then(|m| m.ppr.as_ref());
     let inherited_bidi = direction_is_inherited(para);
     let props = if para.props.outline_level.is_some()
         || para.props.widow_control.is_some()
@@ -727,13 +815,21 @@ fn serialize_paragraph(
     } else {
         std::borrow::Cow::Borrowed(&para.props)
     };
-    emit_ppr(
-        &props,
-        para.style_id.as_deref(),
-        para.list_item,
-        para.section_end.as_deref(),
-        out,
-    );
+    match source_ppr {
+        /* Verified passthrough: the model still holds exactly what these
+        bytes produced, so they are the most faithful serialization (and
+        the source never baked docDefaults / style spacing into a direct
+        `<w:spacing>`). */
+        Some(sp) if source_ppr_is_current(sp, para) => push_utf8(&sp.xml, out),
+        sp => emit_ppr(
+            &props,
+            para.style_id.as_deref(),
+            para.list_item,
+            para.section_end.as_deref(),
+            sp.map(|sp| sp.xml.as_slice()),
+            out,
+        ),
+    }
     /* Issue #81 — paragraph-scoped `_Toc*` bookmarks wrap the content. */
     for b in &para.bookmarks {
         out.push_str(&format!(
@@ -751,12 +847,16 @@ fn serialize_paragraph(
         .text
         .chars()
         .any(|c| c == '\u{2028}' || c == '\u{000C}');
+    let has_source_runs = markup.is_some_and(|m| {
+        m.offsets_valid(para.text.len()) && !(m.runs.is_empty() && m.markers.is_empty())
+    });
     if para.spans.is_empty()
         && para.inline_objects.is_empty()
         && para.revisions.is_empty()
         && para.fields.is_empty()
         && para.hyperlinks.is_empty()
         && !has_break
+        && !has_source_runs
     {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
@@ -817,6 +917,36 @@ fn publish_inherited_directions(
     InheritedDirectionsScope
 }
 
+thread_local! {
+    /// Issues #199 / #106 — set for the duration of a [`write_docx`]: the
+    /// output keeps the source package (its `styles.xml` included, or its
+    /// absence), so recorded source `<w:pPr>` / `<w:rPr>` bytes mean what
+    /// they meant when read.
+    static WRITE_AGAINST_SOURCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores [`WRITE_AGAINST_SOURCE`] when the write ends.
+struct AgainstSourceScope(bool);
+
+impl AgainstSourceScope {
+    fn enter(trusted: bool) -> Self {
+        Self(WRITE_AGAINST_SOURCE.with(|c| c.replace(trusted)))
+    }
+}
+
+impl Drop for AgainstSourceScope {
+    fn drop(&mut self) {
+        let prev = self.0;
+        WRITE_AGAINST_SOURCE.with(|c| c.set(prev));
+    }
+}
+
+/// `true` inside [`write_docx`] (see [`WRITE_AGAINST_SOURCE`]); `false` in
+/// [`build_minimal_docx`].
+fn source_bytes_trusted() -> bool {
+    WRITE_AGAINST_SOURCE.with(|c| c.get())
+}
+
 /// Issue #202 — `true` when a regenerated paragraph's `<w:bidi>` would
 /// only restate what its style cascade already gives it: no direct
 /// direction was set (`direct_overrides`) and the resolved one equals
@@ -839,6 +969,23 @@ fn direction_is_inherited(para: &Paragraph) -> bool {
             inherited == para.props.direction
         })
     })
+}
+
+/// Issues #199 / #106 — the recorded source `<w:pPr>` still describes the
+/// paragraph: every model input of [`emit_ppr`] equals what the reader
+/// built from those bytes, and no section marker rides the paragraph (the
+/// reader never records a pPr holding a `<w:sectPr>`).
+///
+/// Only inside [`write_docx`] ([`source_bytes_trusted`]): the recorded
+/// bytes lean on the source package's `styles.xml` (a bare `<w:pStyle>`),
+/// which an engine-authored minimal package does not ship — there the
+/// resolved properties stay baked.
+fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
+    source_bytes_trusted()
+        && para.section_end.is_none()
+        && sp.props == para.props
+        && sp.style_id == para.style_id
+        && sp.list_item == para.list_item
 }
 
 /// Issue #81 — a stable `w:id` for an engine-emitted bookmark. Ids are
@@ -891,7 +1038,7 @@ fn bookmark_id(name: &str) -> u32 {
 /// stack-LIFO order.
 fn emit_styled_runs_with_objects(
     para: &Paragraph,
-    out: &mut String,
+    sink: &mut String,
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
     let len = para.text.len();
@@ -923,6 +1070,44 @@ fn emit_styled_runs_with_objects(
         cuts.insert((f.start as usize).min(len));
         cuts.insert((f.end as usize).min(len));
     }
+    /* Issues #199 / #106 — the source run boundaries (so adjacent source
+    runs that coalesced into one span come back as their own `<w:r>`,
+    each with its own attributes) and the in-paragraph markers. Only
+    offsets still in sync with the text, on a char boundary. */
+    let markup: Option<&SourceMarkup> = para
+        .source_markup
+        .as_deref()
+        .filter(|m| m.offsets_valid(len));
+    let source_runs: &[SourceRun] = markup.map_or(&[], |m| m.runs.as_slice());
+    let mut markers: Vec<(usize, &[u8])> = markup.map_or_else(Vec::new, |m| {
+        m.markers
+            .iter()
+            .map(|mk| ((mk.at as usize).min(len), mk.xml.as_slice()))
+            .collect()
+    });
+    markers.sort_by_key(|(at, _)| *at);
+    let mut marker_cursor = 0usize;
+    for r in source_runs {
+        for b in [r.start as usize, r.end as usize] {
+            if b <= len && para.text.is_char_boundary(b) {
+                cuts.insert(b);
+            }
+        }
+    }
+    for (at, _) in &markers {
+        if para.text.is_char_boundary(*at) {
+            cuts.insert(*at);
+        }
+    }
+    let run_source = |lo: usize| -> Option<RunSource<'_>> {
+        source_runs
+            .iter()
+            .find(|r| (r.start as usize) <= lo && lo < r.end as usize)
+            .map(|run| RunSource {
+                run,
+                first: run.start as usize == lo,
+            })
+    };
     /* Phase 2 audit (gap A.12) — `<w:br>` round-trip. Reader maps
     `<w:br/>` to U+2028 LINE SEPARATOR and `<w:br w:type="page"/>` to
     U+000C FORM FEED in `para.text`. Both characters are mandatory-
@@ -1023,12 +1208,27 @@ fn emit_styled_runs_with_objects(
     let mut field_stack: Vec<&Field> = Vec::new();
     let mut hyperlink_stack: Vec<&Hyperlink> = Vec::new();
     let mut next_fallback_id: u32 = 1;
+    /* Issues #199 / #106 — the `<w:r>` still open in `sink`: consecutive
+    text / tab / break segments of ONE source run (same style, same
+    deletion state, no markup emitted between them) share it, the way the
+    source wrote them (`<w:r><w:tab/><w:t>b</w:t></w:r>`). Every window
+    collects its wrapper / marker markup in its own buffer first; any
+    markup, and any leaf outside a source run, closes the open run. */
+    let mut open_run: Option<(*const SourceRun, SpanStyle, bool)> = None;
+    let close_open_run = |open_run: &mut Option<(*const SourceRun, SpanStyle, bool)>,
+                          sink: &mut String| {
+        if open_run.take().is_some() {
+            sink.push_str("</w:r>");
+        }
+    };
 
     for win in cuts.windows(2) {
         let (lo, hi) = (win[0], win[1]);
         if lo >= hi {
             continue;
         }
+        let mut window = String::new();
+        let out = &mut window;
 
         /* Close any fields ending at or before `lo` first — field
         wrappers nest *inside* revision wrappers, so the field's `end`
@@ -1070,6 +1270,16 @@ fn emit_styled_runs_with_objects(
             }
             emit_span_event(f, out);
             span_cursor += 1;
+        }
+        /* Issues #199 / #106 — in-paragraph source markers due at `lo`
+        (`<w:proofErr/>`, bookmarks, whitespace), between the closes above
+        and the opens below: always a legal run-level position. */
+        while let Some((at, xml)) = markers.get(marker_cursor) {
+            if *at > lo {
+                break;
+            }
+            push_utf8(xml, out);
+            marker_cursor += 1;
         }
         /* Open any hyperlinks that should be active at `lo`. A target the
         pre-pass didn't find a rel id for (should not happen — the pre-pass
@@ -1132,12 +1342,37 @@ fn emit_styled_runs_with_objects(
             }
         }
 
+        let src = run_source(lo);
         if let Some(obj) = obj_at.get(&lo) {
-            emit_inline_object(obj, &style_at(lo), out, hyperlink_rel_map);
+            emit_inline_object(obj, &style_at(lo), src, out, hyperlink_rel_map);
             /* Skip to the byte after the anchor's UTF-8 length — the
             object consumes the full anchor character. The cut set
             already placed a boundary at `lo + OBJECT_REPLACE_UTF8.len()`,
             so the next window picks up from there naturally. */
+        } else if let Some(src) = src {
+            /* Issues #199 / #106 — a leaf inside a source run: continue the
+            open `<w:r>` when nothing was emitted since and it is the same
+            run in the same style, else open a new one. */
+            let style = style_at(lo);
+            let key = (src.run as *const SourceRun, style, in_del);
+            let continues = window.is_empty() && open_run.as_ref() == Some(&key);
+            if !continues {
+                close_open_run(&mut open_run, sink);
+                sink.push_str(&window);
+                open_source_run(&key.1, Some(src), sink);
+                open_run = Some(key);
+            }
+            if let Some(&kind) = break_at.get(&lo) {
+                sink.push_str(match kind {
+                    BreakKind::Line => "<w:br/>",
+                    BreakKind::Page => "<w:br w:type=\"page\"/>",
+                });
+            } else if tab_at.contains(&lo) {
+                sink.push_str("<w:tab/>");
+            } else {
+                push_text_element(&para.text[lo..hi], in_del, Some(src.run), sink);
+            }
+            continue;
         } else if let Some(&kind) = break_at.get(&lo) {
             /* `<w:br/>` / `<w:br w:type="page"/>` runs replace the
             U+2028 / U+000C character — emit the structural element so
@@ -1147,11 +1382,15 @@ fn emit_styled_runs_with_objects(
             /* Audit gap A.M5 — emit the structural `<w:tab/>` element
             instead of a literal HT byte; the rPr applies to the tab
             run so an inherited bold/italic style still survives. */
-            emit_tab_run(&style_at(lo), in_del, out);
+            emit_tab_run(&style_at(lo), out);
         } else {
             serialize_run_kind(&para.text[lo..hi], &style_at(lo), in_del, out);
         }
+        close_open_run(&mut open_run, sink);
+        sink.push_str(&window);
     }
+    close_open_run(&mut open_run, sink);
+    let out = sink;
 
     /* Drain whatever is still open. Field epilogues fire before
     revision closes (field wrappers nest inside revision wrappers), and
@@ -1167,6 +1406,11 @@ fn emit_styled_runs_with_objects(
     }
     for (_, _, f) in span_events.iter().skip(span_cursor) {
         emit_span_event(f, out);
+    }
+    /* Markers at the paragraph end (a trailing `_GoBack` bookmark, the
+    whitespace before `</w:p>`). */
+    for (_, xml) in markers.iter().skip(marker_cursor) {
+        push_utf8(xml, out);
     }
 }
 
@@ -1226,7 +1470,7 @@ fn emit_br_run(kind: BreakKind, out: &mut String) {
 /// when the tab sits inside a `<w:del>` block — the tab element itself
 /// has no body so it does not switch tag names, only the enclosing
 /// run picks up `<w:delText>` semantics for any neighbouring text.
-fn emit_tab_run(style: &SpanStyle, _delete_kind: bool, out: &mut String) {
+fn emit_tab_run(style: &SpanStyle, out: &mut String) {
     out.push_str("<w:r>");
     emit_rpr(style, out);
     out.push_str("<w:tab/></w:r>");
@@ -1254,6 +1498,7 @@ fn preserved_drawing_is_current(obj: &InlineObject, src: &[u8]) -> bool {
 fn emit_inline_object(
     obj: &InlineObject,
     style: &SpanStyle,
+    src: Option<RunSource<'_>>,
     out: &mut String,
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
@@ -1273,8 +1518,7 @@ fn emit_inline_object(
             let emit_story = |blocks: &[Block], o: &mut String| {
                 emit_blocks(blocks, o, hyperlink_rel_map);
             };
-            out.push_str("<w:r>");
-            emit_rpr(style, out);
+            open_source_run(style, src, out);
             out.push_str(&crate::parts::textbox::container_xml(
                 *width_emu,
                 *height_emu,
@@ -1296,12 +1540,11 @@ fn emit_inline_object(
             An object without a picture (a text box, shape, chart, OLE
             object) has no typed regeneration and is ALWAYS written from
             its bytes — never dropped. */
-            if let Some(src) = obj.source_xml.as_deref()
-                && let Ok(verbatim) = std::str::from_utf8(src)
-                && (rel_id.is_empty() || preserved_drawing_is_current(obj, src))
+            if let Some(bytes) = obj.source_xml.as_deref()
+                && let Ok(verbatim) = std::str::from_utf8(bytes)
+                && (rel_id.is_empty() || preserved_drawing_is_current(obj, bytes))
             {
-                out.push_str("<w:r>");
-                emit_rpr(style, out);
+                open_source_run(style, src, out);
                 out.push_str(verbatim);
                 out.push_str("</w:r>");
                 return;
@@ -1337,7 +1580,8 @@ fn emit_inline_object(
             } else {
                 "w:endnoteReference"
             };
-            out.push_str("<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr><");
+            open_note_mark_run(style, src, out);
+            out.push('<');
             out.push_str(elem);
             if *custom_mark_follows {
                 out.push_str(" w:customMarkFollows=\"1\"");
@@ -1350,10 +1594,29 @@ fn emit_inline_object(
                 engine::NoteKind::Footnote => "w:footnoteRef",
                 engine::NoteKind::Endnote => "w:endnoteRef",
             };
-            out.push_str("<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr><");
+            open_note_mark_run(style, src, out);
+            out.push('<');
             out.push_str(elem);
             out.push_str("/></w:r>");
         }
+    }
+}
+
+/// `<w:r …>` + `<w:rPr>` of a note reference / self-mark run: the source
+/// run's attributes and — while verified — its own `<w:rPr>` (Word's
+/// `FootnoteReference` character style); otherwise the explicit
+/// superscript that keeps the mark raised in readers without that style.
+fn open_note_mark_run(style: &SpanStyle, src: Option<RunSource<'_>>, out: &mut String) {
+    match src {
+        Some(s) if s.run.style == *style && source_bytes_trusted() => {
+            open_source_run(style, src, out)
+        }
+        Some(s) => {
+            out.push_str("<w:r");
+            attrs_xml(&s.run.attrs, out);
+            out.push_str("><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>");
+        }
+        None => out.push_str("<w:r><w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>"),
     }
 }
 
@@ -2209,6 +2472,13 @@ fn geometry_is_stock_a4(g: &engine::PageGeometry) -> bool {
 /// Repack `archive`'s sibling entries verbatim + a freshly serialized
 /// `word/document.xml` from `doc`. Returns the assembled `.docx` bytes.
 pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    let _source_scope = AgainstSourceScope::enter(true);
+    write_docx_inner(archive, doc)
+}
+
+/// [`write_docx`] without choosing whether recorded source markup is
+/// trusted — the caller has set [`WRITE_AGAINST_SOURCE`].
+fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
     /* Issue #135 — images inserted after open: plan their media parts,
     package relationship ids and content-type defaults, and write from a
     copy of the tree whose image references carry the package ids. */
@@ -3060,7 +3330,11 @@ pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
         document_root_attrs: doc.document_root_attrs.clone(),
         warnings: Vec::new(),
     };
-    write_docx(&archive, doc)
+    /* Issues #199 / #106 — no source `styles.xml` travels in a minimal
+    package, so recorded source `<w:pPr>` / `<w:rPr>` bytes (a bare
+    `<w:pStyle>`) would lose their meaning: regenerate them. */
+    let _source_scope = AgainstSourceScope::enter(false);
+    write_docx_inner(&archive, doc)
 }
 
 /// Issue #188 — [`build_minimal_docx`] declares every picture in the ONE
@@ -3819,6 +4093,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3860,6 +4135,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3905,6 +4181,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3964,6 +4241,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4009,6 +4287,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4112,6 +4391,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -5969,6 +6249,7 @@ mod tests {
                 section_end: None,
                 bookmarks: Vec::new(),
                 body_xml: None,
+                source_markup: None,
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -6027,6 +6308,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -6129,6 +6411,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -6159,6 +6442,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -6217,6 +6501,7 @@ mod tests {
             section_end: Some(Box::new(engine::SectionProps::default())),
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -6388,7 +6673,10 @@ mod tests {
         assert!(p0.contains("<w:pStyle w:val=\"RtlBody\"/>"), "{p0}");
         assert!(!p0.contains("<w:bidi"), "inherited bidi leaked: {p0}");
         let p1 = xml.split("</w:p>").nth(1).expect("p1");
-        assert!(p1.contains("<w:bidi w:val=\"false\"/>"), "{p1}");
+        /* Issues #199 / #106 — p1's properties are unchanged by the
+        edit, so its verified source `<w:pPr>` is reused: the direct
+        override keeps its source spelling. */
+        assert!(p1.contains("<w:bidi w:val=\"0\"/>"), "{p1}");
         let reread = read_docx(&saved).expect("reread").document;
         let q0 = reread.nth_paragraph(0).unwrap();
         assert_eq!(q0.props.direction, Some(TextDirection::Rtl));
@@ -6893,6 +7181,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -7533,6 +7822,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -8359,7 +8649,15 @@ mod tests {
         let bytes = write_docx(&parsed, &merged).expect("write merged");
         crate::check_document_xml_well_formed(&bytes).expect("merge well-formed");
         let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
-        assert!(out.contains("first insidesecond inside"));
+        /* Issues #199 / #106 — each half keeps its source run, so the
+        merged text spans two `<w:r>`; the reread joins it. */
+        assert_eq!(
+            read_docx(&bytes)
+                .expect("re-read merged")
+                .document
+                .paragraph_text(1),
+            Some("first insidesecond inside")
+        );
         assert_eq!(out.matches("<w:sdt>").count(), 4, "{out}");
         assert_eq!(out.matches("</w:sdt>").count(), 4);
 
@@ -8670,5 +8968,149 @@ mod tests {
             patch_root_bindings(b"<w:document xmlns:w=\"x\"/>", &[("r", "y")]),
             "<w:document xmlns:w=\"x\" xmlns:r=\"y\"/>"
         );
+    }
+
+    /* ========================== issues #199 / #106 — source markup ==== */
+
+    /// docDefaults carry spacing, so a writer that baked resolved
+    /// properties would add a direct `<w:spacing>` to every regenerated
+    /// paragraph.
+    const MARKUP_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:pPrDefault><w:pPr><w:spacing w:after="200" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults></w:styles>"#;
+
+    /// A Word-shaped paragraph: `w14:paraId` / rsids on `<w:p>`, run
+    /// rsids on runs whose formatting is equal (they coalesce into one
+    /// span on read), bare `<w:t>`, `<w:proofErr>` around a word, an
+    /// underline carrying an unread `w:color`, a tab inside a text run, a
+    /// trailing `_GoBack` bookmark; then a self-closing paragraph and a
+    /// run led by `<w:lastRenderedPageBreak/>`.
+    const MARKUP_P0: &str = r#"<w:p w14:paraId="1A2B3C4D" w14:textId="77777777" w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3" w:rsidP="00D4E5F6"><w:pPr><w:ind w:left="720"/></w:pPr><w:r w:rsidRPr="00112233"><w:t xml:space="preserve">Hello </w:t></w:r><w:proofErr w:type="spellStart"/><w:r w:rsidR="00445566"><w:t>wrold</w:t></w:r><w:proofErr w:type="spellEnd"/><w:r w:rsidR="00445566"><w:rPr><w:u w:val="single" w:color="FF0000"/></w:rPr><w:t xml:space="preserve"> underlined</w:t></w:r><w:r w:rsidR="00778899"><w:tab/><w:t>tabbed</w:t></w:r><w:bookmarkStart w:id="0" w:name="_GoBack"/><w:bookmarkEnd w:id="0"/></w:p>"#;
+    const MARKUP_P1: &str = r#"<w:p w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3"/>"#;
+    const MARKUP_P2: &str = r#"<w:p w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3"><w:r><w:lastRenderedPageBreak/><w:t>Second page</w:t></w:r></w:p>"#;
+
+    fn markup_document() -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="w14"><w:body>{MARKUP_P0}{MARKUP_P1}{MARKUP_P2}<w:sectPr/></w:body></w:document>"#
+        )
+    }
+
+    fn markup_archive() -> (String, DocxArchive) {
+        let xml = markup_document();
+        let archive =
+            read_docx(&build_docx_with_styles(MARKUP_STYLES_XML, &xml)).expect("read markup");
+        (xml, archive)
+    }
+
+    fn at(block: u32, offset: usize) -> engine::LogicalPos {
+        engine::LogicalPos {
+            path: engine::BlockPath::top(block),
+            offset: offset as u32,
+        }
+    }
+
+    /// Issue #199 — an insertion inside a Word-authored paragraph
+    /// regenerates it as exactly source + the inserted bytes: paragraph
+    /// and run attributes, bare `<w:t>`, `<w:proofErr>`, the run split
+    /// that formatting alone cannot see, the tab inside its run, the
+    /// trailing bookmark and the verified `<w:pPr>` all survive.
+    #[test]
+    fn edited_word_paragraph_is_source_plus_insert() {
+        let (xml, archive) = markup_archive();
+        let p0 = archive.document.nth_paragraph(0).unwrap();
+        let m = p0.source_markup.as_deref().expect("markup captured");
+        assert_eq!(m.attrs.len(), 5, "{:?}", m.attrs);
+        assert_eq!(m.runs.len(), 4);
+        assert_eq!(m.markers.len(), 4, "2 proofErr + 2 bookmark");
+        let zero = write_docx(&archive, &archive.document).expect("zero-edit");
+        assert_eq!(document_xml_of(&zero), xml, "zero-edit byte-identical");
+
+        let edited = archive.document.insert_text(at(0, "Hello wr".len()), "INS");
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(out, xml.replacen("wrold", "wrINSold", 1));
+
+        /* Appending to a run continues that run: no new `<w:r>`. */
+        let len = p0.text.len();
+        let edited = archive.document.insert_text(at(0, len), "X");
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(out, xml.replacen("tabbed", "tabbedX", 1));
+
+        /* A run led by `<w:lastRenderedPageBreak/>` keeps it. */
+        let edited = archive.document.insert_text(at(2, 0), "Y");
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(out, xml.replacen(">Second page", ">YSecond page", 1));
+        crate::check_document_xml_well_formed(&write_docx(&archive, &edited).unwrap())
+            .expect("well-formed");
+    }
+
+    /// Issue #106 — bolding a run whose `<w:u>` carries an unread
+    /// `w:color` regenerates its rPr but keeps the underline element's
+    /// source spelling (the modeled value is unchanged), and the run keeps
+    /// its rsid.
+    #[test]
+    fn restyled_run_keeps_unread_attributes_of_unchanged_children() {
+        let (_, archive) = markup_archive();
+        let start = "Hello wrold".len();
+        let end = start + " underlined".len();
+        let patch = SpanStyle {
+            bold: Some(true),
+            ..SpanStyle::default()
+        };
+        let edited = archive
+            .document
+            .apply_style(at(0, start), at(0, end), patch);
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        let run = out
+            .split("<w:r ")
+            .find(|r| r.contains(" underlined"))
+            .expect("restyled run");
+        assert!(run.starts_with(r#"w:rsidR="00445566">"#), "{run}");
+        assert!(run.contains("<w:b/>"), "{run}");
+        assert!(
+            run.contains(r#"<w:u w:val="single" w:color="FF0000"/>"#),
+            "unread w:color lost: {run}"
+        );
+        /* The untouched paragraph-level markup is still there. */
+        assert!(out.contains(r#"<w:proofErr w:type="spellStart"/>"#));
+        assert!(out.contains(r#"w14:paraId="1A2B3C4D""#));
+    }
+
+    /// Issues #199 / #106 — a split keeps the paragraph identity on the
+    /// left half only (a duplicated `w14:paraId` is a corrupt part); both
+    /// halves keep their runs' rsids and the verified `<w:pPr>`.
+    #[test]
+    fn split_paragraph_keeps_identity_left_and_rsids_on_both_halves() {
+        let (_, archive) = markup_archive();
+        let edited = archive.document.split_paragraph(at(0, "Hello wr".len()));
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(out.matches("w14:paraId=\"1A2B3C4D\"").count(), 1, "{out}");
+        assert_eq!(
+            out.matches(r#"<w:r w:rsidR="00445566"><w:t>wr</w:t>"#)
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.matches(r#"<w:r w:rsidR="00445566"><w:t>old</w:t>"#)
+                .count(),
+            1
+        );
+        assert!(!out.contains("<w:spacing"), "docDefaults baked: {out}");
+        crate::check_document_xml_well_formed(&write_docx(&archive, &edited).unwrap())
+            .expect("well-formed");
+        let back = read_docx(&write_docx(&archive, &edited).unwrap()).expect("re-read");
+        assert_eq!(back.document.paragraph_text(0), Some("Hello wr"));
+    }
+
+    /// Issues #199 / #106 — a minimal package ships no `styles.xml`, so the
+    /// recorded source pPr / rPr bytes are not reused there: the resolved
+    /// properties are baked instead (the docDefaults spacing appears).
+    #[test]
+    fn minimal_package_regenerates_instead_of_reusing_source_ppr() {
+        let (_, archive) = markup_archive();
+        let edited = archive.document.insert_text(at(0, 0), "Z");
+        let out = document_xml_of(&build_minimal_docx(&edited).expect("minimal"));
+        assert!(out.contains("<w:spacing"), "{out}");
+        /* The attributes still ride (no styles involved). */
+        assert!(out.contains(r#"w:rsidR="00A1B2C3""#), "{out}");
     }
 }
