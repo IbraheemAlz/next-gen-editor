@@ -206,6 +206,20 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "table_cell_runs.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 11,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "intro",
+          "after"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "table_grid_span.docx": {
       "generator": "handcrafted",
       "phase_introduced": 5,
@@ -265,6 +279,21 @@
         "paragraph_count": 1,
         "paragraph_texts": [
           "intro"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
+    "w14_paraid_word.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 11,
+      "asserts": {
+        "paragraph_count": 3,
+        "paragraph_texts": [
+          "first paragraph",
+          "second paragraph",
+          "after"
         ]
       },
       "roundtrip": {

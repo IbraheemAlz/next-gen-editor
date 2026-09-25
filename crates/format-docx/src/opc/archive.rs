@@ -68,36 +68,79 @@ pub struct DocxArchive {
 /// Any violation is an error — a writer that splices a misaligned
 /// passthrough range produces a part this rejects, and our own reader
 /// then cannot reopen what we just saved.
+///
+/// Issue #100 — the check is namespace-aware too: every element and
+/// attribute prefix must resolve to an in-scope `xmlns:` binding. A
+/// passthrough `<w:p w14:paraId=…>` spliced under a synthesized root
+/// that forgot to re-declare `xmlns:w14` is well-formed XML 1.0 but NOT
+/// namespace-well-formed, and Word refuses (or "repairs") the file.
 pub fn check_document_xml_well_formed(docx: &[u8]) -> Result<(), DocxError> {
+    check_part_xml_well_formed(docx, DOC_XML)
+}
+
+/// [`check_document_xml_well_formed`] for any XML part of the package
+/// (`word/header1.xml`, `word/footer2.xml`, …) — issue #100: regenerated
+/// header/footer roots must re-declare the source root's bindings exactly
+/// like `word/document.xml`.
+pub fn check_part_xml_well_formed(docx: &[u8], part_name: &str) -> Result<(), DocxError> {
     use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
+    use quick_xml::name::ResolveResult;
+    use quick_xml::reader::NsReader;
 
     let mut archive = ZipArchive::new(Cursor::new(docx))?;
     let mut part = archive
-        .by_name(DOC_XML)
-        .map_err(|_| DocxError::MissingEntry(DOC_XML.into()))?;
+        .by_name(part_name)
+        .map_err(|_| DocxError::MissingEntry(part_name.into()))?;
     let mut xml = Vec::with_capacity(part.size() as usize);
     part.read_to_end(&mut xml)?;
 
-    let mut reader = Reader::from_reader(xml.as_slice());
+    let mut reader = NsReader::from_reader(xml.as_slice());
     let config = reader.config_mut();
     config.trim_text(false);
     config.check_end_names = true;
     config.check_comments = true;
     config.allow_unmatched_ends = false;
 
+    let unbound = |what: &str, qname: &[u8], pos: u64| {
+        DocxError::MalformedXml(format!(
+            "{part_name}: unbound namespace prefix on {what} `{}` at byte {pos}",
+            String::from_utf8_lossy(qname)
+        ))
+    };
     let mut depth: usize = 0;
     let mut roots: usize = 0;
     let mut buf = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf)? {
-            Event::Start(_) => {
-                if depth == 0 {
+        let (elem_ns, event) = reader.read_resolved_event_into(&mut buf)?;
+        let elem_unbound = matches!(elem_ns, ResolveResult::Unknown(_));
+        match event {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                if elem_unbound {
+                    return Err(unbound(
+                        "element",
+                        e.name().as_ref(),
+                        reader.buffer_position(),
+                    ));
+                }
+                for a in e.attributes() {
+                    let a = a?;
+                    if let (ResolveResult::Unknown(_), _) = reader.resolve_attribute(a.key) {
+                        return Err(unbound(
+                            "attribute",
+                            a.key.as_ref(),
+                            reader.buffer_position(),
+                        ));
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    if depth == 0 {
+                        roots += 1;
+                    }
+                    depth += 1;
+                } else if depth == 0 {
                     roots += 1;
                 }
-                depth += 1;
             }
-            Event::Empty(_) if depth == 0 => roots += 1,
             Event::End(_) => {
                 depth = depth.checked_sub(1).ok_or_else(|| {
                     DocxError::MalformedXml(format!(
@@ -113,12 +156,12 @@ pub fn check_document_xml_well_formed(docx: &[u8]) -> Result<(), DocxError> {
     }
     if depth != 0 {
         return Err(DocxError::MalformedXml(format!(
-            "{depth} element(s) still open at end of {DOC_XML}"
+            "{depth} element(s) still open at end of {part_name}"
         )));
     }
     if roots != 1 {
         return Err(DocxError::MalformedXml(format!(
-            "{DOC_XML} has {roots} root elements, expected exactly 1"
+            "{part_name} has {roots} root elements, expected exactly 1"
         )));
     }
     Ok(())
@@ -422,6 +465,12 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         let Ok(part) = parsed else {
             continue;
         };
+        /* Issue #100 — the note part's own root bindings (they can differ
+        from the document root's) for the UI save path, which regenerates
+        this part from the tree without the archive. */
+        document
+            .part_root_attrs
+            .insert(entry.to_string(), part.root_attrs.clone());
         let rels_name = part_rels_entry_name(entry);
         let part_rels = other_entries
             .iter()
@@ -519,6 +568,11 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     }
 
     let document_root_attrs = root_attributes(&xml);
+    /* Issue #100 — the live editor keeps only the tree (the engine-wasm
+    save path is `build_minimal_docx(&DocumentTree)`), so the tree must
+    carry the root bindings too, or every Word paragraph's `w14:paraId`
+    is written unbound. */
+    document.document_root_attrs = document_root_attrs.clone();
 
     Ok(DocxArchive {
         other_entries,
@@ -708,6 +762,33 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// Issue #100 — a prefix used without an in-scope binding is not
+    /// namespace-well-formed: the exact shape a Word paragraph
+    /// (`w14:paraId`) takes under a synthesized root that forgot to
+    /// re-declare `xmlns:w14`. Declared prefixes (root or local) pass.
+    #[test]
+    fn well_formed_guard_rejects_unbound_prefixes() {
+        let attr = format!(
+            r#"{ROOT}<w:body><w:p w14:paraId="1A2B3C4D"><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"#
+        );
+        let err = check_document_xml_well_formed(&package(attr.as_bytes()))
+            .expect_err("unbound attribute prefix must be rejected");
+        assert!(err.to_string().contains("w14:paraId"), "{err}");
+        let elem = format!(
+            r#"{ROOT}<w:body><w:p><w:r><w:rPr><w14:glow/></w:rPr></w:r></w:p></w:body></w:document>"#
+        );
+        let err = check_document_xml_well_formed(&package(elem.as_bytes()))
+            .expect_err("unbound element prefix must be rejected");
+        assert!(err.to_string().contains("w14:glow"), "{err}");
+        /* Bound on the root, or locally — both fine; `xml:` is implicit. */
+        let ok_root = r#"<w:document xmlns:w="urn:w" xmlns:w14="urn:w14"><w:body><w:p w14:paraId="1"><w:r><w:t xml:space="preserve">x</w:t></w:r></w:p></w:body></w:document>"#;
+        check_document_xml_well_formed(&package(ok_root.as_bytes())).expect("root-bound");
+        let ok_local = format!(
+            r#"{ROOT}<w:body><w:p><w:r><w:rPr><w14:glow xmlns:w14="urn:w14"/></w:rPr></w:r></w:p></w:body></w:document>"#
+        );
+        check_document_xml_well_formed(&package(ok_local.as_bytes())).expect("locally bound");
     }
 
     #[test]

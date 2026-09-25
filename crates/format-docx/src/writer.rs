@@ -1807,9 +1807,16 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                 if !regen {
                     return (present, None);
                 }
+                /* Issue #100 — no source part in the archive (the UI save
+                path, `build_minimal_docx`): the part's own root bindings
+                recorded on the tree at read time, else the document's. */
                 let root_attrs: Vec<(String, String)> = match existing {
                     Some((_, bytes)) => root_attributes(bytes),
-                    None => archive.document_root_attrs.clone(),
+                    None => doc
+                        .part_root_attrs
+                        .get(entry)
+                        .cloned()
+                        .unwrap_or_else(|| archive.document_root_attrs.clone()),
                 };
                 (present, Some(build_notes_xml(kind, doc, &root_attrs)))
             };
@@ -2372,7 +2379,14 @@ pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
     let archive = DocxArchive {
         other_entries,
         document: doc.clone(),
-        document_root_attrs: Vec::new(),
+        /* Issue #100 — this is the live editor's save path (engine-wasm
+        `SaveDocx` / `SaveDocument`). A document opened from `.docx`
+        carries its source root's bindings on the tree; re-declare them
+        on the synthesized `word/document.xml` and header/footer roots
+        exactly as `write_docx` does for an archive, or passthrough
+        `w14:paraId` paragraphs are written with an unbound prefix. Empty
+        for an engine-authored document (minimal root unchanged). */
+        document_root_attrs: doc.document_root_attrs.clone(),
         warnings: Vec::new(),
     };
     write_docx(&archive, doc)

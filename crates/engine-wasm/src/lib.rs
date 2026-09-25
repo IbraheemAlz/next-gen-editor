@@ -17948,4 +17948,79 @@ mod snapshot_tests {
             .unwrap();
         assert!(matches!(b.active_story, StoryTarget::Body));
     }
+
+    /// Issue #100 — the live editor's save path. Open a Word-shaped
+    /// document (`w14:paraId` on every `<w:p>`, bound only on the root),
+    /// edit one paragraph through `Command::InsertText`, `SaveDocx`: the
+    /// saved `word/document.xml` must be namespace-well-formed. It was
+    /// not — `build_minimal_docx` synthesized a bare `<w:document
+    /// xmlns:w>` root, leaving every untouched paragraph's `w14:` unbound.
+    /// A crash-recovered session (snapshot restore) must save the same.
+    #[test]
+    fn save_docx_of_a_word_document_keeps_root_namespace_bindings() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../../format-docx/tests/fixtures/w14_paraid_word.docx");
+        let saved = |e: &mut Engine| -> Vec<u8> {
+            match apply(e, Command::SaveDocx) {
+                Event::DocumentSaved { bytes, .. } => bytes,
+                other => panic!("expected DocumentSaved, got {other:?}"),
+            }
+        };
+        let mut e = engine();
+        /* Natively `current_review_date` would reach `js_sys::Date`; pin
+        it the way `new_headless` does. The dispatcher's edit path lays
+        out, so boot a real font + layout config (the interactive state). */
+        e.review_date = "2026-01-01T00:00:00Z".into();
+        let font_bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("test-latin".to_string(), font_bytes).expect("font");
+        e.fonts.insert("test-latin".to_string(), Arc::new(font));
+        e.layout_cfg = Some(RenderConfig {
+            font_id: "test-latin".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 16.0,
+            line_height: 26.0,
+            alignment: Alignment::Start,
+            scale: 2.0,
+            base_scale: 2.0,
+            zoom: 1.0,
+        });
+        let evt = apply(
+            &mut e,
+            Command::LoadDocx {
+                bytes: FIXTURE.to_vec(),
+            },
+        );
+        assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+        /* The live-caret path the UI's typing uses (`at: None`). */
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(0, 5),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let evt = apply(&mut e, insert(" edited"));
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        let bytes = saved(&mut e);
+        format_docx::check_document_xml_well_formed(&bytes)
+            .expect("UI save of a Word document must be namespace-well-formed");
+        let reread = format_docx::read_docx(&bytes).expect("re-read");
+        assert_eq!(
+            reread.document.paragraph_text(0),
+            Some("first edited paragraph")
+        );
+        assert!(
+            reread
+                .document_root_attrs
+                .iter()
+                .any(|(k, _)| k == "xmlns:w14"),
+            "{:?}",
+            reread.document_root_attrs
+        );
+
+        /* Crash recovery: the attrs ride the snapshot envelope. */
+        let mut b = engine();
+        b.restore_from_bytes(&e.snapshot_bytes().unwrap()).unwrap();
+        format_docx::check_document_xml_well_formed(&saved(&mut b))
+            .expect("recovered session saves well-formed");
+    }
 }
