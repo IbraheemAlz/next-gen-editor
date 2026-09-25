@@ -8557,8 +8557,9 @@ impl Engine {
                         Word's own default is ON). */
                         para_box.keep_next = para.props.keep_next_on();
                         para_box.flow.keep_lines = para.props.keep_lines_on();
-                        para_box.flow.widow_control =
-                            para.props.widow_control_on(doc.settings.widow_control_default);
+                        para_box.flow.widow_control = para
+                            .props
+                            .widow_control_on(doc.settings.widow_control_default);
                         after_keep_next = para.props.keep_next_on();
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
@@ -18426,7 +18427,10 @@ mod tests {
         let typed = engine.do_insert_text_interactive(caret, long_text);
         assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
         let exited = engine.do_exit_header_footer();
-        assert!(matches!(exited, Event::SelectionChanged { .. }), "{exited:?}");
+        assert!(
+            matches!(exited, Event::SelectionChanged { .. }),
+            "{exited:?}"
+        );
 
         let scale = engine.scale();
         let (pages, _fonts, page_paths, info) = engine
