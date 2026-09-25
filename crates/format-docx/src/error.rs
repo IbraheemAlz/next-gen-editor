@@ -47,4 +47,9 @@ pub enum WriteNote {
     /// form fields, content-control boundaries — was written at offsets
     /// clamped to the current text.
     StaleMarkupClamped { markers: u32 },
+    /// Issue #245 — the run-level content control `id` (the source byte
+    /// offset of its `<w:sdt>`) would have crossed a regenerated wrapper
+    /// (hyperlink, revision, field) or another control after an edit; its
+    /// range was widened to enclose it so the part stays well-formed.
+    InlineWrapperWidened { id: u32 },
 }

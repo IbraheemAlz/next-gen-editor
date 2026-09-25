@@ -996,7 +996,37 @@ pub fn parse_document_xml_with_warnings(
                 if in_run && is_modeled_textless_run_child(name.as_ref()) {
                     markup.run_modeled();
                 }
+                if in_run && !in_rpr && name.as_ref() != b"w:rPr" {
+                    markup.run_child_start();
+                }
+                let in_para = p_start_byte.is_some() && !in_run;
                 match name.as_ref() {
+                    /* Issue #245 — a run-level content control: its runs
+                    stay paragraph content; the wrapper (`<w:sdt>` …
+                    `<w:sdtContent>` / `</w:sdtContent></w:sdt>`) rides the
+                    paragraph's source markup as a positioned opener /
+                    closer pair. The property subtrees are skipped whole
+                    (their bytes are inside the opener) so nothing in them
+                    can leak into the live run state. */
+                    b"w:sdt" if in_para => {
+                        markup.sdt_start(prev_pos);
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    b"w:sdtPr" | b"w:sdtEndPr" if in_para => {
+                        let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    b"w:sdtContent" if in_para => {
+                        let end = reader.buffer_position() as usize;
+                        markup.sdt_content_start(xml, end, para_text.len() as u32, &ns, false);
+                        prev_pos = end;
+                        buf.clear();
+                        continue;
+                    }
                     /* Issue #119 — a run-level object element: capture the
                     whole subtree, lower the modeled facts out of it, and
                     anchor ONE inline object carrying the bytes. A picture
@@ -1335,6 +1365,9 @@ pub fn parse_document_xml_with_warnings(
                 if in_run && is_modeled_textless_run_child(name.as_ref()) {
                     markup.run_modeled();
                 }
+                if in_run && !in_rpr && name.as_ref() != b"w:rPr" {
+                    markup.run_child_start();
+                }
                 /* Issues #199 / #106 — in-paragraph markup the model does
                 not represent: the empty `<w:pPr/>`, an empty run `<w:rPr/>`,
                 a leading `<w:lastRenderedPageBreak/>`, and the positioned
@@ -1342,6 +1375,14 @@ pub fn parse_document_xml_with_warnings(
                 let in_para = p_start_byte.is_some() && in_tbl == 0;
                 let here = reader.buffer_position() as usize;
                 match name.as_ref() {
+                    /* Issue #245 — an empty run-level content control. */
+                    b"w:sdtContent" if in_para && !in_run => {
+                        markup.sdt_content_start(xml, here, para_text.len() as u32, &ns, true);
+                    }
+                    b"w:sdt" if in_para && !in_run => {
+                        markup.sdt_start(prev_pos);
+                        markup.sdt_end(xml, here, para_text.len() as u32, &ns);
+                    }
                     b"w:pPr" if in_para && !in_run => markup.close_ppr(xml, here, &ns),
                     b"w:rPr" if in_para && in_run => {
                         if let Some(frag) = slice_fragment(xml, prev_pos, here) {
@@ -1745,6 +1786,21 @@ pub fn parse_document_xml_with_warnings(
                     markup.whitespace(para_text.len() as u32, frag);
                 }
             }
+            Event::Text(t)
+                if p_start_byte.is_some()
+                    && in_tbl == 0
+                    && in_run
+                    && !in_rpr
+                    && !in_instr_text
+                    && t.iter().all(u8::is_ascii_whitespace) =>
+            {
+                /* Issue #245 — pretty-print whitespace between a run's
+                children rides the source run. */
+                let end = reader.buffer_position() as usize;
+                if let Some(frag) = xml.get(prev_pos..end) {
+                    markup.run_whitespace(frag);
+                }
+            }
             Event::Text(t) if in_instr_text && in_tbl == 0 => {
                 /* `<w:instrText>` content accumulates onto the innermost
                 open field's instruction buffer. The text may straddle
@@ -1806,7 +1862,23 @@ pub fn parse_document_xml_with_warnings(
                     buf.clear();
                     continue;
                 }
+                if in_run && !in_rpr && name.as_ref() != b"w:r" {
+                    markup.run_child_end();
+                }
                 match name.as_ref() {
+                    /* Issue #245 — the run-level content control's content
+                    and element close. */
+                    b"w:sdtContent" if p_start_byte.is_some() && !in_run => {
+                        markup.sdt_content_end(prev_pos);
+                    }
+                    b"w:sdt" if p_start_byte.is_some() && !in_run => {
+                        markup.sdt_end(
+                            xml,
+                            reader.buffer_position() as usize,
+                            para_text.len() as u32,
+                            &ns,
+                        );
+                    }
                     b"w:t" => in_text_elt = false,
                     b"w:delText" => in_del_text_elt = false,
                     b"w:instrText" => in_instr_text = false,
@@ -1983,7 +2055,12 @@ pub fn parse_document_xml_with_warnings(
                             r_style_id.as_deref(),
                             direct_rpr.clone(),
                         );
-                        markup.close_text_run(start, end, &style);
+                        markup.close_text_run(
+                            start,
+                            end,
+                            &style,
+                            &para_text[start as usize..end as usize],
+                        );
                         if style != SpanStyle::default() {
                             match spans.last_mut() {
                                 Some(last) if last.end == start && last.style == style => {

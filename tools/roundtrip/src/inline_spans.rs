@@ -150,3 +150,99 @@ pub(crate) fn run_form_fields_roundtrip() -> Result<()> {
     println!("[roundtrip] step 27c OK — both form fields re-read as content spans");
     Ok(())
 }
+
+/* ============================ #245 — run-level content controls ==== */
+
+/// `Bug64561.docx`'s shape (Word, tab-indented): nested run-level
+/// controls around one run, then a `_GoBack` bookmark.
+const SDT_NESTED: &str = "<w:p w:rsidR=\"005828DB\">\n\t\t\t<w:sdt>\n\t\t\t\t<w:sdtPr>\n\t\t\t\t\t<w:alias w:val=\"subject[@list=1]\"/>\n\t\t\t\t\t<w:id w:val=\"1332796321\"/>\n\t\t\t\t</w:sdtPr>\n\t\t\t\t<w:sdtContent>\n\t\t\t\t\t<w:sdt>\n\t\t\t\t\t\t<w:sdtPr>\n\t\t\t\t\t\t\t<w:alias w:val=\"subjectline\"/>\n\t\t\t\t\t\t\t<w:id w:val=\"614486968\"/>\n\t\t\t\t\t\t</w:sdtPr>\n\t\t\t\t\t\t<w:sdtContent>\n\t\t\t\t\t\t\t<w:r>\n\t\t\t\t\t\t\t\t<w:t>Subject</w:t>\n\t\t\t\t\t\t\t</w:r>\n\t\t\t\t\t\t</w:sdtContent>\n\t\t\t\t\t</w:sdt>\n\t\t\t\t</w:sdtContent>\n\t\t\t</w:sdt>\n\t\t\t<w:bookmarkStart w:id=\"0\" w:name=\"_GoBack\"/>\n\t\t\t<w:bookmarkEnd w:id=\"0\"/>\n\t\t</w:p>";
+
+/// `Bug66263-paragraph.docx`'s shape (Apache POI, space-indented): text,
+/// a control whose run carries an rPr, text.
+const SDT_BETWEEN: &str = r#"<w:p>
+            <w:r><w:t xml:space="preserve">Before </w:t></w:r>
+            <w:sdt>
+                <w:sdtPr><w:id w:val="1001"/></w:sdtPr>
+                <w:sdtContent>
+                    <w:r>
+                        <w:rPr><w:b w:val="on"/></w:rPr>
+                        <w:t>SDTRun</w:t>
+                    </w:r>
+                </w:sdtContent>
+            </w:sdt>
+            <w:r><w:t xml:space="preserve"> After</w:t></w:r>
+        </w:p>"#;
+
+/// Issue #245 — step 28: run-level content controls.
+///
+/// a. An untouched save is byte-identical.
+/// b. Edits inside the nested controls, inside the single control and
+///    outside it are EXACTLY source + insert on both save paths (the
+///    wrappers, the `sdtPr` bytes and the pretty-print whitespace all
+///    survive).
+/// c. The edited file re-reads with every opener / closer pair.
+/// d. Splitting the paragraph inside a control keeps the part
+///    well-formed and the control on the left half.
+pub(crate) fn run_content_controls_roundtrip() -> Result<()> {
+    let xml = document(&format!("{SDT_NESTED}{SDT_BETWEEN}"));
+    let archive = read_docx(&build_styled_docx(STYLES_XML, &xml)).context("read sdt fixture")?;
+    let untouched = write_docx(&archive, &archive.document).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != xml.as_bytes() {
+        bail!("step 28: untouched content-control document drifted");
+    }
+    println!("[roundtrip] step 28a OK — untouched save byte-identical");
+
+    assert_pure_insertions(
+        "step 28b",
+        &xml,
+        &archive,
+        &[
+            (0, 3, ">Subject<", format!(">Sub{INSERT_TEXT}ject<")),
+            (0, 7, ">Subject<", format!(">Subject{INSERT_TEXT}<")),
+            (1, 9, ">SDTRun<", format!(">SD{INSERT_TEXT}TRun<")),
+            (1, 3, ">Before <", format!(">Bef{INSERT_TEXT}ore <")),
+            (1, 16, "> After<", format!("> Af{INSERT_TEXT}ter<")),
+        ],
+    )?;
+    println!("[roundtrip] step 28b OK — edits inside / outside controls are source + insert");
+
+    let edited = archive.document.insert_text(at(1, 9), INSERT_TEXT);
+    let back = read_docx(&write_docx(&archive, &edited)?).context("re-read")?;
+    let ends = |i: u32| -> usize {
+        back.document
+            .nth_paragraph(i)
+            .and_then(|p| p.source_markup.as_deref())
+            .map_or(0, |m| {
+                m.markers
+                    .iter()
+                    .filter(|mk| {
+                        matches!(
+                            mk.role,
+                            engine::MarkerRole::Open { .. } | engine::MarkerRole::Close { .. }
+                        )
+                    })
+                    .count()
+            })
+    };
+    if (ends(0), ends(1)) != (4, 2) {
+        bail!(
+            "step 28c: control ends on re-read {:?}, expected (4, 2)",
+            (ends(0), ends(1))
+        );
+    }
+    println!("[roundtrip] step 28c OK — every control re-reads as an opener / closer pair");
+
+    let split = archive.document.split_paragraph(at(1, 10));
+    for bytes in [
+        write_docx(&archive, &split).context("write split")?,
+        format_docx::save_docx(&split).context("ui save split")?,
+    ] {
+        assert_document_xml_well_formed(&bytes).context("step 28d: split")?;
+        let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+        if out.matches("<w:sdt>").count() != 3 || out.matches("</w:sdt>").count() != 3 {
+            bail!("step 28d: split lost or duplicated a control\n{out}");
+        }
+    }
+    println!("[roundtrip] step 28d OK — a split inside a control stays well-formed");
+    Ok(())
+}

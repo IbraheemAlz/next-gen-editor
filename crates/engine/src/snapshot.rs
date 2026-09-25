@@ -484,6 +484,13 @@ mod tests {
                 },
                 lead: b"<w:lastRenderedPageBreak/>".to_vec(),
                 t_attrs: Some(Vec::new()),
+                /* Issue #245 — pretty-print whitespace inside the run. */
+                pad: Some(Box::new(crate::RunPad {
+                    open: b"\n  ".to_vec(),
+                    after_rpr: b"\n  ".to_vec(),
+                    close: b"\n".to_vec(),
+                })),
+                bare_edge_ws: true,
             }],
             markers: vec![
                 SourceMarker {
@@ -496,6 +503,20 @@ mod tests {
                     at: 11,
                     xml: br#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#.to_vec(),
                     role: crate::MarkerRole::Content,
+                },
+                SourceMarker {
+                    /* Issue #245 — a content control's two ends. */
+                    at: 0,
+                    xml: b"<w:sdt><w:sdtContent>".to_vec(),
+                    role: crate::MarkerRole::Open {
+                        id: 7,
+                        close_xml: b"</w:sdtContent></w:sdt>".to_vec(),
+                    },
+                },
+                SourceMarker {
+                    at: 5,
+                    xml: b"</w:sdtContent></w:sdt>".to_vec(),
+                    role: crate::MarkerRole::Close { id: 7 },
                 },
             ],
         };

@@ -177,6 +177,25 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   Tier 3: when the offsets go stale they are still written, at the offset
   clamped to the text, and `write_docx_with_notes` reports
   `WriteNote::StaleMarkupClamped` (verbatim markers stay dropped).
+- **Run-level wrappers (issue #245).** An in-paragraph `<w:sdt>` keeps
+  its runs as paragraph content; its wrapper rides as a marker pair —
+  `MarkerRole::Open { id, close_xml }` (`<w:sdt>…<w:sdtContent>`, the
+  `sdtPr` subtree skipped whole by the parser) and `MarkerRole::Close
+  { id }` (`</w:sdtContent>…</w:sdt>`), `id` = the source byte offset. An
+  insertion at the closer's offset lands inside the control. The writer
+  (`positioned_markers`) pairs them with a stack (an orphaned closer is
+  dropped, an opener that lost its closer — a split — closes with
+  `close_xml` at the paragraph end) and checks every pair against the
+  wrappers it regenerates (hyperlinks, `ins` / `del`, local fields,
+  `nests_with`): a pair that would cross one is widened to a fixpoint and
+  the markers are emitted in a constructed order, noted as
+  `WriteNote::InlineWrapperWidened`. Row / cell-level `sdt` inside a
+  regenerated table are NOT covered (table markup, #248).
+- **Run padding (issue #245).** Pretty-print whitespace inside a source
+  `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
+  re-emitted on every regenerated piece of the run; a source bare `<w:t>`
+  whose text already had edge whitespace (`SourceRun::bare_edge_ws`) keeps
+  its bare spelling.
 - Offsets are remapped by `insert_text`, `delete_text`, `split_at`,
   `concat`, inline-object splices and the revision accept/reject helper;
   `SourceMarkup::text_len` makes any other text edit go *stale* (runs /

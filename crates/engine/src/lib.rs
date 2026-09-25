@@ -1502,6 +1502,33 @@ pub struct SourceRun {
     #[serde(with = "serde_bytes")]
     pub lead: Vec<u8>,
     pub t_attrs: Option<Vec<SourceAttr>>,
+    /// Issue #245 — the pretty-print whitespace inside the source `<w:r>`
+    /// (`None` for a compact part). Skipped when `None`, so a pre-#245
+    /// snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pad: Option<Box<RunPad>>,
+    /// Issue #245 — the source wrote this run's text with edge whitespace
+    /// in a bare `<w:t>` (no `xml:space`); the reader kept the whitespace,
+    /// so the writer keeps the source spelling instead of adding
+    /// `xml:space="preserve"` to text it did not change the meaning of.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bare_edge_ws: bool,
+}
+
+/// Issue #245 — whitespace between the children of a pretty-printed
+/// source `<w:r>`: after the start tag (`open`), after the `<w:rPr>`
+/// (`after_rpr`) and before the end tag (`close`). Re-emitted on every
+/// regenerated piece of the run, so an edit inside a pretty-printed part
+/// rewrites only the bytes it changed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RunPad {
+    #[serde(with = "serde_bytes")]
+    pub open: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub after_rpr: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub close: Vec<u8>,
 }
 
 /// Issues #199 / #106 — unmodeled in-paragraph markup at text offset `at`:
@@ -1544,11 +1571,31 @@ impl SourceMarker {
 ///   never dropped — when the offsets go stale it is still written, at its
 ///   offset clamped to the text (a best-effort position beats losing the
 ///   control).
+/// - [`Self::Open`] / [`Self::Close`] (issue #245): the two ends of an
+///   unmodeled run-level WRAPPER around a text range — a `<w:sdt>` content
+///   control. `xml` of the opener is `<w:sdt>…<w:sdtPr>…</w:sdtPr>
+///   <w:sdtContent>`, of the closer `</w:sdtContent></w:sdt>`; `id` pairs
+///   them. They travel with the text like any marker (an insertion at the
+///   closer's offset lands INSIDE the control, as typing at the end of a
+///   run continues it). The writer pairs them with a stack and keeps the
+///   part well-formed whatever an edit did: an opener that lost its
+///   closer (a split) closes with `close_xml` at the paragraph end, a
+///   closer without an opener is skipped, and a range that would cross a
+///   regenerated wrapper (hyperlink, revision, field) is widened to
+///   enclose it. Tier 3 like [`Self::Content`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub enum MarkerRole {
     #[default]
     Verbatim,
     Content,
+    Open {
+        id: u32,
+        #[serde(with = "serde_bytes")]
+        close_xml: Vec<u8>,
+    },
+    Close {
+        id: u32,
+    },
 }
 
 impl MarkerRole {

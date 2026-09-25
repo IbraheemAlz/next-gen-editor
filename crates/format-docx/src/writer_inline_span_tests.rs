@@ -211,3 +211,193 @@ fn only_unmodeled_zero_result_fields_become_spans() {
             .ends_with(br#"<w:fldChar w:fldCharType="end"/></w:r>"#)
     );
 }
+
+/* ======================= issue #245 — run-level content controls ==== */
+
+/// `Bug66263-paragraph.docx`'s shape (Apache POI, pretty-printed): text,
+/// a run-level `<w:sdt>` whose run carries an rPr, text; then a
+/// paragraph that starts and ends inside controls.
+const SDT_P0: &str = r#"<w:p>
+            <w:r><w:t>Before </w:t></w:r>
+            <w:sdt>
+                <w:sdtPr><w:id w:val="1001"/></w:sdtPr>
+                <w:sdtContent>
+                    <w:r>
+                        <w:rPr><w:b w:val="on"/></w:rPr>
+                        <w:t>SDT Run with RPr</w:t>
+                    </w:r>
+                </w:sdtContent>
+            </w:sdt>
+            <w:r><w:t> After</w:t></w:r>
+        </w:p>"#;
+const SDT_P1: &str = r#"<w:p>
+            <w:sdt>
+                <w:sdtPr><w:id w:val="1003"/></w:sdtPr>
+                <w:sdtContent>
+                    <w:r>
+                        <w:rPr><w:b w:val="on"/></w:rPr>
+                        <w:t>First</w:t>
+                    </w:r>
+                </w:sdtContent>
+            </w:sdt>
+            <w:r><w:t> Middle </w:t></w:r>
+            <w:sdt>
+                <w:sdtPr><w:id w:val="1004"/></w:sdtPr>
+                <w:sdtContent>
+                    <w:r>
+                        <w:rPr><w:i w:val="on"/></w:rPr>
+                        <w:t>Second</w:t>
+                    </w:r>
+                </w:sdtContent>
+            </w:sdt>
+        </w:p>"#;
+
+/// `Bug64561.docx`'s shape (Word, tab-indented): nested controls around
+/// one run, then a `_GoBack` bookmark.
+const SDT_NESTED: &str = "<w:p w:rsidR=\"005828DB\">\n\t\t\t<w:sdt>\n\t\t\t\t<w:sdtPr>\n\t\t\t\t\t<w:alias w:val=\"subject[@list=1]\"/>\n\t\t\t\t\t<w:id w:val=\"1332796321\"/>\n\t\t\t\t</w:sdtPr>\n\t\t\t\t<w:sdtContent>\n\t\t\t\t\t<w:sdt>\n\t\t\t\t\t\t<w:sdtPr>\n\t\t\t\t\t\t\t<w:alias w:val=\"subjectline\"/>\n\t\t\t\t\t\t\t<w:id w:val=\"614486968\"/>\n\t\t\t\t\t\t</w:sdtPr>\n\t\t\t\t\t\t<w:sdtContent>\n\t\t\t\t\t\t\t<w:r>\n\t\t\t\t\t\t\t\t<w:t>Subject</w:t>\n\t\t\t\t\t\t\t</w:r>\n\t\t\t\t\t\t</w:sdtContent>\n\t\t\t\t\t</w:sdt>\n\t\t\t\t</w:sdtContent>\n\t\t\t</w:sdt>\n\t\t\t<w:bookmarkStart w:id=\"0\" w:name=\"_GoBack\"/>\n\t\t\t<w:bookmarkEnd w:id=\"0\"/>\n\t\t</w:p>";
+
+fn sdt_roles(p: &engine::Paragraph) -> Vec<(u32, &'static str)> {
+    p.source_markup
+        .as_deref()
+        .unwrap()
+        .markers
+        .iter()
+        .filter_map(|mk| match mk.role {
+            engine::MarkerRole::Open { .. } => Some((mk.at, "open")),
+            engine::MarkerRole::Close { .. } => Some((mk.at, "close")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The wrapper is an opener / closer pair around the control's text; the
+/// text itself stays paragraph content.
+#[test]
+fn run_level_sdt_reads_as_a_positioned_wrapper() {
+    let (xml, archive) = open(&format!("{SDT_P0}{SDT_P1}{SDT_NESTED}"));
+    let p0 = archive.document.nth_paragraph(0).unwrap();
+    assert_eq!(p0.text, "Before SDT Run with RPr After");
+    assert_eq!(sdt_roles(p0), vec![(7, "open"), (23, "close")]);
+    let p1 = archive.document.nth_paragraph(1).unwrap();
+    assert_eq!(
+        sdt_roles(p1),
+        vec![(0, "open"), (5, "close"), (13, "open"), (19, "close")]
+    );
+    let p2 = archive.document.nth_paragraph(2).unwrap();
+    assert_eq!(p2.text, "Subject");
+    assert_eq!(
+        sdt_roles(p2),
+        vec![(0, "open"), (0, "open"), (7, "close"), (7, "close")]
+    );
+    assert_eq!(save(&archive, &archive.document), xml, "zero-edit");
+}
+
+/// Edits outside, inside and at both ends of a control regenerate the
+/// (pretty-printed) paragraph as exactly source + the inserted bytes.
+#[test]
+fn run_level_sdt_survives_edits_outside_and_inside() {
+    let (xml, archive) = open(&format!("{SDT_P0}{SDT_P1}{SDT_NESTED}"));
+    let cases: [(u32, usize, &str, &str); 7] = [
+        /* Outside, before the control. */
+        (0, 3, ">Before <", ">BefINSore <"),
+        /* Inside the control's run. */
+        (0, 10, ">SDT Run with RPr<", ">SDTINS Run with RPr<"),
+        /* At the control's end: inside the control. `insert_text` does
+        not extend the bold span at its end, so the text is its own run
+        (the source run's attributes and whitespace, no rPr). */
+        (
+            0,
+            23,
+            "RPr</w:t>\n                    </w:r>",
+            "RPr</w:t>\n                    </w:r><w:r>\n                        <w:t>INS</w:t>\n                    </w:r>",
+        ),
+        /* Outside, after the control. */
+        (0, 26, "> After<", "> AfINSter<"),
+        /* Inside the nested controls. */
+        (2, 3, ">Subject<", ">SubINSject<"),
+        (2, 7, ">Subject<", ">SubjectINS<"),
+        /* Between two controls (the plain run keeps its bare `<w:t>`). */
+        (1, 8, "> Middle <", "> MiINSddle <"),
+    ];
+    for (block, offset, from, to) in cases {
+        let edited = archive.document.insert_text(at(block, offset), "INS");
+        assert_eq!(
+            save(&archive, &edited),
+            xml.replacen(from, to, 1),
+            "insert at {block}:{offset}"
+        );
+    }
+}
+
+/// Deleting all of a control's text keeps the (now empty) control;
+/// splitting inside a control keeps both halves well-formed (the left
+/// half's control closes at its end; the orphaned closer is dropped).
+#[test]
+fn run_level_sdt_stays_well_formed_through_delete_and_split() {
+    let (_, archive) = open(SDT_P0);
+    let edited = archive.document.delete_range(at(0, 7), at(0, 23));
+    let out = save(&archive, &edited);
+    assert!(
+        out.contains("<w:sdtPr><w:id w:val=\"1001\"/></w:sdtPr>"),
+        "{out}"
+    );
+    assert_eq!(out.matches("</w:sdt>").count(), 1, "{out}");
+
+    let split = archive.document.split_paragraph(at(0, 12));
+    let out = save(&archive, &split);
+    assert_eq!(out.matches("<w:sdt>").count(), 1, "{out}");
+    assert_eq!(out.matches("</w:sdt>").count(), 1, "{out}");
+    let back = read_docx(&write_docx(&archive, &split).unwrap()).unwrap();
+    assert_eq!(back.document.paragraph_text(0), Some("Before SDT R"));
+    assert_eq!(back.document.paragraph_text(1), Some("un with RPr After"));
+}
+
+/// A control that shares its start with a regenerated wrapper extending
+/// past its end (here an internal hyperlink around the control and more
+/// text) cannot be written in the natural order; it is widened to
+/// enclose the wrapper, noted, and the part stays well-formed.
+#[test]
+fn run_level_sdt_crossing_a_wrapper_is_widened_and_noted() {
+    let body = r#"<w:p><w:hyperlink w:anchor="target"><w:sdt><w:sdtPr><w:id w:val="9"/></w:sdtPr><w:sdtContent><w:r><w:t>inside</w:t></w:r></w:sdtContent></w:sdt><w:r><w:t>linked</w:t></w:r></w:hyperlink><w:r><w:t>tail</w:t></w:r></w:p>"#;
+    let (_, archive) = open(body);
+    let edited = archive.document.insert_text(at(0, 13), "X");
+    let (bytes, notes) = write_docx_with_notes(&archive, &edited).expect("write");
+    crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+    let out = document_xml_of(&bytes);
+    assert!(
+        out.contains(
+            r#"<w:sdt><w:sdtPr><w:id w:val="9"/></w:sdtPr><w:sdtContent><w:hyperlink w:anchor="target""#
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("</w:hyperlink></w:sdtContent></w:sdt>"),
+        "{out}"
+    );
+    assert!(
+        matches!(notes.as_slice(), [WriteNote::InlineWrapperWidened { .. }]),
+        "{notes:?}"
+    );
+    let back = read_docx(&bytes).unwrap();
+    assert_eq!(back.document.paragraph_text(0), Some("insidelinkedtXail"));
+}
+
+/// Stale offsets keep the control (clamped) and note it.
+#[test]
+fn stale_markup_keeps_the_content_control() {
+    let (_, archive) = open(SDT_P0);
+    let mut doc = archive.document.clone();
+    let Some(engine::Block::Paragraph(mut p)) = doc.blocks.get(0).cloned() else {
+        panic!("paragraph");
+    };
+    p.text = "short".into();
+    p.spans.clear();
+    p.dirty = true;
+    p.source_xml = None;
+    doc.blocks.set(0, engine::Block::Paragraph(p));
+    let (bytes, notes) = write_docx_with_notes(&archive, &doc).expect("write");
+    crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+    let out = document_xml_of(&bytes);
+    assert_eq!(out.matches("<w:sdt>").count(), 1, "{out}");
+    assert_eq!(notes, vec![WriteNote::StaleMarkupClamped { markers: 2 }]);
+}

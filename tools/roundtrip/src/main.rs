@@ -297,6 +297,7 @@ fn run_default() -> Result<()> {
     run_part_scoped_media_roundtrip()?;
     run_source_markup_roundtrip()?;
     inline_spans::run_form_fields_roundtrip()?;
+    inline_spans::run_content_controls_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
