@@ -212,9 +212,13 @@ function viewStateFor(engine: EngineHandle): ViewState {
     const state = createRoot(() => {
         const [zoom, setZoom] = createSignal(1);
         const [deviceScale, setDeviceScale] = createSignal<number | undefined>(undefined);
+        /* Issue #240 — seeded from the engine and fed by its change feed:
+           a downgrade persisted across reloads is in force from boot,
+           before any RECOVERED event exists. */
         const [rendererDowngrade, setRendererDowngrade] = createSignal<
             RendererDowngrade | undefined
-        >(undefined);
+        >(engine.rendererDowngrade);
+        engine.onRendererDowngrade?.((d) => setRendererDowngrade(d));
         engine.subscribe((evt: Event) => {
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));

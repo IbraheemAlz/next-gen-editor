@@ -79,6 +79,7 @@ export type {
 import type {
     Command,
     Event,
+    RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 /**
@@ -94,6 +95,16 @@ export interface EngineClientLike {
     recover(canvas: OffscreenCanvas): Promise<void>;
     readonly crossOriginIsolated: boolean;
     readonly renderer: string;
+    /**
+     * Issue #240 — optional crash-loop renderer policy. The downgrade in
+     * force (set at boot from a persisted streak, or by a recovery), a
+     * change feed for it, and the "retry the GPU renderer" action (forgets
+     * the persisted streak and reloads). Implementations without a GPU
+     * policy omit all three; the Dev HUD then shows no retry action.
+     */
+    readonly rendererDowngrade?: RendererDowngrade | undefined;
+    onRendererDowngrade?(fn: (d: RendererDowngrade | undefined) => void): () => void;
+    retryGpuRenderer?(): Promise<void>;
 }
 
 /** Read-only revision row consumed by the Track Changes sidebar. */
