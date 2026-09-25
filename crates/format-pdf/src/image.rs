@@ -590,10 +590,278 @@ fn prepare_gif(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, Imag
     split_samples(layout, &canvas, alpha_mode)
 }
 
+/* ---- Issue #228: WebP VP8 partition-size pre-validation --------------
+Module doc's audit found `image_webp::vp8::init_partitions` (and, one
+field earlier in `read_frame_header`, the first partition's own buffer)
+allocates a declared partition size BEFORE checking the reader actually
+has that many bytes. Nothing in `image_webp`'s public API exposes those
+declared sizes ahead of time, so catching a lying header means parsing
+the RIFF container and the VP8 frame header ourselves — far enough to
+read `log2_nbr_of_dct_partitions`, which sits behind the boolean-coded
+(not raw-byte) frame header fields RFC 6386 §9.2–§9.4 define. VP8L
+(lossless) uses a completely different bitstream and is NOT covered here
+— see the module doc's "Patching either needs a fork" note; that one
+stays a documented residual risk. */
+
+/// Minimal VP8 boolean/arithmetic decoder (RFC 6386 §7.3) — reimplemented
+/// independently from the public IETF specification, NOT copied from any
+/// vendored decoder, solely so [`vp8_num_partitions`] can walk far enough
+/// into a lossy VP8 frame header to read `log2_nbr_of_dct_partitions`.
+/// Byte-at-a-time refill (the real decoders in the wild refill 4 bytes at
+/// once purely for speed) — mathematically the same renormalizing
+/// range-coder, just less optimized, which is fine for a few dozen
+/// header bits. Every read returns `None` once `data` is exhausted; the
+/// caller treats that as "can't tell" and lets the file through
+/// unrejected — seeing this correctly is a *pre-validation*, not a
+/// decoder, so an inconclusive walk must fail OPEN. A false reject here
+/// would silently drop a legitimate image, which is strictly worse than
+/// the documented residual risk standing a little longer.
+#[cfg(feature = "webp")]
+struct Vp8BoolDecoder<'a> {
+    data: &'a [u8],
+    pos: usize,
+    value: u64,
+    range: u32,
+    bit_count: i32,
+}
+
+#[cfg(feature = "webp")]
+impl<'a> Vp8BoolDecoder<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Vp8BoolDecoder {
+            data,
+            pos: 0,
+            value: 0,
+            range: 255,
+            bit_count: -8,
+        }
+    }
+
+    fn read_bool(&mut self, prob: u8) -> Option<bool> {
+        if self.bit_count < 0 {
+            let byte = *self.data.get(self.pos)?;
+            self.pos += 1;
+            self.value = (self.value << 8) | u64::from(byte);
+            self.bit_count += 8;
+        }
+        let prob = u32::from(prob);
+        let split = 1 + (((self.range - 1) * prob) >> 8);
+        let bigsplit = u64::from(split) << self.bit_count;
+        let bit = if let Some(new_value) = self.value.checked_sub(bigsplit) {
+            self.range -= split;
+            self.value = new_value;
+            true
+        } else {
+            self.range = split;
+            false
+        };
+        let shift = self.range.leading_zeros().saturating_sub(24);
+        self.range <<= shift;
+        self.bit_count -= shift as i32;
+        Some(bit)
+    }
+
+    fn read_flag(&mut self) -> Option<bool> {
+        self.read_bool(128)
+    }
+
+    fn read_literal(&mut self, n: u8) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | u32::from(self.read_flag()?);
+        }
+        Some(v)
+    }
+
+    /// RFC 6386's "optional signed value": a flag, then — only when the
+    /// flag is set — an `n`-bit magnitude and a sign flag. We only need
+    /// to consume the right number of bits, never the value itself.
+    fn skip_optional_signed_value(&mut self, n: u8) -> Option<()> {
+        if self.read_flag()? {
+            let _ = self.read_literal(n)?;
+            let _ = self.read_flag()?;
+        }
+        Some(())
+    }
+}
+
+/// Walk a lossy VP8 keyframe's boolean-coded header (RFC 6386 §9.2–§9.4 —
+/// the exact field sequence `image_webp::vp8::read_frame_header` reads)
+/// far enough to read `log2_nbr_of_dct_partitions`, returning the number
+/// of partitions declared (`1 << that field`). `first_partition` is the
+/// frame's first partition — the `first_partition_size`-byte span right
+/// after the keyframe start code + dimensions — since every bit this
+/// reads lives inside it. `None` on any inconsistency (ran out of bits
+/// before reaching the field): see [`Vp8BoolDecoder`]'s doc comment on
+/// failing open.
+#[cfg(feature = "webp")]
+fn vp8_num_partitions(first_partition: &[u8]) -> Option<u32> {
+    let mut b = Vp8BoolDecoder::new(first_partition);
+    // Keyframe-only fields — WebP's embedded VP8 bitstream is always a
+    // keyframe (`prepare_webp` only ever decodes a still image).
+    let _color_space = b.read_flag()?;
+    let _clamping_type = b.read_flag()?;
+    let segmentation_enabled = b.read_flag()?;
+    if segmentation_enabled {
+        // `read_segment_updates`, RFC 6386 §9.3.
+        let update_mb_segmentation_map = b.read_flag()?;
+        let update_segment_feature_data = b.read_flag()?;
+        if update_segment_feature_data {
+            let _segment_feature_mode = b.read_flag()?;
+            for _ in 0..4 {
+                b.skip_optional_signed_value(7)?;
+            }
+            for _ in 0..4 {
+                b.skip_optional_signed_value(6)?;
+            }
+        }
+        if update_mb_segmentation_map {
+            for _ in 0..3 {
+                if b.read_flag()? {
+                    let _ = b.read_literal(8)?;
+                }
+            }
+        }
+    }
+    let _filter_type = b.read_flag()?;
+    let _filter_level = b.read_literal(6)?;
+    let _sharpness_level = b.read_literal(3)?;
+    let loop_filter_adj_enable = b.read_flag()?;
+    if loop_filter_adj_enable {
+        // `read_loop_filter_adjustments`, RFC 6386 §9.4 — its OWN update
+        // flag gates the actual deltas.
+        if b.read_flag()? {
+            for _ in 0..4 {
+                b.skip_optional_signed_value(6)?;
+            }
+            for _ in 0..4 {
+                b.skip_optional_signed_value(6)?;
+            }
+        }
+    }
+    let log2_nbr_of_dct_partitions = b.read_literal(2)?;
+    Some(1u32 << log2_nbr_of_dct_partitions)
+}
+
+/// Walk top-level RIFF sub-chunks (FourCC + `u32` LE size + payload,
+/// padded to an even total) starting right after the 12-byte `RIFF` /
+/// size / `WEBP` header, and return the payload of the first chunk whose
+/// FourCC matches `want` — clipped to however many bytes `data` actually
+/// has, never past it. `None` on a malformed container, or when `want`
+/// never appears (a VP8L-only file, say — that shape simply isn't
+/// covered by this pre-validation and falls through here).
+#[cfg(feature = "webp")]
+fn riff_first_chunk<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+        return None;
+    }
+    let mut pos = 12usize;
+    while pos + 8 <= data.len() {
+        let fourcc = &data[pos..pos + 4];
+        let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let payload_start = pos + 8;
+        let payload_end = payload_start.checked_add(size)?.min(data.len());
+        if fourcc == want {
+            return Some(&data[payload_start..payload_end]);
+        }
+        let advance = 8usize.checked_add(size)?.checked_add(size % 2)?;
+        pos = pos.checked_add(advance)?;
+    }
+    None
+}
+
+/// Issue #228 — reject a lossy WebP whose VP8 frame header declares
+/// partition sizes that read past the chunk's own bytes, BEFORE handing
+/// it to `image_webp` (whose `vp8::init_partitions` allocates each one
+/// first — see the module doc's allocation-bounds audit). Deliberately
+/// conservative: any container or bitstream shape this doesn't fully
+/// recognize passes through UNREJECTED — see [`Vp8BoolDecoder`]'s doc
+/// comment on why an inconclusive walk must never reject.
+#[cfg(feature = "webp")]
+fn validate_webp_vp8_partition_sizes(data: &[u8]) -> Result<(), ImageSkipReason> {
+    let Some(chunk) = riff_first_chunk(data, b"VP8 ") else {
+        return Ok(());
+    };
+    // Frame tag (3 bytes, LE) + keyframe start code (3 bytes) + width +
+    // height (2×u16) = 10 bytes before the first partition begins.
+    if chunk.len() < 10 {
+        return Ok(());
+    }
+    let tag = u32::from(chunk[0]) | (u32::from(chunk[1]) << 8) | (u32::from(chunk[2]) << 16);
+    let keyframe = tag & 1 == 0;
+    let first_partition_size = (tag >> 5) as usize;
+    let is_start_code = chunk[3] == 0x9d && chunk[4] == 0x01 && chunk[5] == 0x2a;
+    if !keyframe || !is_start_code {
+        // Not the "still image" shape `image_webp` expects here; let the
+        // real decoder produce whatever error actually fits.
+        return Ok(());
+    }
+    const HEADER_LEN: usize = 10;
+    let Some(first_partition_end) = HEADER_LEN.checked_add(first_partition_size) else {
+        return Ok(());
+    };
+    if first_partition_end > chunk.len() {
+        // The FIRST partition itself already reads past the chunk — a
+        // smaller (≤ ~512 KiB, the field is 19 bits) but real instance of
+        // the SAME allocate-before-validate gap, one field earlier than
+        // `init_partitions`. Cheap to catch, so catch it too.
+        return Err(malformed(&format!(
+            "WebP: VP8 first partition declares {first_partition_size} bytes past a \
+             {chunk_len}-byte chunk",
+            chunk_len = chunk.len()
+        )));
+    }
+    let first_partition = &chunk[HEADER_LEN..first_partition_end];
+    let Some(num_partitions) = vp8_num_partitions(first_partition) else {
+        return Ok(());
+    };
+    if num_partitions <= 1 {
+        // `init_partitions` only reads the 3-byte size table when there
+        // is more than one partition — a single partition needs no table.
+        return Ok(());
+    }
+    let table_len = 3 * (num_partitions as usize - 1);
+    let Some(after_table) = first_partition_end.checked_add(table_len) else {
+        return Err(malformed("WebP: VP8 partition count overflow"));
+    };
+    if after_table > chunk.len() {
+        return Err(malformed(&format!(
+            "WebP: VP8 declares {num_partitions} partitions needing a \
+             {table_len}-byte size table past a {chunk_len}-byte chunk",
+            chunk_len = chunk.len()
+        )));
+    }
+    // The table itself fits; now check each declared partition's OWN
+    // data actually fits in what's left — the exact allocation the
+    // module doc's audit found unguarded.
+    let mut pos = after_table;
+    for i in 0..(num_partitions as usize - 1) {
+        let at = first_partition_end + i * 3;
+        let size = usize::from(chunk[at])
+            | (usize::from(chunk[at + 1]) << 8)
+            | (usize::from(chunk[at + 2]) << 16);
+        let Some(next) = pos.checked_add(size) else {
+            return Err(malformed("WebP: VP8 partition size overflow"));
+        };
+        if next > chunk.len() {
+            return Err(malformed(&format!(
+                "WebP: VP8 partition {i} declares {size} bytes past a \
+                 {chunk_len}-byte chunk",
+                chunk_len = chunk.len()
+            )));
+        }
+        pos = next;
+    }
+    Ok(())
+}
+
 /// WebP → RGB or RGBA via `image-webp` (lossy VP8 + `ALPH`, lossless VP8L,
 /// first frame of an animation).
 #[cfg(feature = "webp")]
 fn prepare_webp(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, ImageSkipReason> {
+    // Issue #228 — cheap pre-validation BEFORE handing the file to
+    // `image_webp`: see the block comment above.
+    validate_webp_vp8_partition_sizes(data)?;
     let mut decoder = image_webp::WebPDecoder::new(Cursor::new(data))
         .map_err(|e| malformed(&format!("WebP header: {e}")))?;
     let (width, height) = decoder.dimensions();
@@ -1698,6 +1966,63 @@ mod tests {
         assert!(
             flat.data[24..].iter().all(|&v| v == 255),
             "clear rows → white"
+        );
+    }
+
+    /// Issue #228 — [`vp8_num_partitions`] must correctly walk a REAL
+    /// lossy VP8 frame header (both the plain and the `VP8X`+`ALPH`-
+    /// wrapped fixtures) to the same single-partition conclusion an
+    /// encoder targeting two tiny 4×4 test images would produce, so the
+    /// pre-validation this file adds never second-guesses a legitimate
+    /// file — see `Vp8BoolDecoder`'s doc comment on why a false reject
+    /// would be worse than the residual risk it stands in for.
+    #[cfg(feature = "webp")]
+    #[test]
+    fn vp8_num_partitions_reads_real_fixtures_correctly() {
+        for fixture in [
+            &test_images::WEBP_LOSSY_4X4_RED[..],
+            &test_images::WEBP_LOSSY_ALPHA_4X4_BLUE[..],
+        ] {
+            let chunk = riff_first_chunk(fixture, b"VP8 ").expect("fixture has a VP8 chunk");
+            let tag = u32::from(chunk[0]) | (u32::from(chunk[1]) << 8) | (u32::from(chunk[2]) << 16);
+            assert_eq!(tag & 1, 0, "fixture's VP8 frame must be a keyframe");
+            let first_partition_size = (tag >> 5) as usize;
+            let first_partition = &chunk[10..10 + first_partition_size];
+            assert_eq!(
+                vp8_num_partitions(first_partition),
+                Some(1),
+                "a tiny 4x4 test image encodes a single DCT partition"
+            );
+        }
+    }
+
+    /// Issue #228 — a WebP whose VP8 frame tag declares a
+    /// `first_partition_size` (524287 bytes, the 19-bit field's max) that
+    /// reads past the file's own `VP8 ` chunk (72 bytes total, 42 bytes
+    /// actually available after the 10-byte frame header) is rejected
+    /// BEFORE `image_webp` ever allocates a buffer for it — this is a
+    /// real, if smaller-magnitude, instance of the exact
+    /// allocate-before-validate gap the module doc's audit found in
+    /// `vp8::init_partitions`, one field earlier in
+    /// `read_frame_header`. Built from the real `WEBP_LOSSY_4X4_RED`
+    /// fixture with only the 3-byte frame tag altered (see
+    /// `fuzz/corpus/image_decode/webp_vp8_partition_size_exceeds_chunk.bin`,
+    /// generated the same way) — every other byte, including the
+    /// keyframe start code right after the tag, is untouched.
+    #[cfg(feature = "webp")]
+    #[test]
+    fn webp_oversized_first_partition_size_is_rejected_before_allocating() {
+        let mut data = test_images::WEBP_LOSSY_4X4_RED;
+        // tag = (0x7FFFF << 5) | 0x10 — 0x10 preserves the original
+        // keyframe/version/show_frame low 5 bits; 0x7FFFF (19 ones) is
+        // the field's max `first_partition_size`.
+        data[20] = 0xf0;
+        data[21] = 0xff;
+        data[22] = 0xff;
+        let err = prepare_image(&data, "image/webp", AlphaMode::SoftMask, false).unwrap_err();
+        assert!(
+            matches!(&err, ImageSkipReason::Malformed { detail } if detail.contains("first partition")),
+            "{err:?}"
         );
     }
 
