@@ -13,6 +13,15 @@
  * changing zoom through either updates both, and a crash recovery that
  * lands on a different zoom re-syncs both (#97).
  *
+ * Issue #239 — this widget never took an initial-zoom prop of its own
+ * (the removed `defaultScale` was a no-op since #52 — "ignored", see
+ * that issue's history). A host that wants a starting zoom now has a
+ * real, non-deprecated path: `EditorSurface`'s `initialZoom` prop, or
+ * `cmd.openDocument(bytes, name, { initialZoom })` — both dispatch
+ * `SET_ZOOM` through the engine, which queues it even before the first
+ * `RenderPage` instead of dropping it, so the value reaches every
+ * `ZoomControls` (including this one) the normal way.
+ *
  * Shortcuts:
  *   Ctrl+0 → 100%
  *   Ctrl+= → step up
@@ -27,12 +36,6 @@ const MIN = 0.25;
 const MAX = 4.0;
 
 export interface ZoomControlsProps {
-    /**
-     * @deprecated Issue #52 — ignored. The engine owns the zoom and every
-     * `ZoomControls` mirrors it; an initial zoom is a `SET_ZOOM` the host
-     * dispatches once the engine is up.
-     */
-    defaultScale?: number;
     /** Whether to bind the Ctrl+0/+/- shortcuts. Default true. */
     bindShortcuts?: boolean;
 }

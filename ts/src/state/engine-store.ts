@@ -151,7 +151,9 @@ export function selectionViewForPointer(): { rects: Rect[]; kind: SelectionKind 
 export interface ImageRectCss {
     path: BlockPath;
     at: number;
-    relId: string;
+    /** Issue #224 — the `DocumentTree::media` key (`ImageRect.media_key`),
+     *  not the deprecated `rel_id`. */
+    mediaKey: string;
     rect: Rect; // CSS px, document-absolute
     widthEmu: number;
     heightEmu: number;
@@ -382,7 +384,7 @@ export function createEngineStore(client: EngineClient) {
             const rects: ImageRectCss[] = evt.images.map((im) => ({
                 path: im.path,
                 at: im.at,
-                relId: im.rel_id,
+                mediaKey: im.media_key,
                 rect: toCssRect(im.rect, dpr),
                 widthEmu: im.width_emu,
                 heightEmu: im.height_emu,
