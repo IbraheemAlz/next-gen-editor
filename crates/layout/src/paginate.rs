@@ -1433,7 +1433,11 @@ impl Paginator {
     /// rule can never fire again. Pulling a widow line over always places
     /// at least 2 lines, so it is progress. An unsatisfiable constraint
     /// (the paragraph already opens its column) or a watchdog at stage
-    /// (a) keeps `k` and records `KeepChainDropped`.
+    /// (a) keeps `k` and records a release note — `KeepLinesDropped` when
+    /// `<w:keepLines/>` was the constraint in force, `WidowControlDropped`
+    /// for widow / orphan control (issue #180: these used to share
+    /// `KeepChainDropped` with the unrelated keep-*next* release in
+    /// [`Self::detach_keep_chain`], conflating three degradations).
     fn keep_adjusted_split(&mut self, para: &ParagraphBox, k: usize, n: usize) -> usize {
         if k == 0 || k >= n {
             return k;
@@ -1454,7 +1458,12 @@ impl Paginator {
             || (want == 0 && !self.keep_chain_bounds().1);
         if releasing {
             let page = self.cur_page_index();
-            self.watchdog.note(DegradeReason::KeepChainDropped, page);
+            let reason = if flow.keep_lines {
+                DegradeReason::KeepLinesDropped
+            } else {
+                DegradeReason::WidowControlDropped
+            };
+            self.watchdog.note(reason, page);
             return k;
         }
         want
@@ -4960,7 +4969,10 @@ mod tests {
         let (pages, notes) = pag.finish_with_notes();
         assert!(t0.elapsed() < adversarial_budget());
         assert_eq!(lines_per_page(&pages), vec![vec![1], vec![43], vec![17]]);
-        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+        /* Issue #180 — `keep_lines` is checked first in
+        `keep_adjusted_split`, so its release wins the reason even though
+        `widow_control` is also set on this paragraph. */
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepLinesDropped]);
         assert_eq!(notes[0].page, 1);
     }
 
@@ -4989,7 +5001,7 @@ mod tests {
         pag.push_block(LayoutBlock::Paragraph(p), 0.0, 0.0);
         let (pages, notes) = pag.finish_with_notes();
         assert_eq!(lines_per_page(&pages), vec![vec![1], vec![1]]);
-        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::WidowControlDropped]);
     }
 
     /// Stage (a) releases widow / orphan control like any optional
@@ -5002,7 +5014,7 @@ mod tests {
         pag.push_block_inner(LayoutBlock::Paragraph(widow_para(5)), 0.0, 0.0, false);
         let (pages, notes) = pag.finish_with_notes();
         assert_eq!(lines_per_page(&pages), vec![vec![42, 1], vec![4]]);
-        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::WidowControlDropped]);
     }
 
     /// Repeated header rows taller than the page (the #7 class: an

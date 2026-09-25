@@ -451,6 +451,8 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
     let reason = match d.reason {
         R::OversizeLine => LayoutDegradeReason::OversizeLine,
         R::KeepChainDropped => LayoutDegradeReason::KeepChainDropped,
+        R::KeepLinesDropped => LayoutDegradeReason::KeepLinesDropped,
+        R::WidowControlDropped => LayoutDegradeReason::WidowControlDropped,
         R::HeaderRepeatDropped => LayoutDegradeReason::HeaderRepeatDropped,
         R::FootnoteOverflow => LayoutDegradeReason::FootnoteOverflow,
         R::FrozenPlacement => LayoutDegradeReason::FrozenPlacement,
@@ -8664,13 +8666,19 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
-                        /* Issue #95 — pagination constraints from the
-                        resolved (style-cascaded) properties. Widow /
-                        orphan control defaults ON (Word). */
-                        para_box.keep_next = para.props.keep_next;
-                        para_box.flow.keep_lines = para.props.keep_lines;
-                        para_box.flow.widow_control = para.props.widow_control_on();
-                        after_keep_next = para.props.keep_next;
+                        /* Issue #95 / #178 / #179 — pagination
+                        constraints from the resolved (style-cascaded)
+                        properties. keepNext/keepLines are tri-state
+                        (#178), OOXML default off. Widow / orphan control
+                        defaults to the host-configurable
+                        `DocumentSettings::widow_control_default` (#179;
+                        Word's own default is ON). */
+                        para_box.keep_next = para.props.keep_next_on();
+                        para_box.flow.keep_lines = para.props.keep_lines_on();
+                        para_box.flow.widow_control = para
+                            .props
+                            .widow_control_on(doc.settings.widow_control_default);
+                        after_keep_next = para.props.keep_next_on();
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(
@@ -18593,6 +18601,93 @@ mod tests {
         assert!(matches!(direct, Event::Error { .. }));
     }
 
+    /// Issue #180(b) — `attach_block_paths` rebuilds `page_paths` from the
+    /// paginator's emitted pages (issue #95) and PADS any page a trailing
+    /// document-end endnote flushes on its own with an empty `Vec` (the
+    /// endnote band lives in `PageBox::endnotes`, outside `page.blocks`,
+    /// so a body-less page legitimately has zero paths) — nothing
+    /// exercised that directly. A single oversized endnote forces several
+    /// endnote-only pages past the body; every page must still carry a
+    /// path-per-block (`page_paths.len() == pages.len()` in lockstep,
+    /// none missing, none extra) and a hit-test on the LAST page must
+    /// resolve, not panic or mis-map.
+    #[test]
+    fn trailing_endnote_pages_keep_path_parity_and_hit_test_resolves_on_the_last_page() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Body reference point."));
+        let evt = engine.do_insert_note(
+            bpos_top(0, "Body reference point.".len() as u32),
+            engine::NoteKind::Endnote,
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(matches!(
+            engine.active_story,
+            StoryTarget::Note {
+                kind: engine::NoteKind::Endnote,
+                ..
+            }
+        ));
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        /* ~9.7k chars of wrapping prose — several times more than fits
+        one A4 page at 16px/26pt line height, so the trailing band must
+        flush onto multiple fresh pages past the body's single page. */
+        let long_text =
+            "Sphinx of black quartz, judge my vow; pack my box with five dozen liquor jugs. "
+                .repeat(120);
+        let typed = engine.do_insert_text_interactive(caret, long_text);
+        assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+        let exited = engine.do_exit_header_footer();
+        assert!(
+            matches!(exited, Event::SelectionChanged { .. }),
+            "{exited:?}"
+        );
+
+        let scale = engine.scale();
+        let (pages, _fonts, page_paths, info) = engine
+            .build_pages(scale, false, None)
+            .expect("document-end endnote layout");
+        assert!(
+            info.degradations.is_empty(),
+            "nominal endnote overflow reported degradations: {:?}",
+            info.degradations
+        );
+        assert!(
+            pages.len() >= 3,
+            "the oversized endnote must overflow onto trailing pages, got {} page(s)",
+            pages.len()
+        );
+        assert_eq!(
+            page_paths.len(),
+            pages.len(),
+            "every page must have a path-list entry — none missing from the \
+             trailing-endnote pad"
+        );
+        for (pi, page) in pages.iter().enumerate() {
+            assert_eq!(
+                page_paths[pi].len(),
+                page.blocks.len(),
+                "page {pi} has {} block(s) but {} path(s)",
+                page.blocks.len(),
+                page_paths[pi].len()
+            );
+        }
+        let last = pages.last().expect("at least one page");
+        assert!(
+            last.blocks.is_empty(),
+            "the last page is pure endnote overflow, carrying no body blocks"
+        );
+        assert!(
+            !last.endnotes.is_empty(),
+            "the last page's content IS the endnote band overflow"
+        );
+
+        let last_page_idx = (pages.len() - 1) as u32;
+        let hit = engine.do_hit_test_in_page(last_page_idx, BridgePoint { x: 10.0, y: 10.0 });
+        assert!(
+            matches!(hit, Event::HitResult { .. }),
+            "hit-testing on the trailing endnote-only page must resolve, got {hit:?}"
+        );
+    }
+
     /// Clicking inside the footnote band enters that note; clicking the
     /// body while a note is open returns to the body.
     #[test]
@@ -22289,6 +22384,17 @@ mod tests {
         doc
     }
 
+    /// Issue #179 — the host-configurable document-level fallback:
+    /// every paragraph is left at `widow_control: None` (never specified
+    /// anywhere in the cascade) and `default_on` rides
+    /// `DocumentSettings::widow_control_default` instead, exercising
+    /// [`engine::ParaProperties::widow_control_on`]'s parameter rather
+    /// than a per-paragraph stamp.
+    fn with_widow_control_default(mut doc: DocumentTree, default_on: bool) -> DocumentTree {
+        doc.settings.widow_control_default = default_on;
+        doc
+    }
+
     /// Every engine-level nominal shape: the 50-page perf fixture (full
     /// layout and a culled band, both at DPR 2), a forced page break, an
     /// autofit table and a long multi-page prose doc. Fingerprints pinned
@@ -22362,6 +22468,70 @@ mod tests {
             out.push((name, pages, info.degradations));
         }
         out
+    }
+
+    /// Issue #179 — the same six widow/orphan-sensitive fixtures as
+    /// [`engine_nominal_fixtures_with`], but every paragraph's
+    /// `widow_control` stays `None` (unspecified) and `default_on` rides
+    /// [`DocumentSettings::widow_control_default`] instead of a
+    /// per-paragraph stamp — proving the host-configurable default takes
+    /// the same effect as the old hard-coded one it replaces.
+    fn engine_nominal_fixtures_with_document_widow_default(
+        default_on: bool,
+    ) -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
+        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let engine = test_engine_with_doc(with_widow_control_default(archive.document, default_on));
+        let mut out = Vec::new();
+        let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
+        out.push(("50p_full_x2", pages, info.degradations));
+        let (pages, _, _, info) = engine.build_pages(2.0, false, Some(2000.0)).expect("band");
+        out.push(("50p_band_2000_x2", pages, info.degradations));
+
+        let engine = test_engine_with_doc(with_widow_control_default(
+            two_page_doc("alpha beta gamma", "delta epsilon"),
+            default_on,
+        ));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
+        out.push(("two_page_form_feed", pages, info.degradations));
+
+        let engine = test_engine_with_doc(with_widow_control_default(table_doc(), default_on));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
+        out.push(("autofit_table", pages, info.degradations));
+
+        let engine = test_engine_with_doc(with_widow_control_default(prose_doc(300), default_on));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
+        out.push(("prose_300_full", pages, info.degradations));
+        let (pages, _, _, info) = engine
+            .build_pages(1.0, false, Some(1200.0))
+            .expect("prose band");
+        out.push(("prose_300_band_1200", pages, info.degradations));
+        out
+    }
+
+    /// Issue #179 acceptance — `DocumentSettings::widow_control_default =
+    /// false` reproduces the pre-#95 fingerprints (the strict ECMA-376
+    /// reading: an absent `<w:widowControl>` is not applied).
+    #[test]
+    fn document_widow_control_default_off_reproduces_pre_95_fingerprints() {
+        assert_fixtures_pinned(
+            engine_nominal_fixtures_with_document_widow_default(false),
+            PINNED_ENGINE_FINGERPRINTS,
+        );
+    }
+
+    /// Issue #179 acceptance — `DocumentSettings::widow_control_default =
+    /// true` (the crate `#[default]`, matching Word's own application
+    /// default) reproduces the #95 ON fingerprints byte-for-byte, whether
+    /// the ON-ness comes from the host setting or (as `with_widow_control`
+    /// exercises) an explicit per-paragraph `None`.
+    #[test]
+    fn document_widow_control_default_on_reproduces_issue_95_fingerprints() {
+        assert_fixtures_pinned(
+            engine_nominal_fixtures_with_document_widow_default(true),
+            PINNED_WIDOW_DEFAULT_FINGERPRINTS,
+        );
     }
 
     /// Issue #91 — a table taller than a page splits at row boundaries
@@ -22530,7 +22700,7 @@ mod tests {
         d.blocks.push_back(para_of(
             "Heading",
             engine::ParaProperties {
-                keep_next,
+                keep_next: Some(keep_next),
                 widow_control: widow,
                 ..Default::default()
             },

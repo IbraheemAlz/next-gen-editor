@@ -210,25 +210,43 @@ impl DocxArchive {
 }
 
 /// Read a `.docx` byte blob → parsed document + stashed sibling entries.
-/// Fallback page geometry for a `<w:sectPr>` missing `<w:pgSz>` is A4 —
-/// see [`read_docx_with_settings`] to override it.
+/// Fallback page geometry for a `<w:sectPr>` missing `<w:pgSz>` is A4, and
+/// a paragraph with no resolved `<w:widowControl>` anywhere in the cascade
+/// reads as widow/orphan control ON (Word's application default) — see
+/// [`read_docx_with_settings`] to override either.
 pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
-    read_docx_with_settings(bytes, engine::DefaultPageSize::default())
+    let defaults = engine::DocumentSettings::default();
+    read_docx_with_settings(
+        bytes,
+        defaults.default_page_size,
+        defaults.widow_control_default,
+    )
 }
 
-/// [`read_docx`], with a host-chosen [`engine::DefaultPageSize`] fallback
-/// for any `<w:sectPr>` that omits `<w:pgSz>` (issue #109 — ECMA-376
-/// requires `pgSz`, but the Apache POI / docx4j "wild document" corpus
-/// ships files that skip it; `read_docx` itself always resolves those to
-/// A4, unchanged, so every pinned `layout::geometry_fingerprint` fixture
-/// keeps its geometry). An embedding host that defaults new/underspecified
-/// documents to US Letter calls this directly with
-/// `engine::DefaultPageSize::Letter`. The choice is stamped onto
-/// `DocumentTree.settings.default_page_size` for inspection — it is never
-/// read FROM the archive, since OOXML has no such element.
+/// [`read_docx`], with host-chosen fallbacks for two settings OOXML never
+/// carries an element for — the values are stamped onto
+/// `DocumentTree.settings` for inspection, never read FROM the archive:
+///
+/// - `default_page_size` ([`engine::DefaultPageSize`], issue #109) — the
+///   fallback for any `<w:sectPr>` that omits `<w:pgSz>` (ECMA-376 requires
+///   `pgSz`, but the Apache POI / docx4j "wild document" corpus ships files
+///   that skip it). An embedding host that defaults new/underspecified
+///   documents to US Letter calls this directly with
+///   `engine::DefaultPageSize::Letter`.
+/// - `widow_control_default` (issue #179) — the effective
+///   `<w:widowControl>` for a paragraph whose resolved
+///   `engine::ParaProperties::widow_control` is `None`. #95 chose `true`
+///   (Word's application default); ECMA-376 itself reads an absent element
+///   as "not applied" (`false`). A host that wants the strict spec reading
+///   passes `false` here instead of stamping every paragraph.
+///
+/// `read_docx` itself always resolves both to their `#[default]`s (`A4`,
+/// `true`), unchanged, so every pinned `layout::geometry_fingerprint`
+/// fixture keeps its geometry.
 pub fn read_docx_with_settings(
     bytes: &[u8],
     default_page_size: engine::DefaultPageSize,
+    widow_control_default: bool,
 ) -> Result<DocxArchive, DocxError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
     let mut other_entries: Vec<(String, Vec<u8>)> = Vec::new();
@@ -268,6 +286,7 @@ pub fn read_docx_with_settings(
         default_page_size.geometry(),
     )?;
     document.settings.default_page_size = default_page_size;
+    document.settings.widow_control_default = widow_control_default;
 
     /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
     numbering resolver. Second pass over the parsed paragraphs fills each
