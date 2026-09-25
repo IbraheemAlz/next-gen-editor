@@ -100,17 +100,33 @@ export const DevHud: Component<DevHudProps> = (props) => {
                     <dt>Renderer</dt>
                     <dd>{state.renderer()}</dd>
 
-                    {/* Issue #99 — why this session is no longer on Vello. */}
+                    {/* Issue #99 — why this session is no longer on Vello.
+                        Issue #240 — the downgrade is sticky across reloads
+                        (persisted, 24 h decay); "Retry" forgets it and
+                        reloads so the next boot probes the GPU again. */}
                     <Show when={state.rendererDowngrade()}>
                         {(d) => (
                             <>
                                 <dt>Fallback</dt>
                                 <dd
                                     class="nge-hud__warn"
-                                    title={`Recovery forced ${d().to} after ${d().consecutive_traps} consecutive traps on ${d().from}`}
+                                    title={`Forced ${d().to} after ${d().consecutive_traps} consecutive failures on ${d().from}; sticky across reloads for 24 h`}
                                 >
                                     {d().from} → {d().to} ({d().consecutive_traps} traps)
                                 </dd>
+                                <Show when={cmd.canRetryGpuRenderer}>
+                                    <dt />
+                                    <dd>
+                                        <button
+                                            class="nge-hud__retry"
+                                            type="button"
+                                            title={`Forget the crash-loop record and reload to probe ${d().from} again`}
+                                            onClick={() => void cmd.retryGpuRenderer()}
+                                        >
+                                            Retry {d().from} (reload)
+                                        </button>
+                                    </dd>
+                                </Show>
                             </>
                         )}
                     </Show>

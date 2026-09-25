@@ -4,8 +4,10 @@
 //! `read_docx` -> full layout (`crates/layout`) -> PDF export of every page
 //! (`crates/format-pdf`) -> `write_docx` -> `read_docx` again, asserting no
 //! panic, sibling byte-identity, `document.xml` stability, plain-text
-//! equality, and stable page count (plus an optional scripted-edit ≤2×N
-//! bound check). One JSON object per document, streamed to `--out` as
+//! equality, and stable page count (plus an optional scripted-edit fidelity
+//! check, issue #251: primarily `source_bytes_rewritten == 0`, plus a
+//! secondary ≤2×N + new-run-allowance size bound kept informational). One
+//! JSON object per document, streamed to `--out` as
 //! JSONL — this binary does *not* bucket or summarize; that is
 //! `tools/corpus/report.mjs`'s job (issue #88 Scope §3), which reads the
 //! JSONL this produces.
@@ -378,8 +380,21 @@ fn main() -> ExitCode {
     /* Issue #134 — the UI save path (`format_docx::save_docx`). */
     let mut ui_checked = 0usize;
     let mut ui_siblings_identical = 0usize;
-    let mut ui_matches_write_docx = 0usize;
-
+    let mut ui_matches_write_docx = 0usize; /* Issue #250 — pure-insertion edited saves (0 source bytes rewritten),
+    plain typing vs the same net edit in track-changes mode. */
+    let mut edit_checked = 0usize;
+    let mut pure_plain = 0usize;
+    let mut pure_tracked = 0usize;
+    let mut stale_plain = 0usize;
+    let mut stale_tracked = 0usize;
+    /* Issue #251 — the scripted-edit fidelity bound (primary:
+    `source_bytes_rewritten == 0`) and the secondary size bound (2×N + a
+    new-run allowance), plus a root-cause histogram for every document
+    that still rewrites source bytes (tracked against issues #242-#249). */
+    let mut fidelity_ok_count = 0usize;
+    let mut secondary_bound_violations = 0usize;
+    let mut rewrite_causes: std::collections::BTreeMap<String, (usize, String, u64)> =
+        std::collections::BTreeMap::new();
     for (i, path) in files.iter().enumerate() {
         let label = path
             .strip_prefix(&args.corpus_dir)
@@ -417,10 +432,39 @@ fn main() -> ExitCode {
             }
         }
 
+        if let Some(ec) = &rec.edit_check {
+            edit_checked += 1;
+            pure_plain += usize::from(ec.source_bytes_rewritten == 0);
+            pure_tracked += usize::from(ec.tracked_source_bytes_rewritten == Some(0));
+            stale_plain += usize::from(ec.markup_in_step == Some(false));
+            stale_tracked += usize::from(ec.tracked_markup_in_step == Some(false));
+        }
+
         if let Some(identical) = rec.ui_save_siblings_identical {
             ui_checked += 1;
             ui_siblings_identical += usize::from(identical);
             ui_matches_write_docx += usize::from(rec.ui_save_matches_write_docx == Some(true));
+        }
+
+        if let Some(ec) = &rec.edit_check {
+            if ec.fidelity_ok {
+                fidelity_ok_count += 1;
+            }
+            if !ec.within_secondary_bound {
+                secondary_bound_violations += 1;
+            }
+            if let Some(cause) = &ec.rewrite_cause {
+                let entry = rewrite_causes.entry(cause.clone()).or_insert((
+                    0usize,
+                    label.clone(),
+                    size_bytes,
+                ));
+                entry.0 += 1;
+                if size_bytes < entry.2 {
+                    entry.1 = label.clone();
+                    entry.2 = size_bytes;
+                }
+            }
         }
 
         if let Err(e) = writeln!(
@@ -455,6 +499,11 @@ fn main() -> ExitCode {
         "[corpus-native] UI-path save (#134): siblings byte-identical {ui_siblings_identical}/{ui_checked}, \
          byte-identical to write_docx {ui_matches_write_docx}/{ui_checked}"
     );
+    println!(
+        "[corpus-native] edited save pure insertion (#250): plain {pure_plain}/{edit_checked}, \
+         track-changes {pure_tracked}/{edit_checked}; stale source markup: plain {stale_plain}, \
+         track-changes {stale_tracked}"
+    );
     /* Issue #112 — the drift histogram, largest bucket first. */
     println!(
         "[corpus-native] zero-edit document.xml byte-identical: {noedit_identical}/{noedit_checked}"
@@ -465,6 +514,30 @@ fn main() -> ExitCode {
         println!("[corpus-native] first-differing-element histogram (docs):");
         for (key, count) in buckets {
             println!("[corpus-native]   {count:5}  {key}");
+        }
+    }
+    /* Issue #251 — the fidelity bound is now primary; the old ≤2×N size
+    bound is reported informationally via the JSONL `edit_check.bound_bytes`
+    / `within_bound` columns, not summarized here. */
+    println!(
+        "[corpus-native] scripted-edit fidelity bound (source_bytes_rewritten == 0): \
+         {fidelity_ok_count}/{edit_checked}"
+    );
+    println!(
+        "[corpus-native] scripted-edit secondary size bound (<=2xN + new-run allowance) \
+         violated: {secondary_bound_violations}/{edit_checked}"
+    );
+    if !rewrite_causes.is_empty() {
+        let mut buckets: Vec<(&String, &(usize, String, u64))> = rewrite_causes.iter().collect();
+        buckets.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
+        println!(
+            "[corpus-native] rewrite root-cause histogram (docs whose edited save still \
+             rewrote source bytes, issues #242-#249):"
+        );
+        for (cause, (count, example_path, example_bytes)) in buckets {
+            println!(
+                "[corpus-native]   {count:5}  {cause:<14} e.g. {example_path} ({example_bytes} B)"
+            );
         }
     }
     println!("[corpus-native] JSONL written to {}", args.out.display());

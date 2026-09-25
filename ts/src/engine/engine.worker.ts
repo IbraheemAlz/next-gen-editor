@@ -7,6 +7,7 @@ import type {
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
+import type { LoggedCommand, RecoveryCandidate } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
    GitHub Pages /next-gen-editor/); `?url` imports are hashed + base-aware. */
@@ -43,15 +44,22 @@ type ClientInitMsg = {
     documentId: string;
     /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
     mockBackend?: 'vello';
+    /** Issue #240 — a crash loop on the GPU backend persisted across
+     *  reloads: boot on Canvas2D without probing it. */
+    forceRenderer?: 'canvas2d';
 };
 type ClientRecoverMsg = {
     id: number;
     type: 'RECOVER';
     canvas: OffscreenCanvas;
-    snapshot: Uint8Array;
-    log: Command[];
-    snapshotSeq: number;
+    /** Issue #241 — bases to try, newest snapshot first, ending with the
+     *  snapshot-less log base (see `event-log.ts` `loadRecoveryLog`). */
+    candidates: RecoveryCandidate[];
+    /** Every retained logged command, ascending by seq. */
+    commands: LoggedCommand[];
     lastSeq: number;
+    /** Issue #241 — the log still reaches back to the first command. */
+    logComplete: boolean;
     /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
     mockBackend?: 'vello';
     /** Issue #99 — crash-loop fallback: boot this generation on Canvas2D
@@ -131,6 +139,11 @@ let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingLogWrites: Promise<unknown> = Promise.resolve();
 /* Issue #85 — fault-injection countdown; `null` = disarmed. */
 let trapAfterCommands: number | null = null;
+/* Issue #212 — content key of the detached source package the event
+   log's `packages` store holds (or is about to: set when the write is
+   issued, cleared if it fails), passed as `known_package_hash` so the
+   engine ships the package bytes only when they changed. */
+let persistedPackageHash: string | undefined;
 
 /* Issue #96 — every OffscreenCanvas this worker generation was handed, by
    page index (0 = the INIT / RECOVER surface). Only the DEV paint probe
@@ -858,11 +871,17 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
            (WebGPU) when a GPU device is available, else the Canvas2D fallback.
            transferControlToOffscreen is one-shot, so this choice is permanent
            for the canvas (Backlog #4). */
-        const probe = await probeBackend(msg.mockBackend);
+        /* Issue #240 — unless the client forces Canvas2D after a crash
+           loop that spanned reloads: then no probe at all. */
+        const probed = msg.forceRenderer !== 'canvas2d';
+        const probe = probed
+            ? await probeBackend(msg.mockBackend)
+            : { renderer: 'canvas2d', mocked: false };
         const renderer = probe.renderer;
         engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
         await openEventLog(msg.documentId);
+        persistedPackageHash = undefined;
         /* Issue #43 — inject today's date so DATE fields resolve at
            layout time (Word updates DATE on open/print). Single
            injection site: the engine core never reads a wall clock, so
@@ -884,6 +903,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
             ok: true,
             crossOriginIsolated: self.crossOriginIsolated,
             renderer,
+            probed,
         });
     } catch (e: unknown) {
         replyError(msg.id, e);
@@ -917,9 +937,53 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
         /* Resume the event-log sequence past what was already persisted, so
            post-recovery appends don't collide with or shadow prior rows. */
         logSequence = msg.lastSeq;
-        lastSnapshotAt = msg.snapshotSeq;
         trapAfterCommands = null;
-        /* Issue #43 — a recovered engine needs the render date again. */
+        /* Issue #85 — base snapshot + replayed tail, inside the engine.
+           Issue #241 — the candidates are tried newest first: a snapshot
+           that does not restore (unreadable row) falls back to the next
+           older one with its longer tail — every retained snapshot keeps
+           its full tail (`persistSnapshot`'s pruning invariant) — and
+           finally to the bare log. `Command::Recover` starts from a reset
+           engine every time, so a failed attempt leaves nothing behind. */
+        let evt: Event | undefined;
+        let base: RecoveryCandidate | undefined;
+        let snapshotFallbacks = 0;
+        for (const candidate of msg.candidates) {
+            const tail = msg.commands.filter((c) => c.seq > candidate.seq).map((c) => c.cmd);
+            evt = await dispatch({
+                type: 'RECOVER',
+                snapshot: candidate.snapshot,
+                log_tail: tail,
+                ...(msg.rendererDowngrade ? { renderer_downgrade: msg.rendererDowngrade } : {}),
+                /* Issue #212 — the detached package the snapshot names. */
+                ...(candidate.package ? { package: candidate.package } : {}),
+            });
+            base = candidate;
+            const usable =
+                evt.type === 'RECOVERED' &&
+                (evt.snapshot_restored || candidate.snapshot.length === 0);
+            if (usable) break;
+            snapshotFallbacks += 1;
+            console.warn(
+                `[worker] recovery: snapshot @${candidate.seq} did not restore; ` +
+                    'falling back to the next older base',
+            );
+        }
+        if (!evt) throw new Error('recovery: no base to recover from');
+        /* The replay tail of the NEXT recovery starts after the base this
+           one actually restored (0 = none: the next logged command then
+           takes a snapshot straight away — `seq - 0 ≥ SNAPSHOT_EVERY`
+           once the log is long). */
+        lastSnapshotAt =
+            evt.type === 'RECOVERED' && evt.snapshot_restored ? (base?.seq ?? 0) : 0;
+        /* Issue #212 — the store holds the package the restored snapshot
+           named (the engine re-attached it and primed its key), so the
+           next snapshot need not ship it again. Anything else ships. */
+        persistedPackageHash =
+            lastSnapshotAt > 0 && base?.package !== undefined ? base.packageHash : undefined;
+        /* Issue #43 — a recovered engine needs the render date again.
+           Dispatched AFTER `RECOVER`: its session reset wipes the clock
+           half (TIME fields), so an injection ahead of it was lost. */
         const now = new Date();
         await dispatch({
             type: 'SET_RENDER_DATE',
@@ -928,13 +992,6 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             day: now.getDate(),
             hour: now.getHours(),
             minute: now.getMinutes(),
-        });
-        /* Issue #85 — base snapshot + replayed tail, inside the engine. */
-        const evt = await dispatch({
-            type: 'RECOVER',
-            snapshot: msg.snapshot,
-            log_tail: msg.log,
-            ...(msg.rendererDowngrade ? { renderer_downgrade: msg.rendererDowngrade } : {}),
         });
         const recovered = evt.type === 'RECOVERED' ? evt : undefined;
         /* DEV mock (issue #99): the engine truthfully says `canvas2d`;
@@ -961,6 +1018,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             renderer,
             restored,
             appliedCommands: recovered?.applied_commands ?? 0,
+            snapshotFallbacks,
+            logComplete: msg.logComplete,
         });
         /* §10 — the recovered engine has no a11y cache, so this delta is a
            full `Replace`: the mirror DOM rebuilds from the restored tree
@@ -1240,7 +1299,9 @@ function logCommand(cmd: Command): number {
 /**
  * Issue #85 — take an engine snapshot at log position `seq` and persist it
  * (`persistSnapshot` prunes to the newest 3 and drops the command rows
- * they make unreachable). Runs on the serial queue with no command in
+ * they make unreachable). Issue #212 — the snapshot is DETACHED: an
+ * opened `.docx`'s source package rides beside it only when the log
+ * does not hold it yet. Runs on the serial queue with no command in
  * flight — callers are either a command task after its reply, or the
  * queued idle task — so the bytes describe exactly the state after
  * command `seq` and recovery's replay tail starts at `seq + 1`. The
@@ -1250,15 +1311,30 @@ function logCommand(cmd: Command): number {
 async function takeSnapshot(seq: number): Promise<void> {
     if (!engine || seq <= lastSnapshotAt) return;
     try {
-        const evt = await dispatch({ type: 'SNAPSHOT', seq });
+        /* Issue #212 — detached: the retained source package is persisted
+           once per document (`packages` store), not inside every snapshot. */
+        const evt = await dispatch({
+            type: 'SNAPSHOT',
+            seq,
+            detach_package: true,
+            ...(persistedPackageHash !== undefined
+                ? { known_package_hash: persistedPackageHash }
+                : {}),
+        });
         if (evt.type !== 'SNAPSHOT') {
             console.warn('[worker] engine snapshot failed', evt);
             return;
         }
         lastSnapshotAt = seq;
-        const write = persistSnapshot(seq, evt.bytes).catch((e: unknown) =>
-            console.warn('[worker] event-log snapshot failed', e),
-        );
+        const hash = evt.package_hash;
+        const pkg =
+            hash === undefined ? undefined : evt.package ? { hash, bytes: evt.package } : { hash };
+        if (hash !== undefined) persistedPackageHash = hash;
+        const write = persistSnapshot(seq, evt.bytes, pkg).catch((e: unknown) => {
+            console.warn('[worker] event-log snapshot failed', e);
+            /* The package may not have landed: ship it with the next one. */
+            if (persistedPackageHash === hash) persistedPackageHash = undefined;
+        });
         pendingLogWrites = pendingLogWrites.then(() => write);
     } catch (e: unknown) {
         console.warn('[worker] snapshot dispatch failed', e);

@@ -38,7 +38,9 @@
 //!    update is the same pass with a resolver that regenerates the
 //!    entry text.
 
-use crate::{Block, BlockPath, DocumentTree, Field, LogicalPos, Paragraph, PathStep};
+use crate::{
+    Block, BlockPath, DocumentTree, Field, LogicalPos, Paragraph, PathStep, SourceMarkup, TextEdit,
+};
 use im::Vector;
 
 /* ================================================================
@@ -831,32 +833,47 @@ impl DocumentTree {
         resolve: &mut impl FnMut(FieldSite<'_>) -> Option<String>,
     ) -> DocumentTree {
         let mut next = self.clone();
-        let body = restamp_blocks(&self.blocks, &mut |path, index, field, para| {
-            resolve(FieldSite {
-                story: FieldStory::Body,
-                path,
-                index,
-                field,
-                paragraph: para,
-            })
-        });
+        let mut body_edits = Vec::new();
+        let body = restamp_blocks(
+            &self.blocks,
+            &mut |path, index, field, para| {
+                resolve(FieldSite {
+                    story: FieldStory::Body,
+                    path,
+                    index,
+                    field,
+                    paragraph: para,
+                })
+            },
+            &mut body_edits,
+        );
         if let Some(body) = body {
             next.blocks = body;
+        }
+        /* Issue #252 — a restamped result is a text replacement: the body's
+        comment anchors follow it (the markup was remapped with the text). */
+        for (path, edit) in &body_edits {
+            next.remap_text_edit_record(path, *edit);
         }
         let mut header_rids: Vec<&String> = self.headers.keys().collect();
         header_rids.sort();
         for rid in header_rids {
             let blocks = &self.headers[rid];
             let src: Vector<Block> = blocks.iter().cloned().collect();
-            let changed = restamp_blocks(&src, &mut |path, index, field, para| {
-                resolve(FieldSite {
-                    story: FieldStory::Header(rid),
-                    path,
-                    index,
-                    field,
-                    paragraph: para,
-                })
-            });
+            /* Parts carry no comment anchors; only the markup remap matters. */
+            let changed = restamp_blocks(
+                &src,
+                &mut |path, index, field, para| {
+                    resolve(FieldSite {
+                        story: FieldStory::Header(rid),
+                        path,
+                        index,
+                        field,
+                        paragraph: para,
+                    })
+                },
+                &mut Vec::new(),
+            );
             if let Some(changed) = changed {
                 next = next.with_updated_header_part(rid, changed.into_iter().collect());
             }
@@ -866,15 +883,20 @@ impl DocumentTree {
         for rid in footer_rids {
             let blocks = &self.footers[rid];
             let src: Vector<Block> = blocks.iter().cloned().collect();
-            let changed = restamp_blocks(&src, &mut |path, index, field, para| {
-                resolve(FieldSite {
-                    story: FieldStory::Footer(rid),
-                    path,
-                    index,
-                    field,
-                    paragraph: para,
-                })
-            });
+            /* Parts carry no comment anchors; only the markup remap matters. */
+            let changed = restamp_blocks(
+                &src,
+                &mut |path, index, field, para| {
+                    resolve(FieldSite {
+                        story: FieldStory::Footer(rid),
+                        path,
+                        index,
+                        field,
+                        paragraph: para,
+                    })
+                },
+                &mut Vec::new(),
+            );
             if let Some(changed) = changed {
                 next = next.with_updated_footer_part(rid, changed.into_iter().collect());
             }
@@ -892,10 +914,13 @@ impl DocumentTree {
 }
 
 /// Restamp every paragraph in `blocks` (top level + one cell level, the
-/// depth the overlay walks use). Returns `None` when nothing changed.
+/// depth the overlay walks use). Returns `None` when nothing changed. Every
+/// text replacement is appended to `edits` (in application order) for the
+/// caller's comment-anchor remap (issue #252).
 fn restamp_blocks(
     blocks: &Vector<Block>,
     resolve: &mut impl FnMut(&BlockPath, usize, &Field, &Paragraph) -> Option<String>,
+    edits: &mut Vec<(BlockPath, TextEdit)>,
 ) -> Option<Vector<Block>> {
     let mut changed_any = false;
     let mut out = blocks.clone();
@@ -903,7 +928,7 @@ fn restamp_blocks(
         match block {
             Block::Paragraph(p) => {
                 let path = BlockPath::top(bi as u32);
-                if let Some(np) = restamp_paragraph(p, &path, resolve) {
+                if let Some(np) = restamp_paragraph(p, &path, resolve, edits) {
                     out.set(bi, Block::Paragraph(np));
                     changed_any = true;
                 }
@@ -927,7 +952,7 @@ fn restamp_blocks(
                                     PathStep::Block(pi as u32),
                                 ],
                             };
-                            if let Some(np) = restamp_paragraph(p, &path, resolve) {
+                            if let Some(np) = restamp_paragraph(p, &path, resolve, edits) {
                                 table.rows[ri].cells[ci].blocks[pi] = Block::Paragraph(np);
                                 table_changed = true;
                             }
@@ -950,6 +975,7 @@ fn restamp_paragraph(
     p: &Paragraph,
     path: &BlockPath,
     resolve: &mut impl FnMut(&BlockPath, usize, &Field, &Paragraph) -> Option<String>,
+    edits: &mut Vec<(BlockPath, TextEdit)>,
 ) -> Option<Paragraph> {
     if p.fields.is_empty() {
         return None;
@@ -976,7 +1002,23 @@ fn restamp_paragraph(
     let mut para = p.clone();
     for (i, v) in subs {
         let f = &p.fields[i];
+        /* Issues #250 / #252 — `with_spliced_range` is the layout-clone
+        primitive and leaves the source markup alone; this splice is a
+        MODEL edit, so the markup and (via `edits`) the comment anchors
+        follow the same snapped replacement. */
+        let old_len = para.text.len() as u32;
+        let s = para.snap_offset(f.start);
+        let e = para.snap_offset(f.end).max(s);
         para = para.with_spliced_range(f.start, f.end, &v);
+        SourceMarkup::note_replace(&mut para.source_markup, old_len, s, e, v.len() as u32);
+        edits.push((
+            path.clone(),
+            TextEdit {
+                at: s,
+                removed: e - s,
+                inserted: v.len() as u32,
+            },
+        ));
     }
     para.dirty = true;
     para.source_xml = None;
@@ -1066,6 +1108,7 @@ mod tests {
             end,
             instruction: instr.into(),
             span: None,
+            source: None,
         }
     }
 

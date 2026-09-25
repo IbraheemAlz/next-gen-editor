@@ -118,7 +118,18 @@ function main() {
     const siblingDrifted = records.filter((r) => r.sibling_bytes_identical === false);
     const textLost = records.filter((r) => r.plain_text_equal === false);
     const pageUnstable = records.filter((r) => r.page_count_stable === false);
-    const editOutOfBound = records.filter((r) => r.edit_check && r.edit_check.within_bound === false);
+    /* Issue #251 — the PRIMARY edit-drift bound: no ORIGINAL byte rewritten.
+    `within_bound` (the old ≤2×N size-only check) is kept below as an
+    INFORMATIONAL column only — see CLAUDE.md's ".docx round-trip
+    invariants" for why it can't distinguish fidelity from loss. */
+    const editChecked = records.filter((r) => r.edit_check);
+    const fidelityViolations = records.filter((r) => r.edit_check && r.edit_check.fidelity_ok === false);
+    const secondaryBoundViolations = records.filter(
+        (r) => r.edit_check && r.edit_check.within_secondary_bound === false,
+    );
+    const editOutOfBoundInformational = records.filter(
+        (r) => r.edit_check && r.edit_check.within_bound === false,
+    );
 
     console.log('\n=== Round-trip invariant violations (may overlap with failure buckets above) ===');
     console.log(`  document.xml changed on a no-op resave: ${xmlDrifted.length}`);
@@ -137,9 +148,40 @@ function main() {
     for (const r of pageUnstable.slice(0, TOP_N)) {
         console.log(`    ${r.path} (${r.page_count_before} -> ${r.page_count_after})`);
     }
-    console.log(`  scripted-edit ≤2×N bound exceeded:      ${editOutOfBound.length}`);
-    for (const r of editOutOfBound.slice(0, TOP_N)) {
+    console.log(
+        `  scripted-edit fidelity bound violated (#251, primary): ${fidelityViolations.length}/${editChecked.length}`,
+    );
+    for (const r of fidelityViolations.slice(0, TOP_N)) {
+        const cause = r.edit_check.rewrite_cause ?? '<unclassified>';
+        console.log(`    ${r.path} (rewrote ${r.edit_check.source_bytes_rewritten} B, cause: ${cause})`);
+    }
+    console.log(
+        `  scripted-edit secondary size bound violated (#251, advisory): ${secondaryBoundViolations.length}/${editChecked.length}`,
+    );
+    for (const r of secondaryBoundViolations.slice(0, TOP_N)) {
+        console.log(
+            `    ${r.path} (Δ ${r.edit_check.document_xml_delta_bytes} B > secondary bound ${r.edit_check.secondary_bound_bytes} B)`,
+        );
+    }
+    console.log(
+        `  [informational] old size-only ≤2×N bound exceeded:   ${editOutOfBoundInformational.length}/${editChecked.length}`,
+    );
+    for (const r of editOutOfBoundInformational.slice(0, TOP_N)) {
         console.log(`    ${r.path} (Δ ${r.edit_check.document_xml_delta_bytes} B > bound ${r.edit_check.bound_bytes} B)`);
+    }
+
+    /* --- Rewrite root-cause histogram (issues #242-#249), #251 Scope §2. --- */
+    const causeCounts = new Map();
+    for (const r of fidelityViolations) {
+        const cause = r.edit_check.rewrite_cause ?? '<unclassified>';
+        causeCounts.set(cause, (causeCounts.get(cause) || 0) + 1);
+    }
+    const sortedCauses = [...causeCounts.entries()].sort((a, b) => b[1] - a[1]);
+    if (sortedCauses.length > 0) {
+        console.log('\n=== Rewrite root-cause histogram (docs still rewriting source bytes) ===');
+        for (const [cause, count] of sortedCauses) {
+            console.log(`  ${String(count).padStart(4)}  ${cause}`);
+        }
     }
 
     /* --- Layout-time outliers. --- */
@@ -160,8 +202,17 @@ function main() {
             sibling_drifted: siblingDrifted.map((r) => r.path),
             text_lost: textLost.map((r) => r.path),
             page_count_unstable: pageUnstable.map((r) => r.path),
-            edit_bound_exceeded: editOutOfBound.map((r) => r.path),
+            /* Issue #251 — primary bound + advisory secondary bound, plus
+            the old size-only number kept as an informational column. */
+            edit_fidelity_violated: fidelityViolations.map((r) => ({
+                path: r.path,
+                source_bytes_rewritten: r.edit_check.source_bytes_rewritten,
+                rewrite_cause: r.edit_check.rewrite_cause ?? null,
+            })),
+            edit_secondary_bound_exceeded: secondaryBoundViolations.map((r) => r.path),
+            edit_bound_exceeded_informational: editOutOfBoundInformational.map((r) => r.path),
         },
+        edit_rewrite_root_causes: Object.fromEntries(sortedCauses),
         layout_time_outliers: withLayoutTime.slice(0, 10).map((r) => ({
             path: r.path,
             layout_ms: r.layout_ms,
