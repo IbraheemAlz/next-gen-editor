@@ -816,6 +816,14 @@ fn show_run(
     };
     let mut pen = 0.0_f32;
     for glyph in &run.glyphs {
+        /* Issue #69 — a floating object's sentinel glyph reserves no
+        width and shows nothing in the line (the object is positioned
+        from `PageBox::floats`); skip it so a font that maps U+FFFC to a
+        real glyph never prints a zero-advance mark. */
+        if glyph.float.is_some() {
+            pen += glyph.x_advance;
+            continue;
+        }
         let gx = run_x + pen + glyph.x_offset;
         /* Invert the y axis: PDF origin is bottom-left. `<w:vertAlign>`
         baseline shift lifts (positive) / drops (negative) the run. */
@@ -1396,6 +1404,7 @@ mod tests {
             endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         }
     }
 
@@ -1552,6 +1561,7 @@ mod tests {
             endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         };
         let mut out = Vec::new();
         export_pdf(
@@ -1657,6 +1667,7 @@ mod tests {
                 endnotes: layout::NoteBand::default(),
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
+                floats: Vec::new(),
             }
         }
         let stack = liberation_stack();
@@ -1691,6 +1702,7 @@ mod tests {
             endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         };
         let mut out = Vec::new();
         export_pdf(
@@ -1989,6 +2001,7 @@ mod tests {
                 inline_footnote_marker: None,
                 inline_note_anchor: None,
                 inline_object_height: 0.0,
+                float: None,
             }],
             font: "liberation".to_string(),
             direction: ShapingDirection::Ltr,
@@ -2040,6 +2053,7 @@ mod tests {
             endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
+            floats: Vec::new(),
         };
         let mut out = Vec::new();
         export_pdf(

@@ -171,6 +171,11 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
         let content_x = page.margins.left;
         let content_y = top + page.margins.top;
 
+        /* Issue #69 — floating objects marked `behindDoc` paint UNDER every
+        band and body glyph (right after the page card), lowest z-order
+        first. The in-front group closes the page below. */
+        paint_floats(page, top, true, &mut cmds);
+
         /* Phase 6 — header band painted before body so a wide header doesn't
         sit on top of body text. Phase 3 (#39): band placement comes from
         `PageBox::header_band_top()` — the document's real
@@ -205,6 +210,12 @@ pub fn build_document_scene(pages: &[PageBox], gap: f32) -> DisplayList {
                 paint_block(block, content_x, band_top, &mut cmds);
             }
         }
+
+        /* Issue #69 — the in-front float group closes the page: every
+        `<wp:anchor>` object NOT marked `behindDoc` paints over the bands,
+        body and footnotes, lowest `relativeHeight` first so a higher
+        z-order lands on top. */
+        paint_floats(page, top, false, &mut cmds);
 
         top += page.size.height + gap;
     }
@@ -246,6 +257,42 @@ fn paint_note_band(
         for block in &entry.blocks {
             paint_block(block, entry_x, entry_top, cmds);
         }
+    }
+}
+
+/// Issue #69 — paint one z-order group of a page's floating objects.
+/// `behind` selects the `behindDoc` group (painted right after the page
+/// card, under all text) or the in-front group (painted last). Within a
+/// group the objects are ordered by `z_order` (`relativeHeight`) — the
+/// sort is stable so equal z-orders keep anchor order. `FloatBox.origin`
+/// is page-relative (page top-left, not the content area), so only the
+/// page's stacked `top` is added. Hidden objects (`hidden="1"`) stay in
+/// the box list for hit-testing but are never painted; an object with a
+/// degenerate size paints nothing (the backend would reject an empty
+/// rect anyway).
+fn paint_floats(page: &PageBox, top: f32, behind: bool, cmds: &mut Vec<DisplayCmd>) {
+    if page.floats.is_empty() {
+        return;
+    }
+    let mut group: Vec<&layout::FloatBox> = page
+        .floats
+        .iter()
+        .filter(|f| f.behind_doc == behind && !f.hidden)
+        .collect();
+    if group.is_empty() {
+        return;
+    }
+    group.sort_by_key(|f| f.z_order);
+    for f in group {
+        if f.size.width <= 0.0 || f.size.height <= 0.0 {
+            continue;
+        }
+        let x0 = f.origin.x as f64;
+        let y0 = (top + f.origin.y) as f64;
+        cmds.push(DisplayCmd::DrawImage {
+            rect: Rect::new(x0, y0, x0 + f.size.width as f64, y0 + f.size.height as f64),
+            rel_id: f.rel_id.clone(),
+        });
     }
 }
 
@@ -465,6 +512,15 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                 into their own run with a raised baseline), so they
                 paint through the ordinary glyph path below. */
                 for glyph in &run.glyphs {
+                    /* Issue #69 — a FLOATING object's sentinel reserves no
+                    width and paints nothing in the line: the object itself
+                    is painted from `PageBox::floats` by `paint_floats`.
+                    Skip the glyph so a font that has a real glyph for
+                    U+FFFC never leaves a zero-advance tofu on the line. */
+                    if glyph.float.is_some() {
+                        pen += glyph.x_advance;
+                        continue;
+                    }
                     if let Some(rel) = glyph.inline_image_rel_id.as_deref() {
                         /* Image sits flush with the baseline (its bottom
                         edge); the image's `inline_object_height` extends

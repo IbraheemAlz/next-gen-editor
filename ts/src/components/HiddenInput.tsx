@@ -16,7 +16,11 @@ import type {
     TextAttrsPatch,
 } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
-import { clearSelectedImage, editingStoryForPointer } from '../state/engine-store';
+import {
+    clearSelectedImage,
+    editingStoryForPointer,
+    fieldCodeViewForKeys,
+} from '../state/engine-store';
 import { ClipboardWriteError, copy, cut, paste } from '../input/clipboard';
 
 /** Map a non-composition `InputEvent` to an engine command. */
@@ -148,6 +152,23 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
         if (e.key === 'Escape' && editingStoryForPointer()) {
             e.preventDefault();
             void props.client.dispatch({ type: 'EXIT_HEADER_FOOTER' });
+            return;
+        }
+
+        /* Issue #77 — F9 updates every field; Alt+F9 toggles the
+           field-code view (Word parity). Both are engine state: the
+           toggle flips the last broadcast flag, and the reply's
+           `SelectionChanged.field_code_view` re-syncs every mirror. */
+        if (e.key === 'F9' && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+            e.preventDefault();
+            if (e.altKey) {
+                void props.client.dispatch({
+                    type: 'SET_FIELD_CODE_VIEW',
+                    enabled: !fieldCodeViewForKeys(),
+                });
+            } else {
+                void props.client.dispatch({ type: 'UPDATE_FIELDS' });
+            }
             return;
         }
 

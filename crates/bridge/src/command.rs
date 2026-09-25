@@ -187,6 +187,21 @@ pub enum Command {
         width_emu: i64,
         height_emu: i64,
     },
+    /// Issue #69 — reposition the FLOATING (`<wp:anchor>`) image anchored
+    /// at `(path, at)`: both positioning axes become fixed EMU offsets
+    /// (`<wp:posOffset>`) inside their CURRENT reference frames
+    /// (`relativeFrom` is preserved; an `<wp:align>` / percentage
+    /// placement is replaced, and `simplePos` is switched off — exactly
+    /// what Word does the moment an aligned object is dragged). Drives the
+    /// body-drag of the image overlay. Replies `Event::Error` when the
+    /// address holds no floating image — inline images flow with the text
+    /// and have no free position.
+    MoveImage {
+        path: BlockPath,
+        at: u32,
+        offset_h_emu: i64,
+        offset_v_emu: i64,
+    },
 
     /* Selection */
     SetSelection {
@@ -548,11 +563,45 @@ pub enum Command {
     /// Issue #43 — install the render-time date DATE fields resolve
     /// against. The worker injects today's date right after INIT (the
     /// engine core never reads a wall clock — determinism for tests
-    /// and byte-stable exports). Month/day are 1-based.
+    /// and byte-stable exports). Month/day are 1-based. Issue #77 —
+    /// the optional clock component (`hour` 0–23 + `minute`) is what
+    /// TIME fields resolve against; both absent keeps TIME cached.
     SetRenderDate {
         year: i32,
         month: u32,
         day: u32,
+        #[serde(default)]
+        #[tsify(optional)]
+        hour: Option<u32>,
+        #[serde(default)]
+        #[tsify(optional)]
+        minute: Option<u32>,
+    },
+    /// Issue #77 — F9: re-resolve every field in the document (body +
+    /// every header/footer part) and stamp the live values into the
+    /// model as ONE undo step. Page-dependent kinds read the current
+    /// full pagination; the rest read the render environment.
+    UpdateFields,
+    /// Issue #77 — Alt+F9: toggle the field-code view. While enabled
+    /// every field PAINTS its `{ INSTRUCTION }` code in place of the
+    /// result (body + stories). Logical positions (`LogicalPos` in
+    /// every command and in `SelectionChanged.range`) stay SOURCE
+    /// positions — the engine maps them onto the displayed code text
+    /// for pixel geometry only, which the atomic-field invariant makes
+    /// exact (a caret is never strictly inside a field in either view).
+    /// A pure display state — never persisted, never saved.
+    SetFieldCodeView {
+        enabled: bool,
+    },
+    /// Issue #77 — replace the instruction (field code) of the field
+    /// the caret at `at` addresses (strictly inside, ending at, or
+    /// starting at `at`; see `SelectionChanged.field_at_caret`). The
+    /// cached result stays until the next update (Word parity); the
+    /// selection is preserved. Rejected with `Event::Error` when `at`
+    /// addresses no field or `instruction` is blank. Body or story.
+    SetFieldInstruction {
+        at: LogicalPos,
+        instruction: String,
     },
     /// Sprint 2 (UI Edition) — set `<w:pPr><w:pBdr>` on every
     /// paragraph the range spans. Mirrors `SetCellBorders` over the
@@ -799,7 +848,10 @@ pub enum HeaderFooterArea {
 /// `Page` renders the page's formatted number, `NumPages` the
 /// document's total page count (forces full pagination on documents
 /// that carry one), `Date` today's date per the shell-injected render
-/// date (`M/d/yyyy`, Word's en default).
+/// date (`M/d/yyyy`, Word's en default). Issue #77 — `Time` the
+/// shell-injected clock (`h:mm am/pm`), `FileName` the document name
+/// the shell opened / will save (`OpenDocument.name`), `Author` the
+/// `docProps/core.xml` creator.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum FieldKind {
@@ -807,6 +859,9 @@ pub enum FieldKind {
     Page,
     NumPages,
     Date,
+    Time,
+    FileName,
+    Author,
 }
 
 /// Sprint 11 (#13) — wire shape for one `<w:pPr><w:tabs><w:tab>`

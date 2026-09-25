@@ -51,6 +51,15 @@ pub enum InlineObjectInfoKind {
         text: String,
         anchor: Option<engine::NoteAnchor>,
     },
+    /// Issue #69 — a FLOATING image (`<wp:anchor>`). The sentinel glyph
+    /// reserves no width; `width_px` / `height_px` on the owning
+    /// [`InlineObjectInfo`] are the object's own extent, carried to the
+    /// paginator through [`crate::boxes::FloatGlyph`] together with the
+    /// frame-relative positioning `spec`.
+    FloatingImage {
+        rel_id: String,
+        spec: crate::boxes::FloatSpec,
+    },
 }
 
 /// Issue #80 — note markers shape at this fraction of the span size…
@@ -390,6 +399,7 @@ fn build_marker(
             inline_footnote_marker: None,
             inline_note_anchor: None,
             inline_object_height: 0.0,
+            float: None,
         })
         .collect();
     let width = glyphs.iter().map(|g| g.x_advance).sum::<f32>();
@@ -1153,19 +1163,43 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                     let abs_cluster = brun_abs_start + cluster_src;
                     /* Note markers never reach this path (they are
                     their own piece above), so only image anchors
-                    override the glyph. */
+                    (inline or floating) override the glyph. */
                     let info = cfg.inline_objects.iter().find(|info| {
                         info.at == abs_cluster
-                            && matches!(info.kind, InlineObjectInfoKind::Image { .. })
+                            && matches!(
+                                info.kind,
+                                InlineObjectInfoKind::Image { .. }
+                                    | InlineObjectInfoKind::FloatingImage { .. }
+                            )
                     });
-                    let image_rel = match info.map(|i| &i.kind) {
-                        Some(InlineObjectInfoKind::Image { rel_id }) => Some(rel_id.clone()),
-                        _ => None,
+                    let (image_rel, float) = match info.map(|i| &i.kind) {
+                        Some(InlineObjectInfoKind::Image { rel_id }) => {
+                            (Some(rel_id.clone()), None)
+                        }
+                        /* Issue #69 — a floating object's sentinel: the
+                        glyph reserves NO width and grows NO line; the
+                        payload rides to the paginator, which positions
+                        the object against its reference frame. */
+                        Some(InlineObjectInfoKind::FloatingImage { rel_id, spec }) => (
+                            None,
+                            Some(Box::new(crate::boxes::FloatGlyph {
+                                rel_id: rel_id.clone(),
+                                width: info.map_or(0.0, |i| i.width_px),
+                                height: info.map_or(0.0, |i| i.height_px),
+                                spec: *spec,
+                            })),
+                        ),
+                        _ => (None, None),
                     };
+                    let is_float = float.is_some();
                     PositionedGlyph {
                         id: g.glyph_id as u16,
                         cluster: cluster_src,
-                        x_advance: info.map_or(g.x_advance, |i| i.width_px),
+                        x_advance: if is_float {
+                            0.0
+                        } else {
+                            info.map_or(g.x_advance, |i| i.width_px)
+                        },
                         y_advance: g.y_advance,
                         x_offset: g.x_offset,
                         y_offset: g.y_offset,
@@ -1173,7 +1207,12 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                         inline_image_rel_id: image_rel,
                         inline_footnote_marker: None,
                         inline_note_anchor: None,
-                        inline_object_height: info.map_or(0.0, |i| i.height_px),
+                        inline_object_height: if is_float {
+                            0.0
+                        } else {
+                            info.map_or(0.0, |i| i.height_px)
+                        },
+                        float,
                     }
                 })
                 .collect();
@@ -1248,6 +1287,7 @@ fn shape_note_marker(
                 inline_footnote_marker: None,
                 inline_note_anchor: None,
                 inline_object_height: 0.0,
+                float: None,
             });
         }
     }
@@ -1264,6 +1304,7 @@ fn shape_note_marker(
             inline_footnote_marker: None,
             inline_note_anchor: None,
             inline_object_height: 0.0,
+            float: None,
         });
     }
     if let Some(first) = glyphs.first_mut() {
@@ -1647,6 +1688,7 @@ fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &Fon
         inline_footnote_marker: None,
         inline_note_anchor: None,
         inline_object_height: 0.0,
+        float: None,
     };
     for _ in 0..n {
         run.glyphs.insert(glyph_idx + 1, tatweel_glyph.clone());
@@ -1788,6 +1830,7 @@ mod tests {
             inline_footnote_marker: None,
             inline_note_anchor: None,
             inline_object_height: 0.0,
+            float: None,
         }
     }
 

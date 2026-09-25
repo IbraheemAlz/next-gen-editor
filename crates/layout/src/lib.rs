@@ -5,16 +5,19 @@
 //! `layout_paragraph` owns all geometry; the renderer is a pure tree walk.
 
 pub mod boxes;
+pub mod floats;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
 pub mod watchdog;
 
 pub use boxes::{
-    FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, MarkerBox, NoteBand,
+    CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FontId,
+    FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, MarkerBox, NoteBand,
     PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TableBox, TableCellBox,
     TableRowBox, TextAttrs, VisualRun,
 };
+pub use floats::{ColumnLayout, resolve_page_floats};
 pub use page::{A4Page, Margins};
 pub use paginate::{
     FOOTNOTE_SEPARATOR_HEIGHT_PT, HeaderBands, HeaderRole, NoteBody,

@@ -138,6 +138,104 @@ pub struct PositionedGlyph {
     /// pixels. Folded into the line's ascent so the line grows to host
     /// the image without clipping.
     pub inline_object_height: f32,
+    /// Issue #69 — when set, this glyph is the U+FFFC sentinel of a
+    /// FLOATING object (`<wp:anchor>`). The glyph itself reserves no
+    /// width (`x_advance == 0`) and does not grow the line; the page
+    /// assembler resolves the object's rectangle from the spec against
+    /// the page / column / paragraph / line the glyph lands on
+    /// (`crate::floats::resolve_page_floats`). Boxed — floats are rare
+    /// and glyphs are cloned by the million.
+    pub float: Option<Box<FloatGlyph>>,
+}
+
+/// Issue #69 — the floating-object payload a sentinel glyph carries into
+/// pagination. Sizes are layout px (already scaled); the positioning
+/// spec is frame-relative and resolved once the anchor's page is known.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatGlyph {
+    /// Archive relationship id of the image blob to paint.
+    pub rel_id: String,
+    /// Object extent in layout px.
+    pub width: f32,
+    pub height: f32,
+    pub spec: FloatSpec,
+}
+
+/// Issue #69 — one positioning axis of a float in layout units. Mirrors
+/// `engine::FloatOffset` with EMUs already converted to px and the
+/// percentage already normalised to a `0.0..=1.0` fraction of the frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FloatOffsetPx {
+    Px(f32),
+    Align(engine::FloatAlign),
+    /// Fraction of the reference frame's extent (`0.5` ⇒ 50 %).
+    Fraction(f32),
+}
+
+/// Issue #69 — resolved-unit twin of `engine::FloatAnchor`: everything
+/// the page assembler needs to place the object, nothing the writer
+/// needs (wrap XML, docPr) — those stay on the document model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FloatSpec {
+    pub h_frame: engine::HRelativeFrom,
+    pub h_offset: FloatOffsetPx,
+    pub v_frame: engine::VRelativeFrom,
+    pub v_offset: FloatOffsetPx,
+    /// `Some((x, y))` ⇒ `simplePos="1"`: page-absolute placement in px
+    /// that overrides both axes.
+    pub simple_pos: Option<Point>,
+    /// `relativeHeight` — z-order among floats (higher paints later).
+    pub z_order: u32,
+    /// `behindDoc` — paint under the text.
+    pub behind_doc: bool,
+    /// `hidden` — resolved into a [`FloatBox`] for hit-testing but never
+    /// painted.
+    pub hidden: bool,
+}
+
+/// Issue #69 — which laid-out paragraph on a page owns a float's anchor,
+/// so hit-testing can map the float back to an engine block path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatAnchorRef {
+    /// `page.blocks[block]` (a paragraph, or a table when `cell` is set:
+    /// then `rows[row].cells[col].content[inner]`).
+    Body {
+        block: usize,
+        cell: Option<CellAnchorRef>,
+    },
+    /// A paragraph inside the page's header band.
+    Header,
+    /// A paragraph inside the page's footer band.
+    Footer,
+}
+
+/// Issue #69 — table-cell coordinates of a float anchored inside a cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellAnchorRef {
+    pub row: usize,
+    pub col: usize,
+    pub inner: usize,
+}
+
+/// Issue #69 — one positioned floating object on a page. `origin` is
+/// **page-relative** (the page's top-left corner, NOT the content area —
+/// floats are placed against page / margin / column frames, so the
+/// renderer adds only the page top). `frame_origin` is the top-left of
+/// the reference frame the object's offsets were measured from, so an
+/// interactive drag can convert a new page position back into
+/// frame-relative EMU offsets (`Command::MoveImage`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatBox {
+    pub origin: Point,
+    pub size: Size,
+    pub rel_id: String,
+    /// Sentinel byte offset in the anchor paragraph's source text.
+    pub at: u32,
+    pub anchor: FloatAnchorRef,
+    pub z_order: u32,
+    pub behind_doc: bool,
+    pub hidden: bool,
+    pub frame_origin: Point,
 }
 
 /// A maximal run of glyphs sharing one font, direction, and style — the unit
@@ -436,6 +534,15 @@ pub struct PageBox {
     /// a PAGE field on this page renders (pgNumType-rebased). The
     /// field-resolution reshape pass and Even/Odd filler logic read it.
     pub page_number: u32,
+    /// Issue #69 — every floating object whose anchor landed on this
+    /// page, already positioned (page-relative). Resolved by the
+    /// paginator at flush time from the sentinel glyphs in `blocks` and
+    /// the bands; the renderer paints `behind_doc` entries under the
+    /// content and the rest over it, each group in `z_order`. Empty for
+    /// documents without floats — the fingerprint / fast-path checks
+    /// treat an empty list as "no geometry", so fixed-geometry documents
+    /// keep their pinned values.
+    pub floats: Vec<FloatBox>,
 }
 
 impl PageBox {

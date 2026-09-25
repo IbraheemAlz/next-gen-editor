@@ -18,6 +18,10 @@ use crate::schema::ct_rpr::{apply_rpr, attr_val, fold_rpr_fragment, rpr_child_is
 use crate::schema::grab_bag::{
     NamespaceScope, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::wp_anchor::{
+    AnchorAxis, AnchorOffsetKind, anchor_from_start_tag, h_relative_from, is_wrap_element,
+    parse_offset, v_relative_from, wrap_kind_of,
+};
 use crate::style_resolver::StyleResolver;
 use engine::{
     Block, DocumentTree, HeaderFooterRefs, HeaderFooterRole, ListItem, PageGeometry,
@@ -514,6 +518,21 @@ pub fn parse_document_xml_with_warnings(
     let mut cur_drawing_rel_id: Option<String> = None;
     let mut cur_drawing_cx: Option<i64> = None;
     let mut cur_drawing_cy: Option<i64> = None;
+    /* Issue #69 — `<wp:anchor>` (floating picture) accumulators. The
+    anchor's attributes seed `cur_anchor` on the start tag; `<wp:positionH>`
+    / `<wp:positionV>` open an axis (`anchor_axis`) whose `<wp:posOffset>` /
+    `<wp:align>` / `<wp14:pctPos*Offset>` child collects text into
+    `anchor_offset` until its end tag. The wrap element and `<wp:docPr>`
+    are captured VERBATIM (the writer cannot regenerate a wrap polygon or
+    a docPr's descr / hyperlink from typed fields). On `</w:drawing>` an
+    anchored picture with a blip + extents becomes an `InlineObject` whose
+    `anchor` is `Some` — same U+FFFC sentinel as an inline picture, so
+    every offset-shifting edit path already carries it. A text box or
+    shape anchor (no `<a:blip>`) is dropped exactly as before (#119). */
+    let mut in_wp_anchor = false;
+    let mut cur_anchor: Option<Box<engine::FloatAnchor>> = None;
+    let mut anchor_axis: Option<AnchorAxis> = None;
+    let mut anchor_offset: Option<(AnchorOffsetKind, String)> = None;
 
     /* Phase 7 — `<w:hyperlink>` overlays. Word lays paragraph text out
     paragraph-flat with `<w:hyperlink>` spanning a contiguous slice of
@@ -595,6 +614,29 @@ pub fn parse_document_xml_with_warnings(
                     buf.clear();
                     continue;
                 }
+                /* Issue #119 rider (shipped with #69) — drawing sub-stories
+                are NOT body content. A `<w:p>` inside `<w:txbxContent>`
+                (a DrawingML text box), `<w:pict>` (VML: legacy pictures,
+                `<v:textbox>`) or `<mc:Fallback>` (the VML duplicate of an
+                `mc:AlternateContent` choice) used to be hoisted into the
+                body as a paragraph of its own, and its `</w:p>` ended the
+                ENCLOSING paragraph early — losing that paragraph's
+                `p_start_byte`, so the passthrough could not fire and the
+                regenerated paragraph dropped the whole drawing. Consume the
+                subtree instead: the enclosing paragraph keeps its byte
+                capture (a zero-edit resave stays byte-identical), and a
+                `<wp:anchor>` / `<wp:inline>` picture around it still parses
+                — only its inner story is skipped. Modeling text boxes is
+                issue #83. */
+                match name.as_ref() {
+                    b"w:txbxContent" | b"w:pict" | b"mc:Fallback" => {
+                        let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    _ => {}
+                }
                 match name.as_ref() {
                     b"w:p" => {
                         /* Capture the byte offset of the `<w:p` opening
@@ -656,6 +698,50 @@ pub fn parse_document_xml_with_warnings(
                     }
                     b"wp:inline" if in_drawing => {
                         in_wp_inline = true;
+                    }
+                    b"wp:anchor" if in_drawing => {
+                        in_wp_anchor = true;
+                        cur_anchor = Some(Box::new(anchor_from_start_tag(&e)));
+                    }
+                    b"wp:positionH" if in_wp_anchor => {
+                        anchor_axis = Some(AnchorAxis::H);
+                        if let Some(a) = cur_anchor.as_mut() {
+                            a.position_h.relative_from =
+                                h_relative_from(attr_val(&e, b"relativeFrom").as_deref());
+                        }
+                    }
+                    b"wp:positionV" if in_wp_anchor => {
+                        anchor_axis = Some(AnchorAxis::V);
+                        if let Some(a) = cur_anchor.as_mut() {
+                            a.position_v.relative_from =
+                                v_relative_from(attr_val(&e, b"relativeFrom").as_deref());
+                        }
+                    }
+                    b"wp:posOffset" if anchor_axis.is_some() => {
+                        anchor_offset = Some((AnchorOffsetKind::PosOffset, String::new()));
+                    }
+                    b"wp:align" if anchor_axis.is_some() => {
+                        anchor_offset = Some((AnchorOffsetKind::Align, String::new()));
+                    }
+                    b"wp14:pctPosHOffset" | b"wp14:pctPosVOffset" if anchor_axis.is_some() => {
+                        anchor_offset = Some((AnchorOffsetKind::Percent, String::new()));
+                    }
+                    n if in_wp_anchor && is_wrap_element(n) => {
+                        /* Wrap element with children (`<wp:wrapTight>` +
+                        `<wp:wrapPolygon>`, or `<wp:wrapSquare>` carrying
+                        an `<wp:effectExtent>`): consume the subtree and
+                        keep its bytes. */
+                        let frag = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        if let Some(a) = cur_anchor.as_mut() {
+                            a.wrap = wrap_kind_of(n).unwrap_or_default();
+                            a.wrap_xml = frag.and_then(|f| String::from_utf8(f).ok());
+                        }
+                    }
+                    b"wp:docPr" if in_wp_anchor => {
+                        let frag = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        if let Some(a) = cur_anchor.as_mut() {
+                            a.doc_pr_xml = frag.and_then(|f| String::from_utf8(f).ok());
+                        }
                     }
                     b"wp:extent" if in_drawing => {
                         cur_drawing_cx = attr_val(&e, b"cx").and_then(|v| v.parse().ok());
@@ -773,6 +859,31 @@ pub fn parse_document_xml_with_warnings(
                     b"a:blip" if in_drawing => {
                         cur_drawing_rel_id = attr_val(&e, b"r:embed");
                     }
+                    b"wp:simplePos" if in_wp_anchor => {
+                        if let Some(a) = cur_anchor.as_mut() {
+                            a.simple_pos_x_emu =
+                                attr_val(&e, b"x").and_then(|v| v.parse().ok()).unwrap_or(0);
+                            a.simple_pos_y_emu =
+                                attr_val(&e, b"y").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        }
+                    }
+                    n if in_wp_anchor && is_wrap_element(n) => {
+                        /* Empty wrap element (`<wp:wrapNone/>`,
+                        `<wp:wrapSquare wrapText="bothSides"/>`, …). */
+                        let end = reader.buffer_position() as usize;
+                        if let Some(a) = cur_anchor.as_mut() {
+                            a.wrap = wrap_kind_of(n).unwrap_or_default();
+                            a.wrap_xml = slice_fragment(xml, prev_pos, end)
+                                .and_then(|f| String::from_utf8(f).ok());
+                        }
+                    }
+                    b"wp:docPr" if in_wp_anchor => {
+                        let end = reader.buffer_position() as usize;
+                        if let Some(a) = cur_anchor.as_mut() {
+                            a.doc_pr_xml = slice_fragment(xml, prev_pos, end)
+                                .and_then(|f| String::from_utf8(f).ok());
+                        }
+                    }
                     b"w:tab" if in_run => {
                         /* Audit gap A.M5 — `<w:tab/>` inside a `<w:r>`.
                         Stored as the literal U+0009 TAB byte so the
@@ -833,7 +944,11 @@ pub fn parse_document_xml_with_warnings(
                                     custom_mark_follows,
                                 }
                             };
-                            para_inline_objects.push(engine::InlineObject { at, kind });
+                            para_inline_objects.push(engine::InlineObject {
+                                at,
+                                kind,
+                                anchor: None,
+                            });
                         }
                     }
                     b"w:footnoteRef" | b"w:endnoteRef" => {
@@ -852,6 +967,7 @@ pub fn parse_document_xml_with_warnings(
                         para_inline_objects.push(engine::InlineObject {
                             at,
                             kind: engine::InlineKind::NoteSelfRef { kind },
+                            anchor: None,
                         });
                     }
                     b"w:commentRangeStart" => {
@@ -946,6 +1062,13 @@ pub fn parse_document_xml_with_warnings(
             Event::Text(t) if (in_text_elt || in_del_text_elt) && in_tbl == 0 => {
                 run_text.push_str(&t.unescape()?);
             }
+            Event::Text(t) if anchor_offset.is_some() && in_tbl == 0 => {
+                /* Issue #69 — `<wp:posOffset>` / `<wp:align>` / wp14
+                percentage text of the open positioning axis. */
+                if let Some((_, buf_s)) = anchor_offset.as_mut() {
+                    buf_s.push_str(&t.unescape()?);
+                }
+            }
             Event::Text(t) if in_instr_text && in_tbl == 0 => {
                 /* `<w:instrText>` content accumulates onto the innermost
                 open field's instruction buffer. The text may straddle
@@ -1030,6 +1153,26 @@ pub fn parse_document_xml_with_warnings(
                     b"w:numPr" => in_num_pr = false,
                     b"w:pBdr" => in_pbdr = false,
                     b"w:tabs" => in_tabs = false,
+                    b"wp:posOffset"
+                    | b"wp:align"
+                    | b"wp14:pctPosHOffset"
+                    | b"wp14:pctPosVOffset" => {
+                        /* Issue #69 — seal the offset onto the open axis. */
+                        if let (Some((kind, text)), Some(axis), Some(a)) =
+                            (anchor_offset.take(), anchor_axis, cur_anchor.as_mut())
+                            && let Some(offset) = parse_offset(kind, &text)
+                        {
+                            match axis {
+                                AnchorAxis::H => a.position_h.offset = offset,
+                                AnchorAxis::V => a.position_v.offset = offset,
+                            }
+                        }
+                    }
+                    b"wp:positionH" | b"wp:positionV" => anchor_axis = None,
+                    b"wp:anchor" => {
+                        /* Like `</wp:inline>` below: the flag is read by
+                        the `</w:drawing>` handler, which does the reset. */
+                    }
                     b"wp:inline" => {
                         /* Don't clear `in_wp_inline` on the inline close —
                         it's structurally a child of `<w:drawing>`, so the
@@ -1045,7 +1188,7 @@ pub fn parse_document_xml_with_warnings(
                     }
                     b"w:drawing" => {
                         if in_drawing
-                            && in_wp_inline
+                            && (in_wp_inline || in_wp_anchor)
                             && let Some(rid) = cur_drawing_rel_id.take()
                             && let (Some(cx), Some(cy)) =
                                 (cur_drawing_cx.take(), cur_drawing_cy.take())
@@ -1053,7 +1196,9 @@ pub fn parse_document_xml_with_warnings(
                             /* Inject U+FFFC as the inline object's anchor
                             character. Position in the eventual `para_text` =
                             `para_text.len()` (already flushed runs) +
-                            `run_text.len()` (this run's text so far). */
+                            `run_text.len()` (this run's text so far).
+                            Issue #69 — a `<wp:anchor>` picture takes the
+                            same sentinel; its placement rides `anchor`. */
                             let at = (para_text.len() + run_text.len()) as u32;
                             run_text.push('\u{FFFC}');
                             para_inline_objects.push(engine::InlineObject {
@@ -1063,15 +1208,24 @@ pub fn parse_document_xml_with_warnings(
                                     width_emu: cx,
                                     height_emu: cy,
                                 },
+                                anchor: if in_wp_anchor {
+                                    cur_anchor.take()
+                                } else {
+                                    None
+                                },
                             });
                         } else {
-                            /* Anchor / floating or malformed — drop. */
+                            /* Shape / text box (no blip) or malformed — drop. */
                             cur_drawing_rel_id = None;
                             cur_drawing_cx = None;
                             cur_drawing_cy = None;
                         }
                         in_drawing = false;
                         in_wp_inline = false;
+                        in_wp_anchor = false;
+                        cur_anchor = None;
+                        anchor_axis = None;
+                        anchor_offset = None;
                     }
                     b"w:fldSimple" => {
                         /* Issue #43 — seal the compact field. A result-
@@ -1365,6 +1519,271 @@ mod tests {
             String::from_utf8_lossy(raw)
         );
         assert_eq!(t.rows.len(), 1, "table rows must still parse behind a BOM");
+    }
+
+    /* ---------------------------------------------------------------
+    Issue #69 — `<wp:anchor>` floating pictures.
+    --------------------------------------------------------------- */
+
+    const DRAWING_ROOT: &str = concat!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+        r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+        r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+        r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+        r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+        r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing">"#,
+    );
+
+    /// The `<a:graphic>` picture body Word writes (compact, no whitespace).
+    const PIC_GRAPHIC: &str = concat!(
+        r#"<wp:cNvGraphicFramePr/><a:graphic>"#,
+        r#"<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+        r#"<pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="Image"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+        r#"<pic:blipFill><a:blip r:embed="rId5"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+        r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>"#,
+        r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>"#,
+        r#"</a:graphicData></a:graphic>"#,
+    );
+
+    fn parse_body(body: &str) -> DocumentTree {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>{DRAWING_ROOT}<w:body>{body}<w:sectPr/></w:body></w:document>"
+        );
+        let table = StyleTable::default();
+        let resolver = StyleResolver::new(&table);
+        parse_document_xml(xml.as_bytes(), &resolver).expect("parse")
+    }
+
+    #[test]
+    fn anchored_picture_parses_into_a_floating_inline_object() {
+        let body = format!(
+            concat!(
+                r#"<w:p><w:r><w:t xml:space="preserve">float </w:t></w:r><w:r><w:drawing>"#,
+                r#"<wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" "#,
+                r#"relativeHeight="251659264" behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">"#,
+                r#"<wp:simplePos x="0" y="0"/>"#,
+                r#"<wp:positionH relativeFrom="margin"><wp:align>center</wp:align></wp:positionH>"#,
+                r#"<wp:positionV relativeFrom="page"><wp:posOffset>1828800</wp:posOffset></wp:positionV>"#,
+                r#"<wp:extent cx="914400" cy="457200"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+                r#"<wp:wrapSquare wrapText="bothSides"/>"#,
+                r#"<wp:docPr id="7" name="Picture 7" descr="a float"/>"#,
+                "{pic}",
+                r#"</wp:anchor></w:drawing></w:r><w:r><w:t>here</w:t></w:r></w:p>"#,
+            ),
+            pic = PIC_GRAPHIC
+        );
+        let tree = parse_body(&body);
+        let p = tree.blocks[0].as_paragraph().expect("paragraph");
+        assert_eq!(
+            p.text, "float \u{FFFC}here",
+            "the anchor takes the same sentinel as an inline"
+        );
+        assert_eq!(p.inline_objects.len(), 1);
+        let obj = &p.inline_objects[0];
+        assert_eq!(obj.at, 6);
+        match &obj.kind {
+            engine::InlineKind::Image {
+                rel_id,
+                width_emu,
+                height_emu,
+            } => {
+                assert_eq!(rel_id, "rId5");
+                assert_eq!((*width_emu, *height_emu), (914_400, 457_200));
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+        let a = obj.anchor.as_deref().expect("floating");
+        assert!(a.behind_doc);
+        assert!(!a.locked);
+        assert!(a.layout_in_cell);
+        assert!(a.allow_overlap);
+        assert!(!a.simple_pos);
+        assert!(!a.hidden);
+        assert_eq!(a.relative_height, 251_659_264);
+        assert_eq!((a.dist_left_emu, a.dist_right_emu), (114_300, 114_300));
+        assert_eq!((a.dist_top_emu, a.dist_bottom_emu), (0, 0));
+        assert_eq!(a.position_h.relative_from, engine::HRelativeFrom::Margin);
+        assert_eq!(
+            a.position_h.offset,
+            engine::FloatOffset::Align(engine::FloatAlign::Center)
+        );
+        assert_eq!(a.position_v.relative_from, engine::VRelativeFrom::Page);
+        assert_eq!(a.position_v.offset, engine::FloatOffset::Emu(1_828_800));
+        assert_eq!(a.wrap, engine::WrapKind::Square);
+        assert_eq!(
+            a.wrap_xml.as_deref(),
+            Some(r#"<wp:wrapSquare wrapText="bothSides"/>"#),
+            "the wrap element rides verbatim"
+        );
+        assert_eq!(
+            a.doc_pr_xml.as_deref(),
+            Some(r#"<wp:docPr id="7" name="Picture 7" descr="a float"/>"#),
+            "docPr rides verbatim (id / name / descr are not modeled)"
+        );
+    }
+
+    #[test]
+    fn anchored_picture_reads_percent_offsets_simple_pos_and_wrap_polygon() {
+        let wrap = concat!(
+            r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="1">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/>"#,
+            r#"<wp:lineTo x="21600" y="0"/><wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>"#,
+        );
+        let doc_pr = r#"<wp:docPr id="2" name="P"><a:hlinkClick r:id="rId9"/></wp:docPr>"#;
+        let body = format!(
+            concat!(
+                r#"<w:p><w:r><w:drawing>"#,
+                r#"<wp:anchor distT="10" distB="20" distL="30" distR="40" simplePos="1" "#,
+                r#"relativeHeight="3" behindDoc="0" locked="1" layoutInCell="0" hidden="1" allowOverlap="0">"#,
+                r#"<wp:simplePos x="100" y="200"/>"#,
+                r#"<wp:positionH relativeFrom="page"><wp14:pctPosHOffset>25000</wp14:pctPosHOffset></wp:positionH>"#,
+                r#"<wp:positionV relativeFrom="line"><wp:align>bottom</wp:align></wp:positionV>"#,
+                r#"<wp:extent cx="914400" cy="457200"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+                "{wrap}{doc_pr}{pic}",
+                r#"</wp:anchor></w:drawing></w:r></w:p>"#,
+            ),
+            wrap = wrap,
+            doc_pr = doc_pr,
+            pic = PIC_GRAPHIC
+        );
+        let tree = parse_body(&body);
+        let p = tree.blocks[0].as_paragraph().expect("paragraph");
+        assert_eq!(p.text, "\u{FFFC}");
+        let a = p.inline_objects[0].anchor.as_deref().expect("floating");
+        assert!(a.simple_pos);
+        assert_eq!((a.simple_pos_x_emu, a.simple_pos_y_emu), (100, 200));
+        assert!(a.locked);
+        assert!(!a.layout_in_cell);
+        assert!(a.hidden);
+        assert!(!a.allow_overlap);
+        assert_eq!(a.relative_height, 3);
+        assert_eq!(
+            (
+                a.dist_top_emu,
+                a.dist_bottom_emu,
+                a.dist_left_emu,
+                a.dist_right_emu
+            ),
+            (10, 20, 30, 40)
+        );
+        assert_eq!(a.position_h.relative_from, engine::HRelativeFrom::Page);
+        assert_eq!(
+            a.position_h.offset,
+            engine::FloatOffset::PercentMilli(25_000)
+        );
+        assert_eq!(a.position_v.relative_from, engine::VRelativeFrom::Line);
+        assert_eq!(
+            a.position_v.offset,
+            engine::FloatOffset::Align(engine::FloatAlign::Bottom)
+        );
+        assert_eq!(a.wrap, engine::WrapKind::Tight);
+        assert_eq!(a.wrap_xml.as_deref(), Some(wrap), "polygon rides verbatim");
+        assert_eq!(
+            a.doc_pr_xml.as_deref(),
+            Some(doc_pr),
+            "docPr children ride verbatim"
+        );
+    }
+
+    /// A `<wp:anchor>` around a shape / text box has no `<a:blip>`: it is
+    /// dropped exactly as before #69 (issue #119 owns text boxes), and the
+    /// paragraph text around it survives with NO stray sentinel.
+    #[test]
+    fn anchored_shape_without_blip_is_dropped_not_misread_as_a_picture() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t>a</w:t></w:r><w:r><w:drawing>"#,
+            r#"<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" "#,
+            r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">"#,
+            r#"<wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+            r#"<wp:extent cx="100" cy="100"/><wp:wrapNone/><wp:docPr id="1" name="Shape"/>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp>"#,
+            r#"</a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>"#,
+            r#"<w:r><w:t>b</w:t></w:r></w:p>"#,
+        );
+        let tree = parse_body(body);
+        let p = tree.blocks[0].as_paragraph().expect("paragraph");
+        assert_eq!(p.text, "ab");
+        assert!(p.inline_objects.is_empty());
+    }
+
+    /// Issue #119 rider — a text box's `<w:txbxContent><w:p>` is a sub-
+    /// story, never a body paragraph: the enclosing paragraph keeps its
+    /// text AND its verbatim source capture (so a zero-edit resave keeps
+    /// the drawing byte-for-byte), and the paragraph after it is still
+    /// block 1.
+    #[test]
+    fn text_box_paragraphs_are_not_hoisted_into_the_body() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t>a</w:t></w:r><w:r><w:drawing>"#,
+            r#"<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" "#,
+            r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">"#,
+            r#"<wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+            r#"<wp:extent cx="100" cy="100"/><wp:wrapNone/><wp:docPr id="1" name="Text Box 1"/>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:txbx><w:txbxContent>"#,
+            r#"<w:p><w:r><w:t>inside the box</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>second box line</w:t></w:r></w:p>"#,
+            r#"</w:txbxContent></wps:txbx></wps:wsp>"#,
+            r#"</a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>"#,
+            r#"<w:r><w:t>b</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>second</w:t></w:r></w:p>"#,
+        );
+        let tree = parse_body(body);
+        assert_eq!(tree.blocks.len(), 2, "only the two body paragraphs");
+        let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
+        assert_eq!(p0.text, "ab");
+        assert!(p0.inline_objects.is_empty(), "a text box is not a picture");
+        let src = p0
+            .source_xml
+            .as_deref()
+            .expect("passthrough capture intact");
+        assert!(src.starts_with(b"<w:p>") && src.ends_with(b"</w:p>"));
+        assert!(
+            std::str::from_utf8(src).unwrap().contains("inside the box"),
+            "the drawing rides the enclosing paragraph's verbatim bytes"
+        );
+        let p1 = tree.blocks[1].as_paragraph().expect("paragraph 1");
+        assert_eq!(p1.text, "second");
+    }
+
+    /// The `mc:AlternateContent` shape: the Choice carries the DrawingML
+    /// text box, the Fallback the VML `<w:pict><v:textbox>` duplicate —
+    /// neither inner `<w:p>` may reach the body.
+    #[test]
+    fn alternate_content_fallback_and_vml_textbox_are_skipped() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t>a</w:t></w:r>"#,
+            r#"<w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">"#,
+            r#"<mc:Choice Requires="wps"><w:drawing>"#,
+            r#"<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" "#,
+            r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">"#,
+            r#"<wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+            r#"<wp:extent cx="100" cy="100"/><wp:wrapNone/><wp:docPr id="1" name="Text Box 1"/>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:txbx><w:txbxContent><w:p><w:r><w:t>choice text</w:t></w:r></w:p></w:txbxContent></wps:txbx>"#,
+            r#"</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice>"#,
+            r##"<mc:Fallback><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml" id="s1" type="#_x0000_t202">"##,
+            r#"<v:textbox><w:txbxContent><w:p><w:r><w:t>fallback text</w:t></w:r></w:p></w:txbxContent></v:textbox>"#,
+            r#"</v:shape></w:pict></mc:Fallback>"#,
+            r#"</mc:AlternateContent></w:r>"#,
+            r#"<w:r><w:t>b</w:t></w:r></w:p>"#,
+        );
+        let tree = parse_body(body);
+        assert_eq!(tree.blocks.len(), 1);
+        let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
+        assert_eq!(p0.text, "ab");
+        assert!(p0.inline_objects.is_empty());
+        assert!(p0.source_xml.is_some(), "passthrough capture intact");
     }
 
     /// The same document WITHOUT a BOM is the control — identical capture.

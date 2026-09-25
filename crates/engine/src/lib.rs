@@ -6,9 +6,15 @@
 use im::Vector;
 use serde::{Deserialize, Serialize};
 
+pub mod fields;
 pub mod html;
 pub mod numbering;
 pub mod snapshot;
+
+pub use fields::{
+    FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TypedField,
+    render_date_time_picture,
+};
 
 /// Top-level document block (Phase 5 PR 1). Tables sit alongside
 /// paragraphs in the body; future block variants (Phase 7 floating
@@ -738,6 +744,11 @@ pub struct DocumentSettings {
     /// `<w:evenAndOddHeaders/>` — when `true`, even-numbered pages render
     /// the `Even` header / footer instead of the `Default` slot.
     pub even_and_odd_headers: bool,
+    /// Issue #77 — `docProps/core.xml` `<dc:creator>`, the value the
+    /// `AUTHOR` field resolves to. Read-only ingest: the writer never
+    /// regenerates the core-properties part (it rides the OPC
+    /// passthrough), so `None` on documents without one.
+    pub author: Option<String>,
 }
 
 /* ============================================================
@@ -1340,10 +1351,210 @@ pub enum InlineKind {
 /// The paragraph text carries one U+FFFC (OBJECT REPLACEMENT CHARACTER) at
 /// `at`; layout looks the object up here when it sees the sentinel and
 /// reserves the right physical size in the line.
+///
+/// Issue #69 — `anchor` distinguishes the two DrawingML placements: `None`
+/// is `<wp:inline>` (the object flows with the text and reserves its own
+/// width in the line); `Some` is `<wp:anchor>` (the object *floats*: it is
+/// positioned on the page relative to a reference frame and reserves NO
+/// width — the sentinel byte only records where in the run stream the
+/// anchor lives, exactly as OOXML does). Keeping the anchor on the same
+/// byte-anchored object means every offset-shifting edit path (insert,
+/// delete, split, concat, clipboard) already carries floats correctly.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct InlineObject {
     pub at: u32,
     pub kind: InlineKind,
+    /// Issue #69 — `Some` ⇒ the object is a floating (`<wp:anchor>`)
+    /// object; `None` ⇒ in-line (`<wp:inline>`). Boxed — floats are rare
+    /// and `Paragraph` clones constantly. `#[serde(default)]` keeps the
+    /// pre-#69 snapshot envelope (format version 1) readable.
+    #[serde(default)]
+    pub anchor: Option<Box<FloatAnchor>>,
+}
+
+impl InlineObject {
+    /// `true` for a `<wp:anchor>`-placed (floating) object.
+    pub fn is_floating(&self) -> bool {
+        self.anchor.is_some()
+    }
+}
+
+/// Issue #69 — horizontal reference frame of a floating object
+/// (`<wp:positionH relativeFrom="…">`, ECMA-376 §20.4.3.4 `ST_RelFromH`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum HRelativeFrom {
+    /// The anchor character's left edge.
+    Character,
+    /// The text column the anchor paragraph flows in (the whole content
+    /// area in single-column sections). Word's default.
+    #[default]
+    Column,
+    /// The inside margin (left on odd pages, right on even).
+    InsideMargin,
+    LeftMargin,
+    /// The content area between the left and right margins.
+    Margin,
+    /// The outside margin (right on odd pages, left on even).
+    OutsideMargin,
+    /// The physical page edge.
+    Page,
+    RightMargin,
+}
+
+/// Issue #69 — vertical reference frame of a floating object
+/// (`<wp:positionV relativeFrom="…">`, ECMA-376 §20.4.3.5 `ST_RelFromV`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VRelativeFrom {
+    BottomMargin,
+    InsideMargin,
+    /// The line the anchor character sits on.
+    Line,
+    /// The content area between the top and bottom margins.
+    Margin,
+    OutsideMargin,
+    Page,
+    /// The top of the anchor paragraph. Word's default.
+    #[default]
+    Paragraph,
+    TopMargin,
+}
+
+/// Issue #69 — `<wp:align>` values. `Left` / `Right` are horizontal-only,
+/// `Top` / `Bottom` vertical-only; `Center` / `Inside` / `Outside` apply
+/// to both axes (ECMA-376 `ST_AlignH` / `ST_AlignV`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatAlign {
+    Left,
+    Right,
+    Center,
+    Inside,
+    Outside,
+    Top,
+    Bottom,
+}
+
+/// Issue #69 — how a floating object is placed along one axis inside its
+/// reference frame: a fixed EMU offset (`<wp:posOffset>`), an alignment
+/// keyword (`<wp:align>`), or a percentage of the frame's extent
+/// (`<wp14:pctPosHOffset>` / `<wp14:pctPosVOffset>`, thousandths of a
+/// percent — `50000` ⇒ 50 %).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatOffset {
+    Emu(i64),
+    Align(FloatAlign),
+    PercentMilli(i32),
+}
+
+impl Default for FloatOffset {
+    fn default() -> Self {
+        FloatOffset::Emu(0)
+    }
+}
+
+/// Issue #69 — one positioning axis (`<wp:positionH>` / `<wp:positionV>`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(default)]
+pub struct HPosition {
+    pub relative_from: HRelativeFrom,
+    pub offset: FloatOffset,
+}
+
+/// Issue #69 — the vertical twin of [`HPosition`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(default)]
+pub struct VPosition {
+    pub relative_from: VRelativeFrom,
+    pub offset: FloatOffset,
+}
+
+/// Issue #69 — the text-wrap mode a floating object declares
+/// (`<wp:wrapNone>`, `<wp:wrapSquare>`, `<wp:wrapTight>`,
+/// `<wp:wrapThrough>`, `<wp:wrapTopAndBottom>`). Parsed and round-tripped
+/// now; layout treats every mode as "text unaffected" until the text-wrap
+/// epic (issue #82) teaches the line builder about cutouts.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WrapKind {
+    #[default]
+    None,
+    Square,
+    Tight,
+    Through,
+    TopAndBottom,
+}
+
+/// Issue #69 — the `<wp:anchor>` placement of a floating object. Mirrors
+/// ECMA-376 §20.4.2.3 `CT_Anchor`: the two positioning axes, the
+/// `simplePos` escape hatch, the z-order + layering flags, the wrap
+/// distances, and the declared wrap mode. Unmodeled children that the
+/// writer cannot regenerate from the typed fields (`<wp:docPr>` and the
+/// wrap element, which may carry a `<wp:wrapPolygon>`) ride verbatim so a
+/// regenerated paragraph stays byte-faithful to the source.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct FloatAnchor {
+    pub position_h: HPosition,
+    pub position_v: VPosition,
+    /// `simplePos="1"` — ignore both axes and place the object at
+    /// `simple_pos_{x,y}_emu` from the page's top-left corner.
+    pub simple_pos: bool,
+    pub simple_pos_x_emu: i64,
+    pub simple_pos_y_emu: i64,
+    /// `relativeHeight` — z-order among floating objects (higher paints
+    /// later, i.e. on top).
+    pub relative_height: u32,
+    /// `behindDoc="1"` — paint under the text instead of over it.
+    pub behind_doc: bool,
+    /// `locked="1"` — the anchor may not move to another paragraph.
+    pub locked: bool,
+    /// `layoutInCell="1"` — inside a table cell, position relative to the
+    /// cell rather than the page.
+    pub layout_in_cell: bool,
+    /// `allowOverlap="1"` — may overlap other floating objects.
+    pub allow_overlap: bool,
+    /// `hidden="1"` — not painted.
+    pub hidden: bool,
+    /// `distT` / `distB` / `distL` / `distR` — wrap distances (EMU).
+    pub dist_top_emu: i64,
+    pub dist_bottom_emu: i64,
+    pub dist_left_emu: i64,
+    pub dist_right_emu: i64,
+    /// Declared wrap mode (issue #82 consumes it; layout ignores it now).
+    pub wrap: WrapKind,
+    /// Verbatim source bytes of the wrap element (`<wp:wrapSquare …/>`,
+    /// `<wp:wrapTight>…<wp:wrapPolygon>…</wp:wrapTight>`) for
+    /// byte-faithful regeneration. `None` for engine-authored anchors —
+    /// the writer synthesizes the element from `wrap`.
+    pub wrap_xml: Option<String>,
+    /// Verbatim `<wp:docPr …/>` (id / name / descr / hyperlink children).
+    /// `None` ⇒ the writer synthesizes a stock one.
+    pub doc_pr_xml: Option<String>,
+}
+
+impl Default for FloatAnchor {
+    /// Word's stock "In Front of Text" anchor: column-relative X, paragraph-
+    /// relative Y, zero offsets, topmost z-order, overlap allowed.
+    fn default() -> Self {
+        Self {
+            position_h: HPosition::default(),
+            position_v: VPosition::default(),
+            simple_pos: false,
+            simple_pos_x_emu: 0,
+            simple_pos_y_emu: 0,
+            relative_height: 251_658_240,
+            behind_doc: false,
+            locked: false,
+            layout_in_cell: true,
+            allow_overlap: true,
+            hidden: false,
+            dist_top_emu: 0,
+            dist_bottom_emu: 0,
+            dist_left_emu: 0,
+            dist_right_emu: 0,
+            wrap: WrapKind::None,
+            wrap_xml: None,
+            doc_pr_xml: None,
+        }
+    }
 }
 
 /// A hyperlink overlay on a contiguous byte range of a paragraph. Display
@@ -1402,9 +1613,11 @@ impl Field {
     /// evaluate (the renderer keeps the cached text in that case).
     /// `current_page` and `total_pages` are 1-based.
     pub fn evaluate(&self, current_page: u32, total_pages: u32) -> Option<String> {
-        match self.keyword().as_str() {
-            "PAGE" => Some(current_page.to_string()),
-            "NUMPAGES" => Some(total_pages.to_string()),
+        /* Issue #77 — page-only shim over the environment evaluator in
+        `fields.rs`; every kind resolves through `evaluate_in`. */
+        let env = FieldEnv::default().with_page(Some(current_page.to_string()), Some(total_pages));
+        match self.typed() {
+            TypedField::Page | TypedField::NumPages => self.evaluate_in(&env),
             _ => None,
         }
     }
@@ -1427,42 +1640,14 @@ impl Field {
     }
 }
 
-/// Issue #43 — render `(year, month, day)` through a minimal subset of
-/// Word's date-picture language: `yyyy`, `yy`, `MM`, `M`, `dd`, `d`
-/// (longest-match, case-sensitive per Word: `M` = month, `d` = day —
-/// `mm`/minutes is out of scope, time fields are not evaluated).
-/// Unrecognized characters pass through verbatim.
+/// Issue #43 — render `(year, month, day)` through Word's date-picture
+/// language: `yyyy`, `yy`, `MM`, `M`, `dd`, `d` (longest-match,
+/// case-sensitive per Word: `M` = month, `d` = day). Unrecognized
+/// characters (and time tokens — no clock here) pass through verbatim.
 pub fn render_date_picture(picture: &str, year: i32, month: u32, day: u32) -> String {
-    let mut out = String::with_capacity(picture.len() + 4);
-    let bytes = picture.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest = &picture[i..];
-        if rest.starts_with("yyyy") {
-            out.push_str(&format!("{year:04}"));
-            i += 4;
-        } else if rest.starts_with("yy") {
-            out.push_str(&format!("{:02}", year.rem_euclid(100)));
-            i += 2;
-        } else if rest.starts_with("MM") {
-            out.push_str(&format!("{month:02}"));
-            i += 2;
-        } else if rest.starts_with('M') {
-            out.push_str(&month.to_string());
-            i += 1;
-        } else if rest.starts_with("dd") {
-            out.push_str(&format!("{day:02}"));
-            i += 2;
-        } else if rest.starts_with('d') {
-            out.push_str(&day.to_string());
-            i += 1;
-        } else {
-            let ch = rest.chars().next().expect("non-empty rest");
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
+    /* Issue #77 — date-only shim over the shared date/time renderer
+    (`fields::render_date_time_picture`); time tokens pass through. */
+    render_date_time_picture(picture, Some((year, month, day)), None)
 }
 
 /// Phase 8b — kind of tracked-change revision.
@@ -1988,6 +2173,30 @@ impl Paragraph {
                 }
             }
         }
+        /* Issue #69 — INLINE OBJECTS are remapped like fields: an anchor
+        strictly before the gap is unchanged, one at/after the gap's end
+        shifts left, and one whose sentinel byte lies inside the gap is
+        dropped together with its sentinel (deleting the anchor deletes
+        the object — Word semantics; for a floating image the object
+        leaves the page with it). Before #69 this rebuild cleared the
+        whole list, orphaning the surviving U+FFFC sentinels as tofu. */
+        let inline_objects: Vec<InlineObject> = self
+            .inline_objects
+            .iter()
+            .filter_map(|o| {
+                if o.at < s {
+                    Some(o.clone())
+                } else if o.at >= e {
+                    Some(InlineObject {
+                        at: o.at - gap,
+                        kind: o.kind.clone(),
+                        anchor: o.anchor.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
         Paragraph {
             text,
             spans,
@@ -2002,20 +2211,10 @@ impl Paragraph {
             would dangle across the deleted range. Clearing these overlays
             is a known, deliberately out-of-scope limitation (offset
             remapping is a separate, larger task), not an oversight.
-            Issue #80 — inline OBJECTS are the exception: an anchor is a
-            single sentinel byte, so the remap is exact — before the gap
-            unchanged, inside it gone (its sentinel was deleted), after it
-            shifted left. A footnote reference must survive editing the
-            words around it. */
-            inline_objects: self
-                .inline_objects
-                .iter()
-                .filter(|o| o.at < s || o.at >= e)
-                .map(|o| InlineObject {
-                    at: if o.at >= e { o.at - gap } else { o.at },
-                    kind: o.kind.clone(),
-                })
-                .collect(),
+            Inline objects are remapped above (issue #69) — an anchor is a
+            single sentinel byte, so the remap is exact (issue #80: a
+            footnote reference survives editing the words around it). */
+            inline_objects,
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields,
@@ -2080,6 +2279,7 @@ impl Paragraph {
                 objects_right.push(InlineObject {
                     at: o.at - at,
                     kind: o.kind.clone(),
+                    anchor: o.anchor.clone(),
                 });
             }
         }
@@ -2163,6 +2363,7 @@ impl Paragraph {
             inline_objects.push(InlineObject {
                 at: o.at + shift,
                 kind: o.kind.clone(),
+                anchor: o.anchor.clone(),
             });
         }
         Paragraph {
@@ -2293,6 +2494,7 @@ impl Paragraph {
             .map(|o| InlineObject {
                 at: map_start(o.at),
                 kind: o.kind.clone(),
+                anchor: o.anchor.clone(),
             })
             .collect();
         out
@@ -3145,6 +3347,7 @@ impl DocumentTree {
         body_para.inline_objects.push(InlineObject {
             at: 0,
             kind: InlineKind::NoteSelfRef { kind },
+            anchor: None,
         });
         /* Word styles note bodies `FootnoteText` / `EndnoteText`; adopt
         the style when the document defines it so the body picks up the
@@ -3986,10 +4189,10 @@ impl DocumentTree {
                     f.end += len;
                 }
             }
-            /* Issue #80 — inline anchors (images, note references) are
-            single sentinel bytes: one at or past the insertion point
-            slides right with its sentinel. A footnote reference must
-            survive typing in front of it. */
+            /* Issue #69 / #80 — inline-object anchors (images, note
+            references) slide right with their sentinel byte. Typing
+            exactly AT the anchor inserts before it (the sentinel keeps its
+            object; the typed text lands to its left), so `>=`. */
             for io in &mut para.inline_objects {
                 if io.at >= off {
                     io.at += len;
@@ -5704,6 +5907,61 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #69 — reposition the FLOATING image anchored at `(path, at)`
+    /// to fixed offsets inside its reference frames: both axes become
+    /// `FloatOffset::Emu` (an `<wp:align>` / percentage placement is
+    /// replaced, exactly as Word converts an aligned object to an absolute
+    /// offset the moment it is dragged) and `simplePos` is switched off so
+    /// the axes are what the layout reads. The reference frames
+    /// (`relative_from`) are preserved — EXCEPT for a `simplePos` object,
+    /// whose only frame was the page corner: the layout reports its frame
+    /// origin as the page's top-left, the shell hands back page-relative
+    /// offsets, so both axes are re-based onto `Page` to keep the object
+    /// where it was dropped. A no-op (structural clone) when the offset
+    /// holds no floating image.
+    pub fn move_floating_image_at(
+        &self,
+        path: &BlockPath,
+        at: u32,
+        offset_h_emu: i64,
+        offset_v_emu: i64,
+    ) -> Self {
+        let mut blocks = self.blocks.clone();
+        let _ = mutate_paragraph_in_top(&mut blocks, path, |para| {
+            for io in &mut para.inline_objects {
+                if io.at == at
+                    && matches!(io.kind, InlineKind::Image { .. })
+                    && let Some(anchor) = io.anchor.as_mut()
+                {
+                    if anchor.simple_pos {
+                        anchor.position_h.relative_from = HRelativeFrom::Page;
+                        anchor.position_v.relative_from = VRelativeFrom::Page;
+                    }
+                    anchor.position_h.offset = FloatOffset::Emu(offset_h_emu);
+                    anchor.position_v.offset = FloatOffset::Emu(offset_v_emu);
+                    anchor.simple_pos = false;
+                }
+            }
+        });
+        Self {
+            blocks,
+            ..self.clone()
+        }
+    }
+
+    /// Issue #69 — count the floating (`<wp:anchor>`) images in the body.
+    pub fn count_floating_images(&self) -> u32 {
+        let mut n = 0u32;
+        walk_paragraphs(&self.blocks, &mut |p| {
+            for io in &p.inline_objects {
+                if io.is_floating() && matches!(io.kind, InlineKind::Image { .. }) {
+                    n = n.saturating_add(1);
+                }
+            }
+        });
+        n
+    }
+
     /// Sprint 2 (UI Edition) — set `<w:pPr><w:pBdr>` on every
     /// paragraph the range spans. Mirrors [`Self::set_alignment`] but
     /// writes `props.borders`. Pass `None` to clear the borders.
@@ -7313,7 +7571,11 @@ fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) {
             f.end += sentinel_len;
         }
     }
-    para.inline_objects.push(InlineObject { at: off, kind });
+    para.inline_objects.push(InlineObject {
+        at: off,
+        kind,
+        anchor: None,
+    });
     para.inline_objects.sort_by_key(|i| i.at);
     para.dirty = true;
 }
@@ -7962,6 +8224,7 @@ mod tests {
                     width_emu: 0,
                     height_emu: 0,
                 },
+                anchor: None,
             }],
             ..Default::default()
         }));
@@ -7980,6 +8243,7 @@ mod tests {
                     width_emu: 914_400,
                     height_emu: 914_400,
                 },
+                anchor: None,
             }],
             ..Default::default()
         }));
@@ -8007,6 +8271,7 @@ mod tests {
                     width_emu: 100,
                     height_emu: 100,
                 },
+                anchor: None,
             }],
             ..Default::default()
         }));
@@ -8026,6 +8291,188 @@ mod tests {
         );
     }
 
+    /* ---------------------------------------------------------------
+    Issue #69 — floating anchors.
+    --------------------------------------------------------------- */
+
+    fn floating_image_doc(anchor: FloatAnchor) -> DocumentTree {
+        let mut d = DocumentTree::default();
+        d.blocks.push_back(Block::Paragraph(Paragraph {
+            text: "ab\u{FFFC}cd".into(),
+            inline_objects: vec![InlineObject {
+                at: 2,
+                kind: InlineKind::Image {
+                    rel_id: "rId1".into(),
+                    width_emu: 914_400,
+                    height_emu: 914_400,
+                },
+                anchor: Some(Box::new(anchor)),
+            }],
+            ..Default::default()
+        }));
+        d
+    }
+
+    fn first_object(d: &DocumentTree) -> &InlineObject {
+        &d.blocks[0].as_paragraph().unwrap().inline_objects[0]
+    }
+
+    #[test]
+    fn move_floating_image_sets_fixed_offsets_and_keeps_the_frames() {
+        let anchor = FloatAnchor {
+            position_h: HPosition {
+                relative_from: HRelativeFrom::Margin,
+                offset: FloatOffset::Align(FloatAlign::Center),
+            },
+            position_v: VPosition {
+                relative_from: VRelativeFrom::Paragraph,
+                offset: FloatOffset::PercentMilli(25_000),
+            },
+            ..FloatAnchor::default()
+        };
+        let d = floating_image_doc(anchor).move_floating_image_at(&BlockPath::top(0), 2, 111, 222);
+        let obj = first_object(&d);
+        let a = obj.anchor.as_deref().expect("still floating");
+        assert_eq!(a.position_h.offset, FloatOffset::Emu(111));
+        assert_eq!(a.position_v.offset, FloatOffset::Emu(222));
+        assert_eq!(
+            a.position_h.relative_from,
+            HRelativeFrom::Margin,
+            "the reference frame is preserved — only the offset moves"
+        );
+        assert_eq!(a.position_v.relative_from, VRelativeFrom::Paragraph);
+        assert!(!a.simple_pos);
+        assert!(
+            d.blocks[0].as_paragraph().unwrap().dirty,
+            "a move dirties the paragraph so the writer regenerates the anchor"
+        );
+    }
+
+    /// A `simplePos` object was positioned from the page corner; the shell
+    /// hands back page-relative offsets, so the move must re-base both axes
+    /// onto the `Page` frame (else the object would jump on its first drag).
+    #[test]
+    fn move_floating_image_rebases_simple_pos_onto_the_page_frame() {
+        let anchor = FloatAnchor {
+            position_h: HPosition {
+                relative_from: HRelativeFrom::Margin,
+                offset: FloatOffset::Align(FloatAlign::Center),
+            },
+            position_v: VPosition {
+                relative_from: VRelativeFrom::Paragraph,
+                offset: FloatOffset::Emu(5),
+            },
+            simple_pos: true,
+            simple_pos_x_emu: 10,
+            simple_pos_y_emu: 20,
+            ..FloatAnchor::default()
+        };
+        let d = floating_image_doc(anchor).move_floating_image_at(&BlockPath::top(0), 2, 111, 222);
+        let a = first_object(&d).anchor.as_deref().expect("still floating");
+        assert!(!a.simple_pos, "a drag replaces simplePos with the axes");
+        assert_eq!(a.position_h.relative_from, HRelativeFrom::Page);
+        assert_eq!(a.position_v.relative_from, VRelativeFrom::Page);
+        assert_eq!(a.position_h.offset, FloatOffset::Emu(111));
+        assert_eq!(a.position_v.offset, FloatOffset::Emu(222));
+    }
+
+    #[test]
+    fn move_floating_image_is_a_no_op_for_inline_images() {
+        let mut d = DocumentTree::default();
+        d.blocks.push_back(Block::Paragraph(Paragraph {
+            text: "\u{FFFC}".into(),
+            inline_objects: vec![InlineObject {
+                at: 0,
+                kind: InlineKind::Image {
+                    rel_id: "rId1".into(),
+                    width_emu: 100,
+                    height_emu: 100,
+                },
+                anchor: None,
+            }],
+            ..Default::default()
+        }));
+        let moved = d.move_floating_image_at(&BlockPath::top(0), 0, 5, 5);
+        assert!(!first_object(&moved).is_floating());
+        assert_eq!(moved.count_floating_images(), 0);
+        assert_eq!(moved.count_inline_images(), 1);
+    }
+
+    #[test]
+    fn floating_anchor_survives_offset_shifting_edits() {
+        let d = floating_image_doc(FloatAnchor::default());
+        assert_eq!(d.count_floating_images(), 1);
+        /* Delete the "a" before the anchor: the sentinel shifts left and
+        the anchor rides along. */
+        let d = d.delete_range(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 1,
+            },
+        );
+        let obj = first_object(&d);
+        assert_eq!(obj.at, 1, "sentinel shifted by the deleted byte");
+        assert!(
+            obj.is_floating(),
+            "the anchor must travel with its sentinel"
+        );
+        /* Insert text before it: shifts right, still floating. */
+        let d = d.insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            "xyz",
+        );
+        let obj = first_object(&d);
+        assert_eq!(obj.at, 4);
+        assert!(obj.is_floating());
+    }
+
+    /// The pre-#69 snapshot shape (`{at, kind}` with no `anchor`) must keep
+    /// decoding — format version 1 is unchanged, `anchor` defaults.
+    #[test]
+    fn inline_object_without_anchor_field_decodes_as_inline() {
+        #[derive(Serialize)]
+        struct Legacy {
+            at: u32,
+            kind: InlineKind,
+        }
+        let legacy = Legacy {
+            at: 3,
+            kind: InlineKind::FootnoteRef {
+                id: 1,
+                custom_mark_follows: false,
+            },
+        };
+        let bytes = rmp_serde::to_vec_named(&legacy).expect("encode legacy");
+        let decoded: InlineObject = rmp_serde::from_slice(&bytes).expect("decode with default");
+        assert_eq!(decoded.at, 3);
+        assert!(decoded.anchor.is_none());
+        /* And a floating object round-trips its whole anchor. */
+        let obj = InlineObject {
+            at: 0,
+            kind: InlineKind::Image {
+                rel_id: "r".into(),
+                width_emu: 1,
+                height_emu: 2,
+            },
+            anchor: Some(Box::new(FloatAnchor {
+                wrap: WrapKind::Square,
+                wrap_xml: Some("<wp:wrapSquare wrapText=\"bothSides\"/>".into()),
+                behind_doc: true,
+                ..FloatAnchor::default()
+            })),
+        };
+        let bytes = rmp_serde::to_vec_named(&obj).expect("encode");
+        let back: InlineObject = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(back, obj);
+    }
+
     #[test]
     fn count_inline_images_walks_body_and_cells() {
         let mut d = DocumentTree::from_text("plain");
@@ -8040,6 +8487,7 @@ mod tests {
                         width_emu: 1,
                         height_emu: 1,
                     },
+                    anchor: None,
                 },
                 InlineObject {
                     at: 3,
@@ -8048,6 +8496,7 @@ mod tests {
                         width_emu: 1,
                         height_emu: 1,
                     },
+                    anchor: None,
                 },
             ],
             ..Default::default()
@@ -8067,6 +8516,7 @@ mod tests {
                     id: 1,
                     custom_mark_follows: false,
                 },
+                anchor: None,
             },
             InlineObject {
                 at: 7,
@@ -8074,6 +8524,7 @@ mod tests {
                     id: 1,
                     custom_mark_follows: false,
                 },
+                anchor: None,
             },
         ];
         let after = d.insert_text(

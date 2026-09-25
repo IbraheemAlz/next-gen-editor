@@ -17,6 +17,7 @@ use crate::schema::ct_ppr::ppr_child_rank;
 use crate::schema::ct_rpr::rpr_child_rank;
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
 use crate::schema::grab_bag::fragment_qname;
+use crate::schema::wp_anchor::emit_anchor_open;
 use engine::{
     Alignment, Block, BorderStroke, BorderStyle, CellBorders, CellWidth, DocumentTree, Field,
     FontFamily, Hyperlink, InlineKind, InlineObject, LineHeight, ParaProperties, Paragraph,
@@ -38,8 +39,11 @@ const DOC_XML_HEADER: &str = concat!(
 /// Header used for documents that carry inline drawings (images). Word
 /// requires DrawingML, WordprocessingDrawing, picture, and relationships
 /// namespaces declared at the document root before any `<w:drawing>`
-/// child element references them. The image-free header stays the
-/// minimal form so plain text round-trips byte-stable.
+/// child element references them. Issue #69 — `wp14` (Word 2010
+/// WordprocessingDrawing extensions) is bound too: a floating picture's
+/// percentage offset is `<wp14:pctPosHOffset>` / `<wp14:pctPosVOffset>`,
+/// and an unbound prefix would make the part malformed. The image-free
+/// header stays the minimal form so plain text round-trips byte-stable.
 const DOC_XML_HEADER_WITH_DRAWING: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
     "\n",
@@ -48,7 +52,8 @@ const DOC_XML_HEADER_WITH_DRAWING: &str = concat!(
     r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
     r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
     r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
-    r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+    r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+    r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing">"#,
     "<w:body>",
 );
 const DOC_XML_FOOTER: &str = "<w:sectPr/></w:body></w:document>";
@@ -1014,7 +1019,13 @@ fn emit_inline_object(obj: &InlineObject, out: &mut String) {
             rel_id,
             width_emu,
             height_emu,
-        } => emit_image_drawing(rel_id, *width_emu, *height_emu, out),
+        } => match obj.anchor.as_deref() {
+            /* Issue #69 — a floating picture is a `<wp:anchor>` run. */
+            Some(anchor) => {
+                emit_anchored_image_drawing(rel_id, *width_emu, *height_emu, anchor, out)
+            }
+            None => emit_image_drawing(rel_id, *width_emu, *height_emu, out),
+        },
         InlineKind::FootnoteRef {
             id,
             custom_mark_follows,
@@ -1067,8 +1078,39 @@ fn emit_image_drawing(rel_id: &str, width_emu: i64, height_emu: i64, out: &mut S
         "<wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
          <wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\
          <wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
-         <wp:docPr id=\"1\" name=\"Picture\"/>\
-         <wp:cNvGraphicFramePr/>\
+         <wp:docPr id=\"1\" name=\"Picture\"/>"
+    ));
+    emit_pic_graphic(rel_id, cx, cy, out);
+    out.push_str("</wp:inline></w:drawing></w:r>");
+}
+
+/// Issue #69 — the DrawingML anchored-picture run (`<wp:anchor>`). The
+/// anchor attributes + positioning children come from
+/// `schema::wp_anchor::emit_anchor_open` in `CT_Anchor` sequence order;
+/// the picture graphic is the same `<a:graphic>` body an inline picture
+/// uses, so a float and an inline of the same blob differ ONLY in their
+/// placement wrapper.
+fn emit_anchored_image_drawing(
+    rel_id: &str,
+    width_emu: i64,
+    height_emu: i64,
+    anchor: &engine::FloatAnchor,
+    out: &mut String,
+) {
+    let cx = width_emu.max(1);
+    let cy = height_emu.max(1);
+    out.push_str("<w:r><w:drawing>");
+    emit_anchor_open(anchor, cx, cy, out);
+    emit_pic_graphic(rel_id, cx, cy, out);
+    out.push_str("</wp:anchor></w:drawing></w:r>");
+}
+
+/// `<wp:cNvGraphicFramePr/>` + the `<a:graphic>` picture body shared by
+/// the inline and anchored emitters. Byte-identical to the Phase 7 inline
+/// output (the visual-diff / round-trip fixtures pin it).
+fn emit_pic_graphic(rel_id: &str, cx: i64, cy: i64, out: &mut String) {
+    out.push_str(&format!(
+        "<wp:cNvGraphicFramePr/>\
          <a:graphic>\
          <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
          <pic:pic>\
@@ -1083,10 +1125,8 @@ fn emit_image_drawing(rel_id: &str, width_emu: i64, height_emu: i64, out: &mut S
          </pic:spPr>\
          </pic:pic>\
          </a:graphicData>\
-         </a:graphic>\
-         </wp:inline>"
+         </a:graphic>"
     ));
-    out.push_str("</w:drawing></w:r>");
 }
 
 /// Phase 3 passthrough optimisation. A paragraph that was loaded from a
@@ -2582,11 +2622,13 @@ fn build_hf_xml(
     out.push_str(tag);
     out.push_str(" xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"");
     if has_image {
+        /* Issue #69 — `wp14` for a floating picture's percentage offsets. */
         out.push_str(
             " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"\
              \u{20}xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\"\
              \u{20}xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"\
-             \u{20}xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"",
+             \u{20}xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"\
+             \u{20}xmlns:wp14=\"http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing\"",
         );
     } else if has_link {
         out.push_str(
@@ -4799,6 +4841,132 @@ mod tests {
         assert_eq!(hp.fields[0].end, 6);
     }
 
+    /// Issue #77 — pack `entries` into a minimal `.docx` (content
+    /// types + `.rels` + the given parts) and parse it.
+    fn read_docx_from_parts(entries: &[(&str, &str)]) -> DocxArchive {
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            zip.start_file("[Content_Types].xml", opts).unwrap();
+            zip.write_all(content_types.as_bytes()).unwrap();
+            zip.start_file("_rels/.rels", opts).unwrap();
+            zip.write_all(DOT_RELS_XML.as_bytes()).unwrap();
+            for (name, body) in entries {
+                zip.start_file(*name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        read_docx(&buf).expect("read fixture")
+    }
+
+    #[test]
+    fn fld_simple_filename_and_author_round_trip_as_complex_fields() {
+        /* Issue #77 — the compact `<w:fldSimple>` form of the new kinds
+        parses into `Field` overlays with the instruction verbatim; a
+        dirty paragraph re-emits them as the canonical complex triple,
+        and re-reading that output yields identical overlays. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p>
+<w:r><w:t xml:space="preserve">File </w:t></w:r>
+<w:fldSimple w:instr=" FILENAME \p "><w:r><w:t xml:space="preserve">draft.docx</w:t></w:r></w:fldSimple>
+<w:r><w:t xml:space="preserve"> by </w:t></w:r>
+<w:fldSimple w:instr="AUTHOR"><w:r><w:t xml:space="preserve">Ibrahim</w:t></w:r></w:fldSimple>
+</w:p>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+        let parsed = read_docx_from_parts(&[("word/document.xml", document_xml)]);
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "File draft.docx by Ibrahim");
+        assert_eq!(p.fields.len(), 2);
+        assert_eq!(p.fields[0].instruction, "FILENAME \\p");
+        assert_eq!((p.fields[0].start, p.fields[0].end), (5, 15));
+        assert_eq!(
+            p.fields[0].typed(),
+            engine::TypedField::FileName { with_path: true }
+        );
+        assert_eq!(p.fields[1].instruction, "AUTHOR");
+        assert_eq!((p.fields[1].start, p.fields[1].end), (19, 26));
+        assert_eq!(p.fields[1].typed(), engine::TypedField::Author);
+
+        /* Author-restamp the paragraph (dirty) and write — the writer
+        emits the complex sentinel triple for every field. */
+        let mut doc = parsed.document.clone();
+        let mut para = doc.nth_paragraph(0).unwrap().clone();
+        para = para.with_spliced_range(19, 26, "Zed");
+        para.dirty = true;
+        para.source_xml = None;
+        doc.blocks[0] = Block::Paragraph(para);
+        let bytes = write_docx(&parsed, &doc).expect("write");
+        let reparsed = read_docx(&bytes).expect("re-read");
+        let q = reparsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(q.text, "File draft.docx by Zed");
+        assert_eq!(q.fields.len(), 2);
+        assert_eq!(q.fields[0].instruction, "FILENAME \\p");
+        assert_eq!((q.fields[0].start, q.fields[0].end), (5, 15));
+        assert_eq!(q.fields[1].instruction, "AUTHOR");
+        assert_eq!((q.fields[1].start, q.fields[1].end), (19, 22));
+        let xml = String::from_utf8(
+            reparsed
+                .other_entries
+                .iter()
+                .find(|(n, _)| n == "[Content_Types].xml")
+                .map(|(_, b)| b.clone())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(xml.contains("<Types"), "siblings pass through");
+    }
+
+    #[test]
+    fn core_props_creator_feeds_settings_author() {
+        /* Issue #77 — `docProps/core.xml` `<dc:creator>` lifts into
+        `DocumentSettings.author` (what AUTHOR resolves to) and the
+        part itself round-trips byte-identical. */
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t xml:space="preserve">hi</w:t></w:r></w:p><w:sectPr/></w:body>
+</w:document>"#;
+        let core_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator>Ibrahim Z.</dc:creator></cp:coreProperties>"#;
+        let parsed = read_docx_from_parts(&[
+            ("word/document.xml", document_xml),
+            ("docProps/core.xml", core_xml),
+        ]);
+        assert_eq!(
+            parsed.document.settings.author.as_deref(),
+            Some("Ibrahim Z.")
+        );
+        let bytes = write_docx(&parsed, &parsed.document).expect("write");
+        let reparsed = read_docx(&bytes).expect("re-read");
+        let core = reparsed
+            .other_entries
+            .iter()
+            .find(|(n, _)| n == "docProps/core.xml")
+            .map(|(_, b)| b.clone())
+            .expect("core.xml passes through");
+        assert_eq!(core, core_xml.as_bytes());
+        assert_eq!(
+            reparsed.document.settings.author.as_deref(),
+            Some("Ibrahim Z.")
+        );
+        /* A document without the part reports no author. */
+        let plain = read_docx_from_parts(&[("word/document.xml", document_xml)]);
+        assert_eq!(plain.document.settings.author, None);
+    }
+
     #[test]
     fn complex_field_round_trip_page_number() {
         /* Reader: walk a `PAGE \\* MERGEFORMAT` complex field split
@@ -5673,6 +5841,7 @@ mod tests {
                     width_emu: 1_905_000,
                     height_emu: 1_524_000,
                 },
+                anchor: None,
             }],
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
@@ -5714,6 +5883,143 @@ mod tests {
         assert_eq!(
             media.data,
             vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+    }
+
+    /* ---------------------------------------------------------------
+    Issue #69 — `<wp:anchor>` floating pictures.
+    --------------------------------------------------------------- */
+
+    fn floating_paragraph(anchor: engine::FloatAnchor) -> Paragraph {
+        Paragraph {
+            text: "x\u{FFFC}y".into(),
+            dirty: true,
+            inline_objects: vec![InlineObject {
+                at: 1,
+                kind: InlineKind::Image {
+                    rel_id: "rId7".into(),
+                    width_emu: 914_400,
+                    height_emu: 457_200,
+                },
+                anchor: Some(Box::new(anchor)),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// An engine-authored float (no verbatim source fragments) writes a
+    /// schema-ordered `<wp:anchor>` that the reader lowers back to the same
+    /// typed placement; the synthesized wrap / docPr children come back as
+    /// the verbatim fragments a second save re-emits unchanged.
+    #[test]
+    fn floating_image_round_trips_through_build_minimal_docx() {
+        let mut doc = DocumentTree::from_text("seed");
+        doc.media.insert(
+            "rId7".into(),
+            engine::ImageBlob {
+                content_type: "image/png".into(),
+                data: vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+            },
+        );
+        let anchor = engine::FloatAnchor {
+            position_h: engine::HPosition {
+                relative_from: engine::HRelativeFrom::Page,
+                offset: engine::FloatOffset::Emu(457_200),
+            },
+            position_v: engine::VPosition {
+                relative_from: engine::VRelativeFrom::Margin,
+                offset: engine::FloatOffset::Emu(-91_440),
+            },
+            behind_doc: true,
+            relative_height: 5,
+            wrap: engine::WrapKind::Square,
+            dist_left_emu: 114_300,
+            ..engine::FloatAnchor::default()
+        };
+        let mut blocks = doc.blocks.clone();
+        blocks.set(0, Block::Paragraph(floating_paragraph(anchor.clone())));
+        let doc = DocumentTree { blocks, ..doc };
+        let bytes = build_minimal_docx(&doc).expect("build");
+        let parsed = read_docx(&bytes).expect("read");
+        let p = parsed.document.nth_paragraph(0).expect("paragraph");
+        assert_eq!(p.text, "x\u{FFFC}y");
+        let obj = &p.inline_objects[0];
+        assert_eq!(obj.at, 1);
+        let back = obj
+            .anchor
+            .as_deref()
+            .expect("still floating after the round-trip");
+        assert_eq!(back.position_h, anchor.position_h);
+        assert_eq!(back.position_v, anchor.position_v);
+        assert!(back.behind_doc);
+        assert_eq!(back.relative_height, 5);
+        assert_eq!(back.dist_left_emu, 114_300);
+        assert_eq!(back.wrap, engine::WrapKind::Square);
+        assert_eq!(
+            back.wrap_xml.as_deref(),
+            Some(r#"<wp:wrapSquare wrapText="bothSides"/>"#)
+        );
+        assert_eq!(
+            back.doc_pr_xml.as_deref(),
+            Some(r#"<wp:docPr id="1" name="Picture"/>"#)
+        );
+        assert!(back.layout_in_cell && back.allow_overlap && !back.simple_pos && !back.locked);
+        /* Media resolves exactly as for an inline picture. */
+        assert!(parsed.document.media.contains_key("rId7"));
+    }
+
+    /// A float read from a Word file regenerates with its verbatim wrap /
+    /// docPr fragments and its positioning intact, in `CT_Anchor` order.
+    #[test]
+    fn anchored_run_regenerates_source_fragments_verbatim_in_schema_order() {
+        let wrap = concat!(
+            r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="1">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/>"#,
+            r#"<wp:lineTo x="21600" y="0"/></wp:wrapPolygon></wp:wrapTight>"#,
+        );
+        let doc_pr = r#"<wp:docPr id="9" name="Picture 9" descr="alt text"/>"#;
+        let anchor = engine::FloatAnchor {
+            position_h: engine::HPosition {
+                relative_from: engine::HRelativeFrom::Margin,
+                offset: engine::FloatOffset::Align(engine::FloatAlign::Right),
+            },
+            position_v: engine::VPosition {
+                relative_from: engine::VRelativeFrom::Paragraph,
+                offset: engine::FloatOffset::PercentMilli(12_500),
+            },
+            wrap: engine::WrapKind::Tight,
+            wrap_xml: Some(wrap.into()),
+            doc_pr_xml: Some(doc_pr.into()),
+            ..engine::FloatAnchor::default()
+        };
+        let para = floating_paragraph(anchor);
+        let mut out = String::new();
+        emit_styled_runs_with_objects(&para, &mut out, &HashMap::new());
+        let order = [
+            r#"<w:t xml:space="preserve">x</w:t>"#,
+            "<w:r><w:drawing><wp:anchor distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" simplePos=\"0\" relativeHeight=\"251658240\" behindDoc=\"0\" locked=\"0\" layoutInCell=\"1\" allowOverlap=\"1\">",
+            r#"<wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="margin"><wp:align>right</wp:align></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp14:pctPosVOffset>12500</wp14:pctPosVOffset></wp:positionV>"#,
+            r#"<wp:extent cx="914400" cy="457200"/>"#,
+            r#"<wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+            wrap,
+            doc_pr,
+            "<wp:cNvGraphicFramePr/><a:graphic>",
+            r#"<a:blip r:embed="rId7"/>"#,
+            "</a:graphic></wp:anchor></w:drawing></w:r>",
+            r#"<w:t xml:space="preserve">y</w:t>"#,
+        ];
+        let mut cursor = 0;
+        for needle in order {
+            let at = out[cursor..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing or out of order in:\n{out}"));
+            cursor += at + needle.len();
+        }
+        assert!(
+            !out.contains("<wp:inline"),
+            "a float must never regenerate as an inline picture"
         );
     }
 

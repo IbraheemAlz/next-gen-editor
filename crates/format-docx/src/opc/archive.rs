@@ -34,6 +34,9 @@ pub const ENDNOTES_XML: &str = "word/endnotes.xml";
 pub const COMMENTS_XML: &str = "word/comments.xml";
 pub const COMMENTS_EXTENDED_XML: &str = "word/commentsExtended.xml";
 pub const SETTINGS_XML: &str = "word/settings.xml";
+/// Issue #77 — OPC core properties; `<dc:creator>` feeds the `AUTHOR`
+/// field. Passthrough-only (never regenerated).
+pub const CORE_PROPS_XML: &str = "docProps/core.xml";
 
 /// All raw archive entries except `word/document.xml`. Carried through the
 /// round-trip so the writer can re-emit them verbatim.
@@ -502,6 +505,17 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         /* Issue #80 — document-level note properties. */
         document.footnote_props = settings.footnote_props;
         document.endnote_props = settings.endnote_props;
+    }
+
+    /* Issue #77 — `docProps/core.xml` rides `other_entries` verbatim;
+    the typed read lifts `<dc:creator>` so `AUTHOR` fields resolve. */
+    if let Some(bytes) = other_entries
+        .iter()
+        .find(|(n, _)| n == CORE_PROPS_XML)
+        .map(|(_, b)| b.as_slice())
+        && let Ok(props) = crate::parts::core_props::parse_core_props_xml(bytes)
+    {
+        document.settings.author = props.creator;
     }
 
     let document_root_attrs = root_attributes(&xml);
