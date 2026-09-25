@@ -665,6 +665,16 @@ impl Paginator {
         self.pages.iter().map(|p| p.size.height).sum()
     }
 
+    /// The pages finalised so far (the in-progress page excluded).
+    pub fn emitted_pages(&self) -> &[PageBox] {
+        &self.pages
+    }
+
+    /// The blocks placed on the in-progress page so far.
+    pub fn current_blocks(&self) -> &[LayoutBlock] {
+        &self.cur_blocks
+    }
+
     pub fn content_width(&self) -> f32 {
         self.geometry.width - self.geometry.margins.left - self.geometry.margins.right
     }
@@ -1343,23 +1353,10 @@ impl Paginator {
     /// constraint is unsatisfiable, Word drops it too), or the watchdog
     /// is at stage (a) or beyond. Releasing records `KeepChainDropped`.
     fn detach_keep_chain(&mut self) -> Vec<LayoutBlock> {
-        let col_x = self.current_column_origin_x();
-        let in_column = |b: &LayoutBlock| (b.origin().x - col_x).abs() < 0.001;
-        let mut start = self.cur_blocks.len();
-        while start > 0 {
-            match &self.cur_blocks[start - 1] {
-                LayoutBlock::Paragraph(p)
-                    if p.keep_next && in_column(&self.cur_blocks[start - 1]) =>
-                {
-                    start -= 1;
-                }
-                _ => break,
-            }
-        }
+        let (start, has_anchor_before) = self.keep_chain_bounds();
         if start == self.cur_blocks.len() {
             return Vec::new();
         }
-        let has_anchor_before = start > 0 && in_column(&self.cur_blocks[start - 1]);
         if !has_anchor_before || self.watchdog.stage() >= DegradeStage::DropOptional {
             let page = self.cur_page_index();
             self.watchdog.note(DegradeReason::KeepChainDropped, page);
@@ -1380,6 +1377,75 @@ impl Paginator {
             .collect();
         self.uncommit_notes(&anchors);
         chain
+    }
+
+    /// Issue #87 — the trailing keep-with-next chain of the current
+    /// column: the index in `cur_blocks` where it starts (`len` when there
+    /// is none) and whether an in-column block sits above it — the anchor
+    /// that makes moving to the next column / page *productive* (the
+    /// moved content lands higher up on a fresher column than it leaves).
+    /// Without one the chain (or the block itself, when there is no
+    /// chain) already opens the column and a move could only repeat.
+    fn keep_chain_bounds(&self) -> (usize, bool) {
+        let col_x = self.current_column_origin_x();
+        let in_column = |b: &LayoutBlock| (b.origin().x - col_x).abs() < 0.001;
+        let mut start = self.cur_blocks.len();
+        while start > 0 {
+            match &self.cur_blocks[start - 1] {
+                LayoutBlock::Paragraph(p)
+                    if p.keep_next && in_column(&self.cur_blocks[start - 1]) =>
+                {
+                    start -= 1;
+                }
+                _ => break,
+            }
+        }
+        let has_anchor_before = start > 0 && in_column(&self.cur_blocks[start - 1]);
+        (start, has_anchor_before)
+    }
+
+    /// Issue #95 — keep-lines and widow / orphan control. Given a split
+    /// of `para` after `k` of its `n` flow items (`0 < k < n`), return
+    /// the item count that honours the paragraph's constraints:
+    ///
+    /// - `<w:keepLines/>`: `0` — the paragraph moves whole.
+    /// - widow control, widow (`n - k == 1`): pull one more line over,
+    ///   `k - 1`, when that still leaves at least 2 here.
+    /// - widow control, orphan (`k == 1`, or the widow fix would leave
+    ///   one): `0` — the paragraph moves whole.
+    ///
+    /// Termination / release rules (the #87 ladder): a whole-paragraph
+    /// move (`0`) is only taken when it is *productive* — an in-column
+    /// block above the paragraph's keep chain ([`Self::keep_chain_bounds`])
+    /// — so the moved paragraph opens the next column, where the same
+    /// rule can never fire again. Pulling a widow line over always places
+    /// at least 2 lines, so it is progress. An unsatisfiable constraint
+    /// (the paragraph already opens its column) or a watchdog at stage
+    /// (a) keeps `k` and records `KeepChainDropped`.
+    fn keep_adjusted_split(&mut self, para: &ParagraphBox, k: usize, n: usize) -> usize {
+        if k == 0 || k >= n {
+            return k;
+        }
+        let flow = para.flow;
+        let want = if flow.keep_lines {
+            0
+        } else if flow.widow_control {
+            let k = if n - k == 1 { k - 1 } else { k };
+            if k >= 2 { k } else { 0 }
+        } else {
+            k
+        };
+        if want == k {
+            return k;
+        }
+        let releasing = self.watchdog.stage() >= DegradeStage::DropOptional
+            || (want == 0 && !self.keep_chain_bounds().1);
+        if releasing {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::KeepChainDropped, page);
+            return k;
+        }
+        want
     }
 
     /// Issue #87 — move the block that does not fit to the next column /
@@ -1471,7 +1537,24 @@ impl Paginator {
         pages. `line_ends[k]` is the line count through item `k`. A
         paragraph without cut bands has one item per line (unchanged). */
         let (items, line_ends) = band_flow_items(&para.lines);
-        let plan = self.fit_items(&items, remaining, self.cur_blocks.is_empty());
+        let fresh = self.cur_blocks.is_empty();
+        let mut plan = self.fit_items(&items, remaining, fresh);
+        /* Issue #95 — keep-lines / widow / orphan control may place fewer
+        items than fit. Re-fit the shorter prefix so only its notes are
+        reserved (an empty plan moves the paragraph whole). */
+        let keep = self.keep_adjusted_split(&para, plan.count, items.len());
+        if keep != plan.count {
+            plan = if keep == 0 {
+                FitPlan {
+                    count: 0,
+                    notes: Vec::new(),
+                    carry: Vec::new(),
+                    clipped: false,
+                }
+            } else {
+                self.fit_items(&items[..keep], remaining, fresh)
+            };
+        }
         let (head, tail) = if para.lines.is_empty() {
             (Some(para.clone()), None)
         } else {
@@ -4588,6 +4671,149 @@ mod tests {
         let (head, tail) = (head.expect("head"), tail.expect("tail"));
         assert_eq!((head.flow.space_before, head.flow.space_after), (7.0, 0.0));
         assert_eq!((tail.flow.space_before, tail.flow.space_after), (0.0, 9.0));
+    }
+
+    /* ================================================================
+    Issue #95 — keep-lines and widow / orphan control. A4 body budget is
+    698 pt: 43 lines of 16 pt fit a page.
+    ================================================================ */
+
+    fn widow_para(n: usize) -> ParagraphBox {
+        let mut p = fake_paragraph(n, 16.0);
+        p.flow.widow_control = true;
+        p
+    }
+
+    /// Lines of each block per page, in flow order.
+    fn lines_per_page(pages: &[PageBox]) -> Vec<Vec<usize>> {
+        pages
+            .iter()
+            .map(|p| {
+                p.blocks
+                    .iter()
+                    .map(|b| b.as_paragraph().map_or(0, |q| q.lines.len()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Widow: 3 of 4 lines fit — one line would be left alone on the
+    /// next page, so one more line goes with it (2 | 2).
+    #[test]
+    fn widow_control_pulls_a_line_over_to_avoid_a_widow() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(widow_para(4)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![40, 2], vec![2]]);
+    }
+
+    /// Without widow control the same flow leaves the widow (3 | 1) —
+    /// the historical split, unchanged.
+    #[test]
+    fn without_widow_control_the_split_is_unchanged() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(4, 16.0)), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(lines_per_page(&pages), vec![vec![40, 3], vec![1]]);
+    }
+
+    /// Orphan: only the first line fits — the paragraph moves whole.
+    #[test]
+    fn widow_control_moves_an_orphan_whole() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(42, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(widow_para(5)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![42], vec![5]]);
+    }
+
+    /// The 3-line fixture: 2 fit, the widow fix would leave an orphan, so
+    /// the paragraph never leaves a single line on either side.
+    #[test]
+    fn three_line_paragraph_at_page_bottom_never_leaves_a_single_line() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(41, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(widow_para(3)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![41], vec![3]]);
+    }
+
+    /// Keep-lines: a paragraph that does not fit moves whole.
+    #[test]
+    fn keep_lines_moves_the_paragraph_whole() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        let mut p = fake_paragraph(10, 16.0);
+        p.flow.keep_lines = true;
+        pag.push_block(LayoutBlock::Paragraph(p), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![40], vec![10]]);
+    }
+
+    /// Keep-lines on a paragraph longer than a page: it moves once to open
+    /// a fresh page, where the constraint is unsatisfiable — released and
+    /// reported, never bounced.
+    #[test]
+    fn keep_lines_longer_than_a_page_is_released_and_terminates() {
+        let t0 = Instant::now();
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let mut p = fake_paragraph(60, 16.0);
+        p.flow.keep_lines = true;
+        p.flow.widow_control = true;
+        pag.push_block(LayoutBlock::Paragraph(p), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert_eq!(lines_per_page(&pages), vec![vec![1], vec![43], vec![17]]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+        assert_eq!(notes[0].page, 1);
+    }
+
+    /// Keep-with-next folds in: a heading whose follower would leave an
+    /// orphan moves with the follower — it never ends a page alone.
+    #[test]
+    fn orphan_move_carries_the_keep_with_next_heading() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(41, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(widow_para(5)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![41], vec![1, 5]]);
+    }
+
+    /// An orphan that already opens its page cannot move anywhere better:
+    /// the split stands and the release is reported.
+    #[test]
+    fn orphan_at_the_page_top_is_released_not_bounced() {
+        let mut p = widow_para(2);
+        p.lines[1].origin.y = 16.0;
+        p.lines[1].height = 690.0;
+        p.size.height = 706.0;
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(p), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert_eq!(lines_per_page(&pages), vec![vec![1], vec![1]]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+    }
+
+    /// Stage (a) releases widow / orphan control like any optional
+    /// constraint.
+    #[test]
+    fn stage_a_releases_widow_control() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(42, 16.0)), 0.0, 0.0);
+        pag.watchdog_mut().escalate_to(DegradeStage::DropOptional);
+        pag.push_block_inner(LayoutBlock::Paragraph(widow_para(5)), 0.0, 0.0, false);
+        let (pages, notes) = pag.finish_with_notes();
+        assert_eq!(lines_per_page(&pages), vec![vec![42, 1], vec![4]]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
     }
 
     /// Repeated header rows taller than the page (the #7 class: an

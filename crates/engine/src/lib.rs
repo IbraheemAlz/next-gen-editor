@@ -2009,9 +2009,24 @@ pub struct ParaProperties {
     /// a round-trip. The TOC heading collector reads the resolved value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outline_level: Option<u8>,
+    /// Issue #95 — `<w:widowControl>` resolved through the style
+    /// cascade: `Some(false)` is an explicit `w:val="0"` (which must be
+    /// able to switch an inherited ON off, hence `Option`), `None` means
+    /// never specified. Layout reads `None` as ON — Word's application
+    /// default, which diverges from the spec's "not applied". READ-ONLY
+    /// on the paragraph model like [`Self::outline_level`]: the direct
+    /// element rides the grab bag verbatim; style definitions emit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub widow_control: Option<bool>,
 }
 
 impl ParaProperties {
+    /// Issue #95 — the effective widow / orphan control (Word default:
+    /// on).
+    pub fn widow_control_on(&self) -> bool {
+        self.widow_control.unwrap_or(true)
+    }
+
     /// Overlay `patch` onto `self` using OOXML cascade semantics: a child
     /// style with a *set* (non-default) field overrides the parent. Used by
     /// the Phase 3 `format_docx::style_resolver` to fold a basedOn chain
@@ -2062,6 +2077,7 @@ impl ParaProperties {
             style sources never carry one, so nothing leaks downward. */
             grab_bag: patch.grab_bag.or(self.grab_bag),
             outline_level: patch.outline_level.or(self.outline_level),
+            widow_control: patch.widow_control.or(self.widow_control),
         }
     }
 }

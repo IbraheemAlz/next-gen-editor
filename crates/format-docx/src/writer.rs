@@ -653,6 +653,23 @@ fn emit_ppr(
             format!("<w:outlineLvl w:val=\"{l}\"/>"),
         );
     }
+    /* Issue #95 — a style's `<w:widowControl>`; same contract as
+    `outlineLvl` above (paragraph callers clear it, the direct element
+    rides the grab bag). */
+    if let Some(on) = props.widow_control
+        && !engine::GrabBag::fragments_of(&props.grab_bag)
+            .iter()
+            .any(|f| f.starts_with(b"<w:widowControl"))
+    {
+        ch.push(
+            rank(b"w:widowControl"),
+            if on {
+                "<w:widowControl/>".into()
+            } else {
+                "<w:widowControl w:val=\"0\"/>".into()
+            },
+        );
+    }
     /* Phase 3 (#40) — a marker paragraph's interior `<w:sectPr>`: the
     genuinely-last CT_PPr content child (only the never-emitted
     pPrChange follows it in the schema). */
@@ -676,9 +693,10 @@ fn serialize_paragraph(
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
     out.push_str("<w:p>");
-    let props = if para.props.outline_level.is_some() {
+    let props = if para.props.outline_level.is_some() || para.props.widow_control.is_some() {
         let mut p = para.props.clone();
         p.outline_level = None;
+        p.widow_control = None;
         std::borrow::Cow::Owned(p)
     } else {
         std::borrow::Cow::Borrowed(&para.props)
@@ -5316,6 +5334,41 @@ mod tests {
         assert!(xml.contains("<w:p><w:r><w:t xml:space=\"preserve\">plain text</w:t></w:r></w:p>"));
     }
 
+    /// Issue #95 — `<w:widowControl>` round-trips on style definitions
+    /// (a rebuilt `styles.xml` used to drop it) and is never baked into a
+    /// paragraph from its style cascade (the direct element rides the
+    /// grab bag).
+    #[test]
+    fn widow_control_emits_on_styles_not_on_paragraphs() {
+        let mut doc = engine::DocumentTree::default();
+        doc.styles.insert(
+            "Body".into(),
+            engine::ParagraphStyle {
+                id: "Body".into(),
+                name: "Body".into(),
+                para: ParaProperties {
+                    widow_control: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let xml = String::from_utf8(build_styles_xml(&doc)).expect("utf8");
+        assert!(xml.contains(r#"<w:widowControl w:val="0"/>"#), "{xml}");
+
+        let para = Paragraph {
+            text: "x".into(),
+            props: ParaProperties {
+                widow_control: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut out = String::new();
+        serialize_paragraph(&para, &mut out, &HashMap::new());
+        assert!(!out.contains("widowControl"), "{out}");
+    }
+
     #[test]
     fn round_trip_para_properties() {
         use engine::{Indent, LineHeight, Spacing, TextDirection};
@@ -5341,6 +5394,7 @@ mod tests {
             shading: Some([0x33, 0x66, 0x99, 0xFF]),
             grab_bag: None,
             outline_level: None,
+            widow_control: None,
         };
         let para = Paragraph {
             text: "hello world".into(),

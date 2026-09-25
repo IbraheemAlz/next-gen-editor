@@ -447,9 +447,8 @@ pub struct ParagraphBox {
     /// `KeepChainDropped` note) when the chain is already at a page top
     /// or the watchdog reaches stage (a). A split paragraph's head never
     /// keeps (its keep is with its own tail); the tail inherits the flag.
-    /// Not yet wired from `engine::ParaProperties::keep_next` — the
-    /// engine adapter leaves it `false` until the golden corpus is
-    /// re-verified with keep-with-next enabled.
+    /// Engine-wasm sets it from the resolved (style-cascaded)
+    /// `engine::ParaProperties::keep_next` (issue #95).
     pub keep_next: bool,
     /// Issues #94 / #95 — the paragraph's pagination properties beyond
     /// keep-with-next: its resolved before / after spacing (so a block

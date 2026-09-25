@@ -3113,48 +3113,54 @@ fn scaled_paginator_geometry(geom: engine::PageGeometry, scale: f32) -> Paginato
     }
 }
 
-/// Phase 6 — sync `page_paths` with the paginator's emitted-page count
-/// before recording the just-pushed block's engine path. A `push_block`
-/// call can:
-/// - leave the page count unchanged (block fit on the current page) → push
-///   one path entry on the current page;
-/// - bump it by one or more (overflow; the head landed on the page that
-///   was finalised, the tail on the next) → push the path on each new
-///   page the block lands on.
+/// Phase 6 — sync `page_paths` with the paginator's pages after one
+/// `push_block`, so `page_paths[i][j]` is the engine path of
+/// `pages[i].blocks[j]` (`page_paths.last()` is the in-progress page).
 ///
-/// The bookkeeping intentionally keeps `page_paths` parallel to the
-/// pages the paginator has accumulated *so far*: page_paths[i] holds the
-/// paths for `paginator.pages[i]`, page_paths.last() is the in-progress page.
+/// Issue #95 — rebuilt EXACTLY from the paginator's block lists rather
+/// than predicted from the page-count delta. A push can place fragments
+/// of the pushed block on the in-progress page and on every page it
+/// emits, but it can also MOVE earlier blocks: a keep-with-next chain
+/// travels to the next page with its follower (issue #87), so the old
+/// in-progress page loses its tail blocks and the next page opens with
+/// them. The in-progress page's surviving blocks are a prefix of what
+/// it held (a chain is drained from the end); every block the push
+/// placed is either a fragment of the pushed block or a relocated chain
+/// paragraph, recognised by its `source_paragraph_id` in `para_paths`
+/// (every body paragraph is registered there before it is pushed).
 fn attach_block_paths(
     paginator: &Paginator,
     prev_emitted: usize,
     page_paths: &mut Vec<Vec<EngineBlockPath>>,
     path: &EngineBlockPath,
+    para_paths: &std::collections::HashMap<u32, EngineBlockPath>,
 ) {
-    let new_pages = paginator.page_count_emitted() - prev_emitted;
-    /* The block contributed to the previously in-progress page and to
-    every newly emitted page. */
-    if let Some(cur) = page_paths.last_mut() {
-        cur.push(path.clone());
-    }
-    for _ in 0..new_pages {
-        /* The page that just finalised already has its path entry from
-        the line above. The next page is the new in-progress page; it
-        gets a path entry only if the block spilled onto it (handled by
-        the next iteration). For multi-page overflow the same path is
-        pushed onto each page. */
-        page_paths.push(Vec::new());
-        if let Some(cur) = page_paths.last_mut() {
-            cur.push(path.clone());
+    let emitted = paginator.emitted_pages();
+    let blocks_of = |pi: usize| -> &[LayoutBlock] {
+        emitted
+            .get(pi)
+            .map_or(paginator.current_blocks(), |p| p.blocks.as_slice())
+    };
+    let path_of = |b: &LayoutBlock| -> EngineBlockPath {
+        match b {
+            LayoutBlock::Paragraph(p) => para_paths
+                .get(&p.source_paragraph_id)
+                .cloned()
+                .unwrap_or_else(|| path.clone()),
+            LayoutBlock::Table(_) => path.clone(),
         }
+    };
+    /* Pages flushed outside a block push (trailing endnotes) carry no
+    body paths; pad so index `prev_emitted` is the old in-progress page. */
+    page_paths.resize_with(prev_emitted + 1, Vec::new);
+    let old_blocks = blocks_of(prev_emitted);
+    let old = &mut page_paths[prev_emitted];
+    old.truncate(old_blocks.len());
+    let kept = old.len();
+    old.extend(old_blocks[kept..].iter().map(path_of));
+    for pi in prev_emitted + 1..=emitted.len() {
+        page_paths.push(blocks_of(pi).iter().map(path_of).collect());
     }
-    /* If `new_pages > 0` the final entry was for the new in-progress
-    page. But the block may have actually ended on the previously
-    finalised page (no tail). The conservative pass above always assigns
-    one path per page from finalised+1 onwards; that overcounts when a
-    block exactly fills a page with no tail. The hit-test consumers only
-    use paths to map *flow position → engine block*, so a duplicate path
-    entry is harmless. */
 }
 
 /// Resolved base direction for a paragraph layout pass — Phase 9c fix
@@ -6850,6 +6856,10 @@ impl Engine {
         trigger a hard page break + geometry swap. */
         let mut paginator: Option<Paginator> = None;
         let mut page_paths: Vec<Vec<EngineBlockPath>> = Vec::new();
+        /* Issue #95 — `source_paragraph_id` → engine path of every body
+        paragraph pushed so far (see `attach_block_paths`). */
+        let mut para_paths: std::collections::HashMap<u32, EngineBlockPath> =
+            std::collections::HashMap::new();
         /* Track the page index at the start of the current paginator's
         accumulated `cur_blocks` so we know where to attach paths emitted
         by `push_block` (paginator may emit prior pages first). */
@@ -6902,6 +6912,9 @@ impl Engine {
             target_y.map(|y| y + runway)
         };
         let mut culled = false;
+        /* Issue #95 — the last body block pushed was a keep-with-next
+        paragraph (see the cull stop below). */
+        let mut after_keep_next = false;
         /* Issue #87 — degradation notes for this build: paginator
         watchdog notes join here as each paginator finishes; the
         sub-paginator sink is drained at the end. Clear leftovers from
@@ -7119,7 +7132,13 @@ impl Engine {
                 half-flushed page. The check fires at every block
                 boundary, which is enough granularity for typical
                 docs (50 pages × ~20 paragraphs each = 1000 boundaries). */
-                if let Some(budget) = cull_budget {
+                /* Issue #95 — never cull right behind a keep-with-next
+                paragraph: its follower decides whether the chain moves
+                to the next page, so a band ending inside a chain would
+                show the chain where the next, longer band does not
+                (a `FastPathMismatch` demotion on every expand). The
+                chain is finite, so the stop is only deferred. */
+                if let Some(budget) = cull_budget.filter(|_| !after_keep_next) {
                     /* The paginator finalises overflow pages INTERNALLY
                     (they only reach `emitted_pages` at a section break),
                     and `cursor_y` resets to the top of each new page — so
@@ -7157,7 +7176,14 @@ impl Engine {
                         assign_source_ids_table(&mut tb, &mut next_para_id);
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Table(tb), 0.0, 0.0);
-                        attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
+                        after_keep_next = false;
+                        attach_block_paths(
+                            pag,
+                            prev_pages_in_pag,
+                            &mut page_paths,
+                            &para_path,
+                            &para_paths,
+                        );
                         processed_blocks += 1;
                     }
                     engine::Block::Paragraph(para) => {
@@ -7271,6 +7297,7 @@ impl Engine {
                         let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
                         let mut para_box = para_box;
                         para_box.source_paragraph_id = next_para_id;
+                        para_paths.insert(next_para_id, para_path.clone());
                         next_para_id += 1;
                         /* Phase 2 audit (gap D.1) — propagate complex-field
                         overlays so the paginator can re-evaluate PAGE /
@@ -7307,9 +7334,22 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
+                        /* Issue #95 — pagination constraints from the
+                        resolved (style-cascaded) properties. Widow /
+                        orphan control defaults ON (Word). */
+                        para_box.keep_next = para.props.keep_next;
+                        para_box.flow.keep_lines = para.props.keep_lines;
+                        para_box.flow.widow_control = para.props.widow_control_on();
+                        after_keep_next = para.props.keep_next;
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
-                        attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
+                        attach_block_paths(
+                            pag,
+                            prev_pages_in_pag,
+                            &mut page_paths,
+                            &para_path,
+                            &para_paths,
+                        );
                         processed_blocks += 1;
                     }
                 }
@@ -17871,31 +17911,54 @@ mod tests {
         d
     }
 
+    /// Issue #95 — stamp `<w:widowControl>` onto every top-level
+    /// paragraph (`None` = unspecified, Word's default ON).
+    fn with_widow_control(mut doc: DocumentTree, widow: Option<bool>) -> DocumentTree {
+        for b in doc.blocks.iter_mut() {
+            if let engine::Block::Paragraph(p) = b {
+                p.props.widow_control = widow;
+            }
+        }
+        doc
+    }
+
     /// Every engine-level nominal shape: the 50-page perf fixture (full
     /// layout and a culled band, both at DPR 2), a forced page break, an
     /// autofit table and a long multi-page prose doc. Fingerprints pinned
     /// on the pre-#87 adapter — a changed value means the browser goldens
     /// would move.
-    fn engine_nominal_fixtures() -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
+    ///
+    /// Issue #95 — widow / orphan control is ON unless a document says
+    /// otherwise, which legitimately moves every fixture whose flow
+    /// leaves a single line at a page edge. The pre-#87 anchor therefore
+    /// runs with widow control explicitly OFF (`Some(false)`) — proving
+    /// nothing ELSE moved — and the default (`None`) variants are pinned
+    /// separately in [`PINNED_WIDOW_DEFAULT_FINGERPRINTS`].
+    fn engine_nominal_fixtures_with(
+        widow: Option<bool>,
+    ) -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
         let bytes = std::fs::read(path).expect("read 50p.docx fixture");
         let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
-        let engine = test_engine_with_doc(archive.document);
+        let engine = test_engine_with_doc(with_widow_control(archive.document, widow));
         let mut out = Vec::new();
         let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
         out.push(("50p_full_x2", pages, info.degradations));
         let (pages, _, _, info) = engine.build_pages(2.0, false, Some(2000.0)).expect("band");
         out.push(("50p_band_2000_x2", pages, info.degradations));
 
-        let engine = test_engine_with_doc(two_page_doc("alpha beta gamma", "delta epsilon"));
+        let engine = test_engine_with_doc(with_widow_control(
+            two_page_doc("alpha beta gamma", "delta epsilon"),
+            widow,
+        ));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
         out.push(("two_page_form_feed", pages, info.degradations));
 
-        let engine = test_engine_with_doc(table_doc());
+        let engine = test_engine_with_doc(with_widow_control(table_doc(), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
         out.push(("autofit_table", pages, info.degradations));
 
-        let engine = test_engine_with_doc(prose_doc(300));
+        let engine = test_engine_with_doc(with_widow_control(prose_doc(300), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
         out.push(("prose_300_full", pages, info.degradations));
         let (pages, _, _, info) = engine
@@ -17962,11 +18025,42 @@ mod tests {
         ("prose_300_band_1200", 0x5e704685f3cc770c),
     ];
 
+    /// Issue #95 — the same fixtures with widow / orphan control at its
+    /// Word default (ON). Recorded via `--nocapture` when #95 landed:
+    /// only the 50-page perf document moves (its flow leaves single
+    /// lines at page edges); the other four equal the OFF anchor.
+    const PINNED_WIDOW_DEFAULT_FINGERPRINTS: &[(&str, u64)] = &[
+        ("50p_full_x2", 0xa7f584534ce2ac6f),
+        ("50p_band_2000_x2", 0x25ddf363691ee633),
+        ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("autofit_table", 0x92435b9636de4c72),
+        ("prose_300_full", 0xd3d662539c126b7d),
+        ("prose_300_band_1200", 0x5e704685f3cc770c),
+    ];
+
     #[test]
     fn engine_nominal_fixtures_are_geometrically_identical_to_the_pre_watchdog_adapter() {
-        for (name, pages, degradations) in engine_nominal_fixtures() {
+        assert_fixtures_pinned(
+            engine_nominal_fixtures_with(Some(false)),
+            PINNED_ENGINE_FINGERPRINTS,
+        );
+    }
+
+    #[test]
+    fn engine_nominal_fixtures_with_default_widow_control_are_pinned() {
+        assert_fixtures_pinned(
+            engine_nominal_fixtures_with(None),
+            PINNED_WIDOW_DEFAULT_FINGERPRINTS,
+        );
+    }
+
+    fn assert_fixtures_pinned(
+        fixtures: Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)>,
+        pinned: &[(&str, u64)],
+    ) {
+        for (name, pages, degradations) in fixtures {
             let fp = layout::geometry_fingerprint(&pages);
-            match PINNED_ENGINE_FINGERPRINTS.iter().find(|(n, _)| *n == name) {
+            match pinned.iter().find(|(n, _)| *n == name) {
                 Some((_, want)) => assert_eq!(
                     fp,
                     *want,
@@ -17996,6 +18090,205 @@ mod tests {
         } else {
             std::time::Duration::from_millis(250)
         }
+    }
+
+    /* ================================================================
+    Issue #95 — keep-with-next wired from the model, widow / orphan
+    control, and the cull stop that respects keep chains.
+    ================================================================ */
+
+    fn para_of(text: &str, props: engine::ParaProperties) -> engine::Block {
+        engine::Block::Paragraph(engine::Paragraph {
+            text: text.into(),
+            props,
+            ..Default::default()
+        })
+    }
+
+    const BODY_TEXT: &str = "Body text follows the heading: sphinx of black quartz, judge my vow; \
+         pack my box with five dozen liquor jugs; the five boxing wizards jump quickly \
+         over the lazy dog while a quick brown fox watches from the riverbank, \
+         and then everything repeats again for good measure until the paragraph \
+         wraps onto several lines of the page.";
+
+    /// `filler` (≥ 1) prose paragraphs of two lines, then `filler & 1`
+    /// one-line paragraphs (so the sweep walks the heading one line at a
+    /// time), then a keep-with-next heading at block [`heading_index`]
+    /// and a multi-line body paragraph right after it.
+    fn heading_doc(filler: usize, keep_next: bool, widow: Option<bool>) -> DocumentTree {
+        let mut d = prose_doc(filler / 2 + 1);
+        for _ in 0..filler % 2 {
+            d.blocks
+                .push_back(para_of("short", engine::ParaProperties::default()));
+        }
+        d.blocks.push_back(para_of(
+            "Heading",
+            engine::ParaProperties {
+                keep_next,
+                widow_control: widow,
+                ..Default::default()
+            },
+        ));
+        d.blocks.push_back(para_of(
+            BODY_TEXT,
+            engine::ParaProperties {
+                widow_control: widow,
+                ..Default::default()
+            },
+        ));
+        d
+    }
+
+    fn heading_index(filler: usize) -> u32 {
+        (filler / 2 + 1 + filler % 2) as u32
+    }
+
+    /// Page index of every fragment of top-level block `idx`, with its
+    /// line count.
+    fn fragments_of(
+        pages: &[PageBox],
+        paths: &[Vec<EngineBlockPath>],
+        idx: u32,
+    ) -> Vec<(usize, usize)> {
+        let want = EngineBlockPath::top(idx);
+        let mut out = Vec::new();
+        for (pi, (page, pp)) in pages.iter().zip(paths).enumerate() {
+            for (b, path) in page.blocks.iter().zip(pp) {
+                if *path == want {
+                    out.push((pi, b.as_paragraph().map_or(0, |p| p.lines.len())));
+                }
+            }
+        }
+        out
+    }
+
+    /// Acceptance: a keepNext heading never ends a page alone. Swept over
+    /// every filler length that walks the heading across a page bottom;
+    /// the control run (keepNext off) proves the sweep hits the case.
+    #[test]
+    fn keep_next_heading_never_ends_a_page_alone() {
+        let mut control_hits = 0;
+        for filler in 56..96 {
+            for keep in [false, true] {
+                let engine = test_engine_with_doc(heading_doc(filler, keep, Some(false)));
+                let (pages, _, paths, info) = engine.build_pages(1.0, false, None).expect("pages");
+                /* The relocated chain's engine paths travel with it:
+                paths stay exactly parallel to the page blocks. */
+                assert_eq!(pages.len(), paths.len());
+                for (page, pp) in pages.iter().zip(&paths) {
+                    assert_eq!(page.blocks.len(), pp.len(), "filler {filler}");
+                }
+                let heading = fragments_of(&pages, &paths, heading_index(filler));
+                let body = fragments_of(&pages, &paths, heading_index(filler) + 1);
+                let alone = heading[0].0 != body[0].0;
+                if !keep {
+                    control_hits += usize::from(alone);
+                    continue;
+                }
+                assert!(
+                    !alone,
+                    "filler {filler}: heading on page {} alone",
+                    heading[0].0
+                );
+                assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+            }
+        }
+        assert!(
+            control_hits > 0,
+            "the sweep never put the heading at a page bottom"
+        );
+    }
+
+    /// Acceptance: widow / orphan control (the Word default — the model
+    /// leaves it unspecified) never leaves a single line of the body
+    /// paragraph on either side of a page break; the explicit-off
+    /// control run proves the sweep produces single-line fragments.
+    #[test]
+    fn widow_control_never_leaves_a_single_line() {
+        let mut control_hits = 0;
+        let mut splits = 0;
+        for filler in 56..96 {
+            for widow in [Some(false), None] {
+                let engine = test_engine_with_doc(heading_doc(filler, false, widow));
+                let (pages, _, paths, _) = engine.build_pages(1.0, false, None).expect("pages");
+                let body = fragments_of(&pages, &paths, heading_index(filler) + 1);
+                assert!(
+                    body.iter().map(|f| f.1).sum::<usize>() >= 3,
+                    "a multi-line body"
+                );
+                if body.len() < 2 {
+                    continue;
+                }
+                let single = body.iter().any(|f| f.1 == 1);
+                if widow.is_some() {
+                    control_hits += usize::from(single);
+                } else {
+                    splits += 1;
+                    assert!(!single, "filler {filler}: fragments {body:?}");
+                }
+            }
+        }
+        assert!(
+            control_hits > 0,
+            "the sweep never produced a widow or orphan"
+        );
+        assert!(splits > 0, "widow control still splits the paragraph");
+    }
+
+    /// A viewport-culled band never ends right behind a keep-with-next
+    /// paragraph: its follower decides where the chain lands. The cull
+    /// target is aimed so the budget runs out exactly on a heading that
+    /// sits at a page bottom (and moves once its body arrives); expanding
+    /// the band must verify as a prefix — no `FastPathMismatch`.
+    #[test]
+    fn expanding_through_keep_chains_never_demotes() {
+        /* Find a filler length that parks the heading on a page bottom. */
+        let (filler, page, heading_box) = (56..96)
+            .find_map(|filler| {
+                let engine = test_engine_with_doc(heading_doc(filler, false, Some(false)));
+                let (pages, _, paths, _) = engine.build_pages(1.0, false, None).expect("pages");
+                let h = fragments_of(&pages, &paths, heading_index(filler));
+                let b = fragments_of(&pages, &paths, heading_index(filler) + 1);
+                (h[0].0 != b[0].0).then(|| {
+                    let page = h[0].0;
+                    let want = EngineBlockPath::top(heading_index(filler));
+                    let blk = pages[page]
+                        .blocks
+                        .iter()
+                        .zip(&paths[page])
+                        .find(|(_, p)| **p == want)
+                        .map(|(b, _)| (b.origin().y, b.size().height))
+                        .expect("heading block");
+                    (filler, page, blk)
+                })
+            })
+            .expect("a heading at a page bottom");
+        let mut d = heading_doc(filler, true, Some(false));
+        for i in 0..200 {
+            d.blocks.push_back(para_of(
+                &format!("Trailing paragraph {i} keeps the band culled."),
+                engine::ParaProperties::default(),
+            ));
+        }
+        let engine = test_engine_with_doc(d);
+        let (full, _, _, _) = engine.build_pages(1.0, false, None).expect("full");
+        let gap = render::scene::PAGE_GAP_PT;
+        let above: f32 = full[..page].iter().map(|p| p.size.height + gap).sum();
+        let runway = lazy_runway(engine.lazy_layout.viewport_h, 1.0);
+        /* The committed height crosses the budget right after the heading
+        is pushed (before its body): origin.y < budget <= bottom. */
+        let target = above + heading_box.0 + heading_box.1 * 0.5 - runway;
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(target))
+            .expect("band 1");
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(target + 1500.0))
+            .expect("band 2");
+        let snap = engine.layout_snapshot.borrow();
+        let s = snap.as_ref().expect("snapshot");
+        assert!(s.info.degradations.is_empty(), "{:?}", s.info.degradations);
+        assert!(!s.info.is_full_layout, "still a culled band");
+        assert_eq!(layout::verify_prefix(&s.pages, &full), Ok(()));
     }
 
     /// A deeper `ExpandLayout` band verifies as a prefix of the previous

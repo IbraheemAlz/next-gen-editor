@@ -183,6 +183,10 @@ pub fn apply_ppr(name: &[u8], e: &BytesStart, props: &mut ParaProperties) {
                 .and_then(|v| v.trim().parse::<u8>().ok())
                 .filter(|l| *l <= 9);
         }
+        /* Issue #95 — read-only like `outlineLvl`: the direct element
+        rides the grab bag verbatim (it is not in `ppr_child_is_modeled`),
+        the model value feeds layout's widow / orphan control. */
+        b"w:widowControl" => props.widow_control = Some(toggle_on(e)),
         _ => {}
     }
 }
@@ -340,5 +344,40 @@ mod tests {
         assert!(p.keep_next);
         assert!(p.keep_lines);
         assert!(p.page_break_before);
+    }
+
+    /// Issue #95 — `<w:widowControl>` is read into the model (tri-state:
+    /// an explicit off must be able to override an inherited on) while
+    /// the direct element stays unmodeled — it rides the grab bag.
+    #[test]
+    fn widow_control_is_read_tri_state_and_stays_in_the_grab_bag() {
+        assert_eq!(parse_ppr(br#"<w:pPr/>"#).widow_control, None);
+        assert_eq!(
+            parse_ppr(br#"<w:pPr><w:widowControl/></w:pPr>"#).widow_control,
+            Some(true)
+        );
+        for off in ["0", "false", "off"] {
+            let xml = format!(r#"<w:pPr><w:widowControl w:val="{off}"/></w:pPr>"#);
+            assert_eq!(parse_ppr(xml.as_bytes()).widow_control, Some(false));
+        }
+        assert!(!ppr_child_is_modeled(b"w:widowControl"));
+        let style_on = ParaProperties {
+            widow_control: Some(true),
+            ..Default::default()
+        };
+        let direct_off = ParaProperties {
+            widow_control: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            style_on.clone().merged_with(direct_off).widow_control,
+            Some(false)
+        );
+        assert_eq!(
+            style_on
+                .merged_with(ParaProperties::default())
+                .widow_control,
+            Some(true)
+        );
     }
 }
