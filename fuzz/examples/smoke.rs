@@ -166,13 +166,13 @@ fn parse_args() -> Options {
                 i += 1;
             }
             "--iterations" => {
-                opts.iterations = args
-                    .get(i + 1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("smoke: --iterations needs a number");
-                        std::process::exit(2);
-                    });
+                opts.iterations =
+                    args.get(i + 1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("smoke: --iterations needs a number");
+                            std::process::exit(2);
+                        });
                 i += 1;
             }
             "--strict" => opts.strict = true,
@@ -184,6 +184,78 @@ fn parse_args() -> Options {
         i += 1;
     }
     opts
+}
+
+/// Issue #177 acceptance — "smoke sweep reports coverage per variant".
+/// Prints how many of each `Command` variant `command_gen`'s curated +
+/// blind generators produced across the just-finished `rpc_command`
+/// corpus + sweep phases, and separately calls out any variant
+/// `classify_variant` marks `curated: true` that this run never hit
+/// (a live signal the curated arm's odds need tuning, distinct from
+/// the blind-only variants that are *expected* to be rare or absent).
+fn print_variant_coverage() {
+    let snap = engine_fuzz::command_gen::coverage_snapshot();
+    println!(
+        "[rpc_command] issue #177 coverage: {} distinct Command variant(s) generated this run",
+        snap.len()
+    );
+    for (name, count) in &snap {
+        println!("  {name}: {count}");
+    }
+    let curated_names: Vec<&str> = [
+        "InsertText",
+        "DeleteRange",
+        "DeleteAtCaret",
+        "ReplaceRange",
+        "SplitParagraph",
+        "ApplyFormatting",
+        "SetParagraphAlign",
+        "SetParagraphDirection",
+        "ToggleList",
+        "SetLineSpacing",
+        "SetParagraphIndent",
+        "InsertTable",
+        "InsertRow",
+        "DeleteRow",
+        "MergeCells",
+        "SetCellShading",
+        "SetCellBorders",
+        "InsertSectionBreak",
+        "SetColumns",
+        "EnterHeaderFooter",
+        "ExitHeaderFooter",
+        "SetZoom",
+        "SetDeviceScale",
+        "SetRenderDate",
+        "InsertTextBox",
+        "SetTableProperties",
+        "MoveImage",
+        "SetSelection",
+        "ExtendSelection",
+        "SelectAll",
+        "MoveCaret",
+        "Undo",
+        "Redo",
+        "InsertToc",
+        "UpdateFields",
+        "InsertField",
+        "InsertFootnote",
+        "InsertEndnote",
+        "InsertImage",
+        "SetImageWrap",
+    ]
+    .to_vec();
+    let missed: Vec<&&str> = curated_names
+        .iter()
+        .filter(|name| !snap.contains_key(*name))
+        .collect();
+    if !missed.is_empty() {
+        println!(
+            "  (curated but not generated this run — odds may be too low, or {} \
+             iteration(s) just weren't enough: {missed:?})",
+            snap.values().sum::<usize>()
+        );
+    }
 }
 
 fn main() {
@@ -207,9 +279,21 @@ fn main() {
         if opts.only.as_deref().is_some_and(|only| only != name) {
             continue;
         }
+        // Issue #177 — the coverage counters are a `rpc_command`-only
+        // concern (`command_gen::gen_command_sequence` is the only
+        // caller of `record_coverage`); reset right before this
+        // target's corpus + sweep phases so the snapshot below covers
+        // exactly this run, not any earlier `--target rpc_command`
+        // invocation in the same process.
+        if name == "rpc_command" {
+            engine_fuzz::command_gen::reset_coverage();
+        }
         let (corpus_panics, sweep_panics) = run_target(name, opts.iterations, run);
         corpus_clean &= corpus_panics.is_empty();
         sweep_clean &= sweep_panics.is_empty();
+        if name == "rpc_command" {
+            print_variant_coverage();
+        }
     }
 
     println!();
@@ -223,7 +307,9 @@ fn main() {
             eprintln!("smoke: FAIL — --strict and the random sweep panicked (see above)");
             std::process::exit(1);
         }
-        println!("smoke: the random sweep found panics above — every one is a real finding to triage");
+        println!(
+            "smoke: the random sweep found panics above — every one is a real finding to triage"
+        );
     } else {
         println!("smoke: random sweep also clean");
     }

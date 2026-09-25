@@ -341,6 +341,11 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
   cache (gitignored) that nothing else writes to; judge every gate by exit
   code. Large merge-conflict hunks are rebuilt by construction, never
   keep-both — the shared closing brace may belong to different modules.
+  A merge gate on `main` must also compile the browser unit tests for
+  wasm32 — `cargo test -p engine-wasm --target wasm32-unknown-unknown
+  --no-run` — because `wasm-pack test` builds the whole test module for
+  wasm32 and a native-only `cfg` on a helper that tests use breaks CI while
+  every native gate stays green (2026-09-25 incident).
   Disk is the binding constraint on this 8-core / 15 GB box: the shared
   `target/` alone is ~20 GB.
 
