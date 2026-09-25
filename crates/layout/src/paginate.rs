@@ -1647,6 +1647,8 @@ mod tests {
                 runs: Vec::new(),
                 alignment: text_pipeline::Alignment::Start,
                 source_start: 0,
+                segments: Vec::new(),
+                segment: 0,
             });
         }
         ParagraphBox {
@@ -1697,6 +1699,7 @@ mod tests {
                         width: 100.0,
                         height: 50.0,
                         spec,
+                        wrap: crate::boxes::FloatWrap::default(),
                     }),
                 ),
                 glyph(4, 10.0, None),
@@ -1917,6 +1920,8 @@ mod tests {
                 runs: Vec::new(),
                 alignment: text_pipeline::Alignment::Start,
                 source_start: 0,
+                segments: Vec::new(),
+                segment: 0,
             }],
             direction: ShapingDirection::Ltr,
             marker: None,

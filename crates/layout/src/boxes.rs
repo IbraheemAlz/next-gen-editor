@@ -31,6 +31,64 @@ pub struct Size {
     pub height: f32,
 }
 
+/// Issue #82 — one available horizontal range of a line band, in
+/// paragraph-box-relative px (the same space as `LineBox::origin.x`).
+/// A band with no float cutouts has exactly one segment spanning the
+/// content box; a float that cuts into the band splits it into the
+/// ranges left and right of the object (plus its wrap distances). This is
+/// the model that unifies column bounds and float cutouts (and, for the
+/// text-frame epic #83, frame cutouts): the line composer fills segments
+/// in reading order and never sees the object itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LineSegment {
+    pub x0: f32,
+    pub x1: f32,
+}
+
+impl LineSegment {
+    pub fn width(&self) -> f32 {
+        (self.x1 - self.x0).max(0.0)
+    }
+}
+
+/// Issue #82 — which side(s) of a floating object text may flow on
+/// (`<wp:wrapSquare wrapText="…">`, ECMA-376 §20.4.3.7 `ST_WrapText`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WrapSide {
+    #[default]
+    Both,
+    Left,
+    Right,
+    Largest,
+}
+
+/// Issue #82 — the wrap contract a floating object declares, in layout
+/// px: the wrap kind (`<wp:wrapNone>` / `Square` / `Tight` / `Through` /
+/// `TopAndBottom`), the side rule, the four wrap distances (`distT` /
+/// `distB` / `distL` / `distR`, already scaled) and — for tight / through
+/// wrap — the `<wp:wrapPolygon>` vertices in Word's 21600-unit shape
+/// space (`(21600, 21600)` is the object's bottom-right corner). `None`
+/// polygon on a tight / through object falls back to the bounding box
+/// and is reported (`DegradeReason::WrapPolygonFallback`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FloatWrap {
+    pub kind: engine::WrapKind,
+    pub side: WrapSide,
+    pub dist_top: f32,
+    pub dist_bottom: f32,
+    pub dist_left: f32,
+    pub dist_right: f32,
+    pub polygon: Option<Vec<Point>>,
+}
+
+impl FloatWrap {
+    /// `true` when this object cuts text at all — every kind except
+    /// `WrapKind::None` (behind / in front of text).
+    pub fn cuts_text(&self) -> bool {
+        !matches!(self.kind, engine::WrapKind::None)
+    }
+}
+
 /// Per-run text attributes the renderer needs — the data the temporary
 /// `render::scene::PaintConfig` used to carry out-of-band.
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +210,9 @@ pub struct FloatGlyph {
     pub width: f32,
     pub height: f32,
     pub spec: FloatSpec,
+    /// Issue #82 — the wrap contract (kind, side, distances, polygon)
+    /// the page assembler turns into line cutouts.
+    pub wrap: FloatWrap,
 }
 
 /// Issue #69 — one positioning axis of a float in layout units. Mirrors
@@ -229,6 +290,10 @@ pub struct FloatBox {
     pub behind_doc: bool,
     pub hidden: bool,
     pub frame_origin: Point,
+    /// Issue #82 — the wrap contract carried from the sentinel glyph, so
+    /// the wrap plan (`crate::wrap::derive_plan`) can register this
+    /// object's cutouts against every paragraph it overlaps.
+    pub wrap: FloatWrap,
 }
 
 /// A maximal run of glyphs sharing one font, direction, and style — the unit
@@ -264,6 +329,27 @@ pub struct LineBox {
     /// it (otherwise an empty line reports byte 0 and the caret snaps back
     /// to the paragraph's first line).
     pub source_start: u32,
+    /// Issue #82 — the available horizontal ranges of the band this line
+    /// sits in, after float cutouts, sorted left → right in
+    /// paragraph-box-relative px. **Empty ⇒ the whole content box** — the
+    /// pre-#82 shape, which allocates nothing and is what every paragraph
+    /// without a nearby float still produces (fingerprints unchanged by
+    /// construction). When non-empty, [`Self::segment`] indexes the range
+    /// this line's runs were composed into; sibling lines filling the
+    /// other ranges of the same band share `origin.y`, `baseline` and
+    /// `height` (one band, one baseline).
+    pub segments: Vec<LineSegment>,
+    /// Issue #82 — index into [`Self::segments`] (0 when `segments` is
+    /// empty).
+    pub segment: usize,
+}
+
+impl LineBox {
+    /// Issue #82 — the segment this line was composed into, when the
+    /// band was cut by a float. `None` for a full-width line.
+    pub fn segment_range(&self) -> Option<LineSegment> {
+        self.segments.get(self.segment).copied()
+    }
 }
 
 /// Phase 2 audit (gap D.1) — complex-field overlay propagated from the

@@ -10,11 +10,13 @@ pub mod page;
 pub mod paginate;
 pub mod paragraph;
 pub mod watchdog;
+pub mod wrap;
 
 pub use boxes::{
-    CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FontId,
-    HeaderFooterBox, LayoutBlock, LayoutField, LineBox, MarkerBox, PageBox, ParagraphBox, Point,
-    PositionedGlyph, Size, StyleSpan, TableBox, TableCellBox, TableRowBox, TextAttrs, VisualRun,
+    CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FloatWrap,
+    FontId, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, LineSegment, MarkerBox, PageBox,
+    ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TableBox, TableCellBox, TableRowBox,
+    TextAttrs, VisualRun, WrapSide,
 };
 pub use floats::{ColumnLayout, resolve_page_floats};
 pub use page::{A4Page, Margins};
@@ -26,4 +28,8 @@ pub use paragraph::{InlineObjectInfo, ParagraphConfig, layout_paragraph};
 pub use watchdog::{
     BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation, Watchdog,
     geometry_fingerprint, verify_prefix,
+};
+pub use wrap::{
+    FloatKey, WrapConvergence, WrapCutout, WrapPlan, WrapVerdict, cutouts_for_float, derive_plan,
+    float_key, next_band_edge, plans_equal, segments_for_band,
 };

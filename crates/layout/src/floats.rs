@@ -7,14 +7,13 @@
 //! (ECMA-376 §20.4.3.4 / §20.4.3.5). This module resolves every float on
 //! a finished page into page-relative [`FloatBox`]es.
 //!
-//! **No wrap, no iteration.** Text is unaffected by floats until the
-//! text-wrap epic (issue #82); a float's position is therefore a pure
-//! function of the already-placed blocks — one pass, no fixpoint, no
-//! convergence loop, nothing for the layout watchdog to guard. When #82
-//! adds cutouts, the anchor→position→wrap→reflow loop lands *around* this
-//! resolver with its own termination rule and `DegradeReason` (per the
-//! render-rules self-defense doctrine); the resolver itself stays a pure
-//! function of the block geometry.
+//! **Pure, single pass.** A float's position is a function of the
+//! already-placed blocks — this resolver never iterates. Text wrap (issue
+//! #82) lives *around* it: `crate::wrap` turns the resolved boxes into
+//! per-paragraph cutouts for the next layout pass and `WrapConvergence`
+//! drives the anchor→position→wrap→reflow loop to a fixpoint with its own
+//! termination rules and `DegradeReason`s (render-rules self-defense
+//! doctrine). The wrap contract rides each box (`FloatBox::wrap`).
 
 use crate::boxes::{
     CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, LayoutBlock, PageBox,
@@ -315,6 +314,7 @@ fn place_float(
         behind_doc: f.spec.behind_doc,
         hidden: f.spec.hidden,
         frame_origin,
+        wrap: f.wrap.clone(),
     }
 }
 
@@ -412,6 +412,7 @@ mod tests {
             width: 100.0,
             height: 50.0,
             spec,
+            wrap: crate::boxes::FloatWrap::default(),
         };
         let line = LineBox {
             origin: Point { x: 0.0, y: 0.0 },
@@ -431,6 +432,8 @@ mod tests {
             }],
             alignment: Alignment::Start,
             source_start: 0,
+            segments: Vec::new(),
+            segment: 0,
         };
         ParagraphBox {
             origin,

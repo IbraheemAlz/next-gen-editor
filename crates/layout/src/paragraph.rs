@@ -290,6 +290,8 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             alignment: cfg.alignment,
             /* Empty paragraph → caret at offset 0. */
             source_start: 0,
+            segments: Vec::new(),
+            segment: 0,
         });
         y = cfg.line_height;
     }
@@ -1178,6 +1180,8 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
         /* The line's source offset — load-bearing when the range is empty
         (a soft-break placeholder line) and `runs` carries no byte info. */
         source_start: start as u32,
+        segments: Vec::new(),
+        segment: 0,
     }
 }
 
@@ -1698,6 +1702,8 @@ mod tests {
             runs,
             alignment: Alignment::Start,
             source_start: 0,
+            segments: Vec::new(),
+            segment: 0,
         }
     }
 
