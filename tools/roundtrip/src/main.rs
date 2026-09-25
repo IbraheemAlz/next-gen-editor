@@ -282,6 +282,7 @@ fn run_default() -> Result<()> {
     run_table_cell_runs_survival()?;
     run_wrap_modes_roundtrip()?;
     run_toc_roundtrip()?;
+    run_rtl_table_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -1794,6 +1795,119 @@ fn run_table_cell_runs_survival() -> Result<()> {
     println!(
         "[roundtrip] step 13 OK — table cell runs, grab bags and pictures survive a cell edit (Δ {drift} B)"
     );
+    Ok(())
+}
+
+/* ====================================================== RTL tables (#79) ==== */
+
+/// The `<w:tbl>…</w:tbl>` region of a `document.xml` string.
+fn table_region(xml: &str) -> Result<&str> {
+    let start = xml.find("<w:tbl>").context("no <w:tbl>")?;
+    let end = xml.rfind("</w:tbl>").context("no </w:tbl>")? + "</w:tbl>".len();
+    Ok(&xml[start..end])
+}
+
+/// Issue #79 — step 17: the `<w:bidiVisual>` round-trip contract on the
+/// `table_in_rtl_doc.docx` fixture (a 2-column bidiVisual table).
+///
+/// a. The flag is MODELED on read (`TableProperties::bidi_visual`), not
+///    carried in the tblPr grab bag.
+/// b. An untouched save keeps the table region byte-identical
+///    (passthrough).
+/// c. Typing into the visually RIGHTMOST cell (logical grid cell 1)
+///    dirties the table: the regenerated table is exactly the source
+///    table plus the insert — `<w:bidiVisual/>` emitted once, at its
+///    schema rank — on both save paths, and the text lands in grid
+///    cell 1 of the saved file.
+/// d. Toggling the flag through the engine (`set_table_bidi_visual`)
+///    removes / adds exactly the element.
+fn run_rtl_table_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos, PathStep};
+
+    let fixture_bytes = build_table_in_rtl_doc_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read RTL table fixture")?;
+    let table = archive_a.document.blocks[1]
+        .as_table()
+        .context("block 1 is the table")?;
+    if !table.props.bidi_visual {
+        bail!("<w:bidiVisual/> not modeled on read");
+    }
+    if table.props.grab_bag.is_some() {
+        bail!(
+            "bidiVisual must not ride the tblPr grab bag: {:?}",
+            table.props.grab_bag
+        );
+    }
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let src_tbl = table_region(&doc_a)?.to_string();
+
+    /* b. untouched save — the table passes through verbatim. */
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    assert_document_xml_well_formed(&untouched).context("untouched RTL table .docx")?;
+    let doc_u = String::from_utf8(extract_doc_xml(&untouched)?).context("utf8 untouched")?;
+    if table_region(&doc_u)? != src_tbl {
+        bail!("untouched RTL table drifted:\n{}", table_region(&doc_u)?);
+    }
+    println!("[roundtrip] step 17a OK — bidiVisual modeled on read, untouched table byte-identical");
+
+    /* c. edit grid cell 1 (the visually rightmost cell). */
+    let cell0 = BlockPath::top(1)
+        .push(PathStep::Cell { row: 0, col: 0 })
+        .push(PathStep::Block(0));
+    let edited = archive_a.document.insert_text(
+        LogicalPos {
+            path: cell0,
+            offset: "يمين".len() as u32,
+        },
+        INSERT_TEXT,
+    );
+    let expected_tbl = src_tbl.replacen("يمين", &format!("يمين{INSERT_TEXT}"), 1);
+    for (label, bytes) in [
+        (
+            "write_docx",
+            write_docx(&archive_a, &edited).context("write edited RTL table")?,
+        ),
+        (
+            "build_minimal_docx",
+            build_minimal_docx(&edited).context("UI-path save of RTL table")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&bytes).with_context(|| format!("{label} RTL table"))?;
+        let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+        let tbl = table_region(&xml)?;
+        if tbl != expected_tbl {
+            bail!(
+                "{label}: regenerated RTL table is not source + edit\n--- expected ---\n{expected_tbl}\n--- got ---\n{tbl}"
+            );
+        }
+        let back = read_docx(&bytes).with_context(|| format!("{label}: re-read"))?;
+        let t = back.document.blocks[1].as_table().context("table")?;
+        let first = t.rows[0].cells[0].blocks[0]
+            .as_paragraph()
+            .context("cell paragraph")?;
+        if !t.props.bidi_visual || first.text != format!("يمين{INSERT_TEXT}") {
+            bail!("{label}: flag / grid-cell-1 text lost: {:?}", first.text);
+        }
+    }
+    let drift = expected_tbl.len() - src_tbl.len();
+    println!(
+        "[roundtrip] step 17b OK — dirty RTL table regenerates source + edit, flag emitted once (Δ {drift} B)"
+    );
+
+    /* d. the flag itself is authorable. */
+    let off = edited.set_table_bidi_visual(BlockPath::top(1), false);
+    let off_bytes = write_docx(&archive_a, &off).context("write flag-off table")?;
+    let off_xml = String::from_utf8(extract_doc_xml(&off_bytes)?).context("utf8 off")?;
+    if table_region(&off_xml)? != expected_tbl.replacen("<w:tblPr><w:bidiVisual/></w:tblPr>", "", 1) {
+        bail!("flag off must drop exactly the element:\n{}", table_region(&off_xml)?);
+    }
+    let on = off.set_table_bidi_visual(BlockPath::top(1), true);
+    let on_bytes = write_docx(&archive_a, &on).context("write flag-on table")?;
+    let on_xml = String::from_utf8(extract_doc_xml(&on_bytes)?).context("utf8 on")?;
+    if table_region(&on_xml)? != expected_tbl {
+        bail!("flag on must restore the element:\n{}", table_region(&on_xml)?);
+    }
+    println!("[roundtrip] step 17c OK — toggling bidiVisual adds / removes exactly <w:bidiVisual/>");
     Ok(())
 }
 
