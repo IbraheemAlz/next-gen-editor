@@ -22,15 +22,92 @@
 //! - **WebP** (issue #189, `webp` feature) is decoded with `image-webp`:
 //!   lossy (VP8, with an optional `ALPH` plane) and lossless (VP8L); for an
 //!   animated file, the first frame.
-//! - Decoded GIF / WebP pixels take exactly the PNG path from there: raw RGB
-//!   `/FlateDecode` samples plus an `/SMask` or a flatten onto white
-//!   ([`AlphaMode`]). With a feature off, that format falls back to the
-//!   typed [`ImageSkipReason::UnsupportedFormat`] skip.
-//! - **EMF / WMF / BMP / TIFF / SVG / unknown** are typed skips
+//! - **BMP** (issue #207, always on — hand-written, no crate) decodes
+//!   uncompressed 24-bit (BGR) and 32-bit (BGRX, the 4th byte ignored —
+//!   `BI_RGB` has no real alpha there), 8-bit palette (`BI_RGB` or the
+//!   classic `BI_RLE8`). Every other DIB variant (OS/2 core headers, 1/2/4/
+//!   16-bit depths, `BI_BITFIELDS`/`BI_RLE4`/JPEG/PNG-in-BMP compression) is
+//!   a typed [`ImageSkipReason::UnsupportedEncoding`].
+//! - **TIFF** (issue #207, `tiff` feature) decodes 8-bit Gray/GrayA/RGB/
+//!   RGBA via the `tiff` crate (whatever strip compression it used —
+//!   uncompressed, LZW, PackBits, Deflate — the crate handles internally),
+//!   plus CMYK under the same `allow_cmyk` profile gate as JPEG. Palette,
+//!   YCbCr and non-8-bit samples are a typed `UnsupportedEncoding` (rare in
+//!   Word media; the crate's decoder gives no ready path to expand a
+//!   palette without hand-rolling that ourselves, like the BMP one).
+//! - Decoded GIF / WebP / BMP / TIFF pixels take exactly the PNG path from
+//!   there: raw RGB `/FlateDecode` samples plus an `/SMask` or a flatten
+//!   onto white ([`AlphaMode`]). With a decoder feature off, that format
+//!   falls back to the typed [`ImageSkipReason::UnsupportedFormat`] skip.
+//! - **EMF / WMF / SVG / unknown** are typed skips
 //!   ([`ImageSkipReason::UnsupportedFormat`]) — never a panic.
 //!
 //! Every failure is an [`ImageSkipReason`]; the exporter turns it into a
 //! [`crate::PdfWarning`] and leaves the image's rect empty.
+//!
+//! ## Allocation bounds (issue #208)
+//!
+//! [`MAX_IMAGE_PIXELS`] (40 MP ≈ 160 MiB of RGBA) is checked against the
+//! *declared* dimensions before any pixel buffer is allocated, for every
+//! format. That is enough on its own for PNG, GIF and BMP, but not always
+//! for WebP — a source audit of each vendored decoder found:
+//!
+//! - **PNG** (`png` 0.18): the crate's own [`png::Limits`] (default 64 MiB)
+//!   bounds its *internal* scratch (the unfiltering buffer, at most a
+//!   couple of rows wide) independently of our dimension check — pinned
+//!   explicitly in [`prepare_png`] rather than left as an implicit default.
+//!   The *output* buffer we allocate ourselves is sized from
+//!   `reader.output_buffer_size()`, itself a function of the
+//!   already-`MAX_IMAGE_PIXELS`-checked width/height.
+//! - **GIF** (`gif` 0.14): `gif::MemoryLimit::Bytes` is a real, verified
+//!   bound — every internal buffer grows through the crate's own
+//!   `try_reserve`, which checks the limit before each reservation (source:
+//!   `reader/mod.rs`). We set it to `MAX_IMAGE_PIXELS * 4` bytes. The LZW
+//!   dictionary (`weezl`) is separately bounded by the GIF format itself
+//!   (a hard 12-bit code / 4096-entry ceiling), not adversarially growable.
+//! - **WebP** (`image-webp` 0.2, issue #208's original prompt): a source
+//!   audit found `WebPDecoder::set_memory_limit` is **only** consulted for
+//!   the optional ICC/EXIF/XMP metadata chunk reads (`decoder.rs`) — it is
+//!   *never* checked before the pixel-buffer allocations (`rgb_frame` /
+//!   `rgba_frame` / `canvas`), so our call to it below is inert for pixel
+//!   data. The real bound for those buffers is transitively our own
+//!   `check_dimensions` pre-check: `read_image` requires `buf.len() ==
+//!   output_buffer_size()`, itself `width * height * {3,4}`, and every
+//!   animation frame is bounds-checked against that same already-capped
+//!   canvas. Two internal allocations remain **unbounded by anything we can
+//!   reach from this crate** (confirmed by reading `vp8.rs` / `lossless.rs`
+//!   — both permissively licensed, not the clean-room-walled reference
+//!   trees):
+//!   - `vp8::init_partitions` reads a 3-byte (≤ 16 MiB) partition size
+//!     *before* validating the reader has that many bytes left — a lying
+//!     header can force one ~16 MiB transient allocation from a tiny file
+//!     before the subsequent `read_exact` fails and unwinds it. Bounded
+//!     (≤ 8 partitions × ~16 MiB ≈ 128 MiB structurally, since the size
+//!     field is only 3 bytes wide) but not zero.
+//!   - VP8L's meta-Huffman path can set `num_huff_groups` up to 65536 from
+//!     a *tiny* meta-image, then allocates one `HuffmanCodeGroup` (5 trees)
+//!     per group — but building each group consumes real, non-trivial
+//!     bitstream bits (a `read_huffman_code` call per tree), so reaching
+//!     the max is not free; it costs the attacker roughly proportional
+//!     input, not proportional output.
+//!
+//!   Patching either needs a fork of `image-webp`, out of scope for this
+//!   task (a discovered gap, reported rather than fixed here — see the
+//!   task's final report). Both are well inside the 2 GiB wasm heap
+//!   ceiling, and the worker's crash-recovery path (issue #85) makes a
+//!   trap non-destructive, so this is a documented residual risk, not a
+//!   blocking one.
+//! - **BMP** (hand-written): the only buffers are ones we allocate
+//!   ourselves, all sized from the already-`check_dimensions`-checked
+//!   width/height (`MAX_IMAGE_PIXELS * 3` bytes for the RGB output,
+//!   `MAX_IMAGE_PIXELS` bytes for the RLE8 index scratch) — no vendored
+//!   code, no hidden amplification.
+//! - **TIFF** (`tiff` 0.9): [`tiff::decoder::Limits`] defaults are looser
+//!   than we need (256 MiB decode buffer, 128 MiB intermediate, 1 MiB per
+//!   IFD tag value) — [`prepare_tiff`] tightens `decoding_buffer_size` /
+//!   `intermediate_buffer_size` to `MAX_IMAGE_PIXELS * 4` (the widest
+//!   sample layout we accept, RGBA8/CMYK8) and `ifd_value_size` to 64 KiB
+//!   (bounds a single forged tag's value array, e.g. `StripByteCounts`).
 
 use std::io::Cursor;
 
@@ -111,6 +188,8 @@ pub enum MediaFormat {
     Jpeg,
     Gif,
     WebP,
+    Bmp,
+    Tiff,
     Other(&'static str),
 }
 
@@ -137,22 +216,23 @@ pub fn sniff(data: &[u8], content_type: &str) -> MediaFormat {
         return MediaFormat::Other("WMF");
     }
     if data.starts_with(b"BM") {
-        return MediaFormat::Other("BMP");
+        return MediaFormat::Bmp;
     }
     if data.starts_with(b"II*\0") || data.starts_with(b"MM\0*") {
-        return MediaFormat::Other("TIFF");
+        return MediaFormat::Tiff;
     }
     let ct = content_type.to_ascii_lowercase();
     let by_type = match ct.as_str() {
         "image/x-wmf" | "image/wmf" => "WMF",
         "image/x-emf" | "image/emf" => "EMF",
         "image/svg+xml" => "SVG",
-        /* Declared GIF / WebP without the magic: the decoder reports the
-        corruption as `Malformed`. */
+        /* Declared GIF / WebP / BMP / TIFF without the magic: the decoder
+        reports the corruption as `Malformed`, matching the format the
+        relationship claims rather than a generic "unknown". */
         "image/gif" => return MediaFormat::Gif,
         "image/webp" => return MediaFormat::WebP,
-        "image/bmp" => "BMP",
-        "image/tiff" => "TIFF",
+        "image/bmp" | "image/x-bmp" | "image/x-ms-bmp" => return MediaFormat::Bmp,
+        "image/tiff" | "image/tiff-fx" => return MediaFormat::Tiff,
         _ => "unknown",
     };
     MediaFormat::Other(by_type)
@@ -179,6 +259,11 @@ pub fn prepare_image(
         MediaFormat::WebP => prepare_webp(data, alpha),
         #[cfg(not(feature = "webp"))]
         MediaFormat::WebP => Err(ImageSkipReason::UnsupportedFormat { format: "WebP" }),
+        MediaFormat::Bmp => prepare_bmp(data, alpha),
+        #[cfg(feature = "tiff")]
+        MediaFormat::Tiff => prepare_tiff(data, alpha, allow_cmyk),
+        #[cfg(not(feature = "tiff"))]
+        MediaFormat::Tiff => Err(ImageSkipReason::UnsupportedFormat { format: "TIFF" }),
         MediaFormat::Other(format) => Err(ImageSkipReason::UnsupportedFormat { format }),
     }
 }
@@ -311,6 +396,13 @@ fn prepare_jpeg(data: &[u8], allow_cmyk: bool) -> Result<PreparedImage, ImageSki
 fn prepare_png(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, ImageSkipReason> {
     let mut decoder = png::Decoder::new(Cursor::new(data));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
+    /* Issue #208 — pin the crate's own internal-scratch budget explicitly
+    rather than rely on its (currently identical) 64 MiB default: bounds the
+    unfiltering buffer independently of the `MAX_IMAGE_PIXELS` check below,
+    which only gates the *output* buffer we allocate ourselves. */
+    decoder.set_limits(png::Limits {
+        bytes: 64 * 1024 * 1024,
+    });
     let mut reader = decoder
         .read_info()
         .map_err(|e| malformed(&format!("PNG header: {e}")))?;
@@ -433,7 +525,6 @@ fn split_samples(
 }
 
 /// Reject a zero or over-budget canvas before anything is allocated.
-#[cfg(any(feature = "gif", feature = "webp"))]
 fn check_dimensions(format: &str, width: u32, height: u32) -> Result<(), ImageSkipReason> {
     if width == 0 || height == 0 {
         return Err(malformed(&format!("{format}: zero dimension")));
@@ -506,6 +597,14 @@ fn prepare_webp(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, Ima
     let mut decoder = image_webp::WebPDecoder::new(Cursor::new(data))
         .map_err(|e| malformed(&format!("WebP header: {e}")))?;
     let (width, height) = decoder.dimensions();
+    /* Issue #208 — `check_dimensions` above is the bound that actually
+    matters for the pixel buffers below: a source audit found
+    `set_memory_limit` is only consulted for the optional ICC/EXIF/XMP
+    metadata chunk reads in this crate version, never before `rgb_frame` /
+    `rgba_frame` / `canvas`. Set anyway (harmless, and correct if a future
+    `image-webp` release wires it up) — see the module doc's allocation-
+    bounds section for the two internal allocations this crate does not let
+    us bound at all (VP8 partition sizes, VP8L meta-Huffman groups). */
     check_dimensions("WebP", width, height)?;
     decoder.set_memory_limit((MAX_IMAGE_PIXELS * 4) as usize);
     let has_alpha = decoder.has_alpha();
@@ -522,6 +621,381 @@ fn prepare_webp(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, Ima
         height,
         color: ImageColor::Rgb,
         color_channels: 3,
+        has_alpha,
+        row_bytes: width as usize * stride,
+    };
+    split_samples(layout, &buf, alpha_mode)
+}
+
+/* ---- Issue #207: BMP (hand-written, no crate) ------------------------ */
+
+fn read_u16_le(data: &[u8], at: usize) -> Option<u16> {
+    data.get(at..at + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
+}
+
+fn read_u32_le(data: &[u8], at: usize) -> Option<u32> {
+    data.get(at..at + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn read_i32_le(data: &[u8], at: usize) -> Option<i32> {
+    read_u32_le(data, at).map(|v| v as i32)
+}
+
+/// Bytes from one row's start to the next: bit-packed rows are padded up to
+/// a 4-byte boundary (the BMP spec's `DWORD` alignment).
+fn bmp_row_stride(width: u32, bits_per_pixel: u32) -> Result<usize, ImageSkipReason> {
+    let bits = u64::from(width)
+        .checked_mul(u64::from(bits_per_pixel))
+        .ok_or_else(|| malformed("BMP: row width overflow"))?;
+    let stride = bits.div_ceil(8).div_ceil(4).saturating_mul(4);
+    usize::try_from(stride).map_err(|_| malformed("BMP: row stride too large"))
+}
+
+/// Read `colors_used` (or `1 << bpp` when it's the BMP convention's 0-means-
+/// "all of them") palette entries starting at `start`: 4 bytes each, Blue-
+/// Green-Red-Reserved, per the DIB `RGBQUAD` layout.
+fn read_bmp_palette(
+    data: &[u8],
+    start: usize,
+    colors_used: u32,
+    bpp: u32,
+) -> Result<Vec<[u8; 3]>, ImageSkipReason> {
+    let max_colors = 1u32 << bpp;
+    let count = if colors_used == 0 || colors_used > max_colors {
+        max_colors
+    } else {
+        colors_used
+    } as usize;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = start
+            .checked_add(i * 4)
+            .ok_or_else(|| malformed("BMP: palette offset overflow"))?;
+        let entry = data
+            .get(off..off + 4)
+            .ok_or_else(|| malformed("BMP: truncated palette"))?;
+        out.push([entry[2], entry[1], entry[0]]);
+    }
+    Ok(out)
+}
+
+/// Uncompressed `BI_RGB`: 24bpp (BGR), 32bpp (BGRX, 4th byte ignored) or
+/// 8bpp indexed (a palette entry per pixel). Rows are read bottom-up unless
+/// `top_down` (a negative `biHeight`), and padded to the DWORD boundary.
+#[allow(clippy::too_many_arguments)] // one row-decode path for all three BI_RGB depths
+fn decode_bmp_uncompressed(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    top_down: bool,
+    pixel_data_start: usize,
+    bytes_per_pixel: usize,
+    palette: Option<&[[u8; 3]]>,
+    alpha_mode: AlphaMode,
+) -> Result<PreparedImage, ImageSkipReason> {
+    let row_stride = bmp_row_stride(width, (bytes_per_pixel * 8) as u32)?;
+    let (w, h) = (width as usize, height as usize);
+    let mut out = vec![0u8; w * h * 3];
+    for y_out in 0..h {
+        let src_row = if top_down { y_out } else { h - 1 - y_out };
+        let row_start = pixel_data_start
+            .checked_add(
+                src_row
+                    .checked_mul(row_stride)
+                    .ok_or_else(|| malformed("BMP: row offset overflow"))?,
+            )
+            .ok_or_else(|| malformed("BMP: row offset overflow"))?;
+        let row = data
+            .get(row_start..row_start + row_stride)
+            .ok_or_else(|| malformed("BMP: pixel data truncated"))?;
+        let dst = &mut out[y_out * w * 3..(y_out + 1) * w * 3];
+        for x in 0..w {
+            let px = row
+                .get(x * bytes_per_pixel..x * bytes_per_pixel + bytes_per_pixel)
+                .ok_or_else(|| malformed("BMP: row shorter than its declared width"))?;
+            let rgb = match palette {
+                Some(pal) => pal.get(px[0] as usize).copied().unwrap_or([0, 0, 0]),
+                None => [px[2], px[1], px[0]],
+            };
+            dst[x * 3..x * 3 + 3].copy_from_slice(&rgb);
+        }
+    }
+    split_samples(
+        PixelLayout {
+            width,
+            height,
+            color: ImageColor::Rgb,
+            color_channels: 3,
+            has_alpha: false,
+            row_bytes: w * 3,
+        },
+        &out,
+        alpha_mode,
+    )
+}
+
+/// The classic 8-bit RLE (`BI_RLE8`): pairs of (count, index) runs plus the
+/// escape codes (0,0) end-of-line, (0,1) end-of-bitmap, (0,2) delta, (0,N≥3)
+/// an N-byte literal run padded to a word. Always bottom-up per the spec
+/// (the `top_down` / negative-height combination is invalid for RLE and not
+/// specially handled — this just decodes bottom-up regardless). Every
+/// branch of the loop advances the input cursor by at least one byte, and a
+/// `max_steps` bound (proportional to the input length) is kept anyway as
+/// defense in depth — never trust "this can't loop forever" alone.
+fn decode_bmp_rle8(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    pixel_data_start: usize,
+    palette: &[[u8; 3]],
+    alpha_mode: AlphaMode,
+) -> Result<PreparedImage, ImageSkipReason> {
+    let (w, h) = (width as usize, height as usize);
+    let input = data
+        .get(pixel_data_start..)
+        .ok_or_else(|| malformed("BMP: RLE data offset beyond the file"))?;
+    let mut idx = vec![0u8; w * h];
+    let mut pos = 0usize;
+    let mut x = 0usize;
+    let mut row = 0usize; // 0 = bottom row (the RLE stream's origin).
+    let max_steps = input.len().saturating_mul(2).saturating_add(64);
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps > max_steps {
+            return Err(malformed("BMP: RLE stream did not terminate"));
+        }
+        let (Some(&b0), Some(&b1)) = (input.get(pos), input.get(pos + 1)) else {
+            // Truncated mid-stream with no explicit end-of-bitmap marker:
+            // keep whatever full rows were already decoded rather than
+            // fail the whole image over a missing terminator.
+            break;
+        };
+        pos += 2;
+        if b0 > 0 {
+            if row < h {
+                let out_row = h - 1 - row;
+                let n = (b0 as usize).min(w.saturating_sub(x));
+                let dst = out_row * w + x;
+                if let Some(s) = idx.get_mut(dst..dst + n) {
+                    s.fill(b1);
+                }
+            }
+            x += b0 as usize;
+        } else {
+            match b1 {
+                0 => {
+                    row += 1;
+                    x = 0;
+                }
+                1 => break,
+                2 => {
+                    let (Some(&dx), Some(&dy)) = (input.get(pos), input.get(pos + 1)) else {
+                        break;
+                    };
+                    pos += 2;
+                    x += dx as usize;
+                    row += dy as usize;
+                }
+                n => {
+                    let count = n as usize;
+                    let Some(bytes) = input.get(pos..pos + count) else {
+                        break;
+                    };
+                    if row < h {
+                        let out_row = h - 1 - row;
+                        let take = count.min(w.saturating_sub(x));
+                        let dst = out_row * w + x;
+                        if let Some(d) = idx.get_mut(dst..dst + take) {
+                            d.copy_from_slice(&bytes[..take]);
+                        }
+                    }
+                    pos += count;
+                    if count % 2 == 1 {
+                        pos += 1;
+                    }
+                    x += count;
+                }
+            }
+        }
+    }
+    let mut rgb = vec![0u8; w * h * 3];
+    for (i, &pi) in idx.iter().enumerate() {
+        let c = palette.get(pi as usize).copied().unwrap_or([0, 0, 0]);
+        rgb[i * 3..i * 3 + 3].copy_from_slice(&c);
+    }
+    split_samples(
+        PixelLayout {
+            width,
+            height,
+            color: ImageColor::Rgb,
+            color_channels: 3,
+            has_alpha: false,
+            row_bytes: w * 3,
+        },
+        &rgb,
+        alpha_mode,
+    )
+}
+
+/// BMP → RGB. Uncompressed 24/32-bit and 8-bit palette (`BI_RGB`), plus the
+/// classic 8-bit RLE (`BI_RLE8`). Every other DIB header variant (OS/2 core
+/// headers < the 40-byte `BITMAPINFOHEADER`, 1/2/4/16-bit depths,
+/// `BI_BITFIELDS`/`BI_RLE4`/JPEG/PNG-in-BMP compression) is a typed
+/// [`ImageSkipReason::UnsupportedEncoding`] — legacy or rare in Word media,
+/// not worth a general bit-field decoder. Every read is bounds-checked
+/// (`.get()`, checked arithmetic); truncated or corrupt input is
+/// [`ImageSkipReason::Malformed`], never a panic.
+fn prepare_bmp(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, ImageSkipReason> {
+    if data.len() < 18 || &data[0..2] != b"BM" {
+        return Err(malformed("BMP: missing 'BM' magic"));
+    }
+    let pixel_data_start =
+        read_u32_le(data, 10).ok_or_else(|| malformed("BMP: truncated file header"))? as usize;
+    let header_size =
+        read_u32_le(data, 14).ok_or_else(|| malformed("BMP: truncated DIB header size"))?;
+    if header_size < 40 {
+        return Err(ImageSkipReason::UnsupportedEncoding {
+            detail: format!(
+                "BMP DIB header size {header_size} (only BITMAPINFOHEADER-family ≥ 40 supported)"
+            ),
+        });
+    }
+    let width_i = read_i32_le(data, 18).ok_or_else(|| malformed("BMP: truncated width"))?;
+    let height_i = read_i32_le(data, 22).ok_or_else(|| malformed("BMP: truncated height"))?;
+    let bpp = read_u16_le(data, 28).ok_or_else(|| malformed("BMP: truncated bit depth"))?;
+    let compression =
+        read_u32_le(data, 30).ok_or_else(|| malformed("BMP: truncated compression"))?;
+    let colors_used =
+        read_u32_le(data, 46).ok_or_else(|| malformed("BMP: truncated colors-used"))?;
+
+    if width_i <= 0 || height_i == 0 || height_i == i32::MIN {
+        return Err(malformed(
+            "BMP: non-positive width or unrepresentable height",
+        ));
+    }
+    let top_down = height_i < 0;
+    let width = width_i as u32;
+    let height = height_i.unsigned_abs();
+    check_dimensions("BMP", width, height)?;
+
+    let palette_start = 14usize
+        .checked_add(header_size as usize)
+        .ok_or_else(|| malformed("BMP: header size overflow"))?;
+
+    match (bpp, compression) {
+        (24, 0) => decode_bmp_uncompressed(
+            data,
+            width,
+            height,
+            top_down,
+            pixel_data_start,
+            3,
+            None,
+            alpha_mode,
+        ),
+        (32, 0) => decode_bmp_uncompressed(
+            data,
+            width,
+            height,
+            top_down,
+            pixel_data_start,
+            4,
+            None,
+            alpha_mode,
+        ),
+        (8, 0) => {
+            let palette = read_bmp_palette(data, palette_start, colors_used, 8)?;
+            decode_bmp_uncompressed(
+                data,
+                width,
+                height,
+                top_down,
+                pixel_data_start,
+                1,
+                Some(&palette),
+                alpha_mode,
+            )
+        }
+        (8, 1) => {
+            let palette = read_bmp_palette(data, palette_start, colors_used, 8)?;
+            decode_bmp_rle8(data, width, height, pixel_data_start, &palette, alpha_mode)
+        }
+        (bpp, comp) => Err(ImageSkipReason::UnsupportedEncoding {
+            detail: format!("BMP {bpp}bpp compression {comp}"),
+        }),
+    }
+}
+
+/* ---- Issue #207: TIFF (`tiff` crate) ---------------------------------- */
+
+/// TIFF → 8-bit Gray/GrayA/RGB/RGBA/CMYK via the `tiff` crate, whatever
+/// strip compression it used internally (uncompressed, LZW, PackBits,
+/// Deflate). Palette, YCbCr and non-8-bit samples are a typed
+/// `UnsupportedEncoding` (see the module doc). CMYK is gated by
+/// `allow_cmyk`, matching the JPEG path.
+#[cfg(feature = "tiff")]
+fn prepare_tiff(
+    data: &[u8],
+    alpha_mode: AlphaMode,
+    allow_cmyk: bool,
+) -> Result<PreparedImage, ImageSkipReason> {
+    let decoder = tiff::decoder::Decoder::new(Cursor::new(data))
+        .map_err(|e| malformed(&format!("TIFF header: {e}")))?;
+    /* Issue #208 — tighten the crate's own internal-allocation ceilings
+    (defaults: 256 MiB decode buffer / 128 MiB intermediate / 1 MiB per IFD
+    tag value) to our own budget, independent of the `check_dimensions`
+    call below: a lying header (bogus samples-per-pixel or bit depth we'd
+    reject afterward anyway) can't force more than our own worst case
+    before we ever see a pixel. */
+    let mut limits = tiff::decoder::Limits::default();
+    limits.decoding_buffer_size = (MAX_IMAGE_PIXELS * 4) as usize;
+    limits.intermediate_buffer_size = limits.decoding_buffer_size;
+    limits.ifd_value_size = 1 << 16;
+    let mut decoder = decoder.with_limits(limits);
+
+    let (width, height) = decoder
+        .dimensions()
+        .map_err(|e| malformed(&format!("TIFF dimensions: {e}")))?;
+    check_dimensions("TIFF", width, height)?;
+    let color = decoder
+        .colortype()
+        .map_err(|e| malformed(&format!("TIFF color type: {e}")))?;
+    let (color_channels, has_alpha, out_color) = match color {
+        tiff::ColorType::Gray(8) => (1, false, ImageColor::Gray),
+        tiff::ColorType::GrayA(8) => (1, true, ImageColor::Gray),
+        tiff::ColorType::RGB(8) => (3, false, ImageColor::Rgb),
+        tiff::ColorType::RGBA(8) => (3, true, ImageColor::Rgb),
+        tiff::ColorType::CMYK(8) if allow_cmyk => (4, false, ImageColor::Cmyk),
+        tiff::ColorType::CMYK(8) => {
+            return Err(ImageSkipReason::UnsupportedEncoding {
+                detail: "CMYK TIFF under an sRGB output intent".to_string(),
+            });
+        }
+        other => {
+            return Err(ImageSkipReason::UnsupportedEncoding {
+                detail: format!(
+                    "TIFF color type {other:?} (only 8-bit Gray/GrayA/RGB/RGBA/CMYK decode)"
+                ),
+            });
+        }
+    };
+    let result = decoder
+        .read_image()
+        .map_err(|e| malformed(&format!("TIFF data: {e}")))?;
+    let tiff::decoder::DecodingResult::U8(buf) = result else {
+        return Err(ImageSkipReason::UnsupportedEncoding {
+            detail: "TIFF sample width other than 8 bits".to_string(),
+        });
+    };
+    let stride = color_channels + usize::from(has_alpha);
+    let layout = PixelLayout {
+        width,
+        height,
+        color: out_color,
+        color_channels,
         has_alpha,
         row_bytes: width as usize * stride,
     };
@@ -722,6 +1196,160 @@ pub mod test_images {
         0xd8, 0x6c, 0x7f, 0xb0, 0xd8, 0xff, 0x61, 0xb1, 0xff, 0xec, 0x36, 0x3f, 0xfa, 0xca, 0xaf,
         0x92, 0xa3, 0xf6, 0xcc, 0x00, 0x00, 0x00,
     ];
+
+    /// A minimal uncompressed BMP: `BITMAPFILEHEADER` + 40-byte
+    /// `BITMAPINFOHEADER` (+ a palette, for `bytes_per_pixel == 1`) + row-
+    /// padded pixel data. `pixels` is row-major, top-to-bottom, tightly
+    /// packed at `bytes_per_pixel` bytes/pixel (BGR for 3, BGRX for 4, a
+    /// palette index for 1); this builder adds the DWORD row padding and
+    /// writes rows bottom-up in the file (the BMP convention) unless
+    /// `top_down`, matching what `prepare_bmp` expects to invert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bmp(
+        width: u32,
+        height: u32,
+        bpp: u16,
+        bytes_per_pixel: usize,
+        palette: Option<&[[u8; 3]]>,
+        pixels: &[u8],
+        top_down: bool,
+    ) -> Vec<u8> {
+        let row_stride = (u64::from(width) * u64::from(bpp)).div_ceil(8).div_ceil(4) as usize * 4;
+        let palette_bytes = palette.map_or(0, |p| p.len() * 4);
+        let pixel_data_start = 14 + 40 + palette_bytes;
+        let file_size = pixel_data_start + row_stride * height as usize;
+        let mut out = Vec::with_capacity(file_size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(file_size as u32).to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(pixel_data_start as u32).to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(width as i32).to_le_bytes());
+        let signed_height: i32 = if top_down {
+            -(height as i32)
+        } else {
+            height as i32
+        };
+        out.extend_from_slice(&signed_height.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&bpp.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        let colors_used = palette.map_or(0, |p| p.len() as u32);
+        out.extend_from_slice(&colors_used.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        if let Some(pal) = palette {
+            for c in pal {
+                out.extend_from_slice(&[c[2], c[1], c[0], 0]);
+            }
+        }
+        for y in 0..height as usize {
+            let src_row = if top_down { y } else { height as usize - 1 - y };
+            let start = src_row * width as usize * bytes_per_pixel;
+            let row = &pixels[start..start + width as usize * bytes_per_pixel];
+            out.extend_from_slice(row);
+            let pad = out.len() + (row_stride - row.len());
+            out.resize(pad, 0);
+        }
+        out
+    }
+
+    /// A BMP using the classic 8-bit RLE (`BI_RLE8`): `rle_data` is the
+    /// already-encoded opcode stream, written verbatim as the pixel data.
+    pub fn bmp_rle8(width: u32, height: u32, palette: &[[u8; 3]], rle_data: &[u8]) -> Vec<u8> {
+        let pixel_data_start = 14 + 40 + palette.len() * 4;
+        let file_size = pixel_data_start + rle_data.len();
+        let mut out = Vec::with_capacity(file_size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(file_size as u32).to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(pixel_data_start as u32).to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(width as i32).to_le_bytes());
+        out.extend_from_slice(&(height as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // BI_RLE8
+        out.extend_from_slice(&(rle_data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for c in palette {
+            out.extend_from_slice(&[c[2], c[1], c[0], 0]);
+        }
+        out.extend_from_slice(rle_data);
+        out
+    }
+
+    /// A minimal single-IFD TIFF via the `tiff` crate's own encoder —
+    /// uncompressed 8-bit Gray/RGB/RGBA, little-endian.
+    #[cfg(feature = "tiff")]
+    pub fn tiff_rgb8(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut out);
+            let mut enc = ::tiff::encoder::TiffEncoder::new(&mut cursor).expect("tiff header");
+            enc.write_image::<::tiff::encoder::colortype::RGB8>(width, height, pixels)
+                .expect("tiff image");
+        }
+        out
+    }
+
+    /// [`tiff_rgb8`] for 8-bit RGBA pixels.
+    #[cfg(feature = "tiff")]
+    pub fn tiff_rgba8(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut out);
+            let mut enc = ::tiff::encoder::TiffEncoder::new(&mut cursor).expect("tiff header");
+            enc.write_image::<::tiff::encoder::colortype::RGBA8>(width, height, pixels)
+                .expect("tiff image");
+        }
+        out
+    }
+
+    /// [`tiff_rgb8`] for 8-bit grayscale pixels.
+    #[cfg(feature = "tiff")]
+    pub fn tiff_gray8(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut out);
+            let mut enc = ::tiff::encoder::TiffEncoder::new(&mut cursor).expect("tiff header");
+            enc.write_image::<::tiff::encoder::colortype::Gray8>(width, height, pixels)
+                .expect("tiff image");
+        }
+        out
+    }
+
+    /// [`tiff_rgb8`] for 8-bit CMYK pixels.
+    #[cfg(feature = "tiff")]
+    pub fn tiff_cmyk8(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut out);
+            let mut enc = ::tiff::encoder::TiffEncoder::new(&mut cursor).expect("tiff header");
+            enc.write_image::<::tiff::encoder::colortype::CMYK8>(width, height, pixels)
+                .expect("tiff image");
+        }
+        out
+    }
+
+    /// 16-bit grayscale — outside `prepare_tiff`'s supported (8-bit-only)
+    /// subset, used to test that skip path.
+    #[cfg(feature = "tiff")]
+    pub fn tiff_gray16(width: u32, height: u32, pixels: &[u16]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut out);
+            let mut enc = ::tiff::encoder::TiffEncoder::new(&mut cursor).expect("tiff header");
+            enc.write_image::<::tiff::encoder::colortype::Gray16>(width, height, pixels)
+                .expect("tiff image");
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -740,6 +1368,11 @@ mod tests {
         assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 ", ""), MediaFormat::WebP);
         assert_eq!(sniff(b"????", "image/gif"), MediaFormat::Gif);
         assert_eq!(sniff(b"????", "image/webp"), MediaFormat::WebP);
+        assert_eq!(sniff(b"BM\0\0\0\0", ""), MediaFormat::Bmp);
+        assert_eq!(sniff(b"II*\0", ""), MediaFormat::Tiff);
+        assert_eq!(sniff(b"MM\0*", ""), MediaFormat::Tiff);
+        assert_eq!(sniff(b"????", "image/bmp"), MediaFormat::Bmp);
+        assert_eq!(sniff(b"????", "image/tiff"), MediaFormat::Tiff);
         assert_eq!(
             sniff(&[0xD7, 0xCD, 0xC6, 0x9A, 0, 0], ""),
             MediaFormat::Other("WMF")
@@ -870,13 +1503,12 @@ mod tests {
 
     #[test]
     fn tier3_formats_are_typed_skips() {
-        for (bytes, fmt) in [
-            (&[0xD7, 0xCD, 0xC6, 0x9A, 0, 0][..], "WMF"),
-            (&b"BM\0\0"[..], "BMP"),
-            (&b"II*\0"[..], "TIFF"),
+        for (bytes, content_type, fmt) in [
+            (&[0xD7, 0xCD, 0xC6, 0x9A, 0, 0][..], "", "WMF"),
+            (&b"<svg"[..], "image/svg+xml", "SVG"),
         ] {
             assert_eq!(
-                prepare_image(bytes, "", AlphaMode::SoftMask, true),
+                prepare_image(bytes, content_type, AlphaMode::SoftMask, true),
                 Err(ImageSkipReason::UnsupportedFormat { format: fmt })
             );
         }
@@ -1134,6 +1766,266 @@ mod tests {
                 }
             }
         }
+    }
+
+    /* ---- Issue #207: BMP + TIFF --------------------------------------- */
+
+    const BMP_PALETTE: [[u8; 3]; 4] = [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]];
+
+    #[test]
+    fn bmp_24bpp_bgr_becomes_rgb_bottom_up_and_top_down() {
+        /* 2×2, top-to-bottom RGB rows: (255,0,0),(0,255,0) / (0,0,255),(255,255,0). */
+        let bgr: [u8; 12] = [
+            0, 0, 255, 0, 255, 0, //
+            255, 0, 0, 0, 255, 255,
+        ];
+        let expect_rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0];
+        for top_down in [false, true] {
+            let data = test_images::bmp(2, 2, 24, 3, None, &bgr, top_down);
+            let p = prepare_image(&data, "image/bmp", AlphaMode::SoftMask, false).unwrap();
+            assert_eq!((p.width, p.height, p.color), (2, 2, ImageColor::Rgb));
+            assert!(p.alpha.is_none());
+            assert_eq!(p.data, expect_rgb, "top_down={top_down}");
+        }
+    }
+
+    #[test]
+    fn bmp_32bpp_ignores_the_fourth_byte() {
+        let bgrx: [u8; 4] = [10, 20, 30, 200]; // B, G, R, junk/reserved
+        let data = test_images::bmp(1, 1, 32, 4, None, &bgrx, false);
+        let p = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert!(p.alpha.is_none());
+        assert_eq!(p.data, vec![30, 20, 10]);
+    }
+
+    #[test]
+    fn bmp_8bpp_palette_expands_to_rgb() {
+        let indices: [u8; 2] = [1, 3];
+        let data = test_images::bmp(2, 1, 8, 1, Some(&BMP_PALETTE), &indices, false);
+        let p = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!(p.data, vec![40, 50, 60, 100, 110, 120]);
+    }
+
+    #[test]
+    fn bmp_rle8_decodes_encoded_runs_end_of_line_and_absolute_mode() {
+        /* 4×2. Bottom row: run of 4×index0. Top row: absolute-mode [1,1,2]
+        (padded odd count) then an encoded run of 1×index3, then end of
+        bitmap. */
+        let rle: Vec<u8> = vec![4, 0, 0, 0, 0, 3, 1, 1, 2, 0, 1, 3, 0, 1];
+        let data = test_images::bmp_rle8(4, 2, &BMP_PALETTE, &rle);
+        let p = prepare_image(&data, "image/bmp", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!((p.width, p.height), (4, 2));
+        let mut expect = Vec::new();
+        expect.extend_from_slice(&BMP_PALETTE[1]);
+        expect.extend_from_slice(&BMP_PALETTE[1]);
+        expect.extend_from_slice(&BMP_PALETTE[2]);
+        expect.extend_from_slice(&BMP_PALETTE[3]);
+        for _ in 0..4 {
+            expect.extend_from_slice(&BMP_PALETTE[0]);
+        }
+        assert_eq!(p.data, expect);
+    }
+
+    #[test]
+    fn bmp_rle8_delta_leaves_the_default_index_behind() {
+        /* 3×1: index 2 at x=0, delta (+1, +0) to x=2, index 1 at x=2 — x=1
+        is never written and stays the default index 0. */
+        let rle: Vec<u8> = vec![1, 2, 0, 2, 1, 0, 1, 1, 0, 1];
+        let data = test_images::bmp_rle8(3, 1, &BMP_PALETTE, &rle);
+        let p = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        let mut expect = Vec::new();
+        expect.extend_from_slice(&BMP_PALETTE[2]);
+        expect.extend_from_slice(&BMP_PALETTE[0]);
+        expect.extend_from_slice(&BMP_PALETTE[1]);
+        assert_eq!(p.data, expect);
+    }
+
+    #[test]
+    fn bmp_unsupported_dib_variants_are_typed_skips() {
+        /* OS/2 core header (size 12). */
+        let mut core = vec![b'B', b'M'];
+        core.extend_from_slice(&26u32.to_le_bytes()); // file size (unchecked)
+        core.extend_from_slice(&[0, 0, 0, 0]);
+        core.extend_from_slice(&26u32.to_le_bytes()); // pixel data offset
+        core.extend_from_slice(&12u32.to_le_bytes()); // BITMAPCOREHEADER size
+        core.extend_from_slice(&[1, 0, 1, 0, 1, 0, 24, 0]);
+        assert!(matches!(
+            prepare_image(&core, "", AlphaMode::SoftMask, false),
+            Err(ImageSkipReason::UnsupportedEncoding { .. })
+        ));
+
+        /* 16bpp BI_RGB — not in the supported set. */
+        let px16 = [0u8; 4];
+        let data = test_images::bmp(1, 1, 16, 2, None, &px16, false);
+        assert!(matches!(
+            prepare_image(&data, "", AlphaMode::SoftMask, false),
+            Err(ImageSkipReason::UnsupportedEncoding { .. })
+        ));
+    }
+
+    /// Fuzz-style robustness: every truncation, plus deterministic byte
+    /// corruption (the "BM" magic kept intact so the decoder, not the
+    /// sniffer, sees it), of every BMP fixture is `Ok` or a typed skip —
+    /// never a panic.
+    #[test]
+    fn truncated_and_corrupt_bmp_never_panic() {
+        let fixtures: Vec<Vec<u8>> = vec![
+            test_images::bmp(2, 2, 24, 3, None, &[0u8; 12], false),
+            test_images::bmp(2, 2, 32, 4, None, &[0u8; 16], false),
+            test_images::bmp(2, 1, 8, 1, Some(&BMP_PALETTE), &[1, 3], false),
+            test_images::bmp_rle8(
+                4,
+                2,
+                &BMP_PALETTE,
+                &[4, 0, 0, 0, 0, 3, 1, 1, 2, 0, 1, 3, 0, 1],
+            ),
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for fixture in &fixtures {
+            for cut in 0..=fixture.len() {
+                for mode in [AlphaMode::SoftMask, AlphaMode::FlattenOnWhite] {
+                    let r = prepare_image(&fixture[..cut], "image/bmp", mode, false);
+                    if cut < 18 {
+                        assert!(r.is_err(), "cut {cut} of {fixture:?}");
+                    }
+                }
+            }
+            for _ in 0..400 {
+                let mut m = fixture.clone();
+                /* Keep the "BM" magic so the decoder (not the sniffer) sees it. */
+                for _ in 0..1 + next() % 4 {
+                    let at = 2 + (next() as usize) % (m.len() - 2);
+                    m[at] = next() as u8;
+                }
+                if let Ok(p) = prepare_image(&m, "", AlphaMode::SoftMask, false) {
+                    assert_eq!(
+                        p.data.len(),
+                        p.width as usize * p.height as usize * 3,
+                        "decoded size matches the dimensions"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn tiff_rgb8_and_gray8_round_trip() {
+        let rgb_px: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let data = test_images::tiff_rgb8(2, 2, &rgb_px);
+        let p = prepare_image(&data, "image/tiff", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!((p.width, p.height, p.color), (2, 2, ImageColor::Rgb));
+        assert!(p.alpha.is_none());
+        assert_eq!(p.data, rgb_px);
+
+        let gray_px: [u8; 6] = [10, 20, 30, 40, 50, 60];
+        let data = test_images::tiff_gray8(3, 2, &gray_px);
+        let p = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!(p.color, ImageColor::Gray);
+        assert_eq!(p.data, gray_px);
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn tiff_rgba8_keeps_alpha_as_soft_mask_or_flattens_on_white() {
+        /* 2×1: opaque red, half-transparent blue. */
+        let px = [255, 0, 0, 255, 0, 0, 255, 128];
+        let data = test_images::tiff_rgba8(2, 1, &px);
+        let soft = prepare_image(&data, "image/tiff", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!(soft.data, vec![255, 0, 0, 0, 0, 255]);
+        assert_eq!(soft.alpha, Some(vec![255, 128]));
+        let flat = prepare_image(&data, "", AlphaMode::FlattenOnWhite, false).unwrap();
+        assert!(flat.alpha.is_none());
+        assert_eq!(flat.data, vec![255, 0, 0, 127, 127, 255]);
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn tiff_cmyk_is_profile_gated() {
+        let px: [u8; 4] = [10, 20, 30, 40];
+        let data = test_images::tiff_cmyk8(1, 1, &px);
+        let plain = prepare_image(&data, "", AlphaMode::SoftMask, true).unwrap();
+        assert_eq!(plain.color, ImageColor::Cmyk);
+        assert_eq!(plain.data, px);
+        assert!(matches!(
+            prepare_image(&data, "", AlphaMode::SoftMask, false),
+            Err(ImageSkipReason::UnsupportedEncoding { .. })
+        ));
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn tiff_16bit_samples_are_a_typed_skip() {
+        let px16: [u16; 4] = [0, 0, 0, 0];
+        let data = test_images::tiff_gray16(2, 2, &px16);
+        assert!(matches!(
+            prepare_image(&data, "", AlphaMode::SoftMask, false),
+            Err(ImageSkipReason::UnsupportedEncoding { .. })
+        ));
+    }
+
+    /// Fuzz-style robustness: every truncation, plus deterministic byte
+    /// corruption, of every TIFF fixture is `Ok` or a typed skip — never a
+    /// panic.
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn truncated_and_corrupt_tiff_never_panic() {
+        let fixtures: Vec<Vec<u8>> = vec![
+            test_images::tiff_rgb8(2, 2, &[0u8; 12]),
+            test_images::tiff_rgba8(2, 2, &[0u8; 16]),
+            test_images::tiff_gray8(3, 2, &[0u8; 6]),
+        ];
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for fixture in &fixtures {
+            for cut in 0..=fixture.len() {
+                for mode in [AlphaMode::SoftMask, AlphaMode::FlattenOnWhite] {
+                    let _ = prepare_image(&fixture[..cut], "image/tiff", mode, false);
+                }
+            }
+            for _ in 0..400 {
+                let mut m = fixture.clone();
+                for _ in 0..1 + next() % 4 {
+                    let at = (next() as usize) % m.len();
+                    m[at] = next() as u8;
+                }
+                /* Keep the byte-order magic so the sniffer still routes to
+                TIFF (content-type would too, but this exercises both). */
+                m[0..4].copy_from_slice(&fixture[0..4]);
+                if let Ok(p) = prepare_image(&m, "", AlphaMode::SoftMask, false) {
+                    let channels = match p.color {
+                        ImageColor::Gray => 1,
+                        ImageColor::Rgb => 3,
+                        ImageColor::Cmyk => 4,
+                    };
+                    assert_eq!(
+                        p.data.len(),
+                        p.width as usize * p.height as usize * channels,
+                        "decoded size matches the dimensions"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "tiff"))]
+    #[test]
+    fn tiff_without_the_feature_is_an_unsupported_format() {
+        assert_eq!(
+            prepare_image(b"II*\0\x08\0\0\0\0\0", "", AlphaMode::SoftMask, false),
+            Err(ImageSkipReason::UnsupportedFormat { format: "TIFF" })
+        );
     }
 
     #[cfg(not(feature = "gif"))]

@@ -947,3 +947,71 @@ fn corrupt_gif_and_webp_warn_and_paint_nothing() {
         .collect();
     assert_eq!(skipped, vec!["rIdPng", "rIdFloat"]);
 }
+
+/* ---- Issue #207: BMP + TIFF end-to-end embed ------------------------- */
+
+#[test]
+fn bmp_embeds_as_a_flate_xobject() {
+    let stack = liberation_stack();
+    let page = image_page(&stack);
+    let mut m = media();
+    let bmp_px: [u8; 12] = [
+        0, 0, 255, 0, 255, 0, // BGR row 0 (top): red, green
+        255, 0, 0, 0, 255, 255, // BGR row 1 (bottom): blue, yellow
+    ];
+    m.insert(
+        "rIdFloat".into(),
+        ImageBlob {
+            content_type: "image/bmp".into(),
+            data: super::image::test_images::bmp(2, 2, 24, 3, None, &bmp_px, false),
+        },
+    );
+    let mut pdf = Vec::new();
+    let report = export_pdf_with_media(
+        std::slice::from_ref(&page),
+        &stack,
+        &[TEXT],
+        &m,
+        PdfProfile::Plain,
+        &mut pdf,
+    )
+    .expect("export still succeeds");
+    assert_eq!(report.images_embedded, 3, "png + jpeg + bmp, all distinct");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let objs = objects(&pdf);
+    /* 3 XObjects + the base PNG fixture's own `/SMask` (it carries partial
+    alpha; the BMP itself is opaque and gets none). */
+    assert_eq!(images(&objs).len(), 4);
+}
+
+#[cfg(feature = "tiff")]
+#[test]
+fn tiff_embeds_as_a_flate_xobject() {
+    let stack = liberation_stack();
+    let page = image_page(&stack);
+    let mut m = media();
+    let rgb_px: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    m.insert(
+        "rIdFloat".into(),
+        ImageBlob {
+            content_type: "image/tiff".into(),
+            data: super::image::test_images::tiff_rgb8(2, 2, &rgb_px),
+        },
+    );
+    let mut pdf = Vec::new();
+    let report = export_pdf_with_media(
+        std::slice::from_ref(&page),
+        &stack,
+        &[TEXT],
+        &m,
+        PdfProfile::Plain,
+        &mut pdf,
+    )
+    .expect("export still succeeds");
+    assert_eq!(report.images_embedded, 3, "png + jpeg + tiff, all distinct");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let objs = objects(&pdf);
+    /* 3 XObjects + the base PNG fixture's own `/SMask` (it carries partial
+    alpha; the TIFF itself is opaque and gets none). */
+    assert_eq!(images(&objs).len(), 4);
+}
