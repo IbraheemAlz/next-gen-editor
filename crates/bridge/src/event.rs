@@ -747,7 +747,6 @@ pub enum A11yNoteKind {
 /// `role="doc-endnotes"` section. A note is its own node, so an edit
 /// inside it patches only that region (`A11yPatch::Update`).
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(default)]
 pub struct A11yNote {
     /// Footnote or endnote. (Not `kind`: that is the node's tag.)
     pub note_kind: A11yNoteKind,
@@ -770,7 +769,6 @@ pub struct A11yNote {
 /// renders the run as `role="doc-noteref"` linking to the region whose
 /// [`A11yNote::id`] equals `id`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(default)]
 pub struct A11yNoteRef {
     pub kind: A11yNoteKind,
     pub id: String,

@@ -982,9 +982,14 @@ pub enum FieldKind {
 
 /// Issue #81 — the `TOC` field switches [`Command::InsertToc`] authors.
 /// Defaults are Word's Insert › Table of Contents: `TOC \o "1-3" \h \z \u`.
+///
+/// Issue #214 — no struct-level `#[serde(default)]`: every field is always
+/// populated (`@nge/core`'s `insertToc` merges `DEFAULT_TOC_SWITCHES` under
+/// the caller's overrides on the TS side before dispatch, so the wire
+/// payload is never partial). A struct-level default would make tsify-next
+/// render every field as optional in the generated `.d.ts` for no reason.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[serde(default)]
 pub struct TocSwitches {
     /// `\o "min-max"` — heading outline levels collected (1-based,
     /// clamped to 1..=9). `outline_max == 0` omits `\o`.
