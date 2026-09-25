@@ -21,6 +21,9 @@ use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::source_markup::{
+    MarkupCapture, is_inline_marker, is_modeled_textless_run_child,
+};
 use crate::style_resolver::StyleResolver;
 use engine::{
     Block, DocumentEnvelope, DocumentTree, HeaderFooterRefs, HeaderFooterRole, ListItem,
@@ -872,6 +875,13 @@ pub fn parse_document_xml_with_warnings(
     let mut prev_pos: usize = 0;
     let mut p_start_byte: Option<usize> = None;
 
+    /* Issues #199 / #106 — the open paragraph's attribute-level grab bag
+    and in-paragraph source markup (`schema::source_markup`). `toc_ids`
+    holds the `w:id` of every `_Toc*` bookmark the model owns, so its
+    `<w:bookmarkEnd>` is not ALSO kept as a verbatim marker. */
+    let mut markup = MarkupCapture::new();
+    let mut toc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     /* Issue #84 — namespace prefixes the part's root element binds. Grab-bag
     fragments in a foreign namespace (`w14:`, `mc:`, …) re-bind their
     prefixes from here so they stay well-formed under the writer's
@@ -948,6 +958,9 @@ pub fn parse_document_xml_with_warnings(
                 `<wp:anchor>` / `<wp:inline>` picture around it still parses
                 — only its inner story is skipped. Modeling text boxes is
                 issue #83. */
+                if in_run && is_modeled_textless_run_child(name.as_ref()) {
+                    markup.run_modeled();
+                }
                 match name.as_ref() {
                     /* Issue #119 — a run-level object element: capture the
                     whole subtree, lower the modeled facts out of it, and
@@ -1096,6 +1109,7 @@ pub fn parse_document_xml_with_warnings(
                         `<w:p>` lives in the source). */
                         p_start_byte = Some(prev_pos);
                         envelopes.note_block_start(prev_pos);
+                        markup.open_paragraph(&e, &ns, reader.buffer_position() as usize);
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pmark_rpr = SpanStyle::default();
@@ -1105,6 +1119,7 @@ pub fn parse_document_xml_with_warnings(
                         r_style_id = None;
                         direct_rpr = SpanStyle::default();
                         run_text.clear();
+                        markup.open_run(&e, &ns, prev_pos, para_text.len() as u32);
                     }
                     b"w:rPr" if in_ppr && !in_run => {
                         /* Issue #84 — paragraph-mark run properties
@@ -1120,7 +1135,12 @@ pub fn parse_document_xml_with_warnings(
                             stash(&mut direct_ppr.grab_bag, frag, &ns);
                         }
                     }
-                    b"w:rPr" => in_rpr = true,
+                    b"w:rPr" => {
+                        in_rpr = true;
+                        if in_run {
+                            markup.run_rpr_start(prev_pos);
+                        }
+                    }
                     /* A `<w:pPr>` only counts when it's the paragraph's own
                     properties — not a nested element under a `<w:r>`. */
                     b"w:pPr" if !in_run => in_ppr = true,
@@ -1146,6 +1166,9 @@ pub fn parse_document_xml_with_warnings(
                         in_sect_pr = true;
                         cur_sect = SectPrAccum::default();
                         sect_pr_start = Some(prev_pos);
+                        if in_ppr {
+                            markup.note_sect_in_ppr();
+                        }
                         if at_block_level {
                             envelopes.finish(&mut out_blocks);
                         }
@@ -1161,8 +1184,14 @@ pub fn parse_document_xml_with_warnings(
                             .unwrap_or_default();
                         hyperlink_stack.push((target, start));
                     }
-                    b"w:t" => in_text_elt = true,
-                    b"w:delText" => in_del_text_elt = true,
+                    b"w:t" => {
+                        in_text_elt = true;
+                        markup.run_text_elt(&e, &ns);
+                    }
+                    b"w:delText" => {
+                        in_del_text_elt = true;
+                        markup.run_text_elt(&e, &ns);
+                    }
                     b"w:instrText" => in_instr_text = true,
                     b"w:fldChar" => {
                         /* fldChar drives the field state machine. The
@@ -1251,6 +1280,45 @@ pub fn parse_document_xml_with_warnings(
                 }
                 let at_block_level =
                     in_block_container && p_start_byte.is_none() && in_tbl == 0 && !in_sect_pr;
+                if in_run && is_modeled_textless_run_child(name.as_ref()) {
+                    markup.run_modeled();
+                }
+                /* Issues #199 / #106 — in-paragraph markup the model does
+                not represent: the empty `<w:pPr/>`, an empty run `<w:rPr/>`,
+                a leading `<w:lastRenderedPageBreak/>`, and the positioned
+                markers (`<w:proofErr/>`, bookmarks, permission ranges). */
+                let in_para = p_start_byte.is_some() && in_tbl == 0;
+                let here = reader.buffer_position() as usize;
+                match name.as_ref() {
+                    b"w:pPr" if in_para && !in_run => markup.close_ppr(xml, here, &ns),
+                    b"w:rPr" if in_para && in_run => {
+                        if let Some(frag) = slice_fragment(xml, prev_pos, here) {
+                            markup.run_rpr_empty(frag);
+                        }
+                    }
+                    b"w:lastRenderedPageBreak" if in_para && in_run => {
+                        if let Some(frag) = xml.get(prev_pos..here) {
+                            markup.run_lead(frag, run_text.is_empty());
+                        }
+                    }
+                    b"w:bookmarkEnd" if in_para && !in_run && !in_ppr => {
+                        let modeled = attr_val(&e, b"w:id").is_some_and(|id| toc_ids.contains(&id));
+                        if !modeled && let Some(frag) = slice_fragment(xml, prev_pos, here) {
+                            markup.marker(para_text.len() as u32, frag, &ns);
+                        }
+                    }
+                    n if in_para
+                        && !in_run
+                        && !in_ppr
+                        && n != b"w:bookmarkStart"
+                        && is_inline_marker(n) =>
+                    {
+                        if let Some(frag) = slice_fragment(xml, prev_pos, here) {
+                            markup.marker(para_text.len() as u32, frag, &ns);
+                        }
+                    }
+                    _ => {}
+                }
                 match name.as_ref() {
                     b"w:p" if at_block_level => {
                         /* Issue #120 — a self-closing `<w:p …/>` (an empty
@@ -1269,10 +1337,13 @@ pub fn parse_document_xml_with_warnings(
                             SpanStyle::default(),
                         );
                         let list_item = props.list_item;
+                        markup.open_paragraph(&e, &ns, end);
+                        let source_markup = markup.finish(0, &props, &None, list_item);
                         out_blocks.push(Block::Paragraph(Paragraph {
                             props,
                             list_item,
                             source_xml,
+                            source_markup,
                             body_xml: envelopes.take_before(),
                             ..Paragraph::default()
                         }));
@@ -1290,6 +1361,7 @@ pub fn parse_document_xml_with_warnings(
                             ..SectPrAccum::default()
                         };
                         if in_ppr {
+                            markup.note_sect_in_ppr();
                             pending_paragraph_sect = Some(taken);
                         } else {
                             let block_end = out_blocks.len() as u32;
@@ -1420,14 +1492,29 @@ pub fn parse_document_xml_with_warnings(
                         });
                     }
                     b"w:bookmarkStart" if in_tbl == 0 && p_start_byte.is_some() => {
-                        if let Some(name) = attr_val(&e, b"w:name")
-                            && engine::toc::is_toc_bookmark(&name)
-                            && !para_bookmarks.iter().any(|b| b.name == name)
+                        let raw_id = attr_val(&e, b"w:id");
+                        let toc = attr_val(&e, b"w:name")
+                            .filter(|name| engine::toc::is_toc_bookmark(name));
+                        if let Some(name) = toc {
+                            /* Modeled (issue #81): the writer re-emits the
+                            start AND its end from `Paragraph::bookmarks`. */
+                            if let Some(id) = &raw_id {
+                                toc_ids.insert(id.clone());
+                            }
+                            if !para_bookmarks.iter().any(|b| b.name == name) {
+                                para_bookmarks.push(engine::Bookmark {
+                                    name,
+                                    id: raw_id.and_then(|v| v.trim().parse().ok()),
+                                });
+                            }
+                        } else if !in_run
+                            && !in_ppr
+                            && let Some(frag) =
+                                slice_fragment(xml, prev_pos, reader.buffer_position() as usize)
                         {
-                            para_bookmarks.push(engine::Bookmark {
-                                name,
-                                id: attr_val(&e, b"w:id").and_then(|v| v.trim().parse().ok()),
-                            });
+                            /* Issues #199 / #106 — any other bookmark rides
+                            the regenerated paragraph as a marker. */
+                            markup.marker(para_text.len() as u32, frag, &ns);
                         }
                     }
                     b"w:commentRangeStart" => {
@@ -1576,6 +1663,20 @@ pub fn parse_document_xml_with_warnings(
                     envelopes.push_verbatim(frag);
                 }
             }
+            Event::Text(t)
+                if p_start_byte.is_some()
+                    && in_tbl == 0
+                    && !in_run
+                    && !in_ppr
+                    && t.iter().all(u8::is_ascii_whitespace) =>
+            {
+                /* Issues #199 / #106 — pretty-print whitespace between
+                paragraph children rides a regenerated paragraph. */
+                let end = reader.buffer_position() as usize;
+                if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                    markup.whitespace(para_text.len() as u32, frag);
+                }
+            }
             Event::Text(t) if in_instr_text && in_tbl == 0 => {
                 /* `<w:instrText>` content accumulates onto the innermost
                 open field's instruction buffer. The text may straddle
@@ -1657,8 +1758,18 @@ pub fn parse_document_xml_with_warnings(
                             }
                         }
                     }
-                    b"w:rPr" => in_rpr = false,
-                    b"w:pPr" => in_ppr = false,
+                    b"w:rPr" => {
+                        in_rpr = false;
+                        if in_run {
+                            markup.run_rpr_end(xml, reader.buffer_position() as usize, &ns);
+                        }
+                    }
+                    b"w:pPr" => {
+                        if in_ppr && !in_run && p_start_byte.is_some() {
+                            markup.close_ppr(xml, reader.buffer_position() as usize, &ns);
+                        }
+                        in_ppr = false;
+                    }
                     b"w:numPr" => in_num_pr = false,
                     b"w:pBdr" => in_pbdr = false,
                     b"w:tabs" => in_tabs = false,
@@ -1774,6 +1885,14 @@ pub fn parse_document_xml_with_warnings(
                         by the length of whichever run most recently closed. */
                         run_text.clear();
                         if start == end {
+                            /* Issues #199 / #106 — a text-less run with only
+                            unmodeled content survives as a marker. */
+                            markup.close_textless_run(
+                                xml,
+                                reader.buffer_position() as usize,
+                                start,
+                                &ns,
+                            );
                             /* Issue #120 — keep `prev_pos` current (the
                             loop's tail is skipped): the next event may be
                             a captured element whose slice starts here. */
@@ -1796,6 +1915,7 @@ pub fn parse_document_xml_with_warnings(
                             r_style_id.as_deref(),
                             direct_rpr.clone(),
                         );
+                        markup.close_text_run(start, end, &style);
                         if style != SpanStyle::default() {
                             match spans.last_mut() {
                                 Some(last) if last.end == start && last.style == style => {
@@ -1847,6 +1967,12 @@ pub fn parse_document_xml_with_warnings(
                             }),
                             (None, _) => props.list_item,
                         };
+                        let source_markup = markup.finish(
+                            para_text.len() as u32,
+                            &props,
+                            &style_id_for_paragraph,
+                            list_item,
+                        );
                         out_blocks.push(Block::Paragraph(Paragraph {
                             text: std::mem::take(&mut para_text),
                             spans: std::mem::take(&mut spans),
@@ -1874,6 +2000,7 @@ pub fn parse_document_xml_with_warnings(
                             since the previous block (bookmarks, an sdt
                             opener, whitespace) attaches before this one. */
                             body_xml: envelopes.take_before(),
+                            source_markup,
                         }));
                         envelopes.note_block_end(p_end_byte);
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this

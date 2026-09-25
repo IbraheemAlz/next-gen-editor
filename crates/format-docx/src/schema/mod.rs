@@ -11,6 +11,7 @@ pub mod ct_rpr;
 pub mod ct_tbl;
 pub mod drawing;
 pub mod grab_bag;
+pub mod source_markup;
 pub mod wp_anchor;
 
 /// WordprocessingML namespace.

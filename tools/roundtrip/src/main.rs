@@ -3817,6 +3817,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         }]),
     };
     vec![

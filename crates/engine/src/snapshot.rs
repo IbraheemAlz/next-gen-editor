@@ -452,6 +452,71 @@ mod tests {
         assert_eq!(encode(&d).unwrap(), bytes);
     }
 
+    /// Issues #199 / #106 — a paragraph's attribute-level grab bag and
+    /// source markup survive crash recovery byte-stably, and a paragraph
+    /// without one (every engine-authored paragraph) encodes exactly as
+    /// before (the field is skipped, so older snapshots read it as `None`).
+    #[test]
+    fn paragraph_source_markup_round_trips() {
+        use crate::{SourceAttr, SourceMarker, SourceMarkup, SourcePPr, SourceRun, SpanStyle};
+        let attr = |n: &str, v: &str| SourceAttr {
+            name: n.into(),
+            value: v.into(),
+        };
+        let mut doc = DocumentTree::from_text("Hello wrold");
+        let plain = encode(&doc).unwrap();
+        let markup = SourceMarkup {
+            text_len: 11,
+            attrs: vec![attr("w14:paraId", "1A2B3C4D"), attr("w:rsidR", "00A1B2C3")],
+            ppr: Some(SourcePPr {
+                xml: br#"<w:pPr><w:ind w:left="720"/></w:pPr>"#.to_vec(),
+                style_id: Some("Body".into()),
+                ..SourcePPr::default()
+            }),
+            runs: vec![SourceRun {
+                start: 6,
+                end: 11,
+                attrs: vec![attr("w:rsidR", "00445566")],
+                rpr: Some(br#"<w:rPr><w:u w:val="single" w:color="FF0000"/></w:rPr>"#.to_vec()),
+                style: SpanStyle {
+                    bold: Some(true),
+                    ..SpanStyle::default()
+                },
+                lead: b"<w:lastRenderedPageBreak/>".to_vec(),
+                t_attrs: Some(Vec::new()),
+            }],
+            markers: vec![SourceMarker {
+                at: 6,
+                xml: br#"<w:proofErr w:type="spellStart"/>"#.to_vec(),
+            }],
+        };
+        let Some(crate::Block::Paragraph(p)) = doc.blocks.get(0).cloned() else {
+            panic!("paragraph");
+        };
+        doc.blocks.set(
+            0,
+            crate::Block::Paragraph(crate::Paragraph {
+                source_markup: Some(Box::new(markup.clone())),
+                ..p
+            }),
+        );
+        let bytes = encode(&doc).unwrap();
+        assert_ne!(bytes, plain);
+        let back: Decoded<DocumentTree> = decode(&bytes).unwrap();
+        let p0 = back.payload.nth_paragraph(0).unwrap();
+        assert_eq!(p0.source_markup.as_deref(), Some(&markup));
+        assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
+        /* No markup: the pre-#199 encoding, and it decodes to `None`. */
+        let back: Decoded<DocumentTree> = decode(&plain).unwrap();
+        assert!(
+            back.payload
+                .nth_paragraph(0)
+                .unwrap()
+                .source_markup
+                .is_none()
+        );
+    }
+
     /// Issue #79 — the `<w:bidiVisual>` flag survives crash recovery.
     #[test]
     fn table_bidi_visual_round_trips() {

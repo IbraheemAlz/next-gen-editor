@@ -1407,6 +1407,310 @@ impl GrabBag {
     }
 }
 
+/// Issues #199 / #106 — one raw XML attribute captured from a source
+/// element the model reads only partially (`<w:p w:rsidR="…">`,
+/// `<w:r w:rsidRPr="…">`, `<w:t xml:space="preserve">`). `name` is the
+/// qualified name as written; `value` is the **escaped** source form, pasted
+/// back verbatim into a double-quoted attribute position by the writer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SourceAttr {
+    pub name: String,
+    pub value: String,
+}
+
+/// Issues #199 / #106 — the paragraph's own `<w:pPr>` as read, plus the
+/// model state it produced. The writer re-emits `xml` verbatim only while
+/// the paragraph's `props` / `style_id` / `list_item` still equal the
+/// recorded ones and it carries no section marker (a *verified*
+/// passthrough — any formatting edit falls back to regeneration). `xml`
+/// also carries the whitespace between the `<w:p>` start tag and the
+/// `<w:pPr>` of a pretty-printed part; it is empty for a source paragraph
+/// without a `<w:pPr>`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct SourcePPr {
+    #[serde(with = "serde_bytes")]
+    pub xml: Vec<u8>,
+    pub props: ParaProperties,
+    pub style_id: Option<String>,
+    pub list_item: Option<ListItem>,
+}
+
+/// Issues #199 / #106 — one source `<w:r>` covering the text bytes
+/// `[start, end)` of its paragraph.
+///
+/// - `attrs` — the `<w:r>` attributes (`w:rsidR`, `w:rsidRPr`, `w:rsidDel`,
+///   …), re-emitted on every regenerated run inside the range.
+/// - `rpr` — the raw `<w:rPr>…</w:rPr>`, re-emitted verbatim while the
+///   paragraph's style at the run still equals `style` (verified).
+/// - `lead` — unmodeled leading run content (`<w:lastRenderedPageBreak/>`),
+///   re-emitted in the range's first regenerated run.
+/// - `t_attrs` — the first `<w:t>`'s attributes (`None`: the run had no
+///   `<w:t>`), so a run Word wrote as a bare `<w:t>` does not grow an
+///   `xml:space="preserve"` unless its text now needs one.
+///
+/// Travel rule: the range follows the text like a style span, except that
+/// an insertion exactly at the run's END also extends it (typing at the end
+/// of a run continues that run, as in Word). A run split by an insertion or
+/// a style change therefore keeps its attributes on *every* regenerated
+/// piece — the inserted text included; the engine does not mint rsids.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceRun {
+    pub start: u32,
+    pub end: u32,
+    pub attrs: Vec<SourceAttr>,
+    #[serde(with = "serde_bytes")]
+    pub rpr: Option<Vec<u8>>,
+    pub style: SpanStyle,
+    #[serde(with = "serde_bytes")]
+    pub lead: Vec<u8>,
+    pub t_attrs: Option<Vec<SourceAttr>>,
+}
+
+/// Issues #199 / #106 — unmodeled in-paragraph markup at text offset `at`:
+/// `<w:proofErr/>`, a non-TOC `<w:bookmarkStart/>` / `<w:bookmarkEnd/>`,
+/// `<w:permStart/>`, a text-less run holding only unmodeled content, the
+/// whitespace of a pretty-printed part. Re-emitted verbatim between the
+/// regenerated runs at its offset.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SourceMarker {
+    pub at: u32,
+    #[serde(with = "serde_bytes")]
+    pub xml: Vec<u8>,
+}
+
+/// Issues #199 / #106 — attribute-level grab bag + in-paragraph source
+/// markup of a paragraph read from a `.docx`. The element-level grab bags
+/// of #84 ([`GrabBag`]) keep unmodeled `<w:pPr>` / `<w:rPr>` *children*;
+/// this keeps what they cannot: the attributes of `<w:p>` / `<w:r>` /
+/// `<w:t>`, the source `<w:pPr>` / `<w:rPr>` bytes (verified against the
+/// model before reuse, which also keeps the unread attributes of modeled
+/// children), the source run boundaries, and the in-paragraph markers.
+/// A clean paragraph never consults it (its `source_xml` passthrough
+/// wins); a regenerated one uses it to stay close to the source bytes.
+///
+/// `runs` / `markers` are byte-offset anchored and are remapped by the
+/// paragraph edit primitives (`insert_text`, `delete_text`, `split_at`,
+/// `concat`, inline-object splices). `text_len` is the paragraph text
+/// length they were last synced to: an edit path that does not remap them
+/// leaves it stale and the writer then ignores both (never misplaces them).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceMarkup {
+    pub text_len: u32,
+    /// `<w:p>` attributes, source order (`w14:paraId`, `w:rsidR`, …).
+    pub attrs: Vec<SourceAttr>,
+    pub ppr: Option<SourcePPr>,
+    pub runs: Vec<SourceRun>,
+    pub markers: Vec<SourceMarker>,
+}
+
+/// `<w:p>` attributes that identify ONE paragraph (unique per part). The
+/// second half of a split never inherits them.
+const PARAGRAPH_IDENTITY_ATTRS: [&str; 2] = ["w14:paraId", "w14:textId"];
+
+/// `text_len` of a [`SourceMarkup`] whose offsets can no longer be trusted.
+const STALE_TEXT_LEN: u32 = u32::MAX;
+
+impl SourceMarkup {
+    /// `true` while `runs` / `markers` are in sync with a paragraph text of
+    /// `len` bytes.
+    pub fn offsets_valid(&self, len: usize) -> bool {
+        self.text_len as usize == len
+    }
+
+    /// `len` bytes were inserted at `off` into a text that was `old_len`
+    /// bytes long. See [`SourceRun`] for the travel rule; markers at or
+    /// after `off` slide right.
+    pub fn note_insert(slot: &mut Option<Box<Self>>, old_len: u32, off: u32, len: u32) {
+        let Some(m) = slot.as_deref_mut() else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        if m.text_len != old_len {
+            m.text_len = STALE_TEXT_LEN;
+            return;
+        }
+        /* The run the insertion extends: the one ending at (or strictly
+        containing) `off`; at the paragraph start, the first run. */
+        let grow = m
+            .runs
+            .iter()
+            .position(|r| r.start < off && off <= r.end)
+            .or_else(|| {
+                (off == 0)
+                    .then(|| m.runs.iter().position(|r| r.start == 0))
+                    .flatten()
+            });
+        for (i, r) in m.runs.iter_mut().enumerate() {
+            if Some(i) == grow {
+                r.end += len;
+            } else if r.start >= off {
+                r.start += len;
+                r.end += len;
+            }
+        }
+        for mk in &mut m.markers {
+            if mk.at >= off {
+                mk.at += len;
+            }
+        }
+        m.text_len += len;
+    }
+
+    /// Bytes `[s, e)` were removed from a text that was `old_len` bytes
+    /// long. Runs clip (a fully deleted one disappears); markers inside the
+    /// gap collapse to `s`.
+    pub fn note_delete(slot: &mut Option<Box<Self>>, old_len: u32, s: u32, e: u32) {
+        let Some(m) = slot.as_deref_mut() else {
+            return;
+        };
+        if s >= e {
+            return;
+        }
+        if m.text_len != old_len {
+            m.text_len = STALE_TEXT_LEN;
+            return;
+        }
+        let gap = e - s;
+        let map = |p: u32| -> u32 {
+            if p <= s {
+                p
+            } else if p >= e {
+                p - gap
+            } else {
+                s
+            }
+        };
+        for r in &mut m.runs {
+            r.start = map(r.start);
+            r.end = map(r.end);
+        }
+        m.runs.retain(|r| r.start < r.end);
+        for mk in &mut m.markers {
+            mk.at = map(mk.at);
+        }
+        m.text_len -= gap;
+    }
+
+    /// Split for [`Paragraph::split_at`] at byte `at` of a text `old_len`
+    /// bytes long. The left half keeps the paragraph identity
+    /// (`w14:paraId` / `w14:textId`); the right half gets the remaining
+    /// attributes (rsids) only. Markers at the split point stay left.
+    pub fn split_at(
+        slot: &Option<Box<Self>>,
+        old_len: u32,
+        at: u32,
+    ) -> (Option<Box<Self>>, Option<Box<Self>>) {
+        let Some(m) = slot.as_deref() else {
+            return (None, None);
+        };
+        let valid = m.text_len == old_len;
+        let mut left = Self {
+            text_len: at,
+            attrs: m.attrs.clone(),
+            ppr: m.ppr.clone(),
+            runs: Vec::new(),
+            markers: Vec::new(),
+        };
+        let mut right = Self {
+            text_len: old_len - at,
+            attrs: m
+                .attrs
+                .iter()
+                .filter(|a| !PARAGRAPH_IDENTITY_ATTRS.contains(&a.name.as_str()))
+                .cloned()
+                .collect(),
+            ppr: m.ppr.clone(),
+            runs: Vec::new(),
+            markers: Vec::new(),
+        };
+        if valid {
+            for r in &m.runs {
+                if r.start < at {
+                    left.runs.push(SourceRun {
+                        end: r.end.min(at),
+                        ..r.clone()
+                    });
+                }
+                if r.end > at {
+                    right.runs.push(SourceRun {
+                        start: r.start.max(at) - at,
+                        end: r.end - at,
+                        ..r.clone()
+                    });
+                }
+            }
+            for mk in &m.markers {
+                if mk.at <= at {
+                    left.markers.push(mk.clone());
+                } else {
+                    right.markers.push(SourceMarker {
+                        at: mk.at - at,
+                        xml: mk.xml.clone(),
+                    });
+                }
+            }
+        } else {
+            /* Stale offsets: nothing offset-anchored can travel. */
+            left.text_len = STALE_TEXT_LEN;
+            right.text_len = STALE_TEXT_LEN;
+        }
+        (Some(Box::new(left)), Some(Box::new(right)))
+    }
+
+    /// Merge for [`Paragraph::concat`]: the head's attributes and `<w:pPr>`
+    /// record survive (the head keeps its paragraph identity); the tail's
+    /// runs and markers shift right by `head_len`.
+    pub fn concat(
+        head: &Option<Box<Self>>,
+        head_len: u32,
+        tail: &Option<Box<Self>>,
+        tail_len: u32,
+    ) -> Option<Box<Self>> {
+        if head.is_none() && tail.is_none() {
+            return None;
+        }
+        let empty = Self::default();
+        let h = head.as_deref().unwrap_or(&empty);
+        let t = tail.as_deref().unwrap_or(&empty);
+        let h_ok = head.is_none() || h.text_len == head_len;
+        let t_ok = tail.is_none() || t.text_len == tail_len;
+        let mut out = Self {
+            text_len: head_len + tail_len,
+            attrs: h.attrs.clone(),
+            ppr: h.ppr.clone(),
+            runs: Vec::new(),
+            markers: Vec::new(),
+        };
+        if !(h_ok && t_ok) {
+            out.text_len = STALE_TEXT_LEN;
+            return Some(Box::new(out));
+        }
+        out.runs.extend(h.runs.iter().cloned());
+        out.markers.extend(h.markers.iter().cloned());
+        for r in &t.runs {
+            out.runs.push(SourceRun {
+                start: r.start + head_len,
+                end: r.end + head_len,
+                ..r.clone()
+            });
+        }
+        for mk in &t.markers {
+            out.markers.push(SourceMarker {
+                at: mk.at + head_len,
+                xml: mk.xml.clone(),
+            });
+        }
+        Some(Box::new(out))
+    }
+}
+
 /// Issue #120 — one piece of block-level (`<w:body>` / `<w:tc>` child)
 /// markup that is not a paragraph or a table and that the typed model does
 /// not represent: a `<w:bookmarkStart/>` between two paragraphs, a
@@ -2736,6 +3040,11 @@ pub struct Paragraph {
     /// emits it around the paragraph whether the paragraph is clean or
     /// regenerated.
     pub body_xml: Option<Box<BodyPassthrough>>,
+    /// Issues #199 / #106 — attribute-level grab bag and in-paragraph
+    /// source markup (see [`SourceMarkup`]); `None` for engine-synthesized
+    /// paragraphs. Boxed: `Paragraph` clones constantly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_markup: Option<Box<SourceMarkup>>,
 }
 
 /// Issue #81 — one paragraph-scoped bookmark. `id` is the source
@@ -2830,6 +3139,9 @@ impl Paragraph {
             section_end: self.section_end.clone(),
             bookmarks: self.bookmarks.clone(),
             body_xml: self.body_xml.clone(),
+            /* Issues #199 / #106 — no offset moves; the writer verifies
+            each run's recorded `<w:rPr>` against the new style. */
+            source_markup: self.source_markup.clone(),
         }
     }
 
@@ -2887,6 +3199,8 @@ impl Paragraph {
         let mut text = self.text.clone();
         text.replace_range(s as usize..e as usize, "");
         let gap = e - s;
+        let mut markup = self.source_markup.clone();
+        SourceMarkup::note_delete(&mut markup, self.text.len() as u32, s, e);
         /* Map a pre-delete offset to its post-delete position. */
         let map = |p: u32| -> u32 {
             if p <= s {
@@ -3010,12 +3324,15 @@ impl Paragraph {
             section_end: self.section_end.clone(),
             bookmarks: self.bookmarks.clone(),
             body_xml: self.body_xml.clone(),
+            source_markup: markup,
         }
     }
 
     /// Split into `[0, at)` and `[at, len)`. Spans straddling `at` are split.
     pub fn split_at(&self, at: u32) -> (Paragraph, Paragraph) {
         let at = self.snap_offset(at);
+        let (markup_left, markup_right) =
+            SourceMarkup::split_at(&self.source_markup, self.text.len() as u32, at);
         let mut left = Vec::new();
         let mut right = Vec::new();
         for run in &self.spans {
@@ -3118,6 +3435,7 @@ impl Paragraph {
                 left half, the trailing markup moves right with the mark:
                 a content control wrapping the paragraph wraps both halves. */
                 body_xml: BodyPassthrough::before_only(&self.body_xml),
+                source_markup: markup_left,
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -3139,6 +3457,7 @@ impl Paragraph {
                 section_end: self.section_end.clone(),
                 bookmarks: Vec::new(),
                 body_xml: BodyPassthrough::after_only(&self.body_xml),
+                source_markup: markup_right,
             },
         )
     }
@@ -3222,6 +3541,12 @@ impl Paragraph {
             markup, so a content control wrapping both still wraps the
             merge. */
             body_xml: BodyPassthrough::merged(&self.body_xml, &other.body_xml),
+            source_markup: SourceMarkup::concat(
+                &self.source_markup,
+                self.text.len() as u32,
+                &other.source_markup,
+                other.text.len() as u32,
+            ),
         }
     }
 
@@ -4019,6 +4344,7 @@ impl DocumentTree {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         }));
         Self {
             blocks,
@@ -4070,6 +4396,7 @@ impl DocumentTree {
                 section_end: None,
                 bookmarks: Vec::new(),
                 body_xml: None,
+                source_markup: None,
             }));
         }
         Self {
@@ -5415,6 +5742,7 @@ impl DocumentTree {
                 section_end: None,
                 bookmarks: Vec::new(),
                 body_xml: None,
+                source_markup: None,
             }));
             return Self {
                 blocks,
@@ -5455,7 +5783,15 @@ impl DocumentTree {
         let off = at.offset;
         let mutated = mutate_paragraph_in_top(&mut blocks, &target, |para| {
             let offset = para.snap_offset(off) as usize;
+            let old_len = para.text.len() as u32;
             para.text.insert_str(offset, text);
+            /* Issues #199 / #106 — source runs / markers travel too. */
+            SourceMarkup::note_insert(
+                &mut para.source_markup,
+                old_len,
+                offset as u32,
+                text.len() as u32,
+            );
             /* Shift styled spans across the insertion point — a span
             containing the point grows, spans wholly after it slide right. */
             let off = offset as u32;
@@ -9235,6 +9571,15 @@ fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u
         shift(&mut f.end);
     }
     para.fields.retain(|f| f.start < f.end);
+    /* Issues #199 / #106 — the text itself was already sliced by the
+    caller, so the pre-edit length is the current one plus the gap. */
+    let now = para.text.len() as u32;
+    SourceMarkup::note_delete(
+        &mut para.source_markup,
+        now + removed_len,
+        from,
+        from + removed_len,
+    );
 }
 
 /// Phase 3 (#40) — clipboard fragments are never section-marker
@@ -9247,6 +9592,9 @@ fn strip_section_marker(mut p: Paragraph) -> Paragraph {
     /* Issue #120 — a clipboard fragment never transplants the block-level
     envelope markup (a content control's `<w:sdt>`, a bookmark) either. */
     p.body_xml = None;
+    /* Issues #199 / #106 — nor the source paragraph's identity
+    (`w14:paraId`) and rsids: a pasted copy is a new paragraph. */
+    p.source_markup = None;
     p
 }
 
@@ -9264,8 +9612,10 @@ fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) {
     let sentinel_len = SENTINEL.len_utf8() as u32;
     /* Issue #115 — the crate's single offset policy (module docs). */
     let offset = para.snap_offset(offset) as usize;
+    let old_len = para.text.len() as u32;
     para.text.insert(offset, SENTINEL);
     let off = offset as u32;
+    SourceMarkup::note_insert(&mut para.source_markup, old_len, off, sentinel_len);
     for s in &mut para.spans {
         if s.start >= off {
             s.start += sentinel_len;
@@ -11675,6 +12025,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -11704,6 +12055,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -11730,6 +12082,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -11834,6 +12187,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -11874,6 +12228,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -12371,6 +12726,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -12417,6 +12773,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -12462,6 +12819,7 @@ mod tests {
                 section_end: None,
                 bookmarks: Vec::new(),
                 body_xml: None,
+                source_markup: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -12485,6 +12843,7 @@ mod tests {
                 section_end: None,
                 bookmarks: Vec::new(),
                 body_xml: None,
+                source_markup: None,
             },
         ];
         let (out, caret) = doc.insert_rich(
@@ -14377,5 +14736,148 @@ mod wire_validation_tests {
         let _ = hollow.merge_cells(BlockPath::top(0), 0, 0, 1, 1);
         let _ = hollow.merge_cells(BlockPath::top(0), 1, 0, 0, 1);
         let _ = hollow.merge_cells(BlockPath::top(0), 1, 5, 1, 9);
+    }
+}
+
+/// Issues #199 / #106 — the travel rules of [`SourceMarkup`].
+#[cfg(test)]
+mod source_markup_tests {
+    use super::*;
+
+    fn run(start: u32, end: u32, rsid: &str) -> SourceRun {
+        SourceRun {
+            start,
+            end,
+            attrs: vec![SourceAttr {
+                name: "w:rsidR".into(),
+                value: rsid.into(),
+            }],
+            ..SourceRun::default()
+        }
+    }
+
+    fn marker(at: u32) -> SourceMarker {
+        SourceMarker {
+            at,
+            xml: b"<w:proofErr/>".to_vec(),
+        }
+    }
+
+    /// "Hello " [0,6) + "world" [6,11), a marker at 6 and one at the end.
+    fn para() -> Paragraph {
+        Paragraph {
+            text: "Hello world".into(),
+            source_markup: Some(Box::new(SourceMarkup {
+                text_len: 11,
+                attrs: vec![
+                    SourceAttr {
+                        name: "w14:paraId".into(),
+                        value: "1A2B3C4D".into(),
+                    },
+                    SourceAttr {
+                        name: "w:rsidR".into(),
+                        value: "00A1".into(),
+                    },
+                ],
+                ppr: None,
+                runs: vec![run(0, 6, "01"), run(6, 11, "02")],
+                markers: vec![marker(6), marker(11)],
+            })),
+            ..Paragraph::default()
+        }
+    }
+
+    fn markup(p: &Paragraph) -> &SourceMarkup {
+        p.source_markup.as_deref().unwrap()
+    }
+
+    fn ranges(m: &SourceMarkup) -> Vec<(u32, u32)> {
+        m.runs.iter().map(|r| (r.start, r.end)).collect()
+    }
+
+    #[test]
+    fn insert_extends_the_run_it_ends_or_lands_in() {
+        let doc = DocumentTree {
+            blocks: vec![Block::Paragraph(para())].into(),
+            ..DocumentTree::default()
+        };
+        let pos = |o| LogicalPos {
+            path: BlockPath::top(0),
+            offset: o,
+        };
+        /* At a run boundary: the run ending there grows, the next shifts. */
+        let d = doc.insert_text(pos(6), "XY");
+        let m = markup(d.nth_paragraph(0).unwrap());
+        assert_eq!(ranges(m), vec![(0, 8), (8, 13)]);
+        assert_eq!(m.markers[0].at, 8);
+        assert_eq!(m.text_len, 13);
+        /* At the paragraph end: the last run continues. */
+        let d = doc.insert_text(pos(11), "!");
+        let m = markup(d.nth_paragraph(0).unwrap());
+        assert_eq!(ranges(m), vec![(0, 6), (6, 12)]);
+        assert_eq!(m.markers[1].at, 12);
+        /* At the paragraph start: the first run. */
+        let d = doc.insert_text(pos(0), ">");
+        assert_eq!(
+            ranges(markup(d.nth_paragraph(0).unwrap())),
+            vec![(0, 7), (7, 12)]
+        );
+    }
+
+    #[test]
+    fn delete_clips_runs_and_collapses_markers() {
+        let p = para().delete_text(4, 8);
+        let m = markup(&p);
+        assert_eq!(ranges(m), vec![(0, 4), (4, 7)]);
+        assert_eq!(m.markers[0].at, 4);
+        assert_eq!(m.text_len, 7);
+        assert!(m.offsets_valid(p.text.len()));
+        /* Deleting a whole run drops it. */
+        let p = para().delete_text(6, 11);
+        assert_eq!(ranges(markup(&p)), vec![(0, 6)]);
+    }
+
+    #[test]
+    fn split_keeps_identity_left_and_rsids_on_both_halves() {
+        let (l, r) = para().split_at(8);
+        let (ml, mr) = (markup(&l), markup(&r));
+        assert_eq!(ranges(ml), vec![(0, 6), (6, 8)]);
+        assert_eq!(ranges(mr), vec![(0, 3)]);
+        assert_eq!(ml.runs[1].attrs, mr.runs[0].attrs, "split run: both halves");
+        assert!(ml.attrs.iter().any(|a| a.name == "w14:paraId"));
+        assert!(!mr.attrs.iter().any(|a| a.name == "w14:paraId"));
+        assert!(mr.attrs.iter().any(|a| a.name == "w:rsidR"));
+        assert_eq!(ml.markers.len(), 1);
+        assert_eq!(mr.markers[0].at, 3);
+        assert!(ml.offsets_valid(l.text.len()) && mr.offsets_valid(r.text.len()));
+    }
+
+    #[test]
+    fn concat_shifts_the_tail_and_keeps_the_head_identity() {
+        let (l, r) = para().split_at(8);
+        let joined = l.concat(&r);
+        let m = markup(&joined);
+        assert_eq!(ranges(m), vec![(0, 6), (6, 8), (8, 11)]);
+        assert_eq!(
+            m.markers.iter().map(|k| k.at).collect::<Vec<_>>(),
+            vec![6, 11]
+        );
+        assert!(m.attrs.iter().any(|a| a.name == "w14:paraId"));
+        assert!(m.offsets_valid(joined.text.len()));
+    }
+
+    #[test]
+    fn an_unaware_text_edit_goes_stale_instead_of_misplacing() {
+        let mut p = para();
+        p.text.push_str(" more");
+        assert!(!markup(&p).offsets_valid(p.text.len()));
+        /* A later remap keeps it stale. */
+        let q = p.delete_text(0, 1);
+        assert!(!markup(&q).offsets_valid(q.text.len()));
+    }
+
+    #[test]
+    fn clipboard_fragments_drop_the_markup() {
+        assert!(strip_section_marker(para()).source_markup.is_none());
     }
 }

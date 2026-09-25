@@ -16407,6 +16407,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -16559,6 +16560,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -16596,6 +16598,7 @@ mod tests {
             section_end: None,
             bookmarks: Vec::new(),
             body_xml: None,
+            source_markup: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -17747,6 +17750,7 @@ mod tests {
                 section_end: None,
                 bookmarks: Vec::new(),
                 body_xml: None,
+                source_markup: None,
             })],
         }
     }
