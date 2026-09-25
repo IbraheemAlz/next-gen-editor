@@ -650,6 +650,10 @@ fn resolve_hyperlinks_block(
                 .hyperlinks
                 .into_iter()
                 .filter_map(|h| {
+                    /* Issue #81 — internal anchors carry no relationship. */
+                    if h.target.starts_with('#') {
+                        return Some(h);
+                    }
                     rels.get(&h.target).map(|url| engine::Hyperlink {
                         start: h.start,
                         end: h.end,

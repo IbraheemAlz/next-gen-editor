@@ -175,6 +175,14 @@ pub fn apply_ppr(name: &[u8], e: &BytesStart, props: &mut ParaProperties) {
         b"w:keepNext" => props.keep_next = toggle_on(e),
         b"w:keepLines" => props.keep_lines = toggle_on(e),
         b"w:pageBreakBefore" => props.page_break_before = toggle_on(e),
+        /* Issue #81 — read-only (see `ParaProperties::outline_level`):
+        styles.xml feeds the TOC heading cascade; a direct one also
+        rides the grab bag verbatim. */
+        b"w:outlineLvl" => {
+            props.outline_level = attr_val(e, b"w:val")
+                .and_then(|v| v.trim().parse::<u8>().ok())
+                .filter(|l| *l <= 9);
+        }
         _ => {}
     }
 }

@@ -46,6 +46,7 @@ import type {
     SectionBreakKind,
     HeaderFooterArea,
     FieldKind,
+    TocSwitches,
     ListKind,
     BridgeStyleProperties,
 } from './types';
@@ -271,6 +272,14 @@ export interface EditorCommands {
      *  update (Word parity). `at` defaults to the live caret; pass
      *  `fieldAtCaret().end` to address a field explicitly. */
     setFieldInstruction(instruction: string, at?: LogicalPos): Promise<Event>;
+    /** Issue #81 — insert a Table of Contents at the caret (a top-level
+     *  body paragraph; the engine rejects table cells, header / footer /
+     *  note stories and carets inside an existing TOC with
+     *  `Event::Error`). The entries are generated immediately from the
+     *  document's headings with live page numbers; `updateFields()` (F9)
+     *  regenerates them. Unset switches take Word's defaults
+     *  (`TOC \o "1-3" \h \z \u`). */
+    insertToc(switches?: Partial<TocSwitches>, at?: LogicalPos): Promise<Event>;
     /** Issue #80 — author a footnote referenced at the caret (body
      *  paragraphs only; the engine rejects table cells and story
      *  carets with `Event::Error`). The engine splices the reference,
@@ -628,6 +637,12 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 at: at ?? currentCaret(),
                 instruction,
             }),
+        insertToc: (switches, at) =>
+            dispatch({
+                type: 'INSERT_TOC',
+                at: at ?? currentCaret(),
+                switches: { ...DEFAULT_TOC_SWITCHES, ...switches },
+            }),
         insertFootnote: (at) =>
             dispatch({ type: 'INSERT_FOOTNOTE', at: at ?? currentCaret() }),
         insertEndnote: (at) =>
@@ -805,6 +820,17 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
  * selection. Components that also need to read state should call
  * `createEditorState()` themselves — subscriptions are cheap.
  */
+/** Issue #81 — Word's Insert › Table of Contents defaults
+ *  (`TOC \o "1-3" \h \z \u`), merged under `insertToc`'s overrides. */
+export const DEFAULT_TOC_SWITCHES: TocSwitches = {
+    outline_min: 1,
+    outline_max: 3,
+    hyperlinks: true,
+    hide_in_web: true,
+    use_outline_levels: true,
+    page_numbers: true,
+};
+
 export function createEditorCommands(): EditorCommands {
     const engine = useEngine();
     const state = createEditorState();

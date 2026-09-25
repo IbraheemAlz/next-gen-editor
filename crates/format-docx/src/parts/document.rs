@@ -86,6 +86,21 @@ struct FieldBuilder {
     /// `separate` fires). `None` while still in the begin → separate
     /// phase. Used as the field overlay's `start` on close.
     cached_start: Option<u32>,
+    /// Issue #81 — `(top-level block index, inside a table)` of the
+    /// paragraph `separate` fired in. An `end` in a LATER top-level
+    /// paragraph makes this a multi-paragraph field (a TOC): the Head
+    /// overlay is stamped back onto that paragraph, the Tail onto the
+    /// current one.
+    cached_block: Option<(usize, bool)>,
+}
+
+/// Issue #81 — where the fldChar machine is in the block stream.
+struct FieldCursor<'a> {
+    para_text: &'a str,
+    run_text: &'a str,
+    /// Index the paragraph being parsed will take in `out_blocks`.
+    block_idx: usize,
+    in_table: bool,
 }
 
 /// Apply one `<w:fldChar>` event to the field state machine.
@@ -106,29 +121,82 @@ struct FieldBuilder {
 fn handle_fld_char(
     e: &BytesStart<'_>,
     stack: &mut Vec<FieldBuilder>,
-    para_text: &str,
-    run_text: &str,
+    cur: FieldCursor<'_>,
     out_fields: &mut Vec<engine::Field>,
+    out_blocks: &mut [Block],
 ) {
     let kind = attr_val(e, b"w:fldCharType").unwrap_or_default();
+    let here = (cur.para_text.len() + cur.run_text.len()) as u32;
     match kind.trim() {
         "begin" => stack.push(FieldBuilder::default()),
         "separate" => {
             if let Some(top) = stack.last_mut() {
-                top.cached_start = Some((para_text.len() + run_text.len()) as u32);
+                top.cached_start = Some(here);
+                top.cached_block = Some((cur.block_idx, cur.in_table));
             }
         }
         "end" => {
             if let Some(top) = stack.pop()
                 && let Some(start) = top.cached_start
             {
-                let end = (para_text.len() + run_text.len()) as u32;
+                let end = here;
                 let instruction = top.instruction.trim().to_string();
+                /* Issue #81 — a result that crossed into a later top-level
+                paragraph: Head on the separate's paragraph (already
+                emitted), Tail here. Tables on either end keep the pre-#81
+                behaviour (no overlay — the bytes ride the passthrough). */
+                if let Some((b, in_table)) = top.cached_block
+                    && b < cur.block_idx
+                {
+                    if !in_table
+                        && !cur.in_table
+                        && !instruction.is_empty()
+                        && let Some(Block::Paragraph(p)) = out_blocks.get_mut(b)
+                    {
+                        let len = p.text.len() as u32;
+                        p.fields.push(engine::Field {
+                            start: start.min(len),
+                            end: len,
+                            instruction,
+                            span: Some(engine::FieldSpan::Head),
+                        });
+                        out_fields.push(engine::Field {
+                            start: 0,
+                            end,
+                            instruction: String::new(),
+                            span: Some(engine::FieldSpan::Tail),
+                        });
+                    }
+                    return;
+                }
+                /* Issue #81 — a TOC is ALWAYS the multi-paragraph shape,
+                even when its whole result fits one paragraph, so the
+                region / regeneration machinery sees every TOC. */
+                if !instruction.is_empty()
+                    && engine::FieldInstruction::parse(&instruction).keyword == "TOC"
+                    && !cur.in_table
+                {
+                    let len = end.max(start);
+                    out_fields.push(engine::Field {
+                        start,
+                        end: len,
+                        instruction,
+                        span: Some(engine::FieldSpan::Head),
+                    });
+                    out_fields.push(engine::Field {
+                        start: 0,
+                        end,
+                        instruction: String::new(),
+                        span: Some(engine::FieldSpan::Tail),
+                    });
+                    return;
+                }
                 if end > start && !instruction.is_empty() {
                     out_fields.push(engine::Field {
                         start,
                         end,
                         instruction,
+                        span: None,
                     });
                 }
             }
@@ -199,6 +267,10 @@ pub(crate) fn parse_tab_stop(e: &quick_xml::events::BytesStart) -> Option<engine
     Some(engine::TabStop {
         position_pt: (pos_twips as f32) / 20.0,
         kind,
+        /* Issue #81 — `w:leader` (TOC dot leaders). */
+        leader: attr_val(e, b"w:leader")
+            .map(|v| engine::TabLeader::from_ooxml(&v))
+            .unwrap_or_default(),
     })
 }
 
@@ -444,6 +516,8 @@ pub fn parse_document_xml_with_warnings(
     let mut para_hyperlinks: Vec<engine::Hyperlink> = Vec::new();
     let mut para_revisions: Vec<engine::Revision> = Vec::new();
     let mut para_fields: Vec<engine::Field> = Vec::new();
+    /* Issue #81 — `_Toc*` bookmarks opened inside the current paragraph. */
+    let mut para_bookmarks: Vec<engine::Bookmark> = Vec::new();
 
     /* Phase 2 audit (gap D.1) — complex-field state machine. A field
     is the triplet `<w:fldChar fldCharType="begin">` ...
@@ -764,10 +838,15 @@ pub fn parse_document_xml_with_warnings(
                         cur_drawing_rel_id = attr_val(&e, b"r:embed");
                     }
                     b"w:hyperlink" => {
-                        if let Some(rid) = attr_val(&e, b"r:id") {
-                            let start = (para_text.len() + run_text.len()) as u32;
-                            hyperlink_stack.push((rid, start));
-                        }
+                        let start = (para_text.len() + run_text.len()) as u32;
+                        /* Issue #81 — an internal `w:anchor` link (a TOC
+                        entry) rides as a `#name` target; a link with
+                        neither pushes an empty marker so its end tag
+                        pops the right entry. */
+                        let target = attr_val(&e, b"r:id")
+                            .or_else(|| attr_val(&e, b"w:anchor").map(|a| format!("#{a}")))
+                            .unwrap_or_default();
+                        hyperlink_stack.push((target, start));
                     }
                     b"w:t" => in_text_elt = true,
                     b"w:delText" => in_del_text_elt = true,
@@ -780,9 +859,14 @@ pub fn parse_document_xml_with_warnings(
                         handle_fld_char(
                             &e,
                             &mut field_stack,
-                            &para_text,
-                            &run_text,
+                            FieldCursor {
+                                para_text: &para_text,
+                                run_text: &run_text,
+                                block_idx: out_blocks.len(),
+                                in_table: in_tbl > 0,
+                            },
                             &mut para_fields,
+                            &mut out_blocks,
                         );
                     }
                     b"w:fldSimple" => {
@@ -984,6 +1068,17 @@ pub fn parse_document_xml_with_warnings(
                             anchor: None,
                         });
                     }
+                    b"w:bookmarkStart" if in_tbl == 0 && p_start_byte.is_some() => {
+                        if let Some(name) = attr_val(&e, b"w:name")
+                            && engine::toc::is_toc_bookmark(&name)
+                            && !para_bookmarks.iter().any(|b| b.name == name)
+                        {
+                            para_bookmarks.push(engine::Bookmark {
+                                name,
+                                id: attr_val(&e, b"w:id").and_then(|v| v.trim().parse().ok()),
+                            });
+                        }
+                    }
                     b"w:commentRangeStart" => {
                         if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok()) {
                             let block_idx = out_blocks.len() as u32;
@@ -1020,9 +1115,14 @@ pub fn parse_document_xml_with_warnings(
                         handle_fld_char(
                             &e,
                             &mut field_stack,
-                            &para_text,
-                            &run_text,
+                            FieldCursor {
+                                para_text: &para_text,
+                                run_text: &run_text,
+                                block_idx: out_blocks.len(),
+                                in_table: in_tbl > 0,
+                            },
                             &mut para_fields,
+                            &mut out_blocks,
                         );
                     }
                     b"w:rPr" if in_ppr && !in_run => {
@@ -1062,6 +1162,11 @@ pub fn parse_document_xml_with_warnings(
                         /* Issue #84 — unmodeled `<w:pPr>` leaf child
                         (`<w:framePr>`, `<w:cnfStyle>`, `<w:widowControl>`,
                         `<w:outlineLvl>`, …) → the paragraph's grab bag. */
+                        if n == b"w:outlineLvl" {
+                            /* Issue #81 — also read it (TOC `\u`); the
+                            grab bag stays the writer's source. */
+                            apply_ppr(n, &e, &mut direct_ppr);
+                        }
                         let end = reader.buffer_position() as usize;
                         if let Some(frag) = slice_fragment(xml, prev_pos, end) {
                             stash(&mut direct_ppr.grab_bag, frag, &ns);
@@ -1254,6 +1359,7 @@ pub fn parse_document_xml_with_warnings(
                                     start,
                                     end,
                                     instruction: instr,
+                                    span: None,
                                 });
                             }
                         }
@@ -1261,7 +1367,7 @@ pub fn parse_document_xml_with_warnings(
                     b"w:hyperlink" => {
                         if let Some((target, start)) = hyperlink_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
-                            if end > start {
+                            if end > start && !target.is_empty() {
                                 para_hyperlinks.push(engine::Hyperlink { start, end, target });
                             }
                         }
@@ -1416,6 +1522,7 @@ pub fn parse_document_xml_with_warnings(
                             parser keeps emitting range-stamped `Section`s
                             below. */
                             section_end: None,
+                            bookmarks: std::mem::take(&mut para_bookmarks),
                         }));
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this
                         paragraph. Emit a `Section` covering everything since

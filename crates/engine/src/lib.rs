@@ -11,10 +11,12 @@ pub mod html;
 pub mod numbering;
 pub mod snapshot;
 
+pub mod toc;
 pub use fields::{
-    FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TypedField,
-    render_date_time_picture,
+    FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TocSwitches,
+    TypedField, render_date_time_picture,
 };
+pub use toc::{TocEntry, TocHeading};
 
 /// Top-level document block (Phase 5 PR 1). Tables sit alongside
 /// paragraphs in the body; future block variants (Phase 7 floating
@@ -1678,9 +1680,44 @@ pub struct Field {
     /// surrounding whitespace; switches like `\* MERGEFORMAT` are
     /// preserved (the evaluator parses the leading keyword).
     pub instruction: String,
+    /// Issue #81 — `Some` when this overlay is one END of a field whose
+    /// result runs across several paragraphs (a TOC). See [`FieldSpan`].
+    /// `None` = the ordinary paragraph-local field (#43 / #77).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<FieldSpan>,
+}
+
+/// Issue #81 — the multi-paragraph field representation. OOXML lets a
+/// complex field's result run across paragraphs (Word writes a TOC as
+/// `begin` + instruction + `separate` in the FIRST entry paragraph and
+/// `end` in the LAST); the engine models it as a matched pair of
+/// overlays on sibling top-level body paragraphs:
+///
+/// - [`FieldSpan::Head`] on the first paragraph: `start` is the `begin`
+///   offset, `end` is that paragraph's text length, `instruction` is
+///   the field code.
+/// - [`FieldSpan::Tail`] on the last paragraph: `start` is 0, `end` is
+///   the `end` offset (may be 0 — Word often closes a TOC in an empty
+///   paragraph), `instruction` is empty.
+///
+/// Every paragraph between them belongs to the result. The pair is
+/// matched by document order (a Head claims the NEXT Tail among the
+/// following siblings), so structural edits inside the result (Enter,
+/// merges) keep the region intact without any index side table; an
+/// orphan end degrades to a one-paragraph region, never to data loss.
+/// Span overlays are NOT caret-atomic (Word lets you edit TOC text).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldSpan {
+    Head,
+    Tail,
 }
 
 impl Field {
+    /// `true` for a paragraph-local field (the caret-atomic kind).
+    pub fn is_local(&self) -> bool {
+        self.span.is_none()
+    }
+
     /// Extract the leading keyword from `instruction` — the part Word
     /// uses to dispatch field types. `"PAGE \* MERGEFORMAT"` → `"PAGE"`;
     /// `"DATE"` → `"DATE"`. Returns an uppercase owned `String` so
@@ -1860,6 +1897,53 @@ pub enum LineHeight {
 pub struct TabStop {
     pub position_pt: f32,
     pub kind: TabKind,
+    /// Issue #81 — `<w:tab w:leader>` fill character drawn across the
+    /// tab's advance (TOC dot leaders). `None` for the default.
+    #[serde(skip_serializing_if = "TabLeader::is_none")]
+    pub leader: TabLeader,
+}
+
+/// Issue #81 — `<w:tab w:leader>` (ST_TabTlc). The layout records the
+/// advance a leadered tab covers; the renderer fills it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum TabLeader {
+    #[default]
+    None,
+    Dot,
+    Hyphen,
+    Underscore,
+    Heavy,
+    MiddleDot,
+}
+
+impl TabLeader {
+    pub fn is_none(&self) -> bool {
+        matches!(self, TabLeader::None)
+    }
+
+    /// OOXML `w:leader` token (`None` → `"none"`).
+    pub fn as_ooxml(self) -> &'static str {
+        match self {
+            TabLeader::None => "none",
+            TabLeader::Dot => "dot",
+            TabLeader::Hyphen => "hyphen",
+            TabLeader::Underscore => "underscore",
+            TabLeader::Heavy => "heavy",
+            TabLeader::MiddleDot => "middleDot",
+        }
+    }
+
+    /// Parse an OOXML `w:leader` token; unknown → `None`.
+    pub fn from_ooxml(v: &str) -> Self {
+        match v.trim() {
+            "dot" => TabLeader::Dot,
+            "hyphen" => TabLeader::Hyphen,
+            "underscore" => TabLeader::Underscore,
+            "heavy" => TabLeader::Heavy,
+            "middleDot" => TabLeader::MiddleDot,
+            _ => TabLeader::None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1918,6 +2002,13 @@ pub struct ParaProperties {
     /// [`GrabBag`]. Rides `Paragraph::direct_overrides` as well as the
     /// resolved `props` so a style re-cascade keeps it.
     pub grab_bag: Option<Box<GrabBag>>,
+    /// Issue #81 — `<w:outlineLvl w:val>` (0-based; 9 = body text),
+    /// read from styles.xml and from the direct `<w:pPr>`. READ-ONLY on
+    /// the model: the direct element still rides the grab bag verbatim
+    /// (the writer never regenerates it), so modelling it cannot drift
+    /// a round-trip. The TOC heading collector reads the resolved value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_level: Option<u8>,
 }
 
 impl ParaProperties {
@@ -1970,6 +2061,7 @@ impl ParaProperties {
             property: the direct `<w:pPr>` (patch) contributes its own;
             style sources never carry one, so nothing leaks downward. */
             grab_bag: patch.grab_bag.or(self.grab_bag),
+            outline_level: patch.outline_level.or(self.outline_level),
         }
     }
 }
@@ -2074,6 +2166,25 @@ pub struct Paragraph {
     /// - clipboard fragments (`slice` / `slice_blocks`) always CLEAR
     ///   it — pasting must never transplant a section break.
     pub section_end: Option<Box<SectionProps>>,
+    /// Issue #81 — paragraph-scoped bookmarks (`<w:bookmarkStart>` …
+    /// `<w:bookmarkEnd>` around the paragraph content). Modelled only
+    /// for the TOC's `_Toc*` heading anchors (the target of a `\h`
+    /// entry's `<w:hyperlink w:anchor>`); other bookmarks keep riding
+    /// `source_xml` untouched.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bookmarks: Vec<Bookmark>,
+}
+
+/// Issue #81 — one paragraph-scoped bookmark. `id` is the source
+/// `w:id` when the bookmark was read from a file (kept so a dirty
+/// re-serialization does not renumber it); engine-stamped bookmarks
+/// carry `None` and the writer derives a stable id from the name.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct Bookmark {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u32>,
 }
 
 impl Paragraph {
@@ -2154,6 +2265,7 @@ impl Paragraph {
             /* Phase 3 (#40) — not offset-anchored; formatting a marker
             paragraph must never dissolve its section break. */
             section_end: self.section_end.clone(),
+            bookmarks: self.bookmarks.clone(),
         }
     }
 
@@ -2239,19 +2351,39 @@ impl Paragraph {
         inline-object remapping stays out of scope (issue #56). */
         let mut fields = Vec::new();
         for f in &self.fields {
-            if f.end <= s {
+            if !f.is_local() {
+                /* Issue #81 — a multi-paragraph field end is a POINT
+                (Head: its `begin` at `start`; Tail: its `end` at `end`),
+                not an atom: it survives every edit, clamped into the
+                gap's start when the gap swallowed it. */
+                let map = |o: u32| {
+                    if o >= e {
+                        o - gap
+                    } else if o > s {
+                        s
+                    } else {
+                        o
+                    }
+                };
+                let (ns, ne) = (map(f.start), map(f.end));
+                fields.push(Field {
+                    start: ns,
+                    end: ne.max(ns),
+                    ..f.clone()
+                });
+            } else if f.end <= s {
                 fields.push(f.clone());
             } else if f.start >= e {
                 fields.push(Field {
                     start: f.start - gap,
                     end: f.end - gap,
-                    instruction: f.instruction.clone(),
+                    ..f.clone()
                 });
             } else if f.start <= s && f.end >= e {
                 let nf = Field {
                     start: f.start,
                     end: f.end - gap,
-                    instruction: f.instruction.clone(),
+                    ..f.clone()
                 };
                 if nf.start < nf.end {
                     fields.push(nf);
@@ -2309,6 +2441,7 @@ impl Paragraph {
             marker has no byte offsets and the paragraph mark survives
             an in-paragraph character deletion. */
             section_end: self.section_end.clone(),
+            bookmarks: self.bookmarks.clone(),
         }
     }
 
@@ -2343,14 +2476,36 @@ impl Paragraph {
         let mut fields_left = Vec::new();
         let mut fields_right = Vec::new();
         for f in &self.fields {
-            if f.end <= at {
-                fields_left.push(f.clone());
-            } else if f.start >= at {
-                fields_right.push(Field {
+            match f.span {
+                /* Issue #81 — a Head's `begin` stays left when it sits
+                before the split (its region now continues through the
+                new right paragraph), otherwise it moves right. A Tail's
+                `end` stays left when it sits at/before the split. */
+                Some(FieldSpan::Head) if f.start < at => fields_left.push(Field {
+                    end: at,
+                    ..f.clone()
+                }),
+                Some(FieldSpan::Head) => fields_right.push(Field {
+                    start: f.start - at,
+                    end: (f.end.max(f.start)) - at,
+                    ..f.clone()
+                }),
+                Some(FieldSpan::Tail) if f.end <= at => fields_left.push(Field {
+                    start: 0,
+                    ..f.clone()
+                }),
+                Some(FieldSpan::Tail) => fields_right.push(Field {
+                    start: 0,
+                    end: f.end - at,
+                    ..f.clone()
+                }),
+                None if f.end <= at => fields_left.push(f.clone()),
+                None if f.start >= at => fields_right.push(Field {
                     start: f.start - at,
                     end: f.end - at,
-                    instruction: f.instruction.clone(),
-                });
+                    ..f.clone()
+                }),
+                None => {}
             }
         }
         /* Issue #80 — inline objects travel with the half that holds
@@ -2388,6 +2543,9 @@ impl Paragraph {
                 paragraph mark; the original mark (and any section
                 marker riding it) belongs to the right half. */
                 section_end: None,
+                /* Issue #81 — paragraph-scoped bookmarks anchor at the
+                paragraph START, which the left half keeps. */
+                bookmarks: self.bookmarks.clone(),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -2407,6 +2565,7 @@ impl Paragraph {
                 /* Phase 3 (#40) — the ORIGINAL paragraph mark terminates
                 the right half, so a section marker travels with it. */
                 section_end: self.section_end.clone(),
+                bookmarks: Vec::new(),
             },
         )
     }
@@ -2434,13 +2593,22 @@ impl Paragraph {
         offset remapping would need to resolve anyway. FIELDS remap
         (issue #43): both sides' fields survive, tail's shifted right. */
         let mut fields = self.fields.clone();
+        /* Issue #81 — a multi-paragraph Head runs to the paragraph end,
+        which the merge just moved. */
+        for f in fields.iter_mut() {
+            if f.span == Some(FieldSpan::Head) {
+                f.end = text.len() as u32;
+            }
+        }
         for f in &other.fields {
             fields.push(Field {
                 start: f.start + shift,
                 end: f.end + shift,
-                instruction: f.instruction.clone(),
+                ..f.clone()
             });
         }
+        let mut bookmarks = self.bookmarks.clone();
+        bookmarks.extend(other.bookmarks.iter().cloned());
         /* Issue #80 — both sides' inline objects survive; the tail's
         anchors shift right with its text. */
         let mut inline_objects = self.inline_objects.clone();
@@ -2474,6 +2642,7 @@ impl Paragraph {
             break makes the preceding text adopt the FOLLOWING
             section's properties). Do not "fix" this to self.*. */
             section_end: other.section_end.clone(),
+            bookmarks,
         }
     }
 
@@ -2565,10 +2734,11 @@ impl Paragraph {
             .iter()
             .filter_map(|f| {
                 let (ns, ne) = (map_start(f.start), map_end(f.end));
-                (ns < ne).then(|| Field {
+                /* Issue #81 — multi-paragraph ends are points: keep. */
+                (ns < ne || !f.is_local()).then(|| Field {
                     start: ns,
-                    end: ne,
-                    instruction: f.instruction.clone(),
+                    end: ne.max(ns),
+                    ..f.clone()
                 })
             })
             .collect();
@@ -2954,6 +3124,7 @@ impl DocumentTree {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         }));
         Self {
             blocks,
@@ -3001,6 +3172,7 @@ impl DocumentTree {
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
+                bookmarks: Vec::new(),
             }));
         }
         Self {
@@ -4227,6 +4399,7 @@ impl DocumentTree {
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
+                bookmarks: Vec::new(),
             }));
             return Self {
                 blocks,
@@ -4639,6 +4812,7 @@ impl DocumentTree {
                 start,
                 end: start + cached.len() as u32,
                 instruction: instruction.to_string(),
+                span: None,
             });
             para.fields.sort_by_key(|f| f.start);
         });
@@ -10080,6 +10254,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -10107,6 +10282,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -10131,6 +10307,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -10233,6 +10410,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -10271,6 +10449,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -10766,6 +10945,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -10810,6 +10990,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -10853,6 +11034,7 @@ mod tests {
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
+                bookmarks: Vec::new(),
             },
             Paragraph {
                 text: "two".into(),
@@ -10874,6 +11056,7 @@ mod tests {
                 style_id: None,
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
+                bookmarks: Vec::new(),
             },
         ];
         let (out, caret) = doc.insert_rich(
@@ -11714,6 +11897,7 @@ mod tests {
                 start: 4,
                 end: 8,
                 instruction: "PAGE".into(),
+                span: None,
             }],
             ..Default::default()
         };
@@ -11739,6 +11923,7 @@ mod tests {
                 start: 2,
                 end: 4,
                 instruction: "PAGE".into(),
+                span: None,
             }],
             ..Default::default()
         };
@@ -11772,6 +11957,7 @@ mod tests {
                     start: 5,
                     end: 6,
                     instruction: "PAGE".into(),
+                    span: None,
                 });
             });
             d.blocks = blocks;
@@ -11810,6 +11996,7 @@ mod tests {
                 start: 5,
                 end: 8,
                 instruction: "NUMPAGES".into(),
+                span: None,
             }],
             spans: vec![
                 StyleRun {
@@ -11851,12 +12038,14 @@ mod tests {
             start: 0,
             end: 1,
             instruction: "DATE \\@ \"dd/MM/yyyy\" \\* MERGEFORMAT".into(),
+            span: None,
         };
         assert_eq!(f.date_picture().as_deref(), Some("dd/MM/yyyy"));
         let bare = Field {
             start: 0,
             end: 1,
             instruction: "DATE".into(),
+            span: None,
         };
         assert_eq!(bare.date_picture(), None);
     }

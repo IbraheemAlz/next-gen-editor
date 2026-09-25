@@ -1031,6 +1031,7 @@ impl ParaBuilder {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         })
     }
 }
@@ -1146,6 +1147,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -1168,6 +1170,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -1198,6 +1201,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         assert_eq!(
             to_html(&[p]),
@@ -1231,6 +1235,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);
@@ -1386,6 +1391,7 @@ mod tests {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let html = to_html(&[p]);
         assert!(html.contains("data-rel-id=\"rId7\""));

@@ -1688,6 +1688,7 @@ impl Paginator {
                 start: f.byte_range.start,
                 end: f.byte_range.end,
                 instruction: f.instruction.clone(),
+                span: None,
             };
             if let Some(v) = synthetic.evaluate_in(&page_env) {
                 f.evaluated_text = Some(v);
@@ -1954,6 +1955,7 @@ impl Paginator {
                         start: f.byte_range.start,
                         end: f.byte_range.end,
                         instruction: f.instruction.clone(),
+                        span: None,
                     };
                     if synthetic.typed() == engine::TypedField::NumPages {
                         f.evaluated_text = synthetic.evaluate_in(&total_env);
@@ -2522,6 +2524,7 @@ mod tests {
             inline_note_anchor: None,
             inline_object_height: 0.0,
             float: float.map(Box::new),
+            leader: None,
         };
         let mut p = fake_paragraph(3, 16.0);
         p.lines[0].runs.push(VisualRun {
@@ -3861,6 +3864,7 @@ mod tests {
             inline_note_anchor: Some(fn_anchor(id)),
             inline_object_height: 0.0,
             float: None,
+            leader: None,
         };
         p.lines[line_idx].runs.push(crate::boxes::VisualRun {
             glyphs: vec![glyph],

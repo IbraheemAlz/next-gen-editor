@@ -302,6 +302,23 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "toc_word_shape.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 11,
+      "asserts": {
+        "paragraph_count": 5,
+        "paragraph_texts": [
+          "Alpha\t1",
+          "Beta\t1",
+          "",
+          "Alpha",
+          "Beta"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "w14_paraid_word.docx": {
       "generator": "handcrafted",
       "phase_introduced": 11,

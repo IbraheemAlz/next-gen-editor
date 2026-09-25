@@ -359,6 +359,59 @@ thread_local! {
     static LAYOUT_NOTES: RefCell<Vec<LayoutDegraded>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Issue #81 — wire TOC switches → the engine's.
+fn toc_switches_from_bridge(s: &bridge::TocSwitches) -> engine::TocSwitches {
+    let (lo, hi) = (s.outline_min.clamp(1, 9), s.outline_max.min(9));
+    engine::TocSwitches {
+        outline_levels: (hi > 0).then(|| (lo.min(hi.max(1)), hi.max(lo))),
+        hyperlinks: s.hyperlinks,
+        hide_in_web: s.hide_in_web,
+        use_outline_levels: s.use_outline_levels,
+        no_page_numbers: (!s.page_numbers).then_some((1, 9)),
+        custom_styles: Vec::new(),
+    }
+}
+
+/// Issue #81 — carry a top-level body position across a TOC
+/// regeneration (`old` → `new` differ only inside TOC regions, region
+/// for region): positions after a region shift by its size change, a
+/// position inside a region lands on the region's first paragraph.
+fn shift_pos_across_tocs(
+    old: &DocumentTree,
+    new: &DocumentTree,
+    pos: BridgeLogicalPos,
+) -> BridgeLogicalPos {
+    let Some(bridge::PathStep::Block { idx: b }) = pos.path.steps.first().cloned() else {
+        return pos;
+    };
+    let (ro, rn) = (old.toc_regions(), new.toc_regions());
+    if ro.len() != rn.len() {
+        return pos;
+    }
+    let mut delta: i64 = 0;
+    for (o, n) in ro.iter().zip(&rn) {
+        if b > o.last {
+            delta += (n.last - n.first) as i64 - (o.last - o.first) as i64;
+        } else if b >= o.first {
+            return BridgeLogicalPos {
+                path: BridgeBlockPath::top((n.first as i64 + delta).max(0) as u32),
+                offset: 0,
+            };
+        }
+    }
+    if delta == 0 {
+        return pos;
+    }
+    let mut steps = pos.path.steps.clone();
+    steps[0] = bridge::PathStep::Block {
+        idx: (b as i64 + delta).max(0) as u32,
+    };
+    BridgeLogicalPos {
+        path: BridgeBlockPath { steps },
+        offset: pos.offset,
+    }
+}
+
 /// Issue #87 — record a sub-paginator degradation (no page index).
 fn note_layout_degradation(reason: LayoutDegradeReason) {
     LAYOUT_NOTES.with(|n| n.borrow_mut().push(LayoutDegraded { reason, page: None }));
@@ -385,6 +438,7 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::WrapObjectFrozen => LayoutDegradeReason::WrapObjectFrozen,
         R::WrapOscillation => LayoutDegradeReason::WrapOscillation,
         R::WrapPolygonFallback => LayoutDegradeReason::WrapPolygonFallback,
+        R::PageRefCap => LayoutDegradeReason::PageRefCap,
     };
     LayoutDegraded {
         reason,
@@ -1693,6 +1747,15 @@ fn apply_hyperlink_overlay(
     hyperlinks: &[engine::Hyperlink],
     default_color: [u8; 4],
 ) -> Vec<StyleSpan> {
+    /* Issue #81 — an internal `w:anchor` link (a TOC entry) renders in
+    the run's own formatting, as Word does: its look comes from the
+    paragraph / run styles, not from being a link. */
+    let external: Vec<engine::Hyperlink> = hyperlinks
+        .iter()
+        .filter(|h| !h.target.starts_with('#'))
+        .cloned()
+        .collect();
+    let hyperlinks = external.as_slice();
     if hyperlinks.is_empty() {
         return spans;
     }
@@ -2969,6 +3032,7 @@ fn build_header_footer_box(
                     p.fields = para
                         .fields
                         .iter()
+                        .filter(|f| f.is_local())
                         .map(|f| layout::LayoutField {
                             byte_range: f.start..f.end,
                             instruction: f.instruction.clone(),
@@ -3217,8 +3281,8 @@ fn effective_layout_indents(
 fn tab_stops_to_layout_px(
     stops: &[engine::TabStop],
     scale: f32,
-) -> Vec<(f32, layout::paragraph::TabKind)> {
-    let mut out: Vec<(f32, layout::paragraph::TabKind)> = stops
+) -> Vec<layout::paragraph::TabStopPx> {
+    let mut out: Vec<layout::paragraph::TabStopPx> = stops
         .iter()
         .filter_map(|s| {
             let kind = match s.kind {
@@ -3228,7 +3292,16 @@ fn tab_stops_to_layout_px(
                 engine::TabKind::Decimal => layout::paragraph::TabKind::Decimal,
                 engine::TabKind::Clear => return None,
             };
-            Some((s.position_pt * scale, kind))
+            /* Issue #81 — the stop's leader rides to the renderer. */
+            let leader = match s.leader {
+                engine::TabLeader::None => None,
+                engine::TabLeader::Dot => Some(layout::TabLeaderKind::Dot),
+                engine::TabLeader::Hyphen => Some(layout::TabLeaderKind::Hyphen),
+                engine::TabLeader::Underscore => Some(layout::TabLeaderKind::Underscore),
+                engine::TabLeader::Heavy => Some(layout::TabLeaderKind::Heavy),
+                engine::TabLeader::MiddleDot => Some(layout::TabLeaderKind::MiddleDot),
+            };
+            Some((s.position_pt * scale, kind, leader))
         })
         .collect();
     out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -5719,6 +5792,7 @@ impl Engine {
             Command::SetTitlePage { enabled } => self.do_set_title_page(enabled),
             Command::SetEvenOddHeaders { enabled } => self.do_set_even_odd_headers(enabled),
             Command::InsertField { at, kind } => self.do_insert_field(at, kind),
+            Command::InsertToc { at, switches } => self.do_insert_toc(at, switches),
             Command::InsertFootnote { at } => self.do_insert_note(at, engine::NoteKind::Footnote),
             Command::InsertEndnote { at } => self.do_insert_note(at, engine::NoteKind::Endnote),
             Command::SetRenderDate {
@@ -7194,6 +7268,9 @@ impl Engine {
                         para_box.fields = para
                             .fields
                             .iter()
+                            /* Issue #81 — multi-paragraph field ends
+                            (a TOC) never resolve per page. */
+                            .filter(|f| f.is_local())
                             .map(|f| layout::LayoutField {
                                 byte_range: f.start..f.end,
                                 instruction: f.instruction.clone(),
@@ -8012,7 +8089,7 @@ impl Engine {
         let snapped = self
             .fields_at_path(&pos.path)
             .iter()
-            .find(|f| f.start < off && off < f.end)
+            .find(|f| f.is_local() && f.start < off && off < f.end)
             .map(|f| if forward { f.end } else { f.start });
         match snapped {
             Some(offset) => BridgeLogicalPos {
@@ -8029,7 +8106,7 @@ impl Engine {
         let snapped = self
             .fields_at_path(&pos.path)
             .iter()
-            .find(|f| f.start < off && off < f.end)
+            .find(|f| f.is_local() && f.start < off && off < f.end)
             .map(|f| {
                 if off - f.start > f.end - off {
                     f.end
@@ -8190,16 +8267,28 @@ impl Engine {
     /// A document whose fields are all current is left untouched (no
     /// undo entry, nothing dirtied).
     fn do_update_fields(&mut self) -> Event {
-        let (new_doc, changed) = self.restamped_document();
+        let (new_doc, changed) = self.restamped_document(true);
         if !changed {
             self.announce(AnnouncementPriority::Polite, "Fields are up to date");
             return self.selection_changed();
         }
+        let old_doc = self.undo.current().clone();
         self.undo.push(new_doc);
         if let Some(sel) = self.selection.clone() {
+            /* Issue #81 — a regenerated TOC changes the body's block
+            count: carry a body caret across the regions first. */
+            let (anchor, caret) = if self.story_active() {
+                (sel.anchor, sel.caret)
+            } else {
+                let new_doc = self.undo.current();
+                (
+                    shift_pos_across_tocs(&old_doc, new_doc, sel.anchor),
+                    shift_pos_across_tocs(&old_doc, new_doc, sel.caret),
+                )
+            };
             let clamped = self.with_selection_doc(|d| SelectionState {
-                anchor: clamp_pos(d, sel.anchor),
-                caret: clamp_pos(d, sel.caret),
+                anchor: clamp_pos(d, anchor),
+                caret: clamp_pos(d, caret),
                 ideal_x: None,
                 kind: sel.kind,
             });
@@ -8219,15 +8308,24 @@ impl Engine {
     /// NUMPAGES read a full pagination of the SOURCE tree
     /// (`page_field_values`); every other kind reads `field_env()`; a
     /// kind the environment cannot resolve keeps its cached text. Shared
-    /// by F9 and the save-time restamp.
-    fn restamped_document(&self) -> (DocumentTree, bool) {
-        let doc = self.undo.current();
+    /// by F9 and the save-time restamp. Issue #81 — with
+    /// `regenerate_tocs` (F9 only — Word never rebuilds a TOC on save, so
+    /// an untouched TOC stays byte-identical) every TOC is regenerated
+    /// first through the page-number post-pass
+    /// ([`Self::regenerate_tocs_converged`]).
+    fn restamped_document(&self, regenerate_tocs: bool) -> (DocumentTree, bool) {
+        let (toc_doc, toc_changed) = if regenerate_tocs {
+            self.regenerate_tocs_converged(self.undo.current())
+        } else {
+            (self.undo.current().clone(), false)
+        };
+        let doc = &toc_doc;
         if !doc.has_any_fields() {
-            return (doc.clone(), false);
+            return (doc.clone(), toc_changed);
         }
         let env = self.field_env();
-        let page_values = self.page_field_values();
-        let mut changed = false;
+        let page_values = self.page_field_values_of(doc);
+        let mut changed = toc_changed;
         let new_doc = doc.restamp_fields(&mut |site| {
             let value = match site.field.typed() {
                 engine::TypedField::Page | engine::TypedField::NumPages => {
@@ -8263,18 +8361,16 @@ impl Engine {
     /// Fields inside table cells are not addressed (their cached text
     /// stands; `InsertField` rejects cell carets today).
     #[allow(clippy::type_complexity)]
-    fn page_field_values(&self) -> Vec<((u8, String), EngineBlockPath, usize, String)> {
+    fn page_field_values_of(
+        &self,
+        doc: &DocumentTree,
+    ) -> Vec<((u8, String), EngineBlockPath, usize, String)> {
         let mut out: Vec<((u8, String), EngineBlockPath, usize, String)> = Vec::new();
-        let Ok((pages, _fonts, page_paths, _info)) = self.build_pages_of(
-            self.undo.current().clone(),
-            self.scale(),
-            false,
-            None,
-            FieldMode::Probe,
-        ) else {
+        let Ok((pages, _fonts, page_paths, _info)) =
+            self.build_pages_of(doc.clone(), self.scale(), false, None, FieldMode::Probe)
+        else {
             return out;
         };
-        let doc = self.undo.current();
         let mut push = |story: (u8, String),
                         path: &EngineBlockPath,
                         sp: &engine::Paragraph,
@@ -8286,7 +8382,7 @@ impl Engine {
                 let Some(index) = sp
                     .fields
                     .iter()
-                    .position(|f| f.start == lf.byte_range.start)
+                    .position(|f| f.is_local() && f.start == lf.byte_range.start)
                 else {
                     continue;
                 };
@@ -8514,7 +8610,7 @@ impl Engine {
                     continue;
                 }
                 let dp = sp.with_field_codes();
-                let inside = |o: u32| dp.field_strictly_containing(o).is_some();
+                let inside = |o: u32| dp.code_span_strictly_containing(o).is_some();
                 let map = |o: u32| sp.code_view_offset_to_source(o);
                 line.start_byte = map(line.start_byte);
                 line.end_byte = map(line.end_byte);
@@ -10950,6 +11046,111 @@ impl Engine {
         }
     }
 
+    /// Issue #81 — every TOC regenerated with live page numbers. The
+    /// numbers come from a real pagination ([`FieldMode::Probe`]) of the
+    /// regenerated tree, and stamping them can move the headings (a TOC
+    /// whose height changes shifts the body), so the pass runs to a
+    /// bounded fixed point ([`layout::converge_page_refs`], one re-run);
+    /// hitting the cap stamps the last observation and records a
+    /// `PageRefCap` degradation note for the next paint. Without a
+    /// layout (no fonts yet) entries carry no numbers.
+    fn regenerate_tocs_converged(&self, doc: &DocumentTree) -> (DocumentTree, bool) {
+        if !doc.has_toc() {
+            return (doc.clone(), false);
+        }
+        type Refs = Option<Vec<Option<String>>>;
+        let stamp = |refs: Option<&Refs>| -> DocumentTree {
+            match refs {
+                /* Initial guess: a one-digit placeholder — the common
+                case, so round 1 usually confirms round 0. */
+                None => doc.regenerate_tocs(&|_| Some("0".to_string())).0,
+                Some(Some(v)) => doc.regenerate_tocs(&|ord| v.get(ord).cloned().flatten()).0,
+                Some(None) => doc.regenerate_tocs(&|_| None).0,
+            }
+        };
+        let measure = |d: &DocumentTree| -> Refs {
+            let (pages, _fonts, page_paths, _info) = self
+                .build_pages_of(d.clone(), self.scale(), false, None, FieldMode::Probe)
+                .ok()?;
+            let mut first_page: HashMap<u32, usize> = HashMap::new();
+            for (pi, paths) in page_paths.iter().enumerate() {
+                for path in paths {
+                    if let [engine::PathStep::Block(b)] = path.steps.as_slice() {
+                        first_page.entry(*b).or_insert(pi);
+                    }
+                }
+            }
+            Some(
+                d.toc_content_blocks()
+                    .into_iter()
+                    .map(|b| {
+                        let pi = *first_page.get(&b)?;
+                        let n = pages.get(pi)?.page_number;
+                        Some(d.section_for_block(b).page_num.format.render(n))
+                    })
+                    .collect(),
+            )
+        };
+        let result = layout::converge_page_refs(1, |prev: Option<&Refs>| measure(&stamp(prev)));
+        if result.degraded.is_some() {
+            note_layout_degradation(LayoutDegradeReason::PageRefCap);
+        }
+        let final_refs = result.refs;
+        match final_refs {
+            Some(v) => doc.regenerate_tocs(&|ord| v.get(ord).cloned().flatten()),
+            None => doc.regenerate_tocs(&|_| None),
+        }
+    }
+
+    /// `Command::InsertToc` (issue #81) — insert a TOC stub at `at` and
+    /// generate it immediately (with page numbers). Body only; the caret
+    /// lands at the start of the paragraph after the TOC.
+    fn do_insert_toc(&mut self, at: BridgeLogicalPos, switches: bridge::TocSwitches) -> Event {
+        if self.story_active() {
+            return Event::Error {
+                message: "InsertToc: a table of contents belongs in the document body".into(),
+            };
+        }
+        let sw = toc_switches_from_bridge(&switches);
+        let Some((stub_doc, first)) = self
+            .undo
+            .current()
+            .insert_toc_at(&to_engine_pos(at.clone()), &sw)
+        else {
+            return Event::Error {
+                message: "InsertToc: place the caret in a body paragraph outside tables and \
+                          other tables of contents"
+                    .into(),
+            };
+        };
+        let (new_doc, _) = self.regenerate_tocs_converged(&stub_doc);
+        let after = new_doc
+            .toc_regions()
+            .into_iter()
+            .find(|r| r.first == first)
+            .map(|r| r.last + 1)
+            .unwrap_or(first + 1);
+        let caret = if (after as usize) < new_doc.blocks.len() {
+            BridgeLogicalPos {
+                path: BridgeBlockPath::top(after),
+                offset: 0,
+            }
+        } else {
+            let last = after.saturating_sub(1);
+            let len = new_doc
+                .paragraph_at_path(&EngineBlockPath::top(last))
+                .map(|p| p.text.len() as u32)
+                .unwrap_or(0);
+            BridgeLogicalPos {
+                path: BridgeBlockPath::top(last),
+                offset: len,
+            }
+        };
+        self.invalidate_layout_snapshot();
+        self.announce(AnnouncementPriority::Polite, "Table of contents inserted");
+        self.commit_edit(new_doc, caret)
+    }
+
     /// `Command::InsertField` (issue #43) — author a PAGE / NUMPAGES /
     /// DATE field at the caret. Works in the body AND in stories (a
     /// page-number footer is the primary use); rejected inside table
@@ -11957,6 +12158,7 @@ impl Engine {
                     bridge::BridgeTabKind::Decimal => engine::TabKind::Decimal,
                     bridge::BridgeTabKind::Clear => engine::TabKind::Clear,
                 },
+                leader: Default::default(),
             })
             .collect();
         if self.story_active() {
@@ -12391,7 +12593,7 @@ impl Engine {
         reader that never evaluates fields still shows current text.
         The in-memory document is untouched — F9 is the user's explicit
         update; this is the file's. */
-        let (doc, _changed) = self.restamped_document();
+        let (doc, _changed) = self.restamped_document(false);
         match build_minimal_docx(&doc) {
             Ok(bytes) => {
                 let size = bytes.len() as u32;
@@ -13781,6 +13983,7 @@ mod tests {
             inline_note_anchor: None,
             inline_object_height: 0.0,
             float: None,
+            leader: None,
         };
         let run = layout::VisualRun {
             glyphs: vec![
@@ -13847,6 +14050,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -13995,6 +14199,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -14030,6 +14235,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -15174,6 +15380,7 @@ mod tests {
                 style_id: None,
                 direct_overrides: engine::ParaProperties::default(),
                 section_end: None,
+                bookmarks: Vec::new(),
             })],
         }
     }
@@ -16908,6 +17115,7 @@ mod tests {
                         start: 5,
                         end: 7,
                         instruction: "PAGE".into(),
+                        span: None,
                     }],
                     ..Default::default()
                 })],
@@ -16960,6 +17168,7 @@ mod tests {
                         start: 3,
                         end: 4,
                         instruction: "NUMPAGES".into(),
+                        span: None,
                     }],
                     ..Default::default()
                 })],
@@ -17124,6 +17333,7 @@ mod tests {
                 start: 3,
                 end: 4,
                 instruction: "DATE".into(),
+                span: None,
             }],
             ..Default::default()
         })]);
@@ -17164,11 +17374,13 @@ mod tests {
                     start: 5,
                     end: 7,
                     instruction: "PAGE".into(),
+                    span: None,
                 },
                 engine::Field {
                     start: 11,
                     end: 13,
                     instruction: "NUMPAGES".into(),
+                    span: None,
                 },
             ],
             ..Default::default()
@@ -17375,11 +17587,13 @@ mod tests {
                         start: 5,
                         end: 7,
                         instruction: "PAGE".into(),
+                        span: None,
                     },
                     engine::Field {
                         start: 11,
                         end: 12,
                         instruction: "NUMPAGES".into(),
+                        span: None,
                     },
                 ],
                 ..Default::default()
@@ -17399,11 +17613,13 @@ mod tests {
                         start: 3,
                         end: 4,
                         instruction: "AUTHOR".into(),
+                        span: None,
                     },
                     engine::Field {
                         start: 8,
                         end: 9,
                         instruction: "FILENAME \\p".into(),
+                        span: None,
                     },
                 ],
                 ..Default::default()
@@ -18039,6 +18255,284 @@ mod tests {
             });
             assert!(engine.undo_depth() <= 100, "undo depth exceeded its bound");
         }
+    }
+
+    /* ================================================================
+    Issue #81 — Table of Contents: insertion, F9 regeneration, the
+    page-number post-pass, leaders, pinned geometry.
+    ================================================================ */
+
+    fn toc_heading(text: &str, level: u8) -> engine::Block {
+        engine::Block::Paragraph(engine::Paragraph {
+            text: text.into(),
+            style_id: Some(format!("Heading{level}")),
+            ..Default::default()
+        })
+    }
+
+    fn toc_body(text: &str) -> engine::Block {
+        engine::Block::Paragraph(engine::Paragraph {
+            text: text.into(),
+            ..Default::default()
+        })
+    }
+
+    /// Five headings over three levels on three pages (FORM FEED page
+    /// breaks): Introduction p1 · Background, Details p2 · Method,
+    /// Results p3.
+    fn five_heading_doc() -> DocumentTree {
+        let mut d = DocumentTree::from_text("");
+        d.blocks = vec![
+            toc_heading("Introduction", 1),
+            toc_body("Intro body.\u{000C}"),
+            toc_heading("Background", 2),
+            toc_heading("Details", 3),
+            toc_body("Details body.\u{000C}"),
+            toc_heading("Method", 1),
+            toc_heading("Results", 2),
+        ]
+        .into_iter()
+        .collect();
+        d
+    }
+
+    fn toc_entry_texts(engine: &Engine) -> Vec<String> {
+        let doc = engine.undo.current();
+        let r = doc.toc_regions();
+        assert_eq!(r.len(), 1, "one TOC");
+        (r[0].first..=r[0].last)
+            .map(|b| {
+                doc.paragraph_at_path(&EngineBlockPath::top(b))
+                    .unwrap()
+                    .text
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// Every entry's number equals the page its heading lands on in the
+    /// FINAL layout — the post-pass invariant.
+    fn assert_toc_numbers_match_layout(engine: &Engine) {
+        let doc = engine.undo.current().clone();
+        let (_pages, _, page_paths, _) = engine.build_pages(1.0, false, None).expect("layout");
+        let page_of = |block: u32| {
+            page_paths
+                .iter()
+                .position(|paths| {
+                    paths
+                        .iter()
+                        .any(|p| p.steps.as_slice() == [engine::PathStep::Block(block)])
+                })
+                .map(|pi| (pi + 1).to_string())
+        };
+        let sw = engine::TocSwitches::default();
+        let headings = doc.toc_headings(&sw);
+        let entries = toc_entry_texts(engine);
+        assert_eq!(entries.len(), headings.len());
+        for (h, e) in headings.iter().zip(&entries) {
+            let want = format!(
+                "{}\t{}",
+                h.text,
+                page_of(h.block).expect("heading laid out")
+            );
+            assert_eq!(e, &want, "entry for `{}`", h.text);
+        }
+    }
+
+    #[test]
+    fn insert_toc_renders_five_entries_with_dot_leaders_and_page_numbers() {
+        let mut engine = test_engine_with_doc(five_heading_doc());
+        let evt = engine.do_insert_toc(bpos_top(0, 0), bridge::TocSwitches::default());
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(
+            toc_entry_texts(&engine),
+            vec![
+                "Introduction\t1",
+                "Background\t2",
+                "Details\t2",
+                "Method\t3",
+                "Results\t3"
+            ]
+        );
+        assert_toc_numbers_match_layout(&engine);
+        /* The caret lands after the TOC, on the first heading. */
+        let sel = engine.selection.clone().unwrap();
+        assert_eq!(sel.caret, bpos_top(5, 0));
+        /* Leaders: each entry line carries exactly one dotted tab glyph. */
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let mut leadered = 0;
+        for block in pages[0].blocks.iter().take(5) {
+            let p = block.as_paragraph().expect("entry paragraph");
+            let n = p
+                .lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .flat_map(|r| r.glyphs.iter())
+                .filter(|g| g.leader == Some(layout::TabLeaderKind::Dot))
+                .count();
+            assert_eq!(n, 1, "one dot-leader tab per entry");
+            leadered += n;
+            /* Right tab: the number ends at the right margin. */
+            let line = &p.lines[0];
+            let right = p.origin.x + line.origin.x + line.width;
+            assert!(
+                (right - p.size.width).abs() < 1.0 || line.width <= p.size.width,
+                "entry fits the column"
+            );
+        }
+        assert_eq!(leadered, 5);
+        /* Pinned: a change here moves the TOC goldens. */
+        let fp = layout::geometry_fingerprint(&pages);
+        eprintln!(
+            "TOC FINGERPRINT five_heading_toc = {fp:#x} ({} pages)",
+            pages.len()
+        );
+        assert_eq!(pages.len(), 3);
+        assert_eq!(fp, PINNED_TOC_FINGERPRINT, "TOC fixture geometry changed");
+    }
+
+    /// Recorded on this change via `--nocapture` (issue #81).
+    const PINNED_TOC_FINGERPRINT: u64 = 0xe2f7683e6b40ee7f;
+
+    #[test]
+    fn f9_regenerates_after_a_heading_edit_and_a_page_shift() {
+        let mut engine = test_engine_with_doc(five_heading_doc());
+        engine.do_insert_toc(bpos_top(0, 0), bridge::TocSwitches::default());
+        /* Up to date: F9 is a no-op (no undo entry). */
+        let depth = engine.undo.depth();
+        engine.do_update_fields();
+        assert_eq!(engine.undo.depth(), depth, "a current TOC is left alone");
+        /* Edit a heading (block 10 = "Method") and push Background to a
+        new page by adding a page break before it. */
+        let doc = engine
+            .undo
+            .current()
+            .insert_text(EnginePos::new(EngineBlockPath::top(10), 6), "ology");
+        let mut doc = doc;
+        doc.blocks.insert(7, toc_body("More.\u{000C}"));
+        engine.undo.push(doc);
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(11, 2),
+            caret: bpos_top(11, 2),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        /* Stale until F9. */
+        assert_eq!(toc_entry_texts(&engine)[3], "Method\t3");
+        engine.do_update_fields();
+        assert_eq!(
+            toc_entry_texts(&engine),
+            vec![
+                "Introduction\t1",
+                "Background\t3",
+                "Details\t3",
+                "Methodology\t4",
+                "Results\t4"
+            ]
+        );
+        assert_toc_numbers_match_layout(&engine);
+        /* The caret stayed on the edited heading. */
+        let caret = engine.selection.clone().unwrap().caret;
+        assert_eq!(caret, bpos_top(11, 2));
+        /* One undo step restores the stale TOC. */
+        engine.undo.undo();
+        assert_eq!(toc_entry_texts(&engine)[3], "Method\t3");
+    }
+
+    #[test]
+    fn a_toc_longer_than_a_page_converges_on_correct_numbers() {
+        /* 70 level-1 headings, one per page: the TOC itself spans two
+        pages, so every body page number depends on the TOC's height. */
+        let mut d = DocumentTree::from_text("");
+        let mut blocks = Vec::new();
+        for i in 0..70 {
+            blocks.push(toc_heading(&format!("Chapter {i}"), 1));
+            blocks.push(toc_body("Body.\u{000C}"));
+        }
+        d.blocks = blocks.into_iter().collect();
+        let mut engine = test_engine_with_doc(d);
+        engine.do_insert_toc(bpos_top(0, 0), bridge::TocSwitches::default());
+        assert_eq!(toc_entry_texts(&engine).len(), 70);
+        assert_toc_numbers_match_layout(&engine);
+        assert!(
+            !drain_layout_notes()
+                .iter()
+                .any(|n| n.reason == LayoutDegradeReason::PageRefCap),
+            "a stable document converges without the cap"
+        );
+    }
+
+    #[test]
+    fn save_restamp_never_regenerates_a_toc() {
+        let mut engine = test_engine_with_doc(five_heading_doc());
+        engine.do_insert_toc(bpos_top(0, 0), bridge::TocSwitches::default());
+        let doc = engine
+            .undo
+            .current()
+            .insert_text(EnginePos::new(EngineBlockPath::top(10), 6), "ology");
+        engine.undo.push(doc);
+        let (saved, _) = engine.restamped_document(false);
+        let r = saved.toc_regions();
+        assert_eq!(
+            saved
+                .paragraph_at_path(&EngineBlockPath::top(r[0].first + 3))
+                .unwrap()
+                .text,
+            "Method\t3",
+            "Word keeps a stale TOC on save; only F9 rebuilds it"
+        );
+    }
+
+    #[test]
+    fn insert_toc_is_rejected_in_stories_tables_and_existing_tocs() {
+        let mut engine = test_engine_with_doc(five_heading_doc());
+        engine.do_insert_toc(bpos_top(0, 0), bridge::TocSwitches::default());
+        let evt = engine.do_insert_toc(bpos_top(2, 0), bridge::TocSwitches::default());
+        assert!(matches!(evt, Event::Error { .. }), "nested TOC refused");
+        let cell = BridgeLogicalPos {
+            path: BridgeBlockPath {
+                steps: vec![
+                    bridge::PathStep::Block { idx: 0 },
+                    bridge::PathStep::Cell { row: 0, col: 0 },
+                    bridge::PathStep::Block { idx: 0 },
+                ],
+            },
+            offset: 0,
+        };
+        let evt = engine.do_insert_toc(cell, bridge::TocSwitches::default());
+        assert!(matches!(evt, Event::Error { .. }), "table-cell TOC refused");
+    }
+
+    #[test]
+    fn caret_in_a_toc_reports_the_field_and_code_view_shows_the_instruction() {
+        let mut engine = test_engine_with_doc(five_heading_doc());
+        engine.do_insert_toc(bpos_top(0, 0), bridge::TocSwitches::default());
+        let sel = SelectionState {
+            anchor: bpos_top(0, 3),
+            caret: bpos_top(0, 3),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        };
+        let f = engine.field_ref_at_selection(&sel).expect("TOC at caret");
+        assert_eq!(f.keyword, "TOC");
+        assert_eq!(f.instruction, "TOC \\o \"1-3\" \\h \\z \\u");
+        /* Not atomic: the caret may sit inside the entry text. */
+        assert_eq!(
+            engine.snap_out_of_field(bpos_top(0, 3), true),
+            bpos_top(0, 3)
+        );
+        /* Edit the switches through the #77 path, then F9. */
+        let evt = engine.do_set_field_instruction(bpos_top(0, 3), "TOC \\o \"1-1\" \\h".into());
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        engine.do_update_fields();
+        assert_eq!(
+            toc_entry_texts(&engine),
+            vec!["Introduction\t1", "Method\t3"]
+        );
+        /* Alt+F9 lays out without error and the geometry maps back. */
+        engine.do_set_field_code_view(true);
+        assert!(engine.document_geometry().is_ok());
     }
 }
 
