@@ -11,7 +11,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 3
+        "document_xml_drift_bytes": 144
       }
     },
     "floating_image_anchor.docx": {
@@ -72,7 +72,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "pPr_bidi_rtl.docx": {
@@ -98,7 +98,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "pPr_jc_center.docx": {
@@ -111,7 +111,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "pPr_spacing.docx": {
@@ -124,7 +124,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "simple_arabic.docx": {
@@ -137,7 +137,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "simple_text.docx": {
@@ -150,7 +150,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "simple_xml_escapes.docx": {
@@ -163,7 +163,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "style_cascade.docx": {
@@ -176,7 +176,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "table_2x2_opaque.docx": {
@@ -190,7 +190,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "table_borders_double.docx": {
@@ -203,7 +203,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "table_grid_span.docx": {
@@ -216,7 +216,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "table_in_rtl_doc.docx": {
@@ -229,7 +229,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "table_nested_200_deep.docx": {
@@ -242,7 +242,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "table_shaded_header.docx": {
@@ -255,7 +255,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     },
     "table_vmerge.docx": {
@@ -268,7 +268,7 @@
         ]
       },
       "roundtrip": {
-        "document_xml_drift_bytes": 0
+        "document_xml_drift_bytes": 141
       }
     }
   }
