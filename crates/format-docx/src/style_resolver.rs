@@ -137,6 +137,7 @@ mod tests {
             id: id.into(),
             kind: StyleKind::Paragraph,
             based_on: based_on.map(String::from),
+            next: None,
             para: ParaProperties::default(),
             run,
         }
@@ -323,6 +324,7 @@ mod tests {
             id: "Emph".into(),
             kind: StyleKind::Character,
             based_on: None,
+            next: None,
             para: ParaProperties::default(),
             run: SpanStyle {
                 italic: Some(true),
@@ -351,6 +353,7 @@ mod tests {
                 id: format!("S{i}"),
                 kind: StyleKind::Paragraph,
                 based_on: parent,
+                next: None,
                 para: ParaProperties::default(),
                 run: SpanStyle::default(),
             });
@@ -373,6 +376,7 @@ mod tests {
             id: "Heading".into(),
             kind: StyleKind::Paragraph,
             based_on: None,
+            next: None,
             para: ParaProperties {
                 keep_next: Some(true),
                 keep_lines: Some(true),

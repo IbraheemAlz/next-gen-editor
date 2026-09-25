@@ -68,14 +68,15 @@ pub enum DisplayCmd {
         width: f64,
     },
     DrawGlyphRun(GlyphRun),
-    /// Phase 7 — paint an inline image at `rect`. `rel_id` matches the
-    /// archive relationship id the engine stashed for the image; the
-    /// backend looks the decoded bitmap up via its image-cache
+    /// Phase 7 — paint an inline image at `rect`. Issue #224 —
+    /// `media_key` (renamed from `rel_id`; internal, no wire impact) is
+    /// the `DocumentTree::media` key the engine stashed for the image;
+    /// the backend looks the decoded bitmap up via its image-cache
     /// callback and falls back to a placeholder rectangle on miss
-    /// (image bytes not yet decoded, or the rId resolved nothing).
+    /// (image bytes not yet decoded, or the key resolved nothing).
     DrawImage {
         rect: Rect,
-        rel_id: String,
+        media_key: String,
     },
     /// UI-polish sprint — paint one page "card" (Google Docs / Word
     /// print-layout look): a white rectangle floating over the gray
@@ -295,7 +296,7 @@ fn paint_floats(page: &PageBox, top: f32, behind: bool, cmds: &mut Vec<DisplayCm
         }
         cmds.push(DisplayCmd::DrawImage {
             rect: Rect::new(x0, y0, x0 + f.size.width as f64, y0 + f.size.height as f64),
-            rel_id: f.rel_id.clone(),
+            media_key: f.rel_id.clone(),
         });
     }
 }
@@ -385,7 +386,7 @@ fn paint_frame_floats(
             let y0 = (content_y + f.origin.y) as f64;
             cmds.push(DisplayCmd::DrawImage {
                 rect: Rect::new(x0, y0, x0 + f.size.width as f64, y0 + f.size.height as f64),
-                rel_id: f.rel_id.clone(),
+                media_key: f.rel_id.clone(),
             });
         }
     }
@@ -683,10 +684,10 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                     pen += glyph.x_advance;
                 }
                 let run_x1 = (line_x as f64) + (pen as f64);
-                for (x0, y0, x1, y1, rel_id) in images {
+                for (x0, y0, x1, y1, media_key) in images {
                     cmds.push(DisplayCmd::DrawImage {
                         rect: Rect::new(x0, y0, x1, y1),
-                        rel_id,
+                        media_key,
                     });
                 }
 
@@ -747,6 +748,66 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                 }
             }
         }
+        /* Issue #262 — a tracked change on the paragraph mark: a pilcrow
+        just past the logical end of the last line. */
+        if let (Some(color), Some(line)) = (para.review_mark, para.lines.last()) {
+            let width: f32 = line
+                .runs
+                .iter()
+                .flat_map(|r| r.glyphs.iter())
+                .map(|g| g.x_advance)
+                .sum();
+            let line_x = (para_x + line.origin.x) as f64;
+            let baseline = (para_y + line.origin.y + line.baseline) as f64;
+            let rtl = matches!(para.direction, text_pipeline::ShapingDirection::Rtl);
+            push_pilcrow(
+                cmds,
+                line_x,
+                width as f64,
+                baseline,
+                line.height as f64,
+                rtl,
+                color,
+            );
+        }
+    }
+}
+
+/// Issue #262 — a pilcrow (`¶`) drawn from rectangles (no font needed):
+/// top bar, a filled bowl hanging off it and two stems, `height`-scaled,
+/// placed just past the end of a line whose content starts at `line_x`
+/// and is `width` wide (left of `line_x` for an RTL paragraph).
+fn push_pilcrow(
+    cmds: &mut Vec<DisplayCmd>,
+    line_x: f64,
+    width: f64,
+    baseline: f64,
+    line_height: f64,
+    rtl: bool,
+    [r, g, b, a]: [u8; 4],
+) {
+    let h = (line_height * 0.7).max(4.0);
+    let w = h * 0.6;
+    let gap = h * 0.2;
+    let x0 = if rtl {
+        line_x - gap - w
+    } else {
+        line_x + width + gap
+    };
+    let top = baseline - h * 0.85;
+    let bottom = baseline;
+    let t = (h * 0.1).max(1.0);
+    let paint = Paint::solid(Color::from_rgba8(r, g, b, a));
+    for (ax, ay, bx, by) in [
+        (x0, top, x0 + w, top + t),
+        (x0, top, x0 + w * 0.55, top + h * 0.45),
+        (x0 + w * 0.45, top, x0 + w * 0.45 + t, bottom),
+        (x0 + w - t, top, x0 + w, bottom),
+    ] {
+        cmds.push(DisplayCmd::FillRect {
+            rect: Rect::new(ax, ay, bx, by),
+            paint: paint.clone(),
+        });
     }
 }
 

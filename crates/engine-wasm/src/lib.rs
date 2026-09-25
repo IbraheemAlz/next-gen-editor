@@ -922,6 +922,30 @@ pub struct Engine {
     /// replacing a hand-kept per-command allowlist; `Event::Painted`
     /// carries it too.
     mutation_seq: u64,
+    /// Issue #239 — a `SetZoom` sent before the first `RenderPage` has no
+    /// `layout_cfg` to fold into and no selection either (`render_page`
+    /// always resets it), so it used to be silently dropped. Stashed
+    /// here instead; `render_page` composes it into the fresh config
+    /// (`cfg.zoom = pending_zoom.take().unwrap_or(cfg.zoom)`), and
+    /// `user_zoom()` reports it in the meantime so a `SelectionChanged`
+    /// emitted before any `RenderPage` (there is none in practice, but
+    /// `do_recover`'s replay reads `user_zoom()` too) never lies. `None`
+    /// once a `RenderPage` has consumed it.
+    pending_zoom: Option<f32>,
+    /// Issue #239 — the `SetDeviceScale` mirror of `pending_zoom`.
+    pending_base_scale: Option<f32>,
+    /// Issue #231 — monotonic "a repaint just produced fresh page
+    /// geometry" counter, bumped once per completed `render_document`
+    /// call (both the Vello and Canvas2D branches, at the same
+    /// chokepoint that refreshes `last_paint_dims`). `SetZoom` /
+    /// `SetDeviceScale` / `ExpandLayout` change page geometry without
+    /// bumping `mutation_seq` (the document didn't change), so the
+    /// worker's mutation-seq gate alone never re-broadcasts `Painted`
+    /// for them and the overlays / page tops stay stale until the next
+    /// edit. The worker compares THIS counter separately (`paint_dims()`
+    /// carries it) and re-broadcasts on a move, independent of whether
+    /// the document itself changed.
+    paint_geometry_seq: u64,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -977,6 +1001,9 @@ fn assemble_engine(
         last_command_ms: 0.0,
         last_paint_ms: 0.0,
         mutation_seq: 0,
+        pending_zoom: None,
+        pending_base_scale: None,
+        paint_geometry_seq: 0,
     }
 }
 
@@ -1013,9 +1040,9 @@ impl Engine {
     /// Phase 7 — list every inline-image media blob the document carries,
     /// keyed by media key (issue #188: the resolved target path for an
     /// imported picture, the minted id for an inserted one — the same key
-    /// the display list's `DrawImage.rel_id` names). The TS shell consumes
-    /// this list once after `OpenDocx`, decodes each blob into an
-    /// `ImageBitmap` via the browser, and installs the result via
+    /// the display list's `DrawImage.media_key` names, issue #224). The TS
+    /// shell consumes this list once after `OpenDocx`, decodes each blob
+    /// into an `ImageBitmap` via the browser, and installs the result via
     /// [`Engine::register_image`]. Returns an array of
     /// `{ rel_id, mime, bytes }` objects.
     pub fn media_entries(&self) -> Result<JsValue, JsValue> {
@@ -1121,6 +1148,7 @@ impl Engine {
             layout_degraded: dims.layout_degraded,
             paint_ms: dims.paint_ms,
             mutation_seq: self.mutation_seq,
+            paint_geometry_seq: self.paint_geometry_seq,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -1134,6 +1162,20 @@ impl Engine {
     /// a `BigInt`.
     pub fn document_mutation_seq(&self) -> f64 {
         self.mutation_seq as f64
+    }
+
+    /// Issue #231 — the engine's own "a repaint just produced fresh page
+    /// geometry" signal (see the `paint_geometry_seq` field): a monotonic
+    /// counter bumped once per completed `render_document` call,
+    /// independent of `document_mutation_seq` (a zoom / device-scale /
+    /// `ExpandLayout` repaint moves this WITHOUT moving that one — the
+    /// document didn't change, only its painted scale or laid-out
+    /// extent). The worker compares this across a command the same way it
+    /// compares `document_mutation_seq`, and re-broadcasts `Painted` on a
+    /// move so the overlays never read stale `page_tops` / `page_heights`
+    /// after a pure zoom change.
+    pub fn paint_geometry_seq(&self) -> f64 {
+        self.paint_geometry_seq as f64
     }
 
     /// Sprint 10 — drain queued `aria-live` announcements as
@@ -1167,13 +1209,27 @@ impl Engine {
                         block: block_idx as u32,
                         start: r.start,
                         end: r.end,
-                        kind: match r.kind {
-                            engine::RevisionKind::Insert => "insert",
-                            engine::RevisionKind::Delete => "delete",
-                            engine::RevisionKind::FormatChange => "format",
-                        },
+                        kind: revision_kind_label(r.kind),
                         author: r.author.clone(),
                         date: r.date.clone(),
+                        move_name: r.move_name.clone(),
+                        mark: false,
+                    });
+                }
+                /* Issue #262 — the paragraph-mark revision, addressed as
+                the empty range at the paragraph end (what
+                `AcceptRevision` / `RejectRevision` resolve it by). */
+                if let Some(r) = &p.mark_revision {
+                    let end = p.text.len() as u32;
+                    rows.push(RevisionOut {
+                        block: block_idx as u32,
+                        start: end,
+                        end,
+                        kind: revision_kind_label(r.kind),
+                        author: r.author.clone(),
+                        date: r.date.clone(),
+                        move_name: r.move_name.clone(),
+                        mark: true,
                     });
                 }
             }
@@ -1244,6 +1300,11 @@ struct PaintDimsOut {
     mutation_seq: u64,
     /// Issue #86 — mirrors `Event::Painted.paint_ms` (see `LastPaintDims`).
     paint_ms: f32,
+    /// Issue #231 — mirrors `Engine::paint_geometry_seq()`: bumped on
+    /// every completed repaint independent of `mutation_seq`, so the
+    /// worker can re-broadcast `Painted` after a pure zoom / device-scale
+    /// change even though the document itself did not move.
+    paint_geometry_seq: u64,
 }
 
 #[derive(::serde::Serialize)]
@@ -1254,6 +1315,25 @@ struct RevisionOut {
     kind: &'static str,
     author: String,
     date: String,
+    /// Issue #247 — the move's range name (`MoveFrom` / `MoveTo` only):
+    /// the two halves of one move share it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    move_name: Option<String>,
+    /// Issue #262 — a paragraph-MARK revision (a tracked split / merge),
+    /// addressed by the empty range `start == end == text length`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mark: bool,
+}
+
+/// The `revisions_snapshot()` wire label of a revision kind.
+fn revision_kind_label(kind: engine::RevisionKind) -> &'static str {
+    match kind {
+        engine::RevisionKind::Insert => "insert",
+        engine::RevisionKind::Delete => "delete",
+        engine::RevisionKind::FormatChange => "format",
+        engine::RevisionKind::MoveFrom => "move-from",
+        engine::RevisionKind::MoveTo => "move-to",
+    }
 }
 
 #[derive(::serde::Serialize)]
@@ -1850,6 +1930,21 @@ const HYPERLINK_BLUE: [u8; 4] = [0x05, 0x63, 0xC1, 0xFF];
 /// with a later cut.
 const REVISION_INSERT_COLOR: [u8; 4] = [0x00, 0x80, 0x00, 0xFF];
 const REVISION_DELETE_COLOR: [u8; 4] = [0xCC, 0x00, 0x00, 0xFF];
+/// Issue #247 — tracked moves get their own tint (both halves), so a
+/// move reads differently from an unrelated insert / delete pair.
+const REVISION_MOVE_COLOR: [u8; 4] = [0x6A, 0x1B, 0x9A, 0xFF];
+
+/// Issue #262 — the pilcrow colour of a paragraph whose MARK carries a
+/// tracked change (paint-only review decoration), in the same tint as
+/// the matching text revision.
+fn review_mark_color(para: &engine::Paragraph) -> Option<[u8; 4]> {
+    para.mark_revision.as_ref().map(|r| match r.kind {
+        engine::RevisionKind::Insert => REVISION_INSERT_COLOR,
+        engine::RevisionKind::Delete => REVISION_DELETE_COLOR,
+        engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => REVISION_MOVE_COLOR,
+        engine::RevisionKind::FormatChange => REVISION_INSERT_COLOR,
+    })
+}
 
 /// Phase 8b — overlay each revision range so insertions render with
 /// `underline = true` + the insert colour and deletions render with
@@ -1905,6 +2000,22 @@ fn apply_revision_overlay(
                         sub.strike = true;
                         if sub.color == default_color {
                             sub.color = REVISION_DELETE_COLOR;
+                        }
+                    }
+                    /* Issue #247 — a move's source half reads like a
+                    deletion, its destination like an insertion (double
+                    underline), both in the move tint. Paint-only: glyph
+                    advances do not change. */
+                    engine::RevisionKind::MoveFrom => {
+                        sub.strike = true;
+                        if sub.color == default_color {
+                            sub.color = REVISION_MOVE_COLOR;
+                        }
+                    }
+                    engine::RevisionKind::MoveTo => {
+                        sub.underline = engine::UnderlineStyle::Double;
+                        if sub.color == default_color {
+                            sub.color = REVISION_MOVE_COLOR;
                         }
                     }
                     /* Sprint 14 (#14) — FormatChange has no text-wrap
@@ -3010,6 +3121,12 @@ fn paragraph_layout_key(
         r.start.hash(&mut h);
         r.end.hash(&mut h);
         matches!(r.kind, engine::RevisionKind::Insert).hash(&mut h);
+        /* Issue #247 — the move kinds paint differently from ins / del. */
+        matches!(
+            r.kind,
+            engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo
+        )
+        .hash(&mut h);
     }
     /* Audit gap A.M3 — tab stops affect glyph advances at the line
     builder's post-pass; without them in the key, two paragraphs with
@@ -3205,6 +3322,7 @@ fn layout_story_blocks_cut(
                 };
                 p.borders = para.props.borders.clone();
                 p.shading = para.props.shading;
+                p.review_mark = review_mark_color(para);
                 LayoutBlock::Paragraph(p)
             }
             engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
@@ -5100,6 +5218,7 @@ fn collect_paragraph_image_rects(
                         path: path.clone(),
                         at: run.source_range.start + g.cluster,
                         rel_id: rel.to_string(),
+                        media_key: rel.to_string(),
                         rect: BridgeRect {
                             x: x0,
                             y: y0,
@@ -5171,6 +5290,7 @@ fn collect_text_box_image_rects(
             path: engine_to_bridge_path(host),
             at: nf.at,
             rel_id: nf.rel_id.clone(),
+            media_key: nf.rel_id.clone(),
             rect: BridgeRect {
                 x: cx + nf.origin.x,
                 y: cy + nf.origin.y,
@@ -5950,6 +6070,42 @@ fn selection_rects_geom(
     rects
 }
 
+/// Issue #276 — typing over (or replacing) a non-empty selection gives the
+/// new text the formatting of the FIRST replaced character, as Word does —
+/// and as the toolbar already reports for a range (`attrs_at` reads the
+/// selection start). `None` for a collapsed caret (plain insertion inherits
+/// the character before the caret inside `DocumentTree::insert_text`) or
+/// when the selection starts at a paragraph end (nothing replaced there).
+fn replaced_text_style(
+    doc: &DocumentTree,
+    start: &BridgeLogicalPos,
+    end: &BridgeLogicalPos,
+) -> Option<SpanStyle> {
+    if start == end {
+        return None;
+    }
+    let p = doc.paragraph_at_path(&bridge_to_engine_path(start.path.clone()))?;
+    ((start.offset as usize) < p.text.len()).then(|| p.style_at(start.offset))
+}
+
+/// Issue #276 — apply [`replaced_text_style`]'s result to the `len` bytes
+/// just inserted at `start`.
+fn restyle_replacement(
+    doc: DocumentTree,
+    style: Option<SpanStyle>,
+    start: &BridgeLogicalPos,
+    len: usize,
+) -> DocumentTree {
+    match style {
+        Some(style) if len > 0 => doc.set_span_style(
+            to_engine_pos(start.clone()),
+            start.offset + len as u32,
+            style,
+        ),
+        _ => doc,
+    }
+}
+
 /// Order two positions into document order (path, then offset).
 fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, BridgeLogicalPos) {
     use core::cmp::Ordering;
@@ -6036,18 +6192,21 @@ fn push_run(runs: &mut Vec<A11yRun>, text: &str, s: u32, e: u32, style: SpanStyl
                 .unwrap_or(engine::UnderlineStyle::None)
                 .is_visible(),
             note_ref: None,
+            object: None,
         });
     }
 }
 
 /// Split a paragraph into gap-free accessibility runs by its style spans.
 ///
-/// Issue #203 — `subs` are the paragraph's note marks (each a U+FFFC
-/// placeholder byte offset, the display text, the optional note link):
-/// each placeholder is replaced by its own run carrying the marker text
-/// (and `note_ref` for a reference), styled like the span it sits in.
-/// Without `subs` the output is exactly the pre-#203 run list.
-fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
+/// Issue #203 / #215 — `subs` are the paragraph's sentinel marks (each a
+/// U+FFFC placeholder byte offset, the display text, and the optional note
+/// / object link): each placeholder is replaced by its own run carrying
+/// the mark's text (empty for an inline object — see
+/// [`A11ySentinelMark::object`]) and its `note_ref` / `object`, styled
+/// like the span it sits in. Without `subs` the output is exactly the
+/// pre-#203 run list.
+fn a11y_runs(para: &engine::Paragraph, subs: &[A11ySentinelMark]) -> Vec<A11yRun> {
     let len = para.text.len() as u32;
     let mut runs: Vec<A11yRun> = Vec::new();
     let push = |runs: &mut Vec<A11yRun>, s: u32, e: u32, style: SpanStyle| {
@@ -6063,6 +6222,7 @@ fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
                     .unwrap_or(engine::UnderlineStyle::None)
                     .is_visible(),
                 note_ref: m.note_ref.clone(),
+                object: m.object.clone(),
             });
             cursor = (m.at + A11Y_PLACEHOLDER_LEN).min(e);
         }
@@ -6078,14 +6238,19 @@ fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
     runs
 }
 
-/// UTF-8 length of the U+FFFC object placeholder a note mark occupies.
+/// UTF-8 length of the U+FFFC object placeholder a sentinel mark occupies.
 const A11Y_PLACEHOLDER_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
 
-/// Issue #203 — one note mark inside a paragraph, for [`a11y_runs`].
-struct A11yNoteMark {
+/// Issue #203 / #215 — one U+FFFC sentinel's replacement inside a
+/// paragraph, for [`a11y_runs`]: a note reference / self-mark (`note_ref`
+/// or bare marker `text`), or (issue #215) an inline image / text box
+/// (`object`, `text` empty — the object IS the run). Exactly one of
+/// `note_ref` / `object` is ever set.
+struct A11ySentinelMark {
     at: u32,
     text: String,
     note_ref: Option<bridge::A11yNoteRef>,
+    object: Option<bridge::A11yObjectRef>,
 }
 
 /// Issue #203 — the note context of a body walk: the document (for the
@@ -6129,14 +6294,19 @@ fn note_ref_anchor(kind: &engine::InlineKind) -> Option<engine::NoteAnchor> {
     }
 }
 
-/// Issue #203 — the note marks of `p` in `scope`: reference marks when
-/// the walk carries a note context (the body), the self-mark when the
-/// walk is a note story's body. Only real U+FFFC placeholders qualify.
-fn a11y_note_marks(p: &engine::Paragraph, scope: A11yScope<'_>) -> Vec<A11yNoteMark> {
-    let mut marks: Vec<A11yNoteMark> = Vec::new();
-    if scope.notes.is_none() && scope.self_marker.is_none() {
-        return marks;
-    }
+/// Issue #203 / #215 — the sentinel marks of `p` in `scope`: a note
+/// reference mark / self-mark when the walk carries a note context (only
+/// then — see [`A11yNotes`]), and (unconditionally, any scope) an inline
+/// image or text box. Only real U+FFFC placeholders qualify. `path` is
+/// [`push_a11y_paragraph`]'s own path string for `p`, so a text-box
+/// mark's `id` matches the region [`push_a11y_text_boxes`] builds for the
+/// SAME box.
+fn a11y_inline_marks(
+    p: &engine::Paragraph,
+    scope: A11yScope<'_>,
+    path: &str,
+) -> Vec<A11ySentinelMark> {
+    let mut marks: Vec<A11ySentinelMark> = Vec::new();
     for io in &p.inline_objects {
         if !p
             .text
@@ -6145,26 +6315,60 @@ fn a11y_note_marks(p: &engine::Paragraph, scope: A11yScope<'_>) -> Vec<A11yNoteM
         {
             continue;
         }
-        if let Some(notes) = scope.notes
-            && let Some(anchor) = note_ref_anchor(&io.kind)
-        {
-            let note_ref = notes.doc.note_story(anchor).map(|_| bridge::A11yNoteRef {
-                kind: a11y_note_kind(anchor.kind),
-                id: a11y_note_id(anchor),
-            });
-            marks.push(A11yNoteMark {
-                at: io.at,
-                text: notes.markers.get(&anchor).cloned().unwrap_or_default(),
-                note_ref,
-            });
-        } else if let Some(marker) = scope.self_marker
-            && matches!(io.kind, engine::InlineKind::NoteSelfRef { .. })
-        {
-            marks.push(A11yNoteMark {
-                at: io.at,
-                text: marker.to_string(),
-                note_ref: None,
-            });
+        match &io.kind {
+            engine::InlineKind::Image { .. } => {
+                let id = io.kind.image_media_key().unwrap_or_default().to_string();
+                let (name, descr) = io.image_label().unwrap_or((None, None));
+                marks.push(A11ySentinelMark {
+                    at: io.at,
+                    text: String::new(),
+                    note_ref: None,
+                    object: Some(bridge::A11yObjectRef {
+                        kind: bridge::A11yObjectKind::Image,
+                        id,
+                        alt: descr.or(name),
+                    }),
+                });
+            }
+            engine::InlineKind::TextBox { .. } => {
+                let id = format!("{}{path}@{}", scope.id_prefix, io.at);
+                let (name, descr) = io.text_box_label().unwrap_or((None, None));
+                marks.push(A11ySentinelMark {
+                    at: io.at,
+                    text: String::new(),
+                    note_ref: None,
+                    object: Some(bridge::A11yObjectRef {
+                        kind: bridge::A11yObjectKind::TextBox,
+                        id,
+                        alt: descr.or(name),
+                    }),
+                });
+            }
+            _ => {
+                if let Some(notes) = scope.notes
+                    && let Some(anchor) = note_ref_anchor(&io.kind)
+                {
+                    let note_ref = notes.doc.note_story(anchor).map(|_| bridge::A11yNoteRef {
+                        kind: a11y_note_kind(anchor.kind),
+                        id: a11y_note_id(anchor),
+                    });
+                    marks.push(A11ySentinelMark {
+                        at: io.at,
+                        text: notes.markers.get(&anchor).cloned().unwrap_or_default(),
+                        note_ref,
+                        object: None,
+                    });
+                } else if let Some(marker) = scope.self_marker
+                    && matches!(io.kind, engine::InlineKind::NoteSelfRef { .. })
+                {
+                    marks.push(A11ySentinelMark {
+                        at: io.at,
+                        text: marker.to_string(),
+                        note_ref: None,
+                        object: None,
+                    });
+                }
+            }
         }
     }
     marks.sort_by_key(|m| m.at);
@@ -6357,7 +6561,7 @@ fn push_a11y_paragraph(
     out.push(A11yNode::Paragraph(A11yParagraph {
         direction,
         resolved_direction,
-        runs: a11y_runs(p, &a11y_note_marks(p, scope)),
+        runs: a11y_runs(p, &a11y_inline_marks(p, scope, path)),
     }));
     push_a11y_text_boxes(out, p, direction, scope, path);
     /* Issue #203 — the footnotes FIRST referenced in this paragraph
@@ -7161,6 +7365,8 @@ impl Engine {
             Command::RejectRevision { block, start, end } => {
                 self.do_reject_revision(block, start, end)
             }
+            Command::AcceptAllRevisions => self.do_resolve_all_revisions(true),
+            Command::RejectAllRevisions => self.do_resolve_all_revisions(false),
             Command::InsertComment {
                 range,
                 text,
@@ -7304,8 +7510,20 @@ impl Engine {
     /// Reset the document + undo stack to a single paragraph of `text`, cache
     /// `cfg` so subsequent InsertText/Undo/Redo commands repaint without
     /// re-specifying params, then paint the first frame.
-    fn render_page(&mut self, text: String, cfg: RenderConfig) -> Event {
+    fn render_page(&mut self, text: String, mut cfg: RenderConfig) -> Event {
         self.install_undo_stack(UndoStack::new(DocumentTree::from_text(&text), 100));
+        /* Issue #239 — a `SetZoom` / `SetDeviceScale` sent before this,
+        the engine's first `RenderPage`, had no layout config to fold into
+        and was stashed as pending (see `do_set_zoom` / `do_set_device_scale`).
+        Compose it into the fresh config now instead of dropping it, so
+        `scale = base_scale × zoom` holds from the very first paint. */
+        if let Some(base) = self.pending_base_scale.take() {
+            cfg.base_scale = base;
+        }
+        if let Some(zoom) = self.pending_zoom.take() {
+            cfg.zoom = zoom;
+        }
+        cfg.scale = cfg.base_scale * cfg.zoom;
         self.layout_cfg = Some(cfg);
         /* A RenderPage reset is a fresh document; a surviving selection
         or IME preview from the previous session would be load-bearing
@@ -7573,6 +7791,11 @@ impl Engine {
         self.fonts.clear();
         self.install_undo_stack(UndoStack::new(DocumentTree::new(), UNDO_CAP));
         self.layout_cfg = None;
+        /* Issue #239 — a pending pre-`RenderPage` zoom belongs to the
+        session that just crashed; `do_recover`'s own tail-scan (below)
+        re-derives whatever the replayed log wants from scratch. */
+        self.pending_zoom = None;
+        self.pending_base_scale = None;
         self.selection = None;
         self.composition = None;
         self.pending_format = None;
@@ -7771,9 +7994,15 @@ impl Engine {
     }
 
     /// Issue #52 — the user zoom fraction the engine renders at; `1.0`
-    /// (the `RenderPage` default) before any layout config exists.
+    /// (the `RenderPage` default) before any layout config exists AND no
+    /// zoom is pending. Issue #239 — a `SetZoom` sent before the first
+    /// `RenderPage` has no config to live in yet but IS queued
+    /// (`pending_zoom`); report it here so it is never invisible in the
+    /// gap between the `SetZoom` and the `RenderPage` that consumes it.
     fn user_zoom(&self) -> f32 {
-        self.layout_cfg.as_ref().map_or(1.0, |c| c.zoom)
+        self.layout_cfg
+            .as_ref()
+            .map_or_else(|| self.pending_zoom.unwrap_or(1.0), |c| c.zoom)
     }
 
     /// Issue #66 — the backend this instance actually paints with.
@@ -9049,6 +9278,8 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
+                        /* Issue #262 — the pilcrow of a tracked mark. */
+                        para_box.review_mark = review_mark_color(para);
                         /* Issue #95 / #178 / #179 — pagination
                         constraints from the resolved (style-cascaded)
                         properties. keepNext/keepLines are tri-state
@@ -9402,6 +9633,10 @@ impl Engine {
                 layout_degraded: stats.layout_degraded.clone(),
                 paint_ms: self.last_paint_ms,
             };
+            /* Issue #231 — a completed repaint, independent of whether the
+            DOCUMENT changed (mutation_seq). The worker uses this to
+            re-broadcast `Painted` after a zoom / device-scale change. */
+            self.paint_geometry_seq += 1;
             return Ok(stats);
         }
 
@@ -9463,6 +9698,8 @@ impl Engine {
             layout_degraded: stats.layout_degraded.clone(),
             paint_ms: self.last_paint_ms,
         };
+        /* Issue #231 — see the Vello branch above. */
+        self.paint_geometry_seq += 1;
         Ok(stats)
     }
 
@@ -10649,6 +10886,7 @@ impl Engine {
                     path,
                     at: f.at,
                     rel_id: f.rel_id.clone(),
+                    media_key: f.rel_id.clone(),
                     rect: BridgeRect {
                         x: f.origin.x,
                         y: page_top + f.origin.y,
@@ -11531,7 +11769,6 @@ impl Engine {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
         };
-        let probe = self.attrs_probe(&start, &end);
         Event::SelectionChanged {
             range: BridgeLogicalRange {
                 start: start.clone(),
@@ -11548,7 +11785,7 @@ impl Engine {
             rects,
             /* A collapsed caret reflects any armed pending style; a real
             selection reports the document's own attributes (Backlog #11). */
-            attrs_at_caret: self.attrs_at(probe, start == end),
+            attrs_at_caret: self.attrs_at(start.clone(), start == end),
             paragraph_alignment: self.paragraph_alignment_at(&sel.caret.path),
             paragraph_style_id: self.with_selection_doc(|d| {
                 d.paragraph_at_path(&bridge_to_engine_path(sel.caret.path.clone()))
@@ -12026,31 +12263,19 @@ impl Engine {
         Some(head)
     }
 
-    /// The offset whose style the toolbar should reflect: the selection start
-    /// for a range, or the char before a collapsed caret (the style typing
-    /// there would extend). `style_at(caret)` alone reads the char *after* the
-    /// caret, which is unstyled right after formatting a selection.
-    fn attrs_probe(&self, start: &BridgeLogicalPos, end: &BridgeLogicalPos) -> BridgeLogicalPos {
-        if start != end || start.offset == 0 {
-            return start.clone();
-        }
-        let engine_path = bridge_to_engine_path(start.path.clone());
-        let prev = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path)
-                .map_or(start.offset, |p| p.prev_offset(start.offset))
-        });
-        BridgeLogicalPos {
-            path: start.path.clone(),
-            offset: prev,
-        }
-    }
-
     /// Resolved text attributes at `pos`. Spans carry size + colour + the
     /// bold/italic/underline flags; `strike`, `bg_color`, `script` and
-    /// `language` default until those land. When `apply_pending` is set (a
-    /// collapsed caret), any armed sticky style is overlaid so the toolbar
-    /// previews what the next keystroke will adopt (Backlog #11).
-    fn attrs_at(&self, pos: BridgeLogicalPos, apply_pending: bool) -> TextAttrs {
+    /// `language` default until those land.
+    ///
+    /// `collapsed` (a caret, not a range): the toolbar previews what the
+    /// next keystroke will produce — issue #276: the very style
+    /// `DocumentTree::insert_text` continues (`Paragraph::typing_style_at`:
+    /// the character before the caret, at the paragraph start the one
+    /// after it, never an inline-object anchor's), with any armed sticky
+    /// style overlaid (Backlog #11). A range reports its first character
+    /// — which is also what typing over it produces.
+    fn attrs_at(&self, pos: BridgeLogicalPos, collapsed: bool) -> TextAttrs {
+        let apply_pending = collapsed;
         let engine_path = bridge_to_engine_path(pos.path.clone());
         /* Issue #29 — fold the paragraph's style-chain run base UNDER
         the direct span style so the toolbar reads the same cascaded
@@ -12059,8 +12284,13 @@ impl Engine {
         let mut style = self.with_selection_doc(|doc| {
             doc.paragraph_at_path(&engine_path)
                 .map_or_else(SpanStyle::default, |p| {
+                    let direct = if collapsed {
+                        p.typing_style_at(pos.offset)
+                    } else {
+                        p.style_at(pos.offset)
+                    };
                     doc.resolve_style_run_cascade(p.style_id.as_deref())
-                        .merged_with(p.style_at(pos.offset))
+                        .merged_with(direct)
                 })
         });
         if apply_pending && let Some(pending) = self.pending_format.as_ref() {
@@ -12190,12 +12420,14 @@ impl Engine {
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
         };
+        let replaced = replaced_text_style(&temp, &start, &end);
         let base = if start == end {
             temp
         } else {
             temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
+        let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,
@@ -13725,6 +13957,7 @@ impl Engine {
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
+        let replaced = replaced_text_style(self.undo.current(), &start, &end);
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
@@ -13752,6 +13985,7 @@ impl Engine {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
         let inserted_end = start.offset + text.len() as u32;
+        new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         /* Sticky formatting (Backlog #11): overlay any armed pending style
         onto the just-inserted run. It is intentionally NOT cleared here — it
         stays armed across consecutive keystrokes so a whole typed run shares
@@ -13790,6 +14024,7 @@ impl Engine {
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
+        let replaced = replaced_text_style(self.undo.current(), &start, &end);
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
@@ -13809,6 +14044,7 @@ impl Engine {
         } else {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
+        let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,
@@ -14551,6 +14787,45 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #262 — `Command::AcceptAllRevisions` /
+    /// `RejectAllRevisions`: every tracked change of the body resolved in
+    /// one tree edit, pushed as ONE undo step. Nothing to resolve → no
+    /// undo step. The selection is clamped back into the (possibly
+    /// merged / shortened) paragraphs.
+    fn do_resolve_all_revisions(&mut self, accept: bool) -> Event {
+        let doc = self.undo.current();
+        if !doc.has_revisions() {
+            self.announce(AnnouncementPriority::Polite, "No tracked changes");
+            return self.selection_changed();
+        }
+        let new_doc = doc.resolve_all_revisions(accept);
+        self.undo.push(new_doc);
+        /* Merged / shortened paragraphs: keep the caret on real text. */
+        if let Some(sel) = self.selection.clone() {
+            let doc = self.undo.current();
+            self.selection = Some(SelectionState {
+                anchor: clamp_pos(doc, sel.anchor),
+                caret: clamp_pos(doc, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+        }
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(
+            AnnouncementPriority::Polite,
+            if accept {
+                "All tracked changes accepted"
+            } else {
+                "All tracked changes rejected"
+            },
+        );
+        self.selection_changed()
+    }
+
     /// `Command::InsertComment` (Sprint 7 UI Edition). Stamped with the
     /// engine clock via `current_review_date` (issue #118 — the
     /// `SetReviewIdentity` override wins, else `Date` / `SystemTime`).
@@ -15198,10 +15473,19 @@ impl Engine {
     /// a full repaint. Clamped to `[0.25, 4.0]` and COMPOSED with the
     /// boot `base_scale` (`scale = base_scale × zoom`) so zooming
     /// never clobbers DPI scaling and zoom `1.0` restores the exact
-    /// boot rendering. `RenderPage` must have cached a `layout_cfg`
-    /// first (a fresh engine before any render has no scale to
-    /// mutate — return a no-op `selection_changed` so the caller
-    /// still sees a reply).
+    /// boot rendering.
+    ///
+    /// Issue #239 — before the first `RenderPage`, there is no
+    /// `layout_cfg` to mutate (a fresh engine has no scale) AND no
+    /// selection either (`render_page` always resets it), so this used
+    /// to route through `selection_changed()` and answer with a
+    /// misleading `Event::Error` ("no active selection") for what was
+    /// actually a successful command whose effect just hadn't landed
+    /// yet. Stash the value instead; `render_page` composes it into the
+    /// fresh config on the very first paint, and answer with
+    /// `Event::ZoomPending` — honest about there being no layout
+    /// config yet, rather than fabricating selection/caret geometry
+    /// over a document that doesn't exist.
     ///
     /// Issue #186 — a NaN/±∞ `zoom` is rejected with a typed
     /// `Event::Error` before `.clamp()` ever sees it (`f32::clamp`
@@ -15214,12 +15498,15 @@ impl Engine {
             };
         }
         let zoom = zoom.clamp(0.25, 4.0);
-        if let Some(cfg) = self.layout_cfg.as_mut() {
-            cfg.zoom = zoom;
-            cfg.scale = cfg.base_scale * zoom;
-        } else {
-            return self.selection_changed();
-        }
+        let Some(cfg) = self.layout_cfg.as_mut() else {
+            self.pending_zoom = Some(zoom);
+            return Event::ZoomPending {
+                zoom,
+                device_scale: self.pending_base_scale,
+            };
+        };
+        cfg.zoom = zoom;
+        cfg.scale = cfg.base_scale * zoom;
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15234,6 +15521,8 @@ impl Engine {
     /// the mirror image of `do_set_zoom`. The wider clamp admits real
     /// device ratios (dpr up to ~6 × the 4/3 CSS-pt factor).
     ///
+    /// Issue #239 — same pre-`RenderPage` pending path as `do_set_zoom`.
+    ///
     /// Issue #186 — same NaN/±∞ rejection as `do_set_zoom`.
     fn do_set_device_scale(&mut self, scale: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(scale) {
@@ -15242,12 +15531,15 @@ impl Engine {
             };
         }
         let base = scale.clamp(0.5, 8.0);
-        if let Some(cfg) = self.layout_cfg.as_mut() {
-            cfg.base_scale = base;
-            cfg.scale = base * cfg.zoom;
-        } else {
-            return self.selection_changed();
-        }
+        let Some(cfg) = self.layout_cfg.as_mut() else {
+            self.pending_base_scale = Some(base);
+            return Event::ZoomPending {
+                zoom: self.pending_zoom.unwrap_or(1.0),
+                device_scale: Some(base),
+            };
+        };
+        cfg.base_scale = base;
+        cfg.scale = base * cfg.zoom;
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -16554,6 +16846,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -17003,6 +17298,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -17048,6 +17344,7 @@ mod tests {
                 italic: false,
                 underline: false,
                 note_ref: None,
+                object: None,
             }],
         })
     }
@@ -17156,6 +17453,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -17194,6 +17492,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -17401,6 +17700,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -17459,6 +17761,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -17508,6 +17813,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -17634,6 +17942,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -17673,6 +17984,7 @@ mod tests {
                 id: "Heading1".into(),
                 name: "Heading 1".into(),
                 based_on: None,
+                next: None,
                 para: engine::ParaProperties::default(),
                 run: engine::SpanStyle {
                     bold: Some(true),
@@ -18181,6 +18493,9 @@ mod tests {
                 last_command_ms: 0.0,
                 last_paint_ms: 0.0,
                 mutation_seq: 0,
+                pending_zoom: None,
+                pending_base_scale: None,
+                paint_geometry_seq: 0,
             }
         }
 
@@ -18351,7 +18666,9 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             })],
+            source_markup: None,
         }
     }
 
@@ -18362,10 +18679,12 @@ mod tests {
             rows: vec![engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells,
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }
     }
 
@@ -20610,7 +20929,7 @@ mod tests {
         let draw = cmds
             .iter()
             .position(|c| {
-                matches!(c, render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdBoxPic")
+                matches!(c, render::scene::DisplayCmd::DrawImage { media_key, .. } if media_key == "rIdBoxPic")
             })
             .expect("story picture paints");
         let pop = cmds
@@ -20958,7 +21277,7 @@ mod tests {
         let scene = render::scene::build_document_scene(&pages, 0.0);
         assert!(scene.cmds.iter().any(|c| matches!(
             c,
-            render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdInnerPic"
+            render::scene::DisplayCmd::DrawImage { media_key, .. } if media_key == "rIdInnerPic"
         )));
     }
 
@@ -21580,11 +21899,14 @@ mod tests {
                         text: "cell".into(),
                         ..Default::default()
                     })],
+                    source_markup: None,
                 }],
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         let mut engine = test_engine_with_doc(doc);
         let cell_path = BridgeBlockPath {
@@ -21910,6 +22232,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         }
     }
 
@@ -22580,6 +22905,41 @@ mod tests {
         assert_eq!(zoom_of(engine.do_set_device_scale(2.0)), 4.0);
     }
 
+    /// Issue #231 — `SetZoom` / `SetDeviceScale` repaint (bumping
+    /// `paint_geometry_seq`, the engine's own "fresh page geometry"
+    /// signal) WITHOUT mutating the document (`mutation_seq` stays put).
+    /// The worker uses exactly this split to broadcast a fresh `Painted`
+    /// after a pure zoom / device-scale change without triggering a
+    /// spurious accessibility-tree rebuild (the visible text didn't
+    /// change, only its painted scale).
+    #[test]
+    fn set_zoom_and_set_device_scale_bump_paint_geometry_seq_not_mutation_seq() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello"));
+        let mutation_before = engine.mutation_seq;
+        let geometry_before = engine.paint_geometry_seq;
+
+        assert!(matches!(
+            engine.do_set_zoom(1.5),
+            Event::SelectionChanged { .. }
+        ));
+        assert_eq!(
+            engine.mutation_seq, mutation_before,
+            "zoom does not mutate the document"
+        );
+        assert!(
+            engine.paint_geometry_seq > geometry_before,
+            "zoom repaints — the geometry counter must move"
+        );
+
+        let geometry_before = engine.paint_geometry_seq;
+        assert!(matches!(
+            engine.do_set_device_scale(2.0),
+            Event::SelectionChanged { .. }
+        ));
+        assert_eq!(engine.mutation_seq, mutation_before);
+        assert!(engine.paint_geometry_seq > geometry_before);
+    }
+
     #[test]
     fn set_device_scale_rejects_non_finite_scale_and_leaves_geometry_unchanged() {
         let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
@@ -23142,6 +23502,7 @@ mod tests {
         let cell = |text: &str| engine::TableCell {
             props: engine::CellProperties::default(),
             blocks: vec![engine::Block::Paragraph(rtl(text))],
+            source_markup: None,
         };
         let mut d = DocumentTree::from_text("");
         d.blocks.set(0, engine::Block::Paragraph(rtl("intro")));
@@ -23149,6 +23510,7 @@ mod tests {
             .map(|r| engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells: (1..=3).map(|c| cell(&format!("r{r}c{c}"))).collect(),
+                source_markup: None,
             })
             .collect();
         d.blocks.push_back(engine::Block::Table(engine::Table {
@@ -23162,6 +23524,7 @@ mod tests {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(rtl("outro")));
         d
@@ -23193,8 +23556,10 @@ mod tests {
                     .map(|c| engine::TableCell {
                         props: engine::CellProperties::default(),
                         blocks: vec![engine::Block::Paragraph(para(&format!("r{r}c{c}")))],
+                        source_markup: None,
                     })
                     .collect(),
+                source_markup: None,
             })
             .collect();
         d.blocks.push_back(engine::Block::Table(engine::Table {
@@ -23211,6 +23576,7 @@ mod tests {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(para("outro")));
         d
@@ -23585,6 +23951,7 @@ mod tests {
         t.rows.push(engine::TableRow {
             props: engine::RowProperties::default(),
             cells: vec![cell_with_text("next A"), cell_with_text("next B")],
+            source_markup: None,
         });
         let mut d = DocumentTree::from_text("intro");
         d.blocks.push_back(engine::Block::Table(t));
@@ -23862,6 +24229,7 @@ mod tests {
             t.rows.push(engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells: vec![cell_with_text(&format!("row {i}"))],
+                source_markup: None,
             });
         }
         d.blocks.push_back(engine::Block::Table(t));
@@ -25186,6 +25554,94 @@ mod snapshot_tests {
         assert_eq!(renderer_downgrade, Some(downgrade));
     }
 
+    /// Issue #239 — `SetZoom` sent before the engine's first `RenderPage`
+    /// used to be silently dropped: `do_set_zoom` found no `layout_cfg`
+    /// to mutate and fell through to `selection_changed()`, which
+    /// errored ("no active selection" — `render_page` is what seeds
+    /// one). It is now queued (`Event::ZoomPending`) and composed into
+    /// the config `render_page` builds, so `RenderPage`'s own first
+    /// paint already reflects it — `SET_ZOOM 1.5` → `RENDER_PAGE` →
+    /// painted page height is 150 % of the zoom-1.0 page height.
+    #[test]
+    fn set_zoom_before_render_page_is_queued_and_applied_on_first_render() {
+        let mut e = engine();
+        assert!(
+            e.layout_cfg.is_none(),
+            "a fresh engine has no layout config"
+        );
+        assert!(
+            e.selection.is_none(),
+            "render_page seeds the selection, not boot"
+        );
+
+        let queued = apply(&mut e, Command::SetZoom { scale: 1.5 });
+        match queued {
+            Event::ZoomPending { zoom, device_scale } => {
+                assert_eq!(zoom, 1.5);
+                assert_eq!(device_scale, None, "no SetDeviceScale queued yet");
+            }
+            other => panic!("expected ZoomPending, got {other:?}"),
+        }
+        assert_eq!(e.pending_zoom, Some(1.5), "stashed, not dropped");
+        assert_eq!(
+            e.user_zoom(),
+            1.5,
+            "user_zoom() reports the pending value even with no layout_cfg yet"
+        );
+
+        /* A real font so layout actually shapes the seed text — page
+        SIZE is independent of shaping, but every other RenderPage-driven
+        test in this file loads one, and there is no reason for this one
+        to be the exception. */
+        let font_bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        assert!(matches!(
+            apply(
+                &mut e,
+                Command::LoadFont {
+                    id: "test-latin".into(),
+                    bytes: font_bytes,
+                },
+            ),
+            Event::FontLoaded { .. }
+        ));
+
+        let rendered = apply(
+            &mut e,
+            Command::RenderPage {
+                text: "hello".into(),
+                font_id: "test-latin".into(),
+                base_direction: "LTR".into(),
+                px_size: 16.0,
+                line_height: 24.0,
+                align: "START".into(),
+                /* `.max(1.0)` composes to `base_scale = 1.0`, so
+                `scale = base_scale × zoom` is exactly the pending zoom —
+                no DPR noise in the assertion below. */
+                device_pixel_ratio: Some(1.0),
+            },
+        );
+        let Event::PageRendered { page_height, .. } = rendered else {
+            panic!("expected PageRendered, got {rendered:?}");
+        };
+        /* A4 height (`layout::A4Page::a4()`) is 841.9 pt; at the queued
+        150 % zoom (composed with the 1.0 base scale from
+        `device_pixel_ratio: Some(1.0)`) the painted page is 150 % of
+        that — not the un-zoomed 841.9 the pre-#239 drop would have left
+        it at. */
+        let expected_height = 841.9_f32 * 1.5;
+        assert!(
+            (page_height - expected_height).abs() < 0.5,
+            "page_height {page_height} should be ~{expected_height} (150% of A4), \
+             not the un-zoomed 841.9 the old drop would have produced"
+        );
+        assert_eq!(e.pending_zoom, None, "consumed by render_page");
+        let cfg = e.layout_cfg.as_ref().expect("render_page seeded a config");
+        assert_eq!(cfg.zoom, 1.5);
+        assert_eq!(cfg.base_scale, 1.0);
+        assert_eq!(cfg.scale, 1.5);
+        assert_eq!(e.user_zoom(), 1.5, "now read straight off the real config");
+    }
+
     #[test]
     fn snapshot_command_echoes_seq_and_reports_the_format_version() {
         let mut a = seeded_engine();
@@ -25622,9 +26078,41 @@ mod snapshot_tests {
     /// so paragraph 1 lands as a fully-contained middle paragraph of
     /// `DocumentTree::slice` — cloned verbatim, `style_id` intact.
     /// Selecting *within* a single paragraph goes through
-    /// `Paragraph::split_at` instead, which drops `style_id` on both
-    /// halves unconditionally (issue discovered by this task; see the
-    /// final report's "Discovered gaps").
+    /// `Paragraph::split_at`, which keeps `style_id` since issue #277 —
+    /// see `clipboard_docx_fragment_of_a_sub_range_keeps_the_style`.
+    /// Issue #277 — a copy of a sub-range INSIDE one styled paragraph
+    /// (`slice` → `Paragraph::split_at` twice) keeps the paragraph style:
+    /// `split_at` used to clear `style_id` on both halves, so the fragment
+    /// carried a bare paragraph even though #213 shipped the style table.
+    #[test]
+    fn clipboard_docx_fragment_of_a_sub_range_keeps_the_style() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        assert_eq!(e.undo.current().paragraph_text(1), Some("first item"));
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(1, 2),
+            caret: bpos_top(1, 8),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload { docx_fragment, .. } = e.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        let reread = format_docx::read_docx(&docx_fragment).expect("re-read fragment");
+        assert_eq!(reread.document.paragraph_text(0), Some("rst it"));
+        assert_eq!(
+            reread
+                .document
+                .nth_paragraph(0)
+                .unwrap()
+                .style_id
+                .as_deref(),
+            Some("ListParagraph"),
+            "a sub-range copy keeps the paragraph style"
+        );
+        assert!(reread.document.styles.contains_key("ListParagraph"));
+    }
+
     #[test]
     fn clipboard_docx_fragment_carries_the_source_packages_styles() {
         let mut e = opened_engine(PACKAGE_FIXTURE);
@@ -25936,6 +26424,9 @@ mod mutation_signal_tests;
 #[cfg(test)]
 mod a11y_direction_tests;
 
+#[cfg(test)]
+mod para_style_edit_tests;
+
 /// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
 /// `format_pdf::export_pdf` path, end to end (not the #144 acceptance
 /// test's `layout_paragraph`-simulated TOC-entry-shaped paragraph).
@@ -25946,6 +26437,9 @@ mod toc_pdf_export_tests;
 mod a11y_note_tests;
 
 #[cfg(test)]
+mod a11y_object_tests;
+
+#[cfg(test)]
 mod part_media_tests;
 
 #[cfg(test)]
@@ -25953,6 +26447,9 @@ mod block_remap_tests;
 
 #[cfg(test)]
 mod text_remap_tests;
+
+#[cfg(test)]
+mod revision_command_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
@@ -26340,6 +26837,7 @@ mod wire_validation_tests {
                 date: "d".into(),
                 id: None,
                 prev_attrs: None,
+                move_name: None,
             }],
             hyperlinks: vec![
                 engine::Hyperlink {

@@ -2864,6 +2864,7 @@ pub fn split_paragraph_at_line(
             space_after: 0.0,
             ..para.flow
         },
+        review_mark: None,
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -2886,6 +2887,8 @@ pub fn split_paragraph_at_line(
             page_break_before: false,
             ..para.flow
         },
+        /* Issue #262 — the paragraph mark ends the tail. */
+        review_mark: para.review_mark,
     };
     (Some(head), Some(tail))
 }
@@ -2955,6 +2958,7 @@ pub fn split_paragraph_at_line_index(
             space_after: 0.0,
             ..para.flow
         },
+        review_mark: None,
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -2977,6 +2981,8 @@ pub fn split_paragraph_at_line_index(
             page_break_before: false,
             ..para.flow
         },
+        /* Issue #262 — the paragraph mark ends the tail. */
+        review_mark: para.review_mark,
     };
     (Some(head), Some(tail))
 }
@@ -3058,6 +3064,7 @@ mod tests {
             shading: None,
             keep_next: false,
             flow: ParaFlow::default(),
+            review_mark: None,
         }
     }
 
@@ -3319,6 +3326,7 @@ mod tests {
                 shading: None,
                 keep_next: false,
                 flow: ParaFlow::default(),
+                review_mark: None,
             })],
             source_rid: None,
         }
@@ -3372,6 +3380,7 @@ mod tests {
             shading: None,
             keep_next: false,
             flow: ParaFlow::default(),
+            review_mark: None,
         }
     }
 

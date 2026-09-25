@@ -192,9 +192,13 @@ D5.10 are external/human sign-offs, not code.
 - **Release pipeline (D5.8).** `.github/workflows/release.yml` is
   tag-triggered (`v*`): builds the WASM artifact + static site + SBOM and
   publishes a GitHub Release. Cosign signing is a commented-out stub.
-- **CI.** A **non-blocking** `qa-harness` job in `ci.yml` runs the visual-diff,
-  memory and perf harnesses — non-blocking because golden pixel-reproducibility
-  on the GitHub runner is unproven across machines.
+- **CI.** A **non-blocking** `qa-harness` job in `ci.yml` runs the
+  `tools/visual-diff --tier A` farm — non-blocking because golden
+  pixel-reproducibility on the GitHub runner is unproven across machines;
+  `tools/memory-profile` / `tools/perf` are not wired into `ci.yml` at all
+  (their heavier fixtures blew the runner's time cap — run them locally or
+  on a nightly schedule). The Playwright e2e suite (`ts/e2e/`) became a
+  **blocking** `e2e` job later, issue #230 — see the Validation section.
 
 ## SDK architecture — the "Monaco Standard" (post-`beta.3`)
 
@@ -285,12 +289,34 @@ Engine backlog" references a real issue.
 - `cargo run -p shape-regression --release` — 0 failed on the corpus.
 - `cargo run -p roundtrip --release` — PASS.
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
-- `pnpm exec playwright test` (from `ts/`) — the 7 Phase 2 exit-gate e2e specs in `ts/e2e/` all green.
-- `cargo check --manifest-path fuzz/Cargo.toml` — the D5.5 fuzz crate compiles.
-- `cargo test --manifest-path fuzz/Cargo.toml` (issue #229) — the fuzz
-  crate's own unit tests, including the #186/#187 regression-seed checks.
-- The non-blocking `qa-harness` job runs the D5.1–D5.3 browser harnesses
-  (`tools/visual-diff` farm, `tools/memory-profile`, `tools/perf`).
+- `pnpm exec playwright test` (from `ts/`) — the full e2e suite in `ts/e2e/`
+  (`workers: 1`, well under a minute locally) all green.
+  **Blocking since issue #230**: `ci.yml`'s `e2e` job reuses the `wasm`
+  job's build (`actions/upload-artifact` / `download-artifact` of
+  `crates/engine-wasm/pkg` — TS imports it by relative path, no npm
+  indirection, so no Rust toolchain / wasm-pack rerun), ensures
+  `google-chrome-stable` is present (`channel: 'chrome'` — no Playwright
+  browser download), then runs `pnpm exec playwright test --reporter=line`
+  with `CI=true`; `ts/test-results/` uploads on failure. `playwright.config.ts`
+  sets `retries: process.env.CI ? 1 : 0` — a rare cold-Vite-dep-cache flake
+  observed once locally ("Execution context was destroyed" mid-`evaluate`),
+  not a mask for a repeatable failure; local runs stay retry-free.
+- `cargo check --manifest-path fuzz/Cargo.toml` — the D5.5 fuzz crate
+  compiles. `cargo test --manifest-path fuzz/Cargo.toml` (issue #229) — the
+  fuzz crate's own unit tests, including the #186/#187 regression-seed
+  checks. Both run inside `ci.yml`'s blocking `rust-native` job, alongside
+  fmt/clippy/`cargo test --workspace` — not a separate silent lane.
+- CI (`ci.yml`), blocking: `rust-native` (fmt + clippy + `cargo test
+  --workspace` + the two fuzz-crate steps above), `wasm` (build + size
+  budget + `wasm-pack test` + the `engine-wasm-pkg` artifact upload),
+  `e2e` (this suite, issue #230). Non-blocking (`continue-on-error: true`):
+  `qa-harness` runs `tools/visual-diff --tier A` only (capped at 3 min) —
+  non-blocking because golden pixel-reproducibility on the GitHub runner's
+  Chrome is still unproven across machines. `tools/memory-profile` and
+  `tools/perf` are **not** wired into `ci.yml` at all — the heavier
+  fixtures (100p/250p/500p) blew the runner's time cap; run them locally
+  (`node tools/memory-profile/run.mjs --budgets`, `node tools/perf/run.mjs
+  --strict`) or against a dedicated nightly runner.
 
 ## Visual-diff harness
 
@@ -352,9 +378,11 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
   regeneration didn't).
 - Every document that still rewrites source bytes gets a cheap root-cause
   tag (`hyperlink` / `comment anchor` / `form field` / `sdt` / `fldSimple`
-  / `move` / `table` / `rPr` / `other`) so the corpus can be tracked
-  against the filed issues (#242–#249) — see `tools/corpus-native`'s
-  `classify_rewrite` and `report.mjs`'s root-cause histogram.
+  / `move` / `table` / `rPr` / `other`, plus the one-byte shapes
+  `empty <w:p/>` (#267) and `t preserve`, issue #248) so the corpus can be
+  tracked against the filed issues (#242–#249) — see
+  `tools/corpus-native`'s `classify_rewrite` and `report.mjs`'s
+  root-cause histogram.
 - XML escapes: `&` `<` `>` only. `xml:space="preserve"` on every `<w:t>` to keep trailing whitespace.
 
 ## Bash / agent ergonomics

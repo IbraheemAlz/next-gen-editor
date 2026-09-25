@@ -352,6 +352,20 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "table_source_markup.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 12,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "intro",
+          "after"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "table_vmerge.docx": {
       "generator": "handcrafted",
       "phase_introduced": 5,

@@ -371,6 +371,7 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         shading: None,
         keep_next: false,
         flow: crate::boxes::ParaFlow::default(),
+        review_mark: None,
     }
 }
 
@@ -534,6 +535,7 @@ pub fn layout_paragraph_wrapped(
         shading: None,
         keep_next: false,
         flow: crate::boxes::ParaFlow::default(),
+        review_mark: None,
     }
 }
 

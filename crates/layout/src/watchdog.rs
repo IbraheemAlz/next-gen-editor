@@ -962,6 +962,7 @@ mod tests {
             shading: None,
             keep_next: false,
             flow: crate::boxes::ParaFlow::default(),
+            review_mark: None,
         })
     }
 

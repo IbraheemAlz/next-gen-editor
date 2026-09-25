@@ -304,13 +304,17 @@ pub enum Command {
     SetViewport {
         rect: Rect,
     },
+    /// Issue #239 — sent before the engine's first `RenderPage`, this is
+    /// queued (`Event::ZoomPending`) rather than dropped; `RenderPage`
+    /// composes it into the fresh layout config it builds.
     SetZoom {
         scale: f32,
     },
     /// Post-boot devicePixelRatio change (monitor move / browser zoom).
     /// Replaces the boot device scale (`devicePixelRatio × 4/3`) and
     /// recomposes the effective scale with the user zoom untouched —
-    /// unlike `SetZoom`, which owns the user-zoom factor.
+    /// unlike `SetZoom`, which owns the user-zoom factor. Issue #239 —
+    /// same pre-`RenderPage` queuing as `SetZoom`.
     SetDeviceScale {
         scale: f32,
     },
@@ -820,6 +824,18 @@ pub enum Command {
         start: u32,
         end: u32,
     },
+    /// Issue #262 — accept EVERY tracked change of the body (table cells
+    /// included) in document order, as one undo step: deletions and move
+    /// sources lose their text, insertions and move destinations keep
+    /// it, and a deleted (or moved-away) paragraph mark merges its
+    /// paragraph with the next. A document without revisions is a no-op
+    /// (no undo step).
+    AcceptAllRevisions,
+    /// Issue #262 — reject every tracked change of the body, as one undo
+    /// step: insertions and move destinations lose their text, a tracked
+    /// formatting change restores its recorded style, and an inserted
+    /// (or moved-in) paragraph mark merges its paragraph with the next.
+    RejectAllRevisions,
     /// Sprint 7 (UI Edition) — insert a new `<w:comment>` anchored
     /// to `range`. Engine assigns a fresh sequential `w:id`.
     InsertComment {
@@ -1008,9 +1024,14 @@ pub enum FieldKind {
 
 /// Issue #81 — the `TOC` field switches [`Command::InsertToc`] authors.
 /// Defaults are Word's Insert › Table of Contents: `TOC \o "1-3" \h \z \u`.
+///
+/// Issue #214 — no struct-level `#[serde(default)]`: every field is always
+/// populated (`@nge/core`'s `insertToc` merges `DEFAULT_TOC_SWITCHES` under
+/// the caller's overrides on the TS side before dispatch, so the wire
+/// payload is never partial). A struct-level default would make tsify-next
+/// render every field as optional in the generated `.d.ts` for no reason.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[serde(default)]
 pub struct TocSwitches {
     /// `\o "min-max"` — heading outline levels collected (1-based,
     /// clamped to 1..=9). `outline_max == 0` omits `\o`.

@@ -837,6 +837,7 @@ mod tests {
                 text: s.into(),
                 ..Default::default()
             })],
+            source_markup: None,
         }
     }
 
@@ -859,15 +860,18 @@ mod tests {
                 TableRow {
                     props: Default::default(),
                     cells: vec![top_left, cell_with_text("TR")],
+                    source_markup: None,
                 },
                 TableRow {
                     props: Default::default(),
                     cells: vec![cell_with_text("BL"), cell_with_text("BR")],
+                    source_markup: None,
                 },
             ],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         };
         let html = to_html_fragment(&doc_with(vec![Block::Table(table)]));
         assert!(html.starts_with("<table style=\"border-collapse:collapse;\">"));
@@ -895,6 +899,7 @@ mod tests {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }
     }
 
@@ -908,6 +913,7 @@ mod tests {
             vec![TableRow {
                 props: Default::default(),
                 cells: vec![cell_with_text("يمين"), cell_with_text("left")],
+                source_markup: None,
             }],
         );
         let html = to_html_fragment(&doc_with(vec![Block::Table(table)]));
@@ -924,6 +930,7 @@ mod tests {
             vec![TableRow {
                 props: Default::default(),
                 cells: vec![cell_with_text("a"), cell_with_text("b")],
+                source_markup: None,
             }],
         );
         let html = to_html_fragment(&doc_with(vec![Block::Table(table)]));
@@ -945,17 +952,20 @@ mod tests {
             vec![TableRow {
                 props: Default::default(),
                 cells: vec![cell_with_text("inner")],
+                source_markup: None,
             }],
         );
         let outer_cell = TableCell {
             props: CellProperties::default(),
             blocks: vec![Block::Table(inner)],
+            source_markup: None,
         };
         let outer = table_with(
             TableProperties::default(),
             vec![TableRow {
                 props: Default::default(),
                 cells: vec![outer_cell],
+                source_markup: None,
             }],
         );
         let html = to_html_fragment(&doc_with(vec![Block::Table(outer)]));
@@ -1087,19 +1097,23 @@ mod tests {
                 TableRow {
                     props: Default::default(),
                     cells: vec![tl, cell_with_text("R0C1")],
+                    source_markup: None,
                 },
                 TableRow {
                     props: Default::default(),
                     cells: vec![cont, cell_with_text("R1C1")],
+                    source_markup: None,
                 },
                 TableRow {
                     props: Default::default(),
                     cells: vec![wide],
+                    source_markup: None,
                 },
             ],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         };
         let html = to_html_fragment(&doc_with(vec![Block::Table(table)]));
         assert!(

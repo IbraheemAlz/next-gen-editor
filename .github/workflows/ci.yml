@@ -89,6 +89,92 @@ jobs:
       - name: Run WASM tests (headless Chrome)
         run: wasm-pack test --headless --chrome crates/engine-wasm
 
+      # Issue #230 — the `e2e` job below needs this exact build (TS imports
+      # `crates/engine-wasm/pkg/engine_wasm.js` by relative path, no npm
+      # package indirection) but has no reason to redo a Rust toolchain
+      # install + wasm-pack build just to get it. Short retention: the
+      # artifact only needs to outlive this one workflow run.
+      - name: Upload engine-wasm pkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-wasm-pkg
+          path: crates/engine-wasm/pkg
+          retention-days: 1
+
+  e2e:
+    name: Playwright e2e suite
+    needs: wasm
+    runs-on: ubuntu-24.04
+    # Issue #230 — the suite itself runs in under a minute locally
+    # (`workers: 1` — several specs are timing-sensitive, see
+    # playwright.config.ts).
+    # No Rust toolchain / wasm-pack build in this job (the `wasm` job's
+    # artifact is reused below), so the whole job should land well inside
+    # this cap; the cap exists to catch a Vite dev-server boot stall, not
+    # the suite itself.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download engine-wasm pkg artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-wasm-pkg
+          path: crates/engine-wasm/pkg
+
+      # `channel: 'chrome'` in playwright.config.ts (see tools/visual-diff's
+      # own comment on this) means Playwright never downloads a browser —
+      # it drives system Google Chrome. GitHub's ubuntu-24.04 runner image
+      # ships `google-chrome-stable` already, but that's an image-tool-cache
+      # implementation detail, not a contract; install it explicitly so the
+      # job doesn't silently start failing if a future runner image drops
+      # it. A no-op (just prints the version) on the current image.
+      - name: Ensure Google Chrome stable is installed
+        run: |
+          set -euo pipefail
+          if command -v google-chrome-stable >/dev/null 2>&1; then
+            google-chrome-stable --version
+          else
+            wget -q -O /tmp/google-chrome-key.pub https://dl.google.com/linux/linux_signing_key.pub
+            sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg /tmp/google-chrome-key.pub
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+              | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y google-chrome-stable
+          fi
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install JS dependencies
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        # Root install, not `--dir ts` (see the qa-harness job's comment on
+        # this exact trap: the workspace lockfile lives at the repo root).
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Playwright e2e suite
+        env:
+          CI: 'true'
+        run: cd ts && pnpm exec playwright test --reporter=line
+
+      - name: Upload Playwright test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: ts/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
   qa-harness:
     name: QA harnesses (visual-diff + memory)
     runs-on: ubuntu-24.04

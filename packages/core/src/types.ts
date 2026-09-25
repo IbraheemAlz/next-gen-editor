@@ -62,6 +62,8 @@ export type {
     A11yNote,
     A11yNoteKind,
     A11yNoteRef,
+    A11yObjectKind,
+    A11yObjectRef,
     AnnouncementPriority,
     BridgeSectionGeometry,
     BridgeCellProperties,
@@ -112,9 +114,16 @@ export interface RevisionSnapshot {
     block: number;
     start: number;
     end: number;
-    kind: 'insert' | 'delete';
+    /** Issue #247 — `move-from` / `move-to` are the two halves of a
+     *  tracked move; `format` a tracked formatting change. */
+    kind: 'insert' | 'delete' | 'format' | 'move-from' | 'move-to';
     author: string;
     date: string;
+    /** Issue #247 — the move's range name; both halves share it. */
+    move_name?: string;
+    /** Issue #262 — a paragraph-MARK revision (a tracked paragraph split
+     *  or merge), addressed by the empty range at the paragraph end. */
+    mark?: boolean;
 }
 
 /** Read-only comment row consumed by the Comments rail. Sprint 7

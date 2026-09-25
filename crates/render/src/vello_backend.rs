@@ -97,7 +97,7 @@ pub fn render_vello(
                 let white = peniko::Brush::Solid(peniko::Color::from_rgba8(0xff, 0xff, 0xff, 0xff));
                 scene.fill(Fill::NonZero, transform, &white, None, rect);
             }
-            DisplayCmd::DrawImage { rect, rel_id: _ } => {
+            DisplayCmd::DrawImage { rect, media_key: _ } => {
                 /* Phase 7 — Vello path paints a placeholder rectangle.
                 Full image decoding through Vello's `Image` resource
                 ships with the dedicated Vello-renderer activation
