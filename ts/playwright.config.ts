@@ -20,30 +20,45 @@ const REPO_ROOT = resolve(HERE, '..');
  * for the wrong reason — a false-green hazard for the parallel-agent
  * workflow (CLAUDE.md "Parallel agents in git worktrees").
  *
- * Fix: derive the port from a stable hash of the absolute repo root, so the
- * main checkout and every worktree land on their own port (5200–5999,
- * 800-wide range — plenty of headroom for concurrent checkouts, well clear
- * of the well-known-port range and of the fixed 5173/4173 Vite defaults).
- * `PW_PORT` overrides it explicitly (e.g. to pin a port in a script).
- * `reuseExistingServer` now defaults to `false` — a stale server from a
+ * Fix: derive the port from a stable hash of the absolute repo root (+ a
+ * salt, so different services never collide with each other even though
+ * they hash the same root), so the main checkout and every worktree land on
+ * their own port. `PW_PORT` overrides the main dev-server port explicitly
+ * (e.g. to pin a port in a script). `reuseExistingServer` now defaults to
+ * `false` for every webServer entry below — a stale server from a
  * *previous* run of the same worktree is no longer silently trusted either;
- * set `PW_REUSE_SERVER=1` to opt back into reuse for fast local iteration. */
-function stablePortFor(absolutePath: string): number {
-    const PORT_RANGE_START = 5200;
-    const PORT_RANGE_SIZE = 800; // 5200..5999 inclusive
-    const digest = createHash('sha256').update(absolutePath).digest();
-    return PORT_RANGE_START + (digest.readUInt32BE(0) % PORT_RANGE_SIZE);
+ * set `PW_REUSE_SERVER=1` to opt back into reuse for fast local iteration
+ * (this also covers the telemetry sink below, which has the exact same
+ * cross-worktree collision risk as the dev server: it is a stateful HTTP
+ * service on a fixed port, and `telemetry.spec.ts` mutates that state
+ * — `POST /reset` — mid-test, so two worktrees silently sharing one sink
+ * process doesn't just misattribute samples, it makes both suites flaky). */
+function stablePortFor(seed: string, rangeStart: number, rangeSize: number): number {
+    const digest = createHash('sha256').update(seed).digest();
+    return rangeStart + (digest.readUInt32BE(0) % rangeSize);
 }
 
-const PORT = process.env.PW_PORT ? Number.parseInt(process.env.PW_PORT, 10) : stablePortFor(REPO_ROOT);
+// 5200-5999 (800-wide): plenty of headroom for concurrent checkouts, well
+// clear of the well-known-port range and of the fixed 5173/4173 Vite
+// defaults.
+const PORT = process.env.PW_PORT
+    ? Number.parseInt(process.env.PW_PORT, 10)
+    : stablePortFor(REPO_ROOT, 5200, 800);
 const REUSE_SERVER = process.env.PW_REUSE_SERVER === '1';
 const BASE_URL = `http://localhost:${PORT}`;
 
 /* Issue #86 — D5.7 real telemetry: the tiny Node receiver `telemetry.spec.ts`
- * points `?telemetryEndpoint=` at. Not part of the #205 port collision (a
- * fixed, separate service on its own port) — left as-is. */
+ * points `?telemetryEndpoint=` at. Issue #205 extends the same per-checkout
+ * derivation here: a distinct salt (`::telemetry-sink`) on the same
+ * REPO_ROOT seed, in a disjoint range (4200-4999) so it can never collide
+ * with the dev-server port above even for a checkout path that hashes to
+ * the same offset in both ranges. `telemetry.spec.ts` computes this exact
+ * same port independently (same algorithm + salt + range, see the comment
+ * there) — the two processes have no shared state to pass it through, so
+ * the derivation itself is the contract. If you change the algorithm, salt,
+ * or range here, change it there too. */
 const TELEMETRY_SINK_ENTRY = join(HERE, '..', 'tools', 'telemetry-sink', 'run.mjs');
-const TELEMETRY_SINK_PORT = 4319;
+const TELEMETRY_SINK_PORT = stablePortFor(`${REPO_ROOT}::telemetry-sink`, 4200, 800);
 const TELEMETRY_SINK_OUT = join(HERE, '..', 'tools', 'telemetry-sink', '.e2e-received.jsonl');
 
 export default defineConfig({
