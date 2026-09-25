@@ -464,6 +464,7 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::WrapOscillation => LayoutDegradeReason::WrapOscillation,
         R::WrapPolygonFallback => LayoutDegradeReason::WrapPolygonFallback,
         R::PageRefCap => LayoutDegradeReason::PageRefCap,
+        R::NoteRestartCap => LayoutDegradeReason::NoteRestartCap,
     };
     LayoutDegraded {
         reason,
@@ -3330,6 +3331,52 @@ fn build_note_bodies(
     (bodies, notice)
 }
 
+/// Issue #129 — the note labels a settled layout calls for: `base` (the
+/// document-order labels) with every footnote of an `eachPage` section
+/// (`rules`: anchor → `(numStart, numFmt)`) relabelled by its ordinal on
+/// the page carrying its head entry. A footnote not laid out (a culled
+/// band) keeps its `base` label.
+fn page_restart_note_markers(
+    base: &HashMap<engine::NoteAnchor, String>,
+    rules: &HashMap<engine::NoteAnchor, (u32, engine::PageNumFormat)>,
+    pages: &[PageBox],
+) -> HashMap<engine::NoteAnchor, String> {
+    let mut out = base.clone();
+    for (anchor, n) in layout::page_note_ordinals(pages, |a| rules.get(&a).map(|r| r.0)) {
+        if let Some((_, fmt)) = rules.get(&anchor) {
+            out.insert(anchor, fmt.render(n));
+        }
+    }
+    out
+}
+
+/// Issue #130 — one note table: the referenced note bodies laid out at
+/// one content width, plus the continuation notice at that width.
+type NoteTable = (
+    HashMap<engine::NoteAnchor, layout::NoteBody>,
+    Option<layout::NoteBody>,
+);
+
+/// Issue #130 — the note table for `width` (layout px), laid out on
+/// first use and memoised in `tables` by the width's bits for the rest
+/// of the pass: a note is laid out once per distinct section width.
+#[allow(clippy::too_many_arguments)]
+fn note_table_at<'t>(
+    tables: &'t mut HashMap<u32, NoteTable>,
+    width: f32,
+    doc: &DocumentTree,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    active_comp: Option<(engine::NoteAnchor, &CompositionState)>,
+) -> &'t NoteTable {
+    tables.entry(width.to_bits()).or_insert_with(|| {
+        build_note_bodies(doc, width, fonts, cfg, scale, sctx, cache, active_comp)
+    })
+}
+
 /// Issue #80 — the endnotes referenced by top-level blocks in
 /// `[start, end)`, in reference order (deduped), paired with their laid
 /// out bodies — the paginator's trailing-band input.
@@ -4068,13 +4115,22 @@ fn layout_table_box(
             x += cell_width;
             col_cursor += span;
         }
-        /* Apply row min-height from `<w:trHeight>` if present. */
+        /* `<w:trHeight>`: `atLeast` is a floor under the measured
+        content height; `exact` (issue #169) IS the row height — the
+        content is clipped to it at paint time (`exact_height`). A
+        non-positive exact value has no height to honour and keeps the
+        content height (nothing clipped away to zero). */
+        let mut exact_height = false;
         if let Some(rh) = row.props.height {
             match rh {
-                engine::RowHeight::AtLeast { twips } | engine::RowHeight::Exact { twips } => {
+                engine::RowHeight::AtLeast { twips } => {
                     row_height = row_height.max(twips_to_layout_px(twips, scale));
                 }
-                engine::RowHeight::Auto => {}
+                engine::RowHeight::Exact { twips } if twips > 0 => {
+                    row_height = twips_to_layout_px(twips, scale);
+                    exact_height = true;
+                }
+                engine::RowHeight::Exact { .. } | engine::RowHeight::Auto => {}
             }
         }
         /* Stamp final row height onto every cell. */
@@ -4124,6 +4180,7 @@ fn layout_table_box(
             cant_split: row.props.cant_split
                 || matches!(row.props.height, Some(engine::RowHeight::Exact { .. })),
             source_row: rows_out.len() as u32,
+            exact_height,
         });
         y += row_height;
     }
@@ -6791,7 +6848,14 @@ impl Engine {
             // behavior lands in Phase 3 behind the RequestPaint pipeline.
             // ===============================================================
             Command::Init { .. } => phase3_stub("Init"),
-            Command::Recover { snapshot, log_tail } => self.do_recover(snapshot, log_tail).await,
+            Command::Recover {
+                snapshot,
+                log_tail,
+                renderer_downgrade,
+            } => {
+                self.do_recover(snapshot, log_tail, renderer_downgrade)
+                    .await
+            }
             Command::Snapshot { seq } => self.do_snapshot(seq),
             Command::Dispose => phase3_stub("Dispose"),
             Command::Tick { .. } => phase3_stub("Tick"),
@@ -7504,7 +7568,17 @@ impl Engine {
     /// The shell repaints once fonts are back (`SetDeviceScale` +
     /// `RequestPaint`), and reads the actual renderer off the reply so
     /// `__renderer` cannot lie after a respawn (issue #66).
-    async fn do_recover(&mut self, snapshot: Vec<u8>, log_tail: Vec<Command>) -> Event {
+    ///
+    /// Issue #97 — the reply carries the recovered `zoom` / `device_scale`
+    /// so the shell's zoom controls re-sync from the engine. Issue #99 —
+    /// `renderer_downgrade` (the worker's crash-loop record) is echoed
+    /// verbatim on the reply.
+    async fn do_recover(
+        &mut self,
+        snapshot: Vec<u8>,
+        log_tail: Vec<Command>,
+        renderer_downgrade: Option<bridge::RendererDowngrade>,
+    ) -> Event {
         self.reset_session_state();
         let snapshot_restored = if snapshot.is_empty() {
             false
@@ -7564,6 +7638,9 @@ impl Engine {
             applied_commands,
             snapshot_restored,
             renderer: self.renderer_name().to_string(),
+            zoom: self.user_zoom(),
+            device_scale: self.layout_cfg.as_ref().map(|c| c.base_scale),
+            renderer_downgrade,
         }
     }
 
@@ -7579,6 +7656,12 @@ impl Engine {
                 message: format!("Snapshot: {e}"),
             },
         }
+    }
+
+    /// Issue #52 — the user zoom fraction the engine renders at; `1.0`
+    /// (the `RenderPage` default) before any layout config exists.
+    fn user_zoom(&self) -> f32 {
+        self.layout_cfg.as_ref().map_or(1.0, |c| c.zoom)
     }
 
     /// Issue #66 — the backend this instance actually paints with.
@@ -7961,34 +8044,91 @@ impl Engine {
         ),
         Box<Event>,
     > {
-        let mut plan = layout::WrapPlan::new();
-        let mut built =
-            self.build_pages_pass(doc.clone(), scale, with_composition, target_y, mode, &plan)?;
-        let slab = self
-            .layout_cfg
-            .as_ref()
-            .map_or(12.0, |c| c.line_height * scale);
-        let mut conv = layout::WrapConvergence::new(slab);
-        loop {
-            match conv.observe(&built.0, &plan) {
-                layout::WrapVerdict::Converged | layout::WrapVerdict::Capped => break,
-                layout::WrapVerdict::Continue(next) => {
-                    plan = next;
-                    built = self.build_pages_pass(
-                        doc.clone(),
-                        scale,
-                        with_composition,
-                        target_y,
-                        mode,
-                        &plan,
-                    )?;
+        /* One full wrap-converged layout with `markers` (None = the
+        document-order note markers). */
+        let wrap_converged = |markers: Option<&HashMap<engine::NoteAnchor, String>>| {
+            let mut plan = layout::WrapPlan::new();
+            let mut built = self.build_pages_pass(
+                doc.clone(),
+                scale,
+                with_composition,
+                target_y,
+                mode,
+                &plan,
+                markers,
+            )?;
+            let slab = self
+                .layout_cfg
+                .as_ref()
+                .map_or(12.0, |c| c.line_height * scale);
+            let mut conv = layout::WrapConvergence::new(slab);
+            loop {
+                match conv.observe(&built.0, &plan) {
+                    layout::WrapVerdict::Converged | layout::WrapVerdict::Capped => break,
+                    layout::WrapVerdict::Continue(next) => {
+                        plan = next;
+                        built = self.build_pages_pass(
+                            doc.clone(),
+                            scale,
+                            with_composition,
+                            target_y,
+                            mode,
+                            &plan,
+                            markers,
+                        )?;
+                    }
                 }
             }
-        }
-        built
-            .3
-            .degradations
-            .extend(conv.take_notes().into_iter().map(bridge_degradation));
+            built
+                .3
+                .degradations
+                .extend(conv.take_notes().into_iter().map(bridge_degradation));
+            Ok::<_, Box<Event>>(built)
+        };
+        /* Issue #129 — `<w:numRestart w:val="eachPage"/>`: the page a
+        footnote reference lands on is only known once pagination has
+        settled, so the labels are a post-pass. Lay out with the
+        document-order labels, read the per-page ordinals off the pages
+        (`layout::page_note_ordinals`), and — when they differ — lay out
+        again with them (they re-shape every reference mark and note
+        self-mark through the marker-aware paragraph cache key). A
+        narrower label can move a reference across a page break, so the
+        observation is re-checked: one re-run under the bounded fixed
+        point (`layout::converge_stamped`), then the last pass is kept
+        with a `NoteRestartCap` note. Documents without the rule (the
+        default) take the single-pass path untouched. */
+        let restart_rules = doc.each_page_note_numbering();
+        let mut built = if restart_rules.is_empty() {
+            wrap_converged(None)?
+        } else {
+            let base = doc.note_markers();
+            let mut last = None;
+            let mut failure = None;
+            let conv = layout::converge_stamped(
+                base.clone(),
+                1,
+                layout::DegradeReason::NoteRestartCap,
+                |stamp| match wrap_converged(Some(stamp)) {
+                    Ok(b) => {
+                        let observed = page_restart_note_markers(&base, &restart_rules, &b.0);
+                        last = Some(b);
+                        observed
+                    }
+                    Err(e) => {
+                        /* Echo the stamp: the fixed point ends the loop. */
+                        failure = Some(e);
+                        stamp.clone()
+                    }
+                },
+            );
+            if let Some(e) = failure {
+                return Err(e);
+            }
+            let mut b = last.expect("converge_stamped lays out at least once");
+            b.3.degradations
+                .extend(conv.degraded.into_iter().map(bridge_degradation));
+            b
+        };
         /* Issue #83 — the boxes are final: lay every text box's story
         into its content rect. */
         let nested_notes = self.attach_text_box_frames(
@@ -8109,8 +8249,9 @@ impl Engine {
 
     /// One layout pass of [`Self::build_pages_of`] against the wrap
     /// `plan` (cutouts keyed by `ParagraphBox::source_paragraph_id`, the
-    /// walk-order id this pass assigns; empty ⇒ nothing is cut).
-    #[allow(clippy::type_complexity)]
+    /// walk-order id this pass assigns; empty ⇒ nothing is cut), with the
+    /// note labels `markers` (issue #129; `None` = document order).
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn build_pages_pass(
         &self,
         doc: DocumentTree,
@@ -8119,6 +8260,7 @@ impl Engine {
         target_y: Option<f32>,
         mode: FieldMode,
         plan: &layout::WrapPlan,
+        markers: Option<&HashMap<engine::NoteAnchor, String>>,
     ) -> Result<
         (
             Vec<PageBox>,
@@ -8145,9 +8287,17 @@ impl Engine {
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
         /* Issue #80 — document-order note markers are a layout input
-        (shaped into every reference and self-mark). */
-        let note_markers = doc.note_markers();
-        let sctx = StyleContext::of(&doc).with_note_markers(&note_markers);
+        (shaped into every reference and self-mark); issue #129 — the
+        per-page relabelling pass hands its own table in. */
+        let doc_markers;
+        let note_markers: &HashMap<engine::NoteAnchor, String> = match markers {
+            Some(m) => m,
+            None => {
+                doc_markers = doc.note_markers();
+                &doc_markers
+            }
+        };
+        let sctx = StyleContext::of(&doc).with_note_markers(note_markers);
         let mut cache = self.layout_cache.borrow_mut();
         let composition = if with_composition {
             self.composition.as_ref()
@@ -8164,17 +8314,15 @@ impl Engine {
         split paragraphs (head + tail) share the same id and resolve
         to the same source string. */
         let mut next_para_id: u32 = 0;
-        /* Issue #80 — lay every referenced note story out once at the
-        first section's content width (notes flow against the page they
-        reference into; a per-section width is a follow-up) and hand
-        the table to every paginator. Endnotes reuse the same bodies as
-        the trailing band's input. */
-        let note_width = sections
-            .first()
-            .map_or(engine::PageGeometry::a4().content_width(), |s| {
-                s.geometry.content_width()
-            })
-            * scale;
+        /* Issue #80 / #130 — every referenced note story is laid out at
+        the content width of the section that owns the page it lands on:
+        one table per distinct section width, built lazily the first time
+        a section of that width opens (`note_tables`, keyed by the width's
+        bits — the per-(note, width) cache; the paragraph LRU underneath
+        keeps it warm across paints). A single-width document builds
+        exactly one table at the first section's width, as before.
+        Endnotes reuse the table of the section they trail. */
+        let mut note_tables: HashMap<u32, NoteTable> = HashMap::new();
         /* The active note previews the live IME composition. */
         let note_comp = match (&self.active_story, composition) {
             (StoryTarget::Note { kind, id, .. }, Some(c)) => u32::try_from(*id)
@@ -8182,16 +8330,13 @@ impl Engine {
                 .map(|id| (engine::NoteAnchor { kind: *kind, id }, c)),
             _ => None,
         };
-        let (note_bodies, continuation_notice) = build_note_bodies(
-            &doc,
-            note_width,
-            &font_stack,
-            &cfg,
-            scale,
-            sctx,
-            &mut cache,
-            note_comp,
-        );
+        /* The width of the table the live paginator draws from. */
+        let mut note_width = sections
+            .first()
+            .map_or(engine::PageGeometry::a4().content_width(), |s| {
+                s.geometry.content_width()
+            })
+            * scale;
         let mut endnotes_placed: std::collections::HashSet<engine::NoteAnchor> =
             std::collections::HashSet::new();
         /* Each top-level block is covered by at most one effective section. The
@@ -8433,7 +8578,41 @@ impl Engine {
                     doc.resolved_note_props(engine::NoteKind::Footnote, Some(section))
                         .position,
                 );
+                /* Issue #130 — the page now flushes with this section's
+                geometry: notes committed from here on lay out at its
+                width (a same-width swap keeps the installed table). */
+                let w = section.geometry.content_width() * scale;
+                if w.to_bits() != note_width.to_bits() {
+                    note_width = w;
+                    let (bodies, notice) = note_table_at(
+                        &mut note_tables,
+                        note_width,
+                        &doc,
+                        &font_stack,
+                        &cfg,
+                        scale,
+                        sctx,
+                        &mut cache,
+                        note_comp,
+                    )
+                    .clone();
+                    pag.set_note_bodies(bodies, notice);
+                }
             } else {
+                /* Issue #130 — this section's note table. */
+                note_width = section.geometry.content_width() * scale;
+                let (note_bodies, continuation_notice) = note_table_at(
+                    &mut note_tables,
+                    note_width,
+                    &doc,
+                    &font_stack,
+                    &cfg,
+                    scale,
+                    sctx,
+                    &mut cache,
+                    note_comp,
+                )
+                .clone();
                 let mut pag = Paginator::new(
                     geom,
                     headers,
@@ -8441,8 +8620,8 @@ impl Engine {
                     section.title_pg,
                     doc.settings.even_and_odd_headers,
                 )
-                .with_note_bodies(note_bodies.clone())
-                .with_continuation_notice(continuation_notice.clone())
+                .with_note_bodies(note_bodies)
+                .with_continuation_notice(continuation_notice)
                 /* Issue #43 / #77 — DATE / TIME / FILENAME / AUTHOR
                 resolve against the shell-injected environment; the
                 field-code view freezes every field at its code text. */
@@ -8708,6 +8887,12 @@ impl Engine {
                             .props
                             .widow_control_on(doc.settings.widow_control_default);
                         after_keep_next = para.props.keep_next_on();
+                        /* Issue #75 — `<w:pageBreakBefore/>` (resolved
+                        through the style cascade like keepNext). Only
+                        this body-story loop stamps it: cell, header /
+                        footer, note and text-box paragraphs are laid
+                        out elsewhere and ignore it, as Word does. */
+                        para_box.flow.page_break_before = para.props.page_break_before;
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(
@@ -8733,8 +8918,19 @@ impl Engine {
                     &doc,
                     section.start_block,
                     section.end_block,
-                    &note_bodies,
-                    &note_markers,
+                    &note_table_at(
+                        &mut note_tables,
+                        note_width,
+                        &doc,
+                        &font_stack,
+                        &cfg,
+                        scale,
+                        sctx,
+                        &mut cache,
+                        note_comp,
+                    )
+                    .0,
+                    note_markers,
                     &mut endnotes_placed,
                 );
                 pag.push_trailing_notes(entries);
@@ -8749,8 +8945,19 @@ impl Engine {
                 &doc,
                 0,
                 u32::MAX,
-                &note_bodies,
-                &note_markers,
+                &note_table_at(
+                    &mut note_tables,
+                    note_width,
+                    &doc,
+                    &font_stack,
+                    &cfg,
+                    scale,
+                    sctx,
+                    &mut cache,
+                    note_comp,
+                )
+                .0,
+                note_markers,
                 &mut endnotes_placed,
             );
             pag.push_trailing_notes(entries);
@@ -11163,6 +11370,7 @@ impl Engine {
             editing_story: self.bridge_story_ref(),
             field_code_view: self.field_code_view,
             field_at_caret: self.field_ref_at_selection(&sel),
+            zoom: self.user_zoom(),
         }
     }
 
@@ -12151,9 +12359,7 @@ impl Engine {
         self.caret_affinity = CaretAffinity::default();
         self.pending_format = None;
         let marker = self
-            .undo
-            .current()
-            .note_markers()
+            .painted_note_markers(self.undo.current())
             .get(&anchor)
             .cloned()
             .unwrap_or_else(|| anchor.id.to_string());
@@ -13756,7 +13962,7 @@ impl Engine {
             markers: if doc.footnote_stories.is_empty() && doc.endnote_stories.is_empty() {
                 HashMap::new()
             } else {
-                doc.note_markers()
+                self.painted_note_markers(doc)
             },
             emitted: RefCell::new(std::collections::HashSet::new()),
         };
@@ -13803,6 +14009,37 @@ impl Engine {
             }
         }
         nodes
+    }
+
+    /// Issue #129 — the note labels as PAINTED: the document-order
+    /// markers, with every `eachPage` footnote relabelled from the head
+    /// entry of the current layout snapshot (the label its band entry and
+    /// reference mark were shaped with). Without a snapshot of the current
+    /// revision — or for a footnote beyond a culled band — the
+    /// document-order label stands.
+    fn painted_note_markers(&self, doc: &DocumentTree) -> HashMap<engine::NoteAnchor, String> {
+        let mut markers = doc.note_markers();
+        let rules = doc.each_page_note_numbering();
+        if rules.is_empty() {
+            return markers;
+        }
+        let snap = self.layout_snapshot.borrow();
+        let Some(snap) = snap
+            .as_ref()
+            .filter(|s| s.doc_revision == self.undo.revision() && !s.code_view)
+        else {
+            return markers;
+        };
+        for entry in snap.pages.iter().flat_map(|p| p.footnotes.entries.iter()) {
+            let anchor = engine::NoteAnchor {
+                kind: entry.kind,
+                id: entry.id,
+            };
+            if !entry.continued_from_previous && rules.contains_key(&anchor) {
+                markers.insert(anchor, entry.marker.clone());
+            }
+        }
+        markers
     }
 
     /// Build an incremental accessibility delta (Backlog #10). The first call
@@ -15118,20 +15355,51 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::InsertPageBreak` (Sprint 2 UI Edition) — flip
-    /// `ParaProperties.page_break_before` on the paragraph at `at`.
+    /// `Command::InsertPageBreak` — Word's `Ctrl+Enter`: insert a
+    /// manual page break (U+000C FORM FEED, which the writer emits as
+    /// `<w:br w:type="page"/>` and the paginator honours through
+    /// `page_break_after_line`) at the caret, replacing any non-empty
+    /// selection exactly like typed text (with a collapsed or absent
+    /// selection the break lands at `at`). Issue #75: this used to flip
+    /// `ParaProperties.page_break_before` — the *paragraph-format*
+    /// property (Word's "Page break before" checkbox), not what
+    /// `Ctrl+Enter` authors — which also broke before the whole caret
+    /// paragraph instead of at the caret. The property itself is now
+    /// honoured by the paginator for imported documents.
+    ///
+    /// Rejected inside a table cell (Word never paginates a cell's
+    /// FORM FEED; the paginator only scans body paragraphs), so the
+    /// Breaks menu greys the entry there and this error is the
+    /// Honest-UX backstop. Header/footer stories are rejected earlier
+    /// by `story_gate`.
     fn do_insert_page_break(&mut self, at: BridgeLogicalPos) -> Event {
-        let new_doc = self
-            .undo
-            .current()
-            .set_page_break_before(to_engine_pos(at), true);
-        self.undo.push(new_doc);
-        self.announce(AnnouncementPriority::Polite, "Page break inserted");
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
+        let at = self.with_selection_doc(|d| clamp_pos(d, at));
+        /* A non-empty selection is replaced, as typing would; a collapsed
+        (or absent) one yields to the explicit `at`. */
+        let replacing = self
+            .selection
+            .as_ref()
+            .filter(|sel| sel.anchor != sel.caret)
+            .map(|sel| ordered(sel.anchor.clone(), sel.caret.clone()));
+        let (start, end) = replacing.clone().unwrap_or((at.clone(), at.clone()));
+        if start.path.steps.len() != 1 || end.path.steps.len() != 1 {
+            return Event::Error {
+                message: "InsertPageBreak: page breaks inside table cells are not supported".into(),
+            };
         }
-        self.selection_changed()
+        if replacing.is_none() {
+            self.selection = Some(SelectionState {
+                anchor: at.clone(),
+                caret: at.clone(),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            });
+        }
+        let evt = self.do_insert_text_interactive(at, "\u{000C}".into());
+        if !matches!(evt, Event::Error { .. }) {
+            self.announce(AnnouncementPriority::Polite, "Page break inserted");
+        }
+        evt
     }
 
     /// `Command::InsertSectionBreak` (Phase 3, #40) — split the caret
@@ -18683,6 +18951,272 @@ mod tests {
     }
 
     /* ================================================================
+    Issue #130 — note bodies lay out at the content width of the section
+    that owns their page.
+    ================================================================ */
+
+    const LONG_NOTE: &str = "This footnote is deliberately long so that it wraps across \
+        several lines at any reasonable content width, which makes the width it was laid \
+        out at visible in the geometry of its band entry on the page.";
+
+    /// A portrait A4 section (block 0) then a landscape A4 section
+    /// (block 1), each carrying one footnote with a long body.
+    fn portrait_then_landscape_with_footnotes() -> Engine {
+        let mut d = DocumentTree::from_text("Portrait section body text.");
+        let portrait = d.body_section.clone();
+        if let Some(engine::Block::Paragraph(p)) = d.blocks.get_mut(0) {
+            p.section_end = Some(Box::new(portrait));
+        }
+        d.blocks.push_back(para_of(
+            "Landscape section body text.",
+            engine::ParaProperties::default(),
+        ));
+        let g = &mut d.body_section.geometry;
+        std::mem::swap(&mut g.width, &mut g.height);
+        let mut engine = test_engine_with_doc(d);
+        for block in [0_u32, 1] {
+            let evt = engine.do_insert_note(bpos_top(block, 8), engine::NoteKind::Footnote);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+            let caret = engine.selection.as_ref().unwrap().caret.clone();
+            let typed = engine.do_insert_text_interactive(caret, LONG_NOTE.to_string());
+            assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+            engine.do_exit_header_footer();
+        }
+        engine
+    }
+
+    /// Acceptance (#130): each note fills ITS section's content width —
+    /// the landscape note is not squeezed into the portrait width — and
+    /// the fixture is pinned by `geometry_fingerprint`.
+    #[test]
+    fn footnotes_lay_out_at_their_own_sections_content_width() {
+        let engine = portrait_then_landscape_with_footnotes();
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        assert_eq!(pages.len(), 2, "one page per section");
+        assert!(
+            pages[1].size.width > pages[0].size.width,
+            "page 2 is landscape"
+        );
+        let mut widths = Vec::new();
+        for page in &pages {
+            let content_w = page.size.width - page.margins.left - page.margins.right;
+            assert_eq!(page.footnotes.entries.len(), 1, "one note per page");
+            let entry = &page.footnotes.entries[0];
+            let para = entry.blocks[0].as_paragraph().expect("note paragraph");
+            assert!(
+                (para.size.width - content_w).abs() < 0.01,
+                "note box {} != content width {content_w}",
+                para.size.width
+            );
+            assert!(para.lines.len() >= 2, "the note wraps");
+            /* Filled: the first (wrapped) line reaches close to the
+            section's measure — within one long word of it. */
+            let first = &para.lines[0];
+            assert!(
+                first.width > content_w - 80.0 && first.width <= content_w + 0.01,
+                "first line {} does not fill {content_w}",
+                first.width
+            );
+            widths.push(first.width);
+        }
+        let portrait_w = pages[0].size.width - pages[0].margins.left - pages[0].margins.right;
+        assert!(
+            widths[1] > portrait_w,
+            "the landscape note runs past the portrait measure ({} vs {portrait_w})",
+            widths[1]
+        );
+        let fp = layout::geometry_fingerprint(&pages);
+        eprintln!("NOTE WIDTH FINGERPRINT portrait_then_landscape = {fp:#x}");
+        assert_eq!(
+            fp, PINNED_NOTE_SECTION_WIDTHS,
+            "note width fixture geometry changed"
+        );
+    }
+
+    /// Recorded on this change via `--nocapture` (issue #130).
+    const PINNED_NOTE_SECTION_WIDTHS: u64 = 0xd6cfac1cc9cef805;
+
+    /* ================================================================
+    Issue #129 — `<w:numRestart w:val="eachPage"/>` footnote numbering.
+    ================================================================ */
+
+    /// Every note marker shaped into `block` (reference marks in the body,
+    /// the self-mark heading a note body), in line order.
+    fn shaped_note_marks(block: &LayoutBlock) -> Vec<String> {
+        block
+            .as_paragraph()
+            .map(|p| {
+                p.lines
+                    .iter()
+                    .flat_map(|l| l.runs.iter())
+                    .flat_map(|r| r.glyphs.iter())
+                    .filter_map(|g| g.inline_footnote_marker.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Two pages (a FORM FEED ends page 1), two footnotes per page, the
+    /// document-level footnote props restarting `eachPage`.
+    fn each_page_restart_doc(restart: engine::NoteNumRestart) -> Engine {
+        let mut d = DocumentTree::from_text("Page one body text.\u{000C}");
+        d.blocks.push_back(para_of(
+            "Page two body text.",
+            engine::ParaProperties::default(),
+        ));
+        d.footnote_props.num_restart = Some(restart);
+        let mut engine = test_engine_with_doc(d);
+        /* Later offsets first: a spliced reference shifts what follows. */
+        for (block, offset, text) in [
+            (0_u32, 13_u32, "Second note on page one."),
+            (0, 4, "First note on page one."),
+            (1, 13, "Second note on page two."),
+            (1, 4, "First note on page two."),
+        ] {
+            let evt = engine.do_insert_note(bpos_top(block, offset), engine::NoteKind::Footnote);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+            let caret = engine.selection.as_ref().unwrap().caret.clone();
+            engine.do_insert_text_interactive(caret, text.to_string());
+            engine.do_exit_header_footer();
+        }
+        engine
+    }
+
+    /// Per page: (band entry markers, body reference marks, note
+    /// self-marks).
+    fn page_note_labels(pages: &[PageBox]) -> Vec<(Vec<String>, Vec<String>, Vec<String>)> {
+        pages
+            .iter()
+            .map(|page| {
+                let entries = page
+                    .footnotes
+                    .entries
+                    .iter()
+                    .map(|e| e.marker.clone())
+                    .collect();
+                let refs = page.blocks.iter().flat_map(shaped_note_marks).collect();
+                let selfs = page
+                    .footnotes
+                    .entries
+                    .iter()
+                    .filter_map(|e| e.blocks.first().map(shaped_note_marks))
+                    .filter_map(|m| m.into_iter().next())
+                    .collect();
+                (entries, refs, selfs)
+            })
+            .collect()
+    }
+
+    /// Acceptance (#129): page 2's first footnote is "1" — in its band
+    /// entry, its body reference mark and its note's self-mark — and the
+    /// fixture is pinned.
+    #[test]
+    fn each_page_restart_numbers_footnotes_per_page() {
+        let engine = each_page_restart_doc(engine::NoteNumRestart::EachPage);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        assert_eq!(pages.len(), 2);
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let one_two = s(&["1", "2"]);
+        for (i, (entries, refs, selfs)) in page_note_labels(&pages).into_iter().enumerate() {
+            assert_eq!(entries, one_two, "page {} band", i + 1);
+            assert_eq!(refs, one_two, "page {} reference marks", i + 1);
+            assert_eq!(selfs, one_two, "page {} self-marks", i + 1);
+        }
+        let fp = layout::geometry_fingerprint(&pages);
+        eprintln!("NOTE RESTART FINGERPRINT each_page = {fp:#x}");
+        assert_eq!(
+            fp, PINNED_NOTE_EACH_PAGE,
+            "eachPage fixture geometry changed"
+        );
+    }
+
+    /// Recorded on this change via `--nocapture` (issue #129).
+    const PINNED_NOTE_EACH_PAGE: u64 = 0x34081f7fb7e9e11c;
+
+    /// Continuous stays the default: the same document numbers 1–4, and
+    /// no relabelling pass runs (the rule table is empty).
+    #[test]
+    fn continuous_numbering_is_untouched_by_the_restart_pass() {
+        let engine = each_page_restart_doc(engine::NoteNumRestart::Continuous);
+        assert!(engine.undo.current().each_page_note_numbering().is_empty());
+        let (pages, ..) = engine.build_pages(1.0, false, None).expect("layout");
+        let labels = page_note_labels(&pages);
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(labels[0].0, s(&["1", "2"]));
+        assert_eq!(labels[1].0, s(&["3", "4"]));
+        assert_eq!(labels[1].1, s(&["3", "4"]));
+    }
+
+    /// The a11y mirror reads the restarted label: page 2's first note
+    /// region and its reference mark say "1", not the document-order "3".
+    #[test]
+    fn a11y_note_markers_show_the_per_page_label() {
+        let engine = each_page_restart_doc(engine::NoteNumRestart::EachPage);
+        engine
+            .ensure_layout_snapshot(engine.scale(), false, None)
+            .expect("layout");
+        let nodes = engine.build_a11y_nodes();
+        let markers: Vec<String> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                A11yNode::Note(note) => Some(note.marker.clone()),
+                _ => None,
+            })
+            .collect();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(markers, s(&["1", "2", "1", "2"]));
+        let refs: Vec<String> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                A11yNode::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .flat_map(|p| p.runs.iter())
+            .filter(|r| r.note_ref.is_some())
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(refs, s(&["1", "2", "1", "2"]));
+    }
+
+    /// Issue #130 — a CONTINUOUS break into a section with wider margins
+    /// swaps the note table in place: the page flushes with the second
+    /// section's geometry, so its note lays out at that (narrower)
+    /// measure rather than the first section's.
+    #[test]
+    fn continuous_section_swaps_the_note_width_in_place() {
+        let mut d = DocumentTree::from_text("First section body text.");
+        let first = d.body_section.clone();
+        if let Some(engine::Block::Paragraph(p)) = d.blocks.get_mut(0) {
+            p.section_end = Some(Box::new(first));
+        }
+        d.blocks.push_back(para_of(
+            "Second section body text.",
+            engine::ParaProperties::default(),
+        ));
+        d.body_section.section_type = engine::SectionType::Continuous;
+        d.body_section.geometry.margin_left += 72.0;
+        d.body_section.geometry.margin_right += 72.0;
+        let narrow = d.body_section.geometry.content_width();
+        let mut engine = test_engine_with_doc(d);
+        let evt = engine.do_insert_note(bpos_top(1, 6), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        engine.do_insert_text_interactive(caret, LONG_NOTE.to_string());
+        engine.do_exit_header_footer();
+        let (pages, ..) = engine.build_pages(1.0, false, None).expect("layout");
+        assert_eq!(pages.len(), 1, "a continuous break shares the page");
+        let entry = pages[0].footnotes.entries.first().expect("the note");
+        let para = entry.blocks[0].as_paragraph().expect("note paragraph");
+        assert!(
+            (para.size.width - narrow).abs() < 0.01,
+            "note box {} != the second section's measure {narrow}",
+            para.size.width
+        );
+    }
+
+    /* ================================================================
     Issue #80 — note stories: insert, enter, edit, exit, undo guard.
     ================================================================ */
 
@@ -21268,6 +21802,164 @@ mod tests {
         d
     }
 
+    /// Issue #75 — body doc whose second paragraph carries ONLY
+    /// `<w:pageBreakBefore/>` (no FORM FEED anywhere).
+    fn page_break_before_doc(first: &str, second: &str) -> DocumentTree {
+        let mut d = DocumentTree::from_text(first);
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: second.into(),
+                props: engine::ParaProperties {
+                    page_break_before: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        d
+    }
+
+    fn page_source_ids(pages: &[PageBox]) -> Vec<Vec<u32>> {
+        pages
+            .iter()
+            .map(|p| {
+                p.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        LayoutBlock::Paragraph(pb) => Some(pb.source_paragraph_id),
+                        LayoutBlock::Table(_) => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Issue #75 acceptance — `<w:pageBreakBefore/>` reaches the
+    /// paginator: the flagged paragraph opens page 2.
+    #[test]
+    fn page_break_before_paragraph_opens_a_new_page() {
+        let engine = test_engine_with_doc(page_break_before_doc("alpha beta", "gamma delta"));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("pages");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+
+        /* Imported: the same doc through `<w:pageBreakBefore/>` XML. */
+        let bytes =
+            format_docx::build_minimal_docx(&page_break_before_doc("alpha beta", "gamma delta"))
+                .expect("write");
+        let archive = format_docx::read_docx(&bytes).expect("read");
+        let engine = test_engine_with_doc(archive.document);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+    }
+
+    /// Issue #75 — Word never breaks at a page top: a flagged FIRST
+    /// paragraph (and a flagged paragraph right after a next-page
+    /// section break) does not mint an empty page.
+    #[test]
+    fn page_break_before_at_a_page_top_is_a_no_op() {
+        let mut d = page_break_before_doc("alpha", "beta");
+        if let engine::Block::Paragraph(p) = &mut d.blocks[0] {
+            p.props.page_break_before = true;
+        }
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+
+        /* The first paragraph of a next-page section: the section
+        already flushed, so the flag adds nothing. */
+        let mut d = DocumentTree::from_text("alpha beta").insert_section_break_at(
+            engine::LogicalPos {
+                path: engine::BlockPath::top(0),
+                offset: 5,
+            },
+            engine::SectionType::NextPage,
+        );
+        assert_eq!(d.blocks.len(), 2, "the break splits the paragraph in two");
+        if let engine::Block::Paragraph(p) = &mut d.blocks[1] {
+            p.props.page_break_before = true;
+        }
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+    }
+
+    /// Issue #75 — `Command::InsertPageBreak` is Word's `Ctrl+Enter`: a
+    /// FORM FEED at the caret (saved as `<w:br w:type="page"/>`), not the
+    /// paragraph-format flag; the text after it starts page 2.
+    #[test]
+    fn insert_page_break_inserts_a_form_feed_at_the_caret() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("alpha beta"));
+        let evt = engine.do_insert_page_break(bpos_top(0, 5));
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let doc = engine.undo.current().clone();
+        let engine::Block::Paragraph(p) = &doc.blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "alpha\u{000C} beta");
+        assert!(!p.props.page_break_before, "the format flag stays off");
+        let sel = engine.selection.clone().expect("selection");
+        assert_eq!(sel.caret, bpos_top(0, 6), "caret lands after the break");
+        assert!(
+            engine
+                .pending_announcements
+                .iter()
+                .any(|(_, m)| m == "Page break inserted")
+        );
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(
+            pages.len(),
+            2,
+            "the break splits the paragraph across pages"
+        );
+
+        /* Saved as a real `<w:br w:type="page"/>`. */
+        let bytes = format_docx::build_minimal_docx(&doc).expect("write");
+        let back = format_docx::read_docx(&bytes).expect("read");
+        let engine::Block::Paragraph(p) = &back.document.blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "alpha\u{000C} beta");
+        assert!(!p.props.page_break_before);
+    }
+
+    /// Issue #75 — a table-cell caret is rejected loudly (Word never
+    /// paginates a cell's page break); the Breaks menu greys out there.
+    #[test]
+    fn insert_page_break_is_rejected_in_a_table_cell() {
+        let mut d = DocumentTree::from_text("intro");
+        d.blocks
+            .push_back(engine::Block::Table(one_row_table(vec![cell_with_text(
+                "cell",
+            )])));
+        let mut engine = test_engine_with_doc(d);
+        let cell_pos = BridgeLogicalPos {
+            path: BridgeBlockPath {
+                steps: vec![
+                    BridgePathStep::Block { idx: 1 },
+                    BridgePathStep::Cell { row: 0, col: 0 },
+                    BridgePathStep::Block { idx: 0 },
+                ],
+            },
+            offset: 2,
+        };
+        engine.selection = Some(SelectionState {
+            anchor: cell_pos.clone(),
+            caret: cell_pos.clone(),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let evt = engine.do_insert_page_break(cell_pos);
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(!engine.undo.can_undo(), "a rejected break pushes no edit");
+        let engine::Block::Table(t) = &engine.undo.current().blocks[1] else {
+            panic!("table expected");
+        };
+        let engine::Block::Paragraph(p) = &t.rows[0].cells[0].blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "cell");
+    }
+
     fn band_glyph_count(band: &layout::HeaderFooterBox) -> usize {
         let mut n = 0;
         band.for_each_paragraph(&mut |p| {
@@ -21609,6 +22301,26 @@ mod tests {
         let evt = engine.do_set_zoom(100.0);
         assert!(!matches!(evt, Event::Error { .. }));
         assert_eq!(engine.layout_cfg.as_ref().unwrap().zoom, 4.0);
+    }
+
+    /// Issue #52 — `SetZoom` answers with a `SelectionChanged` that
+    /// carries the engine's (clamped) zoom, so every zoom control can
+    /// mirror one engine-owned value.
+    #[test]
+    fn selection_changed_reports_the_engine_zoom() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
+        let zoom_of = |evt: Event| match evt {
+            Event::SelectionChanged { zoom, .. } => zoom,
+            other => panic!("expected SelectionChanged, got {other:?}"),
+        };
+        assert_eq!(zoom_of(engine.do_set_zoom(1.5)), 1.5);
+        assert_eq!(
+            zoom_of(engine.do_set_zoom(9.0)),
+            4.0,
+            "clamped to the engine's range"
+        );
+        /* A device-scale change keeps the user zoom and says so. */
+        assert_eq!(zoom_of(engine.do_set_device_scale(2.0)), 4.0);
     }
 
     #[test]
@@ -22594,6 +23306,110 @@ mod tests {
         d
     }
 
+    /// Issue #169 — "intro", a 2-cell table whose first row is
+    /// `<w:trHeight w:val="800">` under `rule` (40 px at scale 1) with a
+    /// long cell A that wraps far past it, a plain second row, "outro".
+    fn exact_row_doc(exact: bool) -> DocumentTree {
+        let mut t = one_row_table(vec![
+            cell_with_text(&"overflowing exact row content ".repeat(12)),
+            cell_with_text("short"),
+        ]);
+        t.rows[0].props.height = Some(if exact {
+            engine::RowHeight::Exact { twips: 800 }
+        } else {
+            engine::RowHeight::AtLeast { twips: 800 }
+        });
+        t.rows.push(engine::TableRow {
+            props: engine::RowProperties::default(),
+            cells: vec![cell_with_text("next A"), cell_with_text("next B")],
+        });
+        let mut d = DocumentTree::from_text("intro");
+        d.blocks.push_back(engine::Block::Table(t));
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "outro".into(),
+                ..Default::default()
+            }));
+        d
+    }
+
+    fn glyph_runs(pages: &[PageBox]) -> usize {
+        render::scene::build_document_scene(pages, 0.0)
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::DrawGlyphRun(_)))
+            .count()
+    }
+
+    /// Issue #169 acceptance — an exact row keeps its declared height
+    /// (the content does not grow it), is flagged for clipping, and the
+    /// scene clips both its cells and drops the lines below the row;
+    /// the same content under `atLeast` grows the row and paints every
+    /// line unclipped.
+    #[test]
+    fn exact_height_row_is_fixed_and_clipped() {
+        let engine = test_engine_with_doc(exact_row_doc(true));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("exact");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let t = first_table(&pages);
+        let declared = twips_to_layout_px(800, 1.0);
+        assert_eq!(t.rows[0].size.height, declared);
+        assert!(t.rows[0].exact_height && t.rows[0].cant_split);
+        assert!(!t.rows[1].exact_height);
+        let content: f32 = t.rows[0].cells[0]
+            .content
+            .iter()
+            .map(|b| b.size().height)
+            .sum();
+        assert!(content > 2.0 * declared, "the cell content overflows");
+        for c in &t.rows[0].cells {
+            assert_eq!(c.size.height, declared);
+        }
+        assert_eq!(
+            t.rows[1].origin.y, declared,
+            "the next row follows the fixed row"
+        );
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let clips = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 2, "one clip per cell of the exact row");
+
+        let grown = test_engine_with_doc(exact_row_doc(false));
+        let (grown_pages, _, _, _) = grown.build_pages(1.0, false, None).expect("atLeast");
+        let g = first_table(&grown_pages);
+        assert!(
+            g.rows[0].size.height > 2.0 * declared,
+            "atLeast grows to fit"
+        );
+        assert!(!g.rows[0].exact_height);
+        assert!(
+            glyph_runs(&pages) < glyph_runs(&grown_pages),
+            "lines past the exact row are not painted"
+        );
+        let clips = render::scene::build_document_scene(&grown_pages, 0.0)
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 0, "a growing row needs no clip");
+
+        /* PDF: the clipped export is valid and smaller (dropped lines). */
+        let fonts = test_font_stack();
+        let mut exact_pdf = Vec::new();
+        format_pdf::export_pdf(
+            &pages,
+            &fonts,
+            &[],
+            format_pdf::PdfProfile::Plain,
+            &mut exact_pdf,
+        )
+        .expect("pdf");
+        assert!(exact_pdf.starts_with(b"%PDF"));
+    }
+
     /// Issue #95 — stamp `<w:widowControl>` onto every top-level
     /// paragraph (`None` = unspecified, Word's default ON).
     fn with_widow_control(mut doc: DocumentTree, widow: Option<bool>) -> DocumentTree {
@@ -22648,9 +23464,23 @@ mod tests {
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
         out.push(("two_page_form_feed", pages, info.degradations));
 
+        /* Issue #75 — the same two pages from `<w:pageBreakBefore/>`
+        alone (no FORM FEED). */
+        let engine = test_engine_with_doc(with_widow_control(
+            page_break_before_doc("alpha beta gamma", "delta epsilon"),
+            widow,
+        ));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("pbb");
+        out.push(("two_page_break_before", pages, info.degradations));
+
         let engine = test_engine_with_doc(with_widow_control(table_doc(), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
         out.push(("autofit_table", pages, info.degradations));
+
+        /* Issue #169 — an overflowing `<w:trHeight w:hRule="exact">` row. */
+        let engine = test_engine_with_doc(with_widow_control(exact_row_doc(true), widow));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("exact row");
+        out.push(("exact_row_overflow_table", pages, info.degradations));
 
         let engine = test_engine_with_doc(with_widow_control(prose_doc(300), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
@@ -22807,7 +23637,13 @@ mod tests {
         ("50p_full_x2", 0xf565e610ffdbc22d),
         ("50p_band_2000_x2", 0x3b2d3d53655395a1),
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        /* Issue #75 — `<w:pageBreakBefore/>` alone (new fixture, recorded
+        on the #75 adapter; every other value is unchanged by it). */
+        ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
+        /* Issue #169 — an overflowing exact-height row, recorded on the
+        #169 adapter (new fixture; every other value is unchanged). */
+        ("exact_row_overflow_table", 0x33d0f55718ea079f),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),
         /* Issue #79 — recorded with the `<w:bidiVisual>` mirror in place
@@ -22830,7 +23666,9 @@ mod tests {
         ("50p_full_x2", 0xa7f584534ce2ac6f),
         ("50p_band_2000_x2", 0x25ddf363691ee633),
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
+        ("exact_row_overflow_table", 0x33d0f55718ea079f),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),
     ];
@@ -23937,6 +24775,7 @@ mod snapshot_tests {
             Command::Recover {
                 snapshot: bytes,
                 log_tail: vec![insert("X"), Command::SetZoom { scale: 2.0 }],
+                renderer_downgrade: None,
             },
         );
         match evt {
@@ -23944,10 +24783,19 @@ mod snapshot_tests {
                 applied_commands,
                 snapshot_restored,
                 renderer,
+                zoom,
+                device_scale,
+                renderer_downgrade,
             } => {
                 assert_eq!(applied_commands, 2);
                 assert!(snapshot_restored);
                 assert_eq!(renderer, "canvas2d");
+                /* Issue #97 — the reply reports the REPLAYED zoom (the
+                snapshot said 1.25, the tail's SetZoom said 2.0) and the
+                restored boot device scale, so the shell re-syncs. */
+                assert_eq!(zoom, 2.0);
+                assert_eq!(device_scale, Some(1.5));
+                assert_eq!(renderer_downgrade, None);
             }
             other => panic!("expected Recovered, got {other:?}"),
         }
@@ -23985,6 +24833,7 @@ mod snapshot_tests {
             Command::Recover {
                 snapshot: b"definitely not a snapshot".to_vec(),
                 log_tail: vec![insert("hello"), insert(" world")],
+                renderer_downgrade: None,
             },
         );
         match evt {
@@ -24011,6 +24860,7 @@ mod snapshot_tests {
             Command::Recover {
                 snapshot: Vec::new(),
                 log_tail: Vec::new(),
+                renderer_downgrade: None,
             },
         );
         assert!(matches!(
@@ -24021,11 +24871,52 @@ mod snapshot_tests {
                 ..
             }
         ));
+        /* Issue #97 — a cold recovery reports the cold defaults: 100 %
+        zoom and no device scale (the shell re-seeds both). */
+        let Event::Recovered {
+            zoom, device_scale, ..
+        } = evt
+        else {
+            unreachable!()
+        };
+        assert_eq!(zoom, 1.0);
+        assert_eq!(device_scale, None);
         assert_eq!(text(&b), "");
         assert!(b.selection.is_none());
         assert!(b.layout_cfg.is_none());
         assert!(!b.tracking_changes);
         assert!(matches!(b.active_story, StoryTarget::Body));
+    }
+
+    /// Issue #99 — the worker's crash-loop downgrade record rides
+    /// `Command::Recover` and comes back verbatim on `Event::Recovered`.
+    #[test]
+    fn recover_echoes_the_renderer_downgrade() {
+        let downgrade = bridge::RendererDowngrade {
+            from: "vello".to_string(),
+            to: "canvas2d".to_string(),
+            reason: bridge::RendererDowngradeReason::CrashLoop,
+            consecutive_traps: 2,
+        };
+        let mut b = engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: seeded_engine().snapshot_bytes().unwrap(),
+                log_tail: Vec::new(),
+                renderer_downgrade: Some(downgrade.clone()),
+            },
+        );
+        let Event::Recovered {
+            renderer,
+            renderer_downgrade,
+            ..
+        } = evt
+        else {
+            panic!("expected Recovered, got {evt:?}");
+        };
+        assert_eq!(renderer, "canvas2d");
+        assert_eq!(renderer_downgrade, Some(downgrade));
     }
 
     #[test]
@@ -25262,6 +26153,7 @@ mod wire_validation_tests {
             Command::Recover {
                 snapshot: Vec::new(),
                 log_tail: Vec::new(),
+                renderer_downgrade: None,
             },
         );
         assert!(matches!(evt, Event::Recovered { .. }), "{evt:?}");

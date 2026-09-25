@@ -10,7 +10,12 @@
  * crate is not built standalone — its `Command`/`Event` types are generated
  * (via `tsify-next`) into the `engine-wasm` wasm-pack package, so that is the
  * real import site. */
-import type { Command, DocFormat, Event } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import type {
+    Command,
+    DocFormat,
+    Event,
+    RendererDowngrade,
+} from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { loadLatestEventLog } from './event-log';
 
 type WorkerReply = {
@@ -34,6 +39,8 @@ type WorkerReply = {
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
     revisions?: RevisionSnapshot[];
+    /** Issue #96 — payload of the DEV-only `PROBE_PAGE_INK` reply. */
+    ink?: Record<number, number>;
 };
 
 /** Phase 8a — read-only snapshot row for the comments sidebar. */
@@ -70,7 +77,31 @@ export interface RecoveryInfo {
     appliedCommands: number;
     /** The renderer the recovered engine actually paints with (#66). */
     renderer: string;
+    /** Issue #97 — the user zoom the recovered engine renders at. */
+    zoom: number;
+    /** Issue #97 — the recovered boot device scale; `undefined` when the
+     *  engine came back without a layout config. */
+    deviceScale: number | undefined;
+    /**
+     * Issue #97 — the recovered engine holds a live session (document +
+     * layout config): either a base snapshot was restored, or the replayed
+     * tail itself re-seeded it (it carried the boot `RENDER_PAGE`). The
+     * shell must then NOT re-seed via `RENDER_PAGE`, which would wipe the
+     * replayed document and reset the zoom to 100 %.
+     */
+    layoutRestored: boolean;
+    /** Issue #99 — set when this generation was forced onto Canvas2D after
+     *  a crash loop on Vello (the engine's echo on `Event::Recovered`). */
+    rendererDowngrade: RendererDowngrade | undefined;
 }
+
+/** Issue #99 — consecutive traps on the Vello backend after which recovery
+ *  stops re-probing the GPU and forces Canvas2D (so a persistently failing
+ *  driver / shader path costs at most N + 1 worker generations). */
+export const VELLO_TRAP_LIMIT = 2;
+/** Issue #99 — a generation that stays up this long ends the streak: two
+ *  unrelated traps an hour apart are not a crash loop. */
+const STABLE_GENERATION_MS = 60_000;
 
 type Resolver = (v: WorkerReply) => void;
 
@@ -103,6 +134,20 @@ export class EngineClient {
     private workerIsolated = false;
     private activeRenderer = 'canvas2d';
     private lastRecoveryInfo: RecoveryInfo | undefined;
+    /** Issue #99 — traps in a row whose generation painted with Vello. */
+    private velloTrapStreak = 0;
+    /** Issue #99 — sticky for the session once the crash loop tripped. */
+    private downgrade: RendererDowngrade | undefined;
+    private stableTimer: ReturnType<typeof setTimeout> | undefined;
+    /** Worker generations spawned so far (1 = the boot worker). */
+    private generations = 0;
+    /** Issue #99 — DEV-only `?mockBackend=vello` test hook, forwarded to
+     *  the worker (which also ignores it outside DEV). */
+    private readonly mockBackend: 'vello' | undefined =
+        import.meta.env.DEV &&
+        new URLSearchParams(globalThis.location?.search ?? '').get('mockBackend') === 'vello'
+            ? 'vello'
+            : undefined;
 
     /**
      * @param documentId identifies the IndexedDB event log for this document.
@@ -124,6 +169,7 @@ export class EngineClient {
             resolve({ ok: false, error: 'engine worker respawned; request abandoned' });
         }
         this.pending.clear();
+        this.generations += 1;
         this.worker = new Worker(new URL('./engine.worker.ts', import.meta.url), {
             type: 'module',
         });
@@ -132,10 +178,41 @@ export class EngineClient {
     }
 
     async init(canvas: OffscreenCanvas): Promise<void> {
-        const r = await this.send({ type: 'INIT', canvas, documentId: this.documentId }, [canvas]);
+        const r = await this.send(
+            {
+                type: 'INIT',
+                canvas,
+                documentId: this.documentId,
+                ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
+            },
+            [canvas],
+        );
         if (!r.ok) throw new Error(r.error);
         this.workerIsolated = r.crossOriginIsolated === true;
         this.activeRenderer = r.renderer ?? 'canvas2d';
+        this.armStableTimer();
+    }
+
+    /** Worker generations spawned so far (1 = boot; +1 per recovery). */
+    get generation(): number {
+        return this.generations;
+    }
+
+    /** Issue #99 — the crash-loop downgrade in force for this session, or
+     *  `undefined` while the GPU backend is still trusted. */
+    get rendererDowngrade(): RendererDowngrade | undefined {
+        return this.downgrade;
+    }
+
+    /** Issue #99 — a generation that survives STABLE_GENERATION_MS ends a
+     *  trap streak. Never lifts an active downgrade (that stays for the
+     *  session: the GPU path already proved it can crash-loop). */
+    private armStableTimer(): void {
+        if (this.stableTimer !== undefined) clearTimeout(this.stableTimer);
+        this.stableTimer = setTimeout(() => {
+            this.stableTimer = undefined;
+            this.velloTrapStreak = 0;
+        }, STABLE_GENERATION_MS);
     }
 
     /** D2.3: whether the engine worker reported `crossOriginIsolated === true`. */
@@ -173,22 +250,55 @@ export class EngineClient {
             console.error('event log unreadable; recovering with an empty log', e);
             return { snapshot: new Uint8Array(0), log: [], snapshotSeq: 0, lastSeq: 0 };
         });
+        /* Issue #99 — N traps in a row on Vello: stop re-probing the GPU
+           (it would pick Vello again and crash-loop) and force Canvas2D for
+           this and every later generation of the session. */
+        if (this.downgrade === undefined && this.velloTrapStreak >= VELLO_TRAP_LIMIT) {
+            this.downgrade = {
+                from: 'vello',
+                to: 'canvas2d',
+                reason: 'CRASH_LOOP',
+                consecutive_traps: this.velloTrapStreak,
+            };
+            console.warn(
+                `[recovery] ${this.velloTrapStreak} consecutive traps on Vello — ` +
+                    'booting the recovered engine on Canvas2D',
+            );
+        }
         this.spawn();
         /* Clear the guard BEFORE awaiting the reply: if the RECOVER replay
            itself traps, handle() runs onTrap() synchronously — ahead of this
            await's continuation — and must re-fire onCrash, not drop it. */
         this.recovering = false;
-        const r = await this.send({ type: 'RECOVER', canvas, snapshot, log, snapshotSeq, lastSeq }, [
-            canvas,
-            snapshot.buffer as ArrayBuffer,
-        ]);
+        const r = await this.send(
+            {
+                type: 'RECOVER',
+                canvas,
+                snapshot,
+                log,
+                snapshotSeq,
+                lastSeq,
+                ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
+                ...(this.downgrade
+                    ? { forceRenderer: 'canvas2d', rendererDowngrade: this.downgrade }
+                    : {}),
+            },
+            [canvas, snapshot.buffer as ArrayBuffer],
+        );
         if (!r.ok) throw new Error(r.error);
         this.activeRenderer = r.renderer ?? 'canvas2d';
+        const recovered = r.evt?.type === 'RECOVERED' ? r.evt : undefined;
+        const deviceScale = recovered?.device_scale;
         this.lastRecoveryInfo = {
             restored: r.restored === true,
             appliedCommands: r.appliedCommands ?? 0,
             renderer: this.activeRenderer,
+            zoom: recovered?.zoom ?? 1,
+            deviceScale,
+            layoutRestored: r.restored === true || deviceScale !== undefined,
+            rendererDowngrade: recovered?.renderer_downgrade,
         };
+        this.armStableTimer();
     }
 
     /**
@@ -214,6 +324,20 @@ export class EngineClient {
     async armTrap(afterCommands = 1): Promise<void> {
         const r = await this.send({ type: 'ARM_TRAP', after_commands: afterCommands });
         if (!r.ok) throw new Error(r.error);
+    }
+
+    /**
+     * Issue #96 test hook (DEV builds only; the worker refuses it in a
+     * production build): opaque non-white pixel count per page surface
+     * the CURRENT worker generation holds, read back worker-side — the
+     * only paint evidence headless Chrome offers for the full app. `-1`
+     * for a surface without a 2d context (Vello page 0); a page the
+     * shell never registered with this worker is absent.
+     */
+    async probePageInk(): Promise<Record<number, number>> {
+        const r = await this.send({ type: 'PROBE_PAGE_INK' });
+        if (!r.ok) throw new Error(r.error);
+        return r.ink ?? {};
     }
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {
@@ -354,6 +478,13 @@ export class EngineClient {
     private onTrap(stack: string): void {
         if (this.recovering) return;
         this.recovering = true;
+        /* Issue #99 — count the streak by the backend the TRAPPED
+           generation painted with; any non-Vello trap breaks it. */
+        if (this.stableTimer !== undefined) {
+            clearTimeout(this.stableTimer);
+            this.stableTimer = undefined;
+        }
+        this.velloTrapStreak = this.activeRenderer === 'vello' ? this.velloTrapStreak + 1 : 0;
         for (const resolve of this.pending.values()) {
             resolve({ ok: false, error: 'engine worker trapped; recovering', trap: true });
         }

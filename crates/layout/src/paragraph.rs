@@ -1271,14 +1271,35 @@ fn compose_lines(cfg: &ParagraphConfig<'_>) -> Vec<(LineBox, bool)> {
 /// separator yields an empty range so the caret can rest on the blank
 /// line it produces. With no separator present the result is the single
 /// range `[(0, text.len())]` — the composer's fast path.
+///
+/// Issue #75 — a U+000C FORM FEED (the reader's `<w:br w:type="page"/>`,
+/// and what `Command::InsertPageBreak` types) is a mandatory break too
+/// (UAX #14 class BK): the range ends right AFTER it — the FORM FEED
+/// stays on the line it ends, because the engine's
+/// `compute_page_break_lines` finds the page-break line by the run that
+/// covers the FORM FEED byte — and the next range starts behind it.
+/// Before this, a mid-paragraph FORM FEED was only a break *opportunity*
+/// and the greedy composer happily kept the text after it on the same
+/// line, so the page break never fired. A FORM FEED that ends the text
+/// adds no empty trailing range: that shape was already a line end, and
+/// keeping it byte-identical keeps every pinned FORM FEED fixture.
 fn soft_break_segments(text: &str) -> Vec<(usize, usize)> {
     const LINE_SEP: char = '\u{2028}';
-    let sep_len = LINE_SEP.len_utf8();
+    const FORM_FEED: char = '\u{000C}';
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut seg_start = 0_usize;
-    for (pos, _) in text.match_indices(LINE_SEP) {
-        out.push((seg_start, pos));
-        seg_start = pos + sep_len;
+    for (pos, c) in text.char_indices() {
+        match c {
+            LINE_SEP => {
+                out.push((seg_start, pos));
+                seg_start = pos + LINE_SEP.len_utf8();
+            }
+            FORM_FEED if pos + FORM_FEED.len_utf8() < text.len() => {
+                out.push((seg_start, pos + FORM_FEED.len_utf8()));
+                seg_start = pos + FORM_FEED.len_utf8();
+            }
+            _ => {}
+        }
     }
     out.push((seg_start, text.len()));
     out
@@ -2126,6 +2147,18 @@ mod tests {
         straight to the width-breaker — byte-identical to the old path. */
         assert_eq!(soft_break_segments("hello world"), vec![(0, 11)]);
         assert_eq!(soft_break_segments(""), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn soft_break_segments_form_feed_ends_its_line() {
+        /* Issue #75 — "ab\u{C}cd": the FORM FEED (1 byte at 2) stays on
+        the first range; the second starts behind it. */
+        assert_eq!(soft_break_segments("ab\u{C}cd"), vec![(0, 3), (3, 5)]);
+        /* Trailing: no empty range — byte-identical to the pre-#75 shape. */
+        assert_eq!(soft_break_segments("ab\u{C}"), vec![(0, 3)]);
+        /* Mixed with a soft break. */
+        let s = "a\u{C}b\u{2028}c";
+        assert_eq!(soft_break_segments(s), vec![(0, 2), (2, 3), (6, 7)]);
     }
 
     #[test]

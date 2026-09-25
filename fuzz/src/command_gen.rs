@@ -573,125 +573,152 @@ pub struct VariantInfo {
     pub curated: bool,
 }
 
-/// Classify every `Command` variant — issue #177. **No wildcard arm.**
-/// Ordered to match `crates/bridge/src/command.rs`'s declaration order
-/// so a side-by-side diff of the two is easy to audit.
-pub fn classify_variant(cmd: &Command) -> VariantInfo {
-    fn v(name: &'static str, curated: bool) -> VariantInfo {
-        VariantInfo { name, curated }
-    }
-    match cmd {
-        // ---- Phase 1 PoC ---------------------------------------------------
-        Command::Ping => v("Ping", false),
-        Command::LoadFont { .. } => v("LoadFont", false),
-        Command::RasterizeGlyph { .. } => v("RasterizeGlyph", false),
-        Command::ShapeAndRasterize { .. } => v("ShapeAndRasterize", false),
-        Command::RenderPage { .. } => v("RenderPage", false),
-        Command::InsertText { .. } => v("InsertText", true), // gen_targeted_command
-        Command::Undo => v("Undo", true),                    // gen_selection_command
-        Command::Redo => v("Redo", true),                    // gen_selection_command
-        Command::LoadDocx { .. } => v("LoadDocx", false),
-        Command::SaveDocx => v("SaveDocx", false),
-        // ---- Phase 2 §4 ------------------------------------------------------
-        Command::Init { .. } => v("Init", false),
-        Command::Recover { .. } => v("Recover", false),
-        Command::Snapshot { .. } => v("Snapshot", false),
-        Command::Dispose => v("Dispose", false),
-        Command::Tick { .. } => v("Tick", false),
-        Command::OpenDocument { .. } => v("OpenDocument", false),
-        Command::SaveDocument { .. } => v("SaveDocument", false),
-        Command::ExportPdf { .. } => v("ExportPdf", false),
-        Command::CloseDocument => v("CloseDocument", false),
-        Command::DeleteRange { .. } => v("DeleteRange", true), // gen_targeted_command
-        Command::ReplaceRange { .. } => v("ReplaceRange", true), // gen_targeted_command
-        Command::ApplyFormatting { .. } => v("ApplyFormatting", true), // gen_targeted_command
-        Command::SplitParagraph { .. } => v("SplitParagraph", true), // gen_targeted_command
-        Command::MergeParagraph { .. } => v("MergeParagraph", false),
-        Command::InsertImage { .. } => v("InsertImage", true), // gen_image_command
-        Command::ResizeImage { .. } => v("ResizeImage", false),
-        Command::MoveImage { .. } => v("MoveImage", true), // gen_targeted_command (#177)
-        Command::SetImageWrap { .. } => v("SetImageWrap", true), // gen_image_command
-        Command::SetSelection { .. } => v("SetSelection", true), // gen_selection_command
-        Command::ExtendSelection { .. } => v("ExtendSelection", true), // gen_selection_command
-        Command::SelectAll => v("SelectAll", true),        // gen_selection_command
-        Command::MoveCaret { .. } => v("MoveCaret", true), // gen_selection_command
-        Command::BeginComposition { .. } => v("BeginComposition", false),
-        Command::UpdateComposition { .. } => v("UpdateComposition", false),
-        Command::EndComposition { .. } => v("EndComposition", false),
-        Command::SetViewport { .. } => v("SetViewport", false),
-        Command::SetZoom { .. } => v("SetZoom", true), // gen_targeted_command (#177/#186)
-        Command::SetDeviceScale { .. } => v("SetDeviceScale", true), // gen_targeted_command (#177/#186)
-        Command::RequestPaint { .. } => v("RequestPaint", false),
-        Command::ExpandLayout { .. } => v("ExpandLayout", false),
-        Command::UnloadFont { .. } => v("UnloadFont", false),
-        Command::RequestStats => v("RequestStats", false),
-        // ---- Phase 4 §7 --------------------------------------------------------
-        Command::HitTest { .. } => v("HitTest", false),
-        Command::HitTestInPage { .. } => v("HitTestInPage", false),
-        Command::PlaceCaretAtPoint { .. } => v("PlaceCaretAtPoint", false),
-        Command::ExtendSelectionToPoint { .. } => v("ExtendSelectionToPoint", false),
-        Command::GetImageRects => v("GetImageRects", false),
-        Command::SelectWordAt { .. } => v("SelectWordAt", false),
-        Command::SelectParagraphAt { .. } => v("SelectParagraphAt", false),
-        Command::SelectCellAt { .. } => v("SelectCellAt", false),
-        Command::DeleteAtCaret { .. } => v("DeleteAtCaret", true), // gen_targeted_command
-        Command::RequestAccessibilityDelta => v("RequestAccessibilityDelta", false),
-        Command::GetSelectionAsClipboard { .. } => v("GetSelectionAsClipboard", false),
-        Command::PastePlain { .. } => v("PastePlain", false),
-        // ---- Backlog sprint 1 --------------------------------------------------
-        Command::SetParagraphAlign { .. } => v("SetParagraphAlign", true), // gen_targeted_command
-        Command::SetParagraphDirection { .. } => v("SetParagraphDirection", true), // gen_targeted_command
-        // ---- Backlog sprint 7 --------------------------------------------------
-        Command::PasteHtml { .. } => v("PasteHtml", false),
-        // ---- Phase 5 PR 3 — tables ----------------------------------------------
-        Command::InsertTable { .. } => v("InsertTable", true), // gen_targeted_command
-        Command::DeleteTable { .. } => v("DeleteTable", false),
-        Command::InsertRow { .. } => v("InsertRow", true), // gen_targeted_command
-        Command::DeleteRow { .. } => v("DeleteRow", true), // gen_targeted_command
-        Command::InsertColumn { .. } => v("InsertColumn", false),
-        Command::DeleteColumn { .. } => v("DeleteColumn", false),
-        Command::MergeCells { .. } => v("MergeCells", true), // gen_targeted_command
-        Command::SplitCell { .. } => v("SplitCell", false),
-        Command::SetCellShading { .. } => v("SetCellShading", true), // gen_targeted_command
-        Command::SetCellBorders { .. } => v("SetCellBorders", true), // gen_targeted_command
-        Command::SetTableProperties { .. } => v("SetTableProperties", true), // gen_targeted_command (#177)
-        Command::SetColumns { .. } => v("SetColumns", true),                 // gen_targeted_command
-        Command::InsertPageBreak { .. } => v("InsertPageBreak", false),
-        Command::InsertSectionBreak { .. } => v("InsertSectionBreak", true), // gen_targeted_command
-        Command::EnterHeaderFooter { .. } => v("EnterHeaderFooter", true),   // gen_targeted_command
-        Command::ExitHeaderFooter => v("ExitHeaderFooter", true), // gen_targeted_command fallback / gen_note_command
-        Command::SetHeaderFooterLink { .. } => v("SetHeaderFooterLink", false),
-        Command::SetTitlePage { .. } => v("SetTitlePage", false),
-        Command::SetEvenOddHeaders { .. } => v("SetEvenOddHeaders", false),
-        Command::InsertField { .. } => v("InsertField", true), // gen_field_command
-        Command::InsertFootnote { .. } => v("InsertFootnote", true), // gen_note_command
-        Command::InsertEndnote { .. } => v("InsertEndnote", true), // gen_note_command
-        Command::InsertTextBox { .. } => v("InsertTextBox", true), // gen_targeted_command (#177)
-        Command::SetRenderDate { .. } => v("SetRenderDate", true), // gen_targeted_command (#177/#187)
-        Command::UpdateFields => v("UpdateFields", true),          // gen_field_command
-        Command::SetFieldCodeView { .. } => v("SetFieldCodeView", false),
-        Command::SetFieldInstruction { .. } => v("SetFieldInstruction", false),
-        Command::InsertToc { .. } => v("InsertToc", true), // gen_field_command
-        Command::SetParagraphBorders { .. } => v("SetParagraphBorders", false),
-        Command::SetPageMargins { .. } => v("SetPageMargins", false),
-        Command::SetPageOrientation { .. } => v("SetPageOrientation", false),
-        Command::ToggleList { .. } => v("ToggleList", true), // gen_targeted_command
-        Command::ChangeListLevel { .. } => v("ChangeListLevel", false),
-        Command::SetParagraphIndent { .. } => v("SetParagraphIndent", true), // gen_targeted_command
-        Command::SetLineSpacing { .. } => v("SetLineSpacing", true),         // gen_targeted_command
-        Command::SetParagraphShading { .. } => v("SetParagraphShading", false),
-        Command::ToggleTrackChanges { .. } => v("ToggleTrackChanges", false),
-        Command::AcceptRevision { .. } => v("AcceptRevision", false),
-        Command::RejectRevision { .. } => v("RejectRevision", false),
-        Command::InsertComment { .. } => v("InsertComment", false),
-        Command::DeleteComment { .. } => v("DeleteComment", false),
-        Command::SetTabStops { .. } => v("SetTabStops", false),
-        Command::SetReviewIdentity { .. } => v("SetReviewIdentity", false),
-        Command::ApplyStyle { .. } => v("ApplyStyle", false),
-        Command::ResolveComment { .. } => v("ResolveComment", false),
-        Command::ReplyToComment { .. } => v("ReplyToComment", false),
-        Command::ModifyStyle { .. } => v("ModifyStyle", false),
-    }
+/// Issue #209 — defines `classify_variant`'s match **and** [`ALL_VARIANT_NAMES`]
+/// from one list, so the two can never desync. Before this macro, the match
+/// below and a hand-maintained `KNOWN_VARIANT_NAMES: &[&str]` test constant
+/// listed the same ~100 variant names independently; nothing enforced they
+/// stayed in sync (the *match* itself is still safe on a rename — `Command::
+/// $variant` is a concrete path the compiler checks — but a typo in a
+/// separately hand-typed name string was not).
+///
+/// Each entry names a variant exactly once, as the `$variant:ident` token —
+/// the same token used both in the generated `Command::$variant` match arm
+/// and, via `stringify!`, as the runtime name string. There is no second,
+/// independently-typed copy of the name to fall out of sync.
+macro_rules! classify_variants {
+    ( $( $variant:ident $( { $($field:tt)* } )? => $curated:expr ),+ $(,)? ) => {
+        /// Classify every `Command` variant — issue #177. **No wildcard arm.**
+        /// Ordered to match `crates/bridge/src/command.rs`'s declaration order
+        /// so a side-by-side diff of the two is easy to audit.
+        pub fn classify_variant(cmd: &Command) -> VariantInfo {
+            match cmd {
+                $(
+                    Command::$variant $( { $($field)* } )? => VariantInfo {
+                        name: stringify!($variant),
+                        curated: $curated,
+                    },
+                )+
+            }
+        }
+
+        /// Every name `classify_variant` can produce, generated from the
+        /// exact same list that defines its match — issue #209. Used to
+        /// sanity-check `coverage_snapshot`'s output (see the tests below).
+        pub const ALL_VARIANT_NAMES: &[&str] = &[ $( stringify!($variant) ),+ ];
+    };
+}
+
+classify_variants! {
+    // ---- Phase 1 PoC ---------------------------------------------------
+    Ping => false,
+    LoadFont { .. } => false,
+    RasterizeGlyph { .. } => false,
+    ShapeAndRasterize { .. } => false,
+    RenderPage { .. } => false,
+    InsertText { .. } => true, // gen_targeted_command
+    Undo => true,              // gen_selection_command
+    Redo => true,              // gen_selection_command
+    LoadDocx { .. } => false,
+    SaveDocx => false,
+    // ---- Phase 2 §4 ------------------------------------------------------
+    Init { .. } => false,
+    Recover { .. } => false,
+    Snapshot { .. } => false,
+    Dispose => false,
+    Tick { .. } => false,
+    OpenDocument { .. } => false,
+    SaveDocument { .. } => false,
+    ExportPdf { .. } => false,
+    CloseDocument => false,
+    DeleteRange { .. } => true, // gen_targeted_command
+    ReplaceRange { .. } => true, // gen_targeted_command
+    ApplyFormatting { .. } => true, // gen_targeted_command
+    SplitParagraph { .. } => true, // gen_targeted_command
+    MergeParagraph { .. } => false,
+    InsertImage { .. } => true, // gen_image_command
+    ResizeImage { .. } => false,
+    MoveImage { .. } => true, // gen_targeted_command (#177)
+    SetImageWrap { .. } => true, // gen_image_command
+    SetSelection { .. } => true, // gen_selection_command
+    ExtendSelection { .. } => true, // gen_selection_command
+    SelectAll => true,        // gen_selection_command
+    MoveCaret { .. } => true, // gen_selection_command
+    BeginComposition { .. } => false,
+    UpdateComposition { .. } => false,
+    EndComposition { .. } => false,
+    SetViewport { .. } => false,
+    SetZoom { .. } => true, // gen_targeted_command (#177/#186)
+    SetDeviceScale { .. } => true, // gen_targeted_command (#177/#186)
+    RequestPaint { .. } => false,
+    ExpandLayout { .. } => false,
+    UnloadFont { .. } => false,
+    RequestStats => false,
+    // ---- Phase 4 §7 --------------------------------------------------------
+    HitTest { .. } => false,
+    HitTestInPage { .. } => false,
+    PlaceCaretAtPoint { .. } => false,
+    ExtendSelectionToPoint { .. } => false,
+    GetImageRects => false,
+    SelectWordAt { .. } => false,
+    SelectParagraphAt { .. } => false,
+    SelectCellAt { .. } => false,
+    DeleteAtCaret { .. } => true, // gen_targeted_command
+    RequestAccessibilityDelta => false,
+    GetSelectionAsClipboard { .. } => false,
+    PastePlain { .. } => false,
+    // ---- Backlog sprint 1 --------------------------------------------------
+    SetParagraphAlign { .. } => true, // gen_targeted_command
+    SetParagraphDirection { .. } => true, // gen_targeted_command
+    // ---- Backlog sprint 7 --------------------------------------------------
+    PasteHtml { .. } => false,
+    // ---- Phase 5 PR 3 — tables ----------------------------------------------
+    InsertTable { .. } => true, // gen_targeted_command
+    DeleteTable { .. } => false,
+    InsertRow { .. } => true, // gen_targeted_command
+    DeleteRow { .. } => true, // gen_targeted_command
+    InsertColumn { .. } => false,
+    DeleteColumn { .. } => false,
+    MergeCells { .. } => true, // gen_targeted_command
+    SplitCell { .. } => false,
+    SetCellShading { .. } => true, // gen_targeted_command
+    SetCellBorders { .. } => true, // gen_targeted_command
+    SetTableProperties { .. } => true, // gen_targeted_command (#177)
+    SetColumns { .. } => true,                 // gen_targeted_command
+    InsertPageBreak { .. } => false,
+    InsertSectionBreak { .. } => true, // gen_targeted_command
+    EnterHeaderFooter { .. } => true,   // gen_targeted_command
+    ExitHeaderFooter => true, // gen_targeted_command fallback / gen_note_command
+    SetHeaderFooterLink { .. } => false,
+    SetTitlePage { .. } => false,
+    SetEvenOddHeaders { .. } => false,
+    InsertField { .. } => true, // gen_field_command
+    InsertFootnote { .. } => true, // gen_note_command
+    InsertEndnote { .. } => true, // gen_note_command
+    InsertTextBox { .. } => true, // gen_targeted_command (#177)
+    SetRenderDate { .. } => true, // gen_targeted_command (#177/#187)
+    UpdateFields => true,          // gen_field_command
+    SetFieldCodeView { .. } => false,
+    SetFieldInstruction { .. } => false,
+    InsertToc { .. } => true, // gen_field_command
+    SetParagraphBorders { .. } => false,
+    SetPageMargins { .. } => false,
+    SetPageOrientation { .. } => false,
+    ToggleList { .. } => true, // gen_targeted_command
+    ChangeListLevel { .. } => false,
+    SetParagraphIndent { .. } => true, // gen_targeted_command
+    SetLineSpacing { .. } => true,         // gen_targeted_command
+    SetParagraphShading { .. } => false,
+    ToggleTrackChanges { .. } => false,
+    AcceptRevision { .. } => false,
+    RejectRevision { .. } => false,
+    InsertComment { .. } => false,
+    DeleteComment { .. } => false,
+    SetTabStops { .. } => false,
+    SetReviewIdentity { .. } => false,
+    ApplyStyle { .. } => false,
+    ResolveComment { .. } => false,
+    ReplyToComment { .. } => false,
+    ModifyStyle { .. } => false,
 }
 
 thread_local! {
@@ -851,119 +878,41 @@ mod tests {
             // Every reported name must be a real variant name — i.e. it
             // came from `classify_variant`, not some other source.
             assert!(
-                KNOWN_VARIANT_NAMES.contains(name),
+                ALL_VARIANT_NAMES.contains(name),
                 "coverage reported an unclassified variant name: {name}"
             );
         }
     }
 
-    /// Every name `classify_variant` can produce — kept in sync by hand
-    /// alongside the match above; used only to sanity-check
-    /// `coverage_snapshot`'s output in the test above.
-    const KNOWN_VARIANT_NAMES: &[&str] = &[
-        "Ping",
-        "LoadFont",
-        "RasterizeGlyph",
-        "ShapeAndRasterize",
-        "RenderPage",
-        "InsertText",
-        "Undo",
-        "Redo",
-        "LoadDocx",
-        "SaveDocx",
-        "Init",
-        "Recover",
-        "Snapshot",
-        "Dispose",
-        "Tick",
-        "OpenDocument",
-        "SaveDocument",
-        "ExportPdf",
-        "CloseDocument",
-        "DeleteRange",
-        "ReplaceRange",
-        "ApplyFormatting",
-        "SplitParagraph",
-        "MergeParagraph",
-        "InsertImage",
-        "ResizeImage",
-        "MoveImage",
-        "SetImageWrap",
-        "SetSelection",
-        "ExtendSelection",
-        "SelectAll",
-        "MoveCaret",
-        "BeginComposition",
-        "UpdateComposition",
-        "EndComposition",
-        "SetViewport",
-        "SetZoom",
-        "SetDeviceScale",
-        "RequestPaint",
-        "ExpandLayout",
-        "UnloadFont",
-        "RequestStats",
-        "HitTest",
-        "HitTestInPage",
-        "PlaceCaretAtPoint",
-        "ExtendSelectionToPoint",
-        "GetImageRects",
-        "SelectWordAt",
-        "SelectParagraphAt",
-        "SelectCellAt",
-        "DeleteAtCaret",
-        "RequestAccessibilityDelta",
-        "GetSelectionAsClipboard",
-        "PastePlain",
-        "SetParagraphAlign",
-        "SetParagraphDirection",
-        "PasteHtml",
-        "InsertTable",
-        "DeleteTable",
-        "InsertRow",
-        "DeleteRow",
-        "InsertColumn",
-        "DeleteColumn",
-        "MergeCells",
-        "SplitCell",
-        "SetCellShading",
-        "SetCellBorders",
-        "SetTableProperties",
-        "SetColumns",
-        "InsertPageBreak",
-        "InsertSectionBreak",
-        "EnterHeaderFooter",
-        "ExitHeaderFooter",
-        "SetHeaderFooterLink",
-        "SetTitlePage",
-        "SetEvenOddHeaders",
-        "InsertField",
-        "InsertFootnote",
-        "InsertEndnote",
-        "InsertTextBox",
-        "SetRenderDate",
-        "UpdateFields",
-        "SetFieldCodeView",
-        "SetFieldInstruction",
-        "InsertToc",
-        "SetParagraphBorders",
-        "SetPageMargins",
-        "SetPageOrientation",
-        "ToggleList",
-        "ChangeListLevel",
-        "SetParagraphIndent",
-        "SetLineSpacing",
-        "SetParagraphShading",
-        "ToggleTrackChanges",
-        "AcceptRevision",
-        "RejectRevision",
-        "InsertComment",
-        "DeleteComment",
-        "SetTabStops",
-        "SetReviewIdentity",
-        "ApplyStyle",
-        "ResolveComment",
-        "ReplyToComment",
-        "ModifyStyle",
-    ];
+    /// Issue #209 — `ALL_VARIANT_NAMES` is generated by the
+    /// `classify_variants!` macro from the exact same list that defines
+    /// `classify_variant`'s match (see its doc comment above), so a variant
+    /// rename or count change can no longer silently desync the two the way
+    /// a hand-maintained mirror list could. This test pins the properties
+    /// that make the generated list trustworthy as `classify_variant`'s
+    /// coverage: every name is unique, and the count matches the number of
+    /// arms the match actually has today — since that match has no
+    /// wildcard arm (issue #177), the count *is* the full `Command` variant
+    /// count, so this also doubles as a tripwire for "a variant landed
+    /// without anyone updating this test".
+    #[test]
+    fn all_variant_names_equals_classifier_coverage() {
+        let mut seen = std::collections::BTreeSet::new();
+        for name in ALL_VARIANT_NAMES {
+            assert!(
+                seen.insert(*name),
+                "duplicate variant name in ALL_VARIANT_NAMES: {name}"
+            );
+        }
+        const EXPECTED_VARIANT_COUNT: usize = 104;
+        assert_eq!(
+            ALL_VARIANT_NAMES.len(),
+            EXPECTED_VARIANT_COUNT,
+            "classify_variant's no-wildcard match covers exactly this many \
+             Command variants today (crates/bridge/src/command.rs); update \
+             EXPECTED_VARIANT_COUNT here (and the curated flags of any new \
+             variant in the classify_variants! call above) when that enum \
+             gains or loses a variant"
+        );
+    }
 }

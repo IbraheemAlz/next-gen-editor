@@ -1,7 +1,11 @@
 /// <reference lib="webworker" />
 
 import init, { Engine, detect_backend } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
-import type { Command, Event } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import type {
+    Command,
+    Event,
+    RendererDowngrade,
+} from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
@@ -37,6 +41,8 @@ type ClientInitMsg = {
     type: 'INIT';
     canvas: OffscreenCanvas;
     documentId: string;
+    /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
+    mockBackend?: 'vello';
 };
 type ClientRecoverMsg = {
     id: number;
@@ -46,6 +52,14 @@ type ClientRecoverMsg = {
     log: Command[];
     snapshotSeq: number;
     lastSeq: number;
+    /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
+    mockBackend?: 'vello';
+    /** Issue #99 — crash-loop fallback: boot this generation on Canvas2D
+     *  without re-probing the GPU backend that kept trapping. */
+    forceRenderer?: 'canvas2d';
+    /** Issue #99 — the downgrade record, echoed by the engine on
+     *  `Event::Recovered.renderer_downgrade`. */
+    rendererDowngrade?: RendererDowngrade;
 };
 type ClientCommandMsg = { id: number; cmd: Command };
 /* Phase 8a — side-channel snapshot request. The reply carries the array
@@ -66,6 +80,9 @@ type RegisterPageCanvasMsg = { id: number; type: 'REGISTER_PAGE_CANVAS'; idx: nu
    → `{ trap: true }` → `self.close()` → respawn → `RECOVER` — instead of
    `EngineClient.forceTrap()`'s worker.terminate() shortcut. */
 type ArmTrapMsg = { id: number; type: 'ARM_TRAP'; after_commands: number };
+/* Issue #96 — DEV-only test hook: per-page opaque-ink counts read back
+   from the surfaces this worker holds (see the handler). */
+type ProbePageInkMsg = { id: number; type: 'PROBE_PAGE_INK' };
 
 type Msg =
     | InitMsg
@@ -76,7 +93,8 @@ type Msg =
     | GetCommentsMsg
     | GetRevisionsMsg
     | RegisterPageCanvasMsg
-    | ArmTrapMsg;
+    | ArmTrapMsg
+    | ProbePageInkMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -113,6 +131,53 @@ let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingLogWrites: Promise<unknown> = Promise.resolve();
 /* Issue #85 — fault-injection countdown; `null` = disarmed. */
 let trapAfterCommands: number | null = null;
+
+/* Issue #96 — every OffscreenCanvas this worker generation was handed, by
+   page index (0 = the INIT / RECOVER surface). Only the DEV paint probe
+   reads it; the engine owns the contexts. A fresh worker starts empty, so
+   a page the shell failed to re-register after a trap is visibly absent. */
+const pageSurfaces = new Map<number, OffscreenCanvas>();
+
+/**
+ * Issue #99 — pick the backend for a fresh surface. `mock === 'vello'` is
+ * a DEV-only test hook (`?mockBackend=vello`, forwarded by EngineClient):
+ * the generation REPORTS Vello — to the client, on the INIT reply and on
+ * `Event::Recovered.renderer` — while actually painting with Canvas2D, so
+ * the crash-loop fallback can be exercised on GPU-less CI. A production
+ * build ignores it.
+ */
+async function probeBackend(
+    mock: 'vello' | undefined,
+): Promise<{ renderer: string; mocked: boolean }> {
+    if (import.meta.env.DEV && mock === 'vello') {
+        return { renderer: 'vello', mocked: true };
+    }
+    return { renderer: await detect_backend(), mocked: false };
+}
+
+async function constructEngine(
+    canvas: OffscreenCanvas,
+    probe: { renderer: string; mocked: boolean },
+): Promise<Engine> {
+    return probe.renderer === 'vello' && !probe.mocked
+        ? await Engine.with_vello(canvas)
+        : new Engine(canvas);
+}
+
+function countOpaqueInk(surface: OffscreenCanvas): number {
+    /* Same context type the engine took → the SAME context back; a
+       surface Vello claimed for WebGPU answers `null`. */
+    const ctx = surface.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+    if (!ctx || surface.width === 0 || surface.height === 0) return -1;
+    const d = ctx.getImageData(0, 0, surface.width, surface.height).data;
+    let ink = 0;
+    for (let p = 0; p < d.length; p += 4) {
+        const opaque = (d[p + 3] ?? 0) > 200;
+        const white = (d[p] ?? 255) >= 250 && (d[p + 1] ?? 255) >= 250 && (d[p + 2] ?? 255) >= 250;
+        if (opaque && !white) ink++;
+    }
+    return ink;
+}
 
 /* Issue #194 — the engine `document_mutation_seq` the last accessibility
    delta was broadcast for. A fresh engine (INIT, crash recovery — a new
@@ -785,11 +850,10 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
            (WebGPU) when a GPU device is available, else the Canvas2D fallback.
            transferControlToOffscreen is one-shot, so this choice is permanent
            for the canvas (Backlog #4). */
-        const renderer = await detect_backend();
-        engine =
-            renderer === 'vello'
-                ? await Engine.with_vello(msg.canvas)
-                : new Engine(msg.canvas);
+        const probe = await probeBackend(msg.mockBackend);
+        const renderer = probe.renderer;
+        engine = await constructEngine(msg.canvas, probe);
+        pageSurfaces.set(0, msg.canvas);
         await openEventLog(msg.documentId);
         /* Issue #43 — inject today's date so DATE fields resolve at
            layout time (Word updates DATE on open/print). Single
@@ -832,11 +896,16 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            with on `Event::Recovered.renderer`; that value — never a
            remembered INIT-time one — is what the reply and the shell's
            `__renderer` carry. */
-        const probed = await detect_backend();
-        engine =
-            probed === 'vello'
-                ? await Engine.with_vello(msg.canvas)
-                : new Engine(msg.canvas);
+        /* Issue #99 — after a crash loop on the GPU backend the client
+           forces Canvas2D: no probe, so a failing WebGPU driver / shader
+           path cannot be re-selected and trap this generation too. */
+        const probe =
+            msg.forceRenderer === 'canvas2d'
+                ? { renderer: 'canvas2d', mocked: false }
+                : await probeBackend(msg.mockBackend);
+        const probed = probe.renderer;
+        engine = await constructEngine(msg.canvas, probe);
+        pageSurfaces.set(0, msg.canvas);
         /* Resume the event-log sequence past what was already persisted, so
            post-recovery appends don't collide with or shadow prior rows. */
         logSequence = msg.lastSeq;
@@ -857,13 +926,24 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             type: 'RECOVER',
             snapshot: msg.snapshot,
             log_tail: msg.log,
+            ...(msg.rendererDowngrade ? { renderer_downgrade: msg.rendererDowngrade } : {}),
         });
         const recovered = evt.type === 'RECOVERED' ? evt : undefined;
+        /* DEV mock (issue #99): the engine truthfully says `canvas2d`;
+           the mocked generation must keep reporting the backend it
+           pretends to run, or the crash-loop policy never sees Vello. */
+        if (recovered && probe.mocked) recovered.renderer = probe.renderer;
         const renderer = recovered?.renderer ?? probed;
         const restored = recovered?.snapshot_restored === true;
+        /* Issue #97 — the engine holds a live session when a snapshot was
+           restored OR the replayed tail re-seeded one (it carried the boot
+           RENDER_PAGE → a layout config, reported as `device_scale`). The
+           shell then keeps it instead of re-seeding, so it needs the same
+           media re-decode + a11y rebuild as a snapshot restore. */
+        const sessionRestored = restored || recovered?.device_scale !== undefined;
         /* Phase 7 — a restored document may carry inline images whose
            bitmaps died with the old worker; decode them again. */
-        if (restored) {
+        if (sessionRestored) {
             await decodeAndRegisterMedia();
         }
         self.postMessage({
@@ -877,7 +957,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
         /* §10 — the recovered engine has no a11y cache, so this delta is a
            full `Replace`: the mirror DOM rebuilds from the restored tree
            instead of narrating 200 replayed edits. */
-        if (restored) {
+        if (sessionRestored) {
             const delta = await dispatch({ type: 'REQUEST_ACCESSIBILITY_DELTA' });
             if (delta.type === 'ACCESSIBILITY_TREE_DELTA') {
                 self.postMessage({ evt: delta });
@@ -1176,6 +1256,29 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
        call aliases the engine while an in-flight `&mut self` dispatch
        future is parked at an await, and wasm-bindgen panics with
        "recursive use of an object". */
+    /* Issue #96 — DEV-only paint probe (test hook). Headless Chrome never
+       composites a transferred placeholder `<canvas>` for the full app,
+       so a main-thread `drawImage` readback cannot tell a painted page
+       from a blank one there. Read the pixels where they actually land —
+       the OffscreenCanvas surfaces this worker was handed — and count
+       OPAQUE non-white ink per page (an unpainted surface is transparent
+       black; alpha > 200 keeps it from counting as ink). `-1` = the
+       surface has no 2d context (Vello page 0) or is not registered. */
+    if (msg.type === 'PROBE_PAGE_INK') {
+        void enqueue(async () => {
+            if (!import.meta.env.DEV) {
+                self.postMessage({ id: msg.id, ok: false, error: 'PROBE_PAGE_INK is dev-only' });
+                return;
+            }
+            const ink: Record<number, number> = {};
+            for (const [idx, surface] of pageSurfaces) {
+                ink[idx] = countOpaqueInk(surface);
+            }
+            self.postMessage({ id: msg.id, ok: true, ink });
+        });
+        return;
+    }
+
     if (msg.type === 'GET_COMMENTS') {
         void enqueue(async () => {
             if (!engine) {
@@ -1213,7 +1316,12 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
                 return;
             }
             try {
+                /* Issue #96 — a respawned worker receives registrations for
+                   pages its restored layout already knows (the shell
+                   remounts every page canvas after a trap): the slot is
+                   simply (re)filled with the fresh surface. */
                 engine.set_page_canvas(msg.idx, msg.canvas);
+                pageSurfaces.set(msg.idx, msg.canvas);
                 self.postMessage({ id: msg.id, ok: true });
             } catch (e: unknown) {
                 replyError(msg.id, e);

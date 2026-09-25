@@ -639,6 +639,20 @@ impl Paginator {
         self
     }
 
+    /// Issue #130 — swap the note body table (and the continuation
+    /// notice) in place, for a continuous section break into a section of
+    /// a different content width: notes committed from here on use the
+    /// new section's bodies. Notes already committed to the page (or
+    /// carried to the next one) keep the blocks they were placed with.
+    pub fn set_note_bodies(
+        &mut self,
+        bodies: HashMap<NoteAnchor, NoteBody>,
+        notice: Option<NoteBody>,
+    ) {
+        self.note_bodies = bodies;
+        self.continuation_notice = notice.filter(|n| !n.is_empty());
+    }
+
     /// Issue #80 — `<w:footnotePr><w:pos>` for the active section.
     /// `SectEnd` / `DocEnd` are meaningless for footnotes and behave as
     /// `BeneathText` (Word's observed reading).
@@ -794,6 +808,18 @@ impl Paginator {
     /// footnote(s) get rolled back, the page closes, and the block is
     /// re-tried on a fresh page (where its footnotes start a new band).
     pub fn push_block(&mut self, mut block: LayoutBlock, before: f32, after: f32) {
+        /* Issue #75 — `<w:pageBreakBefore/>`: close the page first when
+        it already carries content (Word never breaks at a page top).
+        Bounded by construction: one flush per top-level block, and the
+        flushed page held content, so no empty page is ever minted. Past
+        the watchdog's page cap (stage c) nothing breaks pages. */
+        if let LayoutBlock::Paragraph(p) = &block
+            && p.flow.page_break_before
+            && !self.capped
+            && !self.cur_blocks.is_empty()
+        {
+            self.force_page_break();
+        }
         /* Issue #87 — one top-level block is the watchdog's window:
         churn counters and the escalation stage restart here. */
         self.watchdog.begin_block();
@@ -2616,6 +2642,51 @@ fn split_table_rows_at(t: &TableBox, n: usize) -> (Option<TableBox>, Option<Tabl
     (Some(build(&t.rows[..n])), Some(build(&t.rows[n..])))
 }
 
+/// Issue #129 — per-page ordinals for footnotes whose numbering restarts
+/// on every page (`<w:numRestart w:val="eachPage"/>`), read off settled
+/// pages. A note is numbered on the page carrying its HEAD entry — the
+/// deadline invariant puts that on the page of its reference line; a
+/// continuation entry (`continued_from_previous`) never counts. Band
+/// order is reference order, so the ordinals follow the page's reading
+/// order.
+///
+/// `first_number(anchor)` is the restart rule: `Some(start)` when the
+/// note restarts per page with the sequence starting at `start`
+/// (`<w:numStart>`), `None` when it does not take part (continuous or
+/// per-section numbering, a custom mark, an endnote). The page counter
+/// starts at the first participating note's `start` and counts only
+/// participating notes. Returns `(anchor, ordinal)` in page order, each
+/// anchor once (its first head wins).
+pub fn page_note_ordinals(
+    pages: &[PageBox],
+    mut first_number: impl FnMut(NoteAnchor) -> Option<u32>,
+) -> Vec<(NoteAnchor, u32)> {
+    let mut out: Vec<(NoteAnchor, u32)> = Vec::new();
+    let mut seen: std::collections::HashSet<NoteAnchor> = std::collections::HashSet::new();
+    for page in pages {
+        let mut next: Option<u32> = None;
+        for entry in &page.footnotes.entries {
+            if entry.continued_from_previous {
+                continue;
+            }
+            let anchor = NoteAnchor {
+                kind: entry.kind,
+                id: entry.id,
+            };
+            let Some(start) = first_number(anchor) else {
+                continue;
+            };
+            if !seen.insert(anchor) {
+                continue;
+            }
+            let n = next.unwrap_or(start);
+            out.push((anchor, n));
+            next = Some(n.saturating_add(1));
+        }
+    }
+    out
+}
+
 /// Issue #80 — scan a laid-out block for note reference anchors. Returns
 /// `(anchor, marker text)` for every reference the block carries, in
 /// document order, duplicates preserved (the fitter dedupes).
@@ -2807,9 +2878,10 @@ pub fn split_paragraph_at_line(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: para.keep_next,
-        /* A continuation has no gap above it. */
+        /* A continuation has no gap above it, and never re-breaks. */
         flow: ParaFlow {
             space_before: 0.0,
+            page_break_before: false,
             ..para.flow
         },
     };
@@ -2897,9 +2969,10 @@ pub fn split_paragraph_at_line_index(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: para.keep_next,
-        /* A continuation has no gap above it. */
+        /* A continuation has no gap above it, and never re-breaks. */
         flow: ParaFlow {
             space_before: 0.0,
+            page_break_before: false,
             ..para.flow
         },
     };
@@ -3451,6 +3524,100 @@ mod tests {
         let mut p = fake_paragraph(n, line_height);
         p.page_break_after_line = vec![break_after];
         p
+    }
+
+    /// Issue #75 — stamp `<w:pageBreakBefore/>` on a fake paragraph.
+    fn page_break_before(mut p: ParagraphBox) -> ParagraphBox {
+        p.flow.page_break_before = true;
+        p
+    }
+
+    fn paragraphs_per_page(pages: &[PageBox]) -> Vec<usize> {
+        pages.iter().map(|p| p.blocks.len()).collect()
+    }
+
+    /// Issue #75 — the flagged paragraph opens a fresh page; its
+    /// `space_before` still applies at the new page top (the paginator
+    /// never suppresses it for any other page-top block either).
+    #[test]
+    fn page_break_before_starts_a_new_page() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(paragraphs_per_page(&pages), vec![1, 1]);
+        assert_eq!(pages[1].blocks[0].origin().y, 0.0);
+    }
+
+    /// Issue #75 — Word never breaks at a page top: a flagged first
+    /// paragraph, a flagged paragraph right after a forced break and a
+    /// flagged first paragraph of a new section add no page.
+    #[test]
+    fn page_break_before_at_a_page_top_is_a_no_op() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        pag.force_page_break();
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        pag.start_new_section(geom, HeaderBands::default(), HeaderBands::default(), false);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(paragraphs_per_page(&pages), vec![1, 1, 1]);
+    }
+
+    /// Issue #75 — in a multi-column section the flag breaks to the next
+    /// PAGE (not the next column), and a flagged paragraph that itself
+    /// spans pages breaks once: its split tail never re-breaks.
+    #[test]
+    fn page_break_before_skips_columns_and_breaks_once() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.set_columns(2, 12.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(2, 16.0))),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        assert_eq!(paragraphs_per_page(&pages), vec![1, 1]);
+        assert_eq!(pages[1].blocks[0].origin().x, 0.0, "column 0 of page 2");
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(80, 16.0))),
+            0.0,
+            0.0,
+        );
+        let pages = pag.finish();
+        let lines: usize = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .map(|b| match b {
+                LayoutBlock::Paragraph(p) => p.lines.len(),
+                LayoutBlock::Table(_) => 0,
+            })
+            .sum();
+        assert_eq!(lines, 82, "no line lost");
+        let per_page = (a4_geometry().content_height() / 16.0).floor() as usize;
+        assert_eq!(pages.len(), 1 + 80usize.div_ceil(per_page));
     }
 
     #[test]
@@ -4287,6 +4454,7 @@ mod tests {
                 header,
                 cant_split: false,
                 source_row: out_rows.len() as u32,
+                exact_height: false,
             });
             y += h;
         }
@@ -4429,6 +4597,18 @@ mod tests {
         );
         pag.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), 0.0, 0.0);
         finish("form_feed", pag);
+
+        /* Issue #75 — `<w:pageBreakBefore/>` alone, no FORM FEED: the
+        flagged paragraph opens page 2, the one after it follows it. */
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(3, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Paragraph(page_break_before(fake_paragraph(5, 16.0))),
+            6.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("page_break_before", pag);
 
         let headers = HeaderBands {
             default: Some(fake_band_tall(9, 100.0)),
@@ -4595,6 +4775,9 @@ mod tests {
         ),
         ("continuous_balance", 0x4223f896a4f3452c, &[]),
         ("form_feed", 0x9cc8e34c49eb9a4e, &[]),
+        /* Issue #75 — `<w:pageBreakBefore/>` alone (new fixture, recorded
+        on the #75 paginator; every value above/below is unchanged). */
+        ("page_break_before", 0x000c3f543ec6f6a7, &[]),
         ("intruding_bands_title_pg", 0xd740800cab2c8c6d, &[]),
         ("footnotes", 0xd598c54612629596, &[]),
         ("sections_and_forced_breaks", 0xc92c5638ce1f2440, &[]),
@@ -5530,6 +5713,7 @@ mod tests {
             header,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 
@@ -5863,6 +6047,7 @@ mod tests {
             header: false,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 
@@ -6052,6 +6237,7 @@ mod tests {
             header: false,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 
@@ -6175,5 +6361,63 @@ mod tests {
             .map(cell_lines)
             .sum();
         assert_eq!(total, 60, "no line lost");
+    }
+
+    /* ---------- issue #129 — per-page footnote ordinals ---------- */
+
+    fn note_page(entries: &[(u32, bool)]) -> PageBox {
+        let g = a4_geometry();
+        PageBox {
+            size: Size {
+                width: g.width,
+                height: g.height,
+            },
+            margins: g.margins,
+            blocks: Vec::new(),
+            header: None,
+            footer: None,
+            header_offset: g.header_offset,
+            footer_offset: g.footer_offset,
+            footnotes: NoteBand {
+                entries: entries
+                    .iter()
+                    .map(|&(id, continued)| FootnoteEntry {
+                        id,
+                        kind: engine::NoteKind::Footnote,
+                        marker: String::new(),
+                        origin: Point { x: 0.0, y: 0.0 },
+                        blocks: Vec::new(),
+                        first_block_index: 0,
+                        continued_from_previous: continued,
+                        continues_on_next: false,
+                    })
+                    .collect(),
+                y: 700.0,
+                continuation: false,
+            },
+            endnotes: NoteBand::default(),
+            hf_role: HeaderRole::Default,
+            page_number: 1,
+            floats: Vec::new(),
+        }
+    }
+
+    /// Every page restarts at `numStart`; a continuation entry (a note
+    /// cut on the previous page) never takes a number; non-participating
+    /// notes neither take nor consume one.
+    #[test]
+    fn page_note_ordinals_restart_on_every_page() {
+        let pages = [
+            note_page(&[(1, false), (2, false), (3, false)]),
+            note_page(&[(3, true), (4, false), (5, false)]),
+        ];
+        /* Note 2 is custom-marked (does not participate). */
+        let got = page_note_ordinals(&pages, |a| (a.id != 2).then_some(1));
+        let ids: Vec<(u32, u32)> = got.iter().map(|(a, n)| (a.id, *n)).collect();
+        assert_eq!(ids, vec![(1, 1), (3, 2), (4, 1), (5, 2)]);
+        /* `numStart` = 5 starts each page's sequence at 5. */
+        let got = page_note_ordinals(&pages[1..], |_| Some(5));
+        let ids: Vec<(u32, u32)> = got.iter().map(|(a, n)| (a.id, *n)).collect();
+        assert_eq!(ids, vec![(4, 5), (5, 6)]);
     }
 }

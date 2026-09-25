@@ -348,6 +348,11 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
   every native gate stays green (2026-09-25 incident).
   Disk is the binding constraint on this 8-core / 15 GB box: the shared
   `target/` alone is ~20 GB.
+  Playwright ports are per-checkout too (issue #205): `ts/playwright.config.ts`
+  derives its port from a stable hash of the absolute repo path (5200–5999)
+  instead of a fixed 5173, so a sibling worktree's already-running Vite
+  server can no longer be silently reused as the wrong tree under test —
+  override with `PW_PORT`, or opt back into reuse with `PW_REUSE_SERVER=1`.
 
 ## Things to never do
 

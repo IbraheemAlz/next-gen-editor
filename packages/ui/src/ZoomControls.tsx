@@ -5,19 +5,21 @@
  * exists in `crates/bridge/src/command.rs` but has no UI consumer
  * before this — biggest blast-radius win in Sprint 1 (UI Edition).
  *
+ * Issue #52 — the widget holds NO zoom state of its own. The displayed
+ * value is `createEditorState().zoom`, the engine's zoom read back from
+ * `SELECTION_CHANGED.zoom` (the reply to every `SET_ZOOM`) and shared
+ * by every instance on the same engine. The shell mounts two of these
+ * (the StatusBar's embedded one and the standalone footer widget);
+ * changing zoom through either updates both, and a crash recovery that
+ * lands on a different zoom re-syncs both (#97).
+ *
  * Shortcuts:
  *   Ctrl+0 → 100%
  *   Ctrl+= → step up
  *   Ctrl+- → step down
  */
-import {
-    createEffect,
-    createSignal,
-    For,
-    onCleanup,
-    type Component,
-} from 'solid-js';
-import { createEditorCommands } from '@nge/core';
+import { createEffect, For, onCleanup, Show, type Component } from 'solid-js';
+import { createEditorCommands, createEditorState } from '@nge/core';
 import './ZoomControls.css';
 
 const PRESETS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] as const;
@@ -25,7 +27,11 @@ const MIN = 0.25;
 const MAX = 4.0;
 
 export interface ZoomControlsProps {
-    /** Initial zoom. Default 1.0. */
+    /**
+     * @deprecated Issue #52 — ignored. The engine owns the zoom and every
+     * `ZoomControls` mirrors it; an initial zoom is a `SET_ZOOM` the host
+     * dispatches once the engine is up.
+     */
     defaultScale?: number;
     /** Whether to bind the Ctrl+0/+/- shortcuts. Default true. */
     bindShortcuts?: boolean;
@@ -35,18 +41,34 @@ function clamp(s: number): number {
     return Math.max(MIN, Math.min(MAX, s));
 }
 
+/** Two-decimal step arithmetic, so `1.0 + 0.1` lands on `1.1`, not
+ *  `1.1000000000000001`. */
+function step(s: number, delta: number): number {
+    return Math.round((s + delta) * 100) / 100;
+}
+
 export const ZoomControls: Component<ZoomControlsProps> = (props) => {
     const cmd = createEditorCommands();
-    const [scale, setScale] = createSignal(props.defaultScale ?? 1.0);
+    const state = createEditorState();
+    const scale = state.zoom;
+    let selectEl: HTMLSelectElement | undefined;
 
     const apply = async (next: number) => {
-        const clamped = clamp(next);
-        setScale(clamped);
-        await cmd.setZoom(clamped);
+        try {
+            /* The reply's SELECTION_CHANGED.zoom updates `scale` for every
+               widget; nothing to set locally. */
+            await cmd.setZoom(clamp(next));
+        } catch {
+            /* Worker trapped mid-dispatch — recovery re-syncs the zoom. */
+        } finally {
+            /* A rejected / refused zoom must not leave the <select>
+               showing the value the user picked but the engine refused. */
+            if (selectEl) selectEl.value = scale().toString();
+        }
     };
 
-    const stepUp = () => void apply(scale() + 0.1);
-    const stepDown = () => void apply(scale() - 0.1);
+    const stepUp = () => void apply(step(scale(), 0.1));
+    const stepDown = () => void apply(step(scale(), -0.1));
     const reset = () => void apply(1.0);
 
     /* Keyboard shortcuts. */
@@ -76,6 +98,14 @@ export const ZoomControls: Component<ZoomControlsProps> = (props) => {
         onCleanup(() => window.removeEventListener('keydown', handler));
     });
 
+    /* The options (incl. the off-preset one) must exist before the value
+       is assigned, or the <select> silently falls back to its first
+       option — so the value is pushed from an effect, after render. */
+    createEffect(() => {
+        const v = scale().toString();
+        if (selectEl && selectEl.value !== v) selectEl.value = v;
+    });
+
     return (
         <div class="nge-zoom" role="group" aria-label="Zoom">
             <button
@@ -88,6 +118,7 @@ export const ZoomControls: Component<ZoomControlsProps> = (props) => {
                 −
             </button>
             <select
+                ref={selectEl}
                 class="nge-zoom__select"
                 aria-label="Zoom level"
                 value={scale().toString()}
@@ -101,11 +132,11 @@ export const ZoomControls: Component<ZoomControlsProps> = (props) => {
                     )}
                 </For>
                 {/* Allow display of off-preset values without losing them. */}
-                {!PRESETS.includes(scale() as (typeof PRESETS)[number]) && (
+                <Show when={!PRESETS.includes(scale() as (typeof PRESETS)[number])}>
                     <option value={scale().toString()}>
                         {Math.round(scale() * 100)}%
                     </option>
-                )}
+                </Show>
             </select>
             <button
                 class="nge-btn nge-btn--icon"

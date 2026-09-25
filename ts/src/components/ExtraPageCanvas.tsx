@@ -40,8 +40,17 @@ export function ExtraPageCanvas(props: ExtraPageCanvasProps) {
         canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
         canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
         const offscreen = canvas.transferControlToOffscreen();
-        await props.client.registerPageCanvas(props.pageIdx, offscreen);
         detach = attachPointer(canvas, props.client, props.pageIdx);
+        /* Issue #96 — this element is one-shot: a trap unmounts it (App's
+           `booting` boundary) and recovery mounts a FRESH one that
+           registers with the respawned worker. A registration that loses
+           a race with a trap is therefore not retried here — the
+           remount after recovery is the retry. */
+        try {
+            await props.client.registerPageCanvas(props.pageIdx, offscreen);
+        } catch (e: unknown) {
+            console.warn(`[page ${props.pageIdx}] canvas registration failed`, e);
+        }
     });
 
     onCleanup(() => detach?.());

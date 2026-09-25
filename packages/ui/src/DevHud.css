@@ -58,3 +58,8 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
 }
+
+/* Issue #99 — crash-loop renderer fallback row. */
+.nge-hud__warn {
+    color: var(--nge-color-warning);
+}

@@ -15,8 +15,8 @@
  *   - `PAINTED` carries: dirty, version, paint_ms, document_height,
  *     page_count, is_full_layout, estimated_document_height.
  */
-import { createSignal, onCleanup, type Accessor } from 'solid-js';
-import { useEngine } from './EngineProvider';
+import { createRoot, createSignal, onCleanup, type Accessor } from 'solid-js';
+import { useEngine, type EngineHandle } from './EngineProvider';
 import type {
     Alignment,
     AttrsMixed,
@@ -33,6 +33,7 @@ import type {
     LayoutDegraded,
     LogicalRange,
     Rect,
+    RendererDowngrade,
     SelectionKind,
     TextAttrs,
 } from './types';
@@ -157,10 +158,88 @@ export interface EditorState {
      * "Update fields" affordance in `FieldButtons`.
      */
     fieldAtCaret: Accessor<BridgeFieldRef | undefined>;
+    /**
+     * Issue #52 — the ENGINE's user zoom fraction (`1` = 100 %), read
+     * back from `SELECTION_CHANGED.zoom` (every `SET_ZOOM` /
+     * `SET_DEVICE_SCALE` answers with one). Shared by every
+     * `createEditorState()` on the same engine — see `viewStateFor` — so
+     * two zoom widgets can never disagree, and a widget mounted late
+     * starts from the live value instead of 100 %.
+     */
+    zoom: Accessor<number>;
+    /**
+     * Issue #97 — the boot device scale (`devicePixelRatio × 4/3`) the
+     * engine reported on its last `RECOVERED`; `undefined` before any
+     * recovery, or when the engine came back cold (no layout config — the
+     * shell re-seeds it). Shared like `zoom`.
+     */
+    deviceScale: Accessor<number | undefined>;
+    /**
+     * Issue #99 — set when the current worker generation was forced onto
+     * Canvas2D after a crash loop on Vello (`RECOVERED.renderer_downgrade`);
+     * `undefined` otherwise. Surfaced in the Dev HUD next to `renderer`.
+     * Shared like `zoom`.
+     */
+    rendererDowngrade: Accessor<RendererDowngrade | undefined>;
+}
+
+/**
+ * Engine-wide view state (issue #52). Unlike the per-call signals in
+ * `createEditorState`, these are ONE set of signals per engine handle:
+ * they are the single source of truth every zoom control reads, and they
+ * must outlive any one component (a widget mounted after the last
+ * `SELECTION_CHANGED` would otherwise start stale at 100 %). Created
+ * lazily under a detached root; the subscription lives as long as the
+ * engine handle, which the shell keeps for the page lifetime.
+ */
+interface ViewState {
+    zoom: Accessor<number>;
+    deviceScale: Accessor<number | undefined>;
+    rendererDowngrade: Accessor<RendererDowngrade | undefined>;
+}
+
+const viewStates = new WeakMap<EngineHandle, ViewState>();
+
+/** f32 → f64 noise (`1.100000023841858`) would defeat the `<select>`'s
+ *  preset matching; four decimals is far below any zoom step. */
+function roundZoom(z: number): number {
+    return Math.round(z * 10_000) / 10_000;
+}
+
+function viewStateFor(engine: EngineHandle): ViewState {
+    const existing = viewStates.get(engine);
+    if (existing) return existing;
+    const state = createRoot(() => {
+        const [zoom, setZoom] = createSignal(1);
+        const [deviceScale, setDeviceScale] = createSignal<number | undefined>(undefined);
+        const [rendererDowngrade, setRendererDowngrade] = createSignal<
+            RendererDowngrade | undefined
+        >(undefined);
+        engine.subscribe((evt: Event) => {
+            if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
+                setZoom(roundZoom(evt.zoom));
+            } else if (evt.type === 'RECOVERED') {
+                /* Issue #97 — the respawned engine folded the replayed
+                   SET_ZOOM / SET_DEVICE_SCALE into its restored config (or
+                   came back cold at 100 %); the controls follow IT, not
+                   whatever they showed before the trap. */
+                setZoom(roundZoom(evt.zoom ?? 1));
+                setDeviceScale(evt.device_scale);
+                /* Issue #99 — per generation: the client re-sends the
+                   downgrade on every forced recovery, so it stays set for
+                   the rest of the session once the crash loop tripped. */
+                setRendererDowngrade(evt.renderer_downgrade);
+            }
+        });
+        return { zoom, deviceScale, rendererDowngrade };
+    });
+    viewStates.set(engine, state);
+    return state;
 }
 
 export function createEditorState(): EditorState {
     const engine = useEngine();
+    const view = viewStateFor(engine);
 
     const [selection, setSelection] = createSignal<LogicalRange | undefined>(undefined);
     const [caret, setCaret] = createSignal<Rect | undefined>(undefined);
@@ -292,5 +371,8 @@ export function createEditorState(): EditorState {
         editingStory,
         fieldCodeView,
         fieldAtCaret,
+        zoom: view.zoom,
+        deviceScale: view.deviceScale,
+        rendererDowngrade: view.rendererDowngrade,
     };
 }

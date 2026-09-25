@@ -250,11 +250,15 @@ export interface EditorCommands {
      * + handlers in `crates/engine-wasm/src/lib.rs`). */
     setColumns(at: LogicalPos, count: number, gutterPt: number): Promise<Event>;
     setColumnsAtCaret(count: number, gutterPt?: number): Promise<Event>;
+    /** Issue #75 — Word's Ctrl+Enter: insert a manual page break
+     *  (`<w:br w:type="page"/>`) at the caret, replacing any selection.
+     *  Rejected with `Event::Error` inside a table cell. */
     insertPageBreak(at?: LogicalPos): Promise<Event>;
     /** Phase 3 (#40) — insert a REAL section break (splits the caret
      *  paragraph into two sections; the following section begins per
-     *  `kind`). Distinct from `insertPageBreak`, which only flips a
-     *  paragraph render hint. The engine rejects table-cell carets with
+     *  `kind`). Distinct from `insertPageBreak`, which inserts a manual
+     *  page break (Word's Ctrl+Enter) inside the current section. The
+     *  engine rejects table-cell carets with
      *  `Event::Error` — the Breaks menu disables those entries. */
     insertSectionBreak(kind: SectionBreakKind, at?: LogicalPos): Promise<Event>;
     /** Phase 3 (#39) — enter header/footer editing for the section that

@@ -5,9 +5,15 @@ use tsify_next::Tsify;
 
 use crate::command::{BridgeCellBorders, BridgeTabStop, HeaderFooterArea, PageOrientation};
 use crate::common::{
-    Alignment, Color, Direction, DocFormat, ImageRect, LogicalPos, LogicalRange, Rect, Script,
-    SelectionKind, TextAttrs,
+    Alignment, Color, Direction, DocFormat, ImageRect, LogicalPos, LogicalRange, Rect,
+    RendererDowngrade, Script, SelectionKind, TextAttrs,
 };
+
+/// `serde(default)` for the user-zoom fields: an absent value means the
+/// engine's cold default (100 %), never `0.0`.
+fn default_zoom() -> f32 {
+    1.0
+}
 
 /// An event emitted by the engine. Serialized internally-tagged
 /// (`{ "type": "PAINTED", ... }`).
@@ -102,6 +108,25 @@ pub enum Event {
         /// so the shell's `__renderer` never drifts from the truth after a
         /// post-trap respawn.
         renderer: String,
+        /// Issue #97 — the user zoom fraction the recovered engine renders
+        /// at (restored config + any replayed `SetZoom`; `1.0` when the
+        /// engine came back cold). The shell re-syncs its zoom controls
+        /// from this instead of trusting its pre-trap UI state.
+        #[serde(default = "default_zoom")]
+        zoom: f32,
+        /// Issue #97 — the recovered boot device scale
+        /// (`devicePixelRatio × 4/3`, before zoom); `None` when the engine
+        /// came back cold with no layout config (the shell re-seeds it).
+        #[serde(default)]
+        #[tsify(optional)]
+        device_scale: Option<f32>,
+        /// Issue #99 — set when this generation was forced off its probed
+        /// GPU backend after a crash loop (echo of
+        /// `Command::Recover.renderer_downgrade`). `None` on an ordinary
+        /// recovery.
+        #[serde(default)]
+        #[tsify(optional)]
+        renderer_downgrade: Option<RendererDowngrade>,
     },
     /// Reply to `Command::Snapshot` (issue #85): the versioned snapshot
     /// envelope (`engine::snapshot`, magic + format version + payload).
@@ -324,6 +349,13 @@ pub enum Event {
         /// at the caret, else the one starting there. `None` otherwise.
         /// Drives the field-code editor + the "Update field" affordance.
         field_at_caret: Option<BridgeFieldRef>,
+        /// Issue #52 — the engine's current user zoom fraction
+        /// (`SetZoom`, clamped to `[0.25, 4.0]`; `1.0` before the first
+        /// `RenderPage`). `SetZoom` / `SetDeviceScale` answer with this
+        /// event, so every zoom control mirrors the ENGINE's value — one
+        /// source of truth instead of one local signal per widget.
+        #[serde(default = "default_zoom")]
+        zoom: f32,
     },
 
     /* IME */
@@ -634,6 +666,11 @@ pub enum LayoutDegradeReason {
     /// Issue #81 — the TOC page-number post-pass hit its re-run cap
     /// without a fixed point; the last observed numbers were stamped.
     PageRefCap,
+    /// Issue #129 — the per-page footnote renumbering pass
+    /// (`<w:numRestart w:val="eachPage"/>`) hit its one re-run without a
+    /// fixed point (the restarted labels' widths kept moving references
+    /// across pages); the last pass's labels were kept.
+    NoteRestartCap,
 }
 
 /// Issue #87 — one degradation note on `Event::Painted`. `page` is the
@@ -723,6 +760,8 @@ pub struct A11yNote {
     pub note_id: u32,
     /// Display marker in document order (`"1"`, `"iv"`, …); empty for a
     /// custom-marked reference (the author's own mark follows in text).
+    /// Issue #129 — a footnote of an `eachPage` section carries its
+    /// per-page label as painted by the current layout.
     pub marker: String,
     pub nodes: Vec<A11yNode>,
 }

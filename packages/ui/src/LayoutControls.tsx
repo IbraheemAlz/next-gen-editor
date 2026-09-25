@@ -7,12 +7,12 @@
  *      Word's stock value). Future revisions can split the gutter into
  *      a separate picker.
  *   2. Breaks menu (Phase 3, #40) — Page Break (`Ctrl+Enter`,
- *      `Command::InsertPageBreak`, a paragraph render hint) plus the two
- *      REAL section breaks (`Command::InsertSectionBreak` Next Page /
- *      Continuous, which split the document into sections with
- *      independent `<w:sectPr>` geometry). The section entries disable
- *      inside table cells — the engine rejects a cell-anchored section
- *      boundary (an interior sectPr is a body-paragraph property), and
+ *      `Command::InsertPageBreak`: a manual `<w:br w:type="page"/>`
+ *      FORM FEED at the caret, issue #75) plus the REAL section breaks
+ *      (`Command::InsertSectionBreak` Next Page / Continuous / Even /
+ *      Odd, which split the document into sections with independent
+ *      `<w:sectPr>` geometry). Every entry disables inside table cells
+ *      — the engine rejects a cell-anchored page or section break, and
  *      Honest UX forbids a button that silently errors.
  *   3. Paragraph Borders button → opens `ParagraphBordersDialog`, the
  *      full per-edge style/width/colour picker (issue #41). Its active
@@ -20,7 +20,7 @@
  *
  * See `crates/bridge/src/command.rs` for the wire types and
  * `crates/engine/src/lib.rs::set_section_columns_at` /
- * `::set_page_break_before` / `::insert_section_break_at` /
+ * `::insert_text` (the page-break FORM FEED) / `::insert_section_break_at` /
  * `::set_paragraph_borders` for the mutation paths.
  */
 import {
@@ -94,8 +94,11 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
      * cells; the entries grey out there rather than silently erroring. */
     const inTable = createMemo(() => state.cellProperties() !== undefined);
 
+    /* Issue #75 — a manual page break inside a table cell is rejected
+     * by the engine (Word never paginates it), so the entry greys out
+     * there and Ctrl+Enter is swallowed rather than erroring. */
     const insertBreak = async () => {
-        if (!ready()) return;
+        if (!ready() || inTable()) return;
         setBreaksOpen(false);
         await cmd.insertPageBreak();
     };
@@ -165,7 +168,12 @@ export const LayoutControls: Component<LayoutControlsProps> = (props) => {
                                 role="menuitem"
                                 class="nge-layout__breaks-item"
                                 type="button"
-                                title="Force the next line onto a new page (Ctrl+Enter)"
+                                disabled={inTable()}
+                                title={
+                                    inTable()
+                                        ? 'Page breaks cannot be inserted inside a table'
+                                        : 'Insert a page break at the caret — the text after it starts a new page (Ctrl+Enter)'
+                                }
                                 onClick={() => void insertBreak()}
                             >
                                 <span>Page Break</span>

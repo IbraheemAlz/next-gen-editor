@@ -237,6 +237,7 @@ mod tests {
             header,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 

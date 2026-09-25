@@ -5,7 +5,7 @@ use tsify_next::Tsify;
 
 use crate::common::{
     Alignment, BlockPath, Color, Direction, DocFormat, ImageWrapMode, LogicalPos, LogicalRange,
-    Point, Rect, TextBoxHop, UnderlineStyle, VerticalScript,
+    Point, Rect, RendererDowngrade, TextBoxHop, UnderlineStyle, VerticalScript,
 };
 
 /// A command issued to the engine. Serialized internally-tagged
@@ -112,6 +112,14 @@ pub enum Command {
         #[tsify(type = "Uint8Array")]
         snapshot: Vec<u8>,
         log_tail: Vec<Command>,
+        /// Issue #99 — the shell forced this generation off its probed
+        /// GPU backend after a crash loop. The engine does not act on it
+        /// (the worker already constructed the Canvas2D engine); it echoes
+        /// it on `Event::Recovered.renderer_downgrade` so the downgrade is
+        /// reported by the same event that reports the renderer.
+        #[serde(default)]
+        #[tsify(optional)]
+        renderer_downgrade: Option<RendererDowngrade>,
     },
     /// Issue #85 — serialize the whole engine session (document tree +
     /// styles + stories + undo window + selection + layout config) into a
@@ -536,10 +544,13 @@ pub enum Command {
         count: u8,
         gutter_pt: f32,
     },
-    /// Sprint 2 (UI Edition) — flip `ParaProperties.page_break_before`
-    /// on the paragraph that contains `at`. The paginator already
-    /// understands the flag (rendered from `<w:pageBreakBefore>` on
-    /// `.docx` load); this command lets the editor author one.
+    /// Word's `Ctrl+Enter` — insert a manual page break (U+000C FORM
+    /// FEED, saved as `<w:br w:type="page"/>`) at the caret, replacing
+    /// a non-empty selection like typed text; with a collapsed (or no)
+    /// selection the break lands at `at`. Issue #75: it no longer flips
+    /// `ParaProperties.page_break_before` (the paragraph-format
+    /// property, which the paginator honours on its own). Rejected with
+    /// `Event::Error` inside a table cell and in header/footer stories.
     InsertPageBreak {
         at: LogicalPos,
     },
@@ -549,8 +560,8 @@ pub enum Command {
     /// full `<w:sectPr>` payload, and the following section begins per
     /// `kind` (Word semantics: `<w:type>` describes how the section it
     /// opens starts relative to the previous one). Distinct from
-    /// `InsertPageBreak`, which is a paragraph render hint with no
-    /// geometry of its own. Rejected with `Event::Error` when `at`
+    /// `InsertPageBreak`, which inserts a manual page break (FORM FEED)
+    /// inside the current section. Rejected with `Event::Error` when `at`
     /// sits inside a table cell (Word-parity there is deferred).
     InsertSectionBreak {
         at: LogicalPos,

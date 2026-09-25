@@ -47,6 +47,12 @@ tools/differential/
                                   fixed-width tables placed by `<w:jc>` /
                                   `<w:tblInd>` / a `<w:bidiVisual>` default
                                   start at the right margin.
+                                  `exact_row_table.docx` (issue #169):
+                                  an overflowing `<w:trHeight
+                                  w:hRule="exact">` row stays at its
+                                  declared 42pt with the overflow
+                                  clipped; the same content under
+                                  `atLeast` grows to 84pt.
 ```
 
 ## Running it
