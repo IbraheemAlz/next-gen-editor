@@ -29,6 +29,8 @@
 //!
 //! Exit 0 on PASS, non-zero on FAIL.
 
+mod inline_spans;
+
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
 use format_docx::writer::build_minimal_docx;
@@ -321,6 +323,9 @@ fn run_default() -> Result<()> {
     run_style_bidi_roundtrip()?;
     run_part_scoped_media_roundtrip()?;
     run_source_markup_roundtrip()?;
+    inline_spans::run_form_fields_roundtrip()?;
+    inline_spans::run_content_controls_roundtrip()?;
+    inline_spans::run_field_source_form_roundtrip()?;
     run_hyperlink_identity_roundtrip()?;
     run_comment_anchor_roundtrip()?;
 
@@ -2867,7 +2872,7 @@ fn build_hyperlink_identity_docx() -> Vec<u8> {
     package_document_xml_with_rels(&document_xml, HYPERLINK_RELS)
 }
 
-/// Issue #242 — step 27: typing before, between and after the links of a
+/// Issue #242 — step 30: typing before, between and after the links of a
 /// regenerated paragraph keeps every link's own `r:id` (two links to one
 /// URL no longer collapse onto one row), every source attribute and the
 /// rels part byte-identical: the saved `document.xml` is exactly source +
@@ -2887,7 +2892,7 @@ fn run_hyperlink_identity_roundtrip() -> Result<()> {
     if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
         bail!("untouched hyperlink document drifted");
     }
-    println!("[roundtrip] step 27a OK — untouched save byte-identical");
+    println!("[roundtrip] step 30a OK — untouched save byte-identical");
 
     /* Before the first link, right after a middle link, after the last
     one. Typing at a link's end stays outside the link (the engine's
@@ -2960,7 +2965,7 @@ fn run_hyperlink_identity_roundtrip() -> Result<()> {
         }
     }
     println!(
-        "[roundtrip] step 27b OK — edited link paragraph keeps each r:id + attribute; rels untouched on both save paths"
+        "[roundtrip] step 30b OK — edited link paragraph keeps each r:id + attribute; rels untouched on both save paths"
     );
     Ok(())
 }
@@ -3004,7 +3009,7 @@ fn build_comment_anchor_docx() -> Vec<u8> {
     )
 }
 
-/// Issue #243 — step 28: comment anchors of a regenerated paragraph.
+/// Issue #243 — step 31: comment anchors of a regenerated paragraph.
 ///
 /// a. An untouched save is byte-identical.
 /// b. Typing before, inside and after the commented range keeps
@@ -3029,7 +3034,7 @@ fn run_comment_anchor_roundtrip() -> Result<()> {
     if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
         bail!("untouched comment document drifted");
     }
-    println!("[roundtrip] step 28a OK — untouched save byte-identical");
+    println!("[roundtrip] step 31a OK — untouched save byte-identical");
 
     for (offset, from, to, covered) in [
         (
@@ -3087,7 +3092,7 @@ fn run_comment_anchor_roundtrip() -> Result<()> {
         }
     }
     println!(
-        "[roundtrip] step 28b OK — edits before / inside / after a commented range keep its anchors (source + insert, both save paths)"
+        "[roundtrip] step 31b OK — edits before / inside / after a commented range keep its anchors (source + insert, both save paths)"
     );
 
     let edited = archive_a.document.insert_text(at(1, 0), INSERT_TEXT);
@@ -3107,7 +3112,7 @@ fn run_comment_anchor_roundtrip() -> Result<()> {
         bail!("deleted comment's anchors resurrected: {xml}");
     }
     println!(
-        "[roundtrip] step 28c OK — reference-only paragraph keeps its reference; a deleted comment's anchors are dropped"
+        "[roundtrip] step 31c OK — reference-only paragraph keeps its reference; a deleted comment's anchors are dropped"
     );
     Ok(())
 }

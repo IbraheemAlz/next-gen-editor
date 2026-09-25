@@ -484,12 +484,54 @@ mod tests {
                 },
                 lead: b"<w:lastRenderedPageBreak/>".to_vec(),
                 t_attrs: Some(Vec::new()),
+                /* Issue #245 — pretty-print whitespace inside the run. */
+                pad: Some(Box::new(crate::RunPad {
+                    open: b"\n  ".to_vec(),
+                    after_rpr: b"\n  ".to_vec(),
+                    close: b"\n".to_vec(),
+                })),
+                bare_edge_ws: true,
             }],
-            markers: vec![SourceMarker {
-                at: 6,
-                xml: br#"<w:proofErr w:type="spellStart"/>"#.to_vec(),
-                ..Default::default()
-            }],
+            markers: vec![
+                SourceMarker {
+                    at: 6,
+                    xml: br#"<w:proofErr w:type="spellStart"/>"#.to_vec(),
+                    ..SourceMarker::default()
+                },
+                SourceMarker {
+                    /* Issue #244 — a content span keeps its role. */
+                    at: 11,
+                    xml: br#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#.to_vec(),
+                    role: crate::MarkerRole::Content,
+                    comment: None,
+                },
+                SourceMarker {
+                    /* Issue #245 — a content control's two ends. */
+                    at: 0,
+                    xml: b"<w:sdt><w:sdtContent>".to_vec(),
+                    role: crate::MarkerRole::Open {
+                        id: 7,
+                        close_xml: b"</w:sdtContent></w:sdt>".to_vec(),
+                    },
+                    comment: None,
+                },
+                SourceMarker {
+                    at: 5,
+                    xml: b"</w:sdtContent></w:sdt>".to_vec(),
+                    role: crate::MarkerRole::Close { id: 7 },
+                    comment: None,
+                },
+                SourceMarker {
+                    /* Issue #243 — a comment anchor keeps its identity. */
+                    at: 5,
+                    xml: br#"<w:commentRangeEnd w:id="3"/>"#.to_vec(),
+                    comment: Some(crate::CommentAnchor {
+                        kind: crate::CommentAnchorKind::RangeEnd,
+                        id: 3,
+                    }),
+                    ..SourceMarker::default()
+                },
+            ],
         };
         let Some(crate::Block::Paragraph(p)) = doc.blocks.get(0).cloned() else {
             panic!("paragraph");
@@ -498,6 +540,18 @@ mod tests {
             0,
             crate::Block::Paragraph(crate::Paragraph {
                 source_markup: Some(Box::new(markup.clone())),
+                /* Issue #246 — a field's source form travels too. */
+                fields: vec![crate::Field {
+                    start: 0,
+                    end: 5,
+                    instruction: "FILENAME".into(),
+                    span: None,
+                    source: Some(Box::new(crate::FieldSource {
+                        instruction: "FILENAME".into(),
+                        open: br#"<w:fldSimple w:instr=" FILENAME ">"#.to_vec(),
+                        close: b"</w:fldSimple>".to_vec(),
+                    })),
+                }],
                 ..p
             }),
         );
@@ -506,6 +560,7 @@ mod tests {
         let back: Decoded<DocumentTree> = decode(&bytes).unwrap();
         let p0 = back.payload.nth_paragraph(0).unwrap();
         assert_eq!(p0.source_markup.as_deref(), Some(&markup));
+        assert!(p0.fields[0].source.is_some(), "field source form");
         assert_eq!(encode(&back.payload).unwrap(), bytes, "byte-stable");
         /* No markup: the pre-#199 encoding, and it decodes to `None`. */
         let back: Decoded<DocumentTree> = decode(&plain).unwrap();

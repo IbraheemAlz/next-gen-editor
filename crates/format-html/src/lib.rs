@@ -11,35 +11,105 @@
 //! BiDi is preserved per-paragraph (UAX #9 runs per line — never flatten
 //! across line breaks). Plain-text fallback lives in
 //! `engine::DocumentTree::to_plain_text` as a sibling deliverable.
+//!
+//! Issue #226 — the body walk used to be the whole story: headers,
+//! footers, footnote/endnote stories and text-box stories are separate
+//! `DocumentTree` structures the body walk never visits, so they used to
+//! export silently as nothing (a Tier-3 violation — no story content may
+//! be dropped on export). This crate now also emits:
+//!
+//! - the first section's default header/footer band once each as a
+//!   landmark `<header>` / `<footer>` (`First` / `Even` variants have no
+//!   flattened-document equivalent — no page concept survives export —
+//!   so they ride as `data-header-first-rid` / `data-header-even-rid` /
+//!   `data-footer-first-rid` / `data-footer-even-rid` attributes instead
+//!   of a second element);
+//! - footnotes/endnotes as a trailing region mirroring the #203 a11y
+//!   mirror's structure: each footnote an `<aside role="doc-footnote">`,
+//!   every endnote an `<li>` inside one trailing
+//!   `<section role="doc-endnotes">`, with `<a role="doc-noteref">` links
+//!   at the in-text reference marks. The visible marker is document-order
+//!   (`DocumentTree::note_markers`) unless the caller passes painted
+//!   per-page labels through [`to_html_with_note_markers`] /
+//!   [`to_html_fragment_with_note_markers`] — the engine-wasm caller does
+//!   this whenever a live layout snapshot exists (`painted_note_markers`);
+//! - text-box stories inline as an `<aside>` at their anchor paragraph,
+//!   recursing through the same block walk as the body (previously a
+//!   bespoke plain-text join that silently dropped a box's own
+//!   formatting, images and nested boxes).
 
 use engine::{
     Block, BorderStyle, CellBorders, CellProperties, DocumentTree, FontFamily, InlineKind,
     InlineObject, Paragraph, SpanStyle, StyleRun, Table, TextDirection, UnderlineStyle, VMergeRole,
 };
+use std::collections::HashMap;
 
 /// Top-level entry point — render the whole `DocumentTree` as a
 /// standalone HTML5 document. UTF-8 encoded, with a `<meta>` declaring
 /// the encoding so a downstream tool that re-opens the file picks the
 /// right codec. Body wraps the blocks in a `dir="auto"` container so a
-/// per-paragraph `dir` override always wins.
+/// per-paragraph `dir` override always wins. Note markers are document
+/// order — see [`to_html_with_note_markers`] for a caller with a live
+/// layout snapshot.
 pub fn to_html(doc: &DocumentTree) -> String {
+    to_html_with_note_markers(doc, &doc.note_markers())
+}
+
+/// [`to_html`], with a caller-supplied override for the footnote/endnote
+/// marker labels (both at the in-text reference mark and on the trailing
+/// note region). This crate has no access to a live layout, so it can
+/// only ever compute the plain document-order labels
+/// (`DocumentTree::note_markers`); a caller that holds a layout snapshot
+/// — engine-wasm's `painted_note_markers` — passes the PAINTED per-page
+/// label instead (the number a footnote actually carries on the page it
+/// lands on, for an each-page-restart numbering scheme).
+pub fn to_html_with_note_markers(
+    doc: &DocumentTree,
+    note_markers: &HashMap<engine::NoteAnchor, String>,
+) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str(
         "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\
          <title>Document</title></head><body dir=\"auto\">",
     );
-    emit_blocks(&doc.blocks_slice(), &Media::of(doc), &mut out);
+    emit_document_body(doc, note_markers, &mut out);
     out.push_str("</body></html>");
     out
 }
 
 /// Render just the block sequence (no `<html>` envelope) — useful for
 /// embedding a document fragment into an existing host page. Identical
-/// rules as `to_html` for paragraphs, tables, and inline images.
+/// rules as `to_html` for paragraphs, tables, inline images, and (issue
+/// #226) stories. Note markers are document order — see
+/// [`to_html_fragment_with_note_markers`] for a caller with a live layout
+/// snapshot.
 pub fn to_html_fragment(doc: &DocumentTree) -> String {
+    to_html_fragment_with_note_markers(doc, &doc.note_markers())
+}
+
+/// [`to_html_fragment`] with the [`to_html_with_note_markers`] override.
+pub fn to_html_fragment_with_note_markers(
+    doc: &DocumentTree,
+    note_markers: &HashMap<engine::NoteAnchor, String>,
+) -> String {
     let mut out = String::with_capacity(512);
-    emit_blocks(&doc.blocks_slice(), &Media::of(doc), &mut out);
+    emit_document_body(doc, note_markers, &mut out);
     out
+}
+
+/// Shared body for [`to_html_with_note_markers`] /
+/// [`to_html_fragment_with_note_markers`]: header band, body blocks,
+/// trailing notes, footer band.
+fn emit_document_body(
+    doc: &DocumentTree,
+    note_markers: &HashMap<engine::NoteAnchor, String>,
+    out: &mut String,
+) {
+    let media = Media::new(doc, note_markers);
+    emit_hf_band("header", doc, &doc.headers, |s| &s.header_refs, &media, out);
+    emit_blocks(&doc.blocks_slice(), &media, out);
+    emit_trailing_notes(doc, &media, out);
+    emit_hf_band("footer", doc, &doc.footers, |s| &s.footer_refs, &media, out);
 }
 
 /* --------------------------------------------------------------------- */
@@ -47,20 +117,142 @@ pub fn to_html_fragment(doc: &DocumentTree) -> String {
 /* --------------------------------------------------------------------- */
 
 /// Document-scoped export context: the media table inline images
-/// resolve against plus (issue #80) the document-order note markers so
-/// a footnote reference exports its displayed number, not its OOXML id.
+/// resolve against, plus (issue #80, extended by #226) the note markers
+/// a footnote/endnote reference and its trailing region export their
+/// displayed number with, not their OOXML id — document order by
+/// default, or a caller's painted-label override (see
+/// [`to_html_with_note_markers`]).
 struct Media<'a> {
-    blobs: &'a std::collections::HashMap<String, engine::ImageBlob>,
-    markers: std::collections::HashMap<engine::NoteAnchor, String>,
+    blobs: &'a HashMap<String, engine::ImageBlob>,
+    markers: &'a HashMap<engine::NoteAnchor, String>,
 }
 
 impl<'a> Media<'a> {
-    fn of(doc: &'a DocumentTree) -> Self {
+    fn new(doc: &'a DocumentTree, markers: &'a HashMap<engine::NoteAnchor, String>) -> Self {
         Self {
             blobs: &doc.media,
-            markers: doc.note_markers(),
+            markers,
         }
     }
+}
+
+/// Issue #226 — the DOM id a note's trailing region is written at, and
+/// the in-text `<a role="doc-noteref">`'s link target: mirrors
+/// engine-wasm's `a11y_note_id` (issue #203) so both the a11y mirror and
+/// the exported file address the same note the same way.
+fn note_dom_id(anchor: engine::NoteAnchor) -> String {
+    match anchor.kind {
+        engine::NoteKind::Footnote => format!("footnote-{}", anchor.id),
+        engine::NoteKind::Endnote => format!("endnote-{}", anchor.id),
+    }
+}
+
+/// Issue #226 — the first section's default header/footer band, emitted
+/// once as a landmark `<header>` / `<footer>` (browsers assign these the
+/// implicit `banner` / `contentinfo` ARIA role already). A section with
+/// no `default` slot — or whose `default` rid does not resolve to a
+/// parsed part — emits nothing. `First` / `Even` variants have no
+/// flattened-document equivalent (a static export has no page concept to
+/// switch bands on), so their part ids ride as `data-{tag}-first-rid` /
+/// `data-{tag}-even-rid` attributes instead of a second element — lossy
+/// for round-trip, but at least discoverable, never silently dropped.
+fn emit_hf_band(
+    tag: &str,
+    doc: &DocumentTree,
+    parts: &HashMap<String, Vec<Block>>,
+    refs_of: impl Fn(&engine::Section) -> &engine::HeaderFooterRefs,
+    media: &Media<'_>,
+    out: &mut String,
+) {
+    let Some(section) = doc.effective_sections().into_iter().next() else {
+        return;
+    };
+    let refs = refs_of(&section);
+    let Some(default_rid) = refs.default.as_deref() else {
+        return;
+    };
+    let Some(blocks) = parts.get(default_rid) else {
+        return;
+    };
+    out.push('<');
+    out.push_str(tag);
+    for (attr, rid) in [
+        (format!("data-{tag}-first-rid"), refs.first.as_deref()),
+        (format!("data-{tag}-even-rid"), refs.even.as_deref()),
+    ] {
+        if let Some(rid) = rid {
+            out.push(' ');
+            out.push_str(&attr);
+            out.push_str("=\"");
+            escape_attr_into(rid, out);
+            out.push('"');
+        }
+    }
+    out.push('>');
+    emit_blocks(blocks, media, out);
+    out.push_str("</");
+    out.push_str(tag);
+    out.push('>');
+}
+
+/// Issue #226 (mirrors #203's a11y structure) — footnotes/endnotes as a
+/// trailing region: each footnote an `<aside role="doc-footnote">`,
+/// every endnote an `<li>` filed into one trailing
+/// `<section role="doc-endnotes">` (DPUB-ARIA 1.1's replacement for the
+/// deprecated `doc-endnote` role) — in document order of first
+/// reference, deduplicated (a note referenced more than once is written
+/// once). Each region opens with its visible marker (`<sup>…</sup>`,
+/// from `media.markers`) since — unlike the visually-hidden a11y mirror —
+/// an exported file has no on-canvas number to fall back on.
+fn emit_trailing_notes(doc: &DocumentTree, media: &Media<'_>, out: &mut String) {
+    if doc.footnote_stories.is_empty() && doc.endnote_stories.is_empty() {
+        return;
+    }
+    let mut seen: std::collections::HashSet<engine::NoteAnchor> = std::collections::HashSet::new();
+    let mut endnotes = String::new();
+    for r in doc.note_references() {
+        if !seen.insert(r.anchor) {
+            continue;
+        }
+        let Some(story) = doc.note_story(r.anchor) else {
+            continue;
+        };
+        let marker = media
+            .markers
+            .get(&r.anchor)
+            .cloned()
+            .unwrap_or_else(|| r.anchor.id.to_string());
+        let dom_id = note_dom_id(r.anchor);
+        match r.anchor.kind {
+            engine::NoteKind::Footnote => {
+                out.push_str("<aside role=\"doc-footnote\" id=\"");
+                escape_attr_into(&dom_id, out);
+                out.push_str("\">");
+                push_note_marker(&marker, out);
+                emit_blocks(&story.body, media, out);
+                out.push_str("</aside>");
+            }
+            engine::NoteKind::Endnote => {
+                endnotes.push_str("<li id=\"");
+                escape_attr_into(&dom_id, &mut endnotes);
+                endnotes.push_str("\">");
+                push_note_marker(&marker, &mut endnotes);
+                emit_blocks(&story.body, media, &mut endnotes);
+                endnotes.push_str("</li>");
+            }
+        }
+    }
+    if !endnotes.is_empty() {
+        out.push_str("<section role=\"doc-endnotes\" aria-label=\"Endnotes\"><ol>");
+        out.push_str(&endnotes);
+        out.push_str("</ol></section>");
+    }
+}
+
+fn push_note_marker(marker: &str, out: &mut String) {
+    out.push_str("<sup>");
+    escape_text_into(marker, out);
+    out.push_str("</sup> ");
 }
 
 fn emit_blocks(blocks: &[Block], media: &Media<'_>, out: &mut String) {
@@ -271,7 +463,11 @@ fn emit_inline_object(obj: &InlineObject, media: &Media<'_>, out: &mut String) {
         ),
         InlineKind::FootnoteRef { id, .. } | InlineKind::EndnoteRef { id, .. } => {
             /* Issue #80 — the displayed number is derived in document
-            order; a dangling reference (no marker) falls back to the id. */
+            order (or the caller's painted override, issue #226); a
+            dangling reference (no marker) falls back to the id. Issue
+            #226 — the mark links to its trailing region
+            (`emit_trailing_notes`) as an `<a role="doc-noteref">`,
+            mirroring the #203 a11y mirror's reference-mark structure. */
             let anchor = engine::NoteAnchor {
                 kind: if matches!(obj.kind, InlineKind::FootnoteRef { .. }) {
                     engine::NoteKind::Footnote
@@ -280,32 +476,31 @@ fn emit_inline_object(obj: &InlineObject, media: &Media<'_>, out: &mut String) {
                 },
                 id: *id,
             };
-            out.push_str("<sup>");
-            match media.markers.get(&anchor) {
-                Some(m) => escape_text_into(m, out),
-                None => out.push_str(&id.to_string()),
-            }
-            out.push_str("</sup>");
+            let marker = media
+                .markers
+                .get(&anchor)
+                .cloned()
+                .unwrap_or_else(|| id.to_string());
+            out.push_str("<sup><a role=\"doc-noteref\" href=\"#");
+            escape_attr_into(&note_dom_id(anchor), out);
+            out.push_str("\">");
+            escape_text_into(&marker, out);
+            out.push_str("</a></sup>");
         }
         InlineKind::NoteSelfRef { .. } => {}
-        /* Issue #83 — a text box exports as an outlined inline-block
-        frame holding its story's paragraph text. */
+        /* Issue #226 — a text box exports as an `<aside>` at its anchor
+        paragraph, recursing through the same block walk as the body:
+        earlier this joined only bare paragraph text, silently dropping a
+        box's own formatting, images and nested boxes. */
         InlineKind::TextBox {
             width_emu, story, ..
         } => {
             let w_px = emu_to_css_px(*width_emu);
             out.push_str(&format!(
-                "<span style=\"display:inline-block;border:1px solid #000;padding:4px;width:{w_px}px\">"
+                "<aside style=\"display:inline-block;vertical-align:top;border:1px solid #000;padding:4px;width:{w_px}px\">"
             ));
-            for (i, b) in story.body.iter().enumerate() {
-                if let engine::Block::Paragraph(p) = b {
-                    if i > 0 {
-                        out.push_str("<br>");
-                    }
-                    escape_text_into(&p.text.replace('\u{FFFC}', ""), out);
-                }
-            }
-            out.push_str("</span>");
+            emit_blocks(&story.body, media, out);
+            out.push_str("</aside>");
         }
     }
 }
@@ -1001,5 +1196,348 @@ mod tests {
         assert!(html.contains("font-family:\"Times New Roman\";"));
         // The double-quote in the display is escaped, not left to close the attr.
         assert!(html.contains("font-family:\"Ev&quot;il\";"));
+    }
+
+    /* ===================================================================
+    Issue #226 — headers / footers / footnotes / endnotes / text boxes.
+    =================================================================== */
+
+    fn para(text: &str) -> Paragraph {
+        Paragraph {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+
+    /* ---- header / footer bands ------------------------------------- */
+
+    #[test]
+    fn header_and_footer_bands_emit_once_from_first_sections_default() {
+        let mut doc = doc_with(vec![Block::Paragraph(para("Body"))]);
+        doc.body_section.header_refs.default = Some("rId1".into());
+        doc.body_section.header_refs.first = Some("rId2".into());
+        doc.body_section.footer_refs.default = Some("rId3".into());
+        doc.body_section.footer_refs.even = Some("rId4".into());
+        doc.headers.insert(
+            "rId1".into(),
+            vec![Block::Paragraph(para("Default header"))],
+        );
+        doc.headers
+            .insert("rId2".into(), vec![Block::Paragraph(para("First header"))]);
+        doc.footers.insert(
+            "rId3".into(),
+            vec![Block::Paragraph(para("Default footer"))],
+        );
+        doc.footers
+            .insert("rId4".into(), vec![Block::Paragraph(para("Even footer"))]);
+
+        let html = to_html_fragment(&doc);
+        assert_eq!(html.matches("<header").count(), 1, "header emitted once");
+        assert_eq!(html.matches("<footer").count(), 1, "footer emitted once");
+        assert!(
+            html.contains("<header data-header-first-rid=\"rId2\"><p>Default header</p></header>"),
+            "got: {html}"
+        );
+        assert!(
+            html.contains("<footer data-footer-even-rid=\"rId4\"><p>Default footer</p></footer>"),
+            "got: {html}"
+        );
+        /* Header precedes the body; footer trails it. */
+        let header_at = html.find("<header").unwrap();
+        let body_at = html.find("<p>Body</p>").unwrap();
+        let footer_at = html.find("<footer").unwrap();
+        assert!(header_at < body_at && body_at < footer_at, "got: {html}");
+    }
+
+    #[test]
+    fn header_with_no_first_or_even_variant_carries_no_data_attributes() {
+        let mut doc = doc_with(vec![Block::Paragraph(para("Body"))]);
+        doc.body_section.header_refs.default = Some("rId1".into());
+        doc.headers
+            .insert("rId1".into(), vec![Block::Paragraph(para("Header"))]);
+        let html = to_html_fragment(&doc);
+        assert!(
+            html.contains("<header><p>Header</p></header>"),
+            "got: {html}"
+        );
+        assert!(!html.contains("data-header-first-rid"));
+        assert!(!html.contains("data-header-even-rid"));
+    }
+
+    #[test]
+    fn no_section_refs_emits_no_header_or_footer() {
+        let doc = doc_with(vec![Block::Paragraph(para("Body"))]);
+        let html = to_html_fragment(&doc);
+        assert!(!html.contains("<header"));
+        assert!(!html.contains("<footer"));
+    }
+
+    #[test]
+    fn rtl_paragraph_inside_header_gets_dir_rtl_like_the_body() {
+        let mut doc = doc_with(vec![Block::Paragraph(para("Body"))]);
+        doc.body_section.header_refs.default = Some("rId1".into());
+        doc.headers.insert(
+            "rId1".into(),
+            vec![Block::Paragraph(Paragraph {
+                text: "مرحبا".into(),
+                props: ParaProperties {
+                    direction: Some(TextDirection::Rtl),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })],
+        );
+        let html = to_html_fragment(&doc);
+        assert!(
+            html.contains("<header><p dir=\"rtl\">مرحبا</p></header>"),
+            "got: {html}"
+        );
+    }
+
+    /* ---- footnotes / endnotes ---------------------------------------- */
+
+    fn footnote_ref(id: u32, at: u32) -> InlineObject {
+        InlineObject {
+            at,
+            kind: InlineKind::FootnoteRef {
+                id,
+                custom_mark_follows: false,
+            },
+            anchor: None,
+            source_xml: None,
+        }
+    }
+
+    fn endnote_ref(id: u32, at: u32) -> InlineObject {
+        InlineObject {
+            at,
+            kind: InlineKind::EndnoteRef {
+                id,
+                custom_mark_follows: false,
+            },
+            anchor: None,
+            source_xml: None,
+        }
+    }
+
+    fn note_story(id: i32, kind: engine::NoteKind, text: &str) -> engine::NoteStory {
+        engine::NoteStory {
+            id,
+            kind,
+            note_type: engine::NoteType::Normal,
+            body: vec![Block::Paragraph(para(text))],
+            source_xml: None,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn footnote_reference_links_to_a_trailing_aside_with_its_marker() {
+        let p = Paragraph {
+            text: "See\u{FFFC} note".into(),
+            inline_objects: vec![footnote_ref(1, 3)],
+            ..Default::default()
+        };
+        let mut doc = doc_with(vec![Block::Paragraph(p)]);
+        doc.footnote_stories.insert(
+            1,
+            note_story(1, engine::NoteKind::Footnote, "Footnote text"),
+        );
+
+        let html = to_html_fragment(&doc);
+        assert!(
+            html.contains("<sup><a role=\"doc-noteref\" href=\"#footnote-1\">1</a></sup>"),
+            "reference mark missing: {html}"
+        );
+        assert!(
+            html.contains("<aside role=\"doc-footnote\" id=\"footnote-1\"><sup>1</sup> <p>Footnote text</p></aside>"),
+            "trailing region missing: {html}"
+        );
+        /* No endnotes exist — no empty `doc-endnotes` section is emitted. */
+        assert!(!html.contains("doc-endnotes"));
+    }
+
+    #[test]
+    fn endnote_is_filed_into_one_trailing_doc_endnotes_section() {
+        let p = Paragraph {
+            text: "See\u{FFFC} note".into(),
+            inline_objects: vec![endnote_ref(7, 3)],
+            ..Default::default()
+        };
+        let mut doc = doc_with(vec![Block::Paragraph(p)]);
+        doc.endnote_stories
+            .insert(7, note_story(7, engine::NoteKind::Endnote, "Endnote text"));
+
+        let html = to_html_fragment(&doc);
+        assert!(
+            html.contains("<sup><a role=\"doc-noteref\" href=\"#endnote-7\">1</a></sup>"),
+            "endnotes number from 1 in document order, not the OOXML id: {html}"
+        );
+        assert!(
+            html.contains(
+                "<section role=\"doc-endnotes\" aria-label=\"Endnotes\"><ol><li id=\"endnote-7\"><sup>1</sup> <p>Endnote text</p></li></ol></section>"
+            ),
+            "got: {html}"
+        );
+        assert!(
+            html.trim_end().ends_with("</section>"),
+            "endnotes trail everything: {html}"
+        );
+    }
+
+    #[test]
+    fn a_note_referenced_twice_is_written_once() {
+        let p = Paragraph {
+            text: "a\u{FFFC}b\u{FFFC}c".into(),
+            inline_objects: vec![footnote_ref(1, 1), footnote_ref(1, 5)],
+            ..Default::default()
+        };
+        let mut doc = doc_with(vec![Block::Paragraph(p)]);
+        doc.footnote_stories
+            .insert(1, note_story(1, engine::NoteKind::Footnote, "Once"));
+        let html = to_html_fragment(&doc);
+        assert_eq!(
+            html.matches("role=\"doc-footnote\"").count(),
+            1,
+            "got: {html}"
+        );
+        assert_eq!(html.matches("<a role=\"doc-noteref\"").count(), 2);
+    }
+
+    #[test]
+    fn painted_note_markers_override_the_document_order_label() {
+        let p = Paragraph {
+            text: "x\u{FFFC}y".into(),
+            inline_objects: vec![footnote_ref(1, 1)],
+            ..Default::default()
+        };
+        let mut doc = doc_with(vec![Block::Paragraph(p)]);
+        doc.footnote_stories
+            .insert(1, note_story(1, engine::NoteKind::Footnote, "Body"));
+
+        /* Document order labels this "1"; a caller with a live layout
+        that restarts numbering each page can paint a different label
+        for the same OOXML id. */
+        let mut painted = std::collections::HashMap::new();
+        painted.insert(
+            engine::NoteAnchor {
+                kind: engine::NoteKind::Footnote,
+                id: 1,
+            },
+            "i".to_string(),
+        );
+        let html = to_html_fragment_with_note_markers(&doc, &painted);
+        assert!(html.contains("href=\"#footnote-1\">i</a>"), "got: {html}");
+        assert!(html.contains("<sup>i</sup> <p>Body</p>"), "got: {html}");
+
+        /* The plain entry point stays document order. */
+        let default_html = to_html_fragment(&doc);
+        assert!(default_html.contains("href=\"#footnote-1\">1</a>"));
+    }
+
+    #[test]
+    fn rtl_paragraph_inside_a_footnote_gets_dir_rtl_like_the_body() {
+        let p = Paragraph {
+            text: "x\u{FFFC}y".into(),
+            inline_objects: vec![footnote_ref(1, 1)],
+            ..Default::default()
+        };
+        let mut doc = doc_with(vec![Block::Paragraph(p)]);
+        doc.footnote_stories.insert(
+            1,
+            engine::NoteStory {
+                id: 1,
+                kind: engine::NoteKind::Footnote,
+                note_type: engine::NoteType::Normal,
+                body: vec![Block::Paragraph(Paragraph {
+                    text: "مرحبا".into(),
+                    props: ParaProperties {
+                        direction: Some(TextDirection::Rtl),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })],
+                source_xml: None,
+                dirty: false,
+            },
+        );
+        let html = to_html_fragment(&doc);
+        assert!(html.contains("<p dir=\"rtl\">مرحبا</p>"), "got: {html}");
+    }
+
+    /* ---- text boxes ---------------------------------------------------- */
+
+    #[test]
+    fn text_box_story_exports_as_an_aside_preserving_formatting() {
+        let boxed = Paragraph {
+            text: "bold".into(),
+            spans: vec![StyleRun {
+                start: 0,
+                end: 4,
+                style: SpanStyle {
+                    bold: Some(true),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let p = Paragraph {
+            text: "\u{FFFC}".into(),
+            inline_objects: vec![InlineObject {
+                at: 0,
+                kind: InlineKind::TextBox {
+                    width_emu: 914_400,
+                    height_emu: 914_400,
+                    story: Box::new(engine::TextBoxStory {
+                        body: vec![Block::Paragraph(boxed)],
+                        ..Default::default()
+                    }),
+                },
+                anchor: None,
+                source_xml: None,
+            }],
+            ..Default::default()
+        };
+        let html = to_html_fragment(&doc_with(vec![Block::Paragraph(p)]));
+        assert!(
+            html.contains("<aside style=\"display:inline-block;vertical-align:top;border:1px solid #000;padding:4px;width:96px\">"),
+            "got: {html}"
+        );
+        assert!(
+            html.contains("<p><b>bold</b></p>"),
+            "the box's own formatting must survive, not just its bare text: {html}"
+        );
+        assert!(html.contains("</aside>"));
+    }
+
+    #[test]
+    fn rtl_paragraph_inside_a_text_box_gets_dir_rtl_like_the_body() {
+        let boxed = Paragraph {
+            text: "مرحبا".into(),
+            props: ParaProperties {
+                direction: Some(TextDirection::Rtl),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let p = Paragraph {
+            text: "\u{FFFC}".into(),
+            inline_objects: vec![InlineObject {
+                at: 0,
+                kind: InlineKind::TextBox {
+                    width_emu: 914_400,
+                    height_emu: 914_400,
+                    story: Box::new(engine::TextBoxStory {
+                        body: vec![Block::Paragraph(boxed)],
+                        ..Default::default()
+                    }),
+                },
+                anchor: None,
+                source_xml: None,
+            }],
+            ..Default::default()
+        };
+        let html = to_html_fragment(&doc_with(vec![Block::Paragraph(p)]));
+        assert!(html.contains("<p dir=\"rtl\">مرحبا</p>"), "got: {html}");
     }
 }

@@ -222,6 +222,16 @@ function viewStateFor(engine: EngineHandle): ViewState {
         engine.subscribe((evt: Event) => {
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
+            } else if (evt.type === 'ZOOM_PENDING') {
+                /* Issue #239 — a `SET_ZOOM` / `SET_DEVICE_SCALE` sent
+                   before the engine's first `RENDER_PAGE` answers with
+                   this instead of `SELECTION_CHANGED` (there is no
+                   selection yet to build one around). Mirror it into the
+                   same signals so a zoom control reflects the requested
+                   value immediately instead of flashing 100 % until the
+                   boot `RENDER_PAGE` + its `SELECTION_CHANGED` land. */
+                setZoom(roundZoom(evt.zoom));
+                if (evt.device_scale !== undefined) setDeviceScale(evt.device_scale);
             } else if (evt.type === 'RECOVERED') {
                 /* Issue #97 — the respawned engine folded the replayed
                    SET_ZOOM / SET_DEVICE_SCALE into its restored config (or

@@ -437,6 +437,7 @@ impl DocumentTree {
                 end: p0.text.len() as u32,
                 instruction: r.instruction.clone(),
                 span: Some(FieldSpan::Head),
+                source: None,
             });
         }
         {
@@ -448,6 +449,7 @@ impl DocumentTree {
                 end,
                 instruction: String::new(),
                 span: Some(FieldSpan::Tail),
+                source: None,
             });
             pl.section_end = last.section_end.clone();
         }
@@ -507,6 +509,7 @@ impl DocumentTree {
                     end: t,
                     instruction: format!("PAGEREF {anchor} \\h"),
                     span: None,
+                    source: None,
                 });
             }
         }
@@ -564,12 +567,14 @@ impl DocumentTree {
                     end: 0,
                     instruction: switches.to_instruction(),
                     span: Some(FieldSpan::Head),
+                    source: None,
                 },
                 Field {
                     start: 0,
                     end: 0,
                     instruction: String::new(),
                     span: Some(FieldSpan::Tail),
+                    source: None,
                 },
             ],
             dirty: true,
@@ -593,6 +598,7 @@ impl DocumentTree {
             end: 0,
             instruction: r.instruction.clone(),
             span: None,
+            source: None,
         })
         .typed()
         {
@@ -951,6 +957,7 @@ mod tests {
                     end: 9,
                     instruction: "TOC \\o \"1-1\"".into(),
                     span: Some(FieldSpan::Head),
+                    source: None,
                 }],
                 ..Default::default()
             }),
@@ -961,6 +968,7 @@ mod tests {
                     end: 4,
                     instruction: String::new(),
                     span: Some(FieldSpan::Tail),
+                    source: None,
                 }],
                 ..Default::default()
             }),

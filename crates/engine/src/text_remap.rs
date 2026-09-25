@@ -687,6 +687,7 @@ mod tests {
                 end: 4,
                 instruction: "NUMPAGES".into(),
                 span: None,
+                source: None,
             });
         }
         let mut d = d;

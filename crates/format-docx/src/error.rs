@@ -35,3 +35,21 @@ pub enum DocxWarning {
     /// overflowed the stack.
     TableNestingTooDeep { limit: u32 },
 }
+
+/// Issues #244 / #245 — non-fatal writer diagnostics: a best-effort
+/// decision [`crate::writer::write_docx_with_notes`] took to keep
+/// unmodeled content instead of dropping it. The file was written and is
+/// well-formed; the content may sit at an approximate position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteNote {
+    /// A regenerated paragraph's source markup was stale (an edit path
+    /// that does not remap its offsets): its must-survive markup — legacy
+    /// form fields, content-control boundaries — was written at offsets
+    /// clamped to the current text.
+    StaleMarkupClamped { markers: u32 },
+    /// Issue #245 — the run-level content control `id` (the source byte
+    /// offset of its `<w:sdt>`) would have crossed a regenerated wrapper
+    /// (hyperlink, revision, field) or another control after an edit; its
+    /// range was widened to enclose it so the part stays well-formed.
+    InlineWrapperWidened { id: u32 },
+}

@@ -16,6 +16,8 @@ export type {
     A11yNote,
     A11yNoteKind,
     A11yNoteRef,
+    A11yObjectKind,
+    A11yObjectRef,
     A11yTree,
     Alignment,
     AttrsMixed,

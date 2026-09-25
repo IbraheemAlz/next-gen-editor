@@ -21,7 +21,6 @@ use engine::{
     FontFamily as EngineFontFamily, LogicalPos as EnginePos, PathStep as EnginePathStep, SpanStyle,
     UndoStack,
 };
-use format_docx::writer::build_minimal_docx;
 use kurbo::Rect;
 use layout::{
     A4Page, LayoutBlock, LineBox, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan,
@@ -923,6 +922,30 @@ pub struct Engine {
     /// replacing a hand-kept per-command allowlist; `Event::Painted`
     /// carries it too.
     mutation_seq: u64,
+    /// Issue #239 — a `SetZoom` sent before the first `RenderPage` has no
+    /// `layout_cfg` to fold into and no selection either (`render_page`
+    /// always resets it), so it used to be silently dropped. Stashed
+    /// here instead; `render_page` composes it into the fresh config
+    /// (`cfg.zoom = pending_zoom.take().unwrap_or(cfg.zoom)`), and
+    /// `user_zoom()` reports it in the meantime so a `SelectionChanged`
+    /// emitted before any `RenderPage` (there is none in practice, but
+    /// `do_recover`'s replay reads `user_zoom()` too) never lies. `None`
+    /// once a `RenderPage` has consumed it.
+    pending_zoom: Option<f32>,
+    /// Issue #239 — the `SetDeviceScale` mirror of `pending_zoom`.
+    pending_base_scale: Option<f32>,
+    /// Issue #231 — monotonic "a repaint just produced fresh page
+    /// geometry" counter, bumped once per completed `render_document`
+    /// call (both the Vello and Canvas2D branches, at the same
+    /// chokepoint that refreshes `last_paint_dims`). `SetZoom` /
+    /// `SetDeviceScale` / `ExpandLayout` change page geometry without
+    /// bumping `mutation_seq` (the document didn't change), so the
+    /// worker's mutation-seq gate alone never re-broadcasts `Painted`
+    /// for them and the overlays / page tops stay stale until the next
+    /// edit. The worker compares THIS counter separately (`paint_dims()`
+    /// carries it) and re-broadcasts on a move, independent of whether
+    /// the document itself changed.
+    paint_geometry_seq: u64,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -978,6 +1001,9 @@ fn assemble_engine(
         last_command_ms: 0.0,
         last_paint_ms: 0.0,
         mutation_seq: 0,
+        pending_zoom: None,
+        pending_base_scale: None,
+        paint_geometry_seq: 0,
     }
 }
 
@@ -1014,9 +1040,9 @@ impl Engine {
     /// Phase 7 — list every inline-image media blob the document carries,
     /// keyed by media key (issue #188: the resolved target path for an
     /// imported picture, the minted id for an inserted one — the same key
-    /// the display list's `DrawImage.rel_id` names). The TS shell consumes
-    /// this list once after `OpenDocx`, decodes each blob into an
-    /// `ImageBitmap` via the browser, and installs the result via
+    /// the display list's `DrawImage.media_key` names, issue #224). The TS
+    /// shell consumes this list once after `OpenDocx`, decodes each blob
+    /// into an `ImageBitmap` via the browser, and installs the result via
     /// [`Engine::register_image`]. Returns an array of
     /// `{ rel_id, mime, bytes }` objects.
     pub fn media_entries(&self) -> Result<JsValue, JsValue> {
@@ -1122,6 +1148,7 @@ impl Engine {
             layout_degraded: dims.layout_degraded,
             paint_ms: dims.paint_ms,
             mutation_seq: self.mutation_seq,
+            paint_geometry_seq: self.paint_geometry_seq,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -1135,6 +1162,20 @@ impl Engine {
     /// a `BigInt`.
     pub fn document_mutation_seq(&self) -> f64 {
         self.mutation_seq as f64
+    }
+
+    /// Issue #231 — the engine's own "a repaint just produced fresh page
+    /// geometry" signal (see the `paint_geometry_seq` field): a monotonic
+    /// counter bumped once per completed `render_document` call,
+    /// independent of `document_mutation_seq` (a zoom / device-scale /
+    /// `ExpandLayout` repaint moves this WITHOUT moving that one — the
+    /// document didn't change, only its painted scale or laid-out
+    /// extent). The worker compares this across a command the same way it
+    /// compares `document_mutation_seq`, and re-broadcasts `Painted` on a
+    /// move so the overlays never read stale `page_tops` / `page_heights`
+    /// after a pure zoom change.
+    pub fn paint_geometry_seq(&self) -> f64 {
+        self.paint_geometry_seq as f64
     }
 
     /// Sprint 10 — drain queued `aria-live` announcements as
@@ -1245,6 +1286,11 @@ struct PaintDimsOut {
     mutation_seq: u64,
     /// Issue #86 — mirrors `Event::Painted.paint_ms` (see `LastPaintDims`).
     paint_ms: f32,
+    /// Issue #231 — mirrors `Engine::paint_geometry_seq()`: bumped on
+    /// every completed repaint independent of `mutation_seq`, so the
+    /// worker can re-broadcast `Painted` after a pure zoom / device-scale
+    /// change even though the document itself did not move.
+    paint_geometry_seq: u64,
 }
 
 #[derive(::serde::Serialize)]
@@ -5101,6 +5147,7 @@ fn collect_paragraph_image_rects(
                         path: path.clone(),
                         at: run.source_range.start + g.cluster,
                         rel_id: rel.to_string(),
+                        media_key: rel.to_string(),
                         rect: BridgeRect {
                             x: x0,
                             y: y0,
@@ -5172,6 +5219,7 @@ fn collect_text_box_image_rects(
             path: engine_to_bridge_path(host),
             at: nf.at,
             rel_id: nf.rel_id.clone(),
+            media_key: nf.rel_id.clone(),
             rect: BridgeRect {
                 x: cx + nf.origin.x,
                 y: cy + nf.origin.y,
@@ -6037,18 +6085,21 @@ fn push_run(runs: &mut Vec<A11yRun>, text: &str, s: u32, e: u32, style: SpanStyl
                 .unwrap_or(engine::UnderlineStyle::None)
                 .is_visible(),
             note_ref: None,
+            object: None,
         });
     }
 }
 
 /// Split a paragraph into gap-free accessibility runs by its style spans.
 ///
-/// Issue #203 — `subs` are the paragraph's note marks (each a U+FFFC
-/// placeholder byte offset, the display text, the optional note link):
-/// each placeholder is replaced by its own run carrying the marker text
-/// (and `note_ref` for a reference), styled like the span it sits in.
-/// Without `subs` the output is exactly the pre-#203 run list.
-fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
+/// Issue #203 / #215 — `subs` are the paragraph's sentinel marks (each a
+/// U+FFFC placeholder byte offset, the display text, and the optional note
+/// / object link): each placeholder is replaced by its own run carrying
+/// the mark's text (empty for an inline object — see
+/// [`A11ySentinelMark::object`]) and its `note_ref` / `object`, styled
+/// like the span it sits in. Without `subs` the output is exactly the
+/// pre-#203 run list.
+fn a11y_runs(para: &engine::Paragraph, subs: &[A11ySentinelMark]) -> Vec<A11yRun> {
     let len = para.text.len() as u32;
     let mut runs: Vec<A11yRun> = Vec::new();
     let push = |runs: &mut Vec<A11yRun>, s: u32, e: u32, style: SpanStyle| {
@@ -6064,6 +6115,7 @@ fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
                     .unwrap_or(engine::UnderlineStyle::None)
                     .is_visible(),
                 note_ref: m.note_ref.clone(),
+                object: m.object.clone(),
             });
             cursor = (m.at + A11Y_PLACEHOLDER_LEN).min(e);
         }
@@ -6079,14 +6131,19 @@ fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
     runs
 }
 
-/// UTF-8 length of the U+FFFC object placeholder a note mark occupies.
+/// UTF-8 length of the U+FFFC object placeholder a sentinel mark occupies.
 const A11Y_PLACEHOLDER_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
 
-/// Issue #203 — one note mark inside a paragraph, for [`a11y_runs`].
-struct A11yNoteMark {
+/// Issue #203 / #215 — one U+FFFC sentinel's replacement inside a
+/// paragraph, for [`a11y_runs`]: a note reference / self-mark (`note_ref`
+/// or bare marker `text`), or (issue #215) an inline image / text box
+/// (`object`, `text` empty — the object IS the run). Exactly one of
+/// `note_ref` / `object` is ever set.
+struct A11ySentinelMark {
     at: u32,
     text: String,
     note_ref: Option<bridge::A11yNoteRef>,
+    object: Option<bridge::A11yObjectRef>,
 }
 
 /// Issue #203 — the note context of a body walk: the document (for the
@@ -6130,14 +6187,19 @@ fn note_ref_anchor(kind: &engine::InlineKind) -> Option<engine::NoteAnchor> {
     }
 }
 
-/// Issue #203 — the note marks of `p` in `scope`: reference marks when
-/// the walk carries a note context (the body), the self-mark when the
-/// walk is a note story's body. Only real U+FFFC placeholders qualify.
-fn a11y_note_marks(p: &engine::Paragraph, scope: A11yScope<'_>) -> Vec<A11yNoteMark> {
-    let mut marks: Vec<A11yNoteMark> = Vec::new();
-    if scope.notes.is_none() && scope.self_marker.is_none() {
-        return marks;
-    }
+/// Issue #203 / #215 — the sentinel marks of `p` in `scope`: a note
+/// reference mark / self-mark when the walk carries a note context (only
+/// then — see [`A11yNotes`]), and (unconditionally, any scope) an inline
+/// image or text box. Only real U+FFFC placeholders qualify. `path` is
+/// [`push_a11y_paragraph`]'s own path string for `p`, so a text-box
+/// mark's `id` matches the region [`push_a11y_text_boxes`] builds for the
+/// SAME box.
+fn a11y_inline_marks(
+    p: &engine::Paragraph,
+    scope: A11yScope<'_>,
+    path: &str,
+) -> Vec<A11ySentinelMark> {
+    let mut marks: Vec<A11ySentinelMark> = Vec::new();
     for io in &p.inline_objects {
         if !p
             .text
@@ -6146,26 +6208,60 @@ fn a11y_note_marks(p: &engine::Paragraph, scope: A11yScope<'_>) -> Vec<A11yNoteM
         {
             continue;
         }
-        if let Some(notes) = scope.notes
-            && let Some(anchor) = note_ref_anchor(&io.kind)
-        {
-            let note_ref = notes.doc.note_story(anchor).map(|_| bridge::A11yNoteRef {
-                kind: a11y_note_kind(anchor.kind),
-                id: a11y_note_id(anchor),
-            });
-            marks.push(A11yNoteMark {
-                at: io.at,
-                text: notes.markers.get(&anchor).cloned().unwrap_or_default(),
-                note_ref,
-            });
-        } else if let Some(marker) = scope.self_marker
-            && matches!(io.kind, engine::InlineKind::NoteSelfRef { .. })
-        {
-            marks.push(A11yNoteMark {
-                at: io.at,
-                text: marker.to_string(),
-                note_ref: None,
-            });
+        match &io.kind {
+            engine::InlineKind::Image { .. } => {
+                let id = io.kind.image_media_key().unwrap_or_default().to_string();
+                let (name, descr) = io.image_label().unwrap_or((None, None));
+                marks.push(A11ySentinelMark {
+                    at: io.at,
+                    text: String::new(),
+                    note_ref: None,
+                    object: Some(bridge::A11yObjectRef {
+                        kind: bridge::A11yObjectKind::Image,
+                        id,
+                        alt: descr.or(name),
+                    }),
+                });
+            }
+            engine::InlineKind::TextBox { .. } => {
+                let id = format!("{}{path}@{}", scope.id_prefix, io.at);
+                let (name, descr) = io.text_box_label().unwrap_or((None, None));
+                marks.push(A11ySentinelMark {
+                    at: io.at,
+                    text: String::new(),
+                    note_ref: None,
+                    object: Some(bridge::A11yObjectRef {
+                        kind: bridge::A11yObjectKind::TextBox,
+                        id,
+                        alt: descr.or(name),
+                    }),
+                });
+            }
+            _ => {
+                if let Some(notes) = scope.notes
+                    && let Some(anchor) = note_ref_anchor(&io.kind)
+                {
+                    let note_ref = notes.doc.note_story(anchor).map(|_| bridge::A11yNoteRef {
+                        kind: a11y_note_kind(anchor.kind),
+                        id: a11y_note_id(anchor),
+                    });
+                    marks.push(A11ySentinelMark {
+                        at: io.at,
+                        text: notes.markers.get(&anchor).cloned().unwrap_or_default(),
+                        note_ref,
+                        object: None,
+                    });
+                } else if let Some(marker) = scope.self_marker
+                    && matches!(io.kind, engine::InlineKind::NoteSelfRef { .. })
+                {
+                    marks.push(A11ySentinelMark {
+                        at: io.at,
+                        text: marker.to_string(),
+                        note_ref: None,
+                        object: None,
+                    });
+                }
+            }
         }
     }
     marks.sort_by_key(|m| m.at);
@@ -6358,7 +6454,7 @@ fn push_a11y_paragraph(
     out.push(A11yNode::Paragraph(A11yParagraph {
         direction,
         resolved_direction,
-        runs: a11y_runs(p, &a11y_note_marks(p, scope)),
+        runs: a11y_runs(p, &a11y_inline_marks(p, scope, path)),
     }));
     push_a11y_text_boxes(out, p, direction, scope, path);
     /* Issue #203 — the footnotes FIRST referenced in this paragraph
@@ -7305,8 +7401,20 @@ impl Engine {
     /// Reset the document + undo stack to a single paragraph of `text`, cache
     /// `cfg` so subsequent InsertText/Undo/Redo commands repaint without
     /// re-specifying params, then paint the first frame.
-    fn render_page(&mut self, text: String, cfg: RenderConfig) -> Event {
+    fn render_page(&mut self, text: String, mut cfg: RenderConfig) -> Event {
         self.install_undo_stack(UndoStack::new(DocumentTree::from_text(&text), 100));
+        /* Issue #239 — a `SetZoom` / `SetDeviceScale` sent before this,
+        the engine's first `RenderPage`, had no layout config to fold into
+        and was stashed as pending (see `do_set_zoom` / `do_set_device_scale`).
+        Compose it into the fresh config now instead of dropping it, so
+        `scale = base_scale × zoom` holds from the very first paint. */
+        if let Some(base) = self.pending_base_scale.take() {
+            cfg.base_scale = base;
+        }
+        if let Some(zoom) = self.pending_zoom.take() {
+            cfg.zoom = zoom;
+        }
+        cfg.scale = cfg.base_scale * cfg.zoom;
         self.layout_cfg = Some(cfg);
         /* A RenderPage reset is a fresh document; a surviving selection
         or IME preview from the previous session would be load-bearing
@@ -7574,6 +7682,11 @@ impl Engine {
         self.fonts.clear();
         self.install_undo_stack(UndoStack::new(DocumentTree::new(), UNDO_CAP));
         self.layout_cfg = None;
+        /* Issue #239 — a pending pre-`RenderPage` zoom belongs to the
+        session that just crashed; `do_recover`'s own tail-scan (below)
+        re-derives whatever the replayed log wants from scratch. */
+        self.pending_zoom = None;
+        self.pending_base_scale = None;
         self.selection = None;
         self.composition = None;
         self.pending_format = None;
@@ -7772,9 +7885,15 @@ impl Engine {
     }
 
     /// Issue #52 — the user zoom fraction the engine renders at; `1.0`
-    /// (the `RenderPage` default) before any layout config exists.
+    /// (the `RenderPage` default) before any layout config exists AND no
+    /// zoom is pending. Issue #239 — a `SetZoom` sent before the first
+    /// `RenderPage` has no config to live in yet but IS queued
+    /// (`pending_zoom`); report it here so it is never invisible in the
+    /// gap between the `SetZoom` and the `RenderPage` that consumes it.
     fn user_zoom(&self) -> f32 {
-        self.layout_cfg.as_ref().map_or(1.0, |c| c.zoom)
+        self.layout_cfg
+            .as_ref()
+            .map_or_else(|| self.pending_zoom.unwrap_or(1.0), |c| c.zoom)
     }
 
     /// Issue #66 — the backend this instance actually paints with.
@@ -9403,6 +9522,10 @@ impl Engine {
                 layout_degraded: stats.layout_degraded.clone(),
                 paint_ms: self.last_paint_ms,
             };
+            /* Issue #231 — a completed repaint, independent of whether the
+            DOCUMENT changed (mutation_seq). The worker uses this to
+            re-broadcast `Painted` after a zoom / device-scale change. */
+            self.paint_geometry_seq += 1;
             return Ok(stats);
         }
 
@@ -9464,6 +9587,8 @@ impl Engine {
             layout_degraded: stats.layout_degraded.clone(),
             paint_ms: self.last_paint_ms,
         };
+        /* Issue #231 — see the Vello branch above. */
+        self.paint_geometry_seq += 1;
         Ok(stats)
     }
 
@@ -10650,6 +10775,7 @@ impl Engine {
                     path,
                     at: f.at,
                     rel_id: f.rel_id.clone(),
+                    media_key: f.rel_id.clone(),
                     rect: BridgeRect {
                         x: f.origin.x,
                         y: page_top + f.origin.y,
@@ -14297,10 +14423,20 @@ impl Engine {
         blocks. */
         let block_slice = doc.slice_blocks(estart.clone(), eend.clone());
         let html = engine::html::to_html_blocks(&block_slice);
-        /* Issue #57 — the shell's prefetch skips the ZIP build. */
+        /* Issue #57 — the shell's prefetch skips the ZIP build. Issue
+        #213 — when the source document carries a retained package
+        (issue #134), splice its styles/numbering/theme/fontTable parts
+        into the fragment additively so a paste target resolves the
+        styles the copied paragraphs reference instead of falling back
+        to plain defaults. The package is document-level (not per-story:
+        `selection_doc()` returns a synthetic story tree with no package
+        of its own — see `story_doc()`), so it is read off the real tree
+        even for a copy issued from inside a header/footer/note story. */
         let docx_fragment = if include_docx {
             let paragraph_slice = doc.slice(estart, eend);
-            build_minimal_docx(&DocumentTree::from_rich_paragraphs(paragraph_slice))
+            let fragment_doc = DocumentTree::from_rich_paragraphs(paragraph_slice);
+            let source_package = self.undo.current().source_package.clone();
+            format_docx::build_clipboard_fragment_docx(&fragment_doc, source_package.as_deref())
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -15158,11 +15294,19 @@ impl Engine {
     }
 
     /// Sprint 9 — serialize the current document to a standalone HTML5
-    /// blob via `format_html::to_html`. `String::into_bytes()` consumes
-    /// the buffer in place — no extra copy crossing the wasm bridge;
-    /// the resulting `Vec<u8>` flows back to TS as a single `Uint8Array`.
+    /// blob via `format_html::to_html_with_note_markers`. `String::
+    /// into_bytes()` consumes the buffer in place — no extra copy
+    /// crossing the wasm bridge; the resulting `Vec<u8>` flows back to TS
+    /// as a single `Uint8Array`. Issue #226 — footnote/endnote labels use
+    /// the PAINTED per-page markers when a live layout snapshot exists
+    /// (`painted_note_markers`, the same source `build_a11y_nodes` reads),
+    /// so an each-page-restart numbering scheme exports the number the
+    /// page actually shows; without a snapshot this falls back to the
+    /// plain document-order labels, exactly `format_html::to_html`.
     fn save_html_bytes(&self) -> Event {
-        let html = format_html::to_html(self.undo.current());
+        let doc = self.undo.current();
+        let markers = self.painted_note_markers(doc);
+        let html = format_html::to_html_with_note_markers(doc, &markers);
         let bytes = html.into_bytes();
         let size = bytes.len() as u32;
         Event::DocumentSaved { bytes, size }
@@ -15181,10 +15325,19 @@ impl Engine {
     /// a full repaint. Clamped to `[0.25, 4.0]` and COMPOSED with the
     /// boot `base_scale` (`scale = base_scale × zoom`) so zooming
     /// never clobbers DPI scaling and zoom `1.0` restores the exact
-    /// boot rendering. `RenderPage` must have cached a `layout_cfg`
-    /// first (a fresh engine before any render has no scale to
-    /// mutate — return a no-op `selection_changed` so the caller
-    /// still sees a reply).
+    /// boot rendering.
+    ///
+    /// Issue #239 — before the first `RenderPage`, there is no
+    /// `layout_cfg` to mutate (a fresh engine has no scale) AND no
+    /// selection either (`render_page` always resets it), so this used
+    /// to route through `selection_changed()` and answer with a
+    /// misleading `Event::Error` ("no active selection") for what was
+    /// actually a successful command whose effect just hadn't landed
+    /// yet. Stash the value instead; `render_page` composes it into the
+    /// fresh config on the very first paint, and answer with
+    /// `Event::ZoomPending` — honest about there being no layout
+    /// config yet, rather than fabricating selection/caret geometry
+    /// over a document that doesn't exist.
     ///
     /// Issue #186 — a NaN/±∞ `zoom` is rejected with a typed
     /// `Event::Error` before `.clamp()` ever sees it (`f32::clamp`
@@ -15197,12 +15350,15 @@ impl Engine {
             };
         }
         let zoom = zoom.clamp(0.25, 4.0);
-        if let Some(cfg) = self.layout_cfg.as_mut() {
-            cfg.zoom = zoom;
-            cfg.scale = cfg.base_scale * zoom;
-        } else {
-            return self.selection_changed();
-        }
+        let Some(cfg) = self.layout_cfg.as_mut() else {
+            self.pending_zoom = Some(zoom);
+            return Event::ZoomPending {
+                zoom,
+                device_scale: self.pending_base_scale,
+            };
+        };
+        cfg.zoom = zoom;
+        cfg.scale = cfg.base_scale * zoom;
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15217,6 +15373,8 @@ impl Engine {
     /// the mirror image of `do_set_zoom`. The wider clamp admits real
     /// device ratios (dpr up to ~6 × the 4/3 CSS-pt factor).
     ///
+    /// Issue #239 — same pre-`RenderPage` pending path as `do_set_zoom`.
+    ///
     /// Issue #186 — same NaN/±∞ rejection as `do_set_zoom`.
     fn do_set_device_scale(&mut self, scale: f32) -> Event {
         if let Err(e) = engine::validate_finite_scale(scale) {
@@ -15225,12 +15383,15 @@ impl Engine {
             };
         }
         let base = scale.clamp(0.5, 8.0);
-        if let Some(cfg) = self.layout_cfg.as_mut() {
-            cfg.base_scale = base;
-            cfg.scale = base * cfg.zoom;
-        } else {
-            return self.selection_changed();
-        }
+        let Some(cfg) = self.layout_cfg.as_mut() else {
+            self.pending_base_scale = Some(base);
+            return Event::ZoomPending {
+                zoom: self.pending_zoom.unwrap_or(1.0),
+                device_scale: Some(base),
+            };
+        };
+        cfg.base_scale = base;
+        cfg.scale = base * cfg.zoom;
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -16493,6 +16654,10 @@ struct RenderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /* Issue #213 — the clipboard fragment path now goes through
+    `format_docx::build_clipboard_fragment_docx`; `build_minimal_docx`
+    itself is only exercised directly by a couple of tests below. */
+    use format_docx::writer::build_minimal_docx;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -16533,6 +16698,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -17027,6 +17195,7 @@ mod tests {
                 italic: false,
                 underline: false,
                 note_ref: None,
+                object: None,
             }],
         })
     }
@@ -17380,6 +17549,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -17438,6 +17610,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -17487,6 +17662,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -17613,6 +17791,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -18160,6 +18341,9 @@ mod tests {
                 last_command_ms: 0.0,
                 last_paint_ms: 0.0,
                 mutation_seq: 0,
+                pending_zoom: None,
+                pending_base_scale: None,
+                paint_geometry_seq: 0,
             }
         }
 
@@ -20590,7 +20774,7 @@ mod tests {
         let draw = cmds
             .iter()
             .position(|c| {
-                matches!(c, render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdBoxPic")
+                matches!(c, render::scene::DisplayCmd::DrawImage { media_key, .. } if media_key == "rIdBoxPic")
             })
             .expect("story picture paints");
         let pop = cmds
@@ -20938,7 +21122,7 @@ mod tests {
         let scene = render::scene::build_document_scene(&pages, 0.0);
         assert!(scene.cmds.iter().any(|c| matches!(
             c,
-            render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdInnerPic"
+            render::scene::DisplayCmd::DrawImage { media_key, .. } if media_key == "rIdInnerPic"
         )));
     }
 
@@ -21890,6 +22074,9 @@ mod tests {
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
             mutation_seq: 0,
+            pending_zoom: None,
+            pending_base_scale: None,
+            paint_geometry_seq: 0,
         }
     }
 
@@ -22261,6 +22448,7 @@ mod tests {
                         end: 7,
                         instruction: "PAGE".into(),
                         span: None,
+                        source: None,
                     }],
                     ..Default::default()
                 })],
@@ -22314,6 +22502,7 @@ mod tests {
                         end: 4,
                         instruction: "NUMPAGES".into(),
                         span: None,
+                        source: None,
                     }],
                     ..Default::default()
                 })],
@@ -22479,6 +22668,7 @@ mod tests {
                 end: 4,
                 instruction: "DATE".into(),
                 span: None,
+                source: None,
             }],
             ..Default::default()
         })]);
@@ -22557,6 +22747,41 @@ mod tests {
         assert_eq!(zoom_of(engine.do_set_device_scale(2.0)), 4.0);
     }
 
+    /// Issue #231 — `SetZoom` / `SetDeviceScale` repaint (bumping
+    /// `paint_geometry_seq`, the engine's own "fresh page geometry"
+    /// signal) WITHOUT mutating the document (`mutation_seq` stays put).
+    /// The worker uses exactly this split to broadcast a fresh `Painted`
+    /// after a pure zoom / device-scale change without triggering a
+    /// spurious accessibility-tree rebuild (the visible text didn't
+    /// change, only its painted scale).
+    #[test]
+    fn set_zoom_and_set_device_scale_bump_paint_geometry_seq_not_mutation_seq() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello"));
+        let mutation_before = engine.mutation_seq;
+        let geometry_before = engine.paint_geometry_seq;
+
+        assert!(matches!(
+            engine.do_set_zoom(1.5),
+            Event::SelectionChanged { .. }
+        ));
+        assert_eq!(
+            engine.mutation_seq, mutation_before,
+            "zoom does not mutate the document"
+        );
+        assert!(
+            engine.paint_geometry_seq > geometry_before,
+            "zoom repaints — the geometry counter must move"
+        );
+
+        let geometry_before = engine.paint_geometry_seq;
+        assert!(matches!(
+            engine.do_set_device_scale(2.0),
+            Event::SelectionChanged { .. }
+        ));
+        assert_eq!(engine.mutation_seq, mutation_before);
+        assert!(engine.paint_geometry_seq > geometry_before);
+    }
+
     #[test]
     fn set_device_scale_rejects_non_finite_scale_and_leaves_geometry_unchanged() {
         let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
@@ -22628,12 +22853,14 @@ mod tests {
                     end: 7,
                     instruction: "PAGE".into(),
                     span: None,
+                    source: None,
                 },
                 engine::Field {
                     start: 11,
                     end: 13,
                     instruction: "NUMPAGES".into(),
                     span: None,
+                    source: None,
                 },
             ],
             ..Default::default()
@@ -22841,12 +23068,14 @@ mod tests {
                         end: 7,
                         instruction: "PAGE".into(),
                         span: None,
+                        source: None,
                     },
                     engine::Field {
                         start: 11,
                         end: 12,
                         instruction: "NUMPAGES".into(),
                         span: None,
+                        source: None,
                     },
                 ],
                 ..Default::default()
@@ -22867,12 +23096,14 @@ mod tests {
                         end: 4,
                         instruction: "AUTHOR".into(),
                         span: None,
+                        source: None,
                     },
                     engine::Field {
                         start: 8,
                         end: 9,
                         instruction: "FILENAME \\p".into(),
                         span: None,
+                        source: None,
                     },
                 ],
                 ..Default::default()
@@ -25157,6 +25388,94 @@ mod snapshot_tests {
         assert_eq!(renderer_downgrade, Some(downgrade));
     }
 
+    /// Issue #239 — `SetZoom` sent before the engine's first `RenderPage`
+    /// used to be silently dropped: `do_set_zoom` found no `layout_cfg`
+    /// to mutate and fell through to `selection_changed()`, which
+    /// errored ("no active selection" — `render_page` is what seeds
+    /// one). It is now queued (`Event::ZoomPending`) and composed into
+    /// the config `render_page` builds, so `RenderPage`'s own first
+    /// paint already reflects it — `SET_ZOOM 1.5` → `RENDER_PAGE` →
+    /// painted page height is 150 % of the zoom-1.0 page height.
+    #[test]
+    fn set_zoom_before_render_page_is_queued_and_applied_on_first_render() {
+        let mut e = engine();
+        assert!(
+            e.layout_cfg.is_none(),
+            "a fresh engine has no layout config"
+        );
+        assert!(
+            e.selection.is_none(),
+            "render_page seeds the selection, not boot"
+        );
+
+        let queued = apply(&mut e, Command::SetZoom { scale: 1.5 });
+        match queued {
+            Event::ZoomPending { zoom, device_scale } => {
+                assert_eq!(zoom, 1.5);
+                assert_eq!(device_scale, None, "no SetDeviceScale queued yet");
+            }
+            other => panic!("expected ZoomPending, got {other:?}"),
+        }
+        assert_eq!(e.pending_zoom, Some(1.5), "stashed, not dropped");
+        assert_eq!(
+            e.user_zoom(),
+            1.5,
+            "user_zoom() reports the pending value even with no layout_cfg yet"
+        );
+
+        /* A real font so layout actually shapes the seed text — page
+        SIZE is independent of shaping, but every other RenderPage-driven
+        test in this file loads one, and there is no reason for this one
+        to be the exception. */
+        let font_bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        assert!(matches!(
+            apply(
+                &mut e,
+                Command::LoadFont {
+                    id: "test-latin".into(),
+                    bytes: font_bytes,
+                },
+            ),
+            Event::FontLoaded { .. }
+        ));
+
+        let rendered = apply(
+            &mut e,
+            Command::RenderPage {
+                text: "hello".into(),
+                font_id: "test-latin".into(),
+                base_direction: "LTR".into(),
+                px_size: 16.0,
+                line_height: 24.0,
+                align: "START".into(),
+                /* `.max(1.0)` composes to `base_scale = 1.0`, so
+                `scale = base_scale × zoom` is exactly the pending zoom —
+                no DPR noise in the assertion below. */
+                device_pixel_ratio: Some(1.0),
+            },
+        );
+        let Event::PageRendered { page_height, .. } = rendered else {
+            panic!("expected PageRendered, got {rendered:?}");
+        };
+        /* A4 height (`layout::A4Page::a4()`) is 841.9 pt; at the queued
+        150 % zoom (composed with the 1.0 base scale from
+        `device_pixel_ratio: Some(1.0)`) the painted page is 150 % of
+        that — not the un-zoomed 841.9 the pre-#239 drop would have left
+        it at. */
+        let expected_height = 841.9_f32 * 1.5;
+        assert!(
+            (page_height - expected_height).abs() < 0.5,
+            "page_height {page_height} should be ~{expected_height} (150% of A4), \
+             not the un-zoomed 841.9 the old drop would have produced"
+        );
+        assert_eq!(e.pending_zoom, None, "consumed by render_page");
+        let cfg = e.layout_cfg.as_ref().expect("render_page seeded a config");
+        assert_eq!(cfg.zoom, 1.5);
+        assert_eq!(cfg.base_scale, 1.0);
+        assert_eq!(cfg.scale, 1.5);
+        assert_eq!(e.user_zoom(), 1.5, "now read straight off the real config");
+    }
+
     #[test]
     fn snapshot_command_echoes_seq_and_reports_the_format_version() {
         let mut a = seeded_engine();
@@ -25580,6 +25899,100 @@ mod snapshot_tests {
         assert_eq!(**pkg, *current_pkg);
     }
 
+    /// Issue #213 — the clipboard `.docx` fragment always went through
+    /// `build_minimal_docx` alone, so copying a styled paragraph out of an
+    /// opened `.docx` produced a fragment with no `styles.xml`: pasting it
+    /// anywhere lost the style. Copy `word_package_parts.docx`'s "first
+    /// item" paragraph (`<w:pStyle w:val="ListParagraph">`) and check the
+    /// fragment carries `styles.xml` with the referenced style, and a
+    /// paste-target re-read resolves it. A document with no retained
+    /// package keeps the pre-#213 minimal fragment unchanged.
+    ///
+    /// The selection spans paragraph 0's end through paragraph 2's start
+    /// so paragraph 1 lands as a fully-contained middle paragraph of
+    /// `DocumentTree::slice` — cloned verbatim, `style_id` intact.
+    /// Selecting *within* a single paragraph goes through
+    /// `Paragraph::split_at` instead, which drops `style_id` on both
+    /// halves unconditionally (issue discovered by this task; see the
+    /// final report's "Discovered gaps").
+    #[test]
+    fn clipboard_docx_fragment_carries_the_source_packages_styles() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let len0 = e
+            .undo
+            .current()
+            .paragraph_text(0)
+            .expect("paragraph 0")
+            .len() as u32;
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(0, len0),
+            caret: bpos_top(2, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload { docx_fragment, .. } = e.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        assert!(!docx_fragment.is_empty());
+
+        let entries = zip_entries(&docx_fragment);
+        let styles = entries
+            .iter()
+            .find(|(n, _)| n == "word/styles.xml")
+            .map(|(_, b)| b.as_slice())
+            .expect("fragment carries styles.xml");
+        assert!(
+            std::str::from_utf8(styles)
+                .unwrap()
+                .contains("ListParagraph"),
+            "styles.xml carries the referenced style"
+        );
+
+        /* A paste-target re-read resolves the style on the paragraph that
+        actually referenced it. */
+        let reread = format_docx::read_docx(&docx_fragment).expect("re-read fragment");
+        assert_eq!(reread.document.paragraph_text(1), Some("first item"));
+        assert_eq!(
+            reread
+                .document
+                .nth_paragraph(1)
+                .unwrap()
+                .style_id
+                .as_deref(),
+            Some("ListParagraph")
+        );
+        assert!(
+            reread.document.styles.contains_key("ListParagraph"),
+            "the style definition itself resolves"
+        );
+
+        /* A document with no retained package never gains a styles.xml —
+        the no-package path stays exactly `build_minimal_docx`'s output. */
+        let mut plain = engine();
+        let evt = apply(&mut plain, insert("hello world"));
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        plain.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload {
+            docx_fragment: plain_fragment,
+            ..
+        } = plain.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        assert!(
+            !zip_entries(&plain_fragment)
+                .iter()
+                .any(|(n, _)| n == "word/styles.xml"),
+            "a document with no retained package never gains a styles.xml"
+        );
+    }
+
     /// Issue #212 — `Command::Snapshot { detach_package }` output.
     fn detached(e: &mut Engine, known: Option<&str>) -> (Vec<u8>, String, Option<Vec<u8>>) {
         match apply(
@@ -25821,6 +26234,9 @@ mod toc_pdf_export_tests;
 
 #[cfg(test)]
 mod a11y_note_tests;
+
+#[cfg(test)]
+mod a11y_object_tests;
 
 #[cfg(test)]
 mod part_media_tests;

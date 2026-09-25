@@ -1505,6 +1505,33 @@ pub struct SourceRun {
     #[serde(with = "serde_bytes")]
     pub lead: Vec<u8>,
     pub t_attrs: Option<Vec<SourceAttr>>,
+    /// Issue #245 — the pretty-print whitespace inside the source `<w:r>`
+    /// (`None` for a compact part). Skipped when `None`, so a pre-#245
+    /// snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pad: Option<Box<RunPad>>,
+    /// Issue #245 — the source wrote this run's text with edge whitespace
+    /// in a bare `<w:t>` (no `xml:space`); the reader kept the whitespace,
+    /// so the writer keeps the source spelling instead of adding
+    /// `xml:space="preserve"` to text it did not change the meaning of.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bare_edge_ws: bool,
+}
+
+/// Issue #245 — whitespace between the children of a pretty-printed
+/// source `<w:r>`: after the start tag (`open`), after the `<w:rPr>`
+/// (`after_rpr`) and before the end tag (`close`). Re-emitted on every
+/// regenerated piece of the run, so an edit inside a pretty-printed part
+/// rewrites only the bytes it changed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RunPad {
+    #[serde(with = "serde_bytes")]
+    pub open: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub after_rpr: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub close: Vec<u8>,
 }
 
 /// Issues #199 / #106 — unmodeled in-paragraph markup at text offset `at`:
@@ -1518,6 +1545,10 @@ pub struct SourceMarker {
     pub at: u32,
     #[serde(with = "serde_bytes")]
     pub xml: Vec<u8>,
+    /// What the bytes are to the writer (issue #244). Skipped when
+    /// [`MarkerRole::Verbatim`], so a pre-#244 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "MarkerRole::is_verbatim")]
+    pub role: MarkerRole,
     /// Issue #243 — `Some` when the marker is a comment anchor: a
     /// `<w:commentRangeStart/>` / `<w:commentRangeEnd/>` or the run holding
     /// a `<w:commentReference/>`. Unlike every other marker it is NOT
@@ -1527,6 +1558,68 @@ pub struct SourceMarker {
     /// where the tree says).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<CommentAnchor>,
+}
+
+impl SourceMarker {
+    /// A [`MarkerRole::Verbatim`] marker.
+    pub fn verbatim(at: u32, xml: Vec<u8>) -> Self {
+        Self {
+            at,
+            xml,
+            role: MarkerRole::Verbatim,
+            comment: None,
+        }
+    }
+}
+
+/// Issue #244 — how the writer treats a [`SourceMarker`].
+///
+/// - [`Self::Verbatim`]: positioned formatting-neutral markup (`proofErr`,
+///   bookmarks, pretty-print whitespace). Written only while the
+///   paragraph's offsets are in sync — a stale marker is dropped rather
+///   than misplaced.
+/// - [`Self::Content`]: unmodeled paragraph *content* kept whole, e.g. a
+///   zero-result legacy form field (`FORMCHECKBOX` / `FORMDROPDOWN` — the
+///   `fldChar begin … end` byte range, `<w:ffData>` included). PRD Tier 3:
+///   never dropped — when the offsets go stale it is still written, at its
+///   offset clamped to the text (a best-effort position beats losing the
+///   control).
+/// - [`Self::Open`] / [`Self::Close`] (issue #245): the two ends of an
+///   unmodeled run-level WRAPPER around a text range — a `<w:sdt>` content
+///   control. `xml` of the opener is `<w:sdt>…<w:sdtPr>…</w:sdtPr>
+///   <w:sdtContent>`, of the closer `</w:sdtContent></w:sdt>`; `id` pairs
+///   them. They travel with the text like any marker (an insertion at the
+///   closer's offset lands INSIDE the control, as typing at the end of a
+///   run continues it). The writer pairs them with a stack and keeps the
+///   part well-formed whatever an edit did: an opener that lost its
+///   closer (a split) closes with `close_xml` at the paragraph end, a
+///   closer without an opener is skipped, and a range that would cross a
+///   regenerated wrapper (hyperlink, revision, field) is widened to
+///   enclose it. Tier 3 like [`Self::Content`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub enum MarkerRole {
+    #[default]
+    Verbatim,
+    Content,
+    Open {
+        id: u32,
+        #[serde(with = "serde_bytes")]
+        close_xml: Vec<u8>,
+    },
+    Close {
+        id: u32,
+    },
+}
+
+impl MarkerRole {
+    pub fn is_verbatim(&self) -> bool {
+        matches!(self, Self::Verbatim)
+    }
+
+    /// `true` for markup that must survive stale offsets.
+    pub fn must_survive(&self) -> bool {
+        !self.is_verbatim()
+    }
 }
 
 /// Issue #243 — what a comment-anchor [`SourceMarker`] is.
@@ -2317,6 +2410,37 @@ impl InlineObject {
             .and_then(|tag| xml_attr(tag, "alt"));
         Some((None, alt))
     }
+
+    /// Issue #215 — the accessible `(name, description)` of a picture,
+    /// mirroring [`Self::text_box_label`]: its `<wp:docPr name descr>`
+    /// (read from the anchor's verbatim `doc_pr_xml` for a float, else
+    /// from the object's OWN verbatim `source_xml` — an inline picture
+    /// keeps it there), or the VML `<v:shape alt>` as the description for
+    /// a bare VML picture. Blank values are `None`; `None` for anything
+    /// but an image.
+    pub fn image_label(&self) -> Option<(Option<String>, Option<String>)> {
+        if !matches!(self.kind, InlineKind::Image { .. }) {
+            return None;
+        }
+        let source = || {
+            self.source_xml
+                .as_deref()
+                .and_then(|b| core::str::from_utf8(b).ok())
+        };
+        let from_anchor = self
+            .anchor
+            .as_deref()
+            .and_then(|a| a.doc_pr_xml.as_deref())
+            .and_then(|x| start_tag(x, "<wp:docPr"));
+        let from_source = || source().and_then(|x| start_tag(x, "<wp:docPr"));
+        if let Some(tag) = from_anchor.or_else(from_source) {
+            return Some((xml_attr(tag, "name"), xml_attr(tag, "descr")));
+        }
+        let alt = source()
+            .and_then(|x| start_tag(x, "<v:shape"))
+            .and_then(|tag| xml_attr(tag, "alt"));
+        Some((None, alt))
+    }
 }
 
 /// Issue #165 — the first start tag in `xml` opening with `open` (e.g.
@@ -2652,6 +2776,43 @@ pub struct Field {
     /// `None` = the ordinary paragraph-local field (#43 / #77).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<FieldSpan>,
+    /// Issue #246 — the field's source markup, for a field read from
+    /// `.docx`; `None` for an engine-authored one. Skipped when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Box<FieldSource>>,
+}
+
+/// Issue #246 — how a field read from `.docx` was spelled, so a
+/// regenerated paragraph writes it back in the SAME form: a
+/// `<w:fldSimple>` stays simple (instead of growing into a
+/// `fldChar begin / instrText / separate … end` complex field), and a
+/// complex field keeps its source prologue — the begin run with its
+/// `<w:ffData>` (a `FORMTEXT` with a result), rsids, the instruction runs
+/// with their spacing — and its end run.
+///
+/// Verified: the writer uses the bytes only while the field's live
+/// `instruction` still equals the one they produced; an edited
+/// instruction regenerates the standard complex form. The result runs in
+/// between always regenerate from the text.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct FieldSource {
+    /// The (trimmed) instruction the bytes produced.
+    pub instruction: String,
+    /// `<w:fldSimple …>` start tag, or the complex field's runs from the
+    /// begin `fldChar` through the `separate` one.
+    #[serde(with = "serde_bytes")]
+    pub open: Vec<u8>,
+    /// `</w:fldSimple>`, or the complex field's end-`fldChar` run.
+    #[serde(with = "serde_bytes")]
+    pub close: Vec<u8>,
+}
+
+impl FieldSource {
+    /// The source bytes still spell `instruction`.
+    pub fn is_current(&self, instruction: &str) -> bool {
+        self.instruction == instruction
+    }
 }
 
 /// Issue #81 — the multi-paragraph field representation. OOXML lets a
@@ -6415,6 +6576,7 @@ impl DocumentTree {
                 end: start + cached.len() as u32,
                 instruction: instruction.to_string(),
                 span: None,
+                source: None,
             });
             para.fields.sort_by_key(|f| f.start);
         });
@@ -14386,6 +14548,7 @@ mod tests {
                 end: 8,
                 instruction: "PAGE".into(),
                 span: None,
+                source: None,
             }],
             ..Default::default()
         };
@@ -14412,6 +14575,7 @@ mod tests {
                 end: 4,
                 instruction: "PAGE".into(),
                 span: None,
+                source: None,
             }],
             ..Default::default()
         };
@@ -14446,6 +14610,7 @@ mod tests {
                     end: 6,
                     instruction: "PAGE".into(),
                     span: None,
+                    source: None,
                 });
             });
             d.blocks = blocks;
@@ -14485,6 +14650,7 @@ mod tests {
                 end: 8,
                 instruction: "NUMPAGES".into(),
                 span: None,
+                source: None,
             }],
             spans: vec![
                 StyleRun {
@@ -14527,6 +14693,7 @@ mod tests {
             end: 1,
             instruction: "DATE \\@ \"dd/MM/yyyy\" \\* MERGEFORMAT".into(),
             span: None,
+            source: None,
         };
         assert_eq!(f.date_picture().as_deref(), Some("dd/MM/yyyy"));
         let bare = Field {
@@ -14534,6 +14701,7 @@ mod tests {
             end: 1,
             instruction: "DATE".into(),
             span: None,
+            source: None,
         };
         assert_eq!(bare.date_picture(), None);
     }
@@ -14700,6 +14868,74 @@ mod text_box_label_tests {
             source_xml: None,
         };
         assert_eq!(pic.text_box_label(), None);
+    }
+}
+
+#[cfg(test)]
+mod image_label_tests {
+    use super::*;
+
+    fn image(anchor_doc_pr: Option<&str>, source: Option<&str>) -> InlineObject {
+        InlineObject {
+            at: 0,
+            kind: InlineKind::Image {
+                rel_id: "rId1".to_string(),
+                width_emu: 914_400,
+                height_emu: 914_400,
+                media_key: None,
+            },
+            anchor: anchor_doc_pr.map(|x| {
+                Box::new(FloatAnchor {
+                    doc_pr_xml: Some(x.to_string()),
+                    ..FloatAnchor::default()
+                })
+            }),
+            source_xml: source.map(|s| s.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn anchor_doc_pr_names_and_describes_the_picture() {
+        let io = image(
+            Some(r#"<wp:docPr id="4" name="Diagram" descr="A flow diagram"/>"#),
+            None,
+        );
+        assert_eq!(
+            io.image_label(),
+            Some((
+                Some("Diagram".to_string()),
+                Some("A flow diagram".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn inline_picture_reads_the_doc_pr_from_its_own_source() {
+        let src = r#"<w:drawing><wp:inline><wp:docPr id="2" name="Logo" descr="Company logo"/></wp:inline></w:drawing>"#;
+        let io = image(None, Some(src));
+        assert_eq!(
+            io.image_label(),
+            Some((Some("Logo".to_string()), Some("Company logo".to_string())))
+        );
+    }
+
+    #[test]
+    fn vml_alt_is_the_description_and_non_images_have_no_label() {
+        let src = r#"<w:pict><v:shape id="s" alt="Scanned page"><v:imagedata/></v:shape></w:pict>"#;
+        assert_eq!(
+            image(None, Some(src)).image_label(),
+            Some((None, Some("Scanned page".to_string())))
+        );
+        assert_eq!(image(None, None).image_label(), Some((None, None)));
+        let tb = InlineObject {
+            at: 0,
+            kind: InlineKind::NoteSelfRef {
+                kind: NoteKind::Footnote,
+            },
+            anchor: None,
+            source_xml: None,
+        };
+        assert_eq!(tb.image_label(), None);
     }
 }
 
@@ -15358,7 +15594,7 @@ mod source_markup_tests {
         SourceMarker {
             at,
             xml: b"<w:proofErr/>".to_vec(),
-            ..Default::default()
+            ..SourceMarker::default()
         }
     }
 

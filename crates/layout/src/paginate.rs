@@ -2152,6 +2152,7 @@ impl Paginator {
                 end: f.byte_range.end,
                 instruction: f.instruction.clone(),
                 span: None,
+                source: None,
             };
             if let Some(v) = synthetic.evaluate_in(&page_env) {
                 f.evaluated_text = Some(v);
@@ -2419,6 +2420,7 @@ impl Paginator {
                         end: f.byte_range.end,
                         instruction: f.instruction.clone(),
                         span: None,
+                        source: None,
                     };
                     if synthetic.typed() == engine::TypedField::NumPages {
                         f.evaluated_text = synthetic.evaluate_in(&total_env);
