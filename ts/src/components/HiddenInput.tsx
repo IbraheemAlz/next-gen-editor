@@ -10,7 +10,6 @@ import { emptyPatch } from '@nge/core';
 import type { EngineClient } from '../engine/engine-client';
 import type {
     Command,
-    LogicalPos,
     MoveDirection,
     TextAttrs,
     TextAttrsPatch,
@@ -21,10 +20,11 @@ import {
     editingStoryForPointer,
     fieldCodeViewForKeys,
 } from '../state/engine-store';
-import { ClipboardWriteError, copy, cut, paste } from '../input/clipboard';
+import { ClipboardWriteError, copy, cut, paste, writeSync } from '../input/clipboard';
+import { createClipboardPrefetch } from '../input/clipboard-cache';
 
 /** Map a non-composition `InputEvent` to an engine command. */
-function mapInputEventToCommand(e: InputEvent, caret: LogicalPos): Command | null {
+function mapInputEventToCommand(e: InputEvent): Command | null {
     switch (e.inputType) {
         case 'insertText':
             /* Issue #53 — `at: undefined` = "at the engine's live
@@ -39,7 +39,9 @@ function mapInputEventToCommand(e: InputEvent, caret: LogicalPos): Command | nul
            model has only paragraphs, so a hard Enter splits the block. */
         case 'insertParagraph':
         case 'insertLineBreak':
-            return { type: 'SPLIT_PARAGRAPH', at: caret };
+            /* Issue #64 — split at the engine's live caret, same
+               reasoning as INSERT_TEXT above. */
+            return { type: 'SPLIT_PARAGRAPH', at: undefined };
         case 'deleteContentBackward':
             return { type: 'DELETE_AT_CARET', forward: false, by_word: false };
         case 'deleteContentForward':
@@ -105,8 +107,12 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     });
 
     const onCompositionStart = (): void => {
-        const caret = props.store.caretLogical();
-        if (caret) void props.client.dispatch({ type: 'BEGIN_COMPOSITION', at: caret });
+        /* Issue #64 — anchor at the engine's live caret (`at:
+           undefined`); the UI mirror may still hold the pre-click
+           position. The mirror is only a readiness gate here. */
+        if (props.store.caretLogical()) {
+            void props.client.dispatch({ type: 'BEGIN_COMPOSITION', at: undefined });
+        }
     };
     const onCompositionUpdate = (e: CompositionEvent): void => {
         void props.client.dispatch({
@@ -123,9 +129,11 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     const onBeforeInput = (e: InputEvent): void => {
         if (e.isComposing) return; /* the composition handlers own this */
         e.preventDefault();
-        const caret = props.store.caretLogical();
-        if (caret) {
-            const cmd = mapInputEventToCommand(e, caret);
+        /* The mirror caret is only a readiness gate (no selection yet
+           ⇒ nothing to edit); every mapped command is caret-relative and
+           resolves against the engine's LIVE selection (#53/#64). */
+        if (props.store.caretLogical()) {
+            const cmd = mapInputEventToCommand(e);
             if (cmd) void props.client.dispatch(cmd);
         }
         if (ref) ref.value = '';
@@ -356,8 +364,23 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
        browser blocks every write tier; the rejection MUST be observed
        and surfaced, never `void`-discarded. On a failed cut nothing was
        deleted (write-before-delete invariant in `input/clipboard.ts`). */
+    /* Issue #57 — warm payload for the live selection, so copy/cut can
+       write synchronously inside the trusted event. `?clipboardPrefetch=0`
+       disables the prefetch (every copy then takes the async path). */
+    const prefetch = createClipboardPrefetch(
+        props.client,
+        props.store,
+        new URLSearchParams(window.location.search).get('clipboardPrefetch') !== '0',
+    );
+    window.__clipboardPrefetch = prefetch;
+
     const onCopy = (e: ClipboardEvent): void => {
         e.preventDefault();
+        /* Issue #57 — cache hit: setData synchronously, no await, no
+           focus dependency. A miss falls through to the #48 async path
+           unchanged. */
+        const hit = prefetch.take();
+        if (hit && (hit.plain === '' || writeSync(e, hit))) return;
         copy(props.client).catch((err: unknown) => {
             /* Only a ClipboardWriteError means the BROWSER blocked the
                write — anything else is an engine/dispatch failure and
@@ -372,6 +395,21 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     };
     const onCut = (e: ClipboardEvent): void => {
         e.preventDefault();
+        /* Issue #57 — cache hit: the synchronous write already succeeded
+           when `writeSync` returns, so the delete may follow
+           (write-before-delete holds). The cache is only trusted with no
+           write in flight, so DELETE_AT_CARET removes exactly the range
+           that was just written. */
+        const hit = prefetch.take();
+        if (hit && hit.plain === '') return;
+        if (hit && writeSync(e, hit)) {
+            props.client
+                .dispatch({ type: 'DELETE_AT_CARET', forward: false, by_word: false })
+                .catch(() => {
+                    props.store.setUiError('Cut failed — an editor error occurred.');
+                });
+            return;
+        }
         cut(props.client).catch((err: unknown) => {
             /* ClipboardWriteError ⇒ the write was blocked and the delete
                was skipped (write-before-delete), so "nothing was deleted"

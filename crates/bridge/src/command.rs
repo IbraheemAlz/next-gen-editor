@@ -171,8 +171,14 @@ pub enum Command {
         range: Option<LogicalRange>,
         attrs: TextAttrsPatch,
     },
+    /// Break the paragraph at the caret (replacing any non-empty
+    /// selection). Issue #64 — `at == None` splits at the engine's LIVE
+    /// caret (interactive Enter passes `None`, so a keystroke racing a
+    /// click can never carry the UI mirror's stale position). An explicit
+    /// `at` is consulted only when no selection exists (API / harness
+    /// callers); `None` with no selection at all replies `Event::Error`.
     SplitParagraph {
-        at: LogicalPos,
+        at: Option<LogicalPos>,
     },
     MergeParagraph {
         left: ParagraphId,
@@ -254,8 +260,11 @@ pub enum Command {
     },
 
     /* IME */
+    /// Start an IME composition. Issue #64 — `at == None` anchors the
+    /// composition at the engine's LIVE caret (what `HiddenInput` sends);
+    /// an explicit `at` is honoured verbatim for API callers.
     BeginComposition {
-        at: LogicalPos,
+        at: Option<LogicalPos>,
     },
     UpdateComposition {
         text: String,
@@ -337,6 +346,19 @@ pub enum Command {
         at: Point,
     },
 
+    /// Issue #64 — single-hop selection EXTENSION: hit-test the
+    /// page-local pixel (same coordinate contract as
+    /// [`Command::PlaceCaretAtPoint`]) and move the caret there keeping
+    /// the anchor, in ONE serialized dispatch; replies
+    /// `Event::SelectionChanged`. Replaces the shell's two-hop
+    /// `HitTestInPage` → `ExtendSelection` for drag and shift-click, so a
+    /// keystroke posted right after a shift-click executes against the
+    /// extended selection.
+    ExtendSelectionToPoint {
+        page: u32,
+        at: Point,
+    },
+
     /// Issue #44 — query every inline image's on-canvas rectangle +
     /// resize address. A pure read; replies with `Event::ImageRects`.
     /// The shell issues it after paints to position the resize-handle
@@ -384,7 +406,15 @@ pub enum Command {
 
     /// Snapshot the current selection for the clipboard — the engine replies
     /// with `Event::ClipboardPayload` (PHASE_4_HEADLESS_UI.md §12).
-    GetSelectionAsClipboard,
+    /// Issue #57 — `include_docx` (absent ⇒ `true`) gates the `.docx`
+    /// fragment ZIP build: the shell's debounced clipboard prefetch passes
+    /// `false` (it only needs `plain` + `html` for the synchronous
+    /// `setData` path) and receives an empty `docx_fragment`.
+    GetSelectionAsClipboard {
+        #[serde(default)]
+        #[tsify(optional)]
+        include_docx: Option<bool>,
+    },
 
     /// Paste plain text at the caret, replacing any non-empty selection.
     PastePlain {
@@ -1240,4 +1270,34 @@ pub enum MoveDirection {
     DocHome,
     /// `Ctrl/Cmd + End` — caret to the last paragraph at `text.len`.
     DocEnd,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #57 — `GetSelectionAsClipboard` grew a struct body; the
+    /// pre-#57 wire shape (tag only) must still decode, as `None`
+    /// (⇒ `.docx` fragment included).
+    #[test]
+    fn get_selection_as_clipboard_accepts_the_legacy_tag_only_shape() {
+        let legacy: Command =
+            serde_json::from_value(serde_json::json!({ "type": "GET_SELECTION_AS_CLIPBOARD" }))
+                .expect("legacy shape decodes");
+        assert!(matches!(
+            legacy,
+            Command::GetSelectionAsClipboard { include_docx: None }
+        ));
+        let prefetch: Command = serde_json::from_value(serde_json::json!({
+            "type": "GET_SELECTION_AS_CLIPBOARD",
+            "include_docx": false,
+        }))
+        .expect("prefetch shape decodes");
+        assert!(matches!(
+            prefetch,
+            Command::GetSelectionAsClipboard {
+                include_docx: Some(false)
+            }
+        ));
+    }
 }

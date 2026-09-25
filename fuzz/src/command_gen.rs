@@ -25,6 +25,19 @@
 //! see its doc comment — plus a per-variant coverage tracker
 //! (`reset_coverage` / `coverage_snapshot`) the smoke driver reports after
 //! the `rpc_command` target runs.
+//!
+//! **Issue #229 — regression seeds robust to generator layout changes.**
+//! The `repro_186_*` / `repro_187_*` corpus seeds used to be raw bytes
+//! tuned to survive whichever arms of `gen_targeted_command` happened to
+//! fire first in the committed byte sequence; #206 grew an unrelated arm's
+//! (`MoveImage` / `SetImageWrap`) byte footprint and silently broke that
+//! tuning. [`Scenario`] (near `gen_targeted_command`, below) replaces it
+//! with a named, fixed-prefix fast path plus an explicit builder
+//! (`Scenario::seed_bytes`); regenerate the committed seeds with
+//! `cargo run --manifest-path fuzz/Cargo.toml --example regen-seeds` after
+//! touching `gen_seed_text`, `gen_command_sequence`'s bucket dispatch, or
+//! the scenario fast path itself — `committed_seed_bytes_match_scenario_builder`
+//! (in `tests`, below) fails loudly if the committed bytes go stale.
 
 use arbitrary::{Arbitrary, Unstructured};
 use bridge::{
@@ -115,9 +128,148 @@ fn text(u: &mut Unstructured) -> String {
     s
 }
 
+/// Issue #229 — reserved marker consumed by `gen_targeted_command`'s
+/// scenario fast path (see [`Scenario`]). Any fixed byte works; the only
+/// requirement is that `Scenario::peek` can recognize it before deciding
+/// to consume it, so a normal (non-scenario) byte stream is never
+/// misinterpreted except on the astronomically rare draw that happens to
+/// match both this byte and a valid scenario index.
+const SCENARIO_SENTINEL: u8 = 0xFE;
+
+/// Issue #229 — the #186/#187 regression corpus seeds
+/// (`repro_186_nan_zoom`, `repro_186_nan_device_scale`,
+/// `repro_187_bad_render_date` under `fuzz/corpus/rpc_command/`) used to be
+/// raw bytes hand-tuned to survive `gen_command_sequence`'s generic bucket
+/// dispatch plus however many of `gen_targeted_command`'s OTHER arms fired
+/// first. #206 grew `MoveImage`/`SetImageWrap`'s byte footprint (the new
+/// `story: Vec<TextBoxHop>` field) — a change to a completely unrelated
+/// arm — which shifted every `Unstructured` read downstream of any command
+/// those arms happened to generate earlier in a committed sequence, so the
+/// seeds silently stopped reaching their scenario. Nothing caught it: the
+/// seeds are raw bytes, not derived from anything that would have flagged
+/// the drift.
+///
+/// `Scenario` replaces "hope the raw bytes still parse the same way" with
+/// an explicit, named encoding that does not depend on the generic arms at
+/// all: `gen_targeted_command` peeks its next two bytes for
+/// `[SCENARIO_SENTINEL, scenario_index]` **before** running any generic
+/// arm, and — only on a match — hands off to [`Scenario::build`], which
+/// takes no `Unstructured` input whatsoever, so no other arm's
+/// byte-consumption change can ever perturb it again.
+///
+/// Regenerate the committed seeds after touching this mechanism (or the
+/// upstream decoding contract it rides on — `gen_seed_text`'s pool
+/// selection, `gen_command_sequence`'s bucket dispatch) with:
+///
+/// ```text
+/// cargo run --manifest-path fuzz/Cargo.toml --example regen-seeds
+/// ```
+///
+/// `committed_seed_bytes_match_scenario_builder` (below, in `tests`) pins
+/// the committed files to `Scenario::seed_bytes()`'s output, so a change
+/// that moves the upstream contract fails LOUDLY — a byte-diff assertion —
+/// instead of silently, which is exactly what happened for #229. The fix
+/// is the one command above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scenario {
+    /// Issue #186 — `SetZoom { scale: NaN }`.
+    NanZoom,
+    /// Issue #186 — `SetDeviceScale { scale: NaN }`.
+    NanDeviceScale,
+    /// Issue #187 — `SetRenderDate` with the exact out-of-range `month`
+    /// the original fuzz run sent (`960_639_140`).
+    BadRenderDate,
+}
+
+impl Scenario {
+    /// Every scenario, in the fixed order [`Scenario::index`] encodes.
+    pub const ALL: [Scenario; 3] = [
+        Scenario::NanZoom,
+        Scenario::NanDeviceScale,
+        Scenario::BadRenderDate,
+    ];
+
+    /// The committed corpus file this scenario's seed lives at, relative
+    /// to `fuzz/corpus/rpc_command/`.
+    pub fn corpus_file(self) -> &'static str {
+        match self {
+            Scenario::NanZoom => "repro_186_nan_zoom",
+            Scenario::NanDeviceScale => "repro_186_nan_device_scale",
+            Scenario::BadRenderDate => "repro_187_bad_render_date",
+        }
+    }
+
+    /// This scenario's position in [`Scenario::ALL`] — the byte
+    /// `seed_bytes` / `peek` use to select it.
+    fn index(self) -> u8 {
+        Self::ALL
+            .iter()
+            .position(|s| *s == self)
+            .expect("every Scenario appears in ALL") as u8
+    }
+
+    /// The one `Command` this scenario builds. Deliberately takes no
+    /// `Unstructured` input — nothing left for another arm's
+    /// byte-consumption change to perturb.
+    fn build(self) -> Command {
+        match self {
+            Scenario::NanZoom => Command::SetZoom { scale: f32::NAN },
+            Scenario::NanDeviceScale => Command::SetDeviceScale { scale: f32::NAN },
+            // The exact #187 repro payload — `validate_render_date` rejects
+            // this `month` regardless of the other fields.
+            Scenario::BadRenderDate => Command::SetRenderDate {
+                year: 2026,
+                month: 960_639_140,
+                day: 1,
+                hour: None,
+                minute: None,
+            },
+        }
+    }
+
+    /// Peek (never consume on a miss) whether `u`'s next two bytes select a
+    /// scenario. `gen_targeted_command` checks this before its generic
+    /// per-variant dispatch runs.
+    fn peek(u: &Unstructured) -> Option<Scenario> {
+        let bytes = u.peek_bytes(2)?;
+        if bytes[0] != SCENARIO_SENTINEL {
+            return None;
+        }
+        Self::ALL.get(bytes[1] as usize).copied()
+    }
+
+    /// The full corpus seed for this scenario, built through the real
+    /// `gen_seed_text` / `gen_command_sequence` decoding contract instead
+    /// of hand-picked raw bytes:
+    /// - byte 0 selects `gen_seed_text`'s `POOL[0]` (an empty string — its
+    ///   content is irrelevant to this scenario, only the one byte it
+    ///   consumes matters);
+    /// - byte 1 selects `gen_command_sequence`'s bucket 0, which routes to
+    ///   `gen_targeted_command`;
+    /// - bytes 2–3 are `[SCENARIO_SENTINEL, self.index()]`, consumed by the
+    ///   scenario fast path above before any generic arm runs.
+    ///
+    /// Exactly 4 bytes: `gen_command_sequence`'s `u.is_empty()` check then
+    /// stops the sequence right after this one command, so the resulting
+    /// `Vec<Command>` has exactly one element.
+    pub fn seed_bytes(self) -> Vec<u8> {
+        vec![0x00, 0x00, SCENARIO_SENTINEL, self.index()]
+    }
+}
+
 /// One curated, small-bounded command spanning the issue's named
 /// categories: insert / delete / format / table / section / story.
+///
+/// Issue #229 — checks [`Scenario::peek`] first: a fixed-prefix fast path
+/// for the #186/#187 regression scenarios that bypasses every arm below
+/// (see `Scenario`'s doc comment for why).
 fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
+    if let Some(scenario) = Scenario::peek(u) {
+        // Consume exactly the two bytes `peek` looked at; `build` itself
+        // reads no further bytes, by design.
+        let _ = u.bytes(2);
+        return Some(scenario.build());
+    }
     let variant = small(u, 26);
     Some(match variant {
         // ---- insert / delete -------------------------------------------------
@@ -138,7 +290,11 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
             range: range(u),
             text: text(u),
         },
-        4 => Command::SplitParagraph { at: pos(u) },
+        // Issue #64 — `at` is optional now; the curated arm keeps its
+        // explicit position (and its exact byte consumption, so committed
+        // corpus seeds still decode to the same scenarios). `None` — split
+        // at the live caret — is reached via the blind `arbitrary()` half.
+        4 => Command::SplitParagraph { at: Some(pos(u)) },
         // ---- format ------------------------------------------------------------
         5 => Command::ApplyFormatting {
             range: if u.ratio(1, 2).unwrap_or(true) {
@@ -653,13 +809,14 @@ classify_variants! {
     HitTest { .. } => false,
     HitTestInPage { .. } => false,
     PlaceCaretAtPoint { .. } => false,
+    ExtendSelectionToPoint { .. } => false,
     GetImageRects => false,
     SelectWordAt { .. } => false,
     SelectParagraphAt { .. } => false,
     SelectCellAt { .. } => false,
     DeleteAtCaret { .. } => true, // gen_targeted_command
     RequestAccessibilityDelta => false,
-    GetSelectionAsClipboard => false,
+    GetSelectionAsClipboard { .. } => false,
     PastePlain { .. } => false,
     // ---- Backlog sprint 1 --------------------------------------------------
     SetParagraphAlign { .. } => true, // gen_targeted_command
@@ -752,6 +909,13 @@ mod tests {
     /// generator that stops hitting one of these branches is a real
     /// regression in fuzz coverage of the #186/#187 fix, not just an
     /// unlucky seed.
+    ///
+    /// Issue #229 — these seeds are now [`Scenario`]'s `seed_bytes()`
+    /// output (see its doc comment), so this test exercises the SAME real
+    /// decoding path (`gen_seed_text` then `gen_command_sequence`) the
+    /// fuzz target itself uses, rather than a shortcut. Byte-for-byte
+    /// staleness against the builder is a separate, narrower test below
+    /// (`committed_seed_bytes_match_scenario_builder`).
     #[test]
     fn issue_186_187_corpus_seeds_reproduce_their_scenarios() {
         let read = |name: &str| {
@@ -793,6 +957,35 @@ mod tests {
             )),
             "repro_187_bad_render_date must still generate an invalid SetRenderDate"
         );
+    }
+
+    /// Issue #229 — the committed #186/#187 regression seeds are DERIVED
+    /// artifacts of `Scenario::seed_bytes()`, not hand-maintained raw
+    /// bytes. A future change to `gen_seed_text`'s pool selection,
+    /// `gen_command_sequence`'s bucket dispatch, or the scenario fast path
+    /// itself would change what bytes each scenario needs; this test
+    /// fails LOUDLY (a byte diff) the moment that happens, instead of the
+    /// seed silently no longer reproducing its scenario — #229's own root
+    /// cause. Fix with the one command named in `Scenario`'s doc comment:
+    /// `cargo run --manifest-path fuzz/Cargo.toml --example regen-seeds`.
+    #[test]
+    fn committed_seed_bytes_match_scenario_builder() {
+        for scenario in Scenario::ALL {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("corpus/rpc_command")
+                .join(scenario.corpus_file());
+            let committed = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("missing seed corpus file {}: {e}", path.display()));
+            let built = scenario.seed_bytes();
+            assert_eq!(
+                committed,
+                built,
+                "{} is stale — regenerate with `cargo run --manifest-path \
+                 fuzz/Cargo.toml --example regen-seeds` (see Scenario's doc comment \
+                 in src/command_gen.rs)",
+                scenario.corpus_file()
+            );
+        }
     }
 
     /// Issue #177 acceptance: "exhaustiveness test green". The real
@@ -899,7 +1092,7 @@ mod tests {
                 "duplicate variant name in ALL_VARIANT_NAMES: {name}"
             );
         }
-        const EXPECTED_VARIANT_COUNT: usize = 103;
+        const EXPECTED_VARIANT_COUNT: usize = 104;
         assert_eq!(
             ALL_VARIANT_NAMES.len(),
             EXPECTED_VARIANT_COUNT,

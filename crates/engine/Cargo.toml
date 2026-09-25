@@ -19,3 +19,12 @@ unicode-segmentation = { workspace = true }
 # uses for `LineSegmenter`, so the compiled-in data tables are shared
 # (no incremental wasm bloat beyond the workspace's existing icu surface).
 icu_segmenter = { workspace = true }
+
+[features]
+# Issue #250 — test-only debug assertion: every committed mutation
+# (`UndoStack::push`) and every remapped edit must find each paragraph's
+# `source_markup` in step with its text (or explicitly stale). Always on in
+# this crate's own unit tests (`cfg(test)`); downstream crates enable it
+# from `[dev-dependencies]` so their tests run the check too. Never enabled
+# in a production / wasm build.
+markup-assert = []

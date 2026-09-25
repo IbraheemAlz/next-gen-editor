@@ -34,6 +34,20 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --release
 
+      # D5.5 (issue #90) / issue #229 — `fuzz/` is its own workspace (its
+      # own `[workspace]` in `fuzz/Cargo.toml`) so it's excluded from the
+      # `cargo test --workspace` above; without an explicit step here
+      # nothing in CI ever compiled or ran it, which is exactly how #229's
+      # regression (a stale corpus seed) went undetected. `cargo check`
+      # first — the D5.5 compile-only gate — then the fuzz crate's own
+      # `cargo test`, in the same job so a fuzz-crate break surfaces
+      # alongside the rest of native CI, not in a separate silent lane.
+      - name: cargo check fuzz crate
+        run: cargo check --manifest-path fuzz/Cargo.toml
+
+      - name: cargo test fuzz crate
+        run: cargo test --manifest-path fuzz/Cargo.toml
+
   wasm:
     name: WASM build + size budget
     runs-on: ubuntu-24.04

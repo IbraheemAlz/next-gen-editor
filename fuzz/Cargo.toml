@@ -23,6 +23,11 @@
 # seeds through each `run_*` function and asserts no panic — see issue #90
 # binding rule 6. Run it with:
 #   cargo run --manifest-path fuzz/Cargo.toml --example smoke
+#
+# `examples/regen-seeds.rs` (issue #229) rewrites the `rpc_command`
+# corpus's #186/#187 regression seeds from `command_gen::Scenario`'s
+# explicit builder — run after touching that decoding contract:
+#   cargo run --manifest-path fuzz/Cargo.toml --example regen-seeds
 [package]
 name = "engine-fuzz"
 version = "0.0.0"
@@ -80,6 +85,10 @@ bench = false
 [[example]]
 name = "smoke"
 path = "examples/smoke.rs"
+
+[[example]]
+name = "regen-seeds"
+path = "examples/regen-seeds.rs"
 
 [profile.release]
 # Keep symbols so libFuzzer can symbolize crashes.

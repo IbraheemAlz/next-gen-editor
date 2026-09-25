@@ -2,9 +2,11 @@
  *
  * The engine owns hit-testing; the UI only forwards device-pixel coordinates.
  * pointerdown places the caret, drag extends the selection, double-click
- * selects a word. Each gesture round-trips through HIT_TEST_IN_PAGE then a
- * selection command; the engine answers with SELECTION_CHANGED, which
- * engine-store fans out to the overlays. */
+ * selects a word. Caret placement and extension are single-hop commands
+ * (PLACE_CARET_AT_POINT / EXTEND_SELECTION_TO_POINT — issues #53/#64) that
+ * hit-test and move the selection inside ONE serialized dispatch; the engine
+ * answers with SELECTION_CHANGED, which engine-store fans out to the
+ * overlays. */
 import type { EngineClient } from '../engine/engine-client';
 import type { Point } from '../engine/types';
 import {
@@ -43,12 +45,11 @@ export function attachPointer(
     pageIdx: number = 0,
 ): () => void {
     let dragging = false;
-    /* Bumped on every new gesture. Still needed for the DRAG path
-       (extendTo), which stays two-hop: its HIT_TEST is async, so the
-       EXTEND_SELECTION it feeds can land out of order; a hit-test whose
-       gesture is stale by the time it resolves is dropped. Plain-click
-       placement no longer needs this — PLACE_CARET_AT_POINT is a single
-       synchronously-posted command ordered by the worker queue itself. */
+    /* Bumped on every new gesture. Issue #64 made the drag path
+       (extendTo) single-hop like plain-click placement, so the worker
+       queue orders every pointer command itself and no in-flight
+       hit-test can resolve out of order any more; the counter survives
+       only as the gesture identity the zone / image gates bump. */
     let gesture = 0;
 
     /* Client coords → this page's LOCAL engine device pixels (origin at
@@ -101,10 +102,18 @@ export function attachPointer(
             });
     };
 
-    const extendTo = async (at: Point, g: number): Promise<void> => {
-        const hit = await client.dispatch({ type: 'HIT_TEST_IN_PAGE', page: pageIdx, at });
-        if (g !== gesture || hit.type !== 'HIT_RESULT') return;
-        await client.dispatch({ type: 'EXTEND_SELECTION', to: hit.pos, modifier: 'None' });
+    /* Issue #64 — drag / shift-click extension, posted SYNCHRONOUSLY
+       like placeCaret: the engine hit-tests AND extends in one
+       serialized command, so a keystroke fired right after a
+       shift-click enters the queue behind it and replaces the EXTENDED
+       selection. The old HIT_TEST_IN_PAGE → (await) → EXTEND_SELECTION
+       let that keystroke execute against the pre-extension selection. */
+    const extendTo = (at: Point): void => {
+        void client
+            .dispatch({ type: 'EXTEND_SELECTION_TO_POINT', page: pageIdx, at })
+            .catch((e: unknown) => {
+                console.error('extendSelection failed', e);
+            });
     };
 
     const onPointerDown = (e: PointerEvent): void => {
@@ -223,7 +232,7 @@ export function attachPointer(
            put, caret jumps to the hit position) instead of resetting
            it. UX_BEHAVIOR_SPEC §IV.7. */
         if (e.shiftKey) {
-            void extendTo(toLocal(e), gesture);
+            extendTo(toLocal(e));
             return;
         }
         placeCaret(toLocal(e));
@@ -231,7 +240,7 @@ export function attachPointer(
 
     const onPointerMove = (e: PointerEvent): void => {
         if (!dragging) return;
-        void extendTo(toLocal(e), gesture);
+        extendTo(toLocal(e));
     };
 
     const onPointerUp = (e: PointerEvent): void => {

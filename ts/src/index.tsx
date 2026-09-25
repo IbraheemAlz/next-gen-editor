@@ -9,6 +9,7 @@ import { App } from './App';
 import type { FontRegistry } from '@nge/core';
 import type { Command, Event } from './engine/types';
 import type { EngineClient } from './engine/engine-client';
+import type { ClipboardPrefetch } from './input/clipboard-cache';
 
 declare global {
     interface Window {
@@ -37,6 +38,9 @@ declare global {
         __setTelemetryEnabled?: (enabled: boolean) => void;
         /** Data-driven font registry (JIT loader; debug + e2e hook). */
         __fontRegistry?: FontRegistry;
+        /** Issue #57 — the synchronous clipboard payload cache (e2e hook:
+         *  `stats()`, `invalidate()`). */
+        __clipboardPrefetch?: ClipboardPrefetch;
     }
 }
 

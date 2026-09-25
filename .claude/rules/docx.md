@@ -42,7 +42,16 @@ paths:
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:
 1. **Sibling entries byte-identical** — zero drift on non-`document.xml` entries.
-2. **`document.xml` delta ≤ 2 × UTF-8 byte size of the inserted text.** Tighter is suspicious (probably overwrote unrelated regions). Looser means whitespace creep.
+2. **Primary (issue #251): `source_bytes_rewritten == 0`.** An edited save
+   must not respell or drop a single ORIGINAL byte; the whole delta must be
+   insertion. Superseded the old size-only check, which couldn't tell a
+   faithful insertion (which may legitimately mint a new `<w:r>`) from a
+   lossy regeneration landing in bounds by coincidence.
+3. **Secondary, informational: `document.xml` delta ≤ 2 × UTF-8 byte size
+   of the inserted text + a per-new-run allowance** (48 B/run — see
+   `tools/corpus-native/src/pipeline.rs::NEW_RUN_ALLOWANCE_BYTES`). The
+   bare `≤ 2×N` number (no allowance) is kept as an informational column
+   only (`EditCheck::bound_bytes` / `within_bound`).
 
 ## In-part grab bags (issue #84)
 - A dirty paragraph / table regenerates from the typed model. Every
@@ -173,13 +182,24 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   the writer re-resolves by target / mints a row. An internal `#name`
   target re-derives `w:anchor`. Typing at either end of a link stays
   outside it.
-- Offsets are remapped by `insert_text`, `delete_text`, `split_at`,
-  `concat`, inline-object splices and the revision accept/reject helper;
-  `SourceMarkup::text_len` makes any other text edit go *stale* (runs /
-  markers ignored, never misplaced).
+- Offsets are remapped by `delete_text`, `split_at`, `concat` and — for
+  every in-place text change — `Paragraph::splice_text` (`engine::
+  text_remap`, issues #250 / #252), which returns the `TextEdit` the
+  caller also feeds to `DocumentTree::remap_text_edit`, so the source
+  markup and the tree-level `comment_ranges` see ONE edit record
+  (insert / tracked insert + own-insertion delete / inline objects /
+  accept-reject / rich paste / field restamp all route through it).
+  `SourceMarkup::text_len` still makes an unaware edit go *stale* in a
+  release build (runs / markers ignored, never misplaced); test builds
+  (`engine` feature `markup-assert`, on in `cfg(test)` and engine-wasm's
+  dev-deps) assert on every `UndoStack::push` that nothing went stale.
 - `tools/corpus-native` reports `edit_check.source_bytes_rewritten` (bytes
-  of the original the edited save rewrote; 0 = pure insertion) next to the
-  size-delta bound.
+  of the original the edited save rewrote; 0 = pure insertion) — the
+  primary bound since issue #251, see "Round-trip diff bounds" above — next
+  to the informational size-delta bound, and (when `> 0`) a cheap
+  `rewrite_cause` tag (`hyperlink` / `comment anchor` / `form field` /
+  `sdt` / `fldSimple` / `move` / `table` / `rPr` / `other`) tracking the
+  corpus against issues #242–#249.
 
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.

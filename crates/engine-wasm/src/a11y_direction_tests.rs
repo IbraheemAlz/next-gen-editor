@@ -372,7 +372,12 @@ fn style_inherited_bidi_survives_edits_and_apply_style() {
         },
     );
     assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
-    let evt = apply(&mut e, Command::SplitParagraph { at: bpos_top(0, 2) });
+    let evt = apply(
+        &mut e,
+        Command::SplitParagraph {
+            at: Some(bpos_top(0, 2)),
+        },
+    );
     assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
     let evt = apply(
         &mut e,

@@ -179,6 +179,13 @@ D5.10 are external/human sign-offs, not code.
   - `fuzz/examples/smoke.rs` is a stable-only driver (no nightly needed)
     proving all four work: `cargo run --manifest-path fuzz/Cargo.toml
     --example smoke --release`.
+  - Issue #229 — the `rpc_command` corpus's #186/#187 regression seeds are
+    derived from `command_gen::Scenario`'s explicit builder (a fixed-prefix
+    fast path in `gen_targeted_command`, immune to unrelated arms' byte-
+    consumption changes) rather than hand-tuned raw bytes; regenerate them
+    with `cargo run --manifest-path fuzz/Cargo.toml --example regen-seeds`,
+    and `cargo test --manifest-path fuzz/Cargo.toml` (now also in `ci.yml`'s
+    `rust-native` job) fails loudly if they go stale.
 - **Telemetry (D5.7).** Schema in `crates/bridge/src/telemetry.rs`; the UI
   collector `ts/src/state/telemetry.ts` batches samples and `console.log`s
   them every 60 s — a **mock** transport (no live collector for the MVP).
@@ -280,6 +287,8 @@ Engine backlog" references a real issue.
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
 - `pnpm exec playwright test` (from `ts/`) — the 7 Phase 2 exit-gate e2e specs in `ts/e2e/` all green.
 - `cargo check --manifest-path fuzz/Cargo.toml` — the D5.5 fuzz crate compiles.
+- `cargo test --manifest-path fuzz/Cargo.toml` (issue #229) — the fuzz
+  crate's own unit tests, including the #186/#187 regression-seed checks.
 - The non-blocking `qa-harness` job runs the D5.1–D5.3 browser harnesses
   (`tools/visual-diff` farm, `tools/memory-profile`, `tools/perf`).
 
@@ -322,7 +331,30 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 
 - The reader stashes every non-`word/document.xml` archive entry verbatim in `DocxArchive.other_entries`.
 - The writer emits those entries **byte-identical** + a freshly serialized `word/document.xml`. Don't re-serialize content types or rels.
-- Round-trip diff bound: `word/document.xml` byte delta ≤ 2 × UTF-8 byte size of the inserted text. Tighter than that is suspicious (probably overwrote unrelated regions). Looser means whitespace creep.
+- **Edit-drift bound (issue #251) — fidelity first, size second.** The
+  primary bound is `edit_check.source_bytes_rewritten == 0`: an edited save
+  must not respell or drop a single byte of the ORIGINAL `word/document.xml`
+  — everything the edit changes must be a pure insertion. The secondary
+  bound is size: `document.xml` byte delta ≤ `2 × inserted UTF-8 bytes` +
+  a per-new-run allowance (48 B/run — the measured ≈43 B markup cost of an
+  empty `<w:r><w:t xml:space="preserve"></w:t></w:r>` wrapper, rounded up;
+  `new_run_count` comes from a cheap tag-count heuristic, not a real diff),
+  since a faithful insertion may legitimately need to mint a new `<w:r>`
+  (e.g. appending after a differently-styled run, or opening a self-closing
+  `<w:p/>`). Both bounds live on `EditCheck` in `tools/corpus-native/src/
+  pipeline.rs` and are asserted the same way in `tools/roundtrip`'s default
+  step 6b/6c. The old size-only `≤ 2×N` bound is kept as an informational
+  column (`bound_bytes` / `within_bound`) — it cannot distinguish a
+  faithful insertion from a lossy regeneration that happens to land in
+  bounds (issue #199: a fix that drove `source_bytes_rewritten` down from
+  134 to a small residual simultaneously drove the old bound's violation
+  count *up*, 82 → 92, because faithful new runs cost bytes a silent
+  regeneration didn't).
+- Every document that still rewrites source bytes gets a cheap root-cause
+  tag (`hyperlink` / `comment anchor` / `form field` / `sdt` / `fldSimple`
+  / `move` / `table` / `rPr` / `other`) so the corpus can be tracked
+  against the filed issues (#242–#249) — see `tools/corpus-native`'s
+  `classify_rewrite` and `report.mjs`'s root-cause histogram.
 - XML escapes: `&` `<` `>` only. `xml:space="preserve"` on every `<w:t>` to keep trailing whitespace.
 
 ## Bash / agent ergonomics
