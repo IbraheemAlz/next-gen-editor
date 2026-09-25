@@ -284,6 +284,89 @@ fn build_long_document() -> Vec<u8> {
 }
 
 /* ---------------------------------------------------------------- */
+/* Table pagination corpus (issue #155)                              */
+/* ---------------------------------------------------------------- */
+
+/// Where `--gen-table-fixtures` writes by default.
+pub const TABLE_FIXTURES_DIR: &str = "tools/differential/fixtures/tables";
+
+/// One single-line paragraph at an exact 14pt line pitch with zero
+/// before/after spacing. Every fixture line is short enough to stay one
+/// line in any sans/serif face, and the exact pitch makes the page
+/// distribution independent of the font LibreOffice substitutes — so the
+/// oracle compares *where rows break*, not font metrics.
+fn exact_line(text: &str) -> String {
+    format!(
+        r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="280" w:lineRule="exact"/></w:pPr><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>"#
+    )
+}
+
+/// A two-column table: a one-line row, a tall row (cell A = `tall_lines`
+/// exact lines, cell B = one line), a one-line row. `cant_split` stamps
+/// `<w:cantSplit/>` on the tall row.
+fn long_cell_table(tag: &str, tall_lines: u32, cant_split: bool) -> String {
+    let cell = |inner: String| {
+        format!(r#"<w:tc><w:tcPr><w:tcW w:w="4500" w:type="dxa"/></w:tcPr>{inner}</w:tc>"#)
+    };
+    let tall_a: String = (1..=tall_lines)
+        .map(|i| exact_line(&format!("{tag} cell line {i}")))
+        .collect();
+    let tr_pr = if cant_split {
+        "<w:trPr><w:cantSplit/></w:trPr>"
+    } else {
+        ""
+    };
+    format!(
+        r#"<w:tbl><w:tblPr><w:tblW w:w="9000" w:type="dxa"/><w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid><w:gridCol w:w="4500"/><w:gridCol w:w="4500"/></w:tblGrid><w:tr>{}{}</w:tr><w:tr>{tr_pr}{}{}</w:tr><w:tr>{}{}</w:tr></w:tbl>"#,
+        cell(exact_line(&format!("{tag} first row A"))),
+        cell(exact_line(&format!("{tag} first row B"))),
+        cell(tall_a),
+        cell(exact_line(&format!("{tag} short cell"))),
+        cell(exact_line(&format!("{tag} last row A"))),
+        cell(exact_line(&format!("{tag} last row B"))),
+    )
+}
+
+/// Issue #155 — Word's default "allow row to break across pages". On A4
+/// with 1in margins the body is ~697.9pt: 44 exact 14pt lines (616pt) +
+/// the first row (14pt) leave ~67.9pt, so table T1's 20-line tall row
+/// keeps 4 lines on page 1 and continues (16 lines + the last row) on
+/// page 2. 30 more body lines then leave ~25.9pt under T2's first row:
+/// T2's tall row is `<w:cantSplit/>`, so it moves whole to page 3 (a
+/// splittable row would keep one line). Expected: 3 pages; page 1 ends
+/// at "T1 cell line 4", page 3 opens with "T2 cell line 1".
+fn build_long_cell_table() -> Vec<u8> {
+    let mut body = String::new();
+    for i in 1..=44u32 {
+        body.push_str(&exact_line(&format!("Body line {i}")));
+    }
+    body.push_str(&long_cell_table("T1", 20, false));
+    for i in 1..=30u32 {
+        body.push_str(&exact_line(&format!("Between line {i}")));
+    }
+    body.push_str(&long_cell_table("T2", 20, true));
+    body.push_str(&exact_line("End of document"));
+    build_plain(&body)
+}
+
+fn table_fixtures() -> Vec<Fixture> {
+    vec![Fixture {
+        name: "long_cell_table.docx",
+        description: "Issue #155 row-split oracle: a 20-line cell row at a page bottom breaks at a line boundary (4 lines stay on page 1); the same row with <w:cantSplit/> later moves whole. Exact 14pt line pitch, explicit A4 pgSz. Expected 3 pages.",
+        bytes: build_long_cell_table(),
+    }]
+}
+
+/// `--gen-table-fixtures [dir]` — the table pagination corpus.
+pub fn generate_tables(dir: &Path) -> Result<()> {
+    write_set(
+        dir,
+        &table_fixtures(),
+        "Issue #155 table pagination differential-oracle fixture corpus. word_pdf is PENDING for every entry: no Word 365 available in this environment (see tools/differential/README.md).",
+    )
+}
+
+/* ---------------------------------------------------------------- */
 /* Manifest + entry point                                            */
 /* ---------------------------------------------------------------- */
 
@@ -334,10 +417,21 @@ fn fixtures() -> Vec<Fixture> {
 }
 
 pub fn generate(dir: &Path) -> Result<()> {
+    write_set(
+        dir,
+        &fixtures(),
+        "Issue #89 Arabic/RTL differential-oracle fixture corpus. word_pdf is PENDING for every entry: no Word 365 available in this environment (see tools/differential/README.md).",
+    )
+}
+
+/// Write `items` plus a `_manifest.json` (with `comment`) into `dir`.
+fn write_set(dir: &Path, items: &[Fixture], comment: &str) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let mut manifest = String::new();
-    manifest.push_str("{\n  \"_comment\": \"Issue #89 Arabic/RTL differential-oracle fixture corpus. word_pdf is PENDING for every entry: no Word 365 available in this environment (see tools/differential/README.md).\",\n  \"fixtures\": {\n");
-    let items = fixtures();
+    manifest.push_str(&format!(
+        "{{\n  \"_comment\": \"{}\",\n  \"fixtures\": {{\n",
+        comment.replace('"', "'")
+    ));
     let last = items.len() - 1;
     for (i, fx) in items.iter().enumerate() {
         let path = dir.join(fx.name);
@@ -374,7 +468,7 @@ mod tests {
     /// (no timestamps, no random ids in any builder above).
     #[test]
     fn every_fixture_round_trips_through_read_docx() {
-        for fx in fixtures() {
+        for fx in fixtures().into_iter().chain(table_fixtures()) {
             let archive = read_docx(&fx.bytes)
                 .unwrap_or_else(|e| panic!("{} failed to parse: {e:?}", fx.name));
             assert!(
@@ -397,5 +491,61 @@ mod tests {
         }
         assert!(dir.join("_manifest.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = dir.with_extension("tables");
+        generate_tables(&dir).expect("generate tables");
+        for fx in table_fixtures() {
+            assert!(dir.join(fx.name).exists(), "{} missing", fx.name);
+        }
+        assert!(dir.join("_manifest.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #155 — our side of the `long_cell_table.docx` oracle: the
+    /// page distribution the fixture's docs promise (LibreOffice is
+    /// expected to agree; `tools/differential` checks it in CI).
+    #[test]
+    fn long_cell_table_breaks_the_row_at_a_line_boundary() {
+        use layout::LayoutBlock;
+        let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let face =
+            text_pipeline::LoadedFont::parse("liberation".into(), bytes).expect("parse font");
+        let mut faces = std::collections::HashMap::new();
+        faces.insert("liberation".to_string(), std::sync::Arc::new(face));
+        let fonts = text_pipeline::FontStack::from_faces(faces, "liberation");
+        let mut doc = read_docx(&build_long_cell_table()).expect("parse").document;
+        let built = crate::pipeline::build_pages(&mut doc, &fonts);
+        assert_eq!(built.pages.len(), 3);
+        let lines = |row: &layout::TableRowBox, cell: usize| -> usize {
+            row.cells[cell]
+                .content
+                .iter()
+                .filter_map(LayoutBlock::as_paragraph)
+                .count()
+        };
+        let tables = |p: usize| -> Vec<&layout::TableBox> {
+            built.pages[p]
+                .blocks
+                .iter()
+                .filter_map(LayoutBlock::as_table)
+                .collect()
+        };
+        /* Page 1: T1's first row + 4 lines of the tall row. */
+        let t1 = tables(0);
+        assert_eq!(t1.len(), 1);
+        assert_eq!(t1[0].rows.len(), 2);
+        assert_eq!(lines(&t1[0].rows[1], 0), 4);
+        assert_eq!(lines(&t1[0].rows[1], 1), 1);
+        /* Page 2: the 16 remaining lines + the last row; T2's first row
+        (its cantSplit row does not fit the ~25.9pt left). */
+        let p2 = tables(1);
+        assert_eq!(p2.len(), 2);
+        assert_eq!(p2[0].rows[0].source_row, 1);
+        assert_eq!(lines(&p2[0].rows[0], 0), 16);
+        assert_eq!(p2[1].rows.len(), 1);
+        /* Page 3: T2's cantSplit row, whole. */
+        let p3 = tables(2);
+        assert_eq!(p3[0].rows[0].source_row, 1);
+        assert_eq!(lines(&p3[0].rows[0], 0), 20);
     }
 }

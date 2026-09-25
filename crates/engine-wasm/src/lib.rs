@@ -3624,7 +3624,10 @@ fn layout_table_box(
             },
             cells: cells_out,
             header: row.props.header,
-            cant_split: row.props.cant_split,
+            /* Issue #155 — an exact-height row never breaks across
+            pages (only a row that may grow can continue). */
+            cant_split: row.props.cant_split
+                || matches!(row.props.height, Some(engine::RowHeight::Exact { .. })),
             source_row: rows_out.len() as u32,
         });
         y += row_height;

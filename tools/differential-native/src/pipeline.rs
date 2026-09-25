@@ -481,7 +481,10 @@ fn build_table_box(
             },
             cells: cells_out,
             header: row.props.header,
-            cant_split: row.props.cant_split,
+            /* Mirrors engine-wasm (issue #155): an exact-height row
+            never breaks across pages. */
+            cant_split: row.props.cant_split
+                || matches!(row.props.height, Some(engine::RowHeight::Exact { .. })),
             source_row: rows_out.len() as u32,
         });
         y += row_height;

@@ -34,6 +34,15 @@ tools/differential/
   fixtures/arabic/_manifest.json Per-fixture description + Word-oracle
                                   status (every entry is PENDING here — no
                                   Word 365 available in this environment).
+  fixtures/tables/*.docx         Issue #155 table pagination corpus
+                                  (`--gen-table-fixtures`): rows breaking
+                                  across pages at a line boundary vs.
+                                  `<w:cantSplit/>`. Exact 14pt line pitch so
+                                  the page distribution does not depend on
+                                  the substituted font; each fixture's
+                                  expected distribution is in its manifest
+                                  description and pinned on our side by a
+                                  `differential-native` unit test.
 ```
 
 ## Running it
@@ -45,6 +54,7 @@ cargo build -p differential-native --release
 # 2. (Re)generate the Arabic/RTL fixture corpus (idempotent; only needed
 #    after editing tools/differential-native/src/fixtures.rs).
 cargo run -p differential-native --release -- --gen-fixtures
+cargo run -p differential-native --release -- --gen-table-fixtures
 
 # 3. Run the comparison. Default corpus = the Arabic/RTL set +
 #    crates/format-docx/tests/fixtures/*.docx.

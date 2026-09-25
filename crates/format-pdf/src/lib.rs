@@ -2640,4 +2640,120 @@ mod tests {
         }
         assert_eq!(painted_body_rows, n_rows - 1);
     }
+
+    /// Issue #155 — a row that does not fit the rest of the page breaks
+    /// at a line boundary: both parts of the row paint their own lines
+    /// (none lost, none doubled) on their own page.
+    #[test]
+    fn row_split_at_a_line_boundary_paints_both_parts() {
+        let stack = liberation_stack();
+        let para = layout_paragraph(ParagraphConfig {
+            text: "hi",
+            fonts: &stack,
+            spans: &[plain_span("hi".len() as u32)],
+            base_direction: ShapingDirection::Ltr,
+            max_width: 200.0,
+            line_height: 22.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 22.0,
+            inline_objects: &[],
+            tab_stops_px: &[],
+        });
+        let glyphs: usize = para
+            .lines
+            .iter()
+            .flat_map(|l| l.runs.iter())
+            .map(|r| r.glyphs.len())
+            .sum();
+        assert!(glyphs > 0);
+        let line_h = para.size.height;
+        let row = |i: u32, n_paras: usize, h: f32| {
+            let content: Vec<LayoutBlock> = (0..n_paras)
+                .map(|k| {
+                    let mut p = para.clone();
+                    p.origin.y = k as f32 * line_h;
+                    LayoutBlock::Paragraph(p)
+                })
+                .collect();
+            layout::TableRowBox {
+                origin: layout::Point::default(),
+                size: layout::Size {
+                    width: 200.0,
+                    height: h,
+                },
+                cells: vec![layout::TableCellBox {
+                    origin: layout::Point::default(),
+                    size: layout::Size {
+                        width: 200.0,
+                        height: h,
+                    },
+                    grid_span: 1,
+                    v_merge: engine::VMergeRole::None,
+                    borders: engine::default_word_borders(),
+                    shading: None,
+                    content,
+                    padding_left: 0.0,
+                    padding_top: 0.0,
+                    padding_right: 0.0,
+                    padding_bottom: 0.0,
+                    content_offset: 0,
+                }],
+                header: false,
+                cant_split: false,
+                source_row: i,
+            }
+        };
+        /* 698 pt body: a 650 pt first row leaves 48 pt — two of the
+        second row's five lines stay, three continue. */
+        let mut rows = vec![row(0, 1, 650.0), row(1, 5, 5.0 * line_h)];
+        rows[1].origin.y = 650.0;
+        let table = TableBox {
+            origin: layout::Point::default(),
+            size: layout::Size {
+                width: 200.0,
+                height: 650.0 + 5.0 * line_h,
+            },
+            columns: vec![200.0],
+            rows,
+            outer_borders: engine::default_word_borders(),
+        };
+        let geom = layout::PaginatePageGeometry {
+            width: 595.0,
+            height: 842.0,
+            margins: Margins::uniform(72.0),
+            header_offset: 36.0,
+            footer_offset: 36.0,
+        };
+        let mut pag = layout::Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Table(table), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        let fo = test_font_objs(&["liberation"]);
+        let per_page: Vec<usize> = pages
+            .iter()
+            .map(|page| {
+                let content = build_content(page, &fo);
+                let text = String::from_utf8_lossy(&content).into_owned();
+                text.split_whitespace().filter(|t| *t == "Tm").count()
+            })
+            .collect();
+        let lines_on = |p: &layout::PageBox| -> usize {
+            p.blocks
+                .iter()
+                .filter_map(LayoutBlock::as_table)
+                .flat_map(|t| t.rows.iter())
+                .map(|r| r.cells[0].content.len())
+                .sum()
+        };
+        assert_eq!(lines_on(&pages[0]), 3, "row 0 + two lines of row 1");
+        assert_eq!(lines_on(&pages[1]), 3, "the other three lines");
+        assert_eq!(per_page, vec![3 * glyphs, 3 * glyphs]);
+    }
 }
