@@ -992,9 +992,9 @@ impl Engine {
     /// Phase 7 — list every inline-image media blob the document carries,
     /// keyed by media key (issue #188: the resolved target path for an
     /// imported picture, the minted id for an inserted one — the same key
-    /// the display list's `DrawImage.rel_id` names). The TS shell consumes
-    /// this list once after `OpenDocx`, decodes each blob into an
-    /// `ImageBitmap` via the browser, and installs the result via
+    /// the display list's `DrawImage.media_key` names, issue #224). The TS
+    /// shell consumes this list once after `OpenDocx`, decodes each blob
+    /// into an `ImageBitmap` via the browser, and installs the result via
     /// [`Engine::register_image`]. Returns an array of
     /// `{ rel_id, mime, bytes }` objects.
     pub fn media_entries(&self) -> Result<JsValue, JsValue> {
@@ -5079,6 +5079,7 @@ fn collect_paragraph_image_rects(
                         path: path.clone(),
                         at: run.source_range.start + g.cluster,
                         rel_id: rel.to_string(),
+                        media_key: rel.to_string(),
                         rect: BridgeRect {
                             x: x0,
                             y: y0,
@@ -5150,6 +5151,7 @@ fn collect_text_box_image_rects(
             path: engine_to_bridge_path(host),
             at: nf.at,
             rel_id: nf.rel_id.clone(),
+            media_key: nf.rel_id.clone(),
             rect: BridgeRect {
                 x: cx + nf.origin.x,
                 y: cy + nf.origin.y,
@@ -10541,6 +10543,7 @@ impl Engine {
                     path,
                     at: f.at,
                     rel_id: f.rel_id.clone(),
+                    media_key: f.rel_id.clone(),
                     rect: BridgeRect {
                         x: f.origin.x,
                         y: page_top + f.origin.y,
@@ -20475,7 +20478,7 @@ mod tests {
         let draw = cmds
             .iter()
             .position(|c| {
-                matches!(c, render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdBoxPic")
+                matches!(c, render::scene::DisplayCmd::DrawImage { media_key, .. } if media_key == "rIdBoxPic")
             })
             .expect("story picture paints");
         let pop = cmds
@@ -20823,7 +20826,7 @@ mod tests {
         let scene = render::scene::build_document_scene(&pages, 0.0);
         assert!(scene.cmds.iter().any(|c| matches!(
             c,
-            render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdInnerPic"
+            render::scene::DisplayCmd::DrawImage { media_key, .. } if media_key == "rIdInnerPic"
         )));
     }
 
