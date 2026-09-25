@@ -5800,28 +5800,171 @@ fn push_run(runs: &mut Vec<A11yRun>, text: &str, s: u32, e: u32, style: SpanStyl
                 .underline
                 .unwrap_or(engine::UnderlineStyle::None)
                 .is_visible(),
+            note_ref: None,
         });
     }
 }
 
 /// Split a paragraph into gap-free accessibility runs by its style spans.
-fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
+///
+/// Issue #203 — `subs` are the paragraph's note marks (each a U+FFFC
+/// placeholder byte offset, the display text, the optional note link):
+/// each placeholder is replaced by its own run carrying the marker text
+/// (and `note_ref` for a reference), styled like the span it sits in.
+/// Without `subs` the output is exactly the pre-#203 run list.
+fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
     let len = para.text.len() as u32;
     let mut runs: Vec<A11yRun> = Vec::new();
+    let push = |runs: &mut Vec<A11yRun>, s: u32, e: u32, style: SpanStyle| {
+        let mut cursor = s;
+        for m in subs.iter().filter(|m| m.at >= s && m.at < e) {
+            push_run(runs, &para.text, cursor, m.at, style.clone());
+            runs.push(A11yRun {
+                text: m.text.clone(),
+                bold: style.bold.unwrap_or(false),
+                italic: style.italic.unwrap_or(false),
+                underline: style
+                    .underline
+                    .unwrap_or(engine::UnderlineStyle::None)
+                    .is_visible(),
+                note_ref: m.note_ref.clone(),
+            });
+            cursor = (m.at + A11Y_PLACEHOLDER_LEN).min(e);
+        }
+        push_run(runs, &para.text, cursor, e, style);
+    };
     let mut cursor = 0_u32;
     for sr in &para.spans {
-        push_run(
-            &mut runs,
-            &para.text,
-            cursor,
-            sr.start,
-            SpanStyle::default(),
-        );
-        push_run(&mut runs, &para.text, sr.start, sr.end, sr.style.clone());
+        push(&mut runs, cursor, sr.start, SpanStyle::default());
+        push(&mut runs, sr.start, sr.end, sr.style.clone());
         cursor = sr.end;
     }
-    push_run(&mut runs, &para.text, cursor, len, SpanStyle::default());
+    push(&mut runs, cursor, len, SpanStyle::default());
     runs
+}
+
+/// UTF-8 length of the U+FFFC object placeholder a note mark occupies.
+const A11Y_PLACEHOLDER_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
+
+/// Issue #203 — one note mark inside a paragraph, for [`a11y_runs`].
+struct A11yNoteMark {
+    at: u32,
+    text: String,
+    note_ref: Option<bridge::A11yNoteRef>,
+}
+
+/// Issue #203 — the note context of a body walk: the document (for the
+/// note stories), the document-order display markers, and the footnotes
+/// already emitted (a note referenced twice gets ONE region, after its
+/// first reference).
+struct A11yNotes<'d> {
+    doc: &'d DocumentTree,
+    markers: HashMap<engine::NoteAnchor, String>,
+    emitted: RefCell<std::collections::HashSet<engine::NoteAnchor>>,
+}
+
+/// Issue #203 — the region id of a note: `"footnote-<w:id>"` /
+/// `"endnote-<w:id>"`.
+fn a11y_note_id(anchor: engine::NoteAnchor) -> String {
+    match anchor.kind {
+        engine::NoteKind::Footnote => format!("footnote-{}", anchor.id),
+        engine::NoteKind::Endnote => format!("endnote-{}", anchor.id),
+    }
+}
+
+fn a11y_note_kind(kind: engine::NoteKind) -> bridge::A11yNoteKind {
+    match kind {
+        engine::NoteKind::Footnote => bridge::A11yNoteKind::Footnote,
+        engine::NoteKind::Endnote => bridge::A11yNoteKind::Endnote,
+    }
+}
+
+/// Issue #203 — the note anchor a reference inline object names.
+fn note_ref_anchor(kind: &engine::InlineKind) -> Option<engine::NoteAnchor> {
+    match kind {
+        engine::InlineKind::FootnoteRef { id, .. } => Some(engine::NoteAnchor {
+            kind: engine::NoteKind::Footnote,
+            id: *id,
+        }),
+        engine::InlineKind::EndnoteRef { id, .. } => Some(engine::NoteAnchor {
+            kind: engine::NoteKind::Endnote,
+            id: *id,
+        }),
+        _ => None,
+    }
+}
+
+/// Issue #203 — the note marks of `p` in `scope`: reference marks when
+/// the walk carries a note context (the body), the self-mark when the
+/// walk is a note story's body. Only real U+FFFC placeholders qualify.
+fn a11y_note_marks(p: &engine::Paragraph, scope: A11yScope<'_>) -> Vec<A11yNoteMark> {
+    let mut marks: Vec<A11yNoteMark> = Vec::new();
+    if scope.notes.is_none() && scope.self_marker.is_none() {
+        return marks;
+    }
+    for io in &p.inline_objects {
+        if !p
+            .text
+            .get(io.at as usize..)
+            .is_some_and(|t| t.starts_with('\u{FFFC}'))
+        {
+            continue;
+        }
+        if let Some(notes) = scope.notes
+            && let Some(anchor) = note_ref_anchor(&io.kind)
+        {
+            let note_ref = notes.doc.note_story(anchor).map(|_| bridge::A11yNoteRef {
+                kind: a11y_note_kind(anchor.kind),
+                id: a11y_note_id(anchor),
+            });
+            marks.push(A11yNoteMark {
+                at: io.at,
+                text: notes.markers.get(&anchor).cloned().unwrap_or_default(),
+                note_ref,
+            });
+        } else if let Some(marker) = scope.self_marker
+            && matches!(io.kind, engine::InlineKind::NoteSelfRef { .. })
+        {
+            marks.push(A11yNoteMark {
+                at: io.at,
+                text: marker.to_string(),
+                note_ref: None,
+            });
+        }
+    }
+    marks.sort_by_key(|m| m.at);
+    marks.dedup_by_key(|m| m.at);
+    marks
+}
+
+/// Issue #203 — the region of note `anchor`: its story body built with
+/// this module's own block walk (self-mark read as `marker`; text boxes
+/// in it scoped under the note id). `None` for a dangling reference.
+fn build_a11y_note(
+    doc: &DocumentTree,
+    anchor: engine::NoteAnchor,
+    marker: &str,
+    direction: Direction,
+) -> Option<A11yNode> {
+    let story = doc.note_story(anchor)?;
+    let id = a11y_note_id(anchor);
+    let id_prefix = format!("{id}:");
+    let nodes = build_a11y_nodes_of(
+        &story.body,
+        direction,
+        A11yScope {
+            id_prefix: &id_prefix,
+            self_marker: Some(marker),
+            ..A11yScope::BODY
+        },
+    );
+    Some(A11yNode::Note(bridge::A11yNote {
+        note_kind: a11y_note_kind(anchor.kind),
+        id,
+        note_id: anchor.id,
+        marker: marker.to_string(),
+        nodes,
+    }))
 }
 
 /// Issue #165 — where a block list sits, for the text-box region ids its
@@ -5829,12 +5972,17 @@ fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
 /// `"<parent box id>/"` inside a story, `"<rid>:"` inside a header /
 /// footer part), `path_prefix` is the list's own path (`"3.1x0."` for a
 /// cell of top-level table 3), `depth` the text-box nesting level of the
-/// list (0 = not inside a box).
+/// list (0 = not inside a box). Issue #203 — `notes` is the note context
+/// of the BODY walk (reference marks + footnote regions; `None`
+/// everywhere else), `self_marker` the display marker of the note whose
+/// story is being walked (its self-mark reads as that text).
 #[derive(Clone, Copy)]
 struct A11yScope<'a> {
     id_prefix: &'a str,
     path_prefix: &'a str,
     depth: u32,
+    notes: Option<&'a A11yNotes<'a>>,
+    self_marker: Option<&'a str>,
 }
 
 impl A11yScope<'static> {
@@ -5842,6 +5990,8 @@ impl A11yScope<'static> {
         id_prefix: "",
         path_prefix: "",
         depth: 0,
+        notes: None,
+        self_marker: None,
     };
 }
 
@@ -5972,8 +6122,41 @@ fn push_a11y_paragraph(
     out.push(A11yNode::Paragraph(A11yParagraph {
         direction,
         resolved_direction,
-        runs: a11y_runs(p),
+        runs: a11y_runs(p, &a11y_note_marks(p, scope)),
     }));
+    push_a11y_text_boxes(out, p, direction, scope, path);
+    /* Issue #203 — the footnotes FIRST referenced in this paragraph
+    follow it (after its text boxes), in reference order. Endnotes
+    collect at the end of the tree instead (`build_a11y_nodes`). */
+    if let Some(notes) = scope.notes {
+        let mut refs: Vec<(u32, engine::NoteAnchor)> = p
+            .inline_objects
+            .iter()
+            .filter_map(|io| note_ref_anchor(&io.kind).map(|a| (io.at, a)))
+            .filter(|(_, a)| a.kind == engine::NoteKind::Footnote)
+            .collect();
+        refs.sort_by_key(|(at, _)| *at);
+        for (_, anchor) in refs {
+            if notes.doc.note_story(anchor).is_none() || !notes.emitted.borrow_mut().insert(anchor)
+            {
+                continue;
+            }
+            let marker = notes.markers.get(&anchor).cloned().unwrap_or_default();
+            if let Some(node) = build_a11y_note(notes.doc, anchor, &marker, direction) {
+                out.push(node);
+            }
+        }
+    }
+}
+
+/// Issue #165 — the text-box regions anchored in paragraph `p`.
+fn push_a11y_text_boxes(
+    out: &mut Vec<A11yNode>,
+    p: &engine::Paragraph,
+    direction: Direction,
+    scope: A11yScope<'_>,
+    path: &str,
+) {
     if scope.depth >= MAX_TEXT_BOX_LAYOUT_DEPTH {
         return;
     }
@@ -5997,6 +6180,8 @@ fn push_a11y_paragraph(
                 id_prefix: &inner_prefix,
                 path_prefix: "",
                 depth: scope.depth + 1,
+                notes: None,
+                self_marker: None,
             },
         );
         out.push(A11yNode::TextBox(bridge::A11yTextBox {
@@ -13273,7 +13458,26 @@ impl Engine {
             _ => Direction::Ltr,
         };
         let doc = self.undo.current();
-        let mut nodes = build_a11y_nodes_of(doc.blocks.iter(), direction, A11yScope::BODY);
+        /* Issue #203 — the body walk carries the note context: reference
+        marks read as their document-order markers, and each footnote's
+        region follows the paragraph of its first reference. */
+        let notes = A11yNotes {
+            doc,
+            markers: if doc.footnote_stories.is_empty() && doc.endnote_stories.is_empty() {
+                HashMap::new()
+            } else {
+                doc.note_markers()
+            },
+            emitted: RefCell::new(std::collections::HashSet::new()),
+        };
+        let mut nodes = build_a11y_nodes_of(
+            doc.blocks.iter(),
+            direction,
+            A11yScope {
+                notes: Some(&notes),
+                ..A11yScope::BODY
+            },
+        );
         /* Issue #73 — mirror every REFERENCED header/footer part so
         screen readers can reach band text (deduped by rid, stable
         body → headers → footers order; the delta differ handles the
@@ -13293,6 +13497,21 @@ impl Engine {
                 ),
             }));
         });
+        /* Issue #203 — endnotes: one region each, in first-reference
+        order, as the contiguous tail of the tree (the mirror wraps it in
+        a `role="doc-endnotes"` section). */
+        if !doc.endnote_stories.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for r in doc.note_references() {
+                if r.anchor.kind != engine::NoteKind::Endnote || !seen.insert(r.anchor) {
+                    continue;
+                }
+                let marker = notes.markers.get(&r.anchor).cloned().unwrap_or_default();
+                if let Some(node) = build_a11y_note(doc, r.anchor, &marker, direction) {
+                    nodes.push(node);
+                }
+            }
+        }
         nodes
     }
 
@@ -15907,6 +16126,7 @@ mod tests {
                 bold: false,
                 italic: false,
                 underline: false,
+                note_ref: None,
             }],
         })
     }
@@ -19345,6 +19565,7 @@ mod tests {
                 A11yNode::TextBox(b) => format!("[box {}]", b.id),
                 A11yNode::Table(_) => "[table]".to_string(),
                 A11yNode::Story(_) => "[story]".to_string(),
+                A11yNode::Note(n) => format!("[note {}]", n.id),
             })
             .collect()
     }
@@ -22853,6 +23074,9 @@ mod mutation_signal_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;
+
+#[cfg(test)]
+mod a11y_note_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

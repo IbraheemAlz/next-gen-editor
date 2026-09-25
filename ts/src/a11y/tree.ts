@@ -10,7 +10,17 @@
  * right after their anchor paragraph (nested boxes inside their parent's
  * region), named from the box's `docPr`, holding the body's exact `<p dir>` /
  * `<span>` structure. The region of the story being edited carries
- * `aria-current="true"` (`setActiveStory`, fed by `editing_story.rid`).
+ * `aria-current="true"` (`setActiveStory`, fed by `editing_story`).
+ *
+ * Issue #203: footnote / endnote stories are `NOTE` nodes. A footnote is an
+ * `<aside role="doc-footnote">` right after the paragraph of its first
+ * reference; endnotes are the contiguous TAIL of the node list, and the
+ * reconciler wraps that tail in ONE `<section role="doc-endnotes">` (an
+ * `<ol>` of `<li>` notes — DPUB-ARIA 1.1's replacement for the deprecated
+ * `doc-endnote` role). A reference mark is an `<a role="doc-noteref">`
+ * linking (`href`) to its note region's DOM id. Because the endnote section
+ * nests nodes one level below the mirror root, patch indices address a
+ * LOGICAL slot list (`slots`), not `root.children` directly.
  *
  * Phase 5 PR 3b: nodes are now `A11yNode` (`Paragraph | Table`), not flat
  * paragraphs. Tables render as `<table role="table">` with `<tr role="row">`
@@ -22,7 +32,7 @@
  * bare `ref` host and never touches what is inside it. Patches are positional:
  * the engine's prefix/suffix diff emits Updates first, then either Inserts
  * (ascending index) or Removes, so applying them in array order is correct. */
-import type { A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRun } from '../engine/types';
+import type { A11yCell, A11yNode, A11yNoteKind, A11yParagraph, A11yPatch, A11yRun } from '../engine/types';
 
 /** Inline CSS for a run, so a screen reader can announce its formatting. */
 function runStyle(r: A11yRun): string {
@@ -33,24 +43,52 @@ function runStyle(r: A11yRun): string {
     return parts.join(';');
 }
 
+/** Issue #203 — the DOM id of a note region (`A11yNote.id` is the engine's
+ *  stable `footnote-<w:id>` / `endnote-<w:id>`). */
+export function noteDomId(id: string): string {
+    return `nge-a11y-${id}`;
+}
+
+/** Issue #203 — "Footnote 3" / "Endnote iv" (bare kind for a custom mark). */
+function noteLabel(kind: A11yNoteKind, marker: string): string {
+    const word = kind === 'Endnote' ? 'Endnote' : 'Footnote';
+    return marker ? `${word} ${marker}` : word;
+}
+
+/** Build the element for one run — a `<span>`, or (issue #203) an
+ *  `<a role="doc-noteref">` for a footnote / endnote reference mark. The
+ *  link is kept out of the tab order: the hidden textarea owns focus. */
+function buildRun(run: A11yRun): HTMLElement {
+    let el: HTMLElement;
+    if (run.note_ref !== undefined) {
+        const a = document.createElement('a');
+        a.setAttribute('role', 'doc-noteref');
+        a.href = `#${noteDomId(run.note_ref.id)}`;
+        a.tabIndex = -1;
+        a.setAttribute('aria-label', noteLabel(run.note_ref.kind, run.text));
+        a.dataset.noteRef = run.note_ref.id;
+        el = a;
+    } else {
+        el = document.createElement('span');
+    }
+    const style = runStyle(run);
+    if (style) el.style.cssText = style;
+    el.textContent = run.text;
+    return el;
+}
+
 /** Build the `<p>` element for one accessibility paragraph.
  *
  *  Issue #195 — `dir` is the paragraph's OWN resolved base direction
  *  (explicit bidi → first-strong → document base, the engine's layout
  *  resolution), never the document-wide `direction`: an RTL paragraph in
  *  an LTR document must run UAX #9 with an RTL base for the screen reader.
- *  Every `<p>` sets it, so container regions (text box, header / footer)
- *  carry no `dir` and nothing is inherited. */
+ *  Every `<p>` sets it, so container regions (text box, header / footer,
+ *  note) carry no `dir` and nothing is inherited. */
 function buildParagraph(p: A11yParagraph): HTMLParagraphElement {
     const el = document.createElement('p');
     el.dir = p.resolved_direction === 'Rtl' ? 'rtl' : 'ltr';
-    for (const run of p.runs) {
-        const span = document.createElement('span');
-        const style = runStyle(run);
-        if (style) span.style.cssText = style;
-        span.textContent = run.text;
-        el.appendChild(span);
-    }
+    for (const run of p.runs) el.appendChild(buildRun(run));
     return el;
 }
 
@@ -111,33 +149,48 @@ function buildTextBox(node: Extract<A11yNode, { kind: 'TEXT_BOX' }>): HTMLElemen
     return el;
 }
 
+/** Issue #203 — one note story: a footnote is an `<aside
+ *  role="doc-footnote">`; an endnote an `<li>` the reconciler files into
+ *  the `doc-endnotes` section's list. `id` is the reference marks' link
+ *  target; `data-story-id` is what `setActiveStory` matches. */
+function buildNote(node: Extract<A11yNode, { kind: 'NOTE' }>): HTMLElement {
+    const endnote = node.note_kind === 'Endnote';
+    const el = document.createElement(endnote ? 'li' : 'aside');
+    if (!endnote) el.setAttribute('role', 'doc-footnote');
+    el.id = noteDomId(node.id);
+    el.setAttribute('aria-label', noteLabel(node.note_kind, node.marker));
+    el.dataset.storyId = node.id;
+    el.dataset.noteKind = endnote ? 'endnote' : 'footnote';
+    for (const child of node.nodes) el.appendChild(buildNode(child));
+    return el;
+}
+
 /** Dispatch on `A11yNode.kind` — single entry point for builders + recursion. */
 function buildNode(node: A11yNode): HTMLElement {
     if (node.kind === 'TABLE') return buildTable(node);
     if (node.kind === 'STORY') return buildStory(node);
     if (node.kind === 'TEXT_BOX') return buildTextBox(node);
+    if (node.kind === 'NOTE') return buildNote(node);
     return buildParagraph(node);
 }
 
-/** Refresh top-level positional indices after a structural shift. */
-function reindex(root: HTMLElement): void {
-    for (let i = 0; i < root.children.length; i++) {
-        const child = root.children[i];
-        if (child instanceof HTMLElement) child.dataset.pid = String(i);
-    }
-}
-
-/** Stamp `data-pid` on `node` for the DevTools inspector. */
+/** Stamp `data-pid` (the logical node index) for the DevTools inspector. */
 function stampPid(node: HTMLElement, index: number): HTMLElement {
     node.dataset.pid = String(index);
     return node;
 }
 
+/** Issue #203 — a top-level endnote lives in the `doc-endnotes` section. */
+function isEndnote(el: HTMLElement): boolean {
+    return el.dataset.noteKind === 'endnote';
+}
+
 export interface A11yReconciler {
     /** Apply one delta's patches to the mirror, in order. */
     apply(patches: A11yPatch[]): void;
-    /** Issue #165 — mark the text-box region whose `data-story-id` is `id`
-     *  as the active story (`aria-current="true"`); `null` clears it.
+    /** Issue #165 / #203 — mark the region whose `data-story-id` is `id`
+     *  (a text box address, or a note's `footnote-N` / `endnote-N`) as
+     *  the active story (`aria-current="true"`); `null` clears it.
      *  Survives later patches (a rebuilt region is re-marked). */
     setActiveStory(id: string | null): void;
 }
@@ -147,6 +200,53 @@ export interface A11yReconciler {
  */
 export function createA11yReconciler(root: HTMLElement): A11yReconciler {
     let activeStory: string | null = null;
+    /* The top-level node elements in engine order — what patch indices
+       address. Every slot is a child of `root`, except endnotes, which
+       are children of the section's list. */
+    const slots: HTMLElement[] = [];
+    let endnotes: { section: HTMLElement; list: HTMLOListElement } | null = null;
+
+    const endnoteList = (): HTMLOListElement => {
+        if (endnotes === null) {
+            const section = document.createElement('section');
+            section.setAttribute('role', 'doc-endnotes');
+            section.setAttribute('aria-label', 'Endnotes');
+            const list = document.createElement('ol');
+            section.appendChild(list);
+            root.appendChild(section);
+            endnotes = { section, list };
+        }
+        return endnotes.list;
+    };
+
+    const dropEmptySection = (): void => {
+        if (endnotes !== null && endnotes.list.childElementCount === 0) {
+            endnotes.section.remove();
+            endnotes = null;
+        }
+    };
+
+    /** Put `slots[i]` into its container, before the next slot that
+     *  shares that container (the section always stays last in `root`). */
+    const place = (i: number): void => {
+        const el = slots[i];
+        if (!el) return;
+        const container: HTMLElement = isEndnote(el) ? endnoteList() : root;
+        for (let j = i + 1; j < slots.length; j++) {
+            const next = slots[j];
+            if (next && next.parentElement === container) {
+                container.insertBefore(el, next);
+                return;
+            }
+        }
+        const section = endnotes?.section ?? null;
+        if (container === root && section !== null) root.insertBefore(el, section);
+        else container.appendChild(el);
+    };
+
+    const reindex = (): void => {
+        slots.forEach((el, i) => stampPid(el, i));
+    };
 
     const markActive = (): void => {
         for (const el of root.querySelectorAll<HTMLElement>('[aria-current]')) {
@@ -169,32 +269,46 @@ export function createA11yReconciler(root: HTMLElement): A11yReconciler {
         for (const patch of patches) {
             switch (patch.type) {
                 case 'REPLACE': {
-                    root.replaceChildren(
-                        ...patch.tree.nodes.map((n, i) => stampPid(buildNode(n), i)),
-                    );
+                    root.replaceChildren();
+                    endnotes = null;
+                    slots.length = 0;
+                    patch.tree.nodes.forEach((n, i) => {
+                        slots.push(stampPid(buildNode(n), i));
+                        place(i);
+                    });
                     break;
                 }
                 case 'UPDATE': {
-                    const target = root.children[patch.index];
-                    if (target) {
-                        target.replaceWith(stampPid(buildNode(patch.node), patch.index));
+                    const old = slots[patch.index];
+                    if (!old) break;
+                    const el = stampPid(buildNode(patch.node), patch.index);
+                    slots[patch.index] = el;
+                    if (isEndnote(el) === isEndnote(old)) {
+                        old.replaceWith(el);
+                    } else {
+                        old.remove();
+                        place(patch.index);
+                        dropEmptySection();
                     }
                     break;
                 }
                 case 'INSERT': {
-                    const before = root.children[patch.index] ?? null;
-                    root.insertBefore(stampPid(buildNode(patch.node), patch.index), before);
+                    const index = Math.min(patch.index, slots.length);
+                    slots.splice(index, 0, stampPid(buildNode(patch.node), index));
+                    place(index);
                     shifted = true;
                     break;
                 }
                 case 'REMOVE': {
-                    root.children[patch.index]?.remove();
+                    const [gone] = slots.splice(patch.index, 1);
+                    gone?.remove();
+                    dropEmptySection();
                     shifted = true;
                     break;
                 }
             }
         }
-        if (shifted) reindex(root);
+        if (shifted) reindex();
         if (activeStory !== null) markActive();
     };
 
