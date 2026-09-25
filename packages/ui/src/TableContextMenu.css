@@ -68,3 +68,17 @@
 .nge-tcm__item--danger:focus-visible {
     background: rgba(220, 38, 38, 0.08);
 }
+
+/* Issue #79 — checkable item (Right-to-left table). The check column
+ * keeps the label aligned whether or not the item is checked. */
+.nge-tcm__check {
+    display: inline-block;
+    width: 1.25em;
+    margin-inline-start: calc(-1 * var(--nge-space-1));
+    color: var(--nge-color-primary);
+    font-weight: 700;
+}
+
+.nge-tcm__item--checked {
+    font-weight: 600;
+}

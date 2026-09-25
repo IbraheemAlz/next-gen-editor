@@ -525,6 +525,11 @@ pub struct BridgeSectionGeometry {
 pub struct BridgeCellProperties {
     pub shading: Option<Color>,
     pub borders: BridgeCellBorders,
+    /// Issue #79 — `<w:bidiVisual>` of the top-level table the caret is
+    /// in (the table `Command::SetTableProperties` / the table context
+    /// menu address): `true` ⇒ right-to-left visual column order.
+    #[serde(default)]
+    pub table_bidi_visual: bool,
 }
 
 /// Per-flag "this attribute is mixed across the selection" bitmap that

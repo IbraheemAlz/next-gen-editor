@@ -121,3 +121,61 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #79 — the differential acceptance oracle, stated natively. On
+    /// the committed `rtl_table.docx` (`<w:bidiVisual/>`, 3 columns) every
+    /// row's cells, read right to left by painted x, come out in LOGICAL
+    /// column order — the order LibreOffice's PDF shows (the harness
+    /// reported our pre-#79 output in the reverse, LTR order).
+    #[test]
+    fn rtl_table_fixture_reads_logical_order_right_to_left() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../differential/fixtures/arabic/rtl_table.docx"
+        );
+        let bytes = std::fs::read(path).expect("read rtl_table.docx");
+        let mut doc = read_docx(&bytes).expect("read_docx").document;
+        let flagged = doc
+            .blocks
+            .iter()
+            .find_map(|b| b.as_table())
+            .is_some_and(|t| t.props.bidi_visual);
+        assert!(flagged, "the flag is modeled on read");
+        let fonts = build_font_stack().expect("fonts");
+        let built = pipeline::build_pages(&mut doc, &fonts);
+        let tb = built
+            .pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| b.as_table())
+            .expect("laid-out table");
+        let rows: Vec<Vec<String>> = tb
+            .rows
+            .iter()
+            .map(|r| {
+                let mut cells: Vec<(f32, String)> = r
+                    .cells
+                    .iter()
+                    .map(|c| {
+                        let mut text = String::new();
+                        layout::boxes::for_each_paragraph_in_blocks(&c.content, &mut |p| {
+                            if let Some(t) = built.para_texts.get(p.source_paragraph_id as usize) {
+                                text.push_str(t);
+                            }
+                        });
+                        (c.origin.x, text)
+                    })
+                    .collect();
+                cells.sort_by(|a, b| b.0.total_cmp(&a.0));
+                cells.into_iter().map(|(_, t)| t).collect()
+            })
+            .collect();
+        assert_eq!(rows[0], vec!["الاسم", "المدينة", "الملاحظات"]);
+        assert_eq!(rows[1][0], "أحمد");
+        assert_eq!(rows[2][0], "سارة");
+    }
+}

@@ -213,6 +213,17 @@ export const TableContextMenu: Component<TableContextMenuProps> = (props) => {
         setPropsOpen(true);
         close();
     };
+    /* Issue #79 — `<w:bidiVisual>`: the engine reports the caret
+     * table's state on every `SelectionChanged` (`cell_properties.
+     * table_bidi_visual`), so the checkbox reflects the live document
+     * and the reply to the toggle updates it — no local optimistic copy. */
+    const isRtlTable = () => state.cellProperties()?.table_bidi_visual === true;
+    const toggleRtlTable = async () => {
+        const c = ctx();
+        if (!c) return;
+        await cmd.setTableBidiVisual(c.tablePath, !isRtlTable());
+        close();
+    };
     const deleteTableFn = async () => {
         const c = ctx();
         if (!c) return;
@@ -294,6 +305,23 @@ export const TableContextMenu: Component<TableContextMenuProps> = (props) => {
                     </button>
                 </li>
                 <li role="presentation" class="nge-tcm__separator" />
+                <li role="presentation" class="nge-tcm__group">Table</li>
+                <li role="none">
+                    <button
+                        class="nge-tcm__item nge-tcm__item--check"
+                        classList={{ 'nge-tcm__item--checked': isRtlTable() }}
+                        type="button"
+                        role="menuitemcheckbox"
+                        aria-checked={isRtlTable()}
+                        title="Right-to-left table: the first column is shown on the right"
+                        onClick={() => void toggleRtlTable()}
+                    >
+                        <span class="nge-tcm__check" aria-hidden="true">
+                            {isRtlTable() ? '✓' : ''}
+                        </span>
+                        Right-to-left table
+                    </button>
+                </li>
                 <li role="none">
                     <button class="nge-tcm__item nge-tcm__item--danger" type="button" role="menuitem" onClick={() => void deleteTableFn()}>
                         Delete table

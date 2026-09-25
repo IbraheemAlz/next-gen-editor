@@ -1688,6 +1688,117 @@ mod tests {
         );
     }
 
+    /// Issue #79 — a `<w:bidiVisual>` table (mirrored by
+    /// `layout::mirror_bidi_visual`) paints its LOGICAL first cell at the
+    /// right: the cell texts' text-matrix x operands, in emission (logical)
+    /// order, descend — the order a right-to-left reader / `pdftotext`
+    /// reconstructs. The unmirrored table ascends.
+    #[test]
+    fn bidi_visual_table_paints_logical_first_cell_rightmost() {
+        fn tm_xs(content: &[u8]) -> Vec<f32> {
+            let s = String::from_utf8_lossy(content);
+            let tokens: Vec<&str> = s.split_whitespace().collect();
+            tokens
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| **t == "Tm")
+                .map(|(i, _)| tokens[i - 2].parse().expect("Tm x operand"))
+                .collect()
+        }
+        fn page(stack: &FontStack, mirrored: bool) -> PageBox {
+            let cell = |text: &str, x: f32| {
+                let para = layout_paragraph(ParagraphConfig {
+                    text,
+                    fonts: stack,
+                    spans: &[plain_span(text.len() as u32)],
+                    base_direction: ShapingDirection::Ltr,
+                    max_width: 90.0,
+                    line_height: 22.0,
+                    line_height_exact: false,
+                    alignment: Alignment::Start,
+                    indent_start_px: 0.0,
+                    indent_end_px: 0.0,
+                    first_line_indent_px: 0.0,
+                    hanging_indent_px: 0.0,
+                    marker_text: None,
+                    px_size_for_marker: 22.0,
+                    inline_objects: &[],
+                    tab_stops_px: &[],
+                });
+                layout::TableCellBox {
+                    origin: layout::Point { x, y: 0.0 },
+                    size: layout::Size {
+                        width: 100.0,
+                        height: 30.0,
+                    },
+                    grid_span: 1,
+                    v_merge: engine::VMergeRole::None,
+                    borders: engine::default_word_borders(),
+                    shading: None,
+                    content: vec![LayoutBlock::Paragraph(para)],
+                    padding_left: 2.0,
+                    padding_top: 0.0,
+                    padding_right: 6.0,
+                    padding_bottom: 0.0,
+                    content_offset: 0,
+                }
+            };
+            let row = layout::TableRowBox {
+                origin: layout::Point { x: 0.0, y: 0.0 },
+                size: layout::Size {
+                    width: 300.0,
+                    height: 30.0,
+                },
+                cells: vec![cell("a", 0.0), cell("b", 100.0), cell("c", 200.0)],
+                header: false,
+                cant_split: false,
+                source_row: 0,
+            };
+            let mut table = TableBox {
+                origin: layout::Point { x: 0.0, y: 100.0 },
+                size: layout::Size {
+                    width: 300.0,
+                    height: 30.0,
+                },
+                columns: vec![100.0; 3],
+                rows: vec![row],
+                outer_borders: engine::default_word_borders(),
+            };
+            if mirrored {
+                layout::mirror_bidi_visual(&mut table);
+            }
+            PageBox {
+                size: Size {
+                    width: 595.0,
+                    height: 842.0,
+                },
+                margins: Margins::uniform(72.0),
+                blocks: vec![LayoutBlock::Table(table)],
+                header: None,
+                footer: None,
+                header_offset: 36.0,
+                footer_offset: 36.0,
+                footnotes: layout::NoteBand::default(),
+                endnotes: layout::NoteBand::default(),
+                hf_role: layout::HeaderRole::Default,
+                page_number: 1,
+                floats: Vec::new(),
+            }
+        }
+        let stack = liberation_stack();
+        let fo = test_font_objs(&["liberation"]);
+        let ltr = tm_xs(&build_content(&page(&stack, false), &fo));
+        let rtl = tm_xs(&build_content(&page(&stack, true), &fo));
+        assert_eq!(ltr.len(), 3, "{ltr:?}");
+        assert_eq!(rtl.len(), 3, "{rtl:?}");
+        assert!(ltr[0] < ltr[1] && ltr[1] < ltr[2], "LTR ascends: {ltr:?}");
+        assert!(rtl[0] > rtl[1] && rtl[1] > rtl[2], "RTL descends: {rtl:?}");
+        /* Cell 1's text starts at the mirrored cell's visual-left edge
+        plus the swapped padding (its `end` margin, 6pt). */
+        assert!((rtl[0] - (72.0 + 200.0 + 6.0)).abs() < 0.01, "{rtl:?}");
+        assert!((ltr[0] - (72.0 + 2.0)).abs() < 0.01, "{ltr:?}");
+    }
+
     #[test]
     fn empty_page_exports_valid_pdf() {
         let stack = FontStack::from_faces(HashMap::new(), "none");
