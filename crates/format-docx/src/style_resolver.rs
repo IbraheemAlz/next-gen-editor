@@ -360,4 +360,47 @@ mod tests {
         let chain = r.collect_chain("S0", StyleKind::Paragraph);
         assert_eq!(chain.len(), MAX_CHAIN);
     }
+
+    /// Issue #178 — a style's `<w:keepNext>` ON must be overridable by a
+    /// paragraph's own explicit `w:val="0"`. Before #178 (`keep_next: bool`
+    /// merged with `||`), a direct `false` could never win against an
+    /// inherited `true`; `merged_with`'s `Option::or` now lets the direct
+    /// override (applied last, highest specificity) win whenever it set
+    /// the field at all.
+    #[test]
+    fn direct_keep_next_and_keep_lines_off_override_style_on() {
+        let heading = StyleDef {
+            id: "Heading".into(),
+            kind: StyleKind::Paragraph,
+            based_on: None,
+            para: ParaProperties {
+                keep_next: Some(true),
+                keep_lines: Some(true),
+                ..Default::default()
+            },
+            run: SpanStyle::default(),
+        };
+        let t = table_with(vec![heading], DocDefaults::default());
+        let r = StyleResolver::new(&t);
+        let direct_off = ParaProperties {
+            keep_next: Some(false),
+            keep_lines: Some(false),
+            ..Default::default()
+        };
+        let (para, _) = r.resolve_paragraph(Some("Heading"), direct_off, SpanStyle::default());
+        assert_eq!(para.keep_next, Some(false));
+        assert_eq!(para.keep_lines, Some(false));
+        assert!(!para.keep_next_on());
+        assert!(!para.keep_lines_on());
+
+        /* Control: no direct override at all still inherits the style's
+        ON, proving the cascade (not just the default) is exercised. */
+        let (inherited, _) = r.resolve_paragraph(
+            Some("Heading"),
+            ParaProperties::default(),
+            SpanStyle::default(),
+        );
+        assert!(inherited.keep_next_on());
+        assert!(inherited.keep_lines_on());
+    }
 }

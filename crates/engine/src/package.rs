@@ -18,8 +18,8 @@
 //!
 //! **Snapshot size.** The package is the file minus `document.xml`, so for
 //! a picture-heavy document its media parts would be persisted twice: once
-//! here and once in `DocumentTree::media` (the same bytes, keyed by
-//! relationship id). The snapshot writes a media entry as a
+//! here and once in `DocumentTree::media` (the same bytes, keyed by the
+//! resolved target path since #188). The snapshot writes a media entry as a
 //! [`MediaRef`] — the `media` key plus the length and an FNV-1a 64 content
 //! hash — instead of its bytes ([`SourcePackage::deduplicated_against`]),
 //! and restore re-hydrates it from the restored tree's `media`

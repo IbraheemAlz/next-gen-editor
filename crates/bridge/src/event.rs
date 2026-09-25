@@ -591,6 +591,15 @@ pub enum LayoutDegradeReason {
     /// A keep-with-next chain could not move with its follower; the
     /// constraint was released (watchdog stage a).
     KeepChainDropped,
+    /// Issue #180 — a `<w:keepLines>` paragraph could not move whole;
+    /// the constraint was released and it split where it stood (watchdog
+    /// stage a). Distinct from `KeepChainDropped` (a keep-*next* chain).
+    KeepLinesDropped,
+    /// Issue #180 — a widow/orphan-controlled paragraph's split could not
+    /// be adjusted to avoid a single line on either side; the constraint
+    /// was released (watchdog stage a). Distinct from `KeepChainDropped`
+    /// / `KeepLinesDropped`.
+    WidowControlDropped,
     /// Repeated table header rows left no room for a body row on a
     /// continuation page; the repeat was suppressed there (stage a).
     HeaderRepeatDropped,

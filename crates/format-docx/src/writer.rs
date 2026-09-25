@@ -516,11 +516,28 @@ fn emit_ppr(
         s.push_str("\"/>");
         ch.push(rank(b"w:pStyle"), s);
     }
-    if props.keep_next {
-        ch.push(rank(b"w:keepNext"), "<w:keepNext/>".into());
+    /* Issue #178 — tri-state: `Some(false)` must round-trip as an
+    explicit `w:val="0"`, not silent omission (omission means "inherit",
+    which a style cascade can resolve to ON). */
+    if let Some(on) = props.keep_next {
+        ch.push(
+            rank(b"w:keepNext"),
+            if on {
+                "<w:keepNext/>".into()
+            } else {
+                "<w:keepNext w:val=\"0\"/>".into()
+            },
+        );
     }
-    if props.keep_lines {
-        ch.push(rank(b"w:keepLines"), "<w:keepLines/>".into());
+    if let Some(on) = props.keep_lines {
+        ch.push(
+            rank(b"w:keepLines"),
+            if on {
+                "<w:keepLines/>".into()
+            } else {
+                "<w:keepLines w:val=\"0\"/>".into()
+            },
+        );
     }
     if props.page_break_before {
         ch.push(rank(b"w:pageBreakBefore"), "<w:pageBreakBefore/>".into());
@@ -1228,7 +1245,7 @@ fn preserved_drawing_is_current(obj: &InlineObject, src: &[u8]) -> bool {
     let (rel_id, cx, cy) = scan.image_fields();
     let same_image = matches!(
         &obj.kind,
-        InlineKind::Image { rel_id: r, width_emu: w, height_emu: h }
+        InlineKind::Image { rel_id: r, width_emu: w, height_emu: h, .. }
             if *r == rel_id && *w == cx && *h == cy
     );
     same_image && scan.anchor == obj.anchor
@@ -1271,6 +1288,7 @@ fn emit_inline_object(
             rel_id,
             width_emu,
             height_emu,
+            ..
         } => {
             /* Issue #119 — verified passthrough of the source element
             (`<w:drawing>`, `<mc:AlternateContent>`, `<w:pict>`,
@@ -3012,6 +3030,8 @@ pub fn save_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
 /// one `<Default>` per distinct image extension; absent that, Word
 /// rejects the file with a "no content type" parse error.
 pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    let view = minimal_media_view(doc);
+    let doc = view.as_ref().unwrap_or(doc);
     let extensions = media_extensions(doc);
     let content_types = build_content_types(&extensions);
     let doc_rels = build_doc_rels(doc);
@@ -3041,6 +3061,93 @@ pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
         warnings: Vec::new(),
     };
     write_docx(&archive, doc)
+}
+
+/// Issue #188 — [`build_minimal_docx`] declares every picture in the ONE
+/// `word/_rels/document.xml.rels` it synthesizes, one relationship per
+/// `media` key (`Id` = key). A tree read from `.docx` instead keys media
+/// by resolved target path (`word/media/image2.png`) and its pictures by
+/// part-scoped rel ids (a header's `rId5` may differ from the body's), so
+/// it is re-keyed first on a copy: every distinct media key gets ONE
+/// relationship id — the first referencing picture's `rel_id` while that
+/// is free, else a minted `nge_media_N` — and every picture is rewritten
+/// to it. Unreferenced path-keyed blobs are dropped (nothing embeds them).
+/// `None` when the tree has no path-keyed media (engine-authored trees,
+/// pre-#188 snapshots): the output stays byte-identical.
+fn minimal_media_view(doc: &DocumentTree) -> Option<DocumentTree> {
+    let path_keyed = |k: &str| k.contains('/');
+    let mut out = doc.clone();
+    let mut assign: HashMap<String, String> = HashMap::new();
+    let mut used: std::collections::HashSet<String> = doc
+        .media
+        .keys()
+        .filter(|k| !path_keyed(k))
+        .cloned()
+        .collect();
+    let mut changed = doc.media.keys().any(|k| path_keyed(k));
+    let mut minted = 0u32;
+    let mut visit = |kind: &mut InlineKind| {
+        if let InlineKind::Image {
+            rel_id, media_key, ..
+        } = kind
+            && let Some(key) = media_key.take()
+        {
+            changed = true;
+            let rid = assign.entry(key).or_insert_with(|| {
+                if !rel_id.is_empty() && used.insert(rel_id.clone()) {
+                    return rel_id.clone();
+                }
+                loop {
+                    minted += 1;
+                    let candidate = format!("nge_media_{minted}");
+                    if used.insert(candidate.clone()) {
+                        return candidate;
+                    }
+                }
+            });
+            *rel_id = rid.clone();
+        }
+    };
+    let mut body: Vec<Block> = out.blocks.iter().cloned().collect();
+    engine::for_each_image_mut(&mut body, &mut visit);
+    /* Deterministic minting: body, then parts and notes in key order. */
+    let mut header_ids: Vec<String> = out.headers.keys().cloned().collect();
+    header_ids.sort();
+    for id in &header_ids {
+        if let Some(blocks) = out.headers.get_mut(id) {
+            engine::for_each_image_mut(blocks, &mut visit);
+        }
+    }
+    let mut footer_ids: Vec<String> = out.footers.keys().cloned().collect();
+    footer_ids.sort();
+    for id in &footer_ids {
+        if let Some(blocks) = out.footers.get_mut(id) {
+            engine::for_each_image_mut(blocks, &mut visit);
+        }
+    }
+    for stories in [&mut out.footnote_stories, &mut out.endnote_stories] {
+        let mut ids: Vec<i32> = stories.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            if let Some(story) = stories.get_mut(&id) {
+                engine::for_each_image_mut(&mut story.body, &mut visit);
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    out.blocks = body.into_iter().collect();
+    out.media = doc
+        .media
+        .iter()
+        .filter_map(|(k, blob)| match assign.get(k) {
+            Some(rid) => Some((rid.clone(), blob.clone())),
+            None if path_keyed(k) => None,
+            None => Some((k.clone(), blob.clone())),
+        })
+        .collect();
+    Some(out)
 }
 
 /// Derive the file extension a `word/media/*` entry uses from its
@@ -4150,7 +4257,7 @@ mod tests {
         let (parsed, xml) = regenerate_dirty(document_xml);
         let para = parsed.document.nth_paragraph(0).unwrap();
         assert_eq!(para.props.alignment, Some(engine::Alignment::Center));
-        assert!(para.props.keep_next);
+        assert_eq!(para.props.keep_next, Some(true));
         assert_eq!(
             para.spans[0].style.bold,
             Some(true),
@@ -5993,8 +6100,8 @@ mod tests {
             },
             line_height: Some(LineHeight::Auto { twips: 360 }),
             direction: Some(TextDirection::Rtl),
-            keep_next: true,
-            keep_lines: false,
+            keep_next: Some(true),
+            keep_lines: Some(false),
             page_break_before: false,
             borders: None,
             tab_stops: Vec::new(),
@@ -6090,8 +6197,8 @@ mod tests {
                     ..Default::default()
                 },
                 direction: Some(TextDirection::Rtl),
-                keep_next: true,
-                keep_lines: true,
+                keep_next: Some(true),
+                keep_lines: Some(true),
                 page_break_before: true,
                 shading: Some([0xFF, 0xEE, 0xDD, 0xFF]),
                 ..Default::default()
@@ -6773,6 +6880,7 @@ mod tests {
                     rel_id: "rId7".into(),
                     width_emu: 1_905_000,
                     height_emu: 1_524_000,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -6801,6 +6909,7 @@ mod tests {
                 rel_id,
                 width_emu,
                 height_emu,
+                ..
             } => {
                 assert_eq!(rel_id, "rId7");
                 assert_eq!(*width_emu, 1_905_000);
@@ -6808,12 +6917,12 @@ mod tests {
             }
             other => panic!("expected Image kind, got {other:?}"),
         }
-        /* Image bytes land at `word/media/rId7.png` and the reader's
-        media cache holds them. */
+        /* Image bytes land at `word/media/rId7.png`; the reader keys the
+        blob by that resolved target path (issue #188). */
         let media = parsed
             .document
             .media
-            .get("rId7")
+            .get("word/media/rId7.png")
             .expect("media blob round-trips");
         assert_eq!(media.content_type, "image/png");
         assert_eq!(
@@ -6836,6 +6945,7 @@ mod tests {
                     rel_id: "rId7".into(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: Some(Box::new(anchor)),
                 source_xml: None,
@@ -6902,7 +7012,7 @@ mod tests {
         );
         assert!(back.layout_in_cell && back.allow_overlap && !back.simple_pos && !back.locked);
         /* Media resolves exactly as for an inline picture. */
-        assert!(parsed.document.media.contains_key("rId7"));
+        assert!(parsed.document.media.contains_key("word/media/rId7.png"));
     }
 
     /// A float read from a Word file regenerates with its verbatim wrap /
@@ -8316,6 +8426,7 @@ mod tests {
                     rel_id,
                     width_emu,
                     height_emu,
+                    ..
                 } => (rel_id.clone(), *width_emu, *height_emu),
                 /* Issue #83 — the text box is a story; its container
                 rides the story, not the object. */

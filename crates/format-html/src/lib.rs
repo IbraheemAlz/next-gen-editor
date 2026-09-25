@@ -255,11 +255,20 @@ fn color_to_hex(c: [u8; 4]) -> String {
 
 fn emit_inline_object(obj: &InlineObject, media: &Media<'_>, out: &mut String) {
     match &obj.kind {
+        /* Issue #188 — the blob lives under the part-resolved media key;
+        `rel_id` is only part-local. */
         InlineKind::Image {
             rel_id,
             width_emu,
             height_emu,
-        } => emit_image(rel_id, *width_emu, *height_emu, media, out),
+            media_key,
+        } => emit_image(
+            media_key.as_deref().unwrap_or(rel_id),
+            *width_emu,
+            *height_emu,
+            media,
+            out,
+        ),
         InlineKind::FootnoteRef { id, .. } | InlineKind::EndnoteRef { id, .. } => {
             /* Issue #80 — the displayed number is derived in document
             order; a dangling reference (no marker) falls back to the id. */
@@ -342,7 +351,16 @@ fn emu_to_css_px(emu: i64) -> i64 {
 /* --------------------------------------------------------------------- */
 
 fn emit_table(t: &Table, media: &Media<'_>, out: &mut String) {
-    out.push_str("<table style=\"border-collapse:collapse;\">");
+    out.push_str("<table");
+    // Issue #176 — `<w:tblPr><w:bidiVisual/>` (ECMA-376 §17.4.1) is purely
+    // visual: the browser needs `dir="rtl"` to mirror columns the same way
+    // Word does. Recursing through `emit_blocks` for cell contents means a
+    // nested table (its own `Block::Table`) picks up its own `bidi_visual`
+    // independently here — no separate nested-table handling needed.
+    if t.props.bidi_visual {
+        out.push_str(" dir=\"rtl\"");
+    }
+    out.push_str(" style=\"border-collapse:collapse;\">");
     /* Pre-compute, for every (row, cell) emit-decision, the rowspan that
     a `VMergeRole::Restart` cell should carry. A Restart cell consumes
     every directly-following `Continue` cell occupying the SAME logical
@@ -672,6 +690,90 @@ mod tests {
         assert!(html.contains("<p>BR</p>"));
     }
 
+    /* ---- issue #176: bidiVisual table emits dir="rtl" ------------------ */
+
+    fn table_with(props: TableProperties, rows: Vec<TableRow>) -> Table {
+        Table {
+            grid: vec![6765, 6765],
+            props,
+            rows,
+            dirty: true,
+            source_xml: None,
+            body_xml: None,
+        }
+    }
+
+    #[test]
+    fn bidi_visual_table_emits_dir_rtl() {
+        let table = table_with(
+            TableProperties {
+                bidi_visual: true,
+                ..Default::default()
+            },
+            vec![TableRow {
+                props: Default::default(),
+                cells: vec![cell_with_text("يمين"), cell_with_text("left")],
+            }],
+        );
+        let html = to_html_fragment(&doc_with(vec![Block::Table(table)]));
+        assert!(
+            html.starts_with("<table dir=\"rtl\" style=\"border-collapse:collapse;\">"),
+            "bidiVisual table missing dir=\"rtl\": {html}"
+        );
+    }
+
+    #[test]
+    fn non_bidi_visual_table_omits_dir_attr() {
+        let table = table_with(
+            TableProperties::default(),
+            vec![TableRow {
+                props: Default::default(),
+                cells: vec![cell_with_text("a"), cell_with_text("b")],
+            }],
+        );
+        let html = to_html_fragment(&doc_with(vec![Block::Table(table)]));
+        assert!(html.starts_with("<table style=\"border-collapse:collapse;\">"));
+        assert!(!html.contains("dir=\"rtl\""));
+    }
+
+    #[test]
+    fn nested_bidi_visual_table_gets_its_own_dir_attr_independent_of_parent() {
+        /* An LTR outer table holding an RTL (bidiVisual) inner table in one
+        cell: each `<table>` resolves its own `bidi_visual` — the nested
+        table's `dir="rtl"` must not leak onto (or depend on) the parent's,
+        since `emit_table` recurses through `emit_blocks` per cell. */
+        let inner = table_with(
+            TableProperties {
+                bidi_visual: true,
+                ..Default::default()
+            },
+            vec![TableRow {
+                props: Default::default(),
+                cells: vec![cell_with_text("inner")],
+            }],
+        );
+        let outer_cell = TableCell {
+            props: CellProperties::default(),
+            blocks: vec![Block::Table(inner)],
+        };
+        let outer = table_with(
+            TableProperties::default(),
+            vec![TableRow {
+                props: Default::default(),
+                cells: vec![outer_cell],
+            }],
+        );
+        let html = to_html_fragment(&doc_with(vec![Block::Table(outer)]));
+        assert!(
+            html.starts_with("<table style=\"border-collapse:collapse;\">"),
+            "outer table wrongly picked up dir=\"rtl\": {html}"
+        );
+        assert!(
+            html.contains("<table dir=\"rtl\" style=\"border-collapse:collapse;\"><tr><td><p>inner</p></td></tr></table>"),
+            "nested bidiVisual table missing its own dir=\"rtl\": {html}"
+        );
+    }
+
     /* ---- BiDi: Arabic + English paragraph emits dir="rtl" ------------- */
 
     #[test]
@@ -727,6 +829,7 @@ mod tests {
                     rel_id: "rId7".into(),
                     width_emu: 1_905_000,
                     height_emu: 1_524_000,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -756,6 +859,7 @@ mod tests {
                     rel_id: "rIdMissing".into(),
                     width_emu: 0,
                     height_emu: 0,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
