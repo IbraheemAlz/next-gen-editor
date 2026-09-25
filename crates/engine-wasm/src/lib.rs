@@ -1301,7 +1301,12 @@ fn now_iso8601() -> String {
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ` from seconds since the Unix epoch — the
 /// proleptic-Gregorian days-to-civil conversion (Howard Hinnant's
 /// `civil_from_days`), so the native clock needs no date dependency.
-#[cfg(not(target_arch = "wasm32"))]
+///
+/// Pure and target-independent: the native `now_iso8601` is its only
+/// production caller (wasm reads `js_sys::Date`), but the unit tests exercise
+/// it on both targets — `wasm-pack test` compiles the whole test module for
+/// `wasm32`, so it must exist there too (CI "Run WASM tests" gate).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn format_iso8601_utc(secs: u64, millis: u32) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
