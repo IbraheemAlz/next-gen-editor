@@ -5,7 +5,16 @@
  *   - commands  (keyPath "seq") — replay-relevant commands, in order; rows
  *                 at/before a pruned snapshot are dropped with it
  *   - snapshots (keyPath "seq") — periodic engine snapshots; pruned to 3
- *   - meta      (keyPath "id")  — bookkeeping (which document is logged) */
+ *   - meta      (keyPath "id")  — bookkeeping (which document is logged,
+ *                 how far the command log has been pruned)
+ *
+ * Issue #241 — pruning invariant: a command row is only ever deleted in
+ * the same transaction that persists a snapshot, and only when it is at
+ * or before a PRUNED snapshot's seq — i.e. strictly before every
+ * retained snapshot. So (a) the log is never pruned while no snapshot is
+ * present, and (b) EVERY retained snapshot still has its complete tail,
+ * which is what lets recovery fall back to an older snapshot when the
+ * newest one turns out unreadable (`loadRecoveryLog` → candidates). */
 import type { Command } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 const DB_NAME = 'engine-log';
@@ -21,6 +30,43 @@ interface CommandRow {
 interface SnapshotRow {
     seq: number;
     bytes: Uint8Array;
+}
+/** Issue #241 — `meta` row: highest command seq deleted by pruning (0 =
+ *  the log is complete from the session's first command). */
+interface PrunedRow {
+    id: 'pruned';
+    through: number;
+}
+const PRUNED_ID = 'pruned';
+
+/** One logged command with its log position. */
+export interface LoggedCommand {
+    seq: number;
+    cmd: Command;
+}
+
+/** Issue #241 — one base a recovery can start from: a persisted snapshot
+ *  (replayed with every logged command after `seq`), or — the last
+ *  candidate, `seq` 0 with empty bytes — the bare command log. */
+export interface RecoveryCandidate {
+    seq: number;
+    snapshot: Uint8Array;
+}
+
+/** Everything `EngineClient.recover()` hands the respawned worker. */
+export interface RecoveryLog {
+    /** Newest snapshot first; always ends with the snapshot-less base. */
+    candidates: RecoveryCandidate[];
+    /** Every retained command row, ascending. Candidate `c` replays the
+     *  rows with `seq > c.seq`. */
+    commands: LoggedCommand[];
+    /** Highest seq already consumed — the recovered worker resumes its
+     *  `logSequence` past it, never restarting at 0. */
+    lastSeq: number;
+    /** Issue #241 — `false` once pruning dropped the session's first
+     *  commands (the boot `RENDER_PAGE` among them): the snapshot-less
+     *  candidate can then no longer rebuild the document. */
+    logComplete: boolean;
 }
 
 /** Resolve when an `IDBRequest` succeeds; reject on error. */
@@ -85,6 +131,7 @@ export async function openEventLog(documentId: string): Promise<void> {
     tx.objectStore('commands').clear();
     tx.objectStore('snapshots').clear();
     tx.objectStore('meta').put({ id: 'document', documentId, openedAt: Date.now() });
+    tx.objectStore('meta').put({ id: PRUNED_ID, through: 0 } satisfies PrunedRow);
     await txDone(tx);
 }
 
@@ -100,7 +147,7 @@ export async function appendCommand(seq: number, cmd: Command): Promise<void> {
 /** Persist an engine snapshot, pruning all but the newest `SNAPSHOTS_KEPT`. */
 export async function persistSnapshot(seq: number, bytes: Uint8Array): Promise<void> {
     const db = await getDb();
-    const tx = db.transaction(['snapshots', 'commands'], 'readwrite');
+    const tx = db.transaction(['snapshots', 'commands', 'meta'], 'readwrite');
     const store = tx.objectStore('snapshots');
     const row: SnapshotRow = { seq, bytes };
     store.put(row);
@@ -109,7 +156,9 @@ export async function persistSnapshot(seq: number, bytes: Uint8Array): Promise<v
        issued synchronously inside onsuccess to stay within this transaction. */
     const keysReq = store.getAllKeys();
     keysReq.onsuccess = () => {
-        const pruned = keysReq.result.slice(0, -SNAPSHOTS_KEPT);
+        const keys = keysReq.result as number[];
+        const pruned = keys.slice(0, -SNAPSHOTS_KEPT);
+        const oldestRetained = keys.slice(-SNAPSHOTS_KEPT)[0];
         for (const key of pruned) {
             store.delete(key);
         }
@@ -117,54 +166,58 @@ export async function persistSnapshot(seq: number, bytes: Uint8Array): Promise<v
            reachable by replaying from that (now deleted) snapshot — every
            retained snapshot's tail starts strictly after its own seq — so
            drop them in the same transaction. Bounds the commands store to
-           roughly SNAPSHOTS_KEPT × SNAPSHOT_EVERY rows. */
+           roughly SNAPSHOTS_KEPT × SNAPSHOT_EVERY rows.
+           Issue #241 — only while a snapshot is retained (the one just
+           put always is: pruning never runs without a snapshot present),
+           and never past the oldest retained one, so every retained
+           snapshot keeps its full tail for the recovery fallback chain. */
         const newestPruned = pruned.at(-1);
-        if (newestPruned !== undefined) {
+        if (
+            newestPruned !== undefined &&
+            oldestRetained !== undefined &&
+            newestPruned < oldestRetained
+        ) {
             tx.objectStore('commands').delete(IDBKeyRange.upperBound(newestPruned));
+            const meta = tx.objectStore('meta');
+            const prev = meta.get(PRUNED_ID);
+            prev.onsuccess = () => {
+                const before = (prev.result as PrunedRow | undefined)?.through ?? 0;
+                const through = Math.max(before, newestPruned);
+                meta.put({ id: PRUNED_ID, through } satisfies PrunedRow);
+            };
         }
     };
     await txDone(tx);
 }
 
 /**
- * Newest snapshot plus the command tail recorded after it (§10.3). Consumed
- * by `EngineClient` on trap recovery. If no snapshot exists yet, returns an
- * empty snapshot and the full command log.
+ * Issue #85 / #241 — the recovery inputs (§10.3), consumed by
+ * `EngineClient` on trap recovery: every retained snapshot, newest first,
+ * then the snapshot-less base, plus every retained command row. The
+ * worker tries the candidates in order and keeps the first whose
+ * snapshot restores, so one unreadable snapshot row costs a longer
+ * replay instead of the document.
  */
-export async function loadLatestEventLog(documentId: string): Promise<{
-    snapshot: Uint8Array;
-    log: Command[];
-    snapshotSeq: number;
-    lastSeq: number;
-}> {
+export async function loadRecoveryLog(): Promise<RecoveryLog> {
     const db = await getDb();
+    const tx = db.transaction(['snapshots', 'commands', 'meta'], 'readonly');
+    const snapReq = tx.objectStore('snapshots').getAll();
+    const cmdReq = tx.objectStore('commands').getAll();
+    const prunedReq = tx.objectStore('meta').get(PRUNED_ID);
+    await txDone(tx);
 
-    const snapTx = db.transaction('snapshots', 'readonly');
-    const snapshots = (await reqToPromise(
-        snapTx.objectStore('snapshots').getAll(),
-    )) as SnapshotRow[];
-
-    let latest: SnapshotRow | undefined;
-    for (const row of snapshots) {
-        if (!latest || row.seq > latest.seq) latest = row;
-    }
-    const snapshotSeq = latest ? latest.seq : 0;
-
-    /* Commands with seq strictly greater than the snapshot's seq. */
-    const cmdTx = db.transaction('commands', 'readonly');
-    const tail = (await reqToPromise(
-        cmdTx.objectStore('commands').getAll(IDBKeyRange.lowerBound(snapshotSeq, true)),
-    )) as CommandRow[];
-
-    /* Highest seq the recovered worker has already consumed — it must resume
-       its `logSequence` past this, not restart at 0. getAll() yields rows in
-       ascending seq order, so the tail's last row holds the highest. */
-    const lastSeq = tail.at(-1)?.seq ?? snapshotSeq;
-
+    const snapshots = (snapReq.result as SnapshotRow[]).slice().sort((a, b) => b.seq - a.seq);
+    const commands = (cmdReq.result as CommandRow[]).map((row) => ({ seq: row.seq, cmd: row.cmd }));
+    const prunedThrough = (prunedReq.result as PrunedRow | undefined)?.through ?? 0;
+    const newestSnapshotSeq = snapshots[0]?.seq ?? 0;
     return {
-        snapshot: latest ? latest.bytes : new Uint8Array(0),
-        log: tail.map((row) => row.cmd),
-        snapshotSeq,
-        lastSeq,
+        candidates: [
+            ...snapshots.map((row) => ({ seq: row.seq, snapshot: row.bytes })),
+            { seq: 0, snapshot: new Uint8Array(0) },
+        ],
+        commands,
+        /* getAll() yields rows in ascending seq order. */
+        lastSeq: Math.max(commands.at(-1)?.seq ?? 0, newestSnapshotSeq),
+        logComplete: prunedThrough === 0,
     };
 }

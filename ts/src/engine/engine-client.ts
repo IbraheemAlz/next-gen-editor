@@ -16,7 +16,7 @@ import type {
     Event,
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
-import { loadLatestEventLog } from './event-log';
+import { loadRecoveryLog, type RecoveryLog } from './event-log';
 
 type WorkerReply = {
     ok: boolean;
@@ -35,6 +35,12 @@ type WorkerReply = {
     restored?: boolean;
     /** Issue #85 — RECOVER reply: replay-tail commands applied. */
     appliedCommands?: number;
+    /** Issue #241 — RECOVER reply: newer snapshots skipped because they
+     *  would not restore before one did (or the log base was used). */
+    snapshotFallbacks?: number;
+    /** Issue #241 — RECOVER reply: whether the event log still reached
+     *  back to the session's first command. */
+    logComplete?: boolean;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -93,6 +99,16 @@ export interface RecoveryInfo {
     /** Issue #99 — set when this generation was forced onto Canvas2D after
      *  a crash loop on Vello (the engine's echo on `Event::Recovered`). */
     rendererDowngrade: RendererDowngrade | undefined;
+    /** Issue #241 — persisted snapshots that were skipped (unreadable)
+     *  before the one that restored; `0` on an ordinary recovery. */
+    snapshotFallbacks: number;
+    /**
+     * Issue #241 — no snapshot restored AND pruning had already dropped
+     * the head of the command log, so the replay could not rebuild the
+     * document (only reachable when every retained snapshot is
+     * unreadable). The shell re-seeds; the flag makes the loss visible.
+     */
+    logTruncated: boolean;
 }
 
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
@@ -237,18 +253,22 @@ export class EngineClient {
     }
 
     /**
-     * Recover after a trap: load the latest snapshot + command tail, spawn a
-     * fresh worker, and replay via `Command::Recover`. `canvas` must be a
+     * Recover after a trap: load the persisted snapshots + command log,
+     * spawn a fresh worker, and replay via `Command::Recover` (newest
+     * snapshot first, falling back to older ones — issue #241). `canvas` must be a
      * brand-new OffscreenCanvas — the trapped surface is gone.
      */
     async recover(canvas: OffscreenCanvas): Promise<void> {
         /* An event-log read failure (IndexedDB rejection / corruption) must
            not strand a dead client — respawn with an empty log instead. */
-        const { snapshot, log, snapshotSeq, lastSeq } = await loadLatestEventLog(
-            this.documentId,
-        ).catch((e: unknown): { snapshot: Uint8Array; log: Command[]; snapshotSeq: number; lastSeq: number } => {
+        const recoveryLog = await loadRecoveryLog().catch((e: unknown): RecoveryLog => {
             console.error('event log unreadable; recovering with an empty log', e);
-            return { snapshot: new Uint8Array(0), log: [], snapshotSeq: 0, lastSeq: 0 };
+            return {
+                candidates: [{ seq: 0, snapshot: new Uint8Array(0) }],
+                commands: [],
+                lastSeq: 0,
+                logComplete: false,
+            };
         });
         /* Issue #99 — N traps in a row on Vello: stop re-probing the GPU
            (it would pick Vello again and crash-loop) and force Canvas2D for
@@ -274,16 +294,19 @@ export class EngineClient {
             {
                 type: 'RECOVER',
                 canvas,
-                snapshot,
-                log,
-                snapshotSeq,
-                lastSeq,
+                candidates: recoveryLog.candidates,
+                commands: recoveryLog.commands,
+                lastSeq: recoveryLog.lastSeq,
+                logComplete: recoveryLog.logComplete,
                 ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
                 ...(this.downgrade
                     ? { forceRenderer: 'canvas2d', rendererDowngrade: this.downgrade }
                     : {}),
             },
-            [canvas, snapshot.buffer as ArrayBuffer],
+            [
+                canvas,
+                ...new Set(recoveryLog.candidates.map((c) => c.snapshot.buffer as ArrayBuffer)),
+            ],
         );
         if (!r.ok) throw new Error(r.error);
         this.activeRenderer = r.renderer ?? 'canvas2d';
@@ -297,7 +320,15 @@ export class EngineClient {
             deviceScale,
             layoutRestored: r.restored === true || deviceScale !== undefined,
             rendererDowngrade: recovered?.renderer_downgrade,
+            snapshotFallbacks: r.snapshotFallbacks ?? 0,
+            logTruncated: r.restored !== true && r.logComplete === false,
         };
+        if (this.lastRecoveryInfo.logTruncated) {
+            console.error(
+                '[recovery] no persisted snapshot restored and the event log was pruned — ' +
+                    'the document could not be rebuilt',
+            );
+        }
         this.armStableTimer();
     }
 

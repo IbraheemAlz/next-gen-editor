@@ -7,6 +7,7 @@ import type {
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
+import type { LoggedCommand, RecoveryCandidate } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
    GitHub Pages /next-gen-editor/); `?url` imports are hashed + base-aware. */
@@ -48,10 +49,14 @@ type ClientRecoverMsg = {
     id: number;
     type: 'RECOVER';
     canvas: OffscreenCanvas;
-    snapshot: Uint8Array;
-    log: Command[];
-    snapshotSeq: number;
+    /** Issue #241 — bases to try, newest snapshot first, ending with the
+     *  snapshot-less log base (see `event-log.ts` `loadRecoveryLog`). */
+    candidates: RecoveryCandidate[];
+    /** Every retained logged command, ascending by seq. */
+    commands: LoggedCommand[];
     lastSeq: number;
+    /** Issue #241 — the log still reaches back to the first command. */
+    logComplete: boolean;
     /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
     mockBackend?: 'vello';
     /** Issue #99 — crash-loop fallback: boot this generation on Canvas2D
@@ -909,9 +914,46 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
         /* Resume the event-log sequence past what was already persisted, so
            post-recovery appends don't collide with or shadow prior rows. */
         logSequence = msg.lastSeq;
-        lastSnapshotAt = msg.snapshotSeq;
         trapAfterCommands = null;
-        /* Issue #43 — a recovered engine needs the render date again. */
+        /* Issue #85 — base snapshot + replayed tail, inside the engine.
+           Issue #241 — the candidates are tried newest first: a snapshot
+           that does not restore (unreadable row) falls back to the next
+           older one with its longer tail — every retained snapshot keeps
+           its full tail (`persistSnapshot`'s pruning invariant) — and
+           finally to the bare log. `Command::Recover` starts from a reset
+           engine every time, so a failed attempt leaves nothing behind. */
+        let evt: Event | undefined;
+        let base: RecoveryCandidate | undefined;
+        let snapshotFallbacks = 0;
+        for (const candidate of msg.candidates) {
+            const tail = msg.commands.filter((c) => c.seq > candidate.seq).map((c) => c.cmd);
+            evt = await dispatch({
+                type: 'RECOVER',
+                snapshot: candidate.snapshot,
+                log_tail: tail,
+                ...(msg.rendererDowngrade ? { renderer_downgrade: msg.rendererDowngrade } : {}),
+            });
+            base = candidate;
+            const usable =
+                evt.type === 'RECOVERED' &&
+                (evt.snapshot_restored || candidate.snapshot.length === 0);
+            if (usable) break;
+            snapshotFallbacks += 1;
+            console.warn(
+                `[worker] recovery: snapshot @${candidate.seq} did not restore; ` +
+                    'falling back to the next older base',
+            );
+        }
+        if (!evt) throw new Error('recovery: no base to recover from');
+        /* The replay tail of the NEXT recovery starts after the base this
+           one actually restored (0 = none: the next logged command then
+           takes a snapshot straight away — `seq - 0 ≥ SNAPSHOT_EVERY`
+           once the log is long). */
+        lastSnapshotAt =
+            evt.type === 'RECOVERED' && evt.snapshot_restored ? (base?.seq ?? 0) : 0;
+        /* Issue #43 — a recovered engine needs the render date again.
+           Dispatched AFTER `RECOVER`: its session reset wipes the clock
+           half (TIME fields), so an injection ahead of it was lost. */
         const now = new Date();
         await dispatch({
             type: 'SET_RENDER_DATE',
@@ -920,13 +962,6 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             day: now.getDate(),
             hour: now.getHours(),
             minute: now.getMinutes(),
-        });
-        /* Issue #85 — base snapshot + replayed tail, inside the engine. */
-        const evt = await dispatch({
-            type: 'RECOVER',
-            snapshot: msg.snapshot,
-            log_tail: msg.log,
-            ...(msg.rendererDowngrade ? { renderer_downgrade: msg.rendererDowngrade } : {}),
         });
         const recovered = evt.type === 'RECOVERED' ? evt : undefined;
         /* DEV mock (issue #99): the engine truthfully says `canvas2d`;
@@ -953,6 +988,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             renderer,
             restored,
             appliedCommands: recovered?.applied_commands ?? 0,
+            snapshotFallbacks,
+            logComplete: msg.logComplete,
         });
         /* §10 — the recovered engine has no a11y cache, so this delta is a
            full `Replace`: the mirror DOM rebuilds from the restored tree
