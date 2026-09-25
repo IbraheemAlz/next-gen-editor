@@ -3687,13 +3687,22 @@ fn attach_block_paths(
 ///    paragraphs with no explicit setting.
 /// 3. `cfg.base_direction` — document-wide default seeded at boot.
 fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingDirection {
+    paragraph_base_direction(p, cfg.base_direction)
+}
+
+/// The precedence of [`resolve_base_direction`] against an explicit
+/// document-base `fallback` — the single resolution shared by layout, the
+/// caret's paragraph-direction read-back and the accessibility mirror
+/// (issue #195), so the screen reader's `dir` can never disagree with the
+/// direction the paragraph was laid out in.
+fn paragraph_base_direction(p: &engine::Paragraph, fallback: ShapingDirection) -> ShapingDirection {
     if let Some(d) = p.props.direction {
         return match d {
             engine::TextDirection::Ltr => ShapingDirection::Ltr,
             engine::TextDirection::Rtl => ShapingDirection::Rtl,
         };
     }
-    first_strong_direction(&p.text).unwrap_or(cfg.base_direction)
+    first_strong_direction(&p.text).unwrap_or(fallback)
 }
 
 /// Pull the four Phase-2 indent fields off `para.props`, convert to layout
@@ -5828,8 +5837,19 @@ fn push_a11y_paragraph(
     scope: A11yScope<'_>,
     path: &str,
 ) {
+    /* Issue #195 — the paragraph's OWN base direction (explicit bidi →
+    first-strong → document base), exactly as layout resolves it. */
+    let fallback = match direction {
+        Direction::Rtl => ShapingDirection::Rtl,
+        Direction::Ltr => ShapingDirection::Ltr,
+    };
+    let resolved_direction = match paragraph_base_direction(p, fallback) {
+        ShapingDirection::Rtl => Direction::Rtl,
+        ShapingDirection::Ltr => Direction::Ltr,
+    };
     out.push(A11yNode::Paragraph(A11yParagraph {
         direction,
+        resolved_direction,
         runs: a11y_runs(p),
     }));
     if scope.depth >= MAX_TEXT_BOX_LAYOUT_DEPTH {
@@ -10950,22 +10970,16 @@ impl Engine {
     ///    always carry a config once `render_document` has run).
     fn paragraph_direction_at(&self, path: &BridgeBlockPath) -> ShapingDirection {
         let engine_path = bridge_to_engine_path(path.clone());
-        let resolved = self.with_selection_doc(|d| {
-            let p = d.paragraph_at_path(&engine_path)?;
-            if let Some(dir) = p.props.direction {
-                return Some(match dir {
-                    engine::TextDirection::Ltr => ShapingDirection::Ltr,
-                    engine::TextDirection::Rtl => ShapingDirection::Rtl,
-                });
-            }
-            first_strong_direction(&p.text)
-        });
-        resolved.unwrap_or_else(|| {
-            self.layout_cfg
-                .as_ref()
-                .map(|c| c.base_direction)
-                .unwrap_or(ShapingDirection::Ltr)
+        let fallback = self
+            .layout_cfg
+            .as_ref()
+            .map(|c| c.base_direction)
+            .unwrap_or(ShapingDirection::Ltr);
+        self.with_selection_doc(|d| {
+            d.paragraph_at_path(&engine_path)
+                .map(|p| paragraph_base_direction(p, fallback))
         })
+        .unwrap_or(fallback)
     }
 
     /// Tri-state paragraph direction across the selection: `Some(dir)`
@@ -15693,6 +15707,7 @@ mod tests {
     fn a11y_para(text: &str) -> A11yNode {
         A11yNode::Paragraph(A11yParagraph {
             direction: Direction::Ltr,
+            resolved_direction: Direction::Ltr,
             runs: vec![A11yRun {
                 text: text.to_string(),
                 bold: false,
@@ -22180,6 +22195,9 @@ mod snapshot_tests {
 /// allocation, and the selection invariant holds after every command.
 #[cfg(test)]
 mod mutation_signal_tests;
+
+#[cfg(test)]
+mod a11y_direction_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

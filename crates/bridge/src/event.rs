@@ -724,7 +724,16 @@ pub struct A11yStory {
 /// matches paragraphs by content and the patches address them by position.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 pub struct A11yParagraph {
+    /// The DOCUMENT base direction (the layout config's), identical on
+    /// every paragraph. Kept for existing consumers; the mirror's per-`<p>`
+    /// `dir` reads [`Self::resolved_direction`].
     pub direction: Direction,
+    /// Issue #195 — THIS paragraph's resolved base direction, by the same
+    /// precedence layout uses: explicit paragraph direction (`<w:bidi>`),
+    /// then UAX #9 first-strong auto-direction, then the document base.
+    /// Region paragraphs (text box, header / footer) resolve on their own
+    /// and inherit nothing from their anchor. Additive.
+    pub resolved_direction: Direction,
     pub runs: Vec<A11yRun>,
 }
 
