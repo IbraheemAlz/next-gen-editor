@@ -17673,6 +17673,7 @@ mod tests {
                 id: "Heading1".into(),
                 name: "Heading 1".into(),
                 based_on: None,
+                next: None,
                 para: engine::ParaProperties::default(),
                 run: engine::SpanStyle {
                     bold: Some(true),
@@ -25622,9 +25623,41 @@ mod snapshot_tests {
     /// so paragraph 1 lands as a fully-contained middle paragraph of
     /// `DocumentTree::slice` — cloned verbatim, `style_id` intact.
     /// Selecting *within* a single paragraph goes through
-    /// `Paragraph::split_at` instead, which drops `style_id` on both
-    /// halves unconditionally (issue discovered by this task; see the
-    /// final report's "Discovered gaps").
+    /// `Paragraph::split_at`, which keeps `style_id` since issue #277 —
+    /// see `clipboard_docx_fragment_of_a_sub_range_keeps_the_style`.
+    /// Issue #277 — a copy of a sub-range INSIDE one styled paragraph
+    /// (`slice` → `Paragraph::split_at` twice) keeps the paragraph style:
+    /// `split_at` used to clear `style_id` on both halves, so the fragment
+    /// carried a bare paragraph even though #213 shipped the style table.
+    #[test]
+    fn clipboard_docx_fragment_of_a_sub_range_keeps_the_style() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        assert_eq!(e.undo.current().paragraph_text(1), Some("first item"));
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(1, 2),
+            caret: bpos_top(1, 8),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload { docx_fragment, .. } = e.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        let reread = format_docx::read_docx(&docx_fragment).expect("re-read fragment");
+        assert_eq!(reread.document.paragraph_text(0), Some("rst it"));
+        assert_eq!(
+            reread
+                .document
+                .nth_paragraph(0)
+                .unwrap()
+                .style_id
+                .as_deref(),
+            Some("ListParagraph"),
+            "a sub-range copy keeps the paragraph style"
+        );
+        assert!(reread.document.styles.contains_key("ListParagraph"));
+    }
+
     #[test]
     fn clipboard_docx_fragment_carries_the_source_packages_styles() {
         let mut e = opened_engine(PACKAGE_FIXTURE);
@@ -25935,6 +25968,9 @@ mod mutation_signal_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;
+
+#[cfg(test)]
+mod para_style_edit_tests;
 
 /// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
 /// `format_pdf::export_pdf` path, end to end (not the #144 acceptance

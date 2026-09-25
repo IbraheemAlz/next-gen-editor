@@ -332,6 +332,12 @@ pub struct ParagraphStyle {
     /// `<w:rPr>` overrides this style contributes — applied to spans
     /// during cascade resolution since issue #29 (closed).
     pub run: SpanStyle,
+    /// Issue #277 — `<w:next w:val>`: the style Word gives the NEW
+    /// paragraph when Enter is pressed at the very end of a paragraph
+    /// in this style (Heading 1 → Normal). `None` ⇒ the same style.
+    /// Skipped when `None`, so a pre-#277 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// Phase 8a — author + date + body for one entry of `word/comments.xml`.
@@ -3576,8 +3582,12 @@ impl Paragraph {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields,
-            style_id: None,
-            direct_overrides: ParaProperties::default(),
+            /* Issue #277 — the paragraph style binding and the direct
+            paragraph formatting are not offset-anchored (same class as
+            `apply_style`, issue #56): deleting characters inside a
+            Heading must not demote it to an unstyled paragraph. */
+            style_id: self.style_id.clone(),
+            direct_overrides: self.direct_overrides.clone(),
             /* Phase 3 (#40) — NOT cleared with the overlays above: the
             marker has no byte offsets and the paragraph mark survives
             an in-paragraph character deletion. */
@@ -3682,8 +3692,14 @@ impl Paragraph {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: fields_left,
-                style_id: None,
-                direct_overrides: ParaProperties::default(),
+                /* Issue #277 — both halves keep the paragraph style and
+                the direct paragraph formatting (Word: a mid-paragraph
+                split leaves two paragraphs in the same style). The
+                next-style rule for Enter at the paragraph END is
+                `DocumentTree::split_paragraph`'s business, not this
+                primitive's (a clipboard slice must keep the style). */
+                style_id: self.style_id.clone(),
+                direct_overrides: self.direct_overrides.clone(),
                 /* Phase 3 (#40) — the LEFT half receives a brand-new
                 paragraph mark; the original mark (and any section
                 marker riding it) belongs to the right half. */
@@ -3710,8 +3726,8 @@ impl Paragraph {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: fields_right,
-                style_id: None,
-                direct_overrides: ParaProperties::default(),
+                style_id: self.style_id.clone(),
+                direct_overrides: self.direct_overrides.clone(),
                 /* Phase 3 (#40) — the ORIGINAL paragraph mark terminates
                 the right half, so a section marker travels with it. */
                 section_end: self.section_end.clone(),
@@ -7142,6 +7158,16 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #277 — the style a paragraph created by Enter at the end
+    /// of a `style_id` paragraph takes: the style's `<w:next>` when it
+    /// names a DIFFERENT style this document defines, else `None`
+    /// (keep the same style).
+    pub fn next_style_after(&self, style_id: Option<&str>) -> Option<String> {
+        let id = style_id?;
+        let next = self.styles.get(id)?.next.as_deref()?;
+        (next != id && self.styles.contains_key(next)).then(|| next.to_owned())
+    }
+
     /// Sprint 12 (#11) — resolve the paragraph cascade for `style_id`
     /// into a flat `ParaProperties`. Cycle-safe (visited set) +
     /// depth-capped at [`MAX_STYLE_CHAIN`] entries, matching ECMA-376
@@ -8560,7 +8586,19 @@ impl DocumentTree {
         let Some(p) = self.paragraph_at_path(&at.path) else {
             return self.clone();
         };
-        let (left, right) = p.split_at(at.offset);
+        let (left, mut right) = p.split_at(at.offset);
+        /* Issue #277 — Word's "next style" rule: Enter at the very END
+        of a paragraph gives the NEW paragraph its style's `<w:next>`
+        (Heading 1 → Normal); a split anywhere else keeps the style on
+        both halves (`split_at`). An unknown / absent next keeps the
+        same style. The direct paragraph formatting and the list binding
+        survive the switch, exactly as `set_paragraph_style` keeps them. */
+        if p.snap_offset(at.offset) as usize == p.text.len()
+            && let Some(next) = self.next_style_after(right.style_id.as_deref())
+        {
+            right.style_id = Some(next);
+            recompute_paragraph_props(&mut right, &self.styles, &self.style_defaults);
+        }
         replace_block_in_top(&mut blocks, &at.path, Block::Paragraph(left));
         insert_block_after_path_in_top(&mut blocks, &at.path, Block::Paragraph(right));
         let mut split = Self {
@@ -11566,6 +11604,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         d
@@ -11646,6 +11685,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         d.styles.insert(
@@ -11660,6 +11700,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         let p0 = LogicalPos {
@@ -12458,6 +12499,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         let mut para = doc.nth_paragraph(0).unwrap().clone();

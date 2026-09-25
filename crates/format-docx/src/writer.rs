@@ -563,6 +563,12 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
             push_escaped_attr(parent, &mut out);
             out.push_str("\"/>");
         }
+        /* Issue #277 — CT_Style order: name, aliases, basedOn, next. */
+        if let Some(next) = &def.next {
+            out.push_str("<w:next w:val=\"");
+            push_escaped_attr(next, &mut out);
+            out.push_str("\"/>");
+        }
         emit_ppr(&def.para, None, None, None, None, &mut out);
         emit_rpr(&def.run, &mut out);
         out.push_str("</w:style>");
@@ -6719,6 +6725,30 @@ mod tests {
         let mut out = String::new();
         serialize_paragraph(&para, &mut out, &HashMap::new());
         assert!(!out.contains("widowControl"), "{out}");
+    }
+
+    /// Issue #277 — a regenerated `styles.xml` keeps `<w:next>` (after
+    /// `<w:basedOn>`, CT_Style order) and the reader maps it back.
+    #[test]
+    fn styles_xml_round_trips_the_next_style() {
+        let mut doc = engine::DocumentTree::default();
+        doc.styles.insert(
+            "Heading1".into(),
+            engine::ParagraphStyle {
+                id: "Heading1".into(),
+                name: "heading 1".into(),
+                based_on: Some("Normal".into()),
+                next: Some("Normal".into()),
+                ..Default::default()
+            },
+        );
+        let xml = String::from_utf8(build_styles_xml(&doc)).expect("utf8");
+        assert!(
+            xml.contains(r#"<w:basedOn w:val="Normal"/><w:next w:val="Normal"/>"#),
+            "{xml}"
+        );
+        let table = crate::parts::styles::parse_styles_xml(xml.as_bytes()).expect("parse");
+        assert_eq!(table.by_id["Heading1"].next.as_deref(), Some("Normal"));
     }
 
     #[test]

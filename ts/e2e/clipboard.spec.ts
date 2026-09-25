@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { inflateRawSync } from 'node:zlib';
 
 /* Issue #48 — silent clipboard copy failure.
  *
@@ -321,4 +322,84 @@ test('drag-selection traffic prefetches at most at the debounce rate', async ({ 
     expect(during, 'prefetches for one settled drag').toBeLessThanOrEqual(2);
     expect(stats.allSkippedDocx).toBe(true);
     expect(stats.warm).toBe(true);
+});
+
+/** Read one entry of a (deflate / stored) zip — enough to inspect a
+ *  clipboard `.docx` fragment's `word/document.xml`. */
+function zipEntry(zip: Uint8Array, name: string): string {
+    const buf = Buffer.from(zip);
+    let eocd = -1;
+    for (let i = buf.length - 22; i >= 0; i--) {
+        if (buf.readUInt32LE(i) === 0x06054b50) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd < 0) throw new Error('zipEntry: no end-of-central-directory record');
+    const count = buf.readUInt16LE(eocd + 10);
+    let at = buf.readUInt32LE(eocd + 16);
+    for (let n = 0; n < count; n++) {
+        const method = buf.readUInt16LE(at + 10);
+        const size = buf.readUInt32LE(at + 20);
+        const nameLen = buf.readUInt16LE(at + 28);
+        const extraLen = buf.readUInt16LE(at + 30);
+        const commentLen = buf.readUInt16LE(at + 32);
+        const local = buf.readUInt32LE(at + 42);
+        const entryName = buf.toString('utf8', at + 46, at + 46 + nameLen);
+        if (entryName === name) {
+            const dataAt =
+                local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+            const raw = buf.subarray(dataAt, dataAt + size);
+            return (method === 8 ? inflateRawSync(raw) : raw).toString('utf8');
+        }
+        at += 46 + nameLen + extraLen + commentLen;
+    }
+    throw new Error(`zipEntry: ${name} not found`);
+}
+
+/* Issue #277 — `Paragraph::split_at` cleared `style_id` on both halves, so
+ * a `.docx` fragment copied from INSIDE a styled paragraph carried a bare
+ * paragraph, and Enter in the middle of a heading demoted both halves. */
+test('a sub-range copy and Enter inside a heading keep the paragraph style', async ({
+    page,
+}) => {
+    await boot(page);
+    const out = await page.evaluate(async () => {
+        const dispatch = (window as any).__dispatch;
+        const pos = (idx: number, offset: number) => ({
+            path: { steps: [{ kind: 'BLOCK', idx }] },
+            offset,
+        });
+        const caret = (idx: number, offset: number) =>
+            dispatch({
+                type: 'SET_SELECTION',
+                range: { start: pos(idx, offset), end: pos(idx, offset) },
+                caret: pos(idx, offset),
+            });
+        await caret(0, 0);
+        await dispatch({
+            type: 'APPLY_STYLE',
+            range: { start: pos(0, 0), end: pos(0, 0) },
+            style_id: 'Heading1',
+        });
+        await dispatch({
+            type: 'SET_SELECTION',
+            range: { start: pos(0, 1), end: pos(0, 4) },
+            caret: pos(0, 4),
+        });
+        const clip = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+        await caret(0, 2);
+        await dispatch({ type: 'SPLIT_PARAGRAPH', at: undefined });
+        const left = await caret(0, 0);
+        const right = await caret(1, 0);
+        return {
+            fragment: Array.from(clip.docx_fragment as Uint8Array),
+            left: left.paragraph_style_id as string | undefined,
+            right: right.paragraph_style_id as string | undefined,
+        };
+    });
+    const documentXml = zipEntry(Uint8Array.from(out.fragment), 'word/document.xml');
+    expect(documentXml).toContain('<w:pStyle w:val="Heading1"/>');
+    expect(out.left).toBe('Heading1');
+    expect(out.right).toBe('Heading1');
 });
