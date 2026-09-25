@@ -25,6 +25,9 @@ use crate::boxes::{
     Size, TableBox, TableRowBox,
 };
 use crate::page::Margins;
+use crate::table_split::{
+    recompute_vmerge_spans, restack_rows, restub_continuation, row_units, split_row_in_cells,
+};
 use crate::watchdog::{BlockFingerprint, DegradeReason, DegradeStage, LayoutDegradation, Watchdog};
 use engine::{NoteAnchor, NotePosition};
 use std::collections::{HashMap, VecDeque};
@@ -825,11 +828,8 @@ impl Paginator {
         above its own note), so even a paragraph that fits by height
         alone may split once its notes are counted. A paragraph that
         does not fit turns into N pages, not one overflowing bag of
-        content. Tables stay atomic on an empty page: the line-splitter
-        doesn't apply, and a table taller than a full page is a rare
-        authoring decision the user took deliberately. */
-        let is_paragraph = matches!(block, LayoutBlock::Paragraph(_));
-        let atomic_overflow_ok = !is_paragraph && self.cur_blocks.is_empty();
+        content. Tables that do not fit split at row boundaries (issue
+        #91 — see `push_table_split`). */
         /* Phase 2 audit (gap A.12) — paragraphs carrying a forced
         page break (`\u{000C}` FORM FEED → `page_break_after_line`
         populated by the layout pass) must always route through the
@@ -864,16 +864,15 @@ impl Paginator {
                         anchors,
                     }],
                     remaining,
-                    atomic_overflow_ok,
+                    self.cur_blocks.is_empty(),
                 );
-                if plan.count == 1 || atomic_overflow_ok {
-                    /* Issue #87 — an atomic table taller than the budget
-                    clips past the bottom margin. Same placement as
-                    before; now the paint says so. */
-                    if block_height > remaining {
-                        let page = self.cur_page_index();
-                        self.watchdog.note(DegradeReason::OversizeLine, page);
-                    }
+                /* Issue #91 — a table that fits where it lands is placed
+                whole (the nominal path, output-identical to before).
+                Anything else — too tall for the rest of this page, or for
+                a fresh one — goes through the row-split path. (`plan.count`
+                can read 1 for a too-tall table on a fresh page: the note
+                waiver forces the first item. Height decides.) */
+                if plan.count == 1 && block_height <= remaining {
                     self.commit_plan(plan);
                     /* Audit gap A.H2 — origin.x carries the column offset
                     for multi-column sections (zero for single-column,
@@ -1508,71 +1507,282 @@ impl Paginator {
         }
     }
 
+    /// Issue #91 — the table row-split path, reached whenever a table
+    /// does not fit where it lands (the rest of the page, or a fresh
+    /// one). The decisions, in order:
+    ///
+    /// 1. **Fit units.** Rows are grouped into indivisible units (a
+    ///    vertical merge is one unit) and run through the #80 deadline
+    ///    fitter, so a row's footnotes reserve band space when it lands
+    ///    and a row whose note cannot fit moves on.
+    /// 2. **Split at a unit boundary** when at least one body row fits
+    ///    under the header rows: the head stays here, the tail — the
+    ///    header rows cloned on top (`<w:tblHeader>` repeat), then the
+    ///    remaining rows — re-enters the flow on the next column / page.
+    ///    Rows are never cut below the page height: a row that does not
+    ///    fit the rest of the page moves whole (`<w:cantSplit>` or not).
+    /// 3. **No body row fits on a page that already holds content**: the
+    ///    whole table moves (with a keep-with-next chain ending before
+    ///    it), exactly the pre-#91 behaviour.
+    /// 4. **No body row fits on a fresh page** — something is taller
+    ///    than the page: see [`Self::push_table_split_fresh`].
+    ///
+    /// Termination: every re-push carries strictly less content (fewer
+    /// rows, or — for a row continued in its cells — fewer lines), the
+    /// move in (3) lands on a fresh page where (4) always places
+    /// something, and the watchdog's fingerprint counts rows + cell
+    /// lines ([`BlockFingerprint::of`]) as the backstop.
     fn push_table_split(&mut self, table: TableBox, after: f32, observe: bool) {
-        /* If the table is non-empty, try moving the *whole* table to a new
-        column (or, when no further columns exist, a new page) first —
-        that handles the common "table just barely overflows the column
-        footer" case without an ugly row split. Audit gap A.H2 — the
-        snake advance keeps the table inside the current page when a
-        sibling column has room. */
-        if !self.cur_blocks.is_empty() {
-            /* Issue #87 — a keep-with-next chain ending right before
-            this table travels with it. */
-            self.advance_with_keep_chain(LayoutBlock::Table(table), after, observe);
+        let fresh = self.cur_blocks.is_empty();
+        if table.rows.is_empty() {
+            self.place_atomic(LayoutBlock::Table(table), after);
             return;
         }
-
-        /* The page is empty and the table is still taller than a page —
-        emit row-by-row splits.
-
-        Audit gap C.M2 — `<w:trPr><w:cantSplit/>` honour. The current
-        implementation already keeps every row atomic (no mid-row
-        paragraph split), so `cant_split=true` is the default
-        behaviour. The flag is threaded through `TableRowBox` for
-        when the mid-cell split lands in a follow-up sprint; the
-        check below mirrors what the future split path will do. */
-        let mut head_rows = Vec::new();
-        let mut head_height = 0.0_f32;
-        let mut tail_rows = Vec::new();
-        let mut tail_height = 0.0_f32;
-        /* Design review M3 — an "empty" page no longer implies
-        `cur_y == 0`: the header-intrusion opening offset (and any
-        footer intrusion) already consumed budget. The old bare
-        `content_height()` here silently seated rows into the footer
-        band on intruded pages. */
         let budget = self.body_budget();
-        /* Issue #80 — rows are the fitter's items here: a row's notes
-        reserve band space when the row lands, and the first row is
-        forced (clipping) so an oversize row cannot loop. */
+        let lead_headers = table.rows.iter().take_while(|r| r.header).count();
+        let units = row_units(&table.rows);
         let mut bottom = 0.0_f32;
-        let items: Vec<FlowItem> = table
-            .rows
+        let items: Vec<FlowItem> = units
             .iter()
-            .map(|r| {
-                bottom += r.size.height;
+            .map(|&(s, e)| {
+                let rows = &table.rows[s..e];
+                bottom += rows.iter().map(|r| r.size.height).sum::<f32>();
                 FlowItem {
                     bottom,
-                    anchors: anchors_in_row(r),
+                    anchors: rows.iter().flat_map(anchors_in_row).collect(),
                 }
             })
             .collect();
-        let plan = self.fit_items(&items, budget, true);
-        let head_count = plan.count.max(1).min(table.rows.len());
-        self.commit_plan(plan);
-        for (idx, row) in table.rows.iter().enumerate() {
-            let row_h = row.size.height;
-            if idx < head_count {
-                let mut r = row.clone();
-                r.origin.y = head_height;
-                head_rows.push(r);
-                head_height += row_h;
+        let plan = self.fit_items(&items, budget, fresh);
+        let fitted_rows = plan.count.checked_sub(1).map_or(0, |k| units[k].1);
+        if fitted_rows >= table.rows.len() {
+            /* Everything fits with its notes (a caller re-routed a table
+            that only overran by its note reservation, now resolved by
+            a note split). */
+            self.commit_plan(plan);
+            self.place_atomic(LayoutBlock::Table(table), after);
+            return;
+        }
+        if fitted_rows > lead_headers {
+            self.commit_plan(plan);
+            let repeat = table.rows[..lead_headers].to_vec();
+            self.emit_table_fragments(&table, fitted_rows, None, repeat, false, after, observe);
+            return;
+        }
+        if !fresh {
+            /* Not one body row fits under the headers here: move the whole
+            table to the next column / page (a trailing keep-with-next
+            chain travels with it — issue #87). */
+            self.advance_with_keep_chain(LayoutBlock::Table(table), after, observe);
+            return;
+        }
+        self.push_table_split_fresh(table, lead_headers, &units, fitted_rows, after, observe);
+    }
+
+    /// Issue #91 — step (4) of [`Self::push_table_split`]: a fresh page
+    /// on which not one body unit fits under the header rows. Each branch
+    /// places at least one row (or one row's first lines), so the flow
+    /// always advances:
+    ///
+    /// - **The header rows themselves overrun the page** (the #7 class):
+    ///   they are placed alone (the first one clipped when nothing fits —
+    ///   `OversizeLine`) and the repeat is dropped for the continuation
+    ///   (`HeaderRepeatDropped`, #87 stage (a)).
+    /// - **A merge group taller than the room**: it is broken at the
+    ///   deepest row boundary that fits (the only cut that ever lands
+    ///   inside a group; the continuation gets a stub cell).
+    /// - **A single row taller than the room a fresh page has under the
+    ///   header rows** (the page itself when there are none): continued
+    ///   inside its cells at a line boundary — the header rows stay above
+    ///   the head fragment and repeat above the tail. This is the only
+    ///   place a row is ever cut; below the page height rows move whole.
+    /// - **That row is `<w:cantSplit>` but fits a page without the
+    ///   headers**: the #87 release rule — the headers stay on this page
+    ///   and the continuation drops the repeat, so it strictly shrinks.
+    /// - **That row is taller than a page and `<w:cantSplit>`, or no cell
+    ///   can place a single line**: placed atomically under the headers,
+    ///   clipping (`OversizeLine`); the rest of the table continues, the
+    ///   headers repeated, on the next page.
+    fn push_table_split_fresh(
+        &mut self,
+        table: TableBox,
+        lead_headers: usize,
+        units: &[(usize, usize)],
+        fitted_rows: usize,
+        after: f32,
+        observe: bool,
+    ) {
+        let budget = self.body_budget();
+        let header_h: f32 = table.rows[..lead_headers]
+            .iter()
+            .map(|r| r.size.height)
+            .sum();
+
+        /* The header rows do not all fit on a page of their own. */
+        if fitted_rows < lead_headers {
+            let cut = if fitted_rows > 0 {
+                fitted_rows
             } else {
-                let mut r = row.clone();
-                r.origin.y = tail_height;
-                tail_rows.push(r);
-                tail_height += row_h;
+                units[0].1
+            };
+            let head_h: f32 = table.rows[..cut].iter().map(|r| r.size.height).sum();
+            if head_h > budget {
+                let page = self.cur_page_index();
+                self.watchdog.note(DegradeReason::OversizeLine, page);
+            }
+            self.commit_forced_rows(&table.rows[..cut], head_h, budget);
+            self.release_header_repeat(&table, cut);
+            self.emit_table_fragments(&table, cut, None, Vec::new(), false, after, observe);
+            return;
+        }
+
+        let avail = budget - header_h;
+        let Some(&(s, e)) = units.iter().find(|&&(s, _)| s >= lead_headers) else {
+            /* Header rows only (a table with nothing but headers that
+            overran by its note reservation): place it. */
+            self.commit_forced_rows(&table.rows, table.size.height, budget);
+            self.place_atomic(LayoutBlock::Table(table), after);
+            return;
+        };
+        let repeat = table.rows[..lead_headers].to_vec();
+
+        /* A merge group taller than the room: break it at the deepest
+        row boundary that fits. */
+        if e - s > 1 {
+            let mut used = 0.0_f32;
+            let mut k = 0usize;
+            for r in &table.rows[s..e] {
+                if used + r.size.height > avail {
+                    break;
+                }
+                used += r.size.height;
+                k += 1;
+            }
+            if k > 0 {
+                let cut = s + k;
+                let head_h = header_h + used;
+                self.commit_forced_rows(&table.rows[..cut], head_h, budget);
+                self.emit_table_fragments(&table, cut, None, repeat, true, after, observe);
+                return;
             }
         }
+
+        /* One row taller than the room a fresh page has under the header
+        rows: continue it inside its cells. */
+        let row = &table.rows[s];
+        if !row.cant_split
+            && let Some(split) = split_row_in_cells(row, avail)
+        {
+            let head_rows: Vec<TableRowBox> = table.rows[..s]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(split.head))
+                .collect();
+            let head_h: f32 = head_rows.iter().map(|r| r.size.height).sum();
+            self.commit_forced_rows(&head_rows, head_h, budget);
+            self.emit_table_fragments(
+                &table,
+                s + 1,
+                Some((head_rows, split.tail)),
+                repeat,
+                true,
+                after,
+                observe,
+            );
+            return;
+        }
+        if lead_headers > 0 && row.size.height <= budget {
+            /* A `cantSplit` row that fits a page only without the headers:
+            release rule — the headers stay here and the row gets a
+            headerless fresh page. */
+            self.commit_forced_rows(&table.rows[..s], header_h, budget);
+            self.release_header_repeat(&table, s);
+            self.emit_table_fragments(&table, s, None, Vec::new(), false, after, observe);
+            return;
+        }
+        /* A row taller than a whole page that must not (`cantSplit`) or
+        cannot (no cell places a line) be cut: atomic under the header
+        rows, clipped at the bottom margin — it clips wherever it lands,
+        so the headers keep it company rather than taking a page of
+        their own. The rest of the table continues (headers repeated) on
+        the next page. */
+        let page = self.cur_page_index();
+        self.watchdog.note(DegradeReason::OversizeLine, page);
+        self.commit_forced_rows(&table.rows[..=s], header_h + row.size.height, budget);
+        self.emit_table_fragments(&table, s + 1, None, repeat, e > s + 1, after, observe);
+    }
+
+    /// Issue #91 — reserve the notes of rows placed by a forced (fresh
+    /// page) decision. One flow item on a fresh page: the #80 waiver
+    /// guarantees it lands, splitting or clipping its notes if it must.
+    fn commit_forced_rows(&mut self, rows: &[TableRowBox], height: f32, budget: f32) {
+        let anchors: Vec<(NoteAnchor, String)> = rows.iter().flat_map(anchors_in_row).collect();
+        if anchors.is_empty() {
+            return;
+        }
+        let plan = self.fit_items(
+            &[FlowItem {
+                bottom: height.min(budget),
+                anchors,
+            }],
+            budget,
+            true,
+        );
+        self.commit_plan(plan);
+    }
+
+    /// Issue #87 / #91 — record the header-repeat release when a page is
+    /// left with nothing but header rows (a continuation that repeats
+    /// them would be the table it started from).
+    fn release_header_repeat(&mut self, table: &TableBox, cut: usize) {
+        let has_headers = table.rows.first().is_some_and(|r| r.header);
+        if has_headers && cut < table.rows.len() {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::HeaderRepeatDropped, page);
+        }
+    }
+
+    /// Issue #91 — place rows `[0, cut)` of `table` here and re-push the
+    /// rest (with `repeat` cloned on top) on the next column / page.
+    /// `row_split` overrides the fragments when the last head row was
+    /// continued inside its cells: `(head rows, tail of the cut row)`.
+    /// `cut_in_group` marks a cut that may land inside a merge group:
+    /// the continuation's first body row gets stub cells and every
+    /// merged cell's height is re-derived per fragment. A clean cut on a
+    /// unit boundary leaves every row box untouched (re-stacked only).
+    /// Stage (a) of the watchdog drops the repeat (optional constraint).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_table_fragments(
+        &mut self,
+        table: &TableBox,
+        cut: usize,
+        row_split: Option<(Vec<TableRowBox>, Option<TableRowBox>)>,
+        mut repeat: Vec<TableRowBox>,
+        cut_in_group: bool,
+        after: f32,
+        observe: bool,
+    ) {
+        let (mut head_rows, cut_tail) = match row_split {
+            Some((head, tail)) => (head, tail),
+            None => (table.rows[..cut].to_vec(), None),
+        };
+        let mut body_tail: Vec<TableRowBox> = cut_tail.into_iter().collect();
+        body_tail.extend(table.rows[cut..].iter().cloned());
+        if !body_tail.is_empty()
+            && !repeat.is_empty()
+            && self.watchdog.stage() >= DegradeStage::DropOptional
+        {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::HeaderRepeatDropped, page);
+            repeat.clear();
+        }
+        if cut_in_group {
+            if let Some(first) = body_tail.first_mut() {
+                restub_continuation(first);
+            }
+            recompute_vmerge_spans(&mut head_rows);
+        }
+        let head_h = restack_rows(&mut head_rows);
         let head = TableBox {
             origin: Point {
                 x: self.current_column_origin_x(),
@@ -1580,78 +1790,38 @@ impl Paginator {
             },
             size: Size {
                 width: table.size.width,
-                height: head_height,
+                height: head_h,
             },
             columns: table.columns.clone(),
             rows: head_rows,
             outer_borders: table.outer_borders.clone(),
         };
-        self.cur_y += head_height;
-        /* Audit gap A.M9 — collect header rows from the head BEFORE we
-        move it into `cur_blocks`. Cloning is cheap (handful of cells
-        each carrying paragraph-content `Vec`s); the originals stay in
-        place at the top of the head. The tail prepends fresh clones
-        so the headers repeat. */
-        let mut header_rows: Vec<TableRowBox> =
-            head.rows.iter().filter(|r| r.header).cloned().collect();
-        /* Issue #87 stage (a) — repeated headers are an OPTIONAL
-        constraint. When every row that fit on this page was a header
-        row, the continuation would be `headers + the same body rows`
-        — the exact table we started from — and the next page would
-        replay this split forever (the #7 class: an autofit column
-        narrower than its longest token wraps a header row past the
-        page height). Suppress the repeat for this continuation so the
-        tail is strictly smaller; likewise once the watchdog has
-        reached stage (a) on its own. */
-        let head_all_headers = head.rows.iter().all(|r| r.header);
-        let drop_repeat = !tail_rows.is_empty()
-            && !header_rows.is_empty()
-            && (head_all_headers || self.watchdog.stage() >= DegradeStage::DropOptional);
-        if drop_repeat {
-            let page = self.cur_page_index();
-            self.watchdog.note(DegradeReason::HeaderRepeatDropped, page);
-            header_rows.clear();
-        }
+        self.cur_y += head_h;
         self.cur_blocks.push(LayoutBlock::Table(head));
-
-        if !tail_rows.is_empty() {
-            /* Audit gap A.M9 — prepend cloned headers to every tail
-            page. Re-stamp `origin.y` so the headers sit at the top of
-            the new TableBox and the original tail rows shift down by
-            the headers' total height. */
-            let header_total: f32 = header_rows.iter().map(|r| r.size.height).sum();
-            let mut combined: Vec<TableRowBox> =
-                Vec::with_capacity(header_rows.len() + tail_rows.len());
-            let mut cursor_y = 0.0_f32;
-            for h in &header_rows {
-                let mut hh = h.clone();
-                hh.origin.y = cursor_y;
-                cursor_y += hh.size.height;
-                combined.push(hh);
-            }
-            for r in &tail_rows {
-                let mut rr = r.clone();
-                rr.origin.y = cursor_y;
-                cursor_y += rr.size.height;
-                combined.push(rr);
-            }
-            let tail = TableBox {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: table.size.width,
-                    height: tail_height + header_total,
-                },
-                columns: table.columns,
-                rows: combined,
-                outer_borders: table.outer_borders,
-            };
-            /* Audit gap A.H2 — snake into the next column before
-            forcing a page; matches the paragraph split policy. */
-            self.advance_column_or_flush_page();
-            self.push_block_inner(LayoutBlock::Table(tail), 0.0, after, observe);
-        } else {
+        if body_tail.is_empty() {
             self.cur_y += after;
+            return;
         }
+        let mut tail_rows = repeat;
+        tail_rows.extend(body_tail);
+        if cut_in_group {
+            recompute_vmerge_spans(&mut tail_rows);
+        }
+        let tail_h = restack_rows(&mut tail_rows);
+        let tail = TableBox {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: table.size.width,
+                height: tail_h,
+            },
+            columns: table.columns.clone(),
+            rows: tail_rows,
+            outer_borders: table.outer_borders.clone(),
+        };
+        /* Audit gap A.H2 — snake into the next column before forcing a
+        page; matches the paragraph split policy. */
+        self.advance_column_or_flush_page();
+        self.push_block_inner(LayoutBlock::Table(tail), 0.0, after, observe);
     }
 
     /// Phase 2 audit (gap D.1) / issue #77 — stamp every field in the
@@ -1688,6 +1858,7 @@ impl Paginator {
                 start: f.byte_range.start,
                 end: f.byte_range.end,
                 instruction: f.instruction.clone(),
+                span: None,
             };
             if let Some(v) = synthetic.evaluate_in(&page_env) {
                 f.evaluated_text = Some(v);
@@ -1954,6 +2125,7 @@ impl Paginator {
                         start: f.byte_range.start,
                         end: f.byte_range.end,
                         instruction: f.instruction.clone(),
+                        span: None,
                     };
                     if synthetic.typed() == engine::TypedField::NumPages {
                         f.evaluated_text = synthetic.evaluate_in(&total_env);
@@ -2522,6 +2694,7 @@ mod tests {
             inline_note_anchor: None,
             inline_object_height: 0.0,
             float: float.map(Box::new),
+            leader: None,
         };
         let mut p = fake_paragraph(3, 16.0);
         p.lines[0].runs.push(VisualRun {
@@ -3797,9 +3970,11 @@ mod tests {
                     padding_top: 0.0,
                     padding_right: 0.0,
                     padding_bottom: 0.0,
+                    content_offset: 0,
                 }],
                 header,
                 cant_split: false,
+                source_row: out_rows.len() as u32,
             });
             y += h;
         }
@@ -3862,6 +4037,7 @@ mod tests {
             inline_note_anchor: Some(fn_anchor(id)),
             inline_object_height: 0.0,
             float: None,
+            leader: None,
         };
         p.lines[line_idx].runs.push(crate::boxes::VisualRun {
             glyphs: vec![glyph],
@@ -3994,6 +4170,82 @@ mod tests {
         pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
         finish("tables_move_whole_and_atomic", pag);
 
+        /* Issue #91 — single-page table shapes, pinned on the pre-#91
+        paginator: a table that fits where it lands, and a table whose
+        first body row does not fit the rest of the page (moves whole,
+        exactly as before the row-split path went live). */
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(10, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Table(fake_table(&[
+                (20.0, true),
+                (30.0, false),
+                (30.0, false),
+                (30.0, false),
+            ])),
+            6.0,
+            6.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(3, 16.0)), 0.0, 0.0);
+        finish("table_fits_where_it_lands", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Table(fake_table(&[(20.0, true), (100.0, false), (100.0, false)])),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("table_first_body_row_too_tall_moves_whole", pag);
+
+        /* Issue #91 — the row-split path. */
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(10, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Table(header_table(200, 20.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("table_200_rows_header_repeat", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![
+                fake_row(1, 20.0, false),
+                fake_row(1, 20.0, false),
+                cant_split(fake_row(5, 20.0, false)),
+                fake_row(1, 20.0, false),
+            ])),
+            0.0,
+            0.0,
+        );
+        finish("table_cant_split_row_at_page_boundary", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![
+                fake_row(1, 20.0, false),
+                fake_row(1, 900.0, false),
+                fake_row(1, 20.0, false),
+            ])),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        finish("table_row_taller_than_a_page", pag);
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![
+                fake_row(1, 20.0, true),
+                fake_row(1, 20.0, false),
+                fake_row(60, 16.0, false),
+                fake_row(1, 20.0, false),
+            ])),
+            0.0,
+            0.0,
+        );
+        finish("table_row_continued_in_its_cells", pag);
+
         out
     }
 
@@ -4022,11 +4274,40 @@ mod tests {
         ("intruding_bands_title_pg", 0xd740800cab2c8c6d, &[]),
         ("footnotes", 0xd598c54612629596, &[]),
         ("sections_and_forced_breaks", 0xc92c5638ce1f2440, &[]),
+        /* Re-pinned by issue #91 (was 0x7e5c0eabb84250c6 with a single
+        `(OversizeLine, 2)`): neither table fits where it lands, so both
+        now split at row boundaries — the 60 pt table leaves header + one
+        row on page 0; the 1100 pt table keeps header + its first row on
+        page 1, and only its single-line 900 pt row (which cannot be cut)
+        clips on page 2 under the repeated header, instead of the whole
+        table clipping there. */
         (
             "tables_move_whole_and_atomic",
-            0x7e5c0eabb84250c6,
+            0xbce858d96a94ade0,
             &[(DegradeReason::OversizeLine, 2)],
         ),
+        /* Issue #91 — recorded on the pre-#91 paginator: single-page
+        tables are untouched by the row-split path. */
+        ("table_fits_where_it_lands", 0x71c85881f26af4f1, &[]),
+        (
+            "table_first_body_row_too_tall_moves_whole",
+            0xd27a871a0a845ccd,
+            &[],
+        ),
+        /* Issue #91 — the row-split fixtures (new behaviour; recorded on
+        the #91 paginator). */
+        ("table_200_rows_header_repeat", 0xc206b44b990cfeb5, &[]),
+        (
+            "table_cant_split_row_at_page_boundary",
+            0xb6714605d8cd27b6,
+            &[],
+        ),
+        (
+            "table_row_taller_than_a_page",
+            0xd5b58b9bb0471ac3,
+            &[(DegradeReason::OversizeLine, 1)],
+        ),
+        ("table_row_continued_in_its_cells", 0xa4fe91140b17173a, &[]),
     ];
 
     #[test]
@@ -4205,16 +4486,17 @@ mod tests {
     /// table it started from — on every page forever. Stage (a) suppresses
     /// the repeat for that continuation so the tail strictly shrinks.
     ///
-    /// Exercises `push_table_split`'s row path directly: through
-    /// `push_block` a table on a fresh page is placed atomically (its
-    /// row-split branch is unreachable today — see the #87 report).
+    /// Issue #91 — reached through `push_block` now that the row-split
+    /// path is live. The header row is a single 800 pt line: it cannot be
+    /// cut, so it clips on its own page (`OversizeLine`) before the
+    /// repeat is released.
     #[test]
     fn header_row_taller_than_the_page_terminates_with_the_repeat_dropped() {
         let t0 = Instant::now();
         let geom = a4_geometry();
         let mut pag = Paginator::with_default_bands(geom, None, None);
         let table = fake_table(&[(800.0, true), (20.0, false), (20.0, false), (20.0, false)]);
-        pag.push_table_split(table, 0.0, true);
+        pag.push_block(LayoutBlock::Table(table), 0.0, 0.0);
         let (pages, notes) = pag.finish_with_notes();
         assert!(t0.elapsed() < adversarial_budget());
         assert_eq!(pages.len(), 2, "header page, then the body rows");
@@ -4229,7 +4511,13 @@ mod tests {
             })
             .collect();
         assert_eq!(rows_per_page, vec![1, 3]);
-        assert_eq!(reasons(&notes), vec![DegradeReason::HeaderRepeatDropped]);
+        assert_eq!(
+            reasons(&notes),
+            vec![
+                DegradeReason::OversizeLine,
+                DegradeReason::HeaderRepeatDropped
+            ]
+        );
     }
 
     /// Header + body rows that DO fit keep repeating the header — the
@@ -4684,5 +4972,463 @@ mod tests {
                 pag.watchdog_mut().note(DegradeReason::FrozenPlacement, 0);
             }
         }
+    }
+
+    /* ================================================================
+    Issue #91 — the table row-split path.
+    ================================================================ */
+
+    /// A one-cell row whose cell holds one paragraph of `n_lines` lines of
+    /// `line_h` (row height = the paragraph height; no padding).
+    fn fake_row(n_lines: usize, line_h: f32, header: bool) -> TableRowBox {
+        let h = n_lines as f32 * line_h;
+        TableRowBox {
+            origin: Point::default(),
+            size: Size {
+                width: 200.0,
+                height: h,
+            },
+            cells: vec![fake_cell(n_lines, line_h, h, engine::VMergeRole::None, 0.0)],
+            header,
+            cant_split: false,
+            source_row: 0,
+        }
+    }
+
+    fn fake_cell(
+        n_lines: usize,
+        line_h: f32,
+        h: f32,
+        v_merge: engine::VMergeRole,
+        x: f32,
+    ) -> crate::boxes::TableCellBox {
+        crate::boxes::TableCellBox {
+            origin: Point { x, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: h,
+            },
+            grid_span: 1,
+            v_merge,
+            borders: engine::CellBorders::default(),
+            shading: None,
+            content: vec![LayoutBlock::Paragraph(fake_paragraph(n_lines, line_h))],
+            padding_left: 0.0,
+            padding_top: 0.0,
+            padding_right: 0.0,
+            padding_bottom: 0.0,
+            content_offset: 0,
+        }
+    }
+
+    fn cant_split(mut r: TableRowBox) -> TableRowBox {
+        r.cant_split = true;
+        r
+    }
+
+    /// Stack `rows` into a table, stamping `source_row` by position.
+    fn table_of(mut rows: Vec<TableRowBox>) -> TableBox {
+        let mut y = 0.0_f32;
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.origin.y = y;
+            r.source_row = i as u32;
+            y += r.size.height;
+        }
+        TableBox {
+            origin: Point::default(),
+            size: Size {
+                width: 200.0,
+                height: y,
+            },
+            columns: vec![100.0, 100.0],
+            rows,
+            outer_borders: engine::CellBorders::default(),
+        }
+    }
+
+    /// One repeated header row + `n` body rows, every row `row_h` tall.
+    fn header_table(n: usize, row_h: f32) -> TableBox {
+        let mut rows = vec![fake_row(1, row_h, true)];
+        rows.extend((0..n).map(|_| fake_row(1, row_h, false)));
+        table_of(rows)
+    }
+
+    /// Every table fragment on `page`, in flow order.
+    fn tables_on(page: &PageBox) -> Vec<&TableBox> {
+        page.blocks
+            .iter()
+            .filter_map(LayoutBlock::as_table)
+            .collect()
+    }
+
+    fn cell_lines(row: &TableRowBox) -> usize {
+        row.cells
+            .iter()
+            .flat_map(|c| c.content.iter())
+            .filter_map(|b| match b {
+                LayoutBlock::Paragraph(p) => Some(p.lines.len()),
+                LayoutBlock::Table(_) => None,
+            })
+            .sum()
+    }
+
+    /// Acceptance — a 200-row table paginates across pages with its
+    /// header row repeated on every continuation, starting mid-page, in
+    /// source order, never past the body budget, without a single
+    /// degradation (the strict watchdog panics on any note).
+    #[test]
+    fn table_200_rows_paginates_with_the_header_repeated() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        let budget = geom.content_height();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(10, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Table(header_table(200, 20.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert!(notes.is_empty(), "{notes:?}");
+        /* 538 pt left under the paragraph: header + 25 rows; then header
+        + 33 rows per 698 pt page: 25 + 33 × 5 + 10 = 200. */
+        let body_per_page: Vec<usize> = pages
+            .iter()
+            .map(|p| {
+                tables_on(p)
+                    .iter()
+                    .map(|t| t.rows.iter().filter(|r| !r.header).count())
+                    .sum()
+            })
+            .collect();
+        assert_eq!(body_per_page, vec![25, 33, 33, 33, 33, 33, 10]);
+        let mut next_source = 1u32;
+        for (i, p) in pages.iter().enumerate() {
+            let ts = tables_on(p);
+            assert_eq!(ts.len(), 1, "one fragment per page");
+            let t = ts[0];
+            assert!(t.rows[0].header, "page {i} opens with the header");
+            assert_eq!(t.rows[0].source_row, 0, "the clone maps to the header");
+            assert!(
+                t.origin.y + t.size.height <= budget + 0.001,
+                "page {i} overruns the body budget"
+            );
+            let expect_y = if i == 0 { 160.0 } else { 0.0 };
+            assert_eq!(t.origin.y, expect_y);
+            let mut y = 0.0;
+            for r in &t.rows {
+                assert_eq!(r.origin.y, y, "rows re-stacked from the fragment top");
+                y += r.size.height;
+            }
+            assert_eq!(t.size.height, y);
+            for r in t.rows.iter().skip(1) {
+                assert_eq!(r.source_row, next_source, "source order kept");
+                next_source += 1;
+            }
+        }
+        assert_eq!(next_source, 201);
+    }
+
+    /// Issue #91 — rows below the page height are never cut: a
+    /// `<w:cantSplit>` row at the page boundary moves whole, and so does
+    /// a plain row (identical geometry — the flag only matters for rows
+    /// taller than a page).
+    #[test]
+    fn cant_split_row_at_a_page_boundary_moves_whole() {
+        let geom = a4_geometry();
+        let run = |flag: bool| {
+            let mut pag =
+                Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+            let mut tall = fake_row(5, 20.0, false);
+            tall.cant_split = flag;
+            pag.push_block(
+                LayoutBlock::Table(table_of(vec![
+                    fake_row(1, 20.0, false),
+                    fake_row(1, 20.0, false),
+                    tall,
+                ])),
+                0.0,
+                0.0,
+            );
+            pag.finish_with_notes()
+        };
+        let (pages, notes) = run(true);
+        assert!(notes.is_empty());
+        assert_eq!(pages.len(), 2);
+        let head = tables_on(&pages[0]);
+        assert_eq!(head.len(), 1);
+        assert_eq!(head[0].rows.len(), 2, "the rows that fit stay");
+        let tail = tables_on(&pages[1]);
+        assert_eq!(tail[0].rows.len(), 1);
+        assert_eq!(tail[0].rows[0].source_row, 2);
+        assert_eq!(tail[0].rows[0].size.height, 100.0, "moved whole");
+        assert_eq!(cell_lines(&tail[0].rows[0]), 5);
+        let (plain, _) = run(false);
+        assert_eq!(geometry_fingerprint(&pages), geometry_fingerprint(&plain));
+    }
+
+    /// Issue #91 — a row taller than a whole page continues inside its
+    /// cells: the head fragment fills the page under the header, the tail
+    /// fragment opens the next page under the repeated header, both map
+    /// to the same model row, and no degradation is reported.
+    #[test]
+    fn row_taller_than_a_page_continues_inside_its_cells() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![
+                fake_row(1, 20.0, true),
+                fake_row(1, 20.0, false),
+                fake_row(60, 16.0, false),
+                fake_row(1, 20.0, false),
+            ])),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 3);
+        /* Page 0: header + row 1; the 960 pt row does not fit the rest
+        and exceeds a page, so it opens page 1 under the header. */
+        assert_eq!(tables_on(&pages[0])[0].rows.len(), 2);
+        let mid = tables_on(&pages[1])[0];
+        assert_eq!(mid.rows.len(), 2);
+        assert!(mid.rows[0].header);
+        /* 698 − 20 = 678 pt under the header → 42 lines of 16. */
+        assert_eq!(cell_lines(&mid.rows[1]), 42);
+        assert_eq!(mid.rows[1].size.height, 672.0);
+        assert_eq!(mid.rows[1].source_row, 2);
+        let last = tables_on(&pages[2])[0];
+        assert!(last.rows[0].header, "the header repeats over the tail");
+        assert_eq!(cell_lines(&last.rows[1]), 18);
+        assert_eq!(last.rows[1].size.height, 288.0);
+        assert_eq!(last.rows[1].source_row, 2, "same model row");
+        assert_eq!(
+            last.rows[1].cells[0].content_offset, 0,
+            "the cut paragraph keeps its own block index"
+        );
+        assert_eq!(last.rows[2].source_row, 3);
+        let LayoutBlock::Paragraph(tail_para) = &last.rows[1].cells[0].content[0] else {
+            panic!("paragraph tail");
+        };
+        assert_eq!(tail_para.origin.y, 0.0);
+        assert_eq!(tail_para.lines[0].origin.y, 0.0);
+    }
+
+    /// Issue #91 — a `<w:cantSplit>` row taller than a page is placed
+    /// atomically and clips (Word's reading of the flag), and a row no
+    /// cell of which can place a single line does the same: both report
+    /// `OversizeLine`, paint, and the rest of the table still flows.
+    #[test]
+    fn unsplittable_row_taller_than_a_page_clips_with_oversize_line() {
+        let t0 = Instant::now();
+        let geom = a4_geometry();
+        for (label, row) in [
+            ("cantSplit", cant_split(fake_row(60, 16.0, false))),
+            ("one 900 pt line", fake_row(1, 900.0, false)),
+        ] {
+            let mut pag = Paginator::with_default_bands(geom, None, None);
+            let height = row.size.height;
+            pag.push_block(
+                LayoutBlock::Table(table_of(vec![
+                    fake_row(1, 20.0, false),
+                    row,
+                    fake_row(1, 20.0, false),
+                ])),
+                0.0,
+                0.0,
+            );
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+            let (pages, notes) = pag.finish_with_notes();
+            assert!(t0.elapsed() < adversarial_budget(), "{label}");
+            assert_eq!(pages.len(), 3, "{label}");
+            assert_eq!(
+                notes.iter().map(|n| (n.reason, n.page)).collect::<Vec<_>>(),
+                vec![(DegradeReason::OversizeLine, 1)],
+                "{label}"
+            );
+            let clipped = tables_on(&pages[1])[0];
+            assert_eq!(clipped.rows.len(), 1, "{label}");
+            assert_eq!(clipped.rows[0].size.height, height, "{label}: whole row");
+            assert_eq!(clipped.rows[0].source_row, 1, "{label}");
+            let rest = tables_on(&pages[2])[0];
+            assert_eq!(rest.rows[0].source_row, 2, "{label}: the table goes on");
+            assert_eq!(pages[2].blocks.len(), 2, "{label}");
+        }
+    }
+
+    /// Issue #87 release rule × #91 — a `<w:cantSplit>` row that fits a
+    /// page on its own but not under the header row: the header stays on
+    /// its page, the continuation drops the repeat (it strictly shrinks),
+    /// and the row moves whole. A row taller than a page that cannot be
+    /// cut instead clips UNDER the header, which keeps repeating after it.
+    #[test]
+    fn cant_split_row_that_fits_only_without_the_header_releases_the_repeat() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![
+                fake_row(1, 100.0, true),
+                cant_split(fake_row(1, 650.0, false)),
+                fake_row(1, 20.0, false),
+            ])),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert_eq!(reasons(&notes), vec![DegradeReason::HeaderRepeatDropped]);
+        assert_eq!(pages.len(), 2);
+        let head = tables_on(&pages[0])[0];
+        assert_eq!(head.rows.len(), 1);
+        assert!(head.rows[0].header);
+        let tail = tables_on(&pages[1])[0];
+        assert_eq!(tail.rows.len(), 2);
+        assert!(!tail.rows[0].header, "repeat released");
+        assert_eq!(tail.rows[0].size.height, 650.0, "moved whole");
+
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![
+                fake_row(1, 20.0, true),
+                fake_row(1, 900.0, false),
+                fake_row(1, 20.0, false),
+            ])),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert_eq!(
+            notes.iter().map(|n| (n.reason, n.page)).collect::<Vec<_>>(),
+            vec![(DegradeReason::OversizeLine, 0)]
+        );
+        assert_eq!(pages.len(), 2);
+        let clipped = tables_on(&pages[0])[0];
+        assert_eq!(clipped.rows.len(), 2, "header + the clipped row");
+        let rest = tables_on(&pages[1])[0];
+        assert!(rest.rows[0].header, "the header keeps repeating");
+        assert_eq!(rest.rows[1].source_row, 2);
+    }
+
+    /// A two-cell row: column 0 carries `v_merge`, column 1 is plain.
+    fn merge_row(h: f32, v_merge: engine::VMergeRole) -> TableRowBox {
+        TableRowBox {
+            origin: Point::default(),
+            size: Size {
+                width: 200.0,
+                height: h,
+            },
+            cells: vec![
+                fake_cell(1, h, h, v_merge, 0.0),
+                fake_cell(1, h, h, engine::VMergeRole::None, 100.0),
+            ],
+            header: false,
+            cant_split: false,
+            source_row: 0,
+        }
+    }
+
+    /// Issue #91 — a vertical merge group moves as one unit: splitting
+    /// between its rows would leave the merged cell hanging past its
+    /// fragment. The unmerged control splits between the same rows.
+    #[test]
+    fn vertical_merge_group_moves_as_a_unit() {
+        let geom = a4_geometry();
+        let run = |first: engine::VMergeRole, second: engine::VMergeRole| {
+            let mut pag =
+                Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+            pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+            let mut t = table_of(vec![
+                merge_row(20.0, engine::VMergeRole::None),
+                merge_row(20.0, first),
+                merge_row(20.0, second),
+            ]);
+            /* What the layout pass does: the Restart cell spans its group. */
+            if matches!(first, engine::VMergeRole::Restart) {
+                t.rows[1].cells[0].size.height = 40.0;
+            }
+            pag.push_block(LayoutBlock::Table(t), 0.0, 0.0);
+            pag.finish_with_notes().0
+        };
+        use engine::VMergeRole::{Continue, None as Plain, Restart};
+        let merged = run(Restart, Continue);
+        let src = |p: &PageBox| -> Vec<u32> {
+            tables_on(p)
+                .iter()
+                .flat_map(|t| t.rows.iter().map(|r| r.source_row))
+                .collect()
+        };
+        assert_eq!(
+            src(&merged[0]),
+            vec![0],
+            "58 pt left: the 40 pt group moves"
+        );
+        assert_eq!(src(&merged[1]), vec![1, 2]);
+        assert_eq!(tables_on(&merged[1])[0].rows[0].cells[0].size.height, 40.0);
+        let plain = run(Plain, Plain);
+        assert_eq!(src(&plain[0]), vec![0, 1]);
+        assert_eq!(src(&plain[1]), vec![2]);
+    }
+
+    /// Issue #91 — a merge group taller than a page is cut at a row
+    /// boundary (the only cut inside a group): the merged cell shrinks to
+    /// its fragment and the continuation opens with an empty stub cell
+    /// that paints the merged region's frame.
+    #[test]
+    fn vertical_merge_group_taller_than_a_page_is_cut_with_a_stub() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        let mut t = table_of(vec![
+            merge_row(400.0, engine::VMergeRole::Restart),
+            merge_row(400.0, engine::VMergeRole::Continue),
+        ]);
+        t.rows[0].cells[0].size.height = 800.0;
+        pag.push_block(LayoutBlock::Table(t), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        let head = tables_on(&pages[0])[0];
+        assert_eq!(head.rows.len(), 1);
+        assert_eq!(
+            head.rows[0].cells[0].size.height, 400.0,
+            "clamped to its fragment"
+        );
+        let tail = tables_on(&pages[1])[0];
+        let stub = &tail.rows[0].cells[0];
+        assert_eq!(stub.v_merge, engine::VMergeRole::Restart);
+        assert!(stub.content.is_empty(), "the stub carries no content");
+        assert_eq!(stub.size.height, 400.0);
+        assert_eq!(tail.rows[0].source_row, 1);
+    }
+
+    /// Issue #80 × #91 — a row carrying a footnote reference reserves the
+    /// note's band space when it lands; a row whose note cannot fit under
+    /// it moves to the next page with the note.
+    #[test]
+    fn table_row_whose_note_cannot_fit_moves_with_its_note() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(1, 10, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        let mut noted = fake_row(1, 20.0, false);
+        noted.cells[0].content = vec![LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(
+            1, 1, 20.0,
+        ))];
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![fake_row(1, 20.0, false), noted])),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(tables_on(&pages[0])[0].rows.len(), 1, "the plain row fits");
+        assert!(pages[0].footnotes.entries.is_empty());
+        assert_eq!(tables_on(&pages[1])[0].rows[0].source_row, 1);
+        assert_eq!(
+            pages[1].footnotes.entries.len(),
+            1,
+            "the note follows its row"
+        );
+        assert_eq!(pages[1].footnotes.entries[0].id, 1);
     }
 }

@@ -601,6 +601,23 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                         pen += glyph.x_advance;
                         continue;
                     }
+                    /* Issue #81 — a leadered tab fills its advance with
+                    the leader pattern (TOC dot leaders); the tab glyph
+                    itself draws nothing. */
+                    if let Some(kind) = glyph.leader {
+                        let x0 = (line_x as f64) + (pen as f64);
+                        push_tab_leader(
+                            cmds,
+                            kind,
+                            x0,
+                            x0 + glyph.x_advance as f64,
+                            baseline,
+                            run.attrs.px_size as f64,
+                            text_color,
+                        );
+                        pen += glyph.x_advance;
+                        continue;
+                    }
                     /* glyph id 0 is .notdef — advance the pen, draw nothing. */
                     if glyph.id != 0 {
                         glyphs.push(RunGlyph {
@@ -675,6 +692,69 @@ fn paint_paragraph(para: &ParagraphBox, base_x: f32, base_y: f32, cmds: &mut Vec
                     }
                 }
             }
+        }
+    }
+}
+
+/// Issue #81 — fill a leadered tab's advance `x0..x1` with its leader
+/// pattern. Dots / hyphens tile on a grid anchored at x = 0 of the page
+/// so the leaders of consecutive TOC entries line up (Word does the
+/// same); a small pad keeps them off the neighbouring glyphs.
+fn push_tab_leader(
+    cmds: &mut Vec<DisplayCmd>,
+    kind: layout::TabLeaderKind,
+    x0: f64,
+    x1: f64,
+    baseline: f64,
+    px: f64,
+    color: Color,
+) {
+    use layout::TabLeaderKind as K;
+    let px = px.max(1.0);
+    let pad = px * 0.15;
+    let (lo, hi) = (x0 + pad, x1 - pad);
+    if hi <= lo {
+        return;
+    }
+    let dot = (px * 0.08).max(1.0);
+    let rect = |cmds: &mut Vec<DisplayCmd>, a: f64, top: f64, b: f64, bottom: f64| {
+        cmds.push(DisplayCmd::FillRect {
+            rect: Rect::new(a, top, b, bottom),
+            paint: Paint::solid(color),
+        });
+    };
+    match kind {
+        K::Dot | K::MiddleDot => {
+            let step = px * 0.33;
+            let y = if matches!(kind, K::Dot) {
+                baseline - dot
+            } else {
+                baseline - px * 0.3
+            };
+            let mut x = (lo / step).ceil() * step;
+            while x + dot <= hi {
+                rect(cmds, x, y, x + dot, y + dot);
+                x += step;
+            }
+        }
+        K::Hyphen => {
+            let step = px * 0.4;
+            let dash = px * 0.25;
+            let y = baseline - px * 0.28;
+            let mut x = (lo / step).ceil() * step;
+            while x + dash <= hi {
+                rect(cmds, x, y, x + dash, y + dot);
+                x += step;
+            }
+        }
+        K::Underscore | K::Heavy => {
+            let t = if matches!(kind, K::Heavy) {
+                dot * 2.0
+            } else {
+                dot
+            };
+            let y = baseline + px * 0.1;
+            rect(cmds, lo, y, hi, y + t);
         }
     }
 }
@@ -754,5 +834,57 @@ fn push_underline_pattern(
                 x += half;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod leader_tests {
+    use super::*;
+
+    #[test]
+    fn dot_leader_tiles_small_squares_inside_the_tab_advance() {
+        let mut cmds = Vec::new();
+        let black = Color::from_rgba8(0, 0, 0, 255);
+        push_tab_leader(
+            &mut cmds,
+            layout::TabLeaderKind::Dot,
+            10.0,
+            110.0,
+            50.0,
+            12.0,
+            black,
+        );
+        /* step = 3.96 px over ~96 px of padded span → ~24 dots. */
+        assert!(cmds.len() >= 20, "got {} dots", cmds.len());
+        for c in &cmds {
+            let DisplayCmd::FillRect { rect, .. } = c else {
+                panic!("leader paints fills only");
+            };
+            assert!(rect.x0 >= 10.0 && rect.x1 <= 110.0);
+            assert!(rect.y1 <= 50.0 + 0.001, "dots sit on the baseline");
+        }
+        /* A tab narrower than the padding paints nothing. */
+        let mut none = Vec::new();
+        push_tab_leader(
+            &mut none,
+            layout::TabLeaderKind::Dot,
+            0.0,
+            2.0,
+            50.0,
+            12.0,
+            black,
+        );
+        assert!(none.is_empty());
+        let mut line = Vec::new();
+        push_tab_leader(
+            &mut line,
+            layout::TabLeaderKind::Underscore,
+            0.0,
+            100.0,
+            50.0,
+            12.0,
+            black,
+        );
+        assert_eq!(line.len(), 1);
     }
 }

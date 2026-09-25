@@ -9,6 +9,7 @@ pub mod floats;
 pub mod page;
 pub mod paginate;
 pub mod paragraph;
+mod table_split;
 pub mod watchdog;
 pub mod wrap;
 #[cfg(test)]
@@ -17,8 +18,9 @@ mod wrap_fixtures;
 pub use boxes::{
     CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FloatWrap,
     FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, LineSegment,
-    MarkerBox, NoteBand, PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TableBox,
-    TableCellBox, TableRowBox, TextAttrs, TextBoxFrame, TextBoxGlyph, VisualRun, WrapSide,
+    MarkerBox, NoteBand, PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan,
+    TabLeaderKind, TableBox, TableCellBox, TableRowBox, TextAttrs, TextBoxFrame, TextBoxGlyph,
+    VisualRun, WrapSide,
 };
 pub use floats::{ColumnLayout, resolve_page_floats};
 pub use page::{A4Page, Margins};
@@ -30,8 +32,8 @@ pub use paragraph::{
     InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
 };
 pub use watchdog::{
-    BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation, Watchdog,
-    geometry_fingerprint, verify_prefix,
+    BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation,
+    PageRefConvergence, Watchdog, converge_page_refs, geometry_fingerprint, verify_prefix,
 };
 pub use wrap::{
     FloatKey, WrapConvergence, WrapCutout, WrapPlan, WrapVerdict, cutouts_for_float, derive_plan,

@@ -204,6 +204,21 @@ pub struct PositionedGlyph {
     /// (`crate::floats::resolve_page_floats`). Boxed — floats are rare
     /// and glyphs are cloned by the million.
     pub float: Option<Box<FloatGlyph>>,
+    /// Issue #81 — `Some` on a TAB glyph whose stop carries a
+    /// `<w:tab w:leader>`: the renderer fills the tab's advance with the
+    /// leader pattern (TOC dot leaders). Geometry-neutral — the
+    /// advance is the tab's own, so fingerprints never see it.
+    pub leader: Option<TabLeaderKind>,
+}
+
+/// Issue #81 — the fill a leadered tab paints across its advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TabLeaderKind {
+    Dot,
+    Hyphen,
+    Underscore,
+    Heavy,
+    MiddleDot,
 }
 
 /// Issue #69 — the floating-object payload a sentinel glyph carries into
@@ -605,13 +620,19 @@ pub struct TableRowBox {
     /// continues onto after a split. Header rows still pay their own
     /// budget on the original page.
     pub header: bool,
-    /// Audit gap C.M2 — `<w:trPr><w:cantSplit/>` toggle. When `true`,
-    /// the row never splits across a page boundary; the paginator
-    /// flushes the page and pushes the row whole on the next. When
-    /// `false`, the paginator MAY split the row's cell paragraphs
-    /// mid-row (deferred — current implementation keeps every row
-    /// atomic).
+    /// Audit gap C.M2 — `<w:trPr><w:cantSplit/>` toggle. Issue #91: the
+    /// paginator moves every row that fits a page whole to the next page
+    /// (no mid-row split below the page height); a row taller than a
+    /// whole page continues cell-by-cell on the next page — unless this
+    /// flag is set, in which case it is placed atomically and clips
+    /// (`DegradeReason::OversizeLine`), Word's reading of the flag.
     pub cant_split: bool,
+    /// Issue #91 — index of the model row (`engine::Table::rows`) this
+    /// box renders. Equal to the row's position in an unsplit table; a
+    /// continuation fragment re-bases its rows and a repeated header
+    /// clone keeps its source header's index, so hit-testing maps every
+    /// fragment row back to the right model row.
+    pub source_row: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -636,6 +657,11 @@ pub struct TableCellBox {
     pub padding_top: f32,
     pub padding_right: f32,
     pub padding_bottom: f32,
+    /// Issue #91 — index of the model cell block `content[0]` renders.
+    /// 0 for an unsplit cell; the continuation of a row split inside its
+    /// cells starts mid-cell (a paragraph cut at a line boundary keeps
+    /// its own index, like a body paragraph split across pages).
+    pub content_offset: u32,
 }
 
 /// Which header/footer slot a page resolved (issue #74). Lives here

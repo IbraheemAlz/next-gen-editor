@@ -337,11 +337,27 @@ fn gen_selection_command(u: &mut Unstructured) -> Option<Command> {
 /// Field authoring — small, separate category (not "format" or "table")
 /// that still exercises real document mutation + layout re-resolution.
 fn gen_field_command(u: &mut Unstructured) -> Option<Command> {
-    Some(Command::InsertField {
-        at: pos(u),
-        kind: *u
-            .choose(&[FieldKind::Page, FieldKind::NumPages, FieldKind::Date])
-            .ok()?,
+    Some(match u.int_in_range(0..=5u8).ok()? {
+        /* Issue #81 — TOC insertion + F9 regeneration (the page-number
+        post-pass runs a bounded fixed point over full paginations). */
+        0 => Command::InsertToc {
+            at: pos(u),
+            switches: bridge::TocSwitches {
+                outline_min: u.int_in_range(0..=9).ok()?,
+                outline_max: u.int_in_range(0..=9).ok()?,
+                hyperlinks: u.ratio(1, 2).unwrap_or(true),
+                hide_in_web: true,
+                use_outline_levels: u.ratio(1, 2).unwrap_or(true),
+                page_numbers: u.ratio(3, 4).unwrap_or(true),
+            },
+        },
+        1 => Command::UpdateFields,
+        _ => Command::InsertField {
+            at: pos(u),
+            kind: *u
+                .choose(&[FieldKind::Page, FieldKind::NumPages, FieldKind::Date])
+                .ok()?,
+        },
     })
 }
 

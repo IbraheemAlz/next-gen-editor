@@ -186,11 +186,147 @@ fn tokenize(text: &str) -> Vec<Token> {
 pub enum TypedField {
     Page,
     NumPages,
-    Date { picture: Option<String> },
-    Time { picture: Option<String> },
-    FileName { with_path: bool },
+    Date {
+        picture: Option<String>,
+    },
+    Time {
+        picture: Option<String>,
+    },
+    FileName {
+        with_path: bool,
+    },
     Author,
-    Other { keyword: String },
+    /// Issue #81 — `TOC`: a multi-paragraph field whose result is
+    /// regenerated from the document's headings (see `crate::toc`).
+    Toc {
+        switches: TocSwitches,
+    },
+    Other {
+        keyword: String,
+    },
+}
+
+/// Issue #81 — the `TOC` switches the engine honours. TC-entry switches
+/// (`\f`, `\l`), SEQ captions (`\c`, `\a`) and bookmark scoping (`\b`)
+/// are out of scope and round-trip verbatim in the instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocSwitches {
+    /// `\o "a-b"` — heading outline levels, 1-based inclusive. `None`
+    /// when `\o` is absent (only `\t` / `\u` sources contribute).
+    pub outline_levels: Option<(u8, u8)>,
+    /// `\h` — entries are internal hyperlinks to `_Toc*` bookmarks.
+    pub hyperlinks: bool,
+    /// `\z` — hide tab leaders and page numbers in Web layout. Carried
+    /// verbatim; print layout (the only view) ignores it.
+    pub hide_in_web: bool,
+    /// `\u` — also collect paragraphs by their DIRECT outline level.
+    pub use_outline_levels: bool,
+    /// `\n "a-b"` — omit page numbers for these levels (1-based). A
+    /// bare `\n` omits them for every level.
+    pub no_page_numbers: Option<(u8, u8)>,
+    /// `\t "Style,level,Style,level"` — custom styles mapped to levels.
+    pub custom_styles: Vec<(String, u8)>,
+}
+
+impl Default for TocSwitches {
+    /// Word's Insert › Table of Contents default: `TOC \o "1-3" \h \z \u`.
+    fn default() -> Self {
+        Self {
+            outline_levels: Some((1, 3)),
+            hyperlinks: true,
+            hide_in_web: true,
+            use_outline_levels: true,
+            no_page_numbers: None,
+            custom_styles: Vec::new(),
+        }
+    }
+}
+
+fn parse_level_range(arg: Option<&str>) -> Option<(u8, u8)> {
+    let a = arg?.trim();
+    let (lo, hi) = match a.split_once('-') {
+        Some((l, h)) => (l.trim().parse::<u8>().ok()?, h.trim().parse::<u8>().ok()?),
+        None => {
+            let v = a.parse::<u8>().ok()?;
+            (v, v)
+        }
+    };
+    let (lo, hi) = (lo.clamp(1, 9), hi.clamp(1, 9));
+    Some((lo.min(hi), lo.max(hi)))
+}
+
+impl TocSwitches {
+    /// Read the TOC switches off a parsed instruction.
+    pub fn from_instruction(ins: &FieldInstruction) -> Self {
+        let outline_levels = if ins.has_switch("o") {
+            Some(parse_level_range(ins.switch_arg("o")).unwrap_or((1, 9)))
+        } else {
+            None
+        };
+        let no_page_numbers = if ins.has_switch("n") {
+            Some(parse_level_range(ins.switch_arg("n")).unwrap_or((1, 9)))
+        } else {
+            None
+        };
+        let mut custom_styles = Vec::new();
+        if let Some(arg) = ins.switch_arg("t") {
+            /* Word writes `Style,level` pairs with the list separator
+            (`,` or `;`). */
+            let parts: Vec<&str> = arg.split([',', ';']).map(str::trim).collect();
+            for pair in parts.chunks(2) {
+                let Some(name) = pair.first() else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                let lvl = pair.get(1).and_then(|l| l.parse::<u8>().ok()).unwrap_or(1);
+                custom_styles.push((name.to_string(), lvl.clamp(1, 9)));
+            }
+        }
+        Self {
+            outline_levels,
+            hyperlinks: ins.has_switch("h"),
+            hide_in_web: ins.has_switch("z"),
+            use_outline_levels: ins.has_switch("u"),
+            no_page_numbers,
+            custom_styles,
+        }
+    }
+
+    /// Render back to a Word-style instruction (`TOC \o "1-3" \h \z \u`).
+    pub fn to_instruction(&self) -> String {
+        let mut out = String::from("TOC");
+        if let Some((a, b)) = self.outline_levels {
+            out.push_str(&format!(" \\o \"{a}-{b}\""));
+        }
+        if self.hyperlinks {
+            out.push_str(" \\h");
+        }
+        if self.hide_in_web {
+            out.push_str(" \\z");
+        }
+        if let Some((a, b)) = self.no_page_numbers {
+            out.push_str(&format!(" \\n \"{a}-{b}\""));
+        }
+        if !self.custom_styles.is_empty() {
+            let joined: Vec<String> = self
+                .custom_styles
+                .iter()
+                .map(|(n, l)| format!("{n},{l}"))
+                .collect();
+            out.push_str(&format!(" \\t \"{}\"", joined.join(",")));
+        }
+        if self.use_outline_levels {
+            out.push_str(" \\u");
+        }
+        out
+    }
+
+    /// `true` when entries at 1-based `level` carry a page number.
+    pub fn shows_page_number(&self, level: u8) -> bool {
+        !matches!(self.no_page_numbers, Some((a, b)) if level >= a && level <= b)
+    }
 }
 
 impl Field {
@@ -215,6 +351,9 @@ impl Field {
                 with_path: ins.has_switch("p"),
             },
             "AUTHOR" => TypedField::Author,
+            "TOC" => TypedField::Toc {
+                switches: TocSwitches::from_instruction(&ins),
+            },
             other => TypedField::Other {
                 keyword: other.to_string(),
             },
@@ -254,7 +393,9 @@ impl Field {
             }),
             TypedField::FileName { .. } => env.document_name.clone(),
             TypedField::Author => env.author.clone(),
-            TypedField::Other { .. } => None,
+            /* The TOC result is regenerated structurally (several
+            paragraphs), never as a string — see `crate::toc`. */
+            TypedField::Toc { .. } | TypedField::Other { .. } => None,
         }
     }
 }
@@ -377,7 +518,40 @@ impl Paragraph {
     /// Field whose result range strictly contains `off`
     /// (`start < off < end`).
     pub fn field_strictly_containing(&self, off: u32) -> Option<&Field> {
-        self.fields.iter().find(|f| f.start < off && off < f.end)
+        self.fields
+            .iter()
+            .find(|f| f.is_local() && f.start < off && off < f.end)
+    }
+
+    /// Issue #81 — the code-view variant of
+    /// [`Self::field_strictly_containing`]: also matches a
+    /// multi-paragraph field's Head (whose first-paragraph portion the
+    /// field-code view replaces with `{ TOC … }`).
+    pub fn code_span_strictly_containing(&self, off: u32) -> Option<&Field> {
+        self.code_view_field_indices()
+            .into_iter()
+            .map(|i| &self.fields[i])
+            .find(|f| f.start < off && off < f.end)
+    }
+
+    /// Indices of the overlays the field-code view displays as
+    /// `{ INSTRUCTION }`: every local field and a multi-paragraph Head —
+    /// except a local field nested inside a Head's range (a TOC entry's
+    /// `PAGEREF`), which the Head's code text already replaces.
+    fn code_view_field_indices(&self) -> Vec<usize> {
+        let heads: Vec<(u32, u32)> = self
+            .fields
+            .iter()
+            .filter(|f| f.span == Some(crate::FieldSpan::Head))
+            .map(|f| (f.start, f.end))
+            .collect();
+        (0..self.fields.len())
+            .filter(|&i| {
+                let f = &self.fields[i];
+                shows_code(f)
+                    && !(f.is_local() && heads.iter().any(|&(s, e)| s <= f.start && f.end <= e))
+            })
+            .collect()
     }
 
     /// Index of the field a caret at `off` addresses: strictly inside
@@ -386,16 +560,23 @@ impl Paragraph {
     pub fn field_index_at(&self, off: u32) -> Option<usize> {
         self.fields
             .iter()
-            .position(|f| f.start < off && off < f.end)
+            .position(|f| f.is_local() && f.start < off && off < f.end)
             .or_else(|| {
                 self.fields
                     .iter()
-                    .position(|f| f.end == off && f.start < f.end)
+                    .position(|f| f.is_local() && f.end == off && f.start < f.end)
             })
             .or_else(|| {
                 self.fields
                     .iter()
-                    .position(|f| f.start == off && f.start < f.end)
+                    .position(|f| f.is_local() && f.start == off && f.start < f.end)
+            })
+            /* Issue #81 — a caret anywhere in a TOC's first paragraph
+            addresses the TOC (Update TOC / edit switches). */
+            .or_else(|| {
+                self.fields.iter().position(|f| {
+                    f.span == Some(crate::FieldSpan::Head) && f.start <= off && off <= f.end
+                })
             })
     }
 
@@ -428,7 +609,7 @@ impl Paragraph {
     pub fn expand_range_over_fields(&self, lo: u32, hi: u32) -> (u32, u32) {
         let mut lo = lo;
         let mut hi = hi;
-        for f in &self.fields {
+        for f in self.fields.iter().filter(|f| f.is_local()) {
             if f.start < lo && lo < f.end {
                 lo = f.start;
             }
@@ -447,7 +628,7 @@ impl Paragraph {
         if self.fields.is_empty() {
             return self.clone();
         }
-        let mut order: Vec<usize> = (0..self.fields.len()).collect();
+        let mut order: Vec<usize> = self.code_view_field_indices();
         order.sort_by_key(|&i| std::cmp::Reverse(self.fields[i].start));
         let mut para = self.clone();
         for i in order {
@@ -477,8 +658,9 @@ impl Paragraph {
     fn code_view_deltas(&self) -> Vec<(u32, u32, u32)> {
         /* (source_start, source_end, code_len) sorted by start. */
         let mut v: Vec<(u32, u32, u32)> = self
-            .fields
-            .iter()
+            .code_view_field_indices()
+            .into_iter()
+            .map(|i| &self.fields[i])
             .filter(|f| f.start < f.end)
             .map(|f| (f.start, f.end, f.code_text().len() as u32))
             .collect();
@@ -519,6 +701,13 @@ impl Paragraph {
         }
         (off as i64 - acc).max(0) as u32
     }
+}
+
+/// `true` when the field-code view displays `{ INSTRUCTION }` for this
+/// overlay: every local field and a multi-paragraph field's Head (never
+/// its instruction-less Tail).
+fn shows_code(f: &Field) -> bool {
+    f.span != Some(crate::FieldSpan::Tail)
 }
 
 /* ================================================================
@@ -769,7 +958,9 @@ fn restamp_paragraph(
     then splice highest-offset first so earlier ranges stay valid. */
     let mut subs: Vec<(usize, String)> = Vec::new();
     for (i, f) in p.fields.iter().enumerate() {
-        if f.start >= f.end {
+        /* Issue #81 — multi-paragraph fields regenerate structurally
+        (`DocumentTree::regenerate_tocs`), never by a string splice. */
+        if f.start >= f.end || !f.is_local() {
             continue;
         }
         if let Some(v) = resolve(path, i, f, p)
@@ -874,6 +1065,7 @@ mod tests {
             start,
             end,
             instruction: instr.into(),
+            span: None,
         }
     }
 
@@ -933,8 +1125,15 @@ mod tests {
         assert_eq!(field(0, 1, "AUTHOR").typed(), TypedField::Author);
         assert_eq!(
             field(0, 1, "TOC \\o \"1-3\"").typed(),
-            TypedField::Other {
-                keyword: "TOC".into()
+            TypedField::Toc {
+                switches: TocSwitches {
+                    outline_levels: Some((1, 3)),
+                    hyperlinks: false,
+                    hide_in_web: false,
+                    use_outline_levels: false,
+                    no_page_numbers: None,
+                    custom_styles: vec![],
+                }
             }
         );
         assert_eq!(

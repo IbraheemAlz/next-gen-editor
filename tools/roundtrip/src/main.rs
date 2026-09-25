@@ -186,6 +186,7 @@ fn run_default() -> Result<()> {
     run_ui_save_root_bindings()?;
     run_table_cell_runs_survival()?;
     run_wrap_modes_roundtrip()?;
+    run_toc_roundtrip()?;
     run_text_boxes_roundtrip()?;
 
     println!("\nPASS");
@@ -1968,6 +1969,131 @@ struct RoundtripBounds {
     document_xml_drift_bytes: usize,
 }
 
+/* ==================================================== TOC (#81) ==== */
+
+/// Issue #81 fixture: Word's TOC shape — `begin` + instruction +
+/// `separate` in the first entry paragraph, each entry a
+/// `<w:hyperlink w:anchor>` with a nested `PAGEREF` over the number and
+/// a right dot-leader tab, the `end` alone in a trailing paragraph —
+/// followed by the two `_Toc*`-bookmarked headings it lists.
+const TOC_DOCUMENT_XML: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    "\n",
+    r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+    r#"<w:p><w:pPr><w:pStyle w:val="TOC1"/><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9350"/></w:tabs></w:pPr><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \o "1-3" \h \z \u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:hyperlink w:anchor="_Toc111" w:history="1"><w:r><w:t xml:space="preserve">Alpha</w:t></w:r><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGEREF _Toc111 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t xml:space="preserve">1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:hyperlink></w:p>"#,
+    r#"<w:p><w:pPr><w:pStyle w:val="TOC2"/><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9350"/></w:tabs></w:pPr><w:hyperlink w:anchor="_Toc222" w:history="1"><w:r><w:t xml:space="preserve">Beta</w:t></w:r><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGEREF _Toc222 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t xml:space="preserve">1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:hyperlink></w:p>"#,
+    r#"<w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
+    r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:bookmarkStart w:id="0" w:name="_Toc111"/><w:r><w:t xml:space="preserve">Alpha</w:t></w:r><w:bookmarkEnd w:id="0"/></w:p>"#,
+    r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:bookmarkStart w:id="1" w:name="_Toc222"/><w:r><w:t xml:space="preserve">Beta</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#,
+    "<w:sectPr/></w:body></w:document>"
+);
+
+fn build_toc_word_shape_docx() -> Vec<u8> {
+    package_document_xml(TOC_DOCUMENT_XML)
+}
+
+/// Issue #81 — step 15: the TOC round-trip contract.
+/// (a) Word's shape reads as ONE multi-paragraph TOC region and an
+/// untouched save is byte-identical; (b) editing a heading WITHOUT an
+/// update keeps the stale TOC byte-identical (Word never rebuilds a TOC
+/// on save) at ≤ 2×N drift; (c) a regenerated TOC (the F9 path) writes
+/// Word's shape — begin before the first entry link, end after the last,
+/// `w:anchor` links, `PAGEREF`s, dot leaders — keeps the headings'
+/// bookmark ids, and reads back as the same live, updatable TOC.
+fn run_toc_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+
+    let fixture = build_toc_word_shape_docx();
+    let archive = read_docx(&fixture).context("read TOC fixture")?;
+    let regions = archive.document.toc_regions();
+    if regions.len() != 1 || (regions[0].first, regions[0].last) != (0, 2) {
+        bail!("TOC fixture: expected one region over blocks 0..=2, got {regions:?}");
+    }
+    let bytes = write_docx(&archive, &archive.document).context("write untouched TOC")?;
+    if extract_doc_xml(&bytes)? != extract_doc_xml(&fixture)? {
+        bail!("TOC fixture: an untouched save is not byte-identical");
+    }
+    println!(
+        "[roundtrip] step 15a OK — Word's TOC reads as one region, untouched save byte-identical"
+    );
+
+    /* (b) Edit the "Beta" heading, save without updating the TOC. */
+    let edited = archive
+        .document
+        .insert_text(LogicalPos::new(BlockPath::top(4), 4), INSERT_TEXT);
+    let bytes_b = write_docx(&archive, &edited).context("write heading edit")?;
+    assert_document_xml_well_formed(&bytes_b).context("heading-edit .docx")?;
+    let src = String::from_utf8(extract_doc_xml(&fixture)?).context("utf8 source")?;
+    let out_b = String::from_utf8(extract_doc_xml(&bytes_b)?).context("utf8 output")?;
+    let drift = (out_b.len() as isize - src.len() as isize).unsigned_abs();
+    if drift > 2 * INSERT_TEXT.len() {
+        bail!(
+            "TOC heading edit: document.xml drift {drift} B exceeds {} B",
+            2 * INSERT_TEXT.len()
+        );
+    }
+    let toc_src = &src[src.find("<w:p>").context("first paragraph")?
+        ..src
+            .find(r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/>"#)
+            .context("heading")?];
+    if !out_b.contains(toc_src) {
+        bail!("TOC heading edit: the stale TOC did not survive byte-for-byte");
+    }
+    println!("[roundtrip] step 15b OK — a heading edit keeps the stale TOC verbatim (Δ {drift} B)");
+
+    /* (c) Regenerate (F9), save, re-read. */
+    let (updated, changed) = edited.regenerate_tocs(&|ord| Some((ord + 1).to_string()));
+    if !changed {
+        bail!("TOC regeneration after a heading edit reported no change");
+    }
+    let bytes_c = write_docx(&archive, &updated).context("write regenerated TOC")?;
+    assert_document_xml_well_formed(&bytes_c).context("regenerated .docx")?;
+    let out_c = String::from_utf8(extract_doc_xml(&bytes_c)?).context("utf8 regenerated")?;
+    let begin = out_c
+        .find(r#"w:fldCharType="begin""#)
+        .context("TOC begin")?;
+    let first_link = out_c
+        .find(r#"<w:hyperlink w:anchor="_Toc111""#)
+        .context("first entry link")?;
+    let last_link_close = out_c.rfind("</w:hyperlink>").context("last link close")?;
+    let toc_end = out_c
+        .rfind(r#"w:fldCharType="end""#)
+        .context("TOC end fldChar")?;
+    if begin > first_link || toc_end < last_link_close {
+        bail!("regenerated TOC is not Word-shaped:\n{out_c}");
+    }
+    for needle in [
+        r#"TOC \o "1-3" \h \z \u"#,
+        r#"PAGEREF _Toc222 \h"#,
+        r#"<w:tab w:val="right" w:leader="dot""#,
+        r#"<w:bookmarkStart w:id="1" w:name="_Toc222"/>"#,
+    ] {
+        if !out_c.contains(needle) {
+            bail!("regenerated TOC lacks `{needle}`:\n{out_c}");
+        }
+    }
+    let reread = read_docx(&bytes_c).context("re-read regenerated TOC")?;
+    let d = &reread.document;
+    let regions = d.toc_regions();
+    if regions.len() != 1 || (regions[0].first, regions[0].last) != (0, 1) {
+        bail!("regenerated TOC re-read as {regions:?}");
+    }
+    let texts: Vec<&str> = (0..2)
+        .filter_map(|i| d.paragraph_at_path(&BlockPath::top(i)))
+        .map(|p| p.text.as_str())
+        .collect();
+    let want_beta = format!("Beta{INSERT_TEXT}\t2");
+    if texts != ["Alpha\t1", want_beta.as_str()] {
+        bail!("regenerated TOC entries re-read as {texts:?}");
+    }
+    let (_, again) = d.regenerate_tocs(&|ord| Some((ord + 1).to_string()));
+    if again {
+        bail!("a re-read regenerated TOC is not current (update is not idempotent)");
+    }
+    println!("[roundtrip] step 15c OK — regenerated TOC writes Word's shape and reads back live");
+    Ok(())
+}
+
 /* ========================================================= --fixtures ==== */
 
 fn run_fixtures(dir: &Path) -> Result<()> {
@@ -2235,6 +2361,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             style_id: None,
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         }]),
     };
     vec![
@@ -2521,6 +2648,28 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         "first paragraph".into(),
                         "second paragraph".into(),
                         "after".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        /* Issue #81 — Word's multi-paragraph TOC shape (hyperlinked
+        entries, nested PAGEREFs, dot leaders, `_Toc*` bookmarks).
+        Passthrough at drift 0; step 15 edits + regenerates it. */
+        PrebuiltFixture {
+            name: "toc_word_shape.docx",
+            bytes: build_toc_word_shape_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 5,
+                    paragraph_texts: vec![
+                        "Alpha\t1".into(),
+                        "Beta\t1".into(),
+                        "".into(),
+                        "Alpha".into(),
+                        "Beta".into(),
                     ],
                 },
                 roundtrip: RoundtripBounds::default(),
