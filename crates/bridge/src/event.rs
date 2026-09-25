@@ -127,6 +127,15 @@ pub enum Event {
         #[serde(default)]
         #[tsify(optional)]
         renderer_downgrade: Option<RendererDowngrade>,
+        /// Issue #268 — the restored base snapshot named a retained source
+        /// package (#134 / #212) that could not be re-attached (not
+        /// supplied, mismatched or unreadable), and the replayed tail did
+        /// not replace the document: the recovered session saves through
+        /// the minimal-package writer, dropping the sibling parts. The
+        /// shell uses it to prefer an older base that still has its
+        /// package, and reports it when none does. `false` otherwise.
+        #[serde(default)]
+        package_lost: bool,
     },
     /// Reply to `Command::Snapshot` (issue #85): the versioned snapshot
     /// envelope (`engine::snapshot`, magic + format version + payload).

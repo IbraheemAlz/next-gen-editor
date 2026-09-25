@@ -7978,11 +7978,16 @@ impl Engine {
         package: Option<Vec<u8>>,
     ) -> Event {
         self.reset_session_state();
+        /* Issue #268 — whether the restored base lost its source package. */
+        let mut base_package_lost = false;
         let snapshot_restored = if snapshot.is_empty() {
             false
         } else {
             match self.restore_from_bytes_with_package(&snapshot, package.as_deref()) {
-                Ok(_) => true,
+                Ok((_, lost)) => {
+                    base_package_lost = lost;
+                    true
+                }
                 Err(e) => {
                     warn_console(&format!(
                         "[engine] recovery: base snapshot unreadable ({e}); replaying the \
@@ -7993,6 +7998,16 @@ impl Engine {
                 }
             }
         };
+        /* A replayed open / load / seed replaces the base document, and
+        with it whatever package it lost. */
+        let tail_replaces_document = log_tail.iter().any(|c| {
+            matches!(
+                c,
+                Command::OpenDocument { .. }
+                    | Command::LoadDocx { .. }
+                    | Command::RenderPage { .. }
+            )
+        });
 
         let mut stashed_cfg = self.layout_cfg.take();
         let mut pending_base_scale: Option<f32> = None;
@@ -8039,6 +8054,7 @@ impl Engine {
             zoom: self.user_zoom(),
             device_scale: self.layout_cfg.as_ref().map(|c| c.base_scale),
             renderer_downgrade,
+            package_lost: base_package_lost && !tail_replaces_document,
         }
     }
 
@@ -8082,7 +8098,10 @@ impl Engine {
         &self,
         known_package_hash: Option<&str>,
     ) -> Result<(Vec<u8>, Option<String>, Option<Vec<u8>>), SnapshotError> {
-        let mut state = self.capture_snapshot();
+        /* Issue #269 — no media-reference pass for a package that stays
+        out of the envelope (it would hash every referenced blob only to be
+        thrown away). */
+        let mut state = self.capture_snapshot_with(false);
         let Some(package) = self.undo.current().source_package.clone() else {
             /* No package (engine-authored document): nothing to detach. */
             return Ok((engine::snapshot::encode(&state)?, None, None));
@@ -8149,6 +8168,13 @@ impl Engine {
 
     /// Issue #85 — assemble the session state the snapshot persists.
     fn capture_snapshot(&self) -> EngineSnapshotV1 {
+        self.capture_snapshot_with(true)
+    }
+
+    /// [`Self::capture_snapshot`]; `inline_package: false` (a detached
+    /// snapshot, #212) skips building the media-deduplicated inline
+    /// package — the caller replaces it with a key anyway.
+    fn capture_snapshot_with(&self, inline_package: bool) -> EngineSnapshotV1 {
         let (mut doc_history, undo_cursor) = self.undo.history_window(self.snapshot_undo_entries());
         /* Issue #134 — the package rides the envelope once, not once per
         undo entry (the entries share one `Arc`). */
@@ -8156,7 +8182,7 @@ impl Engine {
         let source_package = current.and_then(|d| d.source_package.clone());
         /* Media parts ride by reference to the current entry's `media`
         (the same bytes) — see `engine::package`'s snapshot-size notes. */
-        let persisted_package = current.and_then(|d| {
+        let persisted_package = current.filter(|_| inline_package).and_then(|d| {
             d.source_package
                 .as_ref()
                 .map(|p| Arc::new(p.deduplicated_against(&d.media)))
@@ -8201,21 +8227,24 @@ impl Engine {
     /// rendering surface.
     fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<u8, SnapshotError> {
         self.restore_from_bytes_with_package(bytes, None)
+            .map(|(version, _)| version)
     }
 
     /// Issue #212 — [`Self::restore_from_bytes`] for a detached snapshot:
     /// `package` is the separately stored source package
-    /// (`Command::Recover.package`).
+    /// (`Command::Recover.package`). Returns the format version and —
+    /// issue #268 — whether the snapshot named a source package that
+    /// could not be re-attached.
     fn restore_from_bytes_with_package(
         &mut self,
         bytes: &[u8],
         package: Option<&[u8]>,
-    ) -> Result<u8, SnapshotError> {
+    ) -> Result<(u8, bool), SnapshotError> {
         let decoded = engine::snapshot::decode::<EngineSnapshotV1>(bytes)?;
         let mut state = decoded.payload;
         state.apply_version_defaults(decoded.version);
-        self.restore_snapshot(state, package);
-        Ok(decoded.version)
+        let package_lost = self.restore_snapshot(state, package);
+        Ok((decoded.version, package_lost))
     }
 
     /// Issue #212 — the detached package a snapshot names by `key`, if
@@ -8234,7 +8263,10 @@ impl Engine {
             ));
             return None;
         };
-        if engine::package::package_key(bytes) != key {
+        /* Issue #269 — SHA-256 keys; a format-v1 (`pkg-` FNV) key from a
+        snapshot persisted by the previous build is still verified, for one
+        release (see `engine::snapshot`'s migration notes). */
+        if !engine::package::package_key_matches(key, bytes) {
             warn_console(&format!(
                 "[engine] recovery: supplied source package does not match {key}; \
                  saving through the minimal-package writer"
@@ -8245,11 +8277,17 @@ impl Engine {
             Ok(decoded) => {
                 let package = Arc::new(decoded.payload);
                 /* Prime the cache: the next detached snapshot need not
-                re-encode or re-ship what the caller already stores. */
-                *self.detached_package.borrow_mut() = Some(DetachedPackage {
-                    package: package.clone(),
-                    key: key.to_string(),
-                });
+                re-encode or re-ship what the caller already stores.
+                Issue #269 — except under a legacy key: those bytes are a
+                v1 envelope, so the cache stays empty and the next detached
+                snapshot re-encodes the package, names it by the SHA-256 of
+                the bytes it ships, and ships them (the caller's legacy
+                `known_package_hash` never matches). */
+                *self.detached_package.borrow_mut() =
+                    (!engine::package::is_legacy_package_key(key)).then(|| DetachedPackage {
+                        package: package.clone(),
+                        key: key.to_string(),
+                    });
                 Some(package)
             }
             Err(e) => {
@@ -8262,7 +8300,12 @@ impl Engine {
         }
     }
 
-    fn restore_snapshot(&mut self, mut s: EngineSnapshotV1, detached: Option<&[u8]>) {
+    /// Install a decoded snapshot. Returns `true` when it named a source
+    /// package (inline or detached) that could not be re-attached — the
+    /// session then saves through the minimal-package writer (issue #268
+    /// reports it on `Event::Recovered.package_lost`).
+    fn restore_snapshot(&mut self, mut s: EngineSnapshotV1, detached: Option<&[u8]>) -> bool {
+        let named_package = s.source_package.is_some() || s.package_hash.is_some();
         /* Issue #134 — re-attach the once-persisted source package to every
         history entry (see `EngineSnapshotV1::source_package`). */
         /* Media entries were persisted by reference to the current
@@ -8279,6 +8322,7 @@ impl Engine {
             (None, Some(key)) => self.attach_detached_package(&key, detached),
             (None, None) => None,
         };
+        let package_lost = named_package && package.is_none();
         if let Some(pkg) = &package {
             for d in &mut s.doc_history {
                 if d.source_package.is_none() {
@@ -8330,6 +8374,7 @@ impl Engine {
                 kind: sel.kind,
             });
         }
+        package_lost
     }
 
     fn do_redo(&mut self) -> Event {
@@ -25621,9 +25666,11 @@ mod snapshot_tests {
                 zoom,
                 device_scale,
                 renderer_downgrade,
+                package_lost,
             } => {
                 assert_eq!(applied_commands, 2);
                 assert!(snapshot_restored);
+                assert!(!package_lost, "an engine-authored document has no package");
                 assert_eq!(renderer, "canvas2d");
                 /* Issue #97 — the reply reports the REPLAYED zoom (the
                 snapshot said 1.25, the tail's SetZoom said 2.0) and the
@@ -26483,6 +26530,71 @@ mod snapshot_tests {
         assert_eq!((re, rekey, reship), (bytes, key, None));
     }
 
+    /// Issue #269 — a snapshot persisted by the previous build (format
+    /// v1: the package named by its `pkg-<len>-<fnv>` key) still recovers
+    /// WITH its package, and the recovered session's next detached
+    /// snapshot re-keys it under SHA-256 and ships it again.
+    #[test]
+    fn format_v1_detached_snapshot_with_a_legacy_package_key_still_recovers() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let (bytes, key, package) = detached(&mut e, None);
+        assert!(
+            key.starts_with(engine::package::PACKAGE_KEY_PREFIX),
+            "{key}"
+        );
+        let expected = ui_save(&mut e);
+        /* Rewrite both envelopes into their v1 form. */
+        let mut v1_package = package.unwrap();
+        v1_package[4] = 1;
+        let legacy = engine::package::legacy_package_key(&v1_package);
+        let mut state = engine::snapshot::decode::<EngineSnapshotV1>(&bytes)
+            .unwrap()
+            .payload;
+        state.package_hash = Some(legacy.clone());
+        let mut v1 = engine::snapshot::encode(&state).unwrap();
+        v1[4] = 1;
+
+        let mut b = engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: v1,
+                log_tail: Vec::new(),
+                renderer_downgrade: None,
+                package: Some(v1_package),
+            },
+        );
+        assert!(
+            matches!(
+                evt,
+                Event::Recovered {
+                    snapshot_restored: true,
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
+        assert!(
+            b.undo.current().source_package.is_some(),
+            "package attached"
+        );
+        assert!(
+            matches!(
+                evt,
+                Event::Recovered {
+                    package_lost: false,
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
+        assert_eq!(ui_save(&mut b), expected);
+        let (_, rekey, shipped) = detached(&mut b, Some(&legacy));
+        assert_eq!(rekey, key, "re-keyed under SHA-256");
+        let shipped = shipped.expect("the re-keyed package ships");
+        assert_eq!(engine::package::package_key(&shipped), rekey);
+    }
+
     /// Issue #212 — a detached snapshot recovered WITHOUT its package (or
     /// with the wrong one) still restores the document; the session then
     /// saves through the minimal-package writer.
@@ -26503,11 +26615,13 @@ mod snapshot_tests {
                     package: supplied,
                 },
             );
+            /* Issue #268 — and the loss is reported, never silent. */
             assert!(
                 matches!(
                     evt,
                     Event::Recovered {
                         snapshot_restored: true,
+                        package_lost: true,
                         ..
                     }
                 ),
@@ -26521,6 +26635,51 @@ mod snapshot_tests {
             let saved = ui_save(&mut b);
             format_docx::check_document_xml_well_formed(&saved).expect("well-formed");
         }
+    }
+
+    /// Issue #268 — `Event::Recovered.package_lost` is about the document
+    /// the recovery ENDS with: a base that restores with its package, or
+    /// one whose lost package is superseded by a replayed open, is not a
+    /// loss.
+    #[test]
+    fn recovered_reports_package_lost_only_when_the_final_document_lost_it() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let (bytes, _, package) = detached(&mut e, None);
+        let lost = |evt: &Event| match evt {
+            Event::Recovered {
+                snapshot_restored: true,
+                package_lost,
+                ..
+            } => *package_lost,
+            other => panic!("{other:?}"),
+        };
+        let recover = |package: Option<Vec<u8>>, log_tail: Vec<Command>| {
+            let mut b = engine();
+            let evt = apply(
+                &mut b,
+                Command::Recover {
+                    snapshot: bytes.clone(),
+                    log_tail,
+                    renderer_downgrade: None,
+                    package,
+                },
+            );
+            (evt, b)
+        };
+        let (evt, _) = recover(package, vec![insert("x")]);
+        assert!(!lost(&evt), "package supplied");
+        let (evt, _) = recover(None, vec![insert("x")]);
+        assert!(lost(&evt), "package missing, an edit replayed");
+        let (evt, b) = recover(
+            None,
+            vec![Command::OpenDocument {
+                bytes: PACKAGE_FIXTURE.to_vec(),
+                format: bridge::DocFormat::Docx,
+                name: None,
+            }],
+        );
+        assert!(!lost(&evt), "a replayed open supersedes the base");
+        assert!(b.undo.current().source_package.is_some());
     }
 
     /// Issue #212 — a document without a retained package detaches
@@ -26610,7 +26769,9 @@ mod snapshot_tests {
                 with.len() - without.len()
             );
             assert!(
-                detached_len <= without.len() + 64,
+                /* The `package_hash` field + its `sha256-<64 hex>` key
+                (issue #269) is the only addition. */
+                detached_len <= without.len() + 96,
                 "detached ~ package-free size"
             );
             assert!(with.len() >= without.len());
