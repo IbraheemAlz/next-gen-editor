@@ -326,6 +326,7 @@ dependencies = [
  "engine",
  "engine-wasm",
  "format-docx",
+ "format-pdf",
  "layout",
  "libfuzzer-sys",
  "render",

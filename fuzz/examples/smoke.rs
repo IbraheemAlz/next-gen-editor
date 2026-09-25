@@ -3,8 +3,8 @@
 //! Nightly Rust is not installed in this environment and must not be
 //! installed (binding rule 1) — `cargo +nightly fuzz run` is the real
 //! libFuzzer flow, exercised only in CI (`.github/workflows/fuzz-nightly.yml`).
-//! This binary proves the four generators + `run_*` bodies work *right now*
-//! on stable, in two passes per target:
+//! This binary proves the five targets' generators + `run_*` bodies work
+//! *right now* on stable, in two passes per target:
 //!
 //! 1. **Corpus pass** — every file under `fuzz/corpus/<target>/` (binding
 //!    rule 6: "asserts no panic on the seed corpus"). A panic here is a
@@ -13,7 +13,7 @@
 //! 2. **Random sweep** — a deterministic pseudo-random byte stream (a tiny
 //!    inline xorshift64; no `rand` dependency needed just to vary bytes
 //!    per iteration) exercising far more of each generator's structural
-//!    space than four committed corpus files ever could. Panics found
+//!    space than a handful of committed corpus files ever could. Panics found
 //!    here are exactly what fuzzing exists to find — they're reported
 //!    (deduplicated by message, one repro each) but do NOT fail the run;
 //!    see the PR description for the real findings this surfaced and why
@@ -110,9 +110,15 @@ fn hex(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Returns `(corpus_panics, sweep_panics)` for one target.
+/// Returns `(corpus_panics, sweep_panics)` for one target. `corpus_dir_name`
+/// is usually just `name` — it differs for `format_pdf_image_decode`
+/// (issue #227), whose seeds live under `corpus/image_decode/` (issue
+/// #208's naming, predating this target; the directory describes the
+/// SEEDS' subject, not any one target's bin name) rather than
+/// `corpus/format_pdf_image_decode/`.
 fn run_target(
     name: &'static str,
+    corpus_dir_name: &str,
     sweep_iterations: usize,
     run: impl Fn(&[u8]),
 ) -> (Panics, Panics) {
@@ -120,7 +126,7 @@ fn run_target(
     let mut corpus_ran = 0usize;
     let corpus_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("corpus")
-        .join(name);
+        .join(corpus_dir_name);
     if let Ok(entries) = std::fs::read_dir(&corpus_dir) {
         for entry in entries.flatten() {
             if let Ok(bytes) = std::fs::read(entry.path()) {
@@ -260,14 +266,27 @@ fn print_variant_coverage() {
 
 fn main() {
     let opts = parse_args();
-    let targets: [(&str, TargetFn); 4] = [
-        ("docx_reader", engine_fuzz::run_docx_reader),
-        ("docx_roundtrip", engine_fuzz::run_docx_roundtrip),
-        ("rpc_command", engine_fuzz::run_rpc_command),
-        ("layout_paginate", engine_fuzz::run_layout_paginate),
+    let targets: [(&str, &str, TargetFn); 5] = [
+        ("docx_reader", "docx_reader", engine_fuzz::run_docx_reader),
+        (
+            "docx_roundtrip",
+            "docx_roundtrip",
+            engine_fuzz::run_docx_roundtrip,
+        ),
+        ("rpc_command", "rpc_command", engine_fuzz::run_rpc_command),
+        (
+            "layout_paginate",
+            "layout_paginate",
+            engine_fuzz::run_layout_paginate,
+        ),
+        (
+            "format_pdf_image_decode",
+            "image_decode",
+            engine_fuzz::run_format_pdf_image_decode,
+        ),
     ];
     if let Some(only) = &opts.only
-        && !targets.iter().any(|(name, _)| name == only)
+        && !targets.iter().any(|(name, _, _)| name == only)
     {
         eprintln!("smoke: unknown target {only}");
         std::process::exit(2);
@@ -275,7 +294,7 @@ fn main() {
 
     let mut corpus_clean = true;
     let mut sweep_clean = true;
-    for (name, run) in targets {
+    for (name, corpus_dir_name, run) in targets {
         if opts.only.as_deref().is_some_and(|only| only != name) {
             continue;
         }
@@ -288,7 +307,7 @@ fn main() {
         if name == "rpc_command" {
             engine_fuzz::command_gen::reset_coverage();
         }
-        let (corpus_panics, sweep_panics) = run_target(name, opts.iterations, run);
+        let (corpus_panics, sweep_panics) = run_target(name, corpus_dir_name, opts.iterations, run);
         corpus_clean &= corpus_panics.is_empty();
         sweep_clean &= sweep_panics.is_empty();
         if name == "rpc_command" {

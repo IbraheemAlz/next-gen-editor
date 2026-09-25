@@ -102,7 +102,14 @@ mod image;
 mod image_export_tests;
 #[doc(hidden)]
 pub use image::test_images;
-use image::{AlphaMode, ImageColor, ImageEncoding, PreparedImage};
+/// Issue #227 — the `format_pdf_image_decode` fuzz target drives
+/// `prepare_image` end to end from OUTSIDE this crate (`fuzz/` is its own
+/// workspace), so these need to be reachable at the crate root. Nothing
+/// else changes: `image` itself stays a private module, and no new
+/// dependency reaches the wasm build (`AlphaMode`/`PreparedImage`/
+/// `ImageColor`/`ImageEncoding`/`prepare_image` were already compiled in,
+/// just not nameable from outside).
+pub use image::{AlphaMode, ImageColor, ImageEncoding, PreparedImage, prepare_image};
 pub use image::{ImageSkipReason, MAX_IMAGE_PIXELS};
 
 /// The synthesized sRGB ICC profile the PDF/A-1b output intent embeds. Built by
