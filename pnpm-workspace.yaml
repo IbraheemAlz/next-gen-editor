@@ -2,6 +2,15 @@ packages:
   - 'packages/*'
   - 'ts'
   - 'tools/*'
+  # tools/corpus (issue #88) has zero real dependencies — every script
+  # imports only Node built-ins, and corpus-nightly.yml invokes it with
+  # plain `node tools/corpus/*.mjs`, never through pnpm. As a workspace
+  # member with nothing to resolve, its lockfile importer entry is just
+  # `{}`; pnpm 11.5 doesn't reliably keep that empty entry as stable
+  # across every `pnpm install`, which dirtied `pnpm-lock.yaml` on every
+  # fresh install (issue #211). Excluding it needs no install step and
+  # keeps `pnpm install` idempotent.
+  - '!tools/corpus'
 
 # Approve esbuild's postinstall build (pnpm 11). This MUST live at the
 # ROOT workspace file: a `pnpm-workspace.yaml` inside `ts/` makes pnpm
@@ -9,3 +18,10 @@ packages:
 # (so `@nge/core` becomes "not found" on install).
 allowBuilds:
   esbuild: true
+
+# Non-interactive runners (merge gates, worktree agents, CI without CI=true)
+# hit ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY whenever the workspace
+# membership changes (e.g. #211 dropping tools/corpus): pnpm wants to purge
+# node_modules and asks for a TTY confirmation. Purging is exactly what we
+# want in that case — the lockfile is the source of truth.
+confirmModulesPurge: false
