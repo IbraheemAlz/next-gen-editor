@@ -1914,6 +1914,56 @@ mod tests {
         }
     }
 
+    /// Issue #208's adversarial "large declared dimensions" corpus seeds
+    /// (`fuzz/corpus/image_decode/`, staged for a future dedicated
+    /// `format_pdf_image_decode` fuzz target — see the task's final
+    /// report): a tiny file whose header claims a canvas far past
+    /// [`MAX_IMAGE_PIXELS`] must be rejected before any pixel buffer is
+    /// allocated, never panic, for every format this module handles.
+    #[test]
+    fn adversarial_oversized_dimension_seeds_are_rejected_before_allocating() {
+        let cases: &[(&[u8], &str)] = &[
+            (
+                include_bytes!(
+                    "../../../fuzz/corpus/image_decode/gif_oversized_dims_65535x65535.bin"
+                ),
+                "image/gif",
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/image_decode/webp_oversized_dims_vp8x.bin"),
+                "image/webp",
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/image_decode/png_oversized_dims_ihdr.bin"),
+                "image/png",
+            ),
+            (
+                include_bytes!(
+                    "../../../fuzz/corpus/image_decode/bmp_oversized_dims_65535x65535.bin"
+                ),
+                "image/bmp",
+            ),
+            (
+                include_bytes!("../../../fuzz/corpus/image_decode/tiff_oversized_dims_ifd.bin"),
+                "image/tiff",
+            ),
+        ];
+        for (data, content_type) in cases {
+            for mode in [AlphaMode::SoftMask, AlphaMode::FlattenOnWhite] {
+                let r = prepare_image(data, content_type, mode, false);
+                assert!(
+                    matches!(
+                        r,
+                        Err(ImageSkipReason::TooLarge { .. })
+                            | Err(ImageSkipReason::Malformed { .. })
+                            | Err(ImageSkipReason::UnsupportedFormat { .. })
+                    ),
+                    "{content_type}: expected a typed skip, got {r:?}"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "tiff")]
     #[test]
     fn tiff_rgb8_and_gray8_round_trip() {
