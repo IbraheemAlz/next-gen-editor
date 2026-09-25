@@ -290,7 +290,11 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
             range: range(u),
             text: text(u),
         },
-        4 => Command::SplitParagraph { at: pos(u) },
+        // Issue #64 — `at` is optional now; the curated arm keeps its
+        // explicit position (and its exact byte consumption, so committed
+        // corpus seeds still decode to the same scenarios). `None` — split
+        // at the live caret — is reached via the blind `arbitrary()` half.
+        4 => Command::SplitParagraph { at: Some(pos(u)) },
         // ---- format ------------------------------------------------------------
         5 => Command::ApplyFormatting {
             range: if u.ratio(1, 2).unwrap_or(true) {
@@ -805,13 +809,14 @@ classify_variants! {
     HitTest { .. } => false,
     HitTestInPage { .. } => false,
     PlaceCaretAtPoint { .. } => false,
+    ExtendSelectionToPoint { .. } => false,
     GetImageRects => false,
     SelectWordAt { .. } => false,
     SelectParagraphAt { .. } => false,
     SelectCellAt { .. } => false,
     DeleteAtCaret { .. } => true, // gen_targeted_command
     RequestAccessibilityDelta => false,
-    GetSelectionAsClipboard => false,
+    GetSelectionAsClipboard { .. } => false,
     PastePlain { .. } => false,
     // ---- Backlog sprint 1 --------------------------------------------------
     SetParagraphAlign { .. } => true, // gen_targeted_command
@@ -1087,7 +1092,7 @@ mod tests {
                 "duplicate variant name in ALL_VARIANT_NAMES: {name}"
             );
         }
-        const EXPECTED_VARIANT_COUNT: usize = 103;
+        const EXPECTED_VARIANT_COUNT: usize = 104;
         assert_eq!(
             ALL_VARIANT_NAMES.len(),
             EXPECTED_VARIANT_COUNT,

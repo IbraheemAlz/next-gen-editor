@@ -6611,6 +6611,7 @@ impl Engine {
             | Command::HitTest { .. }
             | Command::HitTestInPage { .. }
             | Command::PlaceCaretAtPoint { .. }
+            | Command::ExtendSelectionToPoint { .. }
             | Command::Undo
             | Command::Redo
             | Command::SetViewport { .. }
@@ -6694,7 +6695,7 @@ impl Engine {
             /* Issue #72 — rich copy. `do_get_selection_as_clipboard` now
             reads `self.selection_doc()` so a copy from inside a story
             serializes the story's paragraphs, not the body's. */
-            | Command::GetSelectionAsClipboard
+            | Command::GetSelectionAsClipboard { .. }
             /* Issue #85 — a snapshot is a read of the whole session (the
             active story included) and recovery rebuilds it wholesale. */
             | Command::Snapshot { .. }
@@ -6964,6 +6965,9 @@ impl Engine {
             Command::HitTest { at } => self.do_hit_test(at),
             Command::HitTestInPage { page, at } => self.do_hit_test_in_page(page, at),
             Command::PlaceCaretAtPoint { page, at } => self.do_place_caret_at_point(page, at),
+            Command::ExtendSelectionToPoint { page, at } => {
+                self.do_extend_selection_to_point(page, at)
+            }
             Command::GetImageRects => self.do_get_image_rects(),
             Command::SelectWordAt { at } => self.do_select_word_at(at),
             Command::SelectParagraphAt { at } => self.do_select_paragraph_at(at),
@@ -6978,7 +6982,9 @@ impl Engine {
             },
 
             // Phase 4 §12 — clipboard. Backlog sprint 7 adds rich HTML paste.
-            Command::GetSelectionAsClipboard => self.do_get_selection_as_clipboard(),
+            Command::GetSelectionAsClipboard { include_docx } => {
+                self.do_get_selection_as_clipboard(include_docx.unwrap_or(true))
+            }
             Command::PastePlain { text } => self.do_paste_plain(text),
             Command::PasteHtml { html } => self.do_paste_html(html),
 
@@ -10709,6 +10715,21 @@ impl Engine {
         )
     }
 
+    /// Issue #64 — `Command::ExtendSelectionToPoint`: hit-test + extend
+    /// in ONE dispatch (the drag / shift-click twin of
+    /// [`Self::do_place_caret_at_point`]). The shell posts it
+    /// synchronously from the pointer event, so a keystroke queued right
+    /// behind a shift-click executes against the extended selection.
+    /// Extension never switches stories — the moving end stays in the
+    /// document the anchor lives in (`do_extend_selection` clamps there).
+    fn do_extend_selection_to_point(&mut self, page_idx: u32, at: BridgePoint) -> Event {
+        let pos = match self.do_hit_test_in_page(page_idx, at) {
+            Event::HitResult { pos } => pos,
+            other => return other,
+        };
+        self.do_extend_selection(pos)
+    }
+
     /// `Command::SetSelection` — set the selection to `range`, caret at `caret`.
     fn do_set_selection(&mut self, range: BridgeLogicalRange, caret: BridgeLogicalPos) -> Event {
         /* Issue #117 — the wire range is a REQUEST. The engine owns the
@@ -13668,16 +13689,23 @@ impl Engine {
 
     /// `Command::SplitParagraph` — break the paragraph at the caret (replacing
     /// any non-empty selection first); the caret moves to the new paragraph.
-    fn do_split_paragraph(&mut self, at: BridgeLogicalPos) -> Event {
+    fn do_split_paragraph(&mut self, at: Option<BridgeLogicalPos>) -> Event {
         /* Issue #115 — `at` is consulted only when no selection exists;
-        then it is an explicit wire position and must resolve. */
-        let at = if self.selection.is_none() {
-            match self.resolve_edit_pos("SplitParagraph", at) {
+        then it is an explicit wire position and must resolve.
+        Issue #64 — `None` means "the live caret": with a selection the
+        handlers below split there anyway; with none there is nowhere
+        to split. */
+        let at = match (&self.selection, at) {
+            (Some(s), _) => s.caret.clone(),
+            (None, Some(p)) => match self.resolve_edit_pos("SplitParagraph", p) {
                 Ok(p) => p,
                 Err(e) => return *e,
+            },
+            (None, None) => {
+                return Event::Error {
+                    message: "SplitParagraph: no caret (pass `at` or set a selection first)".into(),
+                };
             }
-        } else {
-            at
         };
         if self.story_active() {
             return self.story_split_paragraph(at);
@@ -13846,7 +13874,16 @@ impl Engine {
     }
 
     /// `Command::BeginComposition` — start tracking an IME composition.
-    fn do_begin_composition(&mut self, at: BridgeLogicalPos) -> Event {
+    fn do_begin_composition(&mut self, at: Option<BridgeLogicalPos>) -> Event {
+        /* Issue #64 — `None` anchors at the engine's LIVE caret (the
+        serialized queue guarantees it reflects every click posted
+        before this); with no selection at all, the document start —
+        the same fallback `do_update_composition` uses. */
+        let at = at.unwrap_or_else(|| {
+            self.selection
+                .as_ref()
+                .map_or_else(|| bpos_top(0, 0), |s| s.caret.clone())
+        });
         self.composition = Some(CompositionState {
             at: at.clone(),
             text: String::new(),
@@ -14071,8 +14108,10 @@ impl Engine {
     /// `Command::GetSelectionAsClipboard` — snapshot the selection as the
     /// three clipboard MIME payloads (Backlog #12): plain text, semantic
     /// HTML, and a minimal standalone `.docx`. An empty selection yields all
-    /// three empty.
-    fn do_get_selection_as_clipboard(&self) -> Event {
+    /// three empty. Issue #57 — `include_docx == false` (the shell's
+    /// debounced prefetch) skips the `.docx` ZIP build and leaves
+    /// `docx_fragment` empty; `plain` + `html` are identical either way.
+    fn do_get_selection_as_clipboard(&self, include_docx: bool) -> Event {
         let empty = Event::ClipboardPayload {
             plain: String::new(),
             html: String::new(),
@@ -14101,10 +14140,14 @@ impl Engine {
         blocks. */
         let block_slice = doc.slice_blocks(estart.clone(), eend.clone());
         let html = engine::html::to_html_blocks(&block_slice);
-        let paragraph_slice = doc.slice(estart, eend);
-        let docx_fragment =
+        /* Issue #57 — the shell's prefetch skips the ZIP build. */
+        let docx_fragment = if include_docx {
+            let paragraph_slice = doc.slice(estart, eend);
             build_minimal_docx(&DocumentTree::from_rich_paragraphs(paragraph_slice))
-                .unwrap_or_default();
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Event::ClipboardPayload {
             plain,
             html,
@@ -18492,6 +18535,152 @@ mod tests {
         );
     }
 
+    /// Issue #64 — `ExtendSelectionToPoint` = hit-test + extend in one
+    /// command: the anchor stays where the click placed it, the caret
+    /// moves to the hit position, and a caret-relative insert queued
+    /// right behind it replaces the EXTENDED selection.
+    #[test]
+    fn extend_selection_to_point_keeps_anchor_and_moves_caret() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello wide world"));
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let evt = engine.do_extend_selection_to_point(0, BridgePoint { x: 300.0, y: 130.0 });
+        let Event::SelectionChanged { .. } = evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        let sel = engine.selection.clone().expect("selection installed");
+        assert_eq!(sel.anchor, bpos_top(0, 0), "extension keeps the anchor");
+        assert!(
+            sel.caret.offset > 0,
+            "a mid-line x extends past offset 0 (hit-test really ran)"
+        );
+        /* The keystroke that follows lands on the extended selection. */
+        let at = engine
+            .resolve_interactive_insert_at(None)
+            .expect("live caret");
+        engine.do_insert_text_interactive(at, "Z".to_string());
+        let text = engine
+            .undo
+            .current()
+            .paragraph_text(0)
+            .expect("para 0")
+            .to_string();
+        assert!(
+            text.starts_with('Z') && text.len() < "Zhello wide world".len(),
+            "the insert replaced the extended range, got {text:?}"
+        );
+    }
+
+    /// Issue #64 — `SplitParagraph { at: None }` splits at the LIVE
+    /// caret; an explicit `at` is still honoured when no selection
+    /// exists, and `None` with no selection is a typed error (nowhere
+    /// to split).
+    #[test]
+    fn split_paragraph_none_uses_live_caret() {
+        let caret_at = |off: u32| SelectionState {
+            anchor: bpos_top(0, off),
+            caret: bpos_top(0, off),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        };
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.selection = Some(caret_at(5));
+        let evt = engine.do_split_paragraph(None);
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert_eq!(engine.undo.current().paragraph_text(0), Some("hello"));
+        assert_eq!(engine.undo.current().paragraph_text(1), Some(" world"));
+        assert_eq!(
+            engine.selection.as_ref().map(|s| s.caret.clone()),
+            Some(bpos_top(1, 0)),
+            "the caret moves to the new paragraph"
+        );
+
+        /* A stale explicit `at` loses to the live selection. */
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.selection = Some(caret_at(5));
+        engine.do_split_paragraph(Some(bpos_top(0, 1)));
+        assert_eq!(engine.undo.current().paragraph_text(0), Some("hello"));
+
+        /* No selection: `None` errors, an explicit `at` resolves. */
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.selection = None;
+        assert!(matches!(
+            engine.do_split_paragraph(None),
+            Event::Error { .. }
+        ));
+        assert_eq!(engine.undo.current().paragraph_text(0), Some("hello world"));
+        engine.do_split_paragraph(Some(bpos_top(0, 2)));
+        assert_eq!(engine.undo.current().paragraph_text(0), Some("he"));
+    }
+
+    /// Issue #64 — `BeginComposition { at: None }` anchors the IME
+    /// composition at the engine's live caret; an explicit `at` wins.
+    #[test]
+    fn begin_composition_none_anchors_at_live_caret() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 7),
+            caret: bpos_top(0, 7),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::CompositionUpdated { at, .. } = engine.do_begin_composition(None) else {
+            panic!("expected CompositionUpdated");
+        };
+        assert_eq!(at, bpos_top(0, 7));
+        assert_eq!(
+            engine.composition.as_ref().map(|c| c.at.clone()),
+            Some(bpos_top(0, 7))
+        );
+        let Event::CompositionUpdated { at, .. } =
+            engine.do_begin_composition(Some(bpos_top(0, 2)))
+        else {
+            panic!("expected CompositionUpdated");
+        };
+        assert_eq!(at, bpos_top(0, 2), "an explicit at is honoured verbatim");
+    }
+
+    /// Issue #57 — the prefetch flavour of `GetSelectionAsClipboard`
+    /// skips the `.docx` fragment but serializes the same plain + HTML.
+    #[test]
+    fn clipboard_payload_include_docx_false_skips_only_the_fragment() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload {
+            plain: p_full,
+            html: h_full,
+            docx_fragment: d_full,
+        } = engine.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        let Event::ClipboardPayload {
+            plain: p_lite,
+            html: h_lite,
+            docx_fragment: d_lite,
+        } = engine.do_get_selection_as_clipboard(false)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        assert_eq!(p_full, "hello");
+        assert_eq!(p_full, p_lite);
+        assert_eq!(h_full, h_lite);
+        assert!(
+            !d_full.is_empty(),
+            "the default copy still builds the .docx"
+        );
+        assert!(d_lite.is_empty(), "the prefetch skips the ZIP build");
+    }
+
     /// Issue #51/#34 — table cell paragraphs must ride the layout LRU.
     /// Before the fix, `layout_cell_blocks` called `layout_paragraph`
     /// raw, so every paint re-shaped every cell (×3 with autofit's
@@ -19405,7 +19594,7 @@ mod tests {
         };
         let (note0, body0) = widths(&engine);
         let caret = engine.selection.as_ref().unwrap().caret.clone();
-        engine.do_begin_composition(caret);
+        engine.do_begin_composition(Some(caret));
         engine.do_update_composition("wide preview".to_string(), None);
         let (note1, body1) = widths(&engine);
         assert!(
@@ -25621,7 +25810,12 @@ mod wire_validation_tests {
             assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
         }
         e.selection = None;
-        let evt = apply(&mut e, Command::SplitParagraph { at: bpos_top(3, 0) });
+        let evt = apply(
+            &mut e,
+            Command::SplitParagraph {
+                at: Some(bpos_top(3, 0)),
+            },
+        );
         assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
         assert_eq!(text(&e), "hello");
         assert_eq!(
@@ -25694,7 +25888,12 @@ mod wire_validation_tests {
     #[test]
     fn undo_with_a_failing_repaint_still_clamps_the_selection() {
         let mut e = text_engine("hello");
-        apply(&mut e, Command::SplitParagraph { at: bpos_top(0, 5) });
+        apply(
+            &mut e,
+            Command::SplitParagraph {
+                at: Some(bpos_top(0, 5)),
+            },
+        );
         assert_eq!(e.selection.clone().unwrap().caret, bpos_top(1, 0));
         /* An unloaded font makes every repaint fail. */
         if let Some(cfg) = e.layout_cfg.as_mut() {
