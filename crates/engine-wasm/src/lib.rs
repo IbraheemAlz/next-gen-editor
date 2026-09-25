@@ -55,7 +55,9 @@ struct RenderConfig {
     px_size: f32,
     line_height: f32,
     alignment: Alignment,
-    /// Effective device scale — always `base_scale × zoom`. Layout + paint
+    /// Effective device scale — `base_scale × zoom`, capped at
+    /// `MAX_PAINT_SCALE` (issue #280, never below `base_scale`; see
+    /// `compose_paint_scale`). Layout + paint
     /// are scaled by this; `px_size` and `line_height` stay logical (the
     /// toolbar + document model use them raw).
     scale: f32,
@@ -66,6 +68,28 @@ struct RenderConfig {
     base_scale: f32,
     /// User zoom fraction set by `SetZoom`, clamped to `[0.25, 4.0]`.
     zoom: f32,
+}
+
+/// Issue #280 — ceiling on the effective paint scale (device px per
+/// layout pt) that a user zoom may push the backing store to. Zoom now
+/// visibly grows every page card, and its canvas backing store grows with
+/// it (`page.size × scale`); uncapped, 400 % on a `devicePixelRatio` 2
+/// display is a ~6350 × 8980 px (≈ 228 MB) canvas PER mounted page —
+/// past Safari's 16.7 M px canvas limit and far past the 256 MiB worker
+/// budget once a few pages are mounted (#63). At `4.0` an A4 page stays
+/// ≤ 2381 × 3368 px (≈ 32 MB). Past the cap the engine keeps painting at
+/// the capped density and the shell stretches the (slightly softer)
+/// bitmap to the full zoomed CSS size — the page still grows exactly
+/// with the zoom. The cap never pushes the scale below the boot
+/// `base_scale`, so 100 % is always rendered at full device resolution.
+/// MIRRORED in `ts/src/state/engine-store.ts` (`MAX_PAINT_SCALE`): the
+/// shell derives its device-px ↔ CSS-px ratio from the same formula.
+const MAX_PAINT_SCALE: f32 = 4.0;
+
+/// Issue #280 — `scale = base_scale × zoom`, capped at
+/// [`MAX_PAINT_SCALE`] (never below `base_scale`).
+fn compose_paint_scale(base_scale: f32, zoom: f32) -> f32 {
+    (base_scale * zoom).min(MAX_PAINT_SCALE.max(base_scale))
 }
 
 /// Bound on the undo stack (`UndoStack::new(_, UNDO_CAP)`).
@@ -147,7 +171,7 @@ impl LayoutCfgSnapshot {
                 "CENTER" => Alignment::Center,
                 _ => Alignment::Start,
             },
-            scale: base_scale * zoom,
+            scale: compose_paint_scale(base_scale, zoom),
             base_scale,
             zoom,
         })
@@ -565,6 +589,8 @@ struct LastPaintDims {
     /// between real paints.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Issue #280 — per-page widths (device px), index-aligned.
+    page_widths: Vec<f32>,
     /// Phase 3 (#39) — per-page top/bottom margins (device px) for the
     /// shell's header/footer double-click zone gate.
     page_margin_tops: Vec<f32>,
@@ -1141,6 +1167,7 @@ impl Engine {
             is_full_layout: dims.is_full_layout,
             page_tops: dims.page_tops,
             page_heights: dims.page_heights,
+            page_widths: dims.page_widths,
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: dims.page_margin_tops,
             page_margin_bottoms: dims.page_margin_bottoms,
@@ -1210,13 +1237,27 @@ impl Engine {
                         block: block_idx as u32,
                         start: r.start,
                         end: r.end,
-                        kind: match r.kind {
-                            engine::RevisionKind::Insert => "insert",
-                            engine::RevisionKind::Delete => "delete",
-                            engine::RevisionKind::FormatChange => "format",
-                        },
+                        kind: revision_kind_label(r.kind),
                         author: r.author.clone(),
                         date: r.date.clone(),
+                        move_name: r.move_name.clone(),
+                        mark: false,
+                    });
+                }
+                /* Issue #262 — the paragraph-mark revision, addressed as
+                the empty range at the paragraph end (what
+                `AcceptRevision` / `RejectRevision` resolve it by). */
+                if let Some(r) = &p.mark_revision {
+                    let end = p.text.len() as u32;
+                    rows.push(RevisionOut {
+                        block: block_idx as u32,
+                        start: end,
+                        end,
+                        kind: revision_kind_label(r.kind),
+                        author: r.author.clone(),
+                        date: r.date.clone(),
+                        move_name: r.move_name.clone(),
+                        mark: true,
                     });
                 }
             }
@@ -1270,6 +1311,8 @@ struct PaintDimsOut {
     /// Issue #26 — per-page absolute tops + heights in device px.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Issue #280 — per-page widths (device px), index-aligned.
+    page_widths: Vec<f32>,
     /// Issue #44 — inline-image count, so the broadcast PAINTED can gate
     /// the shell's `GetImageRects` refresh (mirrors `Event::Painted`).
     image_count: u32,
@@ -1302,6 +1345,25 @@ struct RevisionOut {
     kind: &'static str,
     author: String,
     date: String,
+    /// Issue #247 — the move's range name (`MoveFrom` / `MoveTo` only):
+    /// the two halves of one move share it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    move_name: Option<String>,
+    /// Issue #262 — a paragraph-MARK revision (a tracked split / merge),
+    /// addressed by the empty range `start == end == text length`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mark: bool,
+}
+
+/// The `revisions_snapshot()` wire label of a revision kind.
+fn revision_kind_label(kind: engine::RevisionKind) -> &'static str {
+    match kind {
+        engine::RevisionKind::Insert => "insert",
+        engine::RevisionKind::Delete => "delete",
+        engine::RevisionKind::FormatChange => "format",
+        engine::RevisionKind::MoveFrom => "move-from",
+        engine::RevisionKind::MoveTo => "move-to",
+    }
 }
 
 #[derive(::serde::Serialize)]
@@ -1898,6 +1960,21 @@ const HYPERLINK_BLUE: [u8; 4] = [0x05, 0x63, 0xC1, 0xFF];
 /// with a later cut.
 const REVISION_INSERT_COLOR: [u8; 4] = [0x00, 0x80, 0x00, 0xFF];
 const REVISION_DELETE_COLOR: [u8; 4] = [0xCC, 0x00, 0x00, 0xFF];
+/// Issue #247 — tracked moves get their own tint (both halves), so a
+/// move reads differently from an unrelated insert / delete pair.
+const REVISION_MOVE_COLOR: [u8; 4] = [0x6A, 0x1B, 0x9A, 0xFF];
+
+/// Issue #262 — the pilcrow colour of a paragraph whose MARK carries a
+/// tracked change (paint-only review decoration), in the same tint as
+/// the matching text revision.
+fn review_mark_color(para: &engine::Paragraph) -> Option<[u8; 4]> {
+    para.mark_revision.as_ref().map(|r| match r.kind {
+        engine::RevisionKind::Insert => REVISION_INSERT_COLOR,
+        engine::RevisionKind::Delete => REVISION_DELETE_COLOR,
+        engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => REVISION_MOVE_COLOR,
+        engine::RevisionKind::FormatChange => REVISION_INSERT_COLOR,
+    })
+}
 
 /// Phase 8b — overlay each revision range so insertions render with
 /// `underline = true` + the insert colour and deletions render with
@@ -1953,6 +2030,22 @@ fn apply_revision_overlay(
                         sub.strike = true;
                         if sub.color == default_color {
                             sub.color = REVISION_DELETE_COLOR;
+                        }
+                    }
+                    /* Issue #247 — a move's source half reads like a
+                    deletion, its destination like an insertion (double
+                    underline), both in the move tint. Paint-only: glyph
+                    advances do not change. */
+                    engine::RevisionKind::MoveFrom => {
+                        sub.strike = true;
+                        if sub.color == default_color {
+                            sub.color = REVISION_MOVE_COLOR;
+                        }
+                    }
+                    engine::RevisionKind::MoveTo => {
+                        sub.underline = engine::UnderlineStyle::Double;
+                        if sub.color == default_color {
+                            sub.color = REVISION_MOVE_COLOR;
                         }
                     }
                     /* Sprint 14 (#14) — FormatChange has no text-wrap
@@ -3058,6 +3151,12 @@ fn paragraph_layout_key(
         r.start.hash(&mut h);
         r.end.hash(&mut h);
         matches!(r.kind, engine::RevisionKind::Insert).hash(&mut h);
+        /* Issue #247 — the move kinds paint differently from ins / del. */
+        matches!(
+            r.kind,
+            engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo
+        )
+        .hash(&mut h);
     }
     /* Audit gap A.M3 — tab stops affect glyph advances at the line
     builder's post-pass; without them in the key, two paragraphs with
@@ -3253,6 +3352,7 @@ fn layout_story_blocks_cut(
                 };
                 p.borders = para.props.borders.clone();
                 p.shading = para.props.shading;
+                p.review_mark = review_mark_color(para);
                 LayoutBlock::Paragraph(p)
             }
             engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
@@ -6756,6 +6856,7 @@ impl Engine {
             | Command::DeleteAtCaret { .. }
             | Command::SplitParagraph { .. }
             | Command::ApplyFormatting { .. }
+            | Command::ToggleFormatting { .. }
             | Command::PastePlain { .. }
             | Command::SetSelection { .. }
             | Command::ExtendSelection { .. }
@@ -7081,6 +7182,10 @@ impl Engine {
             Command::DeleteRange { range } => self.do_delete_range(range),
             Command::ReplaceRange { range, text } => self.do_replace_range(range, text),
             Command::ApplyFormatting { range, attrs } => self.apply_formatting(range, attrs),
+            Command::ToggleFormatting {
+                attr,
+                underline_style,
+            } => self.toggle_formatting(attr, underline_style),
             Command::SplitParagraph { at } => self.do_split_paragraph(at),
             Command::MergeParagraph { .. } => phase3_stub("MergeParagraph"),
             // Sprint 3 (UI Edition) — wired now (was a Phase 3 stub
@@ -7296,6 +7401,8 @@ impl Engine {
             Command::RejectRevision { block, start, end } => {
                 self.do_reject_revision(block, start, end)
             }
+            Command::AcceptAllRevisions => self.do_resolve_all_revisions(true),
+            Command::RejectAllRevisions => self.do_resolve_all_revisions(false),
             Command::InsertComment {
                 range,
                 text,
@@ -7452,7 +7559,7 @@ impl Engine {
         if let Some(zoom) = self.pending_zoom.take() {
             cfg.zoom = zoom;
         }
-        cfg.scale = cfg.base_scale * cfg.zoom;
+        cfg.scale = compose_paint_scale(cfg.base_scale, cfg.zoom);
         self.layout_cfg = Some(cfg);
         /* A RenderPage reset is a fresh document; a surviving selection
         or IME preview from the previous session would be load-bearing
@@ -7596,6 +7703,97 @@ impl Engine {
                 attrs: resolved_attrs(&attrs, default_size),
             }
         }
+    }
+
+    /// Issue #286 — `Command::ToggleFormatting`. The target state is
+    /// derived HERE, from the engine's own view of the live selection,
+    /// never from the shell's mirrored toolbar state (which lags the
+    /// `SelectionChanged` reply at typing speed — Ctrl+B, type, Ctrl+B
+    /// used to toggle against the stale "not bold" mirror).
+    ///
+    /// The "current" value is the one rule the toolbar also reads:
+    /// [`Self::attrs_at`] — for a collapsed caret the #276 typing style
+    /// (`Paragraph::typing_style_at`) cascaded over the paragraph style
+    /// with any armed pending style overlaid; for a range its first
+    /// character. A range whose flag is mixed ([`Self::attrs_mixed_over`])
+    /// turns the flag ON (Word). The resulting patch goes through
+    /// [`Self::apply_formatting`] unchanged, so a collapsed caret arms
+    /// pending formatting and a range is restyled — body or story alike.
+    fn toggle_formatting(
+        &mut self,
+        attr: bridge::FormattingToggle,
+        underline_style: Option<UnderlineStyle>,
+    ) -> Event {
+        use bridge::FormattingToggle as T;
+        let Some(sel) = self.selection.clone() else {
+            return Event::Error {
+                message: "ToggleFormatting: no active selection".into(),
+            };
+        };
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        let collapsed = start == end;
+        let current = self.attrs_at(start.clone(), collapsed);
+        let mixed = self.attrs_mixed_over(&start, &end);
+        let mut patch = TextAttrsPatch {
+            bold: None,
+            italic: None,
+            underline: None,
+            strike: None,
+            font_family: None,
+            font_size: None,
+            color: None,
+            bg_color: None,
+            script: None,
+            language: None,
+            caps: None,
+            small_caps: None,
+        };
+        match attr {
+            T::Bold => patch.bold = Some(mixed.bold || !current.bold),
+            T::Italic => patch.italic = Some(mixed.italic || !current.italic),
+            T::Strike => patch.strike = Some(mixed.strike || !current.strike),
+            T::Underline => {
+                let on = mixed.underline || matches!(current.underline, UnderlineStyle::None);
+                patch.underline = Some(if on {
+                    underline_style
+                        .filter(|s| !matches!(s, UnderlineStyle::None))
+                        .unwrap_or(UnderlineStyle::Single)
+                } else {
+                    UnderlineStyle::None
+                });
+            }
+            T::Superscript => {
+                patch.script = Some(if matches!(current.script, VerticalScript::Superscript) {
+                    VerticalScript::Normal
+                } else {
+                    VerticalScript::Superscript
+                });
+            }
+            T::Subscript => {
+                patch.script = Some(if matches!(current.script, VerticalScript::Subscript) {
+                    VerticalScript::Normal
+                } else {
+                    VerticalScript::Subscript
+                });
+            }
+            T::Caps => {
+                if current.caps {
+                    patch.caps = Some(false);
+                } else {
+                    patch.caps = Some(true);
+                    patch.small_caps = Some(false);
+                }
+            }
+            T::SmallCaps => {
+                if current.small_caps {
+                    patch.small_caps = Some(false);
+                } else {
+                    patch.small_caps = Some(true);
+                    patch.caps = Some(false);
+                }
+            }
+        }
+        self.apply_formatting(None, patch)
     }
 
     fn do_undo(&mut self) -> Event {
@@ -7782,11 +7980,16 @@ impl Engine {
         package: Option<Vec<u8>>,
     ) -> Event {
         self.reset_session_state();
+        /* Issue #268 — whether the restored base lost its source package. */
+        let mut base_package_lost = false;
         let snapshot_restored = if snapshot.is_empty() {
             false
         } else {
             match self.restore_from_bytes_with_package(&snapshot, package.as_deref()) {
-                Ok(_) => true,
+                Ok((_, lost)) => {
+                    base_package_lost = lost;
+                    true
+                }
                 Err(e) => {
                     warn_console(&format!(
                         "[engine] recovery: base snapshot unreadable ({e}); replaying the \
@@ -7797,6 +8000,16 @@ impl Engine {
                 }
             }
         };
+        /* A replayed open / load / seed replaces the base document, and
+        with it whatever package it lost. */
+        let tail_replaces_document = log_tail.iter().any(|c| {
+            matches!(
+                c,
+                Command::OpenDocument { .. }
+                    | Command::LoadDocx { .. }
+                    | Command::RenderPage { .. }
+            )
+        });
 
         let mut stashed_cfg = self.layout_cfg.take();
         let mut pending_base_scale: Option<f32> = None;
@@ -7825,7 +8038,7 @@ impl Engine {
             if let Some(zoom) = pending_zoom {
                 cfg.zoom = zoom.clamp(0.25, 4.0);
             }
-            cfg.scale = cfg.base_scale * cfg.zoom;
+            cfg.scale = compose_paint_scale(cfg.base_scale, cfg.zoom);
         }
         self.layout_cfg = stashed_cfg;
         /* Replay side effects the user must not see twice: an IME preview
@@ -7843,6 +8056,7 @@ impl Engine {
             zoom: self.user_zoom(),
             device_scale: self.layout_cfg.as_ref().map(|c| c.base_scale),
             renderer_downgrade,
+            package_lost: base_package_lost && !tail_replaces_document,
         }
     }
 
@@ -7886,7 +8100,10 @@ impl Engine {
         &self,
         known_package_hash: Option<&str>,
     ) -> Result<(Vec<u8>, Option<String>, Option<Vec<u8>>), SnapshotError> {
-        let mut state = self.capture_snapshot();
+        /* Issue #269 — no media-reference pass for a package that stays
+        out of the envelope (it would hash every referenced blob only to be
+        thrown away). */
+        let mut state = self.capture_snapshot_with(false);
         let Some(package) = self.undo.current().source_package.clone() else {
             /* No package (engine-authored document): nothing to detach. */
             return Ok((engine::snapshot::encode(&state)?, None, None));
@@ -7953,6 +8170,13 @@ impl Engine {
 
     /// Issue #85 — assemble the session state the snapshot persists.
     fn capture_snapshot(&self) -> EngineSnapshotV1 {
+        self.capture_snapshot_with(true)
+    }
+
+    /// [`Self::capture_snapshot`]; `inline_package: false` (a detached
+    /// snapshot, #212) skips building the media-deduplicated inline
+    /// package — the caller replaces it with a key anyway.
+    fn capture_snapshot_with(&self, inline_package: bool) -> EngineSnapshotV1 {
         let (mut doc_history, undo_cursor) = self.undo.history_window(self.snapshot_undo_entries());
         /* Issue #134 — the package rides the envelope once, not once per
         undo entry (the entries share one `Arc`). */
@@ -7960,7 +8184,7 @@ impl Engine {
         let source_package = current.and_then(|d| d.source_package.clone());
         /* Media parts ride by reference to the current entry's `media`
         (the same bytes) — see `engine::package`'s snapshot-size notes. */
-        let persisted_package = current.and_then(|d| {
+        let persisted_package = current.filter(|_| inline_package).and_then(|d| {
             d.source_package
                 .as_ref()
                 .map(|p| Arc::new(p.deduplicated_against(&d.media)))
@@ -8005,21 +8229,24 @@ impl Engine {
     /// rendering surface.
     fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<u8, SnapshotError> {
         self.restore_from_bytes_with_package(bytes, None)
+            .map(|(version, _)| version)
     }
 
     /// Issue #212 — [`Self::restore_from_bytes`] for a detached snapshot:
     /// `package` is the separately stored source package
-    /// (`Command::Recover.package`).
+    /// (`Command::Recover.package`). Returns the format version and —
+    /// issue #268 — whether the snapshot named a source package that
+    /// could not be re-attached.
     fn restore_from_bytes_with_package(
         &mut self,
         bytes: &[u8],
         package: Option<&[u8]>,
-    ) -> Result<u8, SnapshotError> {
+    ) -> Result<(u8, bool), SnapshotError> {
         let decoded = engine::snapshot::decode::<EngineSnapshotV1>(bytes)?;
         let mut state = decoded.payload;
         state.apply_version_defaults(decoded.version);
-        self.restore_snapshot(state, package);
-        Ok(decoded.version)
+        let package_lost = self.restore_snapshot(state, package);
+        Ok((decoded.version, package_lost))
     }
 
     /// Issue #212 — the detached package a snapshot names by `key`, if
@@ -8038,7 +8265,10 @@ impl Engine {
             ));
             return None;
         };
-        if engine::package::package_key(bytes) != key {
+        /* Issue #269 — SHA-256 keys; a format-v1 (`pkg-` FNV) key from a
+        snapshot persisted by the previous build is still verified, for one
+        release (see `engine::snapshot`'s migration notes). */
+        if !engine::package::package_key_matches(key, bytes) {
             warn_console(&format!(
                 "[engine] recovery: supplied source package does not match {key}; \
                  saving through the minimal-package writer"
@@ -8049,11 +8279,17 @@ impl Engine {
             Ok(decoded) => {
                 let package = Arc::new(decoded.payload);
                 /* Prime the cache: the next detached snapshot need not
-                re-encode or re-ship what the caller already stores. */
-                *self.detached_package.borrow_mut() = Some(DetachedPackage {
-                    package: package.clone(),
-                    key: key.to_string(),
-                });
+                re-encode or re-ship what the caller already stores.
+                Issue #269 — except under a legacy key: those bytes are a
+                v1 envelope, so the cache stays empty and the next detached
+                snapshot re-encodes the package, names it by the SHA-256 of
+                the bytes it ships, and ships them (the caller's legacy
+                `known_package_hash` never matches). */
+                *self.detached_package.borrow_mut() =
+                    (!engine::package::is_legacy_package_key(key)).then(|| DetachedPackage {
+                        package: package.clone(),
+                        key: key.to_string(),
+                    });
                 Some(package)
             }
             Err(e) => {
@@ -8066,7 +8302,12 @@ impl Engine {
         }
     }
 
-    fn restore_snapshot(&mut self, mut s: EngineSnapshotV1, detached: Option<&[u8]>) {
+    /// Install a decoded snapshot. Returns `true` when it named a source
+    /// package (inline or detached) that could not be re-attached — the
+    /// session then saves through the minimal-package writer (issue #268
+    /// reports it on `Event::Recovered.package_lost`).
+    fn restore_snapshot(&mut self, mut s: EngineSnapshotV1, detached: Option<&[u8]>) -> bool {
+        let named_package = s.source_package.is_some() || s.package_hash.is_some();
         /* Issue #134 — re-attach the once-persisted source package to every
         history entry (see `EngineSnapshotV1::source_package`). */
         /* Media entries were persisted by reference to the current
@@ -8083,6 +8324,7 @@ impl Engine {
             (None, Some(key)) => self.attach_detached_package(&key, detached),
             (None, None) => None,
         };
+        let package_lost = named_package && package.is_none();
         if let Some(pkg) = &package {
             for d in &mut s.doc_history {
                 if d.source_package.is_none() {
@@ -8134,6 +8376,7 @@ impl Engine {
                 kind: sel.kind,
             });
         }
+        package_lost
     }
 
     fn do_redo(&mut self) -> Event {
@@ -9207,6 +9450,8 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
+                        /* Issue #262 — the pilcrow of a tracked mark. */
+                        para_box.review_mark = review_mark_color(para);
                         /* Issue #95 / #178 / #179 — pagination
                         constraints from the resolved (style-cascaded)
                         properties. keepNext/keepLines are tri-state
@@ -9475,6 +9720,7 @@ impl Engine {
         them from uniform-A4 constants. */
         let mut page_tops = Vec::with_capacity(pages.len());
         let mut page_heights = Vec::with_capacity(pages.len());
+        let mut page_widths = Vec::with_capacity(pages.len());
         let mut page_margin_tops = Vec::with_capacity(pages.len());
         let mut page_margin_bottoms = Vec::with_capacity(pages.len());
         let mut page_content_tops = Vec::with_capacity(pages.len());
@@ -9483,6 +9729,7 @@ impl Engine {
         for page in pages {
             page_tops.push(top_acc);
             page_heights.push(page.size.height);
+            page_widths.push(page.size.width);
             /* Phase 3 (#39) — per-page margins for the shell's
             header/footer zone gate; exact under mixed-geometry
             sections. */
@@ -9518,6 +9765,7 @@ impl Engine {
             page_count: pages.len() as u32,
             page_tops,
             page_heights,
+            page_widths,
             page_margin_tops,
             page_margin_bottoms,
             page_content_tops,
@@ -9553,6 +9801,7 @@ impl Engine {
                 is_full_layout: stats.is_full_layout,
                 page_tops: stats.page_tops.clone(),
                 page_heights: stats.page_heights.clone(),
+                page_widths: stats.page_widths.clone(),
                 page_margin_tops: stats.page_margin_tops.clone(),
                 page_margin_bottoms: stats.page_margin_bottoms.clone(),
                 page_content_tops: stats.page_content_tops.clone(),
@@ -9618,6 +9867,7 @@ impl Engine {
             is_full_layout: stats.is_full_layout,
             page_tops: stats.page_tops.clone(),
             page_heights: stats.page_heights.clone(),
+            page_widths: stats.page_widths.clone(),
             page_margin_tops: stats.page_margin_tops.clone(),
             page_margin_bottoms: stats.page_margin_bottoms.clone(),
             page_content_tops: stats.page_content_tops.clone(),
@@ -9897,6 +10147,7 @@ impl Engine {
             estimated_document_height: dims.estimated_document_height,
             page_tops: dims.page_tops,
             page_heights: dims.page_heights,
+            page_widths: dims.page_widths,
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: dims.page_margin_tops,
             page_margin_bottoms: dims.page_margin_bottoms,
@@ -9961,6 +10212,7 @@ impl Engine {
             estimated_document_height: stats.estimated_document_height,
             page_tops: stats.page_tops,
             page_heights: stats.page_heights,
+            page_widths: stats.page_widths,
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: stats.page_margin_tops,
             page_margin_bottoms: stats.page_margin_bottoms,
@@ -12335,7 +12587,9 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// Story `InsertText` — plain (untracked, no sticky format) insert.
+    /// Story `InsertText` — untracked insert. Issue #296 — any armed
+    /// sticky (pending) style is overlaid onto the typed run, the same
+    /// rule as the body path (`do_insert_text_interactive`).
     fn story_insert_text(&mut self, at: BridgeLogicalPos, text: String) -> Event {
         let sel = self.selection.clone().unwrap_or(SelectionState {
             anchor: at.clone(),
@@ -12354,10 +12608,21 @@ impl Engine {
             temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
-        let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        let mut new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        let inserted_end = start.offset + text.len() as u32;
+        if let Some(pending) = self.pending_format.clone() {
+            new_doc = new_doc.apply_style(
+                to_engine_pos(start.clone()),
+                EnginePos {
+                    path: bridge_to_engine_path(start.path.clone()),
+                    offset: inserted_end,
+                },
+                pending,
+            );
+        }
         let caret = BridgeLogicalPos {
             path: start.path,
-            offset: start.offset + text.len() as u32,
+            offset: inserted_end,
         };
         self.commit_story_edit(&new_doc, caret)
     }
@@ -12451,8 +12716,10 @@ impl Engine {
     }
 
     /// Story `ApplyFormatting` — span patch over the selection (or the
-    /// explicit range). Collapsed carets are a no-op in v1: sticky
-    /// pending formatting stays a body-only feature for now.
+    /// explicit range). Issue #296 — a collapsed caret arms sticky
+    /// pending formatting exactly like the body path, and
+    /// [`Self::story_insert_text`] overlays it onto typed text, so the
+    /// toolbar preview and the typed run agree in every story.
     fn story_apply_formatting(
         &mut self,
         range: Option<BridgeLogicalRange>,
@@ -12465,13 +12732,21 @@ impl Engine {
                 None => return self.selection_changed(),
             },
         };
+        let style = patch_to_span_style(&patch);
         if start == end {
+            if self.selection.is_some() {
+                let armed = self
+                    .pending_format
+                    .clone()
+                    .unwrap_or_default()
+                    .merged_with(style);
+                self.pending_format = Some(armed);
+            }
             return self.selection_changed();
         }
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
         };
-        let style = patch_to_span_style(&patch);
         let new_doc = temp.apply_style(
             to_engine_pos(start.clone()),
             to_engine_pos(end.clone()),
@@ -13148,6 +13423,9 @@ impl Engine {
     /// Shared exit: restore + clamp the stashed body selection.
     fn exit_story_to_body(&mut self) {
         self.active_story = StoryTarget::Body;
+        /* Issue #296 — a story can arm sticky formatting now; leaving it
+        is a caret move, which always discards the armed style. */
+        self.pending_format = None;
         let doc = self.undo.current();
         let restored = self.stashed_body_selection.take().map(|s| SelectionState {
             anchor: clamp_pos(doc, s.anchor),
@@ -14714,6 +14992,45 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #262 — `Command::AcceptAllRevisions` /
+    /// `RejectAllRevisions`: every tracked change of the body resolved in
+    /// one tree edit, pushed as ONE undo step. Nothing to resolve → no
+    /// undo step. The selection is clamped back into the (possibly
+    /// merged / shortened) paragraphs.
+    fn do_resolve_all_revisions(&mut self, accept: bool) -> Event {
+        let doc = self.undo.current();
+        if !doc.has_revisions() {
+            self.announce(AnnouncementPriority::Polite, "No tracked changes");
+            return self.selection_changed();
+        }
+        let new_doc = doc.resolve_all_revisions(accept);
+        self.undo.push(new_doc);
+        /* Merged / shortened paragraphs: keep the caret on real text. */
+        if let Some(sel) = self.selection.clone() {
+            let doc = self.undo.current();
+            self.selection = Some(SelectionState {
+                anchor: clamp_pos(doc, sel.anchor),
+                caret: clamp_pos(doc, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+        }
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(
+            AnnouncementPriority::Polite,
+            if accept {
+                "All tracked changes accepted"
+            } else {
+                "All tracked changes rejected"
+            },
+        );
+        self.selection_changed()
+    }
+
     /// `Command::InsertComment` (Sprint 7 UI Edition). Stamped with the
     /// engine clock via `current_review_date` (issue #118 — the
     /// `SetReviewIdentity` override wins, else `Date` / `SystemTime`).
@@ -15412,7 +15729,7 @@ impl Engine {
             };
         };
         cfg.zoom = zoom;
-        cfg.scale = cfg.base_scale * zoom;
+        cfg.scale = compose_paint_scale(cfg.base_scale, zoom);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15445,7 +15762,7 @@ impl Engine {
             };
         };
         cfg.base_scale = base;
-        cfg.scale = base * cfg.zoom;
+        cfg.scale = compose_paint_scale(base, cfg.zoom);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -16692,6 +17009,8 @@ struct RenderStats {
     /// Issue #26 — absolute per-page tops + heights in device px.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Issue #280 — per-page widths (device px), index-aligned.
+    page_widths: Vec<f32>,
     /// Phase 3 (#39) — per-page top/bottom margins in device px,
     /// index-aligned with `page_tops`; the shell's header/footer
     /// double-click zone gate.
@@ -17204,6 +17523,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -17358,6 +17678,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -17396,6 +17717,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -18517,6 +18839,7 @@ mod tests {
             start: 10,
             end: 17,
             target: "https://example.com".to_string(),
+            ..Default::default()
         });
 
         let base_spans = build_style_spans(&para, empty_sctx(), 24.0, [0, 0, 0, 255], 1.0);
@@ -18569,6 +18892,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             })],
             source_markup: None,
         }
@@ -22787,6 +23111,48 @@ mod tests {
         assert_eq!(engine.layout_cfg.as_ref().unwrap().zoom, 4.0);
     }
 
+    /// Issue #280 — the effective paint scale follows `base × zoom` up to
+    /// `MAX_PAINT_SCALE` and never drops below the boot `base_scale`;
+    /// the painted page grows with it and the backing store stays bounded.
+    #[test]
+    fn zoom_paint_scale_is_capped_at_the_backing_store_budget() {
+        assert_eq!(compose_paint_scale(4.0 / 3.0, 1.5), 2.0);
+        assert_eq!(compose_paint_scale(4.0 / 3.0, 0.25), 1.0 / 3.0);
+        assert_eq!(compose_paint_scale(8.0 / 3.0, 2.0), MAX_PAINT_SCALE);
+        // A base already past the cap is kept (100 % stays full-res) and
+        // zooming in does not grow it further.
+        assert_eq!(compose_paint_scale(5.0, 1.0), 5.0);
+        assert_eq!(compose_paint_scale(5.0, 2.0), 5.0);
+
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
+        let _ = engine.do_set_device_scale(8.0 / 3.0);
+        let _ = engine.do_set_zoom(4.0);
+        let cfg = engine.layout_cfg.as_ref().unwrap();
+        assert_eq!(cfg.zoom, 4.0, "the user zoom itself is not capped");
+        assert_eq!(cfg.scale, MAX_PAINT_SCALE);
+        let Event::Painted {
+            page_widths,
+            page_heights,
+            ..
+        } = engine.do_request_paint(
+            BridgeRect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            None,
+        )
+        else {
+            panic!("expected Painted");
+        };
+        assert_eq!(page_widths.len(), page_heights.len());
+        assert!(!page_widths.is_empty());
+        // A4 portrait at the capped scale: 595.3 × 841.9 pt × 4.
+        assert!((page_widths[0] - 595.3 * MAX_PAINT_SCALE).abs() < 2.0);
+        assert!((page_heights[0] - 841.9 * MAX_PAINT_SCALE).abs() < 2.0);
+    }
+
     /// Issue #52 — `SetZoom` answers with a `SelectionChanged` that
     /// carries the engine's (clamped) zoom, so every zoom control can
     /// mirror one engine-owned value.
@@ -25406,9 +25772,11 @@ mod snapshot_tests {
                 zoom,
                 device_scale,
                 renderer_downgrade,
+                package_lost,
             } => {
                 assert_eq!(applied_commands, 2);
                 assert!(snapshot_restored);
+                assert!(!package_lost, "an engine-authored document has no package");
                 assert_eq!(renderer, "canvas2d");
                 /* Issue #97 — the reply reports the REPLAYED zoom (the
                 snapshot said 1.25, the tail's SetZoom said 2.0) and the
@@ -26268,6 +26636,71 @@ mod snapshot_tests {
         assert_eq!((re, rekey, reship), (bytes, key, None));
     }
 
+    /// Issue #269 — a snapshot persisted by the previous build (format
+    /// v1: the package named by its `pkg-<len>-<fnv>` key) still recovers
+    /// WITH its package, and the recovered session's next detached
+    /// snapshot re-keys it under SHA-256 and ships it again.
+    #[test]
+    fn format_v1_detached_snapshot_with_a_legacy_package_key_still_recovers() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let (bytes, key, package) = detached(&mut e, None);
+        assert!(
+            key.starts_with(engine::package::PACKAGE_KEY_PREFIX),
+            "{key}"
+        );
+        let expected = ui_save(&mut e);
+        /* Rewrite both envelopes into their v1 form. */
+        let mut v1_package = package.unwrap();
+        v1_package[4] = 1;
+        let legacy = engine::package::legacy_package_key(&v1_package);
+        let mut state = engine::snapshot::decode::<EngineSnapshotV1>(&bytes)
+            .unwrap()
+            .payload;
+        state.package_hash = Some(legacy.clone());
+        let mut v1 = engine::snapshot::encode(&state).unwrap();
+        v1[4] = 1;
+
+        let mut b = engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: v1,
+                log_tail: Vec::new(),
+                renderer_downgrade: None,
+                package: Some(v1_package),
+            },
+        );
+        assert!(
+            matches!(
+                evt,
+                Event::Recovered {
+                    snapshot_restored: true,
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
+        assert!(
+            b.undo.current().source_package.is_some(),
+            "package attached"
+        );
+        assert!(
+            matches!(
+                evt,
+                Event::Recovered {
+                    package_lost: false,
+                    ..
+                }
+            ),
+            "{evt:?}"
+        );
+        assert_eq!(ui_save(&mut b), expected);
+        let (_, rekey, shipped) = detached(&mut b, Some(&legacy));
+        assert_eq!(rekey, key, "re-keyed under SHA-256");
+        let shipped = shipped.expect("the re-keyed package ships");
+        assert_eq!(engine::package::package_key(&shipped), rekey);
+    }
+
     /// Issue #212 — a detached snapshot recovered WITHOUT its package (or
     /// with the wrong one) still restores the document; the session then
     /// saves through the minimal-package writer.
@@ -26288,11 +26721,13 @@ mod snapshot_tests {
                     package: supplied,
                 },
             );
+            /* Issue #268 — and the loss is reported, never silent. */
             assert!(
                 matches!(
                     evt,
                     Event::Recovered {
                         snapshot_restored: true,
+                        package_lost: true,
                         ..
                     }
                 ),
@@ -26306,6 +26741,51 @@ mod snapshot_tests {
             let saved = ui_save(&mut b);
             format_docx::check_document_xml_well_formed(&saved).expect("well-formed");
         }
+    }
+
+    /// Issue #268 — `Event::Recovered.package_lost` is about the document
+    /// the recovery ENDS with: a base that restores with its package, or
+    /// one whose lost package is superseded by a replayed open, is not a
+    /// loss.
+    #[test]
+    fn recovered_reports_package_lost_only_when_the_final_document_lost_it() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let (bytes, _, package) = detached(&mut e, None);
+        let lost = |evt: &Event| match evt {
+            Event::Recovered {
+                snapshot_restored: true,
+                package_lost,
+                ..
+            } => *package_lost,
+            other => panic!("{other:?}"),
+        };
+        let recover = |package: Option<Vec<u8>>, log_tail: Vec<Command>| {
+            let mut b = engine();
+            let evt = apply(
+                &mut b,
+                Command::Recover {
+                    snapshot: bytes.clone(),
+                    log_tail,
+                    renderer_downgrade: None,
+                    package,
+                },
+            );
+            (evt, b)
+        };
+        let (evt, _) = recover(package, vec![insert("x")]);
+        assert!(!lost(&evt), "package supplied");
+        let (evt, _) = recover(None, vec![insert("x")]);
+        assert!(lost(&evt), "package missing, an edit replayed");
+        let (evt, b) = recover(
+            None,
+            vec![Command::OpenDocument {
+                bytes: PACKAGE_FIXTURE.to_vec(),
+                format: bridge::DocFormat::Docx,
+                name: None,
+            }],
+        );
+        assert!(!lost(&evt), "a replayed open supersedes the base");
+        assert!(b.undo.current().source_package.is_some());
     }
 
     /// Issue #212 — a document without a retained package detaches
@@ -26395,7 +26875,9 @@ mod snapshot_tests {
                 with.len() - without.len()
             );
             assert!(
-                detached_len <= without.len() + 64,
+                /* The `package_hash` field + its `sha256-<64 hex>` key
+                (issue #269) is the only addition. */
+                detached_len <= without.len() + 96,
                 "detached ~ package-free size"
             );
             assert!(with.len() >= without.len());
@@ -26414,6 +26896,9 @@ mod a11y_direction_tests;
 
 #[cfg(test)]
 mod para_style_edit_tests;
+
+#[cfg(test)]
+mod toggle_formatting_tests;
 
 /// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
 /// `format_pdf::export_pdf` path, end to end (not the #144 acceptance
@@ -26435,6 +26920,9 @@ mod block_remap_tests;
 
 #[cfg(test)]
 mod text_remap_tests;
+
+#[cfg(test)]
+mod revision_command_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
@@ -26822,17 +27310,20 @@ mod wire_validation_tests {
                 date: "d".into(),
                 id: None,
                 prev_attrs: None,
+                move_name: None,
             }],
             hyperlinks: vec![
                 engine::Hyperlink {
                     start: 0,
                     end: 6,
                     target: "x".into(),
+                    ..Default::default()
                 },
                 engine::Hyperlink {
                     start: 2,
                     end: 8,
                     target: "y".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()

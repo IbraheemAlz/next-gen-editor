@@ -785,6 +785,7 @@ classify_variants! {
     DeleteRange { .. } => true, // gen_targeted_command
     ReplaceRange { .. } => true, // gen_targeted_command
     ApplyFormatting { .. } => true, // gen_targeted_command
+    ToggleFormatting { .. } => false, // #286 — blind-only (curated arms keep their byte layout)
     SplitParagraph { .. } => true, // gen_targeted_command
     MergeParagraph { .. } => false,
     InsertImage { .. } => true, // gen_image_command
@@ -863,6 +864,8 @@ classify_variants! {
     ToggleTrackChanges { .. } => false,
     AcceptRevision { .. } => false,
     RejectRevision { .. } => false,
+    AcceptAllRevisions => false,
+    RejectAllRevisions => false,
     InsertComment { .. } => false,
     DeleteComment { .. } => false,
     SetTabStops { .. } => false,
@@ -1092,7 +1095,7 @@ mod tests {
                 "duplicate variant name in ALL_VARIANT_NAMES: {name}"
             );
         }
-        const EXPECTED_VARIANT_COUNT: usize = 104;
+        const EXPECTED_VARIANT_COUNT: usize = 107;
         assert_eq!(
             ALL_VARIANT_NAMES.len(),
             EXPECTED_VARIANT_COUNT,

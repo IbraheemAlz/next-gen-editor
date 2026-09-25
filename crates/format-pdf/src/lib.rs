@@ -3238,6 +3238,7 @@ mod tests {
             shading: None,
             keep_next: false,
             flow: layout::ParaFlow::default(),
+            review_mark: None,
         };
         let page = PageBox {
             size: Size {

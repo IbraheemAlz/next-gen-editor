@@ -20,7 +20,8 @@ import { Show } from 'solid-js';
 import type { EngineStore } from '../state/engine-store';
 
 export function StoryModeOverlay(props: { store: EngineStore; pageIdx: number }) {
-    const dpr = () => window.devicePixelRatio || 1;
+    /* Issue #280 — the ratio the margins were painted at (zoom-aware). */
+    const dpr = () => props.store.paintRatio();
     /* Issue #80 — note stories live in the body's own page flow (Word
        never dims the text around a footnote being edited); only the
        margin-band stories get the dim + chip treatment. */

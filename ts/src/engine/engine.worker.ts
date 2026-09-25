@@ -144,6 +144,45 @@ let trapAfterCommands: number | null = null;
    issued, cleared if it fails), passed as `known_package_hash` so the
    engine ships the package bytes only when they changed. */
 let persistedPackageHash: string | undefined;
+/* Issue #268 — the next persisted snapshot becomes the document's pinned
+   base (never pruned; see `event-log.ts`). Set when the log opens, after
+   every document-replacing command, and after a recovery whose pinned
+   base did not restore. */
+let pinNextSnapshot = false;
+/* Issue #268 — commands that replace the whole document: the snapshot
+   after one is the new document's pinned base. */
+const DOCUMENT_REPLACING: ReadonlySet<Command['type']> = new Set([
+    'OPEN_DOCUMENT',
+    'LOAD_DOCX',
+    'RENDER_PAGE',
+]);
+
+/** Issue #268 — how good a recovery base is, best first:
+ *  4 — full tail, package present (or none needed);
+ *  3 — full tail, but the snapshot's source package was lost (the session
+ *      saves through the minimal writer — sibling parts gone);
+ *  2 — a pinned base whose tail pruning has passed (restored alone:
+ *      edits after it are lost), package present;
+ *  1 — the same, package lost;
+ *  0 — nothing restored and the log is truncated (the document is lost);
+ *  -1 — the snapshot did not restore at all. */
+function recoveryRank(candidate: RecoveryCandidate, evt: Event): number {
+    if (evt.type !== 'RECOVERED') return -1;
+    const isLogBase = candidate.snapshot.length === 0;
+    if (!evt.snapshot_restored && !isLogBase) return -1;
+    const tailComplete = candidate.tailComplete !== false;
+    if (isLogBase) return tailComplete ? 4 : 0;
+    return (tailComplete ? 3 : 1) + (evt.package_lost ? 0 : 1);
+}
+
+/** Issue #268 — the best rank a candidate could reach, before trying it:
+ *  a package the store no longer holds is predictably lost. */
+function recoveryRankCeiling(candidate: RecoveryCandidate): number {
+    const tailComplete = candidate.tailComplete !== false;
+    if (candidate.snapshot.length === 0) return tailComplete ? 4 : 0;
+    const packageMissing = candidate.packageHash !== undefined && !candidate.package;
+    return (tailComplete ? 3 : 1) + (packageMissing ? 0 : 1);
+}
 
 /* Issue #96 — every OffscreenCanvas this worker generation was handed, by
    page index (0 = the INIT / RECOVER surface). Only the DEV paint probe
@@ -882,6 +921,8 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
         pageSurfaces.set(0, msg.canvas);
         await openEventLog(msg.documentId);
         persistedPackageHash = undefined;
+        /* Issue #268 — the session's first snapshot is its pinned base. */
+        pinNextSnapshot = true;
         /* Issue #43 — inject today's date so DATE fields resolve at
            layout time (Word updates DATE on open/print). Single
            injection site: the engine core never reads a wall clock, so
@@ -945,42 +986,99 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            its full tail (`persistSnapshot`'s pruning invariant) — and
            finally to the bare log. `Command::Recover` starts from a reset
            engine every time, so a failed attempt leaves nothing behind. */
-        let evt: Event | undefined;
-        let base: RecoveryCandidate | undefined;
-        let snapshotFallbacks = 0;
-        for (const candidate of msg.candidates) {
-            const tail = msg.commands.filter((c) => c.seq > candidate.seq).map((c) => c.cmd);
-            evt = await dispatch({
+        /* Issue #268 — candidates are SCORED, not just tried until one
+           restores: a readable snapshot whose detached package is gone
+           (a failed `packages` write that later snapshots still name)
+           restores, but saves through the minimal writer — silently
+           losing the sibling parts. An older base that still has its
+           package (or the complete bare log, which re-opens the file)
+           ranks higher; a pinned base restored without its pruned tail
+           ranks below any full-tail base. Every attempt starts from a
+           reset engine, so the best one is re-dispatched when a later,
+           worse attempt left the engine in its state. */
+        const attempt = (candidate: RecoveryCandidate): Promise<Event> =>
+            dispatch({
                 type: 'RECOVER',
                 snapshot: candidate.snapshot,
-                log_tail: tail,
+                /* A gapped tail (pruning passed a pinned base) would replay
+                   edits out of context: restore the base alone. */
+                log_tail:
+                    candidate.tailComplete === false
+                        ? []
+                        : msg.commands.filter((c) => c.seq > candidate.seq).map((c) => c.cmd),
                 ...(msg.rendererDowngrade ? { renderer_downgrade: msg.rendererDowngrade } : {}),
                 /* Issue #212 — the detached package the snapshot names. */
                 ...(candidate.package ? { package: candidate.package } : {}),
             });
-            base = candidate;
-            const usable =
-                evt.type === 'RECOVERED' &&
-                (evt.snapshot_restored || candidate.snapshot.length === 0);
-            if (usable) break;
-            snapshotFallbacks += 1;
+        let evt: Event | undefined;
+        let base: RecoveryCandidate | undefined;
+        let bestRank = -2;
+        let current: RecoveryCandidate | undefined;
+        let snapshotFallbacks = 0;
+        let pinnedFailed = false;
+        const packageLostAttempts: RecoveryCandidate[] = [];
+        for (const candidate of msg.candidates) {
+            if (bestRank >= 4) break;
+            if (recoveryRankCeiling(candidate) <= bestRank) continue;
+            const result = await attempt(candidate);
+            current = candidate;
+            const rank = recoveryRank(candidate, result);
+            if (rank < 0) {
+                snapshotFallbacks += 1;
+                if (candidate.pinned) pinnedFailed = true;
+                console.warn(
+                    `[worker] recovery: snapshot @${candidate.seq} did not restore; ` +
+                        'falling back to the next older base',
+                );
+            } else if (result.type === 'RECOVERED' && result.package_lost) {
+                packageLostAttempts.push(candidate);
+                console.warn(
+                    `[worker] recovery: snapshot @${candidate.seq} restores without its ` +
+                        'source package; looking for an older base that has it',
+                );
+            }
+            if (rank > bestRank) {
+                bestRank = rank;
+                evt = result;
+                base = candidate;
+            }
+        }
+        if (!evt || !base) throw new Error('recovery: no base to recover from');
+        if (current !== base) {
+            /* A later, worse attempt holds the engine: restore the best. */
+            evt = await attempt(base);
+        }
+        /* Readable snapshots passed over for an older base with its package. */
+        const chosen = base;
+        const packageFallbacks =
+            evt.type === 'RECOVERED' && !evt.package_lost
+                ? packageLostAttempts.filter((c) => c !== chosen).length
+                : 0;
+        const tailDropped = base.tailComplete === false && base.snapshot.length > 0;
+        const packageLost = evt.type === 'RECOVERED' && evt.package_lost;
+        if (packageLost) {
             console.warn(
-                `[worker] recovery: snapshot @${candidate.seq} did not restore; ` +
-                    'falling back to the next older base',
+                '[worker] recovery: no retained base still has its source package — ' +
+                    'the recovered session saves through the minimal-package writer',
             );
         }
-        if (!evt) throw new Error('recovery: no base to recover from');
         /* The replay tail of the NEXT recovery starts after the base this
            one actually restored (0 = none: the next logged command then
            takes a snapshot straight away — `seq - 0 ≥ SNAPSHOT_EVERY`
            once the log is long). */
-        lastSnapshotAt =
-            evt.type === 'RECOVERED' && evt.snapshot_restored ? (base?.seq ?? 0) : 0;
+        lastSnapshotAt = evt.type === 'RECOVERED' && evt.snapshot_restored ? base.seq : 0;
         /* Issue #212 — the store holds the package the restored snapshot
            named (the engine re-attached it and primed its key), so the
-           next snapshot need not ship it again. Anything else ships. */
+           next snapshot need not ship it again. Anything else ships.
+           Issue #268 — unless the engine could not attach it. */
         persistedPackageHash =
-            lastSnapshotAt > 0 && base?.package !== undefined ? base.packageHash : undefined;
+            lastSnapshotAt > 0 && base.package !== undefined && !packageLost
+                ? base.packageHash
+                : undefined;
+        /* Issue #268 — re-pin when the pinned base proved unreadable or
+           nothing was restored (the document now descends from no
+           persisted base). */
+        pinNextSnapshot = pinnedFailed || lastSnapshotAt === 0;
         /* Issue #43 — a recovered engine needs the render date again.
            Dispatched AFTER `RECOVER`: its session reset wipes the clock
            half (TIME fields), so an injection ahead of it was lost. */
@@ -1020,6 +1118,10 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             appliedCommands: recovered?.applied_commands ?? 0,
             snapshotFallbacks,
             logComplete: msg.logComplete,
+            packageFallbacks,
+            packageLost,
+            pinnedBase: restored && base.pinned === true,
+            tailDropped,
         });
         /* §10 — the recovered engine has no a11y cache, so this delta is a
            full `Replace`: the mirror DOM rebuilds from the restored tree
@@ -1035,6 +1137,16 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                    reflected in the state the shell just rebuilt from. */
                 broadcastGeometrySeq = engine.paint_geometry_seq();
             }
+        }
+        /* Issue #268 — a pinned base restored WITHOUT its (pruned) tail:
+           the log rows after it describe edits this engine never applied.
+           Snapshot the recovered state at the log head straight away, so
+           the next recovery replays only what happens from here on.
+           Queued (this task holds the queue); it reads `logSequence` when
+           it RUNS, so commands queued ahead of it are both applied and
+           counted — the stamp matches the state it captures. */
+        if (tailDropped && logSequence > lastSnapshotAt) {
+            void enqueue(() => takeSnapshot(logSequence));
         }
     } catch (e: unknown) {
         replyError(msg.id, e);
@@ -1089,6 +1201,10 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
            sent, so event-log latency never throttles command throughput. */
         if (shouldLogCommand(msg.cmd)) {
             const seq = logCommand(msg.cmd);
+            /* Issue #268 — a new document: its first snapshot is pinned. */
+            if (DOCUMENT_REPLACING.has(msg.cmd.type) && evt.type !== 'ERROR') {
+                pinNextSnapshot = true;
+            }
             /* Issue #85 — cadence snapshot, taken HERE (still inside this
                command's queue task, reply already posted) so its bytes
                describe exactly the state after `seq`: a command queued
@@ -1191,6 +1307,8 @@ function broadcastPaintDims(): void {
             is_full_layout: boolean;
             page_tops: number[];
             page_heights: number[];
+            /** Issue #280 — per-page widths (device px). */
+            page_widths: number[];
             image_count: number;
             page_margin_tops: number[];
             page_margin_bottoms: number[];
@@ -1215,6 +1333,9 @@ function broadcastPaintDims(): void {
                 estimated_document_height: dims.estimated_document_height,
                 page_tops: dims.page_tops,
                 page_heights: dims.page_heights,
+                /* Issue #280 — the page cards size from these; both
+                Painted producers must carry them. */
+                page_widths: dims.page_widths ?? [],
                 image_count: dims.image_count,
                 /* Phase 3 (#39) — the double-click header/footer zone
                 gate reads per-page margins; BOTH Painted producers (the
@@ -1330,10 +1451,15 @@ async function takeSnapshot(seq: number): Promise<void> {
         const pkg =
             hash === undefined ? undefined : evt.package ? { hash, bytes: evt.package } : { hash };
         if (hash !== undefined) persistedPackageHash = hash;
-        const write = persistSnapshot(seq, evt.bytes, pkg).catch((e: unknown) => {
+        /* Issue #268 — the document's first snapshot is its pinned base. */
+        const pin = pinNextSnapshot;
+        pinNextSnapshot = false;
+        const write = persistSnapshot(seq, evt.bytes, pkg, { pin }).catch((e: unknown) => {
             console.warn('[worker] event-log snapshot failed', e);
             /* The package may not have landed: ship it with the next one. */
             if (persistedPackageHash === hash) persistedPackageHash = undefined;
+            /* Nor the pin: pin the next one instead. */
+            if (pin) pinNextSnapshot = true;
         });
         pendingLogWrites = pendingLogWrites.then(() => write);
     } catch (e: unknown) {

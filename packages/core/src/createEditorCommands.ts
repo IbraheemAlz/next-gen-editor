@@ -28,6 +28,7 @@ import type {
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,
+    FormattingToggle,
     Alignment,
     Direction,
     PdfConformance,
@@ -158,6 +159,15 @@ export interface EditorCommands {
     setCaps(value: boolean, range?: LogicalRange): Promise<Event>;
     /** `<w:smallCaps/>` — render lowercase as smaller uppercase glyphs. */
     setSmallCaps(value: boolean, range?: LogicalRange): Promise<Event>;
+    /**
+     * Issue #286 — flip `attr` on the engine's LIVE selection. The engine
+     * computes the target state from its own style at the caret (+ any
+     * armed pending style), never from this shell's mirrored toolbar
+     * state, which lags the reply at typing speed. Toolbar toggles and
+     * keyboard shortcuts must use this, not `setBold(!isBold())`.
+     * `underlineStyle` is the style used when underline turns ON.
+     */
+    toggleFormatting(attr: FormattingToggle, underlineStyle?: UnderlineStyle): Promise<Event>;
 
     /* Paragraph — `range` defaults to current selection. */
     setParagraphAlign(align: Alignment, range?: LogicalRange): Promise<Event>;
@@ -380,6 +390,12 @@ export interface EditorCommands {
     snapshot(): Promise<Event>;
     acceptRevision(block: number, start: number, end: number): Promise<Event>;
     rejectRevision(block: number, start: number, end: number): Promise<Event>;
+    /** Issue #262 — accept every tracked change of the document in ONE
+     *  engine command (one undo step; paragraph-mark revisions merge
+     *  paragraphs). */
+    acceptAllRevisions(): Promise<Event>;
+    /** Issue #262 — reject every tracked change in one engine command. */
+    rejectAllRevisions(): Promise<Event>;
     insertComment(
         text: string,
         author: string,
@@ -561,6 +577,12 @@ function build(
             fmt({ bg_color: { r, g, b, a } }, range),
         setCaps: (value, range) => fmt({ caps: value }, range),
         setSmallCaps: (value, range) => fmt({ small_caps: value }, range),
+        toggleFormatting: (attr, underlineStyle) =>
+            dispatch(
+                underlineStyle === undefined
+                    ? { type: 'TOGGLE_FORMATTING', attr }
+                    : { type: 'TOGGLE_FORMATTING', attr, underline_style: underlineStyle },
+            ),
 
         setParagraphAlign: (align, range) =>
             dispatch({
@@ -805,6 +827,8 @@ function build(
             dispatch({ type: 'ACCEPT_REVISION', block, start, end }),
         rejectRevision: (block, start, end) =>
             dispatch({ type: 'REJECT_REVISION', block, start, end }),
+        acceptAllRevisions: () => dispatch({ type: 'ACCEPT_ALL_REVISIONS' }),
+        rejectAllRevisions: () => dispatch({ type: 'REJECT_ALL_REVISIONS' }),
         insertComment: (text, author, range) =>
             dispatch({
                 type: 'INSERT_COMMENT',

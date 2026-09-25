@@ -45,8 +45,59 @@ export const SCREEN_DPI_SCALE = 4 / 3;
 /** Exact page height in CSS px (841.9 × 4/3 = 1122.533…). NOT the rounded
  *  1123 — a 0.467 px/page error compounds to over half a line by page 30. */
 export const PAGE_H_CSS = PAGE_H_PT * SCREEN_DPI_SCALE;
-/** Inter-page gap in CSS px (48 × 4/3 = 64) — matches the `.editor-pages` gap. */
+/** Inter-page gap in CSS px (48 × 4/3 = 64) at 100 % zoom — the
+ *  `.editor-pages` gap is this × the engine zoom (issue #280). */
 export const PAGE_GAP_CSS = PAGE_GAP_PT * SCREEN_DPI_SCALE;
+/** A4 page width in layout pt — engine `PageGeometry::a4()`. */
+export const PAGE_W_PT = 595.3;
+/** A4 page width in CSS px at 100 % zoom (595.3 × 4/3 = 793.73…). */
+export const PAGE_W_CSS = PAGE_W_PT * SCREEN_DPI_SCALE;
+
+/* ——— Issue #280 — zoom + the device-px ↔ CSS-px ratio ———
+ *
+ * Zoom visibly resizes the page: every page card's CSS box is the
+ * engine's device-px page size divided by `deviceRatio()`, so 150 %
+ * paints a 1.5× larger card instead of a denser bitmap in a fixed box.
+ *
+ * The engine paints at `scale = base × zoom` with `base = dpr × 4/3`,
+ * capped at `MAX_PAINT_SCALE` device px per pt (never below `base`) so a
+ * zoomed-in page's backing store stays inside the memory budget (#63 —
+ * every mounted page holds one). Below the cap the ratio IS
+ * `devicePixelRatio` (crisp); past it the capped bitmap is stretched to
+ * the full zoomed size — the page still grows exactly with the zoom.
+ * The engine owns the zoom (`SELECTION_CHANGED.zoom`, `ZOOM_PENDING`,
+ * `RECOVERED`); the reply to a `SET_ZOOM` lands before the repaint's
+ * `PAINTED` broadcast, so geometry converted at receipt always uses the
+ * ratio it was painted at. */
+
+/** MIRROR of the engine's `MAX_PAINT_SCALE` (`crates/engine-wasm`). */
+export const MAX_PAINT_SCALE = 4;
+
+const [engineZoomSig, setEngineZoomSig] = createSignal(1);
+
+/** The ENGINE's current user zoom fraction (reactive). */
+export function engineZoom(): number {
+    return engineZoomSig();
+}
+
+/** Device px (engine geometry) per CSS px at `zoom` — `devicePixelRatio`
+ *  until the paint-scale cap bites (see above). */
+export function deviceRatioFor(zoom: number): number {
+    const dpr = window.devicePixelRatio || 1;
+    const base = dpr * SCREEN_DPI_SCALE;
+    const scale = Math.min(base * zoom, Math.max(MAX_PAINT_SCALE, base));
+    return scale / (SCREEN_DPI_SCALE * zoom);
+}
+
+/** Device px per CSS px at the engine's current zoom (reactive). */
+export function deviceRatio(): number {
+    return deviceRatioFor(engineZoomSig());
+}
+
+/** The engine's effective paint scale (device px per layout pt). */
+export function paintScale(): number {
+    return deviceRatio() * SCREEN_DPI_SCALE * engineZoomSig();
+}
 
 /* Issue #26 — engine-reported per-page geometry (device px, from the
  * `Painted` event). The signal drives the reactive overlays; the
@@ -56,6 +107,13 @@ export const PAGE_GAP_CSS = PAGE_GAP_PT * SCREEN_DPI_SCALE;
 export interface PageGeometry {
     tops: number[];
     heights: number[];
+    /** Issue #280 — per-page widths (device px); empty from pre-#280
+     *  producers (A4 fallback). */
+    widths: number[];
+    /** Issue #280 — the device-px-per-CSS-px ratio these numbers were
+     *  painted at (captured at receipt, so a card never mixes a new
+     *  zoom's ratio with the previous paint's geometry). */
+    ratio: number;
 }
 let latestPageTops: number[] | null = null;
 
@@ -380,7 +438,7 @@ export function createEngineStore(client: EngineClient) {
         try {
             const evt = await client.dispatch({ type: 'GET_IMAGE_RECTS' });
             if (evt.type !== 'IMAGE_RECTS') return;
-            const dpr = window.devicePixelRatio || 1;
+            const dpr = deviceRatio();
             const rects: ImageRectCss[] = evt.images.map((im) => ({
                 path: im.path,
                 at: im.at,
@@ -407,7 +465,11 @@ export function createEngineStore(client: EngineClient) {
 
     client.subscribe((ev: Event) => {
         if (ev.type === 'SELECTION_CHANGED') {
-            const dpr = window.devicePixelRatio || 1;
+            /* Issue #280 — the zoom rides this very event; adopt it BEFORE
+               converting its rects so they use the ratio they were
+               produced at. */
+            if (ev.zoom !== undefined) setEngineZoomSig(ev.zoom);
+            const dpr = deviceRatio();
             const cssRects = ev.rects.map((r) => toCssRect(r, dpr));
             latestSelectionView = { rects: cssRects, kind: ev.selection_kind };
             setCaret(toCssRect(ev.caret, dpr));
@@ -426,6 +488,13 @@ export function createEngineStore(client: EngineClient) {
             setListIlvl(ev.list_ilvl);
             setEditingStorySig(ev.editing_story);
             setFieldCodeViewSig(ev.field_code_view);
+        } else if (ev.type === 'ZOOM_PENDING') {
+            /* Issue #239/#280 — a zoom queued before the first paint: the
+               boot paint will already be at this zoom. */
+            setEngineZoomSig(ev.zoom);
+        } else if (ev.type === 'RECOVERED') {
+            /* Issue #97/#280 — the respawned engine's restored zoom. */
+            setEngineZoomSig(ev.zoom ?? 1);
         } else if (ev.type === 'PAINTED') {
             /* Phase 6b — paginator reach. The engine emits
                `document_height` (device px) and `page_count` on every
@@ -442,7 +511,12 @@ export function createEngineStore(client: EngineClient) {
             if (ev.page_tops.length > 0) {
                 latestPageTops = ev.page_tops;
                 latestPageHeights = ev.page_heights;
-                setPageGeometry({ tops: ev.page_tops, heights: ev.page_heights });
+                setPageGeometry({
+                    tops: ev.page_tops,
+                    heights: ev.page_heights,
+                    widths: ev.page_widths ?? [],
+                    ratio: deviceRatio(),
+                });
             }
             /* Phase 3 (#39) — margin zones for the pointer gate + the
                story overlay. */
@@ -553,19 +627,52 @@ export function createEngineStore(client: EngineClient) {
         /* Issue #77 — Alt+F9 field-code view flag. */
         fieldCodeView: fieldCodeViewSig,
         marginGeometry,
+        /** Issue #280 — the engine's user zoom (reactive). */
+        zoom: engineZoomSig,
+        /** Issue #280 — device px per CSS px at the last paint (the
+         *  ratio the page geometry + margins were produced at). */
+        paintRatio: (): number => pageGeometry()?.ratio ?? deviceRatio(),
         /** CSS-px top of page `idx` — engine-exact once a paginated paint
-         *  reported geometry; uniform-A4 fallback before that. */
+         *  reported geometry; uniform-A4 fallback (× zoom) before that. */
         pageTopCss: (idx: number): number => {
-            const top = pageGeometry()?.tops[idx];
-            return top !== undefined
-                ? top / (window.devicePixelRatio || 1)
-                : idx * (PAGE_H_CSS + PAGE_GAP_CSS);
+            const g = pageGeometry();
+            const top = g?.tops[idx];
+            return g && top !== undefined
+                ? top / g.ratio
+                : idx * (PAGE_H_CSS + PAGE_GAP_CSS) * engineZoomSig();
         },
         /** CSS-px height of page `idx` — same fallback rules. */
         pageHeightCss: (idx: number): number => {
-            const h = pageGeometry()?.heights[idx];
-            return h !== undefined ? h / (window.devicePixelRatio || 1) : PAGE_H_CSS;
+            const g = pageGeometry();
+            const h = g?.heights[idx];
+            return g && h !== undefined ? h / g.ratio : PAGE_H_CSS * engineZoomSig();
         },
+        /** Issue #280 — CSS-px width of page `idx` — same fallback rules. */
+        pageWidthCss: (idx: number): number => {
+            const g = pageGeometry();
+            const w = g?.widths[idx];
+            return g && w !== undefined ? w / g.ratio : PAGE_W_CSS * engineZoomSig();
+        },
+        /** Issue #280 — CSS size of page `idx`'s CARD: the engine sizes the
+         *  canvas backing store to `ceil(device px)`, so the card is that
+         *  bitmap ÷ the ratio — one bitmap pixel per device pixel at
+         *  100 % (no resampling blur), overlays in the same page-local
+         *  CSS space. */
+        pageCardCss: (idx: number): { w: number; h: number } => {
+            const g = pageGeometry();
+            const w = g?.widths[idx];
+            const h = g?.heights[idx];
+            const z = engineZoomSig();
+            return {
+                w: g && w !== undefined ? Math.ceil(w) / g.ratio : PAGE_W_CSS * z,
+                h: g && h !== undefined ? Math.ceil(h) / g.ratio : PAGE_H_CSS * z,
+            };
+        },
+        /** Issue #280 — inter-page gap in CSS px at the engine zoom (the
+         *  engine's `PAGE_GAP_PT × scale`, ÷ the ratio). */
+        pageGapCss: (): number => PAGE_GAP_CSS * engineZoomSig(),
+        /** Issue #280 — device px → CSS px at the last paint's ratio. */
+        deviceToCss: (v: number): number => v / (pageGeometry()?.ratio ?? deviceRatio()),
     };
 }
 

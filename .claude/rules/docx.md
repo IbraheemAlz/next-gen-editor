@@ -172,9 +172,29 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
 - Positioned verbatim markers (`<w:proofErr/>`, non-TOC bookmarks,
   permission / move ranges, an empty `<w:fldSimple/>`, text-less runs with
   only unmodeled content, pretty-print whitespace) re-emit at their
-  (remapped) text offset between runs. Comment anchors are deliberately
-  NOT markers (tree-level `comment_ranges`; a verbatim copy could
-  resurrect a deleted comment).
+  (remapped) text offset between runs.
+- **Comment anchors (issue #243)** are *verified* markers
+  (`SourceMarker::comment`, `schema::comment_anchors`): a
+  `<w:commentRangeStart/End/>` replays verbatim only where the tree-level
+  `comment_ranges` puts that end of that comment (a comment with no tree
+  range — cell anchors, unpaired ends — only while it exists), the
+  `<w:commentReference>` run only while the comment exists; a deleted
+  comment is never resurrected. Every tree endpoint no verbatim byte
+  carries (engine-minted comment, stale markup) is synthesized at its
+  offset, plus a `CommentReference`-styled reference run after the end
+  when the source has none. The plan is published per body write (the
+  paragraph serializer has no tree in hand). Anchors are `MarkerRole::
+  Verbatim` (dropped when stale — the tree re-synthesizes them) and pass
+  through `positioned_markers` with every other marker; anchors inside
+  always-kept markup (a #244 content span, a #245 sdt end) count as
+  already carried, so nothing is duplicated.
+- `<w:hyperlink>` attributes ride the link itself (`Hyperlink::attrs`,
+  issue #242) and re-emit in source order. The source `r:id` is kept only
+  while the rels part still maps it to the link's target (*verified* —
+  several rows may share one URL, and each link keeps its own); otherwise
+  the writer re-resolves by target / mints a row. An internal `#name`
+  target re-derives `w:anchor`. Typing at either end of a link stays
+  outside it.
 - **Content spans (issue #244).** A complex field with no result that
   the model does not represent (legacy form fields: `FORMCHECKBOX`,
   `FORMDROPDOWN`, an empty `FORMTEXT`, `<w:ffData>` in the begin
@@ -200,6 +220,28 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   the markers are emitted in a constructed order, noted as
   `WriteNote::InlineWrapperWidened`. Row / cell-level `sdt` inside a
   regenerated table ride the table markup (#248, below).
+- **Tracked moves (issue #247).** `<w:moveFrom>` / `<w:moveTo>` are
+  run-wrapping revisions (`RevisionKind::MoveFrom` / `MoveTo`, text
+  semantics of a deletion / insertion; `Revision::move_name` = the
+  enclosing range's `w:name`) regenerated like `<w:ins>` / `<w:del>`
+  (moveFrom content keeps `<w:t>`); two wrappers over the same range
+  nest in source order. The `move*RangeStart/End` markers stay
+  positioned verbatim markers. Untracked `insert_text` carries every
+  revision with its text (shift at / after the start, grow strictly
+  inside).
+- **Paragraph-mark revisions (issue #262).** `<w:pPr><w:rPr><w:ins/>`
+  (`<w:del/>`, `<w:moveFrom/>`, `<w:moveTo/>`) is lifted out of the
+  mark-rPr grab-bag fragment into `Paragraph::mark_revision`
+  (`parts::document::split_mark_revision`) and recorded on
+  `SourcePPr::mark_revision`; the verified pPr passthrough requires it
+  unchanged, a regenerated pPr re-injects it as the rPr's first child
+  (`writer::with_mark_revision`). The mark travels with the paragraph
+  END (split → right half, concat → tail's). `DocumentTree::
+  resolve_all_revisions` (`Command::AcceptAllRevisions` /
+  `RejectAllRevisions`, one undo step) resolves text revisions per
+  paragraph, then merges paragraphs for resolved marks per container
+  from the end — through `splice_text` + `remap_text_edit_record` /
+  `remap_paragraph_merge` / `remap_block_splice`, never around them.
 - **Run padding (issue #245).** Pretty-print whitespace inside a source
   `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
   re-emitted on every regenerated piece of the run; a source bare `<w:t>`

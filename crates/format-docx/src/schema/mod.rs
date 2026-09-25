@@ -6,6 +6,7 @@
 //! local to each part for now.
 
 pub mod block_envelope;
+pub mod comment_anchors;
 pub mod ct_ppr;
 pub mod ct_rpr;
 pub mod ct_tbl;
