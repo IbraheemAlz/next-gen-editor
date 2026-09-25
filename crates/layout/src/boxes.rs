@@ -204,6 +204,21 @@ pub struct PositionedGlyph {
     /// (`crate::floats::resolve_page_floats`). Boxed — floats are rare
     /// and glyphs are cloned by the million.
     pub float: Option<Box<FloatGlyph>>,
+    /// Issue #81 — `Some` on a TAB glyph whose stop carries a
+    /// `<w:tab w:leader>`: the renderer fills the tab's advance with the
+    /// leader pattern (TOC dot leaders). Geometry-neutral — the
+    /// advance is the tab's own, so fingerprints never see it.
+    pub leader: Option<TabLeaderKind>,
+}
+
+/// Issue #81 — the fill a leadered tab paints across its advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TabLeaderKind {
+    Dot,
+    Hyphen,
+    Underscore,
+    Heavy,
+    MiddleDot,
 }
 
 /// Issue #69 — the floating-object payload a sentinel glyph carries into

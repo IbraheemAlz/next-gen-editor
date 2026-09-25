@@ -11,7 +11,7 @@
 
 use crate::boxes::{
     LineBox, LineSegment, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan,
-    TextAttrs, VisualRun,
+    TabLeaderKind, TextAttrs, VisualRun,
 };
 use std::borrow::Cow;
 use std::mem::take;
@@ -142,7 +142,7 @@ pub struct ParagraphConfig<'a> {
     /// are filtered out by the engine-wasm adapter before reaching us.
     /// L2.1 (#6) — non-`Left` kinds (Center/Right/Decimal) trigger the
     /// shape-then-place pass in `apply_tab_advances`.
-    pub tab_stops_px: &'a [(f32, TabKind)],
+    pub tab_stops_px: &'a [TabStopPx],
 }
 
 /// L2.1 (#6) — geometric kind of a single custom tab stop. Mirrors
@@ -165,6 +165,11 @@ pub enum TabKind {
     /// no separator.
     Decimal,
 }
+
+/// One custom tab stop at the layout boundary: position (paragraph-
+/// content-relative layout px), geometric kind, and — issue #81 — the
+/// optional leader the renderer fills the tab's advance with.
+pub type TabStopPx = (f32, TabKind, Option<TabLeaderKind>);
 
 /// Audit gap A.M3 — default tab grid in layout pt at scale=1. Word's
 /// "default tab stops" knob (`<w:settings><w:defaultTabStop>`) defaults
@@ -758,6 +763,7 @@ fn build_marker(
             inline_note_anchor: None,
             inline_object_height: 0.0,
             float: None,
+            leader: None,
         })
         .collect();
     let width = glyphs.iter().map(|g| g.x_advance).sum::<f32>();
@@ -907,7 +913,7 @@ const MIN_TAB_FILL_PX: f32 = 4.0;
 fn apply_tab_advances(
     line: &mut LineBox,
     para_text: &str,
-    tab_stops_px: &[(f32, TabKind)],
+    tab_stops_px: &[TabStopPx],
     leading_off_px: f32,
     base_dir: ShapingDirection,
 ) {
@@ -944,9 +950,10 @@ fn apply_tab_advances(
     let mut pen = leading_off_px;
     for (k, &(ri, gi, abs)) in order.iter().enumerate() {
         if is_tab(abs) {
-            let (stop_pos, stop_kind) = next_tab_stop_after(pen, tab_stops_px);
+            let (stop_pos, stop_kind, leader) = next_tab_stop_after(pen, tab_stops_px);
             let advance = compute_tab_advance(pen, stop_pos, stop_kind, line, k, &ctx);
             line.runs[ri].glyphs[gi].x_advance = advance;
+            line.runs[ri].glyphs[gi].leader = leader;
             pen += advance;
         } else {
             pen += line.runs[ri].glyphs[gi].x_advance;
@@ -1069,11 +1076,11 @@ fn compute_tab_advance(
 /// half-inch grid (`DEFAULT_TAB_GRID_PT`) ceiling-rounded. Grid stops
 /// are always `Left` — Word does not allow kind overrides on default-
 /// grid stops.
-fn next_tab_stop_after(pen_x: f32, custom: &[(f32, TabKind)]) -> (f32, TabKind) {
+fn next_tab_stop_after(pen_x: f32, custom: &[TabStopPx]) -> TabStopPx {
     let custom_next = custom
         .iter()
         .copied()
-        .filter(|&(p, _)| p > pen_x + 0.001)
+        .filter(|&(p, _, _)| p > pen_x + 0.001)
         .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     if let Some(stop) = custom_next {
         return stop;
@@ -1081,7 +1088,7 @@ fn next_tab_stop_after(pen_x: f32, custom: &[(f32, TabKind)]) -> (f32, TabKind) 
     /* Grid fallback. `(pen / grid).floor() + 1` jumps to the next
     multiple of the grid step regardless of how close pen is. */
     let grid = DEFAULT_TAB_GRID_PT;
-    (((pen_x / grid).floor() + 1.0) * grid, TabKind::Left)
+    (((pen_x / grid).floor() + 1.0) * grid, TabKind::Left, None)
 }
 
 /// Compute one line's `(ascent, descent)` — the line box's height split at
@@ -1583,6 +1590,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                             info.map_or(0.0, |i| i.height_px)
                         },
                         float,
+                        leader: None,
                     }
                 })
                 .collect();
@@ -1660,6 +1668,7 @@ fn shape_note_marker(
                 inline_note_anchor: None,
                 inline_object_height: 0.0,
                 float: None,
+                leader: None,
             });
         }
     }
@@ -1677,6 +1686,7 @@ fn shape_note_marker(
             inline_note_anchor: None,
             inline_object_height: 0.0,
             float: None,
+            leader: None,
         });
     }
     if let Some(first) = glyphs.first_mut() {
@@ -2061,6 +2071,7 @@ fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &Fon
         inline_note_anchor: None,
         inline_object_height: 0.0,
         float: None,
+        leader: None,
     };
     for _ in 0..n {
         run.glyphs.insert(glyph_idx + 1, tatweel_glyph.clone());
@@ -2203,6 +2214,7 @@ mod tests {
             inline_note_anchor: None,
             inline_object_height: 0.0,
             float: None,
+            leader: None,
         }
     }
 
@@ -2263,7 +2275,7 @@ mod tests {
         tab.x_advance = 80 so the next glyph lands at paragraph
         position 100. */
         let mut line = line_with_glyphs("\tA", &[(0, 0.0), (1, 10.0)]);
-        let stops = [(100.0_f32, TabKind::Left)];
+        let stops = [(100.0_f32, TabKind::Left, None)];
         apply_tab_advances(&mut line, "\tA", &stops, 20.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[0].x_advance;
@@ -2289,7 +2301,7 @@ mod tests {
                 (5, 10.0),
             ],
         );
-        let stops = [(100.0_f32, TabKind::Center)];
+        let stops = [(100.0_f32, TabKind::Center, None)];
         apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
@@ -2315,7 +2327,7 @@ mod tests {
                 (5, 10.0),
             ],
         );
-        let stops = [(100.0_f32, TabKind::Right)];
+        let stops = [(100.0_f32, TabKind::Right, None)];
         apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
@@ -2323,6 +2335,39 @@ mod tests {
         let pen_after_tab = 10.0 + tab_adv;
         let segment_right = pen_after_tab + 40.0;
         assert_close(segment_right, 100.0, "segment right edge at stop");
+    }
+
+    #[test]
+    fn leadered_right_tab_marks_the_tab_glyph_and_keeps_geometry() {
+        /* Issue #81 — a TOC entry "X\t12": right tab at 100 with a dot
+        leader. The advance is exactly the plain Right-tab advance (the
+        leader is paint-only); the tab glyph carries the leader kind. */
+        let glyphs = [(0, 10.0), (1, 0.0), (2, 10.0), (3, 10.0)];
+        let mut plain = line_with_glyphs("X\t12", &glyphs);
+        let mut dotted = line_with_glyphs("X\t12", &glyphs);
+        apply_tab_advances(
+            &mut plain,
+            "X\t12",
+            &[(100.0_f32, TabKind::Right, None)],
+            0.0,
+            ShapingDirection::Ltr,
+        );
+        apply_tab_advances(
+            &mut dotted,
+            "X\t12",
+            &[(100.0_f32, TabKind::Right, Some(TabLeaderKind::Dot))],
+            0.0,
+            ShapingDirection::Ltr,
+        );
+        assert_close(dotted.runs[0].glyphs[1].x_advance, 70.0, "right tab fill");
+        assert_close(
+            dotted.runs[0].glyphs[1].x_advance,
+            plain.runs[0].glyphs[1].x_advance,
+            "leader is geometry-neutral",
+        );
+        assert_eq!(dotted.runs[0].glyphs[1].leader, Some(TabLeaderKind::Dot));
+        assert_eq!(plain.runs[0].glyphs[1].leader, None);
+        assert_eq!(dotted.runs[0].glyphs[0].leader, None, "only the tab glyph");
     }
 
     #[test]
@@ -2341,7 +2386,7 @@ mod tests {
                 (5, 10.0),
             ],
         );
-        let stops = [(100.0_f32, TabKind::Decimal)];
+        let stops = [(100.0_f32, TabKind::Decimal, None)];
         apply_tab_advances(&mut line, "X\t12.5", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
@@ -2367,7 +2412,7 @@ mod tests {
                 (6, 10.0),
             ],
         );
-        let stops = [(100.0_f32, TabKind::Decimal)];
+        let stops = [(100.0_f32, TabKind::Decimal, None)];
         apply_tab_advances(&mut line, "X\thello", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
@@ -2393,7 +2438,7 @@ mod tests {
                 (5, 10.0),
             ],
         );
-        let stops = [(15.0_f32, TabKind::Center)];
+        let stops = [(15.0_f32, TabKind::Center, None)];
         apply_tab_advances(&mut line, "X\tWORD", &stops, 0.0, ShapingDirection::Ltr);
 
         let tab_adv = line.runs[0].glyphs[1].x_advance;
@@ -2409,7 +2454,7 @@ mod tests {
         visually before it (B, width 40). Pre-fix the visual-order pen used
         B's width and the Left advance ballooned — the RTL tab explosion. */
         let mut line = line_with_glyphs("A\tB", &[(2, 40.0), (1, 0.0), (0, 10.0)]);
-        let stops = [(100.0_f32, TabKind::Left)];
+        let stops = [(100.0_f32, TabKind::Left, None)];
         apply_tab_advances(&mut line, "A\tB", &stops, 0.0, ShapingDirection::Rtl);
 
         /* Tab glyph is at visual index 1. Logical pen at the tab = width of
@@ -2431,7 +2476,7 @@ mod tests {
         measure the LOGICALLY-following segment "BC" (20+20=40), not the
         visually-following glyph A. fill = stop(100) - pen(10) - 40 = 50. */
         let mut line = line_with_glyphs("A\tBC", &[(3, 20.0), (2, 20.0), (1, 0.0), (0, 10.0)]);
-        let stops = [(100.0_f32, TabKind::Right)];
+        let stops = [(100.0_f32, TabKind::Right, None)];
         apply_tab_advances(&mut line, "A\tBC", &stops, 0.0, ShapingDirection::Rtl);
 
         /* Tab glyph is at visual index 2. */
@@ -2472,7 +2517,7 @@ mod tests {
         apply_tab_advances(
             &mut line,
             "س\t3.5",
-            &[(stop, TabKind::Decimal)],
+            &[(stop, TabKind::Decimal, None)],
             0.0,
             ShapingDirection::Rtl,
         );
@@ -2508,7 +2553,7 @@ mod tests {
         apply_tab_advances(
             &mut line,
             "س\t3.5",
-            &[(stop, TabKind::Center)],
+            &[(stop, TabKind::Center, None)],
             0.0,
             ShapingDirection::Rtl,
         );

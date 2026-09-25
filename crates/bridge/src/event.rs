@@ -608,6 +608,9 @@ pub enum LayoutDegradeReason {
     /// Issue #82 — a tight / through object had no usable wrap polygon;
     /// its bounding box was used (square wrap).
     WrapPolygonFallback,
+    /// Issue #81 — the TOC page-number post-pass hit its re-run cap
+    /// without a fixed point; the last observed numbers were stamped.
+    PageRefCap,
 }
 
 /// Issue #87 — one degradation note on `Event::Painted`. `page` is the

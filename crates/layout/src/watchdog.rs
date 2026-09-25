@@ -103,6 +103,10 @@ pub enum DegradeReason {
     /// Issue #82 — a tight / through wrap object carried no usable
     /// `<wp:wrapPolygon>`; its bounding box was used (square wrap).
     WrapPolygonFallback,
+    /// Issue #81 — a page-reference post-pass (TOC page numbers) did not
+    /// reach a fixed point within its re-run budget: stamping the numbers
+    /// kept moving the headings. The last observed numbers were accepted.
+    PageRefCap,
 }
 
 impl DegradeReason {
@@ -122,6 +126,7 @@ impl DegradeReason {
             DegradeReason::WrapObjectFrozen => "WRAP_OBJECT_FROZEN",
             DegradeReason::WrapOscillation => "WRAP_OSCILLATION",
             DegradeReason::WrapPolygonFallback => "WRAP_POLYGON_FALLBACK",
+            DegradeReason::PageRefCap => "PAGE_REF_CAP",
         }
     }
 }
@@ -133,6 +138,66 @@ impl DegradeReason {
 pub struct LayoutDegradation {
     pub reason: DegradeReason,
     pub page: u32,
+}
+
+/// Issue #81 — outcome of [`converge_page_refs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRefConvergence<T> {
+    /// The page references to stamp: the fixed point, or — when the cap
+    /// was hit — the last observation.
+    pub refs: T,
+    /// Layout rounds run (each round = stamp + full pagination).
+    pub rounds: u32,
+    /// `Some(PageRefCap)` when the re-run budget ran out before a fixed
+    /// point; `page` carries the round count.
+    pub degraded: Option<LayoutDegradation>,
+}
+
+/// Issue #81 — the bounded fixed point behind page-reference post-passes
+/// (a TOC's page numbers). `stamp_and_measure(prev)` stamps `prev` into
+/// the document (`None` = the caller's initial guess), paginates, and
+/// returns the page references it OBSERVES. Stamping can move the very
+/// headings being referenced (a TOC whose height changes shifts the
+/// body), so the observation is fed back until it stops changing:
+///
+/// - round 0 measures the initial stamp; round 1 stamps that
+///   observation and re-measures. Equal ⇒ converged.
+/// - Each further disagreement spends one re-run from `max_reruns`.
+///   When the budget is exhausted the last observation is accepted and a
+///   [`DegradeReason::PageRefCap`] note is returned — an imperfect TOC
+///   that terminates beats one that hangs (render.md self-defense).
+///
+/// Termination is by construction: at most `2 + max_reruns` calls.
+pub fn converge_page_refs<T: PartialEq + Clone>(
+    max_reruns: u32,
+    mut stamp_and_measure: impl FnMut(Option<&T>) -> T,
+) -> PageRefConvergence<T> {
+    let mut observed = stamp_and_measure(None);
+    let mut rounds = 1;
+    let mut reruns = 0;
+    loop {
+        let next = stamp_and_measure(Some(&observed));
+        rounds += 1;
+        if next == observed {
+            return PageRefConvergence {
+                refs: observed,
+                rounds,
+                degraded: None,
+            };
+        }
+        if reruns >= max_reruns {
+            return PageRefConvergence {
+                refs: next,
+                rounds,
+                degraded: Some(LayoutDegradation {
+                    reason: DegradeReason::PageRefCap,
+                    page: rounds,
+                }),
+            };
+        }
+        reruns += 1;
+        observed = next;
+    }
 }
 
 /// Content fingerprint of one placement attempt — what "progress" is
@@ -840,5 +905,49 @@ mod tests {
             ),
             Err(FastPathMismatch::EndPosition { page: 0 })
         );
+    }
+
+    /* ---------- issue #81 — page-reference post-pass ---------- */
+
+    #[test]
+    fn page_refs_converge_in_two_rounds_when_stamping_is_neutral() {
+        let mut calls = 0;
+        let out = converge_page_refs(1, |_prev: Option<&Vec<u32>>| {
+            calls += 1;
+            vec![1, 3, 5]
+        });
+        assert_eq!(out.refs, vec![1, 3, 5]);
+        assert_eq!(out.rounds, 2);
+        assert_eq!(calls, 2);
+        assert!(out.degraded.is_none());
+    }
+
+    #[test]
+    fn page_refs_rerun_once_when_the_stamp_moves_the_headings() {
+        /* The placeholder stamp (None) observes page 2; stamping 2 grows
+        the TOC and the heading lands on 3; stamping 3 is stable. */
+        let out = converge_page_refs(1, |prev: Option<&u32>| match prev {
+            None => 2,
+            Some(_) => 3,
+        });
+        assert_eq!(out.refs, 3);
+        assert_eq!(out.rounds, 3);
+        assert!(out.degraded.is_none());
+    }
+
+    #[test]
+    fn oscillating_page_refs_hit_the_cap_and_terminate() {
+        /* Stamping n observes n + 1 forever — a pathological document
+        whose TOC height flips the heading page on every stamp. */
+        let mut calls = 0u32;
+        let out = converge_page_refs(1, |prev: Option<&u32>| {
+            calls += 1;
+            prev.map_or(1, |p| p + 1)
+        });
+        assert_eq!(calls, 3, "2 + max_reruns rounds, never more");
+        assert_eq!(out.refs, 3);
+        let d = out.degraded.expect("cap note");
+        assert_eq!(d.reason, DegradeReason::PageRefCap);
+        assert_eq!(d.reason.as_str(), "PAGE_REF_CAP");
     }
 }

@@ -106,10 +106,16 @@ fn doc_has_inline_images(doc: &DocumentTree) -> bool {
 /// under OUR freshly-built root `<w:document>` element, so the root must
 /// declare `xmlns:r` regardless of which paragraphs are actually being
 /// regenerated this save.
+/// Issue #81 — only a relationship-backed (`r:id`) link needs the `r`
+/// namespace; an internal `w:anchor` link (a TOC entry) does not.
+fn has_external_link(p: &Paragraph) -> bool {
+    p.hyperlinks.iter().any(|h| !h.target.starts_with('#'))
+}
+
 fn doc_has_hyperlinks(doc: &DocumentTree) -> bool {
     fn any_in_cell_blocks(blocks: &[Block]) -> bool {
         blocks.iter().any(|b| match b {
-            Block::Paragraph(p) => !p.hyperlinks.is_empty(),
+            Block::Paragraph(p) => has_external_link(p),
             Block::Table(t) => t.rows.iter().any(|row| {
                 row.cells
                     .iter()
@@ -118,7 +124,7 @@ fn doc_has_hyperlinks(doc: &DocumentTree) -> bool {
         })
     }
     doc.blocks.iter().any(|b| match b {
-        Block::Paragraph(p) => !p.hyperlinks.is_empty(),
+        Block::Paragraph(p) => has_external_link(p),
         Block::Table(t) => t.rows.iter().any(|row| {
             row.cells
                 .iter()
@@ -564,7 +570,16 @@ fn emit_ppr(
                 engine::TabKind::Clear => "clear",
             };
             let pos_twips = (stop.position_pt * 20.0).round() as i32;
-            s.push_str(&format!("<w:tab w:val=\"{val}\" w:pos=\"{pos_twips}\"/>"));
+            /* Issue #81 — `w:leader` sits between `w:val` and `w:pos`
+            (the attribute order Word writes). */
+            let leader = if stop.leader.is_none() {
+                String::new()
+            } else {
+                format!(" w:leader=\"{}\"", stop.leader.as_ooxml())
+            };
+            s.push_str(&format!(
+                "<w:tab w:val=\"{val}\"{leader} w:pos=\"{pos_twips}\"/>"
+            ));
         }
         s.push_str("</w:tabs>");
         ch.push(rank(b"w:tabs"), s);
@@ -625,6 +640,19 @@ fn emit_ppr(
     if let Some(a) = props.alignment {
         ch.push(rank(b"w:jc"), format!("<w:jc w:val=\"{}\"/>", jc_val(a)));
     }
+    /* Issue #81 — a style's `<w:outlineLvl>` (the TOC heading cascade).
+    Paragraph callers clear the field (their direct element rides the
+    grab bag; a style-inherited level must not be baked in). */
+    if let Some(l) = props.outline_level
+        && !engine::GrabBag::fragments_of(&props.grab_bag)
+            .iter()
+            .any(|f| f.starts_with(b"<w:outlineLvl"))
+    {
+        ch.push(
+            rank(b"w:outlineLvl"),
+            format!("<w:outlineLvl w:val=\"{l}\"/>"),
+        );
+    }
     /* Phase 3 (#40) — a marker paragraph's interior `<w:sectPr>`: the
     genuinely-last CT_PPr content child (only the never-emitted
     pPrChange follows it in the schema). */
@@ -648,13 +676,29 @@ fn serialize_paragraph(
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
     out.push_str("<w:p>");
+    let props = if para.props.outline_level.is_some() {
+        let mut p = para.props.clone();
+        p.outline_level = None;
+        std::borrow::Cow::Owned(p)
+    } else {
+        std::borrow::Cow::Borrowed(&para.props)
+    };
     emit_ppr(
-        &para.props,
+        &props,
         para.style_id.as_deref(),
         para.list_item,
         para.section_end.as_deref(),
         out,
     );
+    /* Issue #81 — paragraph-scoped `_Toc*` bookmarks wrap the content. */
+    for b in &para.bookmarks {
+        out.push_str(&format!(
+            "<w:bookmarkStart w:id=\"{}\" w:name=\"",
+            b.id.unwrap_or_else(|| bookmark_id(&b.name))
+        ));
+        push_escaped_attr(&b.name, out);
+        out.push_str("\"/>");
+    }
     /* `<w:br>` (Phase 2 audit, gap A.12) lives as U+2028 / U+000C in
     `para.text`; the structural `<w:r><w:br/></w:r>` emission needs
     the cut-point walk. The fast path stays open for plain
@@ -674,7 +718,26 @@ fn serialize_paragraph(
     } else {
         emit_styled_runs_with_objects(para, out, hyperlink_rel_map);
     }
+    for b in para.bookmarks.iter().rev() {
+        out.push_str(&format!(
+            "<w:bookmarkEnd w:id=\"{}\"/>",
+            b.id.unwrap_or_else(|| bookmark_id(&b.name))
+        ));
+    }
     out.push_str("</w:p>");
+}
+
+/// Issue #81 — a stable `w:id` for an engine-emitted bookmark. Ids are
+/// document-unique in OOXML; passthrough paragraphs keep their own small
+/// ids, so engine ids live in a disjoint high range derived from the
+/// (unique) name — stateless, deterministic across saves.
+fn bookmark_id(name: &str) -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for b in name.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    1_000_000_000 + (h % 1_000_000_000)
 }
 
 /// Walk the paragraph as a single ordered pass weaving three orthogonal
@@ -807,8 +870,25 @@ fn emit_styled_runs_with_objects(
     the field close emits *before* the revision close. The two stacks
     are independent — interleaving by open / close order in the walk
     naturally produces well-formed XML. */
-    let mut sorted_fields: Vec<&Field> = para.fields.iter().collect();
+    let mut sorted_fields: Vec<&Field> = para.fields.iter().filter(|f| f.is_local()).collect();
     sorted_fields.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    /* Issue #81 — multi-paragraph field ends are POINT events, not a
+    wrapper: a Head emits begin + instrText + separate at `start`, a
+    Tail emits the end fldChar at `end`. They sit outside the hyperlink
+    / revision wrappers (Word writes a TOC's begin before the first
+    entry's `<w:hyperlink>` and its end after the last one's close). At
+    one offset a Head precedes a Tail (a one-paragraph TOC). */
+    let mut span_events: Vec<(usize, u8, &Field)> = para
+        .fields
+        .iter()
+        .filter_map(|f| match f.span {
+            Some(engine::FieldSpan::Head) => Some(((f.start as usize).min(len), 0, f)),
+            Some(engine::FieldSpan::Tail) => Some(((f.end as usize).min(len), 1, f)),
+            None => None,
+        })
+        .collect();
+    span_events.sort_by_key(|(at, order, _)| (*at, *order));
+    let mut span_cursor = 0usize;
 
     /* Inline object lookup by anchor byte. */
     let obj_at: std::collections::HashMap<usize, &InlineObject> = para
@@ -868,6 +948,15 @@ fn emit_styled_runs_with_objects(
                 break;
             }
         }
+        /* Issue #81 — multi-paragraph field ends due at `lo`, between
+        the closes above and the opens below. */
+        while let Some((at, _, f)) = span_events.get(span_cursor) {
+            if *at > lo {
+                break;
+            }
+            emit_span_event(f, out);
+            span_cursor += 1;
+        }
         /* Open any hyperlinks that should be active at `lo`. A target the
         pre-pass didn't find a rel id for (should not happen — the pre-pass
         walks the same `dirty` paragraphs this function is called for —
@@ -881,9 +970,17 @@ fn emit_styled_runs_with_objects(
                 && !hyperlink_stack
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *h as *const _))
-                && let Some(rid) = hyperlink_rel_map.get(&h.target)
+                && (h.target.starts_with('#') || hyperlink_rel_map.contains_key(&h.target))
             {
-                out.push_str(&format!("<w:hyperlink r:id=\"{rid}\">"));
+                /* Issue #81 — `#name` is an internal bookmark anchor (a
+                TOC entry); everything else resolves to a relationship. */
+                if let Some(anchor) = h.target.strip_prefix('#') {
+                    out.push_str("<w:hyperlink w:anchor=\"");
+                    push_escaped_attr(anchor, out);
+                    out.push_str("\" w:history=\"1\">");
+                } else if let Some(rid) = hyperlink_rel_map.get(&h.target) {
+                    out.push_str(&format!("<w:hyperlink r:id=\"{rid}\">"));
+                }
                 hyperlink_stack.push(h);
             }
         }
@@ -953,6 +1050,18 @@ fn emit_styled_runs_with_objects(
     }
     while hyperlink_stack.pop().is_some() {
         out.push_str("</w:hyperlink>");
+    }
+    for (_, _, f) in span_events.iter().skip(span_cursor) {
+        emit_span_event(f, out);
+    }
+}
+
+/// Issue #81 — one end of a multi-paragraph field.
+fn emit_span_event(f: &Field, out: &mut String) {
+    match f.span {
+        Some(engine::FieldSpan::Head) => emit_field_prologue(&f.instruction, false, out),
+        Some(engine::FieldSpan::Tail) => emit_field_epilogue(out),
+        None => {}
     }
 }
 
@@ -2914,7 +3023,12 @@ fn collect_dirty_hyperlink_targets(doc: &DocumentTree) -> Vec<String> {
         for b in blocks {
             match b {
                 Block::Paragraph(p) if p.dirty => {
-                    out.extend(p.hyperlinks.iter().map(|h| h.target.clone()));
+                    out.extend(
+                        p.hyperlinks
+                            .iter()
+                            .filter(|h| !h.target.starts_with('#'))
+                            .map(|h| h.target.clone()),
+                    );
                 }
                 Block::Paragraph(_) => {}
                 Block::Table(t) => {
@@ -2931,7 +3045,12 @@ fn collect_dirty_hyperlink_targets(doc: &DocumentTree) -> Vec<String> {
     for b in &doc.blocks {
         match b {
             Block::Paragraph(p) if p.dirty => {
-                out.extend(p.hyperlinks.iter().map(|h| h.target.clone()));
+                out.extend(
+                    p.hyperlinks
+                        .iter()
+                        .filter(|h| !h.target.starts_with('#'))
+                        .map(|h| h.target.clone()),
+                );
             }
             Block::Paragraph(_) => {}
             Block::Table(t) => {
@@ -3028,6 +3147,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3067,6 +3187,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3110,6 +3231,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3167,6 +3289,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3210,6 +3333,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3311,6 +3435,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -5111,6 +5236,7 @@ mod tests {
                 style_id: None,
                 direct_overrides: engine::ParaProperties::default(),
                 section_end: None,
+                bookmarks: Vec::new(),
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -5167,6 +5293,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -5213,6 +5340,7 @@ mod tests {
             list_item: None,
             shading: Some([0x33, 0x66, 0x99, 0xFF]),
             grab_bag: None,
+            outline_level: None,
         };
         let para = Paragraph {
             text: "hello world".into(),
@@ -5230,6 +5358,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5258,6 +5387,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -5314,6 +5444,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: Some(Box::new(engine::SectionProps::default())),
+            bookmarks: Vec::new(),
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -5863,6 +5994,7 @@ mod tests {
             style_id: None,
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -6498,6 +6630,7 @@ mod tests {
             style_id: Some("Heading1".into()),
             direct_overrides: ParaProperties::default(),
             section_end: None,
+            bookmarks: Vec::new(),
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -6843,5 +6976,156 @@ mod tests {
             hp.resolved_marker.is_some(),
             "the reader's part-marker pass resolved the bullet glyph"
         );
+    }
+
+    /// Issue #81 — the `document.xml` part of a written package.
+    fn written_document_xml(bytes: &[u8]) -> String {
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        let mut f = zip.by_name("word/document.xml").expect("document.xml");
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut f, &mut s).expect("utf-8");
+        s
+    }
+
+    /// Issue #81 — Word's TOC shape: `begin` + instruction + `separate`
+    /// in the first entry paragraph, entries wrapped in
+    /// `<w:hyperlink w:anchor>` with a nested `PAGEREF` field over the
+    /// number, the `end` in a trailing paragraph; `_Toc*` bookmarks on
+    /// the headings; right dot-leader tab stops.
+    const WORD_TOC_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p><w:pPr><w:pStyle w:val="TOC1"/><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9350"/></w:tabs></w:pPr><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \o "1-3" \h \z \u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:hyperlink w:anchor="_Toc111" w:history="1"><w:r><w:t>Alpha</w:t></w:r><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGEREF _Toc111 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:hyperlink></w:p>
+<w:p><w:pPr><w:pStyle w:val="TOC2"/><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9350"/></w:tabs></w:pPr><w:hyperlink w:anchor="_Toc222" w:history="1"><w:r><w:t>Beta</w:t></w:r><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGEREF _Toc222 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>2</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:hyperlink></w:p>
+<w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:bookmarkStart w:id="0" w:name="_Toc111"/><w:r><w:t>Alpha</w:t></w:r><w:bookmarkEnd w:id="0"/></w:p>
+<w:p><w:pPr><w:pStyle w:val="Heading2"/><w:outlineLvl w:val="1"/></w:pPr><w:bookmarkStart w:id="1" w:name="_Toc222"/><w:r><w:t>Beta</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+
+    #[test]
+    fn word_toc_reads_as_a_multi_paragraph_field_and_passes_through_untouched() {
+        let parsed = read_docx_from_parts(&[("word/document.xml", WORD_TOC_XML)]);
+        let doc = &parsed.document;
+        let p0 = doc.nth_paragraph(0).unwrap();
+        assert_eq!(p0.text, "Alpha\t1");
+        let head = p0
+            .fields
+            .iter()
+            .find(|f| f.span == Some(engine::FieldSpan::Head))
+            .expect("Head on the first entry");
+        assert_eq!(head.instruction, "TOC \\o \"1-3\" \\h \\z \\u");
+        assert_eq!(head.start, 0);
+        assert!(matches!(head.typed(), engine::TypedField::Toc { .. }));
+        /* Nested PAGEREF stays a local field over the number. */
+        let pr = p0.fields.iter().find(|f| f.is_local()).unwrap();
+        assert_eq!(pr.instruction, "PAGEREF _Toc111 \\h");
+        assert_eq!((pr.start, pr.end), (6, 7));
+        assert_eq!(p0.hyperlinks[0].target, "#_Toc111");
+        assert_eq!(p0.props.tab_stops[0].leader, engine::TabLeader::Dot);
+        assert_eq!(p0.props.tab_stops[0].kind, engine::TabKind::Right);
+        /* The end fldChar sits alone in the third paragraph. */
+        let p2 = doc.nth_paragraph(2).unwrap();
+        assert_eq!(p2.text, "");
+        assert_eq!(p2.fields.len(), 1);
+        assert_eq!(p2.fields[0].span, Some(engine::FieldSpan::Tail));
+        let regions = doc.toc_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!((regions[0].first, regions[0].last), (0, 2));
+        /* Bookmarks + the direct outline level on the headings. */
+        let h2 = doc.nth_paragraph(4).unwrap();
+        assert_eq!(
+            h2.bookmarks,
+            vec![engine::Bookmark {
+                name: "_Toc222".into(),
+                id: Some(1)
+            }]
+        );
+        assert_eq!(h2.direct_overrides.outline_level, Some(1));
+        /* Untouched: byte-identical document body. */
+        let bytes = write_docx(&parsed, doc).expect("write");
+        let xml = written_document_xml(&bytes);
+        for p in WORD_TOC_XML.split("<w:p>").skip(1) {
+            let para = format!("<w:p>{}", &p[..p.find("</w:p>").unwrap() + 6]);
+            assert!(xml.contains(&para), "passthrough paragraph drifted: {para}");
+        }
+    }
+
+    #[test]
+    fn regenerated_toc_writes_word_shape_and_reads_back_identically() {
+        let parsed = read_docx_from_parts(&[("word/document.xml", WORD_TOC_XML)]);
+        /* Rename a heading, then regenerate with fresh page numbers. */
+        let doc = parsed
+            .document
+            .insert_text(engine::LogicalPos::new(engine::BlockPath::top(4), 4), "Two");
+        let (doc, changed) = doc.regenerate_tocs(&|ord| Some((ord + 3).to_string()));
+        assert!(changed);
+        let entries: Vec<String> = (0..2)
+            .map(|i| doc.nth_paragraph(i).unwrap().text.clone())
+            .collect();
+        assert_eq!(entries, vec!["Alpha\t3", "BetaTwo\t4"]);
+        let bytes = write_docx(&parsed, &doc).expect("write");
+        let xml = written_document_xml(&bytes);
+        /* Word's shape: begin before the first hyperlink, end after the
+        last one's close; internal anchors; leader tabs. */
+        let begin = xml.find("w:fldCharType=\"begin\"").unwrap();
+        let first_link = xml.find("<w:hyperlink w:anchor=\"_Toc111\"").unwrap();
+        assert!(
+            begin < first_link,
+            "TOC begin precedes the first entry link"
+        );
+        assert!(xml.contains("<w:tab w:val=\"right\" w:leader=\"dot\""));
+        assert!(xml.contains("PAGEREF _Toc222 \\h"));
+        let last_link_close = xml.rfind("</w:hyperlink>").unwrap();
+        let last_end = xml.rfind("w:fldCharType=\"end\"").unwrap();
+        assert!(last_end > last_link_close, "TOC end follows the last link");
+        crate::opc::archive::check_document_xml_well_formed(&bytes).expect("well-formed");
+        /* Re-read: the same TOC region and entries. */
+        let again = read_docx(&bytes).expect("re-read");
+        let d2 = &again.document;
+        let regions = d2.toc_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!((regions[0].first, regions[0].last), (0, 1));
+        assert_eq!(d2.nth_paragraph(0).unwrap().text, "Alpha\t3");
+        assert_eq!(d2.nth_paragraph(1).unwrap().text, "BetaTwo\t4");
+        assert_eq!(
+            d2.nth_paragraph(1).unwrap().hyperlinks[0].target,
+            "#_Toc222"
+        );
+        /* A second regeneration with the same numbers is a no-op. */
+        let (_, changed) = d2.regenerate_tocs(&|ord| Some((ord + 3).to_string()));
+        assert!(!changed, "a read-back regenerated TOC is already current");
+    }
+
+    #[test]
+    fn engine_inserted_toc_stamps_bookmarks_and_round_trips() {
+        let mut doc = DocumentTree::from_paragraphs(["Intro".to_string(), "Body".to_string()]);
+        let mut h = doc.nth_paragraph(0).unwrap().clone();
+        h.style_id = Some("Heading1".into());
+        doc.blocks[0] = Block::Paragraph(h);
+        let (doc, _) = doc
+            .insert_toc_at(
+                &engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+                &engine::TocSwitches::default(),
+            )
+            .unwrap();
+        let (doc, _) = doc.regenerate_tocs(&|_| Some("1".into()));
+        let bytes = build_minimal_docx(&doc).expect("build");
+        crate::opc::archive::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let xml = written_document_xml(&bytes);
+        assert!(xml.contains("<w:bookmarkStart"));
+        assert!(xml.contains("<w:bookmarkEnd"));
+        let back = read_docx(&bytes).expect("re-read");
+        let heading = back.document.nth_paragraph(1).unwrap();
+        assert_eq!(heading.text, "Intro");
+        assert_eq!(heading.bookmarks.len(), 1);
+        let entry = back.document.nth_paragraph(0).unwrap();
+        assert_eq!(entry.text, "Intro\t1");
+        assert_eq!(
+            entry.hyperlinks[0].target,
+            format!("#{}", heading.bookmarks[0].name)
+        );
+        assert_eq!(back.document.toc_regions().len(), 1);
     }
 }

@@ -22,6 +22,15 @@
  *      pressed toggle mirroring `state.fieldCodeView()`; while on, the
  *      canvas paints `{ INSTRUCTION }` codes in place of results.
  *
+ * Issue #81 — the menu also carries **Table of Contents**
+ * (`Command::InsertToc`, Word's `TOC \o "1-3" \h \z \u`): the entries are
+ * generated from the document's headings with dot leaders and live page
+ * numbers. A TOC belongs in the body, so the entry greys out in table
+ * cells and header / footer / note stories. With the caret in a TOC the
+ * field chip grows an **Update table** button (F9 regenerates every TOC
+ * from the current headings and pagination). Real engine behaviour end
+ * to end — no "Engine pending" gate.
+ *
  * When the selection addresses a field (`state.fieldAtCaret()` — a
  * click inside a field selects it whole, issue #77), a chip names its
  * keyword and opens the **field-code editor**: a plain `<input>`
@@ -92,6 +101,11 @@ export const FieldButtons: Component = () => {
     const inCell = createMemo(() => state.cellProperties() !== undefined);
     const ready = createMemo(() => state.selection() !== undefined);
     const canInsert = createMemo(() => ready() && !inCell());
+    /* Issue #81 — a TOC is body-only. */
+    const canInsertToc = createMemo(
+        () => canInsert() && state.editingStory() === undefined,
+    );
+    const inToc = () => field()?.keyword === 'TOC';
     const codes = () => state.fieldCodeView();
     const field = () => state.fieldAtCaret();
 
@@ -110,6 +124,13 @@ export const FieldButtons: Component = () => {
         setOpen(false);
         if (!canInsert()) return;
         await cmd.insertField(kind);
+        focusEditorInput();
+    };
+
+    const insertToc = async () => {
+        setOpen(false);
+        if (!canInsertToc()) return;
+        await cmd.insertToc();
         focusEditorInput();
     };
 
@@ -173,6 +194,16 @@ export const FieldButtons: Component = () => {
                 {(f) => (
                     <span class="nge-fields__chip" title={f().instruction}>
                         <span class="nge-fields__chip-key">{f().keyword}</span>
+                        <Show when={inToc()}>
+                            <button
+                                class="nge-fields__chip-btn"
+                                type="button"
+                                title="Rebuild the table of contents from the current headings and page numbers (F9)"
+                                onClick={() => void update()}
+                            >
+                                Update table
+                            </button>
+                        </Show>
                         <button
                             class="nge-fields__chip-btn"
                             type="button"
@@ -213,6 +244,23 @@ export const FieldButtons: Component = () => {
                             </button>
                         </li>
                     ))}
+                    <li role="separator" class="nge-fields__sep" />
+                    <li role="none">
+                        <button
+                            role="menuitem"
+                            class="nge-fields__item"
+                            type="button"
+                            disabled={!canInsertToc()}
+                            title={
+                                canInsertToc()
+                                    ? 'Insert a table of contents built from the document’s headings (levels 1–3, linked, with page numbers)'
+                                    : 'A table of contents goes in the document body — not in a table, header, footer or note'
+                            }
+                            onClick={() => void insertToc()}
+                        >
+                            <span>Table of Contents</span>
+                        </button>
+                    </li>
                     <li role="separator" class="nge-fields__sep" />
                     <li role="none">
                         <button
