@@ -602,6 +602,22 @@ enum StoryTarget {
     /// (a split note spans pages). Entered by clicking into a note band
     /// or by `InsertFootnote` / `InsertEndnote`; left with
     /// `ExitHeaderFooter`.
+    /// Issue #83 — a text-box story: the story of the
+    /// [`engine::InlineKind::TextBox`] anchored at byte `at` of the body
+    /// paragraph `host`. Selection paths are story-rooted (`Block(i)` =
+    /// the story's i-th block); geometry comes from the box's laid-out
+    /// frame (`text_box_geometry`). Entered by clicking into the box or by
+    /// `InsertTextBox`; left by a click outside every box or
+    /// `ExitHeaderFooter`. Body edits are gated while it is active, so
+    /// `(host, at)` cannot shift under it; undo re-validates it.
+    TextBox {
+        host: EngineBlockPath,
+        at: u32,
+        /// Anchor page (0-based): where the box was entered.
+        page: u32,
+        /// Top-level block of the host paragraph.
+        section_block: u32,
+    },
     Note {
         kind: engine::NoteKind,
         /// The story's OOXML `w:id` (key into the engine's story map).
@@ -621,6 +637,8 @@ enum StoryPart {
     Header(String),
     Footer(String),
     Note(engine::NoteKind, i32),
+    /// Issue #83 — `(host paragraph path, anchor byte)`.
+    TextBox(EngineBlockPath, u32),
 }
 
 impl StoryPart {
@@ -631,6 +649,7 @@ impl StoryPart {
             StoryPart::Header(rid) => real.with_updated_header_part(rid, blocks),
             StoryPart::Footer(rid) => real.with_updated_footer_part(rid, blocks),
             StoryPart::Note(kind, id) => real.with_updated_note_story(*kind, *id, blocks),
+            StoryPart::TextBox(host, at) => real.with_updated_text_box(host, *at, blocks),
         }
     }
 }
@@ -5645,6 +5664,10 @@ impl Engine {
                         "This action isn't available while editing a footnote or endnote \
                          — click back into the document body first."
                     }
+                    StoryTarget::TextBox { .. } => {
+                        "This action isn't available while editing a text box \
+                         — click outside the box first."
+                    }
                     _ => {
                         "This action isn't available while editing a header or footer \
                          — exit the header/footer first."
@@ -5928,6 +5951,11 @@ impl Engine {
             Command::InsertToc { at, switches } => self.do_insert_toc(at, switches),
             Command::InsertFootnote { at } => self.do_insert_note(at, engine::NoteKind::Footnote),
             Command::InsertEndnote { at } => self.do_insert_note(at, engine::NoteKind::Endnote),
+            Command::InsertTextBox {
+                at,
+                width_emu,
+                height_emu,
+            } => self.do_insert_text_box(at, width_emu, height_emu),
             Command::SetRenderDate {
                 year,
                 month,
@@ -6312,9 +6340,10 @@ impl Engine {
         tree) then re-run the SAME resolution enter used. */
         let (is_header, section_block, role) = match &self.active_story {
             StoryTarget::Body => return,
-            StoryTarget::Note { .. } => {
-                /* Issue #80 — the note either still exists (clamp the
-                selection to its body) or was undone away (exit). */
+            StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => {
+                /* Issue #80 / #83 — the note (text box) either still
+                exists (clamp the selection to its story) or was undone
+                away (exit). */
                 if self.story_blocks().is_none() {
                     self.exit_story_to_body();
                 } else if let Some(sel) = self.selection.clone() {
@@ -6349,14 +6378,18 @@ impl Engine {
                     StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                         rid != &resolved
                     }
-                    StoryTarget::Body | StoryTarget::Note { .. } => false,
+                    StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => {
+                        false
+                    }
                 };
                 if stale {
                     match &mut self.active_story {
                         StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                             *rid = resolved;
                         }
-                        StoryTarget::Body | StoryTarget::Note { .. } => {}
+                        StoryTarget::Body
+                        | StoryTarget::Note { .. }
+                        | StoryTarget::TextBox { .. } => {}
                     }
                 }
                 if self.story_blocks().is_none() {
@@ -6894,7 +6927,10 @@ impl Engine {
     /// Issue #83 — `(host paragraph path, anchor byte)` of the text box
     /// whose story is being edited, if any.
     fn active_text_box(&self) -> Option<(EngineBlockPath, u32)> {
-        None
+        match &self.active_story {
+            StoryTarget::TextBox { host, at, .. } => Some((host.clone(), *at)),
+            _ => None,
+        }
     }
 
     /// Issue #83 — lay out the story of every text box float on `pages`
@@ -7152,7 +7188,7 @@ impl Engine {
             StoryTarget::Header { rid, .. } => Some((rid.as_str(), true)),
             StoryTarget::Footer { rid, .. } => Some((rid.as_str(), false)),
             /* Issue #80 — a note previews through `build_note_bodies`. */
-            StoryTarget::Body | StoryTarget::Note { .. } => None,
+            StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => None,
         };
         'outer: for (sect_idx, section) in sections.iter().enumerate() {
             let geom = scaled_paginator_geometry(section.geometry, scale);
@@ -7591,7 +7627,7 @@ impl Engine {
         let story_skip: Option<(u32, bool)> = match &self.active_story {
             StoryTarget::Header { page, .. } => Some((*page, true)),
             StoryTarget::Footer { page, .. } => Some((*page, false)),
-            StoryTarget::Body | StoryTarget::Note { .. } => None,
+            StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => None,
         };
         /* Issue #77 — `Codes` has nothing resolved to splice; `Probe`
         must keep the `evaluated_text` markers the restamp reads back. */
@@ -8275,6 +8311,9 @@ impl Engine {
             StoryTarget::Note { kind, id, .. } => {
                 doc.note_stories(*kind).get(id).map(|s| s.body.clone())
             }
+            StoryTarget::TextBox { host, at, .. } => {
+                doc.text_box_at(host, *at).map(|s| s.body.clone())
+            }
         }
     }
 
@@ -8716,6 +8755,32 @@ impl Engine {
     fn bridge_story_ref(&self) -> Option<bridge::BridgeStoryRef> {
         let (area, rid, page, section_block, role) = match &self.active_story {
             StoryTarget::Body => return None,
+            /* Issue #83 — a text-box story: `rid` names the anchor
+            (`host path @ byte`), the slot fields take their defaults. */
+            StoryTarget::TextBox {
+                host,
+                at,
+                page,
+                section_block,
+            } => {
+                let path = host
+                    .steps
+                    .iter()
+                    .map(|st| match st {
+                        EnginePathStep::Block(i) => i.to_string(),
+                        EnginePathStep::Cell { row, col } => format!("{row}x{col}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(".");
+                return Some(bridge::BridgeStoryRef {
+                    area: bridge::HeaderFooterArea::TextBox,
+                    rid: format!("{path}@{at}"),
+                    page: *page,
+                    role: bridge::BridgeHfRole::Default,
+                    linked: false,
+                    section_index: self.section_index_of_block(*section_block) as u32,
+                });
+            }
             /* Issue #80 — a note story: `rid` carries the note id, the
             slot fields take their defaults (no inheritance for notes). */
             StoryTarget::Note {
@@ -8915,6 +8980,10 @@ impl Engine {
             StoryTarget::Header { page, .. } => return self.story_geometry(*page, true),
             StoryTarget::Footer { page, .. } => return self.story_geometry(*page, false),
             StoryTarget::Note { kind, id, .. } => return self.note_geometry(*kind, *id),
+            StoryTarget::TextBox { host, at, .. } => {
+                let (host, at) = (host.clone(), *at);
+                return self.text_box_geometry(&host, at);
+            }
             StoryTarget::Body => {}
         }
         /* `false` — hit-test + caret geometry run on committed document
@@ -9229,8 +9298,17 @@ impl Engine {
         (Word: the footnote area is just another place the caret can
         go); a press in the body while a note is open returns to the
         body. Header/footer stories keep their own zone protocol. */
-        if let Err(e) = self.route_note_click(page_idx, at) {
-            return *e;
+        /* Issue #83 — a press inside a text box enters its story; a press
+        outside every box while one is open returns to the body (and
+        then routes like any body press). */
+        match self.route_text_box_click(page_idx, at) {
+            Err(e) => return *e,
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(e) = self.route_note_click(page_idx, at) {
+                    return *e;
+                }
+            }
         }
         let pos = match self.do_hit_test_in_page(page_idx, at) {
             Event::HitResult { pos } => pos,
@@ -9983,7 +10061,8 @@ impl Engine {
         let top_idx = match &self.active_story {
             StoryTarget::Header { section_block, .. }
             | StoryTarget::Footer { section_block, .. }
-            | StoryTarget::Note { section_block, .. } => *section_block,
+            | StoryTarget::Note { section_block, .. }
+            | StoryTarget::TextBox { section_block, .. } => *section_block,
             StoryTarget::Body => match path.steps.first()? {
                 BridgePathStep::Block { idx } => *idx,
                 BridgePathStep::Cell { .. } => return None,
@@ -10396,6 +10475,7 @@ impl Engine {
             StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
             StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
             StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
+            StoryTarget::TextBox { host, at, .. } => StoryPart::TextBox(host.clone(), *at),
             StoryTarget::Body => {
                 return Event::Error {
                     message: "commit_story_edit outside a story".into(),
@@ -10574,6 +10654,7 @@ impl Engine {
             StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
             StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
             StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
+            StoryTarget::TextBox { host, at, .. } => StoryPart::TextBox(host.clone(), *at),
             StoryTarget::Body => unreachable!("guarded by caller"),
         };
         let mut blocks: Vec<engine::Block> = new_doc.blocks.iter().cloned().collect();
@@ -10913,6 +10994,259 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #83 — the text-box frame for `(host, at)` on the laid-out
+    /// pages, flattened into story-rooted line geometry (story block `j`
+    /// = frame block `j`): the caret, selection and hit-test adapters of
+    /// the text-box story. Lines are clipped to nothing — a caret in an
+    /// overflowing line still resolves (Word scrolls; we keep geometry).
+    fn text_box_geometry(
+        &self,
+        host: &EngineBlockPath,
+        at: u32,
+    ) -> Result<Vec<LineGeom>, Box<Event>> {
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell
+            .as_ref()
+            .expect("ensure_layout_snapshot populated the memo");
+        let gap = render::scene::PAGE_GAP_PT * self.scale();
+        let mut geom: Vec<LineGeom> = Vec::new();
+        let mut page_top = 0.0_f32;
+        for (pi, page) in snap.pages.iter().enumerate() {
+            let paths = snap.page_paths.get(pi).map(Vec::as_slice).unwrap_or(&[]);
+            for f in &page.floats {
+                let Some(tb) = f.text_box.as_deref() else {
+                    continue;
+                };
+                if f.at != at || float_host_path(paths, f).as_ref() != Some(host) {
+                    continue;
+                }
+                let Some((origin, size)) = f.text_box_content_rect() else {
+                    continue;
+                };
+                let (cx, cy) = (origin.x, page_top + origin.y);
+                for (j, block) in tb.blocks.iter().enumerate() {
+                    let idx = j as u32;
+                    match block {
+                        LayoutBlock::Paragraph(para_box) => collect_paragraph_line_geom(
+                            para_box,
+                            cx,
+                            cy,
+                            cx,
+                            size.width,
+                            &BridgeBlockPath {
+                                steps: vec![BridgePathStep::Block { idx }],
+                            },
+                            &mut geom,
+                        ),
+                        LayoutBlock::Table(table_box) => collect_table_line_geom(
+                            table_box,
+                            idx,
+                            cx + table_box.origin.x,
+                            cy + table_box.origin.y,
+                            &mut geom,
+                        ),
+                    }
+                }
+                return Ok(geom);
+            }
+            page_top += page.size.height + gap;
+        }
+        Ok(geom)
+    }
+
+    /// Issue #83 — the body text box under a PAGE-LOCAL device-px point
+    /// on page `page_idx`, as `(host path, anchor byte)`: in-front boxes
+    /// before behind-text ones, higher z-order first. Header / footer
+    /// boxes are painted but not enterable (no body path).
+    fn text_box_at_point(&self, page_idx: u32, at: BridgePoint) -> Option<(EngineBlockPath, u32)> {
+        let snap_cell = self.layout_snapshot.borrow();
+        let snap = snap_cell.as_ref()?;
+        let page = snap.pages.get(page_idx as usize)?;
+        let paths = snap
+            .page_paths
+            .get(page_idx as usize)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut hits: Vec<&layout::FloatBox> = page
+            .floats
+            .iter()
+            .filter(|f| {
+                f.text_box.is_some()
+                    && !f.hidden
+                    && at.x >= f.origin.x
+                    && at.x <= f.origin.x + f.size.width
+                    && at.y >= f.origin.y
+                    && at.y <= f.origin.y + f.size.height
+            })
+            .collect();
+        hits.sort_by_key(|f| (!f.behind_doc, f.z_order));
+        let f = hits.last()?;
+        Some((float_host_path(paths, f)?, f.at))
+    }
+
+    /// Issue #83 — story routing for a pointer press: enter the text box
+    /// under the point (from the body, a note or another box); leave an
+    /// open box when the press lands outside every box. Returns `true`
+    /// when the press belongs to a text box. Header / footer stories
+    /// keep their own zone protocol.
+    fn route_text_box_click(&mut self, page_idx: u32, at: BridgePoint) -> Result<bool, Box<Event>> {
+        if matches!(
+            self.active_story,
+            StoryTarget::Header { .. } | StoryTarget::Footer { .. }
+        ) {
+            return Ok(false);
+        }
+        let target_y = Some(self.lazy_layout.min_target_y * self.scale());
+        self.ensure_layout_snapshot(self.scale(), false, target_y)?;
+        match self.text_box_at_point(page_idx, at) {
+            Some((host, box_at)) => {
+                let already = matches!(
+                    &self.active_story,
+                    StoryTarget::TextBox { host: h, at: a, .. } if *h == host && *a == box_at
+                );
+                if !already {
+                    let section_block = host.steps.first().map_or(0, |s| match s {
+                        EnginePathStep::Block(i) => *i,
+                        EnginePathStep::Cell { .. } => 0,
+                    });
+                    self.enter_text_box_story(host, box_at, page_idx, section_block);
+                }
+                Ok(true)
+            }
+            None => {
+                if matches!(self.active_story, StoryTarget::TextBox { .. }) {
+                    self.exit_story_to_body();
+                    self.announce(AnnouncementPriority::Polite, "Returned to document body");
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Issue #83 — switch the caret into the text box at `(host, at)`:
+    /// stash the body selection (when coming from the body), home the
+    /// selection at the story's first paragraph, announce.
+    fn enter_text_box_story(
+        &mut self,
+        host: EngineBlockPath,
+        at: u32,
+        page: u32,
+        section_block: u32,
+    ) {
+        if !self.story_active() {
+            self.stashed_body_selection = self.selection.clone();
+        }
+        self.active_story = StoryTarget::TextBox {
+            host,
+            at,
+            page,
+            section_block,
+        };
+        let home = self
+            .story_doc()
+            .as_ref()
+            .and_then(|d| d.path_to_first_paragraph_deep())
+            .map(|path| BridgeLogicalPos {
+                path: engine_to_bridge_path(path),
+                offset: 0,
+            })
+            .unwrap_or_else(|| bpos_top(0, 0));
+        self.selection = Some(SelectionState {
+            anchor: home.clone(),
+            caret: home,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.caret_affinity = CaretAffinity::default();
+        self.pending_format = None;
+        self.announce(AnnouncementPriority::Polite, "Editing text box");
+    }
+
+    /// `Command::InsertTextBox` (issue #83) — splice a floating text box
+    /// at `at`, then enter its story so typing lands in it. One undo step
+    /// (the insert); entering is caret state. Body paragraphs only — the
+    /// story gate rejects a story caret; table cells are a follow-up.
+    fn do_insert_text_box(
+        &mut self,
+        at: BridgeLogicalPos,
+        width_emu: i64,
+        height_emu: i64,
+    ) -> Event {
+        /* A sane extent: positive and at most 22 inches on either axis
+        (Word's own shape limit), so a malformed request never reaches
+        layout. */
+        const MAX_EMU: i64 = 22 * 914_400;
+        if self.story_active() {
+            return Event::Error {
+                message: "Insert text box: text boxes can only be inserted from the document body"
+                    .into(),
+            };
+        }
+        if at.path.steps.len() != 1 {
+            return Event::Error {
+                message: "Insert text box: text boxes inside table cells aren't supported yet"
+                    .into(),
+            };
+        }
+        if width_emu <= 0 || height_emu <= 0 || width_emu > MAX_EMU || height_emu > MAX_EMU {
+            return Event::Error {
+                message: format!(
+                    "Insert text box: size {width_emu}×{height_emu} EMU is out of range"
+                ),
+            };
+        }
+        let pos = to_engine_pos(at.clone());
+        let doc = self.undo.current();
+        if doc.paragraph_at_path(&pos.path).is_none() {
+            return Event::Error {
+                message: "Insert text box: the caret does not address a paragraph".into(),
+            };
+        }
+        let (new_doc, host, box_at) = doc.insert_text_box_at(pos, width_emu, height_emu);
+        self.undo.push(new_doc);
+        self.invalidate_layout_snapshot();
+        /* The body caret lands right after the anchor so leaving the box
+        returns there. */
+        let caret = clamp_pos(
+            self.undo.current(),
+            BridgeLogicalPos {
+                path: at.path.clone(),
+                offset: box_at + '\u{FFFC}'.len_utf8() as u32,
+            },
+        );
+        self.caret_affinity = CaretAffinity::default();
+        self.pending_format = None;
+        self.selection = Some(SelectionState {
+            anchor: caret.clone(),
+            caret: caret.clone(),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        let page = match self.document_geometry() {
+            Ok(geom) => geom
+                .iter()
+                .find(|l| {
+                    l.path == caret.path
+                        && l.start_byte <= caret.offset
+                        && caret.offset <= l.end_byte
+                })
+                .map_or(0, |l| self.page_index_at_y(l.y_top)),
+            Err(e) => return *e,
+        };
+        let section_block = host.steps.first().map_or(0, |s| match s {
+            EnginePathStep::Block(i) => *i,
+            EnginePathStep::Cell { .. } => 0,
+        });
+        self.enter_text_box_story(host, box_at, page, section_block);
+        self.selection_changed()
+    }
+
     /// Shared exit: restore + clamp the stashed body selection.
     fn exit_story_to_body(&mut self) {
         self.active_story = StoryTarget::Body;
@@ -11011,6 +11345,13 @@ impl Engine {
             return Event::Error {
                 message: "EnterHeaderFooter: notes are entered by clicking into the note \
                           or with InsertFootnote / InsertEndnote, not by page zone"
+                    .into(),
+            };
+        }
+        if matches!(area, bridge::HeaderFooterArea::TextBox) {
+            return Event::Error {
+                message: "EnterHeaderFooter: text boxes are entered by clicking into the box \
+                          or with InsertTextBox, not by page zone"
                     .into(),
             };
         }
@@ -11132,7 +11473,7 @@ impl Engine {
     /// Previous" toggle for the active story's (section, area, role).
     fn do_set_header_footer_link(&mut self, linked: bool) -> Event {
         let (is_header, page, section_block, role, cur_rid) = match &self.active_story {
-            StoryTarget::Body | StoryTarget::Note { .. } => {
+            StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => {
                 return Event::Error {
                     message: "SetHeaderFooterLink: no header or footer is being edited".into(),
                 };
@@ -11186,7 +11527,7 @@ impl Engine {
                 StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                     *rid = new_rid;
                 }
-                StoryTarget::Body | StoryTarget::Note { .. } => {}
+                StoryTarget::Body | StoryTarget::Note { .. } | StoryTarget::TextBox { .. } => {}
             }
             self.dirty.invalidate(full_page_rect(self.scale()));
             self.announce(
@@ -11211,7 +11552,9 @@ impl Engine {
                         StoryTarget::Header { rid, .. } | StoryTarget::Footer { rid, .. } => {
                             *rid = resolved;
                         }
-                        StoryTarget::Body | StoryTarget::Note { .. } => {}
+                        StoryTarget::Body
+                        | StoryTarget::Note { .. }
+                        | StoryTarget::TextBox { .. } => {}
                     }
                     /* The inherited part may be shorter — clamp. */
                     if let Some(sel) = self.selection.clone() {
@@ -11313,7 +11656,8 @@ impl Engine {
             ),
             /* Issue #80 — a note story anchors the toggle to the
             reference's section but never re-anchors (no band slot). */
-            StoryTarget::Note { section_block, .. } => (*section_block, None),
+            StoryTarget::Note { section_block, .. }
+            | StoryTarget::TextBox { section_block, .. } => (*section_block, None),
             StoryTarget::Body => {
                 let block = self
                     .selection
@@ -11518,6 +11862,7 @@ impl Engine {
             StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
             StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
             StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
+            StoryTarget::TextBox { host, at, .. } => StoryPart::TextBox(host.clone(), *at),
             StoryTarget::Body => {
                 return Event::Error {
                     message: "story_mutate outside a story".into(),
@@ -16133,6 +16478,233 @@ mod tests {
             before + 1,
             "an interactive edit must push exactly one new snapshot"
         );
+    }
+
+    /* ================================================================
+    Issue #83 — text-box stories: insert, enter, edit, exit, undo guard.
+    ================================================================ */
+
+    fn text_box_story_text(engine: &Engine) -> Vec<String> {
+        let doc = engine.undo.current();
+        doc.text_box_addresses()
+            .iter()
+            .filter_map(|(h, a)| doc.text_box_at(h, *a))
+            .filter_map(|s| s.body.first())
+            .filter_map(engine::Block::as_paragraph)
+            .map(|p| p.text.clone())
+            .collect()
+    }
+
+    /// `InsertTextBox` splices the anchor, ENTERS the story; typing lands
+    /// in the box (host paragraph untouched), the geometry adapter hit-
+    /// tests the box's lines, the story is dirty for the writer and the
+    /// host keeps its passthrough bytes; `ExitHeaderFooter` returns to
+    /// the body right after the anchor.
+    #[test]
+    fn insert_text_box_enters_the_story_and_types_into_it() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_text_box(bpos_top(0, 5), 1_371_600, 685_800);
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("expected SelectionChanged, got {evt:?}");
+        };
+        let story = editing_story
+            .as_ref()
+            .expect("the text-box story is active");
+        assert_eq!(story.area, bridge::HeaderFooterArea::TextBox);
+        assert_eq!(story.rid, "0@5");
+        assert_eq!(
+            engine.undo.current().paragraph_text(0).unwrap(),
+            "Alpha\u{FFFC} body text"
+        );
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret, bpos_top(0, 0), "story-rooted home");
+        let typed = engine.do_insert_text_interactive(caret, "inside".to_string());
+        assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+        assert_eq!(text_box_story_text(&engine), ["inside"]);
+        assert_eq!(
+            engine.undo.current().paragraph_text(0).unwrap(),
+            "Alpha\u{FFFC} body text",
+            "the host paragraph is untouched"
+        );
+        let doc = engine.undo.current();
+        assert!(
+            doc.text_box_at(&EngineBlockPath::top(0), 5)
+                .is_some_and(|s| s.dirty)
+        );
+        /* The geometry adapter serves the box's line, inside the box. */
+        let geom = engine.document_geometry().expect("text-box geometry");
+        assert_eq!(geom.len(), 1);
+        let line = &geom[0];
+        assert_eq!(line.path.steps, vec![BridgePathStep::Block { idx: 0 }]);
+        assert_eq!(line.end_byte, "inside".len() as u32);
+        let (bx, bw) = {
+            let snap_cell = engine.layout_snapshot.borrow();
+            let snap = snap_cell.as_ref().expect("snapshot");
+            let f = snap.pages[0]
+                .floats
+                .iter()
+                .find(|f| f.text_box.is_some())
+                .expect("box");
+            (f.origin.x, f.size.width)
+        };
+        assert!(line.hit_left > bx && line.hit_left + line.hit_width < bx + bw);
+
+        let exited = engine.do_exit_header_footer();
+        let Event::SelectionChanged { editing_story, .. } = &exited else {
+            panic!("{exited:?}");
+        };
+        assert!(editing_story.is_none());
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret, bpos_top(0, 8), "body caret right after the anchor");
+    }
+
+    /// Undo past the insert removes the box; the validity guard exits the
+    /// story. Undo of a story keystroke keeps the story and clamps.
+    #[test]
+    fn undo_past_text_box_insert_exits_the_story() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_text_box(bpos_top(0, 5), 1_371_600, 685_800);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        engine.do_insert_text_interactive(caret, "xyz".to_string());
+        let evt = engine.do_undo();
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(matches!(engine.active_story, StoryTarget::TextBox { .. }));
+        assert_eq!(text_box_story_text(&engine), [""]);
+        assert_eq!(engine.selection.as_ref().unwrap().caret, bpos_top(0, 0));
+        let evt = engine.do_undo();
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(matches!(engine.active_story, StoryTarget::Body));
+        assert_eq!(
+            engine.undo.current().paragraph_text(0).unwrap(),
+            "Alpha body text"
+        );
+    }
+
+    /// Story gate: body-only commands (and nesting) are rejected while a
+    /// text box is open; the message names the text box. `InsertTextBox`
+    /// validates its extent and refuses table cells.
+    #[test]
+    fn text_box_story_gate_and_insert_validation() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let bad = engine.do_insert_text_box(bpos_top(0, 0), 0, 10);
+        assert!(matches!(bad, Event::Error { .. }), "{bad:?}");
+        let evt = engine.do_insert_text_box(bpos_top(0, 5), 1_371_600, 685_800);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let gated = engine.story_gate(&Command::InsertTextBox {
+            at: bpos_top(0, 0),
+            width_emu: 10,
+            height_emu: 10,
+        });
+        let Some(Event::Error { message }) = gated else {
+            panic!("expected a gate rejection, got {gated:?}");
+        };
+        assert!(message.contains("text box"), "{message}");
+        let gated = engine.story_gate(&Command::InsertFootnote { at: bpos_top(0, 0) });
+        assert!(matches!(gated, Some(Event::Error { .. })));
+        let enter = engine.do_enter_header_footer(0, bridge::HeaderFooterArea::TextBox);
+        assert!(matches!(enter, Event::Error { .. }));
+    }
+
+    /// A press inside a box enters its story (caret at the pressed
+    /// line); a press in the body leaves it; a press in the OTHER box
+    /// switches stories directly.
+    #[test]
+    fn clicking_text_boxes_switches_stories_and_back() {
+        let mut engine = text_box_engine();
+        let boxes: Vec<(f32, f32, f32, f32)> = {
+            let _ = engine.document_geometry().expect("layout");
+            let snap_cell = engine.layout_snapshot.borrow();
+            let snap = snap_cell.as_ref().expect("snapshot");
+            snap.pages[0]
+                .floats
+                .iter()
+                .filter(|f| f.text_box.is_some())
+                .map(|f| (f.origin.x, f.origin.y, f.size.width, f.size.height))
+                .collect()
+        };
+        assert_eq!(boxes.len(), 2);
+        let centre = |b: (f32, f32, f32, f32)| BridgePoint {
+            x: b.0 + b.2 / 2.0,
+            y: b.1 + b.3 / 3.0,
+        };
+        let evt = engine.do_place_caret_at_point(0, centre(boxes[0]));
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert_eq!(
+            editing_story.as_ref().map(|s| s.area),
+            Some(bridge::HeaderFooterArea::TextBox)
+        );
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { host, .. } if *host == EngineBlockPath::top(0)
+        ));
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret.path.steps, vec![BridgePathStep::Block { idx: 0 }]);
+        /* Straight into the second (RTL) box. */
+        engine.do_place_caret_at_point(0, centre(boxes[1]));
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { host, .. } if *host == EngineBlockPath::top(1)
+        ));
+        /* A press in the body text right of the first box leaves. */
+        let body_point = BridgePoint {
+            x: boxes[0].0 + boxes[0].2 + 60.0,
+            y: boxes[0].1 + 6.0,
+        };
+        let evt = engine.do_place_caret_at_point(0, body_point);
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert!(
+            editing_story.is_none(),
+            "a press in the body leaves the box"
+        );
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret.path.steps, vec![BridgePathStep::Block { idx: 0 }]);
+        assert!(
+            caret.offset > 3,
+            "the press hit the body line beside the box"
+        );
+    }
+
+    /// The IME preview renders inside the ACTIVE text box only.
+    #[test]
+    fn ime_preview_renders_inside_the_active_text_box() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_text_box(bpos_top(0, 5), 1_371_600, 685_800);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        engine.composition = Some(CompositionState {
+            at: bpos_top(0, 0),
+            text: "ime".to_string(),
+        });
+        let (pages, ..) = engine
+            .build_pages(engine.scale(), true, None)
+            .expect("layout");
+        let f = pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("box");
+        let tb = f.text_box.as_deref().expect("frame");
+        let glyphs: usize = tb.blocks[0]
+            .as_paragraph()
+            .expect("p")
+            .lines
+            .iter()
+            .flat_map(|l| l.runs.iter())
+            .map(|r| r.glyphs.len())
+            .sum();
+        assert_eq!(glyphs, 3, "the preview shapes inside the box");
+        let body = pages[0].blocks[0].as_paragraph().expect("body");
+        let body_glyphs: usize = body
+            .lines
+            .iter()
+            .flat_map(|l| l.runs.iter())
+            .map(|r| r.glyphs.len())
+            .sum();
+        assert_eq!(body_glyphs, "Alpha\u{FFFC} body text".chars().count());
     }
 
     /* ================================================================
