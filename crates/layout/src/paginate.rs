@@ -21,8 +21,8 @@
 //! paginator itself only knows about overflow.
 
 use crate::boxes::{
-    FootnoteEntry, HeaderFooterBox, LayoutBlock, LineBox, NoteBand, PageBox, ParagraphBox, Point,
-    Size, TableBox, TableRowBox,
+    FootnoteEntry, HeaderFooterBox, LayoutBlock, LineBox, NoteBand, PageBox, ParaFlow,
+    ParagraphBox, Point, Size, TableBox, TableRowBox,
 };
 use crate::page::Margins;
 use crate::table_split::{
@@ -509,8 +509,11 @@ impl Paginator {
                 col += 1;
                 y_in_col = 0.0;
             }
+            /* Issue #173 — a table keeps its jc / tblInd offset in
+            whichever column it lands. */
+            let dx = block.placement_dx();
             block.set_origin(Point {
-                x: col_x[col],
+                x: col_x[col] + dx,
                 y: section_top_y + y_in_col,
             });
             y_in_col += h;
@@ -671,6 +674,16 @@ impl Paginator {
         self.pages.iter().map(|p| p.size.height).sum()
     }
 
+    /// The pages finalised so far (the in-progress page excluded).
+    pub fn emitted_pages(&self) -> &[PageBox] {
+        &self.pages
+    }
+
+    /// The blocks placed on the in-progress page so far.
+    pub fn current_blocks(&self) -> &[LayoutBlock] {
+        &self.cur_blocks
+    }
+
     pub fn content_width(&self) -> f32 {
         self.geometry.width - self.geometry.margins.left - self.geometry.margins.right
     }
@@ -780,10 +793,17 @@ impl Paginator {
     /// plus its new footnote draw exceeds the budget, the new
     /// footnote(s) get rolled back, the page closes, and the block is
     /// re-tried on a fresh page (where its footnotes start a new band).
-    pub fn push_block(&mut self, block: LayoutBlock, before: f32, after: f32) {
+    pub fn push_block(&mut self, mut block: LayoutBlock, before: f32, after: f32) {
         /* Issue #87 — one top-level block is the watchdog's window:
         churn counters and the escalation stage restart here. */
         self.watchdog.begin_block();
+        /* Issue #94 — the resolved spacing rides the box so a block the
+        paginator re-places later (a relocated keep-with-next chain)
+        gets the same gaps it was placed with. */
+        if let LayoutBlock::Paragraph(p) = &mut block {
+            p.flow.space_before = before;
+            p.flow.space_after = after;
+        }
         self.push_block_inner(block, before, after, true);
     }
 
@@ -1326,7 +1346,10 @@ impl Paginator {
     fn place_atomic(&mut self, mut block: LayoutBlock, after: f32) {
         let h = block.size().height;
         let mut origin = block.origin();
-        origin.x = self.current_column_origin_x();
+        /* Issue #173 — a table sits at its resolved jc / tblInd offset
+        within the column (zero for paragraphs and start-aligned
+        tables). */
+        origin.x = self.current_column_origin_x() + block.placement_dx();
         origin.y = self.cur_y;
         block.set_origin(origin);
         self.cur_y += h + after;
@@ -1342,23 +1365,10 @@ impl Paginator {
     /// constraint is unsatisfiable, Word drops it too), or the watchdog
     /// is at stage (a) or beyond. Releasing records `KeepChainDropped`.
     fn detach_keep_chain(&mut self) -> Vec<LayoutBlock> {
-        let col_x = self.current_column_origin_x();
-        let in_column = |b: &LayoutBlock| (b.origin().x - col_x).abs() < 0.001;
-        let mut start = self.cur_blocks.len();
-        while start > 0 {
-            match &self.cur_blocks[start - 1] {
-                LayoutBlock::Paragraph(p)
-                    if p.keep_next && in_column(&self.cur_blocks[start - 1]) =>
-                {
-                    start -= 1;
-                }
-                _ => break,
-            }
-        }
+        let (start, has_anchor_before) = self.keep_chain_bounds();
         if start == self.cur_blocks.len() {
             return Vec::new();
         }
-        let has_anchor_before = start > 0 && in_column(&self.cur_blocks[start - 1]);
         if !has_anchor_before || self.watchdog.stage() >= DegradeStage::DropOptional {
             let page = self.cur_page_index();
             self.watchdog.note(DegradeReason::KeepChainDropped, page);
@@ -1381,17 +1391,106 @@ impl Paginator {
         chain
     }
 
+    /// Issue #87 — the trailing keep-with-next chain of the current
+    /// column: the index in `cur_blocks` where it starts (`len` when there
+    /// is none) and whether an in-column block sits above it — the anchor
+    /// that makes moving to the next column / page *productive* (the
+    /// moved content lands higher up on a fresher column than it leaves).
+    /// Without one the chain (or the block itself, when there is no
+    /// chain) already opens the column and a move could only repeat.
+    fn keep_chain_bounds(&self) -> (usize, bool) {
+        let col_x = self.current_column_origin_x();
+        let in_column = |b: &LayoutBlock| (b.origin().x - col_x).abs() < 0.001;
+        let mut start = self.cur_blocks.len();
+        while start > 0 {
+            match &self.cur_blocks[start - 1] {
+                LayoutBlock::Paragraph(p)
+                    if p.keep_next && in_column(&self.cur_blocks[start - 1]) =>
+                {
+                    start -= 1;
+                }
+                _ => break,
+            }
+        }
+        let has_anchor_before = start > 0 && in_column(&self.cur_blocks[start - 1]);
+        (start, has_anchor_before)
+    }
+
+    /// Issue #95 — keep-lines and widow / orphan control. Given a split
+    /// of `para` after `k` of its `n` flow items (`0 < k < n`), return
+    /// the item count that honours the paragraph's constraints:
+    ///
+    /// - `<w:keepLines/>`: `0` — the paragraph moves whole.
+    /// - widow control, widow (`n - k == 1`): pull one more line over,
+    ///   `k - 1`, when that still leaves at least 2 here.
+    /// - widow control, orphan (`k == 1`, or the widow fix would leave
+    ///   one): `0` — the paragraph moves whole.
+    ///
+    /// Termination / release rules (the #87 ladder): a whole-paragraph
+    /// move (`0`) is only taken when it is *productive* — an in-column
+    /// block above the paragraph's keep chain ([`Self::keep_chain_bounds`])
+    /// — so the moved paragraph opens the next column, where the same
+    /// rule can never fire again. Pulling a widow line over always places
+    /// at least 2 lines, so it is progress. An unsatisfiable constraint
+    /// (the paragraph already opens its column) or a watchdog at stage
+    /// (a) keeps `k` and records `KeepChainDropped`.
+    fn keep_adjusted_split(&mut self, para: &ParagraphBox, k: usize, n: usize) -> usize {
+        if k == 0 || k >= n {
+            return k;
+        }
+        let flow = para.flow;
+        let want = if flow.keep_lines {
+            0
+        } else if flow.widow_control {
+            let k = if n - k == 1 { k - 1 } else { k };
+            if k >= 2 { k } else { 0 }
+        } else {
+            k
+        };
+        if want == k {
+            return k;
+        }
+        let releasing = self.watchdog.stage() >= DegradeStage::DropOptional
+            || (want == 0 && !self.keep_chain_bounds().1);
+        if releasing {
+            let page = self.cur_page_index();
+            self.watchdog.note(DegradeReason::KeepChainDropped, page);
+            return k;
+        }
+        want
+    }
+
     /// Issue #87 — move the block that does not fit to the next column /
     /// page, carrying its keep-with-next chain along. Chain blocks re-enter
-    /// the flow ahead of `block`; their original `before` / `after`
-    /// spacing is not stored on the box and is not re-applied.
+    /// the flow ahead of `block`.
+    ///
+    /// Issue #94 — spacing on re-placement follows the same page-top rule
+    /// as any moved block: whatever lands first in the fresh column (the
+    /// chain head, or `block` itself when there is no chain) opens it
+    /// without its `before` gap — exactly what a block that moves alone
+    /// has always done. Every later chain block and the follower get the
+    /// `before` / `after` stored on their box ([`ParaFlow`]), so the
+    /// relocated run is geometrically identical to a fresh layout of the
+    /// same content opening that column.
     fn advance_with_keep_chain(&mut self, block: LayoutBlock, after: f32, observe: bool) {
         let chain = self.detach_keep_chain();
         self.advance_column_or_flush_page();
-        for b in chain {
-            self.push_block_inner(b, 0.0, 0.0, false);
+        let follower_before = if chain.is_empty() {
+            0.0
+        } else {
+            block_space_before(&block)
+        };
+        for (i, b) in chain.into_iter().enumerate() {
+            let (before, after) = match &b {
+                LayoutBlock::Paragraph(p) => (
+                    if i == 0 { 0.0 } else { p.flow.space_before },
+                    p.flow.space_after,
+                ),
+                LayoutBlock::Table(_) => (0.0, 0.0),
+            };
+            self.push_block_inner(b, before, after, false);
         }
-        self.push_block_inner(block, 0.0, after, observe);
+        self.push_block_inner(block, follower_before, after, observe);
     }
 
     fn push_paragraph_split(
@@ -1450,7 +1549,24 @@ impl Paginator {
         pages. `line_ends[k]` is the line count through item `k`. A
         paragraph without cut bands has one item per line (unchanged). */
         let (items, line_ends) = band_flow_items(&para.lines);
-        let plan = self.fit_items(&items, remaining, self.cur_blocks.is_empty());
+        let fresh = self.cur_blocks.is_empty();
+        let mut plan = self.fit_items(&items, remaining, fresh);
+        /* Issue #95 — keep-lines / widow / orphan control may place fewer
+        items than fit. Re-fit the shorter prefix so only its notes are
+        reserved (an empty plan moves the paragraph whole). */
+        let keep = self.keep_adjusted_split(&para, plan.count, items.len());
+        if keep != plan.count {
+            plan = if keep == 0 {
+                FitPlan {
+                    count: 0,
+                    notes: Vec::new(),
+                    carry: Vec::new(),
+                    clipped: false,
+                }
+            } else {
+                self.fit_items(&items[..keep], remaining, fresh)
+            };
+        }
         let (head, tail) = if para.lines.is_empty() {
             (Some(para.clone()), None)
         } else {
@@ -1920,9 +2036,12 @@ impl Paginator {
             recompute_vmerge_spans(&mut head_rows);
         }
         let head_h = restack_rows(&mut head_rows);
+        /* Issue #173 — every page part keeps the table's resolved
+        horizontal placement (the tail re-enters `push_block_inner`, whose
+        placement adds the same offset). */
         let head = TableBox {
             origin: Point {
-                x: self.current_column_origin_x(),
+                x: self.current_column_origin_x() + table.placement_dx,
                 y: self.cur_y,
             },
             size: Size {
@@ -1932,6 +2051,7 @@ impl Paginator {
             columns: table.columns.clone(),
             rows: head_rows,
             outer_borders: table.outer_borders.clone(),
+            placement_dx: table.placement_dx,
         };
         self.cur_y += head_h;
         self.cur_blocks.push(LayoutBlock::Table(head));
@@ -1954,6 +2074,7 @@ impl Paginator {
             columns: table.columns.clone(),
             rows: tail_rows,
             outer_borders: table.outer_borders.clone(),
+            placement_dx: table.placement_dx,
         };
         /* Audit gap A.H2 — snake into the next column before forcing a
         page; matches the paragraph split policy. */
@@ -2314,11 +2435,13 @@ fn blocks_height(blocks: &[LayoutBlock]) -> f32 {
         .fold(0.0_f32, f32::max)
 }
 
-/// Re-stack `blocks` from `y = 0` at `x = 0`; returns the total height.
+/// Re-stack `blocks` from `y = 0` at `x = 0` (plus a table's placement
+/// offset, issue #173); returns the total height.
 fn restack_blocks(blocks: &mut [LayoutBlock]) -> f32 {
     let mut y = 0.0_f32;
     for b in blocks.iter_mut() {
-        b.set_origin(Point { x: 0.0, y });
+        let x = b.placement_dx();
+        b.set_origin(Point { x, y });
         y += b.size().height;
     }
     y
@@ -2329,7 +2452,8 @@ fn append_stacked(head: &mut Vec<LayoutBlock>, extra: &[LayoutBlock]) {
     let mut y = blocks_height(head);
     for b in extra {
         let mut c = b.clone();
-        c.set_origin(Point { x: 0.0, y });
+        let x = c.placement_dx();
+        c.set_origin(Point { x, y });
         y += c.size().height;
         head.push(c);
     }
@@ -2356,7 +2480,8 @@ fn split_note_blocks(
         tail_first = idx as u32;
         if y + h <= budget {
             let mut c = b.clone();
-            c.set_origin(Point { x: 0.0, y });
+            let x = c.placement_dx();
+            c.set_origin(Point { x, y });
             head.push(c);
             y += h;
             tail_first = idx as u32 + 1;
@@ -2376,7 +2501,10 @@ fn split_note_blocks(
             LayoutBlock::Table(t) => {
                 let (hd, tl) = split_table_rows(t, budget - y);
                 if let Some(mut hd) = hd {
-                    hd.origin = Point { x: 0.0, y };
+                    hd.origin = Point {
+                        x: hd.placement_dx,
+                        y,
+                    };
                     head.push(LayoutBlock::Table(hd));
                 }
                 if let Some(tl) = tl {
@@ -2462,7 +2590,10 @@ fn split_table_rows_at(t: &TableBox, n: usize) -> (Option<TableBox>, Option<Tabl
             })
             .collect();
         TableBox {
-            origin: Point { x: 0.0, y: 0.0 },
+            origin: Point {
+                x: t.placement_dx,
+                y: 0.0,
+            },
             size: Size {
                 width: t.size.width,
                 height: y,
@@ -2470,6 +2601,7 @@ fn split_table_rows_at(t: &TableBox, n: usize) -> (Option<TableBox>, Option<Tabl
             columns: t.columns.clone(),
             rows,
             outer_borders: t.outer_borders.clone(),
+            placement_dx: t.placement_dx,
         }
     };
     (Some(build(&t.rows[..n])), Some(build(&t.rows[n..])))
@@ -2644,6 +2776,12 @@ pub fn split_paragraph_at_line(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: false,
+        /* Issues #94 / #95 — the head keeps the gap above the paragraph;
+        the gap below belongs to the tail. */
+        flow: ParaFlow {
+            space_after: 0.0,
+            ..para.flow
+        },
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -2660,8 +2798,22 @@ pub fn split_paragraph_at_line(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: para.keep_next,
+        /* A continuation has no gap above it. */
+        flow: ParaFlow {
+            space_before: 0.0,
+            ..para.flow
+        },
     };
     (Some(head), Some(tail))
+}
+
+/// Issue #94 — the `before` gap stored on a block (tables carry none:
+/// the engine places them without paragraph spacing).
+fn block_space_before(block: &LayoutBlock) -> f32 {
+    match block {
+        LayoutBlock::Paragraph(p) => p.flow.space_before,
+        LayoutBlock::Table(_) => 0.0,
+    }
 }
 
 /// Phase 2 audit (gap A.12) — paragraph splitter that cuts at an
@@ -2714,6 +2866,12 @@ pub fn split_paragraph_at_line_index(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: false,
+        /* Issues #94 / #95 — the head keeps the gap above the paragraph;
+        the gap below belongs to the tail. */
+        flow: ParaFlow {
+            space_after: 0.0,
+            ..para.flow
+        },
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -2730,6 +2888,11 @@ pub fn split_paragraph_at_line_index(
         borders: para.borders.clone(),
         shading: para.shading,
         keep_next: para.keep_next,
+        /* A continuation has no gap above it. */
+        flow: ParaFlow {
+            space_before: 0.0,
+            ..para.flow
+        },
     };
     (Some(head), Some(tail))
 }
@@ -2810,6 +2973,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: ParaFlow::default(),
         }
     }
 
@@ -3070,6 +3234,7 @@ mod tests {
                 borders: None,
                 shading: None,
                 keep_next: false,
+                flow: ParaFlow::default(),
             })],
             source_rid: None,
         }
@@ -3122,6 +3287,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: ParaFlow::default(),
         }
     }
 
@@ -4124,6 +4290,7 @@ mod tests {
             columns: vec![200.0],
             rows: out_rows,
             outer_borders: engine::CellBorders::default(),
+            placement_dx: 0.0,
         }
     }
 
@@ -4642,6 +4809,200 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].blocks.len(), 1);
         assert_eq!(pages[1].blocks.len(), 2, "heading + table together");
+    }
+
+    /// Issue #94 — a relocated keep-with-next chain keeps its paragraph
+    /// spacing: the moved run is geometrically identical to a fresh
+    /// layout of the same content opening the page (the first block
+    /// opens it without its `before` gap — the unchanged page-top rule
+    /// for moved blocks — every later gap is re-applied).
+    #[test]
+    fn relocated_keep_chain_keeps_its_spacing() {
+        let geom = a4_geometry();
+        let (b1, a1, b2, a2, bf, af) = (6.0, 4.0, 8.0, 5.0, 10.0, 3.0);
+        let mut pag = Paginator::with_default_bands(geom, None, None);
+        /* 640 pt anchor + (6+16+4) + (8+16+5) = 695; the follower's
+        10 pt gap leaves no room for its first line. */
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), b1, a1);
+        pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), b2, a2);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), bf, af);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].blocks.len(), 1, "the anchor stays");
+
+        let mut fresh = Paginator::with_default_bands(geom, None, None);
+        fresh.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), 0.0, a1);
+        fresh.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), b2, a2);
+        fresh.push_block(LayoutBlock::Paragraph(fake_paragraph(5, 16.0)), bf, af);
+        fresh.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let reference = fresh.finish();
+        let geom_of = |p: &PageBox| -> Vec<(Point, Size)> {
+            p.blocks.iter().map(|b| (b.origin(), b.size())).collect()
+        };
+        assert_eq!(geom_of(&pages[1]), geom_of(&reference[0]));
+        let y2 = 16.0 + a1 + b2;
+        let y3 = y2 + 16.0 + a2 + bf;
+        let ys: Vec<f32> = pages[1].blocks.iter().map(|b| b.origin().y).collect();
+        assert_eq!(ys, vec![0.0, y2, y3, y3 + 80.0 + af]);
+    }
+
+    /// Issue #94 — the stored spacing follows a split: the head keeps
+    /// the gap above, the tail the gap below.
+    #[test]
+    fn split_halves_carry_the_right_spacing() {
+        let mut p = fake_paragraph(4, 16.0);
+        p.flow.space_before = 7.0;
+        p.flow.space_after = 9.0;
+        let (head, tail) = split_paragraph_at_line_index(&p, 2);
+        let (head, tail) = (head.expect("head"), tail.expect("tail"));
+        assert_eq!((head.flow.space_before, head.flow.space_after), (7.0, 0.0));
+        assert_eq!((tail.flow.space_before, tail.flow.space_after), (0.0, 9.0));
+    }
+
+    /* ================================================================
+    Issue #95 — keep-lines and widow / orphan control. A4 body budget is
+    698 pt: 43 lines of 16 pt fit a page.
+    ================================================================ */
+
+    fn widow_para(n: usize) -> ParagraphBox {
+        let mut p = fake_paragraph(n, 16.0);
+        p.flow.widow_control = true;
+        p
+    }
+
+    /// Lines of each block per page, in flow order.
+    fn lines_per_page(pages: &[PageBox]) -> Vec<Vec<usize>> {
+        pages
+            .iter()
+            .map(|p| {
+                p.blocks
+                    .iter()
+                    .map(|b| b.as_paragraph().map_or(0, |q| q.lines.len()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Widow: 3 of 4 lines fit — one line would be left alone on the
+    /// next page, so one more line goes with it (2 | 2).
+    #[test]
+    fn widow_control_pulls_a_line_over_to_avoid_a_widow() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(widow_para(4)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![40, 2], vec![2]]);
+    }
+
+    /// Without widow control the same flow leaves the widow (3 | 1) —
+    /// the historical split, unchanged.
+    #[test]
+    fn without_widow_control_the_split_is_unchanged() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(4, 16.0)), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(lines_per_page(&pages), vec![vec![40, 3], vec![1]]);
+    }
+
+    /// Orphan: only the first line fits — the paragraph moves whole.
+    #[test]
+    fn widow_control_moves_an_orphan_whole() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(42, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(widow_para(5)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![42], vec![5]]);
+    }
+
+    /// The 3-line fixture: 2 fit, the widow fix would leave an orphan, so
+    /// the paragraph never leaves a single line on either side.
+    #[test]
+    fn three_line_paragraph_at_page_bottom_never_leaves_a_single_line() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(41, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(widow_para(3)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![41], vec![3]]);
+    }
+
+    /// Keep-lines: a paragraph that does not fit moves whole.
+    #[test]
+    fn keep_lines_moves_the_paragraph_whole() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        let mut p = fake_paragraph(10, 16.0);
+        p.flow.keep_lines = true;
+        pag.push_block(LayoutBlock::Paragraph(p), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![40], vec![10]]);
+    }
+
+    /// Keep-lines on a paragraph longer than a page: it moves once to open
+    /// a fresh page, where the constraint is unsatisfiable — released and
+    /// reported, never bounced.
+    #[test]
+    fn keep_lines_longer_than_a_page_is_released_and_terminates() {
+        let t0 = Instant::now();
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(1, 16.0)), 0.0, 0.0);
+        let mut p = fake_paragraph(60, 16.0);
+        p.flow.keep_lines = true;
+        p.flow.widow_control = true;
+        pag.push_block(LayoutBlock::Paragraph(p), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(t0.elapsed() < adversarial_budget());
+        assert_eq!(lines_per_page(&pages), vec![vec![1], vec![43], vec![17]]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+        assert_eq!(notes[0].page, 1);
+    }
+
+    /// Keep-with-next folds in: a heading whose follower would leave an
+    /// orphan moves with the follower — it never ends a page alone.
+    #[test]
+    fn orphan_move_carries_the_keep_with_next_heading() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(41, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(keep_para(1, 16.0)), 0.0, 0.0);
+        pag.push_block(LayoutBlock::Paragraph(widow_para(5)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(lines_per_page(&pages), vec![vec![41], vec![1, 5]]);
+    }
+
+    /// An orphan that already opens its page cannot move anywhere better:
+    /// the split stands and the release is reported.
+    #[test]
+    fn orphan_at_the_page_top_is_released_not_bounced() {
+        let mut p = widow_para(2);
+        p.lines[1].origin.y = 16.0;
+        p.lines[1].height = 690.0;
+        p.size.height = 706.0;
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(p), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert_eq!(lines_per_page(&pages), vec![vec![1], vec![1]]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
+    }
+
+    /// Stage (a) releases widow / orphan control like any optional
+    /// constraint.
+    #[test]
+    fn stage_a_releases_widow_control() {
+        let mut pag = Paginator::with_default_bands(a4_geometry(), None, None);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(42, 16.0)), 0.0, 0.0);
+        pag.watchdog_mut().escalate_to(DegradeStage::DropOptional);
+        pag.push_block_inner(LayoutBlock::Paragraph(widow_para(5)), 0.0, 0.0, false);
+        let (pages, notes) = pag.finish_with_notes();
+        assert_eq!(lines_per_page(&pages), vec![vec![42, 1], vec![4]]);
+        assert_eq!(reasons(&notes), vec![DegradeReason::KeepChainDropped]);
     }
 
     /// Repeated header rows taller than the page (the #7 class: an
@@ -5208,6 +5569,7 @@ mod tests {
             columns: vec![100.0, 100.0],
             rows,
             outer_borders: engine::CellBorders::default(),
+            placement_dx: 0.0,
         }
     }
 

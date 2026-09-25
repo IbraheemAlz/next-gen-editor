@@ -285,6 +285,8 @@ fn run_default() -> Result<()> {
     run_toc_roundtrip()?;
     run_text_boxes_roundtrip()?;
     run_rtl_table_roundtrip()?;
+    run_table_jc_tblind_roundtrip()?;
+    run_body_passthrough_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -2153,6 +2155,120 @@ fn run_rtl_table_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/* ================================================ table placement (#173) ==== */
+
+/// Issue #173 — step 18: the `<w:jc>` / `<w:tblInd>` round-trip contract
+/// on `table_jc_tblind.docx` (centred, end-aligned and indented tables).
+///
+/// a. Both are MODELED on read (`TableProperties::alignment` /
+///    `indent_twips`), never carried in the tblPr grab bag.
+/// b. An untouched save is byte-identical (passthrough, drift 0).
+/// c. Typing into each table dirties it: every regenerated table is
+///    exactly its source plus the insert — `<w:jc>` and `<w:tblInd>`
+///    emitted once each, in schema order — on both save paths, and the
+///    re-read model carries the same placement.
+fn run_table_jc_tblind_roundtrip() -> Result<()> {
+    use engine::{Alignment, BlockPath, LogicalPos, PathStep};
+
+    let fixture_bytes = build_table_jc_tblind_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read jc/tblInd fixture")?;
+    /* Block indices of the three tables and their expected placement. */
+    let tables: [(u32, Option<Alignment>, i32, &str, &str); 3] = [
+        (1, Some(Alignment::Center), 0, JC_TBLIND_CENTER, "centre a"),
+        (3, Some(Alignment::End), 0, JC_TBLIND_END, "end a"),
+        (5, Some(Alignment::Start), 720, JC_TBLIND_INDENT, "indent a"),
+    ];
+    for (idx, alignment, indent, _, _) in tables {
+        let t = archive_a.document.blocks[idx as usize]
+            .as_table()
+            .with_context(|| format!("block {idx} is a table"))?;
+        if t.props.alignment != alignment || t.props.indent_twips != indent {
+            bail!(
+                "table {idx}: jc/tblInd not modeled: {:?} / {}",
+                t.props.alignment,
+                t.props.indent_twips
+            );
+        }
+        if t.props.grab_bag.is_some() {
+            bail!(
+                "table {idx}: jc/tblInd must not ride the tblPr grab bag: {:?}",
+                t.props.grab_bag
+            );
+        }
+    }
+    let src = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+
+    /* b. untouched save — byte-identical. */
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    assert_document_xml_well_formed(&untouched).context("untouched jc/tblInd .docx")?;
+    if extract_doc_xml(&untouched)? != src.as_bytes() {
+        bail!("untouched jc/tblInd document.xml drifted");
+    }
+    println!(
+        "[roundtrip] step 18a OK — jc / tblInd modeled on read, untouched save byte-identical"
+    );
+
+    /* c. edit the first cell of every table. */
+    let mut edited = archive_a.document.clone();
+    let mut expected = src.clone();
+    for (idx, _, _, tbl_pr, first) in tables {
+        let path = BlockPath::top(idx)
+            .push(PathStep::Cell { row: 0, col: 0 })
+            .push(PathStep::Block(0));
+        edited = edited.insert_text(
+            LogicalPos {
+                path,
+                offset: first.len() as u32,
+            },
+            INSERT_TEXT,
+        );
+        let src_tbl = jc_tblind_table(tbl_pr, first, &first.replace(" a", " b"));
+        let want_tbl = src_tbl.replacen(first, &format!("{first}{INSERT_TEXT}"), 1);
+        if !expected.contains(&src_tbl) {
+            bail!("fixture does not contain table {idx} verbatim");
+        }
+        expected = expected.replacen(&src_tbl, &want_tbl, 1);
+    }
+    for (label, bytes) in [
+        (
+            "write_docx",
+            write_docx(&archive_a, &edited).context("write edited jc/tblInd tables")?,
+        ),
+        (
+            "build_minimal_docx",
+            build_minimal_docx(&edited).context("UI-path save of jc/tblInd tables")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&bytes)
+            .with_context(|| format!("{label} jc/tblInd tables"))?;
+        let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+        let body = |s: &str| -> Result<String> {
+            let a = s.find("<w:body>").context("no <w:body>")?;
+            let b = s.rfind("</w:body>").context("no </w:body>")?;
+            Ok(s[a..b].to_string())
+        };
+        if body(&xml)? != body(&expected)? {
+            bail!(
+                "{label}: regenerated tables are not source + edit\n--- expected ---\n{expected}\n--- got ---\n{xml}"
+            );
+        }
+        let back = read_docx(&bytes).with_context(|| format!("{label}: re-read"))?;
+        for (idx, alignment, indent, _, _) in tables {
+            let t = back.document.blocks[idx as usize]
+                .as_table()
+                .context("table")?;
+            if t.props.alignment != alignment || t.props.indent_twips != indent {
+                bail!("{label}: table {idx} placement lost on re-read");
+            }
+        }
+    }
+    let drift = expected.len() - src.len();
+    println!(
+        "[roundtrip] step 18b OK — dirty tables regenerate source + edit, jc / tblInd emitted once in schema order (Δ {drift} B)"
+    );
+    Ok(())
+}
+
 /* ========================================================== manifest ==== */
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2609,6 +2725,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         }]),
     };
     vec![
@@ -2900,8 +3017,10 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 2,
                     paragraph_texts: vec!["first".into(), "second".into()],
                 },
+                /* Issue #112 — the BOM, the declaration and the pinned
+                sectPr are all source bytes now: drift 0. */
                 roundtrip: RoundtripBounds {
-                    document_xml_drift_bytes: 3 + sect_pr_compaction_delta(),
+                    document_xml_drift_bytes: 0,
                 },
             },
         },
@@ -3019,7 +3138,130 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 },
             },
         },
+        /* Issue #173 — `<w:jc>` + `<w:tblInd>` on fixed-width tables.
+        Untouched it rides the passthrough at drift 0; the default
+        harness's step 18 is the dirty-regeneration check. */
+        PrebuiltFixture {
+            name: "table_jc_tblind.docx",
+            bytes: build_table_jc_tblind_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 10,
+                asserts: FixtureAsserts {
+                    paragraph_count: 4,
+                    paragraph_texts: vec![
+                        "intro".into(),
+                        "mid one".into(),
+                        "mid two".into(),
+                        "after".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issues #120 / #112 — every body-level construct the typed model
+        does not represent, in a Word-shaped part (CRLF declaration, root
+        attributes in Word's order, rsids / docGrid on the sectPr): an
+        `<w:sdt>` envelope (nested, one empty) around body paragraphs and
+        a table, a self-closing `<w:p …/>`, body-level bookmark / proofErr
+        / commentRangeEnd markers and pretty-print whitespace. Zero-edit
+        drift 0; the default harness's step 19 edits inside the control. */
+        PrebuiltFixture {
+            name: "body_level_passthrough.docx",
+            bytes: build_body_level_passthrough_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 6,
+                    paragraph_texts: vec![
+                        "intro".into(),
+                        "first inside".into(),
+                        "second inside".into(),
+                        "nested inside".into(),
+                        String::new(),
+                        "after".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #119 — run-level objects the model keeps only as bytes: a
+        DrawingML text box with its VML fallback (an #83 story), Word's VML
+        horizontal rule, an OLE object, plus a picture with alt text and
+        an `<a:extLst>`. Zero-edit drift 0; step 19 edits both paragraphs
+        and resizes the picture. */
+        PrebuiltFixture {
+            name: "drawing_objects_preserved.docx",
+            bytes: build_drawing_objects_preserved_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec![
+                        "a \u{FFFC}\u{FFFC}\u{FFFC} z".into(),
+                        "pic \u{FFFC} end".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
     ]
+}
+
+/// Issue #173 — one fixed-width (2 × 2000 twips) 1 × 2 table: `tbl_pr`
+/// is the whole `<w:tblPr>…</w:tblPr>` (writer-canonical child order).
+fn jc_tblind_table(tbl_pr: &str, a: &str, b: &str) -> String {
+    format!(
+        concat!(
+            "<w:tbl>{tbl_pr}",
+            r#"<w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>"#,
+            r#"<w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">{a}</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t xml:space="preserve">{b}</w:t></w:r></w:p></w:tc></w:tr>"#,
+            "</w:tbl>",
+        ),
+        tbl_pr = tbl_pr,
+        a = a,
+        b = b,
+    )
+}
+
+/// Issue #173 — the three `<w:tblPr>`s of `table_jc_tblind.docx`, in
+/// the writer's canonical shape (CT_TblPrBase order: tblW, jc, tblInd,
+/// tblLayout) so a regenerated table is byte-identical to its source.
+const JC_TBLIND_CENTER: &str = r#"<w:tblPr><w:tblW w:w="4000" w:type="dxa"/><w:jc w:val="center"/><w:tblLayout w:type="fixed"/></w:tblPr>"#;
+const JC_TBLIND_END: &str = r#"<w:tblPr><w:tblW w:w="4000" w:type="dxa"/><w:jc w:val="end"/><w:tblLayout w:type="fixed"/></w:tblPr>"#;
+const JC_TBLIND_INDENT: &str = r#"<w:tblPr><w:tblW w:w="4000" w:type="dxa"/><w:jc w:val="start"/><w:tblInd w:w="720" w:type="dxa"/><w:tblLayout w:type="fixed"/></w:tblPr>"#;
+
+/// Issue #173 fixture: a centred, an end-aligned and a start-aligned +
+/// 720-twip-indented fixed-width table, separated by paragraphs (Word
+/// merges adjacent tables).
+fn build_table_jc_tblind_docx() -> Vec<u8> {
+    let p = |t: &str| format!(r#"<w:p><w:r><w:t xml:space="preserve">{t}</w:t></w:r></w:p>"#);
+    let document_xml = format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            "<w:body>{intro}{t1}{mid1}{t2}{mid2}{t3}{after}{sect}</w:body></w:document>",
+        ),
+        intro = p("intro"),
+        t1 = jc_tblind_table(JC_TBLIND_CENTER, "centre a", "centre b"),
+        mid1 = p("mid one"),
+        t2 = jc_tblind_table(JC_TBLIND_END, "end a", "end b"),
+        mid2 = p("mid two"),
+        t3 = jc_tblind_table(JC_TBLIND_INDENT, "indent a", "indent b"),
+        after = p("after"),
+        sect = BARE_SECT_PR,
+    );
+    package_document_xml(&document_xml)
 }
 
 /// Replicates `crates/format-docx/src/writer.rs`
@@ -3299,6 +3541,277 @@ fn build_table_nested_deep_docx(depth: usize) -> Vec<u8> {
 }
 
 /* ============================================================= helpers ==== */
+
+/* ================================ body passthrough (#120 / #112 / #119) ==== */
+
+/// A Word-shaped root: `xmlns:w` is NOT first, foreign prefixes and
+/// `mc:Ignorable` ride along, exactly as Word writes it.
+const WORD_ROOT: &str = concat!(
+    r#"<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" "#,
+    r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" "#,
+    r#"xmlns:o="urn:schemas-microsoft-com:office:office" "#,
+    r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+    r#"xmlns:v="urn:schemas-microsoft-com:vml" "#,
+    r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" "#,
+    r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+    r#"xmlns:w10="urn:schemas-microsoft-com:office:word" "#,
+    r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+    r#"xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" "#,
+    r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" "#,
+    r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+    r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+    r#"mc:Ignorable="w14 wp14">"#,
+);
+
+/// Word's trailing sectPr: rsids, `w:gutter`, `<w:cols w:space>` and
+/// `<w:docGrid>` — none of which the typed model carries.
+const WORD_SECT_PR: &str = concat!(
+    r#"<w:sectPr w:rsidR="00B44B3E" w:rsidSect="00E64C2A">"#,
+    r#"<w:pgSz w:w="11906" w:h="16838"/>"#,
+    r#"<w:pgMar w:top="1417" w:right="1417" w:bottom="1134" w:left="1417" w:header="708" w:footer="708" w:gutter="0"/>"#,
+    r#"<w:cols w:space="708"/><w:docGrid w:linePitch="360"/></w:sectPr>"#,
+);
+
+/// `word/document.xml` the way Word writes it around `body`: CRLF after
+/// the declaration and around the root's children.
+fn word_document_xml(body: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n{WORD_ROOT}\r\n<w:body>{body}{WORD_SECT_PR}</w:body>\r\n</w:document>\r\n"
+    )
+}
+
+/// Every #120 / #112 construct at once (see the fixture's manifest note).
+const BODY_LEVEL_CONSTRUCTS: &str = concat!(
+    r#"<w:p w:rsidR="00A1" w14:paraId="1F2E3D4C"><w:r><w:t>intro</w:t></w:r></w:p>"#,
+    "\r\n  ",
+    r#"<w:bookmarkStart w:id="0" w:name="_GoBack"/>"#,
+    r#"<w:sdt><w:sdtPr><w:alias w:val="Block"/><w:id w:val="-2035718510"/>"#,
+    r#"<w:rPr><w:b/></w:rPr><w:text w:multiLine="1"/></w:sdtPr><w:sdtEndPr><w:rPr><w:i/></w:rPr></w:sdtEndPr><w:sdtContent>"#,
+    r#"<w:p><w:r><w:t xml:space="preserve">first inside</w:t></w:r></w:p>"#,
+    r#"<w:sdt><w:sdtPr/><w:sdtContent/></w:sdt>"#,
+    r#"<w:p><w:r><w:t xml:space="preserve">second inside</w:t></w:r></w:p>"#,
+    r#"<w:sdt><w:sdtPr><w:tag w:val="nested"/></w:sdtPr><w:sdtContent>"#,
+    r#"<w:p><w:r><w:t xml:space="preserve">nested inside</w:t></w:r></w:p>"#,
+    r#"</w:sdtContent></w:sdt>"#,
+    r#"</w:sdtContent></w:sdt>"#,
+    r#"<w:bookmarkEnd w:id="0"/>"#,
+    r#"<w:p w:rsidR="009B100C" w:rsidRDefault="009B100C" w:rsidP="00A54197"/>"#,
+    r#"<w:proofErr w:type="spellStart"/>"#,
+    r#"<w:sdt><w:sdtPr><w:tag w:val="table"/></w:sdtPr><w:sdtContent>"#,
+    r#"<w:tbl><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>"#,
+    r#"</w:sdtContent></w:sdt>"#,
+    r#"<w:p><w:r><w:t>after</w:t></w:r></w:p>"#,
+    r#"<w:commentRangeEnd w:id="3"/>"#,
+    "\r\n  ",
+);
+
+fn build_body_level_passthrough_docx() -> Vec<u8> {
+    package_document_xml(&word_document_xml(BODY_LEVEL_CONSTRUCTS))
+}
+
+/// The text box (DrawingML choice + VML fallback), the VML rule and the
+/// OLE object of `drawing_objects_preserved.docx`, plus its picture.
+const TEXT_BOX_OBJECT: &str = concat!(
+    r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>"#,
+    r#"<wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="1828800" cy="914400"/>"#,
+    r#"<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="1" name="Text Box 1"/>"#,
+    r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+    r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></a:xfrm>"#,
+    r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>"#,
+    r#"<wps:txbx><w:txbxContent><w:p><w:r><w:t>in the box</w:t></w:r></w:p></w:txbxContent></wps:txbx>"#,
+    r#"<wps:bodyPr rot="0"/></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice>"#,
+    r##"<mc:Fallback><w:pict><v:shape id="Text Box 1" o:spid="_x0000_s1026" type="#_x0000_t202" style="width:144pt;height:1in">"##,
+    r#"<v:textbox><w:txbxContent><w:p><w:r><w:t>in the box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback>"#,
+    r#"</mc:AlternateContent>"#,
+);
+const VML_RULE_OBJECT: &str = r##"<w:pict><v:rect id="_x0000_i1025" style="width:0;height:1.5pt" o:hralign="center" o:hrstd="t" o:hr="t" fillcolor="#a0a0a0" stroked="f"/></w:pict>"##;
+const OLE_OBJECT: &str = r##"<w:object w:dxaOrig="1440" w:dyaOrig="720"><v:shape id="_x0000_i1027" type="#_x0000_t75" style="width:72pt;height:36pt" o:ole=""><v:imagedata r:id="rId9" o:title=""/></v:shape><o:OLEObject Type="Embed" ProgID="Package" ShapeID="_x0000_i1027" DrawAspect="Content" ObjectID="_1234" r:id="rId10"/></w:object>"##;
+const PICTURE_OBJECT: &str = concat!(
+    r#"<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" wp14:anchorId="1A2B3C4D">"#,
+    r#"<wp:extent cx="914400" cy="457200"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+    r#"<wp:docPr id="3" name="Picture 3" descr="alt text that must survive"/>"#,
+    r#"<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>"#,
+    r#"<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>"#,
+    r#"<pic:nvPicPr><pic:cNvPr id="3" name="photo.png"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+    r#"<pic:blipFill><a:blip r:embed="rId5"><a:extLst><a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}"/></a:extLst></a:blip>"#,
+    r#"<a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+    r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>"#,
+    r#"</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>"#,
+);
+
+fn drawing_objects_body() -> String {
+    format!(
+        concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">a </w:t></w:r><w:r>{tb}</w:r>"#,
+            r#"<w:r><w:rPr><w:noProof/></w:rPr>{rule}</w:r><w:r>{ole}</w:r>"#,
+            r#"<w:r><w:t xml:space="preserve"> z</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t xml:space="preserve">pic </w:t></w:r><w:r><w:rPr><w:noProof/></w:rPr>{pic}</w:r>"#,
+            r#"<w:r><w:t xml:space="preserve"> end</w:t></w:r></w:p>"#,
+        ),
+        tb = TEXT_BOX_OBJECT,
+        rule = VML_RULE_OBJECT,
+        ole = OLE_OBJECT,
+        pic = PICTURE_OBJECT
+    )
+}
+
+fn build_drawing_objects_preserved_docx() -> Vec<u8> {
+    package_document_xml(&word_document_xml(&drawing_objects_body()))
+}
+
+/// Issues #120 / #112 / #119 — step 19: the body-level passthrough
+/// contract. (a) both fixtures resave byte-identical with zero edits, on
+/// the archive AND the UI save path; (b) an edit inside a content control
+/// regenerates that paragraph only — envelope, markers, prolog, root tag
+/// and sectPr are the source bytes; (c) an edit in a paragraph holding a
+/// text box, a VML rule, an OLE object and a picture re-emits every object
+/// byte for byte; (d) a resized picture regenerates from the typed fields.
+fn run_body_passthrough_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+
+    let body_xml = word_document_xml(BODY_LEVEL_CONSTRUCTS);
+    let body_docx = build_body_level_passthrough_docx();
+    let drawing_xml = word_document_xml(&drawing_objects_body());
+    let drawing_docx = build_drawing_objects_preserved_docx();
+
+    /* (a) zero-edit, both save paths. */
+    for (label, docx, xml) in [
+        ("body_level_passthrough", &body_docx, &body_xml),
+        ("drawing_objects_preserved", &drawing_docx, &drawing_xml),
+    ] {
+        let parsed = read_docx(docx).with_context(|| format!("read {label}"))?;
+        if !parsed.document.document_envelope.is_captured() {
+            bail!("{label}: the document envelope was not captured");
+        }
+        let resaved = write_docx(&parsed, &parsed.document).context("write_docx")?;
+        assert_document_xml_well_formed(&resaved)?;
+        if extract_doc_xml(&resaved)? != xml.as_bytes() {
+            bail!("{label}: zero-edit archive resave is not byte-identical");
+        }
+        let ui = build_minimal_docx(&parsed.document).context("build_minimal_docx")?;
+        assert_document_xml_well_formed(&ui)?;
+        if extract_doc_xml(&ui)? != xml.as_bytes() {
+            bail!("{label}: zero-edit UI-path resave is not byte-identical");
+        }
+    }
+    println!(
+        "[roundtrip] step 19a OK — body-level markup, envelope and objects resave byte-identical on both save paths"
+    );
+
+    /* (b) edit inside the content control. */
+    let parsed = read_docx(&body_docx).context("read body fixture")?;
+    let edited = parsed.document.insert_text(
+        LogicalPos {
+            path: BlockPath::top(1),
+            offset: "first".len() as u32,
+        },
+        "+X",
+    );
+    let bytes = write_docx(&parsed, &edited).context("write edited body")?;
+    assert_document_xml_well_formed(&bytes)?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+    let expected = body_xml.replacen("first inside", "first+X inside", 1);
+    if out != expected {
+        bail!(
+            "edit inside a content control must change only its paragraph\n--- expected ---\n{expected}\n--- got ---\n{out}"
+        );
+    }
+    let back = read_docx(&bytes).context("re-read edited body")?;
+    if back.document.paragraph_text(1) != Some("first+X inside") {
+        bail!("edited paragraph did not persist inside the control");
+    }
+    println!(
+        "[roundtrip] step 19b OK — an edit inside an <w:sdt> keeps its envelope, markers and sectPr byte-for-byte"
+    );
+
+    /* (c) edit a paragraph holding preserved objects. */
+    let parsed = read_docx(&drawing_docx).context("read drawing fixture")?;
+    let p0 = parsed
+        .document
+        .nth_paragraph(0)
+        .context("first paragraph")?;
+    if p0.inline_objects.len() != 3 {
+        bail!(
+            "expected 3 objects in paragraph 0, got {}",
+            p0.inline_objects.len()
+        );
+    }
+    if !matches!(
+        p0.inline_objects[0].kind,
+        engine::InlineKind::TextBox { .. }
+    ) {
+        bail!("the AlternateContent text box must read as a text-box story");
+    }
+    let edited = parsed
+        .document
+        .insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 1,
+            },
+            "bc",
+        )
+        .insert_text(
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
+            "A ",
+        );
+    let bytes = write_docx(&parsed, &edited).context("write edited drawings")?;
+    assert_document_xml_well_formed(&bytes)?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+    let expected =
+        drawing_xml
+            .replacen("a </w:t>", "abc </w:t>", 1)
+            .replacen("pic </w:t>", "A pic </w:t>", 1);
+    if out != expected {
+        bail!(
+            "editing around preserved objects must re-emit them byte-for-byte\n--- expected ---\n{expected}\n--- got ---\n{out}"
+        );
+    }
+    let back = read_docx(&bytes).context("re-read edited drawings")?;
+    if back
+        .document
+        .nth_paragraph(0)
+        .map(|p| p.inline_objects.len())
+        != Some(3)
+    {
+        bail!("objects lost on re-read");
+    }
+    println!(
+        "[roundtrip] step 19c OK — text box, VML rule, OLE object and picture survive an edit in their paragraph byte-for-byte"
+    );
+
+    /* (d) a resized picture regenerates. */
+    let mut resized = parsed.document.clone();
+    let mut p1 = resized
+        .nth_paragraph(1)
+        .context("second paragraph")?
+        .clone();
+    if let engine::InlineKind::Image { width_emu, .. } = &mut p1.inline_objects[0].kind {
+        *width_emu = 1_828_800;
+    } else {
+        bail!("paragraph 1 must hold the picture");
+    }
+    p1.dirty = true;
+    p1.source_xml = None;
+    resized.blocks.set(1, engine::Block::Paragraph(p1));
+    let bytes = write_docx(&parsed, &resized).context("write resized")?;
+    assert_document_xml_well_formed(&bytes)?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+    if !out.contains(r#"<wp:extent cx="1828800" cy="457200"/>"#) {
+        bail!("resized picture must regenerate with the new extent:\n{out}");
+    }
+    if !out.contains(TEXT_BOX_OBJECT) || !out.contains(VML_RULE_OBJECT) || !out.contains(OLE_OBJECT)
+    {
+        bail!("the untouched objects must still be verbatim after a picture resize");
+    }
+    println!(
+        "[roundtrip] step 19d OK — a resized picture regenerates from the typed fields, everything else stays verbatim"
+    );
+    Ok(())
+}
 
 /// Issue #110 — every `write_docx` in this harness is followed by a strict
 /// re-parse of the saved `word/document.xml`. A misaligned passthrough

@@ -88,6 +88,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: crate::boxes::ParaFlow::default(),
         }
     }
 
@@ -157,6 +158,7 @@ mod tests {
                 left: Some(stroke()),
                 ..Default::default()
             },
+            placement_dx: 0.0,
         }
     }
 

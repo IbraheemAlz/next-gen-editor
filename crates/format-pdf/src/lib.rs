@@ -55,6 +55,24 @@
 //! - `/Title` is a fixed string (`X3_TITLE`) — the export API carries no
 //!   document title today.
 //!
+//! # Images (issue #121)
+//!
+//! [`export_pdf_with_media`] embeds every image the layout places — inline
+//! object glyphs in any story and picture floats from `PageBox::floats` —
+//! as an image XObject drawn with one `cm` + `Do` into the exact layout
+//! rect (y inverted like every glyph). Floats keep the scene's z-order:
+//! the `behindDoc` group before any text, the in-front group last, each
+//! sorted by `relativeHeight`. Each distinct media payload is written
+//! once and shared by every page that references it. JPEG passes through
+//! as `/DCTDecode` (dimensions from the SOF marker); PNG is decoded in pure
+//! Rust (`png` crate) and re-deflated. Transparency rule: plain output and
+//! PDF/A-2u carry PNG alpha as an `/SMask`; PDF/A-1b (which forbids
+//! `/SMask`) and PDF/X-3:2003 (which forbids transparency) composite every
+//! pixel onto opaque white instead. No per-image ICC profile is embedded —
+//! samples are `DeviceRGB` / `DeviceGray` under the document's sRGB output
+//! intent; a CMYK JPEG is embedded only in plain output. GIF / WebP / EMF /
+//! WMF and corrupt or oversized images are skipped with a [`PdfWarning`].
+//!
 //! # Stream compression & text extraction
 //!
 //! Content streams and the embedded `FontFile2` programs are zlib-compressed
@@ -75,6 +93,14 @@ use pdf_writer::{Content, Date, Filter, Name, Pdf, Rect, Ref, Str, TextStr};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use text_pipeline::{FontStack, LoadedFont};
+
+mod image;
+#[cfg(test)]
+mod image_export_tests;
+#[doc(hidden)]
+pub use image::test_images;
+use image::{AlphaMode, ImageColor, ImageEncoding, PreparedImage};
+pub use image::{ImageSkipReason, MAX_IMAGE_PIXELS};
 
 /// The synthesized sRGB ICC profile the PDF/A-1b output intent embeds. Built by
 /// `build.rs` — see this module's docs for why it is generated, not vendored.
@@ -207,7 +233,72 @@ struct FontObj {
     resource: String,
 }
 
+/// Content-stream resources the page emitters resolve against: the font
+/// resource table, and (issue #121) each embeddable image's resource name
+/// keyed by relationship id. An image absent from `images` paints nothing.
+///
+/// Issue #144 — `stack` is the loaded-face counterpart of `fonts`: the
+/// tab-leader painter needs an actual glyph id / advance-width lookup
+/// (`LoadedFont::glyph_id` / `glyph_metrics`) for the dot/hyphen/
+/// underscore fill character, which the `(String, FontObj)` resource
+/// table alone cannot answer.
+struct Res<'a> {
+    fonts: &'a [(String, FontObj)],
+    images: &'a HashMap<String, String>,
+    stack: &'a FontStack,
+}
+
+/// A non-fatal export note (the `DocxWarning` counterpart): the PDF is
+/// still produced, but something in the document did not make it in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdfWarning {
+    /// Issue #121 — an image the layout places (inline or floating) was not
+    /// embedded; its rect stays blank. One warning per relationship id.
+    ImageSkipped {
+        rel_id: String,
+        reason: ImageSkipReason,
+    },
+}
+
+/// What [`export_pdf_with_media`] did beyond writing bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PdfExportReport {
+    /// Distinct image XObjects written (after content deduplication; a
+    /// soft mask is not counted separately).
+    pub images_embedded: usize,
+    pub warnings: Vec<PdfWarning>,
+}
+
 /// Export `pages` to a PDF, appending the bytes to `out`.
+///
+/// Image-free wrapper over [`export_pdf_with_media`]: every inline or
+/// floating image rect is left blank (and reported in the discarded
+/// report). Output for a document without images is identical.
+pub fn export_pdf(
+    pages: &[PageBox],
+    fonts: &FontStack,
+    para_texts: &[&str],
+    profile: PdfProfile,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    export_pdf_with_media(pages, fonts, para_texts, &HashMap::new(), profile, out).map(|_| ())
+}
+
+/// Export `pages` to a PDF with images, appending the bytes to `out`.
+///
+/// Issue #121 — `media` is the document's image parts keyed by
+/// relationship id (`DocumentTree::media`). Every image the layout places —
+/// inline object glyphs in any story (body, cells, header/footer bands,
+/// notes, text boxes) and picture floats in `PageBox::floats` — becomes an
+/// image XObject, **written once** per distinct media payload and shared by
+/// every page that shows it. JPEG passes through as `/DCTDecode`; PNG
+/// re-encodes as `/FlateDecode` samples. Transparency depends on the
+/// profile: plain and PDF/A-2u keep PNG alpha as an `/SMask`; PDF/A-1b
+/// (ISO 19005-1 forbids `/SMask`) and PDF/X-3:2003 (no transparency)
+/// composite onto white. Anything that cannot be embedded is skipped with a
+/// [`PdfWarning`] — never an error.
+///
+/// The rest of the contract is [`export_pdf`]'s original one:
 ///
 /// Phase 6 — every `PageBox` in `pages` becomes one PDF page; each has its
 /// own MediaBox sized from `page.size`, and a dedicated content stream.
@@ -218,13 +309,14 @@ struct FontObj {
 /// (head + tail) gets the same `/ToUnicode` mapping on both halves
 /// (their `source_paragraph_id` is identical). `profile` selects plain
 /// output or one of the PDF/A-1b, PDF/A-2u, PDF/X-3 conformance targets.
-pub fn export_pdf(
+pub fn export_pdf_with_media(
     pages: &[PageBox],
     fonts: &FontStack,
     para_texts: &[&str],
+    media: &HashMap<String, engine::ImageBlob>,
     profile: PdfProfile,
     out: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<PdfExportReport, String> {
     let pdfa = matches!(profile, PdfProfile::A1b | PdfProfile::A2u);
     let pdfx = profile == PdfProfile::X3;
     /* Every conformance target shares the ICC output intent, the XMP
@@ -264,7 +356,8 @@ pub fn export_pdf(
         /* Issue #83 — text-box stories embed their fonts too. */
         for f in &page.floats {
             if let Some(tb) = f.text_box.as_deref() {
-                for_each_paragraph(&tb.blocks, &mut collect);
+                /* Issue #165 — nested stories too. */
+                tb.for_each_story_blocks(&mut |blocks| for_each_paragraph(blocks, &mut collect));
             }
         }
     }
@@ -311,12 +404,67 @@ pub fn export_pdf(
     `/Trapped`, dates); PDF/A deliberately writes none — see `pdfa_xmp`. */
     let info_id = if pdfx { Some(alloc()) } else { None };
 
+    /* Issue #121 — images. Every rel id the pages place, in first-seen
+    order; each is prepared once, deduplicated by payload bytes (two rel
+    ids naming the same picture share one XObject), and allocated AFTER
+    every pre-existing object so image-free output is byte-identical. */
+    let mut report = PdfExportReport::default();
+    let alpha_mode = match profile {
+        PdfProfile::Plain | PdfProfile::A2u => AlphaMode::SoftMask,
+        PdfProfile::A1b | PdfProfile::X3 => AlphaMode::FlattenOnWhite,
+    };
+    let page_rels: Vec<Vec<&str>> = pages.iter().map(page_image_rels).collect();
+    let mut image_names: HashMap<String, String> = HashMap::new();
+    let mut xobjs: Vec<ImageObj<'_>> = Vec::new();
+    let mut tried: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for &rel in page_rels.iter().flatten() {
+        if !tried.insert(rel) {
+            continue;
+        }
+        let Some(blob) = media.get(rel) else {
+            report.warnings.push(PdfWarning::ImageSkipped {
+                rel_id: rel.to_string(),
+                reason: ImageSkipReason::MissingMedia,
+            });
+            continue;
+        };
+        if let Some(existing) = xobjs.iter().find(|x| x.source == blob.data.as_slice()) {
+            image_names.insert(rel.to_string(), existing.resource.clone());
+            continue;
+        }
+        match image::prepare_image(&blob.data, &blob.content_type, alpha_mode, !conformant) {
+            Ok(img) => {
+                let resource = format!("Im{}", xobjs.len());
+                image_names.insert(rel.to_string(), resource.clone());
+                let id = alloc();
+                let smask = img.alpha.as_ref().map(|_| alloc());
+                xobjs.push(ImageObj {
+                    id,
+                    smask,
+                    resource,
+                    source: &blob.data,
+                    img,
+                });
+            }
+            Err(reason) => report.warnings.push(PdfWarning::ImageSkipped {
+                rel_id: rel.to_string(),
+                reason,
+            }),
+        }
+    }
+    report.images_embedded = xobjs.len();
+    let res = Res {
+        fonts: &font_objs,
+        images: &image_names,
+        stack: fonts,
+    };
+
     /* Build every page's content stream first — the digest in PDF/A `/ID`
     is keyed on the concatenated uncompressed content so split exports
     stay stable. */
     let contents: Vec<Vec<u8>> = pages
         .iter()
-        .map(|page| build_content(page, &font_objs, fonts))
+        .map(|page| build_page_content(page, &res))
         .collect();
     if conformant {
         let mut hash_in: Vec<u8> = Vec::new();
@@ -372,7 +520,8 @@ pub fn export_pdf(
         .kids(page_refs.iter().map(|(p, _)| *p))
         .count(page_refs.len() as i32)
         .media_box(default_size);
-    for ((page_id, content_id), page) in page_refs.iter().zip(pages.iter()) {
+    for (page_idx, ((page_id, content_id), page)) in page_refs.iter().zip(pages.iter()).enumerate()
+    {
         let media = Rect::new(0.0, 0.0, page.size.width, page.size.height);
         let mut p = pdf.page(*page_id);
         p.parent(pages_id);
@@ -385,9 +534,27 @@ pub fn export_pdf(
         }
         p.contents(*content_id);
         let mut resources = p.resources();
-        let mut font_dict = resources.fonts();
-        for (_, fo) in &font_objs {
-            font_dict.pair(Name(fo.resource.as_bytes()), fo.type0);
+        {
+            let mut font_dict = resources.fonts();
+            for (_, fo) in &font_objs {
+                font_dict.pair(Name(fo.resource.as_bytes()), fo.type0);
+            }
+        }
+        /* Issue #121 — only the images this page shows; no `/XObject`
+        key at all on an image-free page. */
+        let mut names: Vec<&String> = page_rels[page_idx]
+            .iter()
+            .filter_map(|rel| image_names.get(*rel))
+            .collect();
+        names.sort();
+        names.dedup();
+        if !names.is_empty() {
+            let mut xo = resources.x_objects();
+            for name in names {
+                if let Some(x) = xobjs.iter().find(|x| &x.resource == name) {
+                    xo.pair(Name(name.as_bytes()), x.id);
+                }
+            }
         }
     }
 
@@ -432,8 +599,105 @@ pub fn export_pdf(
         );
     }
 
+    for x in &xobjs {
+        write_image_xobject(&mut pdf, x);
+    }
+
     out.extend_from_slice(&pdf.finish());
-    Ok(())
+    Ok(report)
+}
+
+/// Issue #121 — one embedded image: its XObject ref, optional soft-mask
+/// ref, resource name, and the source bytes it was prepared from (the
+/// dedup key).
+struct ImageObj<'a> {
+    id: Ref,
+    smask: Option<Ref>,
+    resource: String,
+    source: &'a [u8],
+    img: PreparedImage,
+}
+
+/// Issue #121 — write an image XObject (+ its `/SMask`). 8 bits per
+/// component throughout; no `/Interpolate`, `/Alternates` or `/OPI`
+/// (all forbidden or discouraged in PDF/A).
+fn write_image_xobject(pdf: &mut Pdf, x: &ImageObj<'_>) {
+    let img = &x.img;
+    let (bytes, filter) = match img.encoding {
+        ImageEncoding::Dct => (img.data.clone(), Filter::DctDecode),
+        ImageEncoding::Raw => (deflate(&img.data), Filter::FlateDecode),
+    };
+    {
+        let mut xo = pdf.image_xobject(x.id, &bytes);
+        xo.filter(filter);
+        xo.width(img.width as i32);
+        xo.height(img.height as i32);
+        match img.color {
+            ImageColor::Gray => xo.color_space().device_gray(),
+            ImageColor::Rgb => xo.color_space().device_rgb(),
+            ImageColor::Cmyk => xo.color_space().device_cmyk(),
+        }
+        xo.bits_per_component(8);
+        if img.invert_cmyk {
+            xo.decode([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+        }
+        if let Some(sm) = x.smask {
+            xo.s_mask(sm);
+        }
+    }
+    if let (Some(sm), Some(alpha)) = (x.smask, img.alpha.as_ref()) {
+        let z = deflate(alpha);
+        let mut mask = pdf.image_xobject(sm, &z);
+        mask.filter(Filter::FlateDecode);
+        mask.width(img.width as i32);
+        mask.height(img.height as i32);
+        mask.color_space().device_gray();
+        mask.bits_per_component(8);
+    }
+}
+
+/// Issue #121 — relationship ids of every image `build_page_content` can
+/// paint on `page`, in paint-walk order (duplicates kept; callers dedupe):
+/// inline image glyphs in the body, header/footer bands, note bands and
+/// visible text-box stories, then visible picture floats. Degenerate
+/// (zero-area) objects paint nothing and are not collected.
+fn page_image_rels<'a>(page: &'a PageBox) -> Vec<&'a str> {
+    let mut rels: Vec<&'a str> = Vec::new();
+    let mut collect = |para: &'a ParagraphBox| {
+        for line in &para.lines {
+            for run in &line.runs {
+                for g in &run.glyphs {
+                    if let Some(rel) = g.inline_image_rel_id.as_deref()
+                        && g.x_advance > 0.0
+                        && g.inline_object_height > 0.0
+                    {
+                        rels.push(rel);
+                    }
+                }
+            }
+        }
+    };
+    if let Some(hf) = &page.header {
+        for_each_paragraph(&hf.blocks, &mut collect);
+    }
+    for_each_paragraph(&page.blocks, &mut collect);
+    page.endnotes.for_each_paragraph(&mut collect);
+    page.footnotes.for_each_paragraph(&mut collect);
+    if let Some(hf) = &page.footer {
+        for_each_paragraph(&hf.blocks, &mut collect);
+    }
+    let visible = |f: &&layout::FloatBox| !f.hidden && f.size.width > 0.0 && f.size.height > 0.0;
+    for f in page.floats.iter().filter(visible) {
+        if let Some(tb) = f.text_box.as_deref() {
+            for_each_paragraph(&tb.blocks, &mut collect);
+        }
+    }
+    for f in page.floats.iter().filter(visible) {
+        if f.text_box.is_none() {
+            rels.push(&f.rel_id);
+        }
+    }
+    rels
 }
 
 /// Build the page content stream: one positioned glyph-show per glyph.
@@ -455,14 +719,27 @@ pub fn export_pdf(
 /// The order mirrors `crates/render/src/scene.rs::paint_table` so PDF and
 /// Canvas2D agree on layering: shading sits behind content, borders sit on
 /// top.
+#[cfg(test)]
 fn build_content(page: &PageBox, font_objs: &[(String, FontObj)], fonts: &FontStack) -> Vec<u8> {
+    build_page_content(
+        page,
+        &Res {
+            fonts: font_objs,
+            images: &HashMap::new(),
+            stack: fonts,
+        },
+    )
+}
+
+fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
     let page_h = page.size.height;
     let content_x = page.margins.left;
     let content_y = page.margins.top;
     let mut content = Content::new();
 
-    /* Issue #83 — behind-text text boxes paint first (scene.rs order). */
-    emit_text_boxes(&mut content, page, true, font_objs, fonts);
+    /* Issue #83 / #121 — the behind-text float group (pictures + text
+    boxes, z-ordered) paints first (scene.rs order). */
+    emit_floats(&mut content, page, true, res);
 
     /* Issue #71 — header band BEFORE body (mirrors
     `render/scene.rs::build_document_scene` ordering: header, body,
@@ -475,8 +752,7 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)], fonts: &FontSt
             content_x,
             page.header_band_top(),
             &hf.blocks,
-            font_objs,
-            fonts,
+            res,
         );
     }
 
@@ -490,26 +766,10 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)], fonts: &FontSt
     for block in &page.blocks {
         match block {
             LayoutBlock::Paragraph(p) => {
-                emit_paragraph_text(
-                    &mut content,
-                    page_h,
-                    content_x,
-                    content_y,
-                    p,
-                    font_objs,
-                    fonts,
-                );
+                emit_paragraph_text(&mut content, page_h, content_x, content_y, p, res);
             }
             LayoutBlock::Table(t) => {
-                emit_table_text(
-                    &mut content,
-                    page_h,
-                    content_x,
-                    content_y,
-                    t,
-                    font_objs,
-                    fonts,
-                );
+                emit_table_text(&mut content, page_h, content_x, content_y, t, res);
             }
         }
     }
@@ -552,26 +812,10 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)], fonts: &FontSt
             for block in &entry.blocks {
                 match block {
                     LayoutBlock::Paragraph(p) => {
-                        emit_paragraph_text(
-                            &mut content,
-                            page_h,
-                            entry_x,
-                            entry_top,
-                            p,
-                            font_objs,
-                            fonts,
-                        );
+                        emit_paragraph_text(&mut content, page_h, entry_x, entry_top, p, res);
                     }
                     LayoutBlock::Table(t) => {
-                        emit_table_text(
-                            &mut content,
-                            page_h,
-                            entry_x,
-                            entry_top,
-                            t,
-                            font_objs,
-                            fonts,
-                        );
+                        emit_table_text(&mut content, page_h, entry_x, entry_top, t, res);
                     }
                 }
             }
@@ -591,93 +835,162 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)], fonts: &FontSt
             content_x,
             page.footer_band_top(),
             &hf.blocks,
-            font_objs,
-            fonts,
+            res,
         );
     }
 
-    /* Issue #83 — in-front text boxes close the page. */
-    emit_text_boxes(&mut content, page, false, font_objs, fonts);
+    /* Issue #83 / #121 — the in-front float group closes the page. */
+    emit_floats(&mut content, page, false, res);
 
     content.finish().to_vec()
 }
 
-/// Issue #83 — one z-order group of the page's text boxes (the scene's
-/// `paint_floats` twin: `behind` selects the `behindDoc` group, sorted by
-/// z-order): shape fill, the story clipped to the shape rect, outline.
-fn emit_text_boxes(
+/// Issue #83 / #121 / #165 — one z-order group of the page's floating
+/// objects (the scene's `paint_floats` twin: `behind` selects the
+/// `behindDoc` group, sorted stably by z-order).
+fn emit_floats(content: &mut Content, page: &PageBox, behind: bool, res: &Res<'_>) {
+    emit_float_group(
+        content,
+        page.size.height,
+        &page.floats,
+        0.0,
+        0.0,
+        behind,
+        res,
+    );
+}
+
+/// One z-order group of `floats` whose origins are relative to
+/// `(base_x, base_y)` in layout space — the page for page floats, the
+/// parent's content rect for nested boxes (issue #165). A picture paints
+/// its image XObject into the float's wrap-independent rect (issue #121);
+/// a text box paints shape fill, the story clipped to the shape rect
+/// (with its own nested boxes), outline (issue #83).
+fn emit_float_group(
     content: &mut Content,
-    page: &PageBox,
+    page_h: f32,
+    floats: &[layout::FloatBox],
+    base_x: f32,
+    base_y: f32,
     behind: bool,
-    font_objs: &[(String, FontObj)],
-    fonts: &FontStack,
+    res: &Res<'_>,
 ) {
-    let page_h = page.size.height;
-    let mut group: Vec<&layout::FloatBox> = page
-        .floats
+    let mut group: Vec<&layout::FloatBox> = floats
         .iter()
-        .filter(|f| f.text_box.is_some() && f.behind_doc == behind && !f.hidden)
+        .filter(|f| f.behind_doc == behind && !f.hidden)
         .collect();
     group.sort_by_key(|f| f.z_order);
     for f in group {
-        let Some(tb) = f.text_box.as_deref() else {
-            continue;
-        };
         if f.size.width <= 0.0 || f.size.height <= 0.0 {
             continue;
         }
-        let (x, w, h) = (f.origin.x, f.size.width, f.size.height);
-        let pdf_y = page_h - (f.origin.y + h);
-        if let Some([r, g, b, _]) = tb.source.fill {
-            content.save_state();
-            content.set_fill_rgb(
-                f32::from(r) / 255.0,
-                f32::from(g) / 255.0,
-                f32::from(b) / 255.0,
-            );
-            content.rect(x, pdf_y, w, h);
-            content.fill_nonzero();
-            content.restore_state();
+        match f.text_box.as_deref() {
+            Some(tb) => emit_text_box(content, page_h, f, tb, base_x, base_y, res),
+            None => emit_image(
+                content,
+                page_h,
+                &f.rel_id,
+                [
+                    base_x + f.origin.x,
+                    base_y + f.origin.y,
+                    f.size.width,
+                    f.size.height,
+                ],
+                res,
+            ),
         }
-        if let Some((origin, _)) = f.text_box_content_rect() {
-            content.save_state();
-            content.rect(x, pdf_y, w, h);
-            content.clip_nonzero();
-            content.end_path();
-            for block in &tb.blocks {
-                emit_block_shading(content, page_h, origin.x, origin.y, block);
-            }
-            for block in &tb.blocks {
-                match block {
-                    LayoutBlock::Paragraph(p) => {
-                        emit_paragraph_text(
-                            content, page_h, origin.x, origin.y, p, font_objs, fonts,
-                        );
-                    }
-                    LayoutBlock::Table(t) => {
-                        emit_table_text(content, page_h, origin.x, origin.y, t, font_objs, fonts);
-                    }
+    }
+}
+
+/// Issue #121 — paint one image XObject into a layout-space rect
+/// `[x, top, w, h]` (`x`, `top` = the rect's top-left, y-down). The image unit square is
+/// mapped by one `cm`: scale to `w`×`h`, translate to the rect's PDF-space
+/// bottom-left (`page_h - (top + h)`). An image the exporter could not
+/// embed (missing / unsupported / corrupt media) paints nothing.
+fn emit_image(
+    content: &mut Content,
+    page_h: f32,
+    rel_id: &str,
+    [x, top, w, h]: [f32; 4],
+    res: &Res<'_>,
+) {
+    let Some(name) = res.images.get(rel_id) else {
+        return;
+    };
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    content.save_state();
+    content.transform([w, 0.0, 0.0, h, x, page_h - (top + h)]);
+    content.x_object(Name(name.as_bytes()));
+    content.restore_state();
+}
+
+/// Issue #83 — one text box: shape fill, the clipped story (with its
+/// nested boxes — the `behindDoc` group under the story text, the rest
+/// over it, issue #165), outline. Origins are relative to
+/// `(base_x, base_y)` in layout space.
+fn emit_text_box(
+    content: &mut Content,
+    page_h: f32,
+    f: &layout::FloatBox,
+    tb: &layout::TextBoxFrame,
+    base_x: f32,
+    base_y: f32,
+    res: &Res<'_>,
+) {
+    let (x, w, h) = (base_x + f.origin.x, f.size.width, f.size.height);
+    let pdf_y = page_h - (base_y + f.origin.y + h);
+    if let Some([r, g, b, _]) = tb.source.fill {
+        content.save_state();
+        content.set_fill_rgb(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        );
+        content.rect(x, pdf_y, w, h);
+        content.fill_nonzero();
+        content.restore_state();
+    }
+    if let Some((origin, _)) = f.text_box_content_rect() {
+        let (cx, cy) = (base_x + origin.x, base_y + origin.y);
+        content.save_state();
+        content.rect(x, pdf_y, w, h);
+        content.clip_nonzero();
+        content.end_path();
+        emit_float_group(content, page_h, &tb.floats, cx, cy, true, res);
+        for block in &tb.blocks {
+            emit_block_shading(content, page_h, cx, cy, block);
+        }
+        for block in &tb.blocks {
+            match block {
+                LayoutBlock::Paragraph(p) => {
+                    emit_paragraph_text(content, page_h, cx, cy, p, res);
+                }
+                LayoutBlock::Table(t) => {
+                    emit_table_text(content, page_h, cx, cy, t, res);
                 }
             }
-            for block in &tb.blocks {
-                emit_block_borders(content, page_h, origin.x, origin.y, block);
-            }
-            content.restore_state();
         }
-        if let Some(([r, g, b, _], lw)) = tb.source.outline
-            && lw > 0.0
-        {
-            content.save_state();
-            content.set_stroke_rgb(
-                f32::from(r) / 255.0,
-                f32::from(g) / 255.0,
-                f32::from(b) / 255.0,
-            );
-            content.set_line_width(lw);
-            content.rect(x, pdf_y, w, h);
-            content.stroke();
-            content.restore_state();
+        for block in &tb.blocks {
+            emit_block_borders(content, page_h, cx, cy, block);
         }
+        emit_float_group(content, page_h, &tb.floats, cx, cy, false, res);
+        content.restore_state();
+    }
+    if let Some(([r, g, b, _], lw)) = tb.source.outline
+        && lw > 0.0
+    {
+        content.save_state();
+        content.set_stroke_rgb(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        );
+        content.set_line_width(lw);
+        content.rect(x, pdf_y, w, h);
+        content.stroke();
+        content.restore_state();
     }
 }
 
@@ -689,8 +1002,7 @@ fn emit_band_blocks(
     band_x: f32,
     band_y: f32,
     blocks: &[LayoutBlock],
-    font_objs: &[(String, FontObj)],
-    fonts: &FontStack,
+    res: &Res<'_>,
 ) {
     for block in blocks {
         emit_block_shading(content, page_h, band_x, band_y, block);
@@ -698,10 +1010,10 @@ fn emit_band_blocks(
     for block in blocks {
         match block {
             LayoutBlock::Paragraph(p) => {
-                emit_paragraph_text(content, page_h, band_x, band_y, p, font_objs, fonts);
+                emit_paragraph_text(content, page_h, band_x, band_y, p, res);
             }
             LayoutBlock::Table(t) => {
-                emit_table_text(content, page_h, band_x, band_y, t, font_objs, fonts);
+                emit_table_text(content, page_h, band_x, band_y, t, res);
             }
         }
     }
@@ -792,16 +1104,14 @@ fn emit_paragraph_borders(
 ///
 /// Three sub-passes mirror `render/scene.rs::paint_paragraph` layering:
 /// run highlight rects first (behind the glyphs), then the marker + line
-/// glyphs in one `BT`/`ET` block, then tab-leader fills and underline /
-/// strike fills on top.
+/// glyphs in one `BT`/`ET` block, then underline / strike fills on top.
 fn emit_paragraph_text(
     content: &mut Content,
     page_h: f32,
     origin_x: f32,
     origin_y: f32,
     para: &ParagraphBox,
-    font_objs: &[(String, FontObj)],
-    fonts: &FontStack,
+    res: &Res<'_>,
 ) {
     let para_x = origin_x + para.origin.x;
     let para_y = origin_y + para.origin.y;
@@ -834,13 +1144,40 @@ fn emit_paragraph_text(
         }
     }
 
+    /* Issue #121 — inline images, over the highlights and under the
+    glyphs. Same rect as `render/scene.rs::paint_paragraph`: the pen
+    position, `x_advance` wide, bottom edge flush with the LINE baseline,
+    `inline_object_height` tall. */
+    if !res.images.is_empty() {
+        for line in &para.lines {
+            let line_x = para_x + line.origin.x;
+            let baseline = para_y + line.origin.y + line.baseline;
+            let mut pen = 0.0_f32;
+            for run in &line.runs {
+                for glyph in &run.glyphs {
+                    if let Some(rel) = glyph.inline_image_rel_id.as_deref() {
+                        let h = glyph.inline_object_height;
+                        emit_image(
+                            content,
+                            page_h,
+                            rel,
+                            [line_x + pen, baseline - h, glyph.x_advance, h],
+                            res,
+                        );
+                    }
+                    pen += glyph.x_advance;
+                }
+            }
+        }
+    }
+
     content.begin_text();
     /* List marker — its own gutter run, baseline-aligned with the first
     line (mirrors `render/scene.rs::paint_paragraph`). */
     if let Some(marker) = &para.marker {
         let m_x = para_x + marker.origin.x;
         let m_baseline = para_y + marker.origin.y + marker.baseline;
-        show_run(content, page_h, &marker.run, m_x, m_baseline, font_objs);
+        show_run(content, page_h, &marker.run, m_x, m_baseline, res);
     }
     for line in &para.lines {
         let line_x = para_x + line.origin.x;
@@ -848,14 +1185,14 @@ fn emit_paragraph_text(
         let baseline = para_y + line.origin.y + line.baseline;
         let mut pen = 0.0_f32;
         for run in &line.runs {
-            pen += show_run(content, page_h, run, line_x + pen, baseline, font_objs);
+            pen += show_run(content, page_h, run, line_x + pen, baseline, res);
         }
     }
     content.end_text();
 
     /* Issue #144 — tab leaders (`<w:tab w:leader>`, e.g. TOC dot
     leaders). `show_run` draws nothing for a leadered tab glyph (see
-    below); its fill is painted here instead, outside any `BT`/`ET`
+    above); its fill is painted here instead, outside any `BT`/`ET`
     block — `re`/`f` (and the leader glyphs' own nested `BT`/`ET`) are
     not legal *inside* the paragraph's main text object. Dot / hyphen /
     underscore tile REAL repeated glyphs from the run's own font (so PDF
@@ -880,8 +1217,8 @@ fn emit_paragraph_text(
                     );
                     let mut drew = false;
                     if let Some(ch) = leader_fill_char(kind)
-                        && let Some(face) = fonts.face(&run.font)
-                        && let Some((_, fo)) = font_objs.iter().find(|(id, _)| id == &run.font)
+                        && let Some(face) = res.stack.face(&run.font)
+                        && let Some((_, fo)) = res.fonts.iter().find(|(id, _)| id == &run.font)
                     {
                         let font = LeaderFont {
                             face,
@@ -891,15 +1228,7 @@ fn emit_paragraph_text(
                         drew = emit_tab_leader_glyphs(content, page_h, &font, ch, x0, x1, baseline);
                     }
                     if !drew {
-                        emit_tab_leader_rule(
-                            content,
-                            page_h,
-                            kind,
-                            x0,
-                            x1,
-                            baseline,
-                            run.attrs.px_size,
-                        );
+                        emit_tab_leader_rule(content, page_h, kind, x0, x1, baseline, run.attrs.px_size);
                     }
                 }
                 pen += glyph.x_advance;
@@ -960,16 +1289,16 @@ fn run_advance(run: &VisualRun) -> f32 {
 /// Show one run's glyphs inside an open text object. `run_x` is the run's
 /// absolute pen start; `baseline` the layout-space line baseline. Returns
 /// the run's total advance so the caller's pen stays in sync even when the
-/// run's font is missing from `font_objs`.
+/// run's font is missing from `res`.
 fn show_run(
     content: &mut Content,
     page_h: f32,
     run: &VisualRun,
     run_x: f32,
     baseline: f32,
-    font_objs: &[(String, FontObj)],
+    res: &Res<'_>,
 ) -> f32 {
-    let Some((_, fo)) = font_objs.iter().find(|(id, _)| id == &run.font) else {
+    let Some((_, fo)) = res.fonts.iter().find(|(id, _)| id == &run.font) else {
         return run_advance(run);
     };
     let [r, g, b, _] = run.attrs.color;
@@ -1002,7 +1331,10 @@ fn show_run(
         width and shows nothing in the line (the object is positioned
         from `PageBox::floats`); skip it so a font that maps U+FFFC to a
         real glyph never prints a zero-advance mark. */
-        if glyph.float.is_some() {
+        /* Issue #121 — likewise an INLINE image's object-replacement
+        glyph: the image paints as an XObject (`emit_paragraph_text`),
+        the glyph itself never shows (scene.rs parity). */
+        if glyph.float.is_some() || glyph.inline_image_rel_id.is_some() {
             pen += glyph.x_advance;
             continue;
         }
@@ -1313,8 +1645,7 @@ fn emit_table_text(
     origin_x: f32,
     origin_y: f32,
     t: &TableBox,
-    font_objs: &[(String, FontObj)],
-    fonts: &FontStack,
+    res: &Res<'_>,
 ) {
     let tx = origin_x + t.origin.x;
     let ty = origin_y + t.origin.y;
@@ -1336,14 +1667,10 @@ fn emit_table_text(
             for inner in &cell.content {
                 match inner {
                     LayoutBlock::Paragraph(p) => {
-                        emit_paragraph_text(
-                            content, page_h, content_x, content_y, p, font_objs, fonts,
-                        );
+                        emit_paragraph_text(content, page_h, content_x, content_y, p, res);
                     }
                     LayoutBlock::Table(nested) => {
-                        emit_table_text(
-                            content, page_h, content_x, content_y, nested, font_objs, fonts,
-                        );
+                        emit_table_text(content, page_h, content_x, content_y, nested, res);
                     }
                 }
             }
@@ -1582,7 +1909,8 @@ fn collect_to_unicode_pages(
         page.endnotes.for_each_paragraph(&mut collect);
         for f in &page.floats {
             if let Some(tb) = f.text_box.as_deref() {
-                for_each_paragraph(&tb.blocks, &mut collect);
+                /* Issue #165 — nested stories too. */
+                tb.for_each_story_blocks(&mut |blocks| for_each_paragraph(blocks, &mut collect));
             }
         }
     }
@@ -1913,6 +2241,7 @@ mod tests {
             columns: vec![200.0],
             rows: vec![row],
             outer_borders: cell_borders,
+            placement_dx: 0.0,
         };
         let page = PageBox {
             size: Size {
@@ -2021,6 +2350,7 @@ mod tests {
                 columns: vec![200.0],
                 rows: vec![row],
                 outer_borders: engine::default_word_borders(),
+                placement_dx: 0.0,
             };
             PageBox {
                 size: Size {
@@ -2129,6 +2459,7 @@ mod tests {
                 columns: vec![100.0; 3],
                 rows: vec![row],
                 outer_borders: engine::default_word_borders(),
+                placement_dx: 0.0,
             };
             if mirrored {
                 layout::mirror_bidi_visual(&mut table);
@@ -2702,6 +3033,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: layout::ParaFlow::default(),
         };
         let page = PageBox {
             size: Size {
@@ -3057,6 +3389,7 @@ mod tests {
             columns: vec![200.0],
             rows,
             outer_borders: engine::default_word_borders(),
+            placement_dx: 0.0,
         };
         let geom = layout::PaginatePageGeometry {
             width: 595.0,
@@ -3178,6 +3511,7 @@ mod tests {
             columns: vec![200.0],
             rows,
             outer_borders: engine::default_word_borders(),
+            placement_dx: 0.0,
         };
         let geom = layout::PaginatePageGeometry {
             width: 595.0,

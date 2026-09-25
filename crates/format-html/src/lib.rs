@@ -654,6 +654,7 @@ mod tests {
             ],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         };
         let html = to_html_fragment(&doc_with(vec![Block::Table(table)]));
         assert!(html.starts_with("<table style=\"border-collapse:collapse;\">"));
@@ -728,6 +729,7 @@ mod tests {
                     height_emu: 1_524_000,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         };
@@ -756,6 +758,7 @@ mod tests {
                     height_emu: 0,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         };
@@ -797,6 +800,7 @@ mod tests {
             ],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         };
         let html = to_html_fragment(&doc_with(vec![Block::Table(table)]));
         assert!(

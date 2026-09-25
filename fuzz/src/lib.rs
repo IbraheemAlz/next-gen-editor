@@ -82,20 +82,26 @@ pub fn run_rpc_command(data: &[u8]) {
     let mut engine = engine_wasm::Engine::new_headless(engine::DocumentTree::from_text(&seed_text));
     let commands = command_gen::gen_command_sequence(&mut u, MAX_COMMAND_SEQUENCE);
     for cmd in commands {
+        /* Kept only for the failure message: the variant name (not the
+        payload, which would defeat the smoke driver's per-message
+        dedup) tells triage WHICH command broke an invariant. Formatted
+        lazily — `assert!`'s message arguments run only on failure. */
+        let keep = cmd.clone();
         let _evt = engine.apply_sync(cmd);
         assert!(
             engine.undo_depth() <= 100,
-            "undo depth exceeded its 100-snapshot bound"
+            "undo depth exceeded its 100-snapshot bound after {}",
+            variant_name(&keep)
         );
-        // NOTE (issue #90 finding): `Command::SetSelection` / `ExtendSelection`
-        // do not clamp their input against the document (unlike every other
-        // selection-mutating path), so this assertion is a KNOWN, reproducible
-        // fail today — see the PR description for the minimal repro. Asserted
-        // anyway because catching it here, deterministically, on every fuzz
-        // run is exactly what this target is for.
+        // Issue #117 — `SetSelection` / `ExtendSelection` used to store the
+        // wire range verbatim (the #90 finding that made this a known
+        // fail); every selection path now clamps through the engine's
+        // `clamp_pos`, and the check is story-aware, so this must hold
+        // after EVERY command. A fail here is a real regression.
         assert!(
             engine.selection_is_valid(),
-            "live selection escaped the document bounds"
+            "live selection escaped the document bounds after {}",
+            variant_name(&keep)
         );
     }
     // Layout + the native (browser-free) rasterizer, exercised end to end
@@ -103,6 +109,16 @@ pub fn run_rpc_command(data: &[u8]) {
     if engine.ensure_layout_for_fuzzing().is_ok() {
         let _ = engine.rasterize_last_layout_for_fuzzing();
     }
+}
+
+/// The `Command` variant's name (`InsertTable`, `SetSelection`, …) — the
+/// leading identifier of its `Debug` rendering.
+fn variant_name(cmd: &bridge::Command) -> String {
+    let dbg = format!("{cmd:?}");
+    dbg.split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or("?")
+        .to_string()
 }
 
 /// Page-count bound standing in for a wall-clock watchdog — see the doc

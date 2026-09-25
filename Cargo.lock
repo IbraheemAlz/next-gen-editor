@@ -220,6 +220,7 @@ dependencies = [
  "format-docx",
  "format-pdf",
  "layout",
+ "quick-xml",
  "serde",
  "serde_json",
  "text-pipeline",
@@ -434,6 +435,7 @@ dependencies = [
  "flate2",
  "layout",
  "pdf-writer",
+ "png",
  "text-pipeline",
 ]
 

@@ -143,6 +143,37 @@ pub fn resolve_page_floats(page: &PageBox, columns: ColumnLayout) -> Vec<FloatBo
     out
 }
 
+/// Issue #165 — a text box's content rect as a margin-less pseudo page:
+/// `size` is the content rect, `blocks` the laid-out story (origins
+/// relative to the content rect). Feeding it to [`resolve_page_floats`]
+/// places the boxes nested in the story against the PARENT box — the
+/// page / margin / column frames all collapse onto the content rect,
+/// and paragraph / line / character frames follow the story text — and
+/// feeding it to `crate::wrap` (`derive_plan` / `WrapConvergence`)
+/// wraps the story around them with the body's own bounded loop.
+/// `page_number` keeps inside / outside parity with the real page.
+pub fn story_frame_page(blocks: Vec<LayoutBlock>, size: Size, page_number: u32) -> PageBox {
+    PageBox {
+        size,
+        margins: crate::page::Margins {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        },
+        blocks,
+        header: None,
+        footer: None,
+        header_offset: 0.0,
+        footer_offset: 0.0,
+        footnotes: Default::default(),
+        endnotes: Default::default(),
+        hf_role: crate::boxes::HeaderRole::Default,
+        page_number,
+        floats: Vec::new(),
+    }
+}
+
 /// Floats anchored in a table's cell paragraphs. The cell content box
 /// stands in for the "column" frame (Word's `layoutInCell` semantics);
 /// page / margin frames are unchanged.
@@ -321,6 +352,7 @@ fn place_float(
             Box::new(crate::boxes::TextBoxFrame {
                 source: (**tb).clone(),
                 blocks: Vec::new(),
+                floats: Vec::new(),
             })
         }),
     }
@@ -461,6 +493,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: crate::boxes::ParaFlow::default(),
         }
     }
 

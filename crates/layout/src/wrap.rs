@@ -838,6 +838,7 @@ mod tests {
             borders: None,
             shading: None,
             keep_next: false,
+            flow: crate::boxes::ParaFlow::default(),
         })
     }
 

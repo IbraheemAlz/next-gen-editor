@@ -12,3 +12,4 @@ layout = { path = "../layout" }
 text-pipeline = { path = "../text-pipeline" }
 pdf-writer = { workspace = true }
 flate2 = { workspace = true }
+png = { workspace = true }

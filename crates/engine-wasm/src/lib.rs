@@ -347,6 +347,16 @@ struct LazyLayoutInfo {
     /// raised below `build_pages` (paragraph-cache verifier, autofit
     /// solver, verified fast path). Forwarded on `Event::Painted`.
     degradations: Vec<LayoutDegraded>,
+    /// Issue #93 — index of the first PROVISIONAL page of a culled band:
+    /// the page that was in progress when the cull stopped inside a
+    /// multi-column section whose next section starts continuously. That
+    /// section's columns are balanced only when the paginator reaches the
+    /// next section (L2.3, #8), so the page is laid out unbalanced here
+    /// and balanced in any band that gets further; pages from this index
+    /// on are excluded from the verified prefix (`layout::
+    /// verify_prefix_open`). `None` — every page is final (up to the
+    /// usual partial last page).
+    open_from_page: Option<usize>,
 }
 
 thread_local! {
@@ -1221,6 +1231,52 @@ pub async fn detect_backend() -> String {
 const POC_BASELINE_X: f64 = 50.0;
 const POC_BASELINE_Y: f64 = 200.0;
 
+/// Issue #118 — the engine's single wall clock. ISO-8601 UTC with
+/// millisecond precision, byte-for-byte the shape of JavaScript's
+/// `Date.prototype.toISOString()`. In the browser it *is* `Date`; on a
+/// native target (unit tests, the D5.5 fuzz harness) it is `SystemTime`,
+/// so no handler ever calls a wasm-bindgen import off-wasm. Every
+/// timestamp the engine mints — tracked revisions, comments, replies —
+/// goes through `Engine::current_review_date`, which prefers the
+/// `SetReviewIdentity` override and falls back to this.
+fn now_iso8601() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::new_0()
+            .to_iso_string()
+            .as_string()
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format_iso8601_utc(since_epoch.as_secs(), since_epoch.subsec_millis())
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` from seconds since the Unix epoch — the
+/// proleptic-Gregorian days-to-civil conversion (Howard Hinnant's
+/// `civil_from_days`), so the native clock needs no date dependency.
+#[cfg(not(target_arch = "wasm32"))]
+fn format_iso8601_utc(secs: u64, millis: u32) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
+}
+
 fn to_engine_pos(p: BridgeLogicalPos) -> EnginePos {
     EnginePos {
         path: bridge_to_engine_path(p.path),
@@ -2052,6 +2108,209 @@ fn text_box_key(story: &engine::TextBoxStory, width_emu: i64, height_emu: i64) -
     h.finish()
 }
 
+/// Issue #165 — how deep text boxes lay out: a box in the body (level 1)
+/// and one box nested in its story (level 2). Mirrors the `.docx`
+/// reader's `MAX_TEXT_BOX_NESTING`, so every box the reader models
+/// paints; a deeper box (only a hand-built tree can carry one — the
+/// reader and `InsertTextBox` both refuse to nest further) keeps its
+/// place in the parent story but is not resolved.
+const MAX_TEXT_BOX_LAYOUT_DEPTH: u32 = 2;
+
+/// Issue #165 — the per-page inputs a text-box story layout shares down
+/// the nesting recursion.
+struct TextBoxLayoutCtx<'a> {
+    fonts: &'a FontStack,
+    cfg: &'a RenderConfig,
+    scale: f32,
+    sctx: StyleContext<'a>,
+    page_number: u32,
+}
+
+/// `true` when `blocks` (table cells included) carry a text box — the
+/// cheap model-side gate that keeps a box without nested boxes on the
+/// exact pre-#165 single pass.
+fn story_has_text_box(blocks: &[engine::Block]) -> bool {
+    blocks.iter().any(|b| match b {
+        engine::Block::Paragraph(p) => p
+            .inline_objects
+            .iter()
+            .any(|io| matches!(io.kind, engine::InlineKind::TextBox { .. })),
+        engine::Block::Table(t) => t
+            .rows
+            .iter()
+            .any(|r| r.cells.iter().any(|c| story_has_text_box(&c.blocks))),
+    })
+}
+
+/// Issue #83 / #165 — lay the story of the text-box float `f` into its
+/// [`layout::TextBoxFrame`] at `depth` (1 = a page float).
+///
+/// The story's blocks stack at the content-rect width through the
+/// cached paragraph / table pipeline. When the story carries a nested
+/// box (and `depth` is under [`MAX_TEXT_BOX_LAYOUT_DEPTH`]) the content
+/// rect becomes a margin-less pseudo page (`layout::story_frame_page`):
+/// `resolve_page_floats` places the nested box against the parent (a
+/// nested box IS a float of its parent's story), and the body's own
+/// `WrapConvergence` loop — bounded by its pass cap, forward-move cap
+/// and churn watchdog — re-lays the story around it; its notes land in
+/// `notes`. Each nested box then recurses. Finally the vertical anchor
+/// shifts the story AND its nested boxes together (`Center` / `Bottom`
+/// split the spare height; an overflowing story stays top-anchored and
+/// clips at paint).
+fn lay_text_box_frame(
+    f: &mut layout::FloatBox,
+    ctx: &TextBoxLayoutCtx<'_>,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    comp: Option<&CompositionState>,
+    depth: u32,
+    notes: &mut Vec<layout::LayoutDegradation>,
+) {
+    let (width, height) = (f.size.width, f.size.height);
+    let Some(tb) = f.text_box.as_deref_mut() else {
+        return;
+    };
+    let [l, t, r, b] = tb.source.insets;
+    let inner_w = (width - l - r).max(1.0);
+    let inner_h = (height - t - b).max(0.0);
+    let story = Arc::clone(&tb.source.story);
+    let lay = |plan: &layout::WrapPlan, cache: &mut LruCache<u64, ParagraphBox>| {
+        layout_story_blocks_cut(
+            &story.body,
+            inner_w,
+            ctx.fonts,
+            ctx.cfg,
+            ctx.scale,
+            ctx.sctx,
+            cache,
+            comp,
+            plan,
+        )
+    };
+    let mut plan = layout::WrapPlan::new();
+    let mut blocks = lay(&plan, cache);
+    let mut nested: Vec<layout::FloatBox> = Vec::new();
+    if depth < MAX_TEXT_BOX_LAYOUT_DEPTH && story_has_text_box(&story.body) {
+        let size = layout::Size {
+            width: inner_w,
+            height: inner_h,
+        };
+        /* The pseudo page keys its wrap plan by top-level block index;
+        the story's own `source_paragraph_id`s are put back after. */
+        let saved: Vec<Option<u32>> = blocks
+            .iter()
+            .map(|bk| bk.as_paragraph().map(|p| p.source_paragraph_id))
+            .collect();
+        let build = |mut blocks: Vec<LayoutBlock>| {
+            for (i, bk) in blocks.iter_mut().enumerate() {
+                if let LayoutBlock::Paragraph(p) = bk {
+                    p.source_paragraph_id = i as u32;
+                }
+            }
+            let mut page = layout::story_frame_page(blocks, size, ctx.page_number);
+            let mut floats = layout::resolve_page_floats(&page, layout::ColumnLayout::default());
+            /* Only nested TEXT BOXES are in scope: a floating picture in
+            a story is neither painted nor wrapped (pre-#165 behaviour). */
+            floats.retain(|nf| nf.text_box.is_some());
+            page.floats = floats;
+            page
+        };
+        let mut page = build(blocks);
+        if page
+            .floats
+            .iter()
+            .any(|nf| nf.wrap.cuts_text() && !nf.hidden)
+        {
+            let mut conv = layout::WrapConvergence::new(ctx.cfg.line_height * ctx.scale);
+            loop {
+                match conv.observe(std::slice::from_ref(&page), &plan) {
+                    layout::WrapVerdict::Converged | layout::WrapVerdict::Capped => break,
+                    layout::WrapVerdict::Continue(next) => {
+                        plan = next;
+                        page = build(lay(&plan, cache));
+                    }
+                }
+            }
+            notes.extend(conv.take_notes());
+        }
+        blocks = page.blocks;
+        nested = page.floats;
+        for (bk, id) in blocks.iter_mut().zip(saved) {
+            if let (LayoutBlock::Paragraph(p), Some(id)) = (bk, id) {
+                p.source_paragraph_id = id;
+            }
+        }
+        for nf in nested.iter_mut() {
+            lay_text_box_frame(nf, ctx, cache, None, depth + 1, notes);
+        }
+    }
+    let used = blocks
+        .iter()
+        .map(|bk| bk.origin().y + bk.size().height)
+        .fold(0.0_f32, f32::max);
+    let spare = (inner_h - used).max(0.0);
+    let shift = match tb.source.v_align {
+        engine::TextBoxVAlign::Top => 0.0,
+        engine::TextBoxVAlign::Center => spare / 2.0,
+        engine::TextBoxVAlign::Bottom => spare,
+    };
+    if shift > 0.0 {
+        for bk in &mut blocks {
+            let mut o = bk.origin();
+            o.y += shift;
+            bk.set_origin(o);
+        }
+        for nf in &mut nested {
+            nf.origin.y += shift;
+            nf.frame_origin.y += shift;
+        }
+    }
+    tb.blocks = blocks;
+    tb.floats = nested;
+}
+
+/// Issue #83 / #165 — join one text box's story to the PDF `/ToUnicode`
+/// text table: append the story's paragraph texts to `texts` and stamp
+/// the frame's laid-out paragraphs (cells included) with their indices
+/// (`base` = the table's length before `texts`), in the same walk order;
+/// then every nested box, depth-first.
+fn stamp_text_box_texts(tb: &mut layout::TextBoxFrame, base: usize, texts: &mut Vec<String>) {
+    let mut next = (base + texts.len()) as u32;
+    let mut story_texts: Vec<&str> = Vec::new();
+    for b in &tb.source.story.body {
+        walk_block_texts(b, &mut story_texts);
+    }
+    texts.extend(story_texts.into_iter().map(str::to_string));
+    for lb in tb.blocks.iter_mut() {
+        match lb {
+            LayoutBlock::Paragraph(p) => {
+                p.source_paragraph_id = next;
+                next += 1;
+            }
+            LayoutBlock::Table(t) => {
+                for row in t.rows.iter_mut() {
+                    for cell in row.cells.iter_mut() {
+                        if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                            continue;
+                        }
+                        layout::boxes::for_each_paragraph_in_blocks_mut(
+                            &mut cell.content,
+                            &mut |p| {
+                                p.source_paragraph_id = next;
+                                next += 1;
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for f in tb.floats.iter_mut() {
+        if let Some(inner) = f.text_box.as_deref_mut() {
+            stamp_text_box_texts(inner, base, texts);
+        }
+    }
+}
+
 /// Issue #83 — lower a text box's shape into the layout glyph payload
 /// (insets / outline width in layout px at `scale`).
 fn text_box_glyph(
@@ -2279,6 +2538,42 @@ fn push_caps_spans(
             ..template.clone()
         });
     }
+}
+
+/// Hyperlink + revision ranges for a paragraph with an IME composition
+/// of `comp_len` bytes spliced in at `off` — shifted exactly like
+/// [`composition_layout_spans`] shifts the style spans, so the overlays
+/// cut the SPLICED text on the same boundaries. Issue #115 (fuzz-found):
+/// the unshifted model offsets used to cut the spliced text `comp_len`
+/// bytes early, landing mid-scalar in Arabic / emoji text and panicking
+/// the width probe (`measure_text`). A range that ends at `off` stays
+/// before the composition; one that straddles `off` covers it.
+fn composition_overlay_ranges(
+    para: &engine::Paragraph,
+    off: u32,
+    comp_len: u32,
+) -> (Vec<engine::Hyperlink>, Vec<engine::Revision>) {
+    let start = |p: u32| if p >= off { p + comp_len } else { p };
+    let end = |p: u32| if p > off { p + comp_len } else { p };
+    let hyperlinks = para
+        .hyperlinks
+        .iter()
+        .map(|h| engine::Hyperlink {
+            start: start(h.start),
+            end: end(h.end),
+            ..h.clone()
+        })
+        .collect();
+    let revisions = para
+        .revisions
+        .iter()
+        .map(|r| engine::Revision {
+            start: start(r.start),
+            end: end(r.end),
+            ..r.clone()
+        })
+        .collect();
+    (hyperlinks, revisions)
 }
 
 /// Style spans for a paragraph with an IME composition spliced in at `off`.
@@ -2658,6 +2953,36 @@ fn layout_note_blocks(
     cache: &mut LruCache<u64, ParagraphBox>,
     composition: Option<&CompositionState>,
 ) -> Vec<LayoutBlock> {
+    layout_story_blocks_cut(
+        blocks,
+        content_width,
+        fonts,
+        cfg,
+        scale,
+        sctx,
+        cache,
+        composition,
+        &layout::WrapPlan::new(),
+    )
+}
+
+/// [`layout_note_blocks`] cut by an issue #82 wrap `plan` keyed by the
+/// story's TOP-LEVEL block index (issue #165: a text-box story wrapping
+/// around the boxes nested in it). A paragraph with cutouts lays out
+/// uncached (the cache key knows nothing of cuts); an empty plan is the
+/// plain cached pipeline, byte for byte.
+#[allow(clippy::too_many_arguments)]
+fn layout_story_blocks_cut(
+    blocks: &[engine::Block],
+    content_width: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    composition: Option<&CompositionState>,
+    plan: &layout::WrapPlan,
+) -> Vec<LayoutBlock> {
     let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
     for (block_idx, block) in blocks.iter().enumerate() {
@@ -2674,8 +2999,12 @@ fn layout_note_blocks(
                         && (c.at.offset as usize) <= para.text.len()
                         && para.text.is_char_boundary(c.at.offset as usize)
                 });
-                let mut p = match comp {
-                    Some(c) => layout_note_paragraph_with_composition(
+                let cuts = plan
+                    .get(&(block_idx as u32))
+                    .map(Vec::as_slice)
+                    .filter(|c| !c.is_empty());
+                let mut p = match (comp, cuts) {
+                    (Some(c), _) => layout_note_paragraph_with_composition(
                         para,
                         c,
                         fonts,
@@ -2684,7 +3013,16 @@ fn layout_note_blocks(
                         content_width,
                         sctx,
                     ),
-                    None => {
+                    (None, Some(cuts)) => layout_paragraph_wrapped_uncached(
+                        para,
+                        fonts,
+                        cfg,
+                        scale,
+                        content_width,
+                        sctx,
+                        cuts,
+                    ),
+                    (None, None) => {
                         layout_paragraph_cached(para, fonts, cfg, scale, content_width, sctx, cache)
                     }
                 };
@@ -2725,7 +3063,8 @@ fn layout_note_blocks(
         };
         y += before;
         let mut o = lb.origin();
-        o.x = 0.0;
+        /* Issue #173 — a table keeps its jc / tblInd offset. */
+        o.x = lb.placement_dx();
         o.y = y;
         lb.set_origin(o);
         y += lb.size().height + after;
@@ -3118,6 +3457,8 @@ fn build_header_footer_box(
                     text.push_str(&para.text[..off]);
                     text.push_str(&c.text);
                     text.push_str(&para.text[off..]);
+                    let (links, revs) =
+                        composition_overlay_ranges(para, off as u32, c.text.len() as u32);
                     let spans = apply_revision_overlay(
                         apply_hyperlink_overlay(
                             composition_layout_spans(
@@ -3128,10 +3469,10 @@ fn build_header_footer_box(
                                 cfg.px_size,
                                 scale,
                             ),
-                            &para.hyperlinks,
+                            &links,
                             [0, 0, 0, 255],
                         ),
-                        &para.revisions,
+                        &revs,
                         [0, 0, 0, 255],
                     );
                     (text, spans)
@@ -3255,48 +3596,54 @@ fn scaled_paginator_geometry(geom: engine::PageGeometry, scale: f32) -> Paginato
     }
 }
 
-/// Phase 6 — sync `page_paths` with the paginator's emitted-page count
-/// before recording the just-pushed block's engine path. A `push_block`
-/// call can:
-/// - leave the page count unchanged (block fit on the current page) → push
-///   one path entry on the current page;
-/// - bump it by one or more (overflow; the head landed on the page that
-///   was finalised, the tail on the next) → push the path on each new
-///   page the block lands on.
+/// Phase 6 — sync `page_paths` with the paginator's pages after one
+/// `push_block`, so `page_paths[i][j]` is the engine path of
+/// `pages[i].blocks[j]` (`page_paths.last()` is the in-progress page).
 ///
-/// The bookkeeping intentionally keeps `page_paths` parallel to the
-/// pages the paginator has accumulated *so far*: page_paths[i] holds the
-/// paths for `paginator.pages[i]`, page_paths.last() is the in-progress page.
+/// Issue #95 — rebuilt EXACTLY from the paginator's block lists rather
+/// than predicted from the page-count delta. A push can place fragments
+/// of the pushed block on the in-progress page and on every page it
+/// emits, but it can also MOVE earlier blocks: a keep-with-next chain
+/// travels to the next page with its follower (issue #87), so the old
+/// in-progress page loses its tail blocks and the next page opens with
+/// them. The in-progress page's surviving blocks are a prefix of what
+/// it held (a chain is drained from the end); every block the push
+/// placed is either a fragment of the pushed block or a relocated chain
+/// paragraph, recognised by its `source_paragraph_id` in `para_paths`
+/// (every body paragraph is registered there before it is pushed).
 fn attach_block_paths(
     paginator: &Paginator,
     prev_emitted: usize,
     page_paths: &mut Vec<Vec<EngineBlockPath>>,
     path: &EngineBlockPath,
+    para_paths: &std::collections::HashMap<u32, EngineBlockPath>,
 ) {
-    let new_pages = paginator.page_count_emitted() - prev_emitted;
-    /* The block contributed to the previously in-progress page and to
-    every newly emitted page. */
-    if let Some(cur) = page_paths.last_mut() {
-        cur.push(path.clone());
-    }
-    for _ in 0..new_pages {
-        /* The page that just finalised already has its path entry from
-        the line above. The next page is the new in-progress page; it
-        gets a path entry only if the block spilled onto it (handled by
-        the next iteration). For multi-page overflow the same path is
-        pushed onto each page. */
-        page_paths.push(Vec::new());
-        if let Some(cur) = page_paths.last_mut() {
-            cur.push(path.clone());
+    let emitted = paginator.emitted_pages();
+    let blocks_of = |pi: usize| -> &[LayoutBlock] {
+        emitted
+            .get(pi)
+            .map_or(paginator.current_blocks(), |p| p.blocks.as_slice())
+    };
+    let path_of = |b: &LayoutBlock| -> EngineBlockPath {
+        match b {
+            LayoutBlock::Paragraph(p) => para_paths
+                .get(&p.source_paragraph_id)
+                .cloned()
+                .unwrap_or_else(|| path.clone()),
+            LayoutBlock::Table(_) => path.clone(),
         }
+    };
+    /* Pages flushed outside a block push (trailing endnotes) carry no
+    body paths; pad so index `prev_emitted` is the old in-progress page. */
+    page_paths.resize_with(prev_emitted + 1, Vec::new);
+    let old_blocks = blocks_of(prev_emitted);
+    let old = &mut page_paths[prev_emitted];
+    old.truncate(old_blocks.len());
+    let kept = old.len();
+    old.extend(old_blocks[kept..].iter().map(path_of));
+    for pi in prev_emitted + 1..=emitted.len() {
+        page_paths.push(blocks_of(pi).iter().map(path_of).collect());
     }
-    /* If `new_pages > 0` the final entry was for the new in-progress
-    page. But the block may have actually ended on the previously
-    finalised page (no tail). The conservative pass above always assigns
-    one path per page from finalised+1 onwards; that overcounts when a
-    block exactly fills a page with no tail. The hit-test consumers only
-    use paths to map *flow position → engine block*, so a duplicate path
-    entry is harmless. */
 }
 
 /// Resolved base direction for a paragraph layout pass — Phase 9c fix
@@ -3652,6 +3999,7 @@ fn layout_table_box(
         columns,
         rows: rows_out,
         outer_borders: table.props.borders.clone().unwrap_or_default(),
+        placement_dx: 0.0,
     };
     /* Issue #79 — `<w:bidiVisual>`: everything above is the LTR layout
     (grid, spans, vMerge, content); the RTL presentation is one visual
@@ -3660,6 +4008,17 @@ fn layout_table_box(
     if table.props.bidi_visual {
         layout::mirror_bidi_visual(&mut table_box);
     }
+    /* Issue #173 — `<w:jc>` + `<w:tblInd>` (direction-aware through
+    `bidiVisual`): the table's offset inside the band it was laid out
+    for. Every placement site (paginator page parts, cell content,
+    header/footer bands, note bodies) adds it to the band's x. */
+    layout::place_table(
+        &mut table_box,
+        table.props.alignment,
+        twips_to_layout_px(table.props.indent_twips, scale),
+        table.props.bidi_visual,
+        available_width_px,
+    );
     table_box
 }
 
@@ -5268,9 +5627,6 @@ fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, Bridg
     if swap { (b, a) } else { (a, b) }
 }
 
-/// Clamp a position into `doc` — `path` resolved to a real paragraph
-/// (falling back to the document end), `offset` capped at the
-/// paragraph's UTF-8 length.
 /// Issue #77 — owned key for a `FieldStory` (body / header rid / footer
 /// rid) so page-field lookups can be collected before the restamp walk.
 fn story_key(story: &engine::FieldStory<'_>) -> (u8, String) {
@@ -5291,6 +5647,13 @@ fn file_base_name(name: &str) -> String {
         .to_string()
 }
 
+/// Clamp a position into `doc` — `path` resolved to a real paragraph
+/// (falling back to the document end), `offset` normalized by the
+/// engine's snap-down policy (`engine::snap_offset`, issue #115): capped
+/// at the paragraph's UTF-8 length AND floored to a char boundary, so a
+/// selection can never sit inside a multi-byte scalar. Idempotent —
+/// "unchanged by clamping" is exactly the validity test
+/// (`Engine::selection_is_valid`).
 fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     /* Design review B6 — a TABLE-ONLY tree (a letterhead header whose
     sole block is a table) has paragraph_count() == 0 but real caret
@@ -5308,20 +5671,18 @@ fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
         };
     }
     let engine_path = bridge_to_engine_path(pos.path.clone());
-    let (resolved_path, para_len) = match doc.paragraph_at_path(&engine_path) {
-        Some(p) => (engine_path, p.text.len() as u32),
+    let (resolved_path, offset) = match doc.paragraph_at_path(&engine_path) {
+        Some(p) => (engine_path, p.snap_offset(pos.offset)),
         None => {
             let fallback = doc
                 .path_to_last_paragraph_deep()
                 .unwrap_or(EngineBlockPath::top(0));
-            let len = doc
+            let offset = doc
                 .paragraph_at_path(&fallback)
-                .map(|p| p.text.len() as u32)
-                .unwrap_or(0);
-            (fallback, len)
+                .map_or(0, |p| p.snap_offset(pos.offset));
+            (fallback, offset)
         }
     };
-    let offset = pos.offset.min(para_len);
     BridgeLogicalPos {
         path: engine_to_bridge_path(resolved_path),
         offset,
@@ -5363,21 +5724,129 @@ fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
     runs
 }
 
-/// Build the accessibility node for one top-level block.
-/// Paragraphs map to `A11yNode::Paragraph`; tables walk rows and cells,
+/// Issue #165 — where a block list sits, for the text-box region ids its
+/// paragraphs' boxes get: `id_prefix` scopes the list (`""` for the body,
+/// `"<parent box id>/"` inside a story, `"<rid>:"` inside a header /
+/// footer part), `path_prefix` is the list's own path (`"3.1x0."` for a
+/// cell of top-level table 3), `depth` the text-box nesting level of the
+/// list (0 = not inside a box).
+#[derive(Clone, Copy)]
+struct A11yScope<'a> {
+    id_prefix: &'a str,
+    path_prefix: &'a str,
+    depth: u32,
+}
+
+impl A11yScope<'static> {
+    const BODY: Self = Self {
+        id_prefix: "",
+        path_prefix: "",
+        depth: 0,
+    };
+}
+
+/// Issue #83 / #165 — the stable address string of a text box: its host
+/// paragraph path (`Block(i)` → `i`, `Cell { row, col }` → `RxC`, joined
+/// by `.`) `@` the anchor byte. `BridgeStoryRef.rid` and the a11y region
+/// id share it, so the shell can match the active story to its region.
+fn text_box_rid(host: &EngineBlockPath, at: u32) -> String {
+    let path = host
+        .steps
+        .iter()
+        .map(|st| match st {
+            EnginePathStep::Block(i) => i.to_string(),
+            EnginePathStep::Cell { row, col } => format!("{row}x{col}"),
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("{path}@{at}")
+}
+
+/// Build the accessibility nodes for a block list: one node per block
+/// (paragraphs → `A11yNode::Paragraph`; tables walk rows and cells,
 /// resolving `<w:gridSpan>` → `col_span` and counting consecutive
-/// `VMergeRole::Continue` rows below a `Restart` cell → `row_span`.
-fn build_a11y_block(block: &engine::Block, block_index: u32, direction: Direction) -> A11yNode {
-    match block {
-        engine::Block::Paragraph(p) => A11yNode::Paragraph(A11yParagraph {
+/// `VMergeRole::Continue` rows below a `Restart` cell → `row_span`).
+///
+/// Issue #165 — every paragraph is followed by one `A11yNode::TextBox`
+/// region per text box anchored in it (anchor order), whose `nodes` are
+/// the box story built by this same function — so a box's paragraphs
+/// have the body's exact shape, and a box nested in a box lands in its
+/// parent's region after ITS anchor paragraph. Recursion is bounded by
+/// [`MAX_TEXT_BOX_LAYOUT_DEPTH`] (the layout / reader nesting cap).
+fn build_a11y_nodes_of<'b>(
+    blocks: impl IntoIterator<Item = &'b engine::Block>,
+    direction: Direction,
+    scope: A11yScope<'_>,
+) -> Vec<A11yNode> {
+    let mut out = Vec::new();
+    for (i, b) in blocks.into_iter().enumerate() {
+        let path = format!("{}{i}", scope.path_prefix);
+        match b {
+            engine::Block::Paragraph(p) => {
+                push_a11y_paragraph(&mut out, p, direction, scope, &path);
+            }
+            engine::Block::Table(t) => out.push(A11yNode::Table(build_a11y_table(
+                t, i as u32, direction, scope, &path,
+            ))),
+        }
+    }
+    out
+}
+
+/// One paragraph node, then its text-box regions (issue #165). `path` is
+/// the paragraph's path string inside `scope`.
+fn push_a11y_paragraph(
+    out: &mut Vec<A11yNode>,
+    p: &engine::Paragraph,
+    direction: Direction,
+    scope: A11yScope<'_>,
+    path: &str,
+) {
+    out.push(A11yNode::Paragraph(A11yParagraph {
+        direction,
+        runs: a11y_runs(p),
+    }));
+    if scope.depth >= MAX_TEXT_BOX_LAYOUT_DEPTH {
+        return;
+    }
+    let mut boxes: Vec<&engine::InlineObject> = p
+        .inline_objects
+        .iter()
+        .filter(|io| matches!(io.kind, engine::InlineKind::TextBox { .. }))
+        .collect();
+    boxes.sort_by_key(|io| io.at);
+    for io in boxes {
+        let engine::InlineKind::TextBox { story, .. } = &io.kind else {
+            continue;
+        };
+        let (name, description) = io.text_box_label().unwrap_or((None, None));
+        let id = format!("{}{path}@{}", scope.id_prefix, io.at);
+        let inner_prefix = format!("{id}/");
+        let nodes = build_a11y_nodes_of(
+            &story.body,
             direction,
-            runs: a11y_runs(p),
-        }),
-        engine::Block::Table(t) => A11yNode::Table(build_a11y_table(t, block_index, direction)),
+            A11yScope {
+                id_prefix: &inner_prefix,
+                path_prefix: "",
+                depth: scope.depth + 1,
+            },
+        );
+        out.push(A11yNode::TextBox(bridge::A11yTextBox {
+            id,
+            name,
+            description,
+            nodes,
+        }));
     }
 }
 
-fn build_a11y_table(t: &engine::Table, block_index: u32, direction: Direction) -> A11yTable {
+fn build_a11y_table(
+    t: &engine::Table,
+    block_index: u32,
+    direction: Direction,
+    scope: A11yScope<'_>,
+    path: &str,
+) -> A11yTable {
     /* Pre-compute vMerge row spans: for every (r, c) that is a Restart,
     count the run of Continue rows directly below at the same column.
     Continue cells are skipped from the DOM — the Restart cell carries
@@ -5416,18 +5885,15 @@ fn build_a11y_table(t: &engine::Table, block_index: u32, direction: Direction) -
                 1
             };
             /* PR 3b: cell paragraphs become paragraphs; nested tables
-            stay flat (recursive descent is PR 4). */
-            let nodes: Vec<A11yNode> = cell
-                .blocks
-                .iter()
-                .filter_map(|b| match b {
-                    engine::Block::Paragraph(p) => Some(A11yNode::Paragraph(A11yParagraph {
-                        direction,
-                        runs: a11y_runs(p),
-                    })),
-                    engine::Block::Table(_) => None,
-                })
-                .collect();
+            stay flat (recursive descent is PR 4). Issue #165 — a cell
+            paragraph's text boxes follow it inside the cell. */
+            let mut nodes: Vec<A11yNode> = Vec::with_capacity(cell.blocks.len());
+            for (j, b) in cell.blocks.iter().enumerate() {
+                if let engine::Block::Paragraph(p) = b {
+                    let cell_path = format!("{path}.{r}x{c}.{j}");
+                    push_a11y_paragraph(&mut nodes, p, direction, scope, &cell_path);
+                }
+            }
             out_cells.push(A11yCell {
                 row: r as u32,
                 col: c as u32,
@@ -6245,6 +6711,15 @@ impl Engine {
         range: Option<BridgeLogicalRange>,
         attrs: TextAttrsPatch,
     ) -> Event {
+        /* Issue #115 — an explicit range is a wire value: both ends must
+        address a paragraph, offsets snap to char boundaries. */
+        let range = match range {
+            Some(r) => match self.resolve_edit_range("ApplyFormatting", r) {
+                Ok((start, end)) => Some(BridgeLogicalRange { start, end }),
+                Err(e) => return *e,
+            },
+            None => None,
+        };
         if self.story_active() {
             return self.story_apply_formatting(range, attrs);
         }
@@ -6333,6 +6808,10 @@ impl Engine {
     fn do_undo(&mut self) -> Event {
         self.undo.undo();
         self.story_validity_guard();
+        /* Issue #117 — re-clamp BEFORE repainting: the tree has already
+        been swapped, so a failing repaint (early return below) must not
+        leave the selection pointing into the previous tree. */
+        self.reclamp_selection();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -6669,6 +7148,10 @@ impl Engine {
     fn do_redo(&mut self) -> Event {
         self.undo.redo();
         self.story_validity_guard();
+        /* Issue #117 — re-clamp BEFORE repainting: the tree has already
+        been swapped, so a failing repaint (early return below) must not
+        leave the selection pointing into the previous tree. */
+        self.reclamp_selection();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -6780,12 +7263,15 @@ impl Engine {
             snap.as_ref()
                 .filter(|s| same_layout_inputs(s) && !s.info.is_full_layout)
                 .and_then(|prev| {
-                    let (shorter, longer) = if prev.pages.len() <= pages.len() {
-                        (&prev.pages[..], &pages[..])
+                    /* Issue #93 — the shorter band's provisional pages
+                    (a pending column balance) are not part of the
+                    prediction. */
+                    let (shorter, longer, open_from) = if prev.pages.len() <= pages.len() {
+                        (&prev.pages[..], &pages[..], prev.info.open_from_page)
                     } else {
-                        (&pages[..], &prev.pages[..])
+                        (&pages[..], &prev.pages[..], info.open_from_page)
                     };
-                    layout::verify_prefix(shorter, longer).err()
+                    layout::verify_prefix_open(shorter, longer, open_from).err()
                 })
         };
         if let Some(m) = mismatch {
@@ -6930,7 +7416,7 @@ impl Engine {
             .extend(conv.take_notes().into_iter().map(bridge_degradation));
         /* Issue #83 — the boxes are final: lay every text box's story
         into its content rect. */
-        self.attach_text_box_frames(
+        let nested_notes = self.attach_text_box_frames(
             &mut built.0,
             &built.1,
             &built.2,
@@ -6938,6 +7424,10 @@ impl Engine {
             scale,
             with_composition,
         );
+        built
+            .3
+            .degradations
+            .extend(nested_notes.into_iter().map(bridge_degradation));
         Ok(built)
     }
 
@@ -6959,6 +7449,14 @@ impl Engine {
     /// clipped at paint). The ACTIVE text-box story previews the live IME
     /// composition. Floats are resolved already, so nothing here can
     /// move a box or re-trigger wrap — a single pass by construction.
+    ///
+    /// Issue #165 — a story that itself carries a text box lays out
+    /// against its CONTENT rect as a pseudo page ([`lay_text_box_frame`]):
+    /// the nested box resolves through `resolve_page_floats`, the story
+    /// wraps around it through the body's bounded `WrapConvergence`
+    /// loop, and the nested story is laid out recursively (bounded by
+    /// [`MAX_TEXT_BOX_LAYOUT_DEPTH`]). Returns the nested wrap loops'
+    /// degradation notes (empty on the nominal path).
     fn attach_text_box_frames(
         &self,
         pages: &mut [PageBox],
@@ -6967,69 +7465,61 @@ impl Engine {
         doc: &DocumentTree,
         scale: f32,
         with_composition: bool,
-    ) {
+    ) -> Vec<layout::LayoutDegradation> {
         let Some(cfg) = self.layout_cfg.clone() else {
-            return;
+            return Vec::new();
         };
         if !pages
             .iter()
             .any(|p| p.floats.iter().any(|f| f.text_box.is_some()))
         {
-            return;
+            return Vec::new();
         }
         let sctx = StyleContext::of(doc);
         let mut cache = self.layout_cache.borrow_mut();
         let active = self.active_text_box();
+        let mut notes: Vec<layout::LayoutDegradation> = Vec::new();
         for (pi, page) in pages.iter_mut().enumerate() {
             let page_paths = paths.get(pi).map(Vec::as_slice).unwrap_or(&[]);
+            let page_number = page.page_number;
             for f in page.floats.iter_mut() {
-                let host = float_host_path(page_paths, f);
-                let (fat, width) = (f.at, f.size.width);
-                let Some(tb) = f.text_box.as_deref_mut() else {
+                if f.text_box.is_none() {
                     continue;
-                };
-                let [l, t, r, b] = tb.source.insets;
-                let inner_w = (width - l - r).max(1.0);
-                let inner_h = (f.size.height - t - b).max(0.0);
+                }
+                let host = float_host_path(page_paths, f);
                 let comp = if with_composition
                     && active
                         .as_ref()
-                        .is_some_and(|(h, a)| Some(h) == host.as_ref() && *a == fat)
+                        .is_some_and(|(h, a)| Some(h) == host.as_ref() && *a == f.at)
                 {
                     self.composition.as_ref()
                 } else {
                     None
                 };
-                let mut blocks = layout_note_blocks(
-                    &tb.source.story.body,
-                    inner_w,
-                    fonts,
-                    &cfg,
-                    scale,
-                    sctx,
+                let mut frame_notes = Vec::new();
+                lay_text_box_frame(
+                    f,
+                    &TextBoxLayoutCtx {
+                        fonts,
+                        cfg: &cfg,
+                        scale,
+                        sctx,
+                        page_number,
+                    },
                     &mut cache,
                     comp,
+                    1,
+                    &mut frame_notes,
                 );
-                let used = blocks
-                    .iter()
-                    .map(|bk| bk.origin().y + bk.size().height)
-                    .fold(0.0_f32, f32::max);
-                let spare = (inner_h - used).max(0.0);
-                let shift = match tb.source.v_align {
-                    engine::TextBoxVAlign::Top => 0.0,
-                    engine::TextBoxVAlign::Center => spare / 2.0,
-                    engine::TextBoxVAlign::Bottom => spare,
-                };
-                if shift > 0.0 {
-                    for bk in &mut blocks {
-                        let mut o = bk.origin();
-                        o.y += shift;
-                        bk.set_origin(o);
-                    }
-                }
-                tb.blocks = blocks;
+                /* The nested wrap loop reports against its pseudo page;
+                re-home the notes onto the real one. */
+                notes.extend(frame_notes.into_iter().map(|mut n| {
+                    n.page = pi as u32;
+                    n
+                }));
             }
         }
+        notes
     }
 
     /// One layout pass of [`Self::build_pages_of`] against the wrap
@@ -7124,6 +7614,10 @@ impl Engine {
         trigger a hard page break + geometry swap. */
         let mut paginator: Option<Paginator> = None;
         let mut page_paths: Vec<Vec<EngineBlockPath>> = Vec::new();
+        /* Issue #95 — `source_paragraph_id` → engine path of every body
+        paragraph pushed so far (see `attach_block_paths`). */
+        let mut para_paths: std::collections::HashMap<u32, EngineBlockPath> =
+            std::collections::HashMap::new();
         /* Track the page index at the start of the current paginator's
         accumulated `cur_blocks` so we know where to attach paths emitted
         by `push_block` (paginator may emit prior pages first). */
@@ -7176,6 +7670,11 @@ impl Engine {
             target_y.map(|y| y + runway)
         };
         let mut culled = false;
+        /* Issue #93 — see `LazyLayoutInfo::open_from_page`. */
+        let mut open_from_page: Option<usize> = None;
+        /* Issue #95 — the last body block pushed was a keep-with-next
+        paragraph (see the cull stop below). */
+        let mut after_keep_next = false;
         /* Issue #87 — degradation notes for this build: paginator
         watchdog notes join here as each paginator finishes; the
         sub-paginator sink is drained at the end. Clear leftovers from
@@ -7393,7 +7892,13 @@ impl Engine {
                 half-flushed page. The check fires at every block
                 boundary, which is enough granularity for typical
                 docs (50 pages × ~20 paragraphs each = 1000 boundaries). */
-                if let Some(budget) = cull_budget {
+                /* Issue #95 — never cull right behind a keep-with-next
+                paragraph: its follower decides whether the chain moves
+                to the next page, so a band ending inside a chain would
+                show the chain where the next, longer band does not
+                (a `FastPathMismatch` demotion on every expand). The
+                chain is finite, so the stop is only deferred. */
+                if let Some(budget) = cull_budget.filter(|_| !after_keep_next) {
                     /* The paginator finalises overflow pages INTERNALLY
                     (they only reach `emitted_pages` at a section break),
                     and `cursor_y` resets to the top of each new page — so
@@ -7408,6 +7913,20 @@ impl Engine {
                     });
                     if height_so_far(&emitted_pages, pag_h) >= budget {
                         culled = true;
+                        /* Issue #93 — stopping inside a multi-column
+                        section that a continuous section follows leaves
+                        its balance pass pending: the in-progress page is
+                        provisional. */
+                        let balance_pending = section.columns.is_multi()
+                            && sections.get(sect_idx + 1).is_some_and(|next| {
+                                matches!(next.section_type, engine::SectionType::Continuous)
+                            });
+                        if balance_pending {
+                            open_from_page = Some(
+                                emitted_pages.len()
+                                    + paginator.as_ref().map_or(0, |p| p.page_count_emitted()),
+                            );
+                        }
                         break 'outer;
                     }
                 }
@@ -7431,7 +7950,14 @@ impl Engine {
                         assign_source_ids_table(&mut tb, &mut next_para_id);
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Table(tb), 0.0, 0.0);
-                        attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
+                        after_keep_next = false;
+                        attach_block_paths(
+                            pag,
+                            prev_pages_in_pag,
+                            &mut page_paths,
+                            &para_path,
+                            &para_paths,
+                        );
                         processed_blocks += 1;
                     }
                     engine::Block::Paragraph(para) => {
@@ -7472,6 +7998,8 @@ impl Engine {
                             text.push_str(&para.text[..off]);
                             text.push_str(&c.text);
                             text.push_str(&para.text[off..]);
+                            let (links, revs) =
+                                composition_overlay_ranges(para, off as u32, c.text.len() as u32);
                             let spans = apply_revision_overlay(
                                 apply_hyperlink_overlay(
                                     composition_layout_spans(
@@ -7482,10 +8010,10 @@ impl Engine {
                                         cfg.px_size,
                                         scale,
                                     ),
-                                    &para.hyperlinks,
+                                    &links,
                                     [0, 0, 0, 255],
                                 ),
-                                &para.revisions,
+                                &revs,
                                 [0, 0, 0, 255],
                             );
                             let base_direction = resolve_base_direction(para, &cfg);
@@ -7545,6 +8073,7 @@ impl Engine {
                         let after_px = twips_to_layout_px(para.props.spacing.after_twips, scale);
                         let mut para_box = para_box;
                         para_box.source_paragraph_id = next_para_id;
+                        para_paths.insert(next_para_id, para_path.clone());
                         next_para_id += 1;
                         /* Phase 2 audit (gap D.1) — propagate complex-field
                         overlays so the paginator can re-evaluate PAGE /
@@ -7581,9 +8110,22 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
+                        /* Issue #95 — pagination constraints from the
+                        resolved (style-cascaded) properties. Widow /
+                        orphan control defaults ON (Word). */
+                        para_box.keep_next = para.props.keep_next;
+                        para_box.flow.keep_lines = para.props.keep_lines;
+                        para_box.flow.widow_control = para.props.widow_control_on();
+                        after_keep_next = para.props.keep_next;
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
-                        attach_block_paths(pag, prev_pages_in_pag, &mut page_paths, &para_path);
+                        attach_block_paths(
+                            pag,
+                            prev_pages_in_pag,
+                            &mut page_paths,
+                            &para_path,
+                            &para_paths,
+                        );
                         processed_blocks += 1;
                     }
                 }
@@ -7690,6 +8232,7 @@ impl Engine {
             is_full_layout: !culled,
             remaining_blocks: total_blocks.saturating_sub(processed_blocks),
             degradations,
+            open_from_page,
         };
         Ok((emitted_pages, font_stack, emitted_paths, info))
     }
@@ -8129,49 +8672,34 @@ impl Engine {
         let mut tb_texts: Vec<String> = Vec::new();
         for page in pages.iter_mut() {
             for f in page.floats.iter_mut() {
-                let Some(tb) = f.text_box.as_deref_mut() else {
-                    continue;
-                };
-                let mut next = (para_texts.len() + tb_texts.len()) as u32;
-                let mut texts: Vec<&str> = Vec::new();
-                for b in &tb.source.story.body {
-                    walk_block_texts(b, &mut texts);
-                }
-                tb_texts.extend(texts.into_iter().map(str::to_string));
-                for lb in tb.blocks.iter_mut() {
-                    match lb {
-                        LayoutBlock::Paragraph(p) => {
-                            p.source_paragraph_id = next;
-                            next += 1;
-                        }
-                        LayoutBlock::Table(t) => {
-                            for row in t.rows.iter_mut() {
-                                for cell in row.cells.iter_mut() {
-                                    if matches!(cell.v_merge, engine::VMergeRole::Continue) {
-                                        continue;
-                                    }
-                                    layout::boxes::for_each_paragraph_in_blocks_mut(
-                                        &mut cell.content,
-                                        &mut |p| {
-                                            p.source_paragraph_id = next;
-                                            next += 1;
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
+                if let Some(tb) = f.text_box.as_deref_mut() {
+                    stamp_text_box_texts(tb, para_texts.len(), &mut tb_texts);
                 }
             }
         }
         para_texts.extend(tb_texts.iter().map(String::as_str));
         let mut bytes: Vec<u8> = Vec::new();
-        if let Err(e) =
-            format_pdf::export_pdf(&pages, &font_stack, &para_texts, profile, &mut bytes)
-        {
-            return Event::Error {
-                message: format!("ExportPdf: {e}"),
-            };
+        /* Issue #121 — images embed from the document's media parts. A
+        skipped image (missing / Tier-3 format / corrupt) is a console
+        warning, never a failed export. */
+        match format_pdf::export_pdf_with_media(
+            &pages,
+            &font_stack,
+            &para_texts,
+            &doc.media,
+            profile,
+            &mut bytes,
+        ) {
+            Ok(report) => {
+                for w in &report.warnings {
+                    warn_console(&format!("ExportPdf: {w:?}"));
+                }
+            }
+            Err(e) => {
+                return Event::Error {
+                    message: format!("ExportPdf: {e}"),
+                };
+            }
         }
         let pages_count = pages.len() as u32;
         Event::PdfExported {
@@ -8780,18 +9308,9 @@ impl Engine {
                 page,
                 section_block,
             } => {
-                let path = host
-                    .steps
-                    .iter()
-                    .map(|st| match st {
-                        EnginePathStep::Block(i) => i.to_string(),
-                        EnginePathStep::Cell { row, col } => format!("{row}x{col}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(".");
                 return Some(bridge::BridgeStoryRef {
                     area: bridge::HeaderFooterArea::TextBox,
-                    rid: format!("{path}@{at}"),
+                    rid: text_box_rid(host, *at),
                     page: *page,
                     role: bridge::BridgeHfRole::Default,
                     linked: false,
@@ -9342,20 +9861,39 @@ impl Engine {
 
     /// `Command::SetSelection` — set the selection to `range`, caret at `caret`.
     fn do_set_selection(&mut self, range: BridgeLogicalRange, caret: BridgeLogicalPos) -> Event {
+        /* Issue #117 — the wire range is a REQUEST. The engine owns the
+        selection and stores only positions that resolve in the document
+        the selection addresses (body, or the active story), exactly
+        like every other selection-mutating path. Decide which end the
+        caret names BEFORE clamping so both ends snapping onto each other
+        cannot flip the anchor.
+        Composition with issue #77 (atomic fields): clamp FIRST (path
+        resolution + char-boundary snap, so the field lookup below only
+        ever sees a position that resolves), THEN widen over fields.
+        Field offsets are stored model offsets on char boundaries, so
+        the widened range stays valid. */
+        let caret_is_start = caret == range.start;
+        let (start, end, caret) = self.with_selection_doc(|d| {
+            (
+                clamp_pos(d, range.start),
+                clamp_pos(d, range.end),
+                clamp_pos(d, caret),
+            )
+        });
         /* Issue #77 — atomic fields: a range never partially covers a
         field, and a collapsed caret strictly inside a field's result
         becomes the whole field (a click inside a field selects it —
         Word parity). The caret keeps its side; field-free input takes
         the historical path untouched. */
-        let (lo, hi) = ordered(range.start.clone(), range.end.clone());
+        let (lo, hi) = ordered(start.clone(), end.clone());
         let (lo2, hi2) = self.expand_over_fields(lo.clone(), hi.clone());
         let (anchor, caret) = if lo2 == lo && hi2 == hi {
-            if caret == range.start {
-                (range.end, caret)
+            if caret_is_start {
+                (end, caret)
             } else {
-                (range.start, caret)
+                (start, caret)
             }
-        } else if range.start != range.end && caret == range.start {
+        } else if start != end && caret_is_start {
             (hi2, lo2)
         } else {
             (lo2, hi2)
@@ -9380,6 +9918,8 @@ impl Engine {
 
     /// `Command::ExtendSelection` — keep the anchor, move the caret to `to`.
     fn do_extend_selection(&mut self, to: BridgeLogicalPos) -> Event {
+        /* Issue #117 — same clamp as `SetSelection`. */
+        let to = self.with_selection_doc(|d| clamp_pos(d, to));
         let anchor = self
             .selection
             .as_ref()
@@ -9509,23 +10049,39 @@ impl Engine {
     /// `Command::SelectAll` — anchor at the document start, caret at the very
     /// last paragraph's byte length. Empty document collapses to (0, 0).
     fn do_select_all(&mut self) -> Event {
-        let doc = self.undo.current();
-        let last_path = doc
-            .path_to_last_top_paragraph()
-            .unwrap_or(EngineBlockPath::top(0));
-        let last_len = doc
-            .paragraph_at_path(&last_path)
-            .map_or(0, |p| p.text.len() as u32);
+        /* Issue #117 — resolve against the document the selection
+        addresses (the story tree in header/footer mode) and anchor on a
+        real paragraph: a table-first document has no paragraph at
+        `top(0)`, and a selection endpoint must always resolve. */
+        let (anchor, caret) = self.with_selection_doc(|doc| {
+            let first = doc
+                .path_to_first_paragraph_deep()
+                .unwrap_or(EngineBlockPath::top(0));
+            let last = doc
+                .path_to_last_top_paragraph()
+                .or_else(|| doc.path_to_last_paragraph_deep())
+                .unwrap_or(EngineBlockPath::top(0));
+            let last_len = doc
+                .paragraph_at_path(&last)
+                .map_or(0, |p| p.text.len() as u32);
+            (
+                BridgeLogicalPos {
+                    path: engine_to_bridge_path(first),
+                    offset: 0,
+                },
+                BridgeLogicalPos {
+                    path: engine_to_bridge_path(last),
+                    offset: last_len,
+                },
+            )
+        });
         self.pending_format = None;
         /* Audit gap B.M4 — SelectAll is a non-arrow motion; reset
         affinity. */
         self.caret_affinity = CaretAffinity::default();
         self.selection = Some(SelectionState {
-            anchor: bpos_top(0, 0),
-            caret: BridgeLogicalPos {
-                path: engine_to_bridge_path(last_path),
-                offset: last_len,
-            },
+            anchor,
+            caret,
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
@@ -9596,7 +10152,18 @@ impl Engine {
                 line_end(self, &sel.caret).unwrap_or(sel.caret.clone()),
                 None,
             ),
-            MoveDirection::DocHome => (bpos_top(0, 0), None),
+            MoveDirection::DocHome => (
+                /* Issue #117 — the first PARAGRAPH, not block 0: a table-first
+                document (or story) has no paragraph at `top(0)`. */
+                doc.path_to_first_paragraph_deep().map_or_else(
+                    || bpos_top(0, 0),
+                    |p| BridgeLogicalPos {
+                        path: engine_to_bridge_path(p),
+                        offset: 0,
+                    },
+                ),
+                None,
+            ),
             MoveDirection::DocEnd => {
                 let last_path = doc
                     .path_to_last_top_paragraph()
@@ -9802,6 +10369,8 @@ impl Engine {
                 (new_caret, Some(ideal))
             }
         };
+        /* Issue #117 — clamp FIRST against the story-aware `doc`
+        (`selection_doc`), then the #77 field snap below. */
         let new_caret = clamp_pos(&doc, new_caret);
         /* Issue #77 — atomic fields: a horizontal step that lands
         strictly inside a field's result continues to the boundary in
@@ -11177,6 +11746,7 @@ impl Engine {
         if !self.story_active() {
             self.stashed_body_selection = self.selection.clone();
         }
+        let (host_for_label, at_for_label) = (host.clone(), at);
         self.active_story = StoryTarget::TextBox {
             host,
             at,
@@ -11200,7 +11770,25 @@ impl Engine {
         });
         self.caret_affinity = CaretAffinity::default();
         self.pending_format = None;
-        self.announce(AnnouncementPriority::Polite, "Editing text box");
+        /* Issue #165 — the live announcement names the region the a11y
+        mirror gives the box (its `docPr` name), so a screen-reader user
+        hears which group the caret entered. */
+        let label = self
+            .undo
+            .current()
+            .paragraph_at_path(&host_for_label)
+            .and_then(|p| {
+                p.inline_objects
+                    .iter()
+                    .find(|io| io.at == at_for_label)
+                    .and_then(engine::InlineObject::text_box_label)
+                    .and_then(|(name, _)| name)
+            });
+        let message = match label {
+            Some(name) => format!("Editing text box: {name}"),
+            None => "Editing text box".to_string(),
+        };
+        self.announce(AnnouncementPriority::Polite, message);
     }
 
     /// `Command::InsertTextBox` (issue #83) — splice a floating text box
@@ -11955,9 +12543,61 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #115 — the single validated boundary for an EXPLICIT wire
+    /// position on an edit command (`DeleteRange`, `ReplaceRange`,
+    /// `ApplyFormatting { range: Some(_) }`, `SplitParagraph` with no
+    /// selection, `InsertComment`). The path must address a paragraph
+    /// in the document the selection addresses (body or active story)
+    /// — an API caller naming a block that is not there is rejected
+    /// with a typed `Event::Error`, never silently redirected to some
+    /// other paragraph (an edit that lands on the wrong text is worse
+    /// than one that fails loudly). The offset then follows the
+    /// engine's snap-down policy (`engine::snap_offset`). Selection
+    /// commands deliberately differ: they go through `clamp_pos`, because
+    /// a selection must always exist.
+    fn resolve_edit_pos(
+        &self,
+        cmd: &str,
+        pos: BridgeLogicalPos,
+    ) -> Result<BridgeLogicalPos, Box<Event>> {
+        let epath = bridge_to_engine_path(pos.path.clone());
+        let snapped = self.with_selection_doc(|d| {
+            d.paragraph_at_path(&epath)
+                .map(|p| p.snap_offset(pos.offset))
+        });
+        match snapped {
+            Some(offset) => Ok(BridgeLogicalPos {
+                path: pos.path,
+                offset,
+            }),
+            None => Err(Box::new(Event::Error {
+                message: format!(
+                    "{cmd}: position {:?} does not address a paragraph",
+                    pos.path.steps
+                ),
+            })),
+        }
+    }
+
+    /// [`Self::resolve_edit_pos`] for both ends of a range, returned in
+    /// document order.
+    fn resolve_edit_range(
+        &self,
+        cmd: &str,
+        range: BridgeLogicalRange,
+    ) -> Result<(BridgeLogicalPos, BridgeLogicalPos), Box<Event>> {
+        let start = self.resolve_edit_pos(cmd, range.start)?;
+        let end = self.resolve_edit_pos(cmd, range.end)?;
+        Ok(ordered(start, end))
+    }
+
     /// Interactive `InsertText` — replace any non-empty selection with `text`,
     /// then place the caret after it.
     fn do_insert_text_interactive(&mut self, at: BridgeLogicalPos, text: String) -> Event {
+        /* Issues #115/#117 — `at` only seeds the selection when none
+        exists, so it follows selection semantics: clamp into the
+        addressed document (path fallback + char-boundary snap). */
+        let at = self.with_selection_doc(|d| clamp_pos(d, at));
         if self.story_active() {
             return self.story_insert_text(at, text);
         }
@@ -12029,7 +12669,10 @@ impl Engine {
     /// text; sticky pending formatting is deliberately not applied
     /// (this is not a typing path).
     fn do_replace_range(&mut self, range: BridgeLogicalRange, text: String) -> Event {
-        let (start, end) = ordered(range.start, range.end);
+        let (start, end) = match self.resolve_edit_range("ReplaceRange", range) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
@@ -12062,7 +12705,10 @@ impl Engine {
     /// Sprint 14 (#14) — when track-changes is on, mark the range as
     /// a `Delete` revision instead of removing text.
     fn do_delete_range(&mut self, range: BridgeLogicalRange) -> Event {
-        let (start, end) = ordered(range.start, range.end);
+        let (start, end) = match self.resolve_edit_range("DeleteRange", range) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
         let (new_doc, caret) = if self.tracking_changes {
             let d = self.undo.current().tracked_delete_range(
                 to_engine_pos(start.clone()),
@@ -12086,6 +12732,16 @@ impl Engine {
     /// `Command::SplitParagraph` — break the paragraph at the caret (replacing
     /// any non-empty selection first); the caret moves to the new paragraph.
     fn do_split_paragraph(&mut self, at: BridgeLogicalPos) -> Event {
+        /* Issue #115 — `at` is consulted only when no selection exists;
+        then it is an explicit wire position and must resolve. */
+        let at = if self.selection.is_none() {
+            match self.resolve_edit_pos("SplitParagraph", at) {
+                Ok(p) => p,
+                Err(e) => return *e,
+            }
+        } else {
+            at
+        };
         if self.story_active() {
             return self.story_split_paragraph(at);
         }
@@ -12316,22 +12972,36 @@ impl Engine {
         }
     }
 
+    /// Clamp the live selection into the document it addresses — after an
+    /// undo/redo swapped the tree, or any structural edit that may have
+    /// moved text under it. Issue #117 — clamp against the
+    /// document the selection addresses: after `story_validity_guard`
+    /// keeps a header / footer story alive, the selection's paths are
+    /// STORY paths and must not be resolved against the body tree.
+    /// Idempotent, so running it both before the repaint and again in
+    /// `after_history_change` is harmless.
+    fn reclamp_selection(&mut self) {
+        let Some(sel) = self.selection.clone() else {
+            return;
+        };
+        let (anchor, caret) =
+            self.with_selection_doc(|doc| (clamp_pos(doc, sel.anchor), clamp_pos(doc, sel.caret)));
+        let kind = derive_selection_kind(&anchor, &caret);
+        self.selection = Some(SelectionState {
+            anchor,
+            caret,
+            ideal_x: None,
+            kind,
+        });
+    }
+
     /// Re-emit selection after an undo/redo, clamping the caret into the
     /// restored document. Falls back to `UndoStateChanged` when no selection
     /// exists (the Phase-1 harness path).
     fn after_history_change(&mut self) -> Event {
-        match self.selection.clone() {
-            Some(sel) => {
-                let doc = self.undo.current();
-                let anchor = clamp_pos(doc, sel.anchor);
-                let caret = clamp_pos(doc, sel.caret);
-                let kind = derive_selection_kind(&anchor, &caret);
-                self.selection = Some(SelectionState {
-                    anchor,
-                    caret,
-                    ideal_x: None,
-                    kind,
-                });
+        match self.selection {
+            Some(_) => {
+                self.reclamp_selection();
                 self.selection_changed()
             }
             None => Event::UndoStateChanged {
@@ -12354,25 +13024,24 @@ impl Engine {
             _ => Direction::Ltr,
         };
         let doc = self.undo.current();
-        let mut nodes: Vec<A11yNode> = doc
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(block_index, b)| build_a11y_block(b, block_index as u32, direction))
-            .collect();
+        let mut nodes = build_a11y_nodes_of(doc.blocks.iter(), direction, A11yScope::BODY);
         /* Issue #73 — mirror every REFERENCED header/footer part so
         screen readers can reach band text (deduped by rid, stable
         body → headers → footers order; the delta differ handles the
         rest). */
         doc.for_each_referenced_story(&mut |is_header, rid, blocks| {
+            let id_prefix = format!("{rid}:");
             nodes.push(A11yNode::Story(bridge::A11yStory {
                 header: is_header,
                 rid: rid.to_string(),
-                nodes: blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| build_a11y_block(b, i as u32, direction))
-                    .collect(),
+                nodes: build_a11y_nodes_of(
+                    blocks,
+                    direction,
+                    A11yScope {
+                        id_prefix: &id_prefix,
+                        ..A11yScope::BODY
+                    },
+                ),
             }));
         });
         nodes
@@ -12602,16 +13271,14 @@ impl Engine {
     /// `Command::AcceptRevision` (Sprint 7 UI Edition).
     /// Sprint 14 (#14) — best-effort current review date stamp.
     /// Prefers the explicit value `Command::SetReviewIdentity` set;
-    /// otherwise falls back to the worker thread's `Date.now()` via
-    /// `js_sys::Date::new_0().to_iso_string()`.
+    /// otherwise falls back to the engine clock (`now_iso8601`, issue
+    /// #118 — `Date` in the browser, `SystemTime` natively). The ONLY
+    /// timestamp source for every handler that stamps a date.
     fn current_review_date(&self) -> String {
         if !self.review_date.is_empty() {
             return self.review_date.clone();
         }
-        js_sys::Date::new_0()
-            .to_iso_string()
-            .as_string()
-            .unwrap_or_default()
+        now_iso8601()
     }
 
     /// Sprint 14 (#14) — `Command::ToggleTrackChanges`. Flips the
@@ -12673,20 +13340,22 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::InsertComment` (Sprint 7 UI Edition). Uses an
-    /// ISO-8601 timestamp derived from `Date.now()` on the worker
-    /// thread (passed in via `js_sys::Date::new_0().to_iso_string()`)
-    /// when wired through; for the engine handler the date is the
-    /// current `wasm_bindgen` UTC epoch ms formatted as RFC 3339.
+    /// `Command::InsertComment` (Sprint 7 UI Edition). Stamped with the
+    /// engine clock via `current_review_date` (issue #118 — the
+    /// `SetReviewIdentity` override wins, else `Date` / `SystemTime`).
+    /// The range is an explicit wire range: both ends must address a
+    /// paragraph (issue #115) or the command is rejected.
     fn do_insert_comment(
         &mut self,
         range: BridgeLogicalRange,
         text: String,
         author: String,
     ) -> Event {
-        let now = js_sys::Date::new_0().to_iso_string();
-        let date = now.as_string().unwrap_or_default();
-        let (start, end) = ordered(range.start, range.end);
+        let date = self.current_review_date();
+        let (start, end) = match self.resolve_edit_range("InsertComment", range) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
         let (new_doc, _new_id) = self.undo.current().insert_comment(
             to_engine_pos(start),
             to_engine_pos(end),
@@ -12739,8 +13408,7 @@ impl Engine {
     /// invalidation, polite announcement). An unknown parent maps the
     /// engine's `None` to `Event::Error` instead of mutating the doc.
     fn do_reply_to_comment(&mut self, parent_id: u32, text: String, author: String) -> Event {
-        let now = js_sys::Date::new_0().to_iso_string();
-        let date = now.as_string().unwrap_or_default();
+        let date = self.current_review_date();
         let Some((new_doc, _new_id)) = self
             .undo
             .current()
@@ -13395,6 +14063,28 @@ impl Engine {
             content_type: image.mime,
             data: image.bytes,
         };
+        /* Issue #117 (fuzz-found) — resolve where the sentinel actually
+        lands, mirroring `insert_inline_image_at`: `at.path` when it
+        names a paragraph, else the last top-level paragraph; offset
+        snapped (issue #115). The live selection is then shifted past
+        the 3-byte U+FFFC like any other insertion — otherwise a caret
+        at/after the insertion point in that paragraph would end up
+        INSIDE the sentinel scalar. (InsertImage is story-gated, so the
+        selection always addresses the body here.) */
+        let (ins_path, ins_off) = {
+            let doc = self.undo.current();
+            let epath = bridge_to_engine_path(at.path.clone());
+            let path = if doc.paragraph_at_path(&epath).is_some() {
+                epath
+            } else {
+                doc.path_to_last_top_paragraph()
+                    .unwrap_or(EngineBlockPath::top(0))
+            };
+            let off = doc
+                .paragraph_at_path(&path)
+                .map_or(0, |p| p.snap_offset(at.offset));
+            (engine_to_bridge_path(path), off)
+        };
         let new_doc = self.undo.current().insert_inline_image_at(
             to_engine_pos(at),
             engine_blob,
@@ -13402,6 +14092,15 @@ impl Engine {
             h_emu,
         );
         self.undo.push(new_doc);
+        if let Some(sel) = self.selection.as_mut() {
+            const SENTINEL_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
+            for p in [&mut sel.anchor, &mut sel.caret] {
+                if p.path == ins_path && p.offset >= ins_off {
+                    p.offset += SENTINEL_LEN;
+                }
+            }
+        }
+        self.reclamp_selection();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -13661,16 +14360,70 @@ impl Engine {
     selection refresh).
     =========================================================== */
 
+    /// Issue #116 — the single validated boundary for every table
+    /// command. Resolves `path` (+ optional `row` / `col`) through
+    /// `DocumentTree::resolve_table_target` against the document the
+    /// selection addresses (body, or the active story — headers and
+    /// footers hold tables too), then runs `extra` for command-specific
+    /// shape checks (growth caps, merge rectangles). Any failure is a
+    /// typed `Event::Error` and the handler returns BEFORE it pushes an
+    /// undo snapshot or announces anything.
+    fn validate_table_cmd(
+        &self,
+        cmd: &str,
+        path: &bridge::BlockPath,
+        row: Option<u32>,
+        col: Option<u32>,
+        extra: impl FnOnce(&engine::Table) -> Result<(), engine::TableError>,
+    ) -> Result<(), Box<Event>> {
+        let epath = bridge_to_engine_path(path.clone());
+        self.with_selection_doc(|d| d.resolve_table_target(&epath, row, col).and_then(extra))
+            .map_err(|e| {
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                })
+            })
+    }
+
     fn do_insert_table(&mut self, at: bridge::BlockPath, rows: u32, cols: u32) -> Event {
+        /* Issue #114 — validate the wire dimensions BEFORE anything
+        allocates. `engine::insert_table` clamps as a second line of
+        defence, but the shell gets a typed rejection rather than a
+        silently smaller table. */
+        if let Err(e) = engine::check_table_dims(rows, cols) {
+            return Event::Error {
+                message: format!("InsertTable: {e}"),
+            };
+        }
+        /* Issue #117 — Word parks the caret in the new table's first cell.
+        Doing so explicitly (instead of leaving the caret on the block
+        index the table now occupies, which resolves to no paragraph)
+        keeps the selection valid through the structural edit. The
+        engine clamps the insertion index to the block count, so mirror
+        that to name the cell the table actually lands in. */
+        let at_idx = match at.steps.first() {
+            Some(BridgePathStep::Block { idx }) => Some(*idx as usize),
+            _ => None,
+        };
+        let first_cell = |block_count: usize| -> BridgeLogicalPos {
+            let idx = at_idx.unwrap_or(block_count).min(block_count) as u32;
+            BridgeLogicalPos {
+                path: BridgeBlockPath {
+                    steps: vec![
+                        BridgePathStep::Block { idx },
+                        BridgePathStep::Cell { row: 0, col: 0 },
+                        BridgePathStep::Block { idx: 0 },
+                    ],
+                },
+                offset: 0,
+            }
+        };
         if self.story_active() {
+            let caret = first_cell(self.story_doc().map_or(0, |d| d.blocks.len()));
             let epath = bridge_to_engine_path(at);
-            let caret = self
-                .selection
-                .as_ref()
-                .map(|s| s.caret.clone())
-                .unwrap_or_else(|| bpos_top(0, 0));
             return self.story_mutate(move |d| d.insert_table(epath, rows, cols), caret, false);
         }
+        let caret = first_cell(self.undo.current().blocks.len());
         let new_doc = self
             .undo
             .current()
@@ -13679,9 +14432,12 @@ impl Engine {
             AnnouncementPriority::Polite,
             format!("Table inserted, {rows} rows by {cols} columns"),
         );
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, Some(caret))
     }
     fn do_delete_table(&mut self, path: bridge::BlockPath) -> Event {
+        if let Err(e) = self.validate_table_cmd("DeleteTable", &path, None, None, |_| Ok(())) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13696,7 +14452,7 @@ impl Engine {
             .current()
             .delete_table(bridge_to_engine_path(path));
         self.announce(AnnouncementPriority::Polite, "Table deleted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_insert_row(
         &mut self,
@@ -13717,6 +14473,13 @@ impl Engine {
             bridge::InsertSide::Before => row as usize,
             bridge::InsertSide::After => (row as usize).saturating_add(1),
         };
+        /* Issues #114/#116 — `row` must name an existing row, and the
+        table must have room for one more. */
+        if let Err(e) = self.validate_table_cmd("InsertRow", &path, Some(row), None, |t| {
+            t.check_growth(1, 0)
+        }) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13731,9 +14494,12 @@ impl Engine {
             .current()
             .insert_row(bridge_to_engine_path(path), at);
         self.announce(AnnouncementPriority::Polite, "Row inserted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_delete_row(&mut self, path: bridge::BlockPath, row: u32) -> Event {
+        if let Err(e) = self.validate_table_cmd("DeleteRow", &path, Some(row), None, |_| Ok(())) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13748,7 +14514,7 @@ impl Engine {
             .current()
             .delete_row(bridge_to_engine_path(path), row);
         self.announce(AnnouncementPriority::Polite, "Row deleted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_insert_column(
         &mut self,
@@ -13760,6 +14526,13 @@ impl Engine {
             bridge::InsertSide::Before => col as usize,
             bridge::InsertSide::After => (col as usize).saturating_add(1),
         };
+        /* Issues #114/#116 — `col` must name an existing logical column
+        (Word's 63-column ceiling applies to the result). */
+        if let Err(e) = self.validate_table_cmd("InsertColumn", &path, None, Some(col), |t| {
+            t.check_growth(0, 1)
+        }) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13774,9 +14547,13 @@ impl Engine {
             .current()
             .insert_column(bridge_to_engine_path(path), at);
         self.announce(AnnouncementPriority::Polite, "Column inserted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_delete_column(&mut self, path: bridge::BlockPath, col: u32) -> Event {
+        if let Err(e) = self.validate_table_cmd("DeleteColumn", &path, None, Some(col), |_| Ok(()))
+        {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13791,7 +14568,7 @@ impl Engine {
             .current()
             .delete_column(bridge_to_engine_path(path), col);
         self.announce(AnnouncementPriority::Polite, "Column deleted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_merge_cells(
         &mut self,
@@ -13801,6 +14578,30 @@ impl Engine {
         to_row: u32,
         to_col: u32,
     ) -> Event {
+        /* Issue #116 — every corner of the rectangle must exist: both
+        rows, and both columns as physical cells of the TOP row (the row
+        `merge_cells` collapses into; continuation rows are clipped by
+        the engine). */
+        let (r0, r1) = (from_row.min(to_row), from_row.max(to_row));
+        let c1 = from_col.max(to_col);
+        if let Err(e) = self.validate_table_cmd("MergeCells", &path, Some(r1), None, |t| {
+            let top = t
+                .rows
+                .get(r0 as usize)
+                .ok_or(engine::TableError::RowOutOfRange {
+                    row: r0,
+                    rows: t.rows.len(),
+                })?;
+            if c1 as usize >= top.cells.len() {
+                return Err(engine::TableError::ColOutOfRange {
+                    col: c1,
+                    cols: top.cells.len(),
+                });
+            }
+            Ok(())
+        }) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13822,9 +14623,14 @@ impl Engine {
             to_col,
         );
         self.announce(AnnouncementPriority::Polite, "Cells merged");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_split_cell(&mut self, path: bridge::BlockPath, row: u32, col: u32) -> Event {
+        if let Err(e) =
+            self.validate_table_cmd("SplitCell", &path, Some(row), Some(col), |_| Ok(()))
+        {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13839,7 +14645,7 @@ impl Engine {
             .current()
             .split_cell(bridge_to_engine_path(path), row, col);
         self.announce(AnnouncementPriority::Polite, "Cell split");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_set_cell_shading(
         &mut self,
@@ -13849,6 +14655,11 @@ impl Engine {
         color: Option<bridge::Color>,
     ) -> Event {
         let rgba = color.map(|c| [c.r, c.g, c.b, c.a]);
+        if let Err(e) =
+            self.validate_table_cmd("SetCellShading", &path, Some(row), Some(col), |_| Ok(()))
+        {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13874,7 +14685,7 @@ impl Engine {
                 "Cell shading cleared"
             },
         );
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     /// Issue #79 — apply a [`bridge::TablePropertiesPatch`]. An empty
     /// patch (or a path that is not a table) is a no-op that still
@@ -13887,12 +14698,13 @@ impl Engine {
         let Some(bidi_visual) = patch.bidi_visual else {
             return self.selection_changed();
         };
-        let epath = bridge_to_engine_path(path);
-        if self.with_selection_doc(|d| d.table_at_path(&epath).is_none()) {
-            return Event::Error {
-                message: "SetTableProperties: path does not address a table".into(),
-            };
+        /* Issue #116 — the same validated boundary as every table
+        command (typed error for a non-table / nested path). */
+        if let Err(e) = self.validate_table_cmd("SetTableProperties", &path, None, None, |_| Ok(()))
+        {
+            return *e;
         }
+        let epath = bridge_to_engine_path(path);
         if self.story_active() {
             let caret = self
                 .selection
@@ -13917,7 +14729,7 @@ impl Engine {
                 "Table set to left-to-right"
             },
         );
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
 
     fn do_set_cell_borders(
@@ -13927,6 +14739,11 @@ impl Engine {
         col: u32,
         borders: bridge::BridgeCellBorders,
     ) -> Event {
+        if let Err(e) =
+            self.validate_table_cmd("SetCellBorders", &path, Some(row), Some(col), |_| Ok(()))
+        {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let engine_borders = bridge_to_engine_borders(borders);
@@ -13948,14 +14765,54 @@ impl Engine {
             bridge_to_engine_borders(borders),
         );
         self.announce(AnnouncementPriority::Polite, "Cell borders updated");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
 
-    /// Common tail for every table command — push undo, invalidate +
-    /// repaint, fire a SelectionChanged event so the UI re-fetches
-    /// state.
-    fn push_table_edit(&mut self, new_doc: engine::DocumentTree) -> Event {
+    /// Common tail for every table command — push undo, re-resolve the
+    /// selection, invalidate + repaint, fire a SelectionChanged event so
+    /// the UI re-fetches state.
+    ///
+    /// Issue #117 — a structural edit can move or remove the block an
+    /// endpoint names (`InsertTable` shifts the caret's paragraph down a
+    /// slot; `DeleteRow` / `DeleteTable` remove the caret's cell), so the
+    /// invariant "the selection always resolves" has to be re-established
+    /// here, not left for the next text edit to heal. `Some(caret)`
+    /// collapses the selection there — the command knows where the caret
+    /// belongs (`InsertTable` → first cell); `None` keeps the current
+    /// selection, both ends re-clamped against the new tree.
+    fn push_table_edit(
+        &mut self,
+        new_doc: engine::DocumentTree,
+        caret: Option<BridgeLogicalPos>,
+    ) -> Event {
         self.undo.push(new_doc);
+        let doc = self.undo.current();
+        let resolved = match (caret, self.selection.clone()) {
+            (Some(c), _) => {
+                let c = clamp_pos(doc, c);
+                Some(SelectionState {
+                    anchor: c.clone(),
+                    caret: c,
+                    ideal_x: None,
+                    kind: SelectionKind::Linear,
+                })
+            }
+            (None, Some(sel)) => {
+                let anchor = clamp_pos(doc, sel.anchor);
+                let caret = clamp_pos(doc, sel.caret);
+                let kind = derive_selection_kind(&anchor, &caret);
+                Some(SelectionState {
+                    anchor,
+                    caret,
+                    ideal_x: sel.ideal_x,
+                    kind,
+                })
+            }
+            (None, None) => None,
+        };
+        if resolved.is_some() {
+            self.selection = resolved;
+        }
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -14016,14 +14873,10 @@ impl Engine {
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
-        /* Non-empty so `current_review_date` never reaches `js_sys::Date`,
-        which panics on native targets outside a browser (mirrors the
-        crate's own `test_engine_with_doc` test helper, below). Does NOT
-        cover `do_insert_comment` / `do_reply_to_comment`, which call
-        `js_sys::Date::new_0()` directly rather than through
-        `current_review_date` — the fuzz generator excludes
-        `Command::InsertComment` / `Command::ReplyToComment` for exactly
-        this reason (D5.5, issue #90). */
+        /* A fixed review date keeps fuzz runs deterministic. Not needed
+        for safety any more: since issue #118 every timestamp goes
+        through `now_iso8601`, which is native-safe, so `Recover` (which
+        resets this field) and the comment commands can all run here. */
         engine.review_date = "2026-01-01T00:00:00Z".to_string();
         engine
     }
@@ -14041,17 +14894,18 @@ impl Engine {
     }
 
     /// `true` when the live selection's anchor and caret both resolve to
-    /// a real position in the current document. `clamp_pos` (used by
-    /// `Command::SetSelection` itself) is idempotent on a valid position,
-    /// so "unchanged by clamping" is exactly the in-bounds check.
+    /// a real position in the document the selection addresses — the
+    /// body, or the active header/footer story (issue #117). `clamp_pos`
+    /// (used by `Command::SetSelection` itself) is idempotent on a valid
+    /// position, so "unchanged by clamping" is exactly the in-bounds +
+    /// on-a-char-boundary check.
     pub fn selection_is_valid(&self) -> bool {
         match &self.selection {
             None => true,
-            Some(sel) => {
-                let doc = self.undo.current();
+            Some(sel) => self.with_selection_doc(|doc| {
                 clamp_pos(doc, sel.anchor.clone()) == sel.anchor
                     && clamp_pos(doc, sel.caret.clone()) == sel.caret
-            }
+            }),
         }
     }
 
@@ -14773,6 +15627,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -14922,6 +15777,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -14958,6 +15814,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -16103,6 +16960,7 @@ mod tests {
                 direct_overrides: engine::ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             })],
         }
     }
@@ -16117,6 +16975,7 @@ mod tests {
             }],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }
     }
 
@@ -17059,6 +17918,7 @@ mod tests {
                     height_emu: 457_200, // 0.5 inch
                 },
                 anchor: None,
+                source_xml: None,
             });
         }
         let engine = test_engine_with_doc(doc);
@@ -17105,6 +17965,7 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: None,
+                source_xml: None,
             });
         }
         let mut engine = test_engine_with_doc(doc);
@@ -17133,6 +17994,7 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: Some(Box::new(anchor)),
+                source_xml: None,
             });
         }
         doc
@@ -17149,9 +18011,76 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: None,
+                source_xml: None,
             });
         }
         doc
+    }
+
+    /// Issue #121 — `ExportPdf` embeds the document's media parts: an
+    /// inline PNG with alpha, an inline JPEG and a behind-text floating
+    /// JPEG become three image XObjects. PDF/A-2u keeps the PNG alpha as
+    /// an `/SMask` (a fourth image object); PDF/A-1b flattens it and
+    /// carries no `/SMask` at all.
+    #[test]
+    fn export_pdf_embeds_inline_and_floating_images() {
+        use format_pdf::test_images;
+        /* Byte offsets: 'a' 0, U+FFFC 1..4, 'b' 4, U+FFFC 5..8, 'c' 8,
+        U+FFFC 9..12, 'd' 12. */
+        let mut doc = DocumentTree::from_text("a\u{FFFC}b\u{FFFC}c\u{FFFC}d");
+        let image =
+            |at: u32, rel: &str, anchor: Option<Box<engine::FloatAnchor>>| engine::InlineObject {
+                at,
+                kind: engine::InlineKind::Image {
+                    rel_id: rel.to_string(),
+                    width_emu: 457_200,
+                    height_emu: 228_600,
+                },
+                anchor,
+                source_xml: None,
+            };
+        let behind = engine::FloatAnchor {
+            behind_doc: true,
+            ..engine::FloatAnchor::default()
+        };
+        if let Some(p) = doc.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(image(1, "rIdPng", None));
+            p.inline_objects.push(image(5, "rIdJpg", None));
+            p.inline_objects
+                .push(image(9, "rIdFloat", Some(Box::new(behind))));
+        }
+        let blob = |content_type: &str, data: Vec<u8>| engine::ImageBlob {
+            content_type: content_type.to_string(),
+            data,
+        };
+        doc.media.insert(
+            "rIdPng".into(),
+            blob(
+                "image/png",
+                test_images::png_rgba(2, 1, &[255, 0, 0, 255, 0, 0, 255, 100]),
+            ),
+        );
+        doc.media.insert(
+            "rIdJpg".into(),
+            blob("image/jpeg", test_images::jpeg(16, 8, 3)),
+        );
+        doc.media.insert(
+            "rIdFloat".into(),
+            blob("image/jpeg", test_images::jpeg(24, 12, 1)),
+        );
+        let engine = test_engine_with_doc(doc);
+        let count =
+            |pdf: &[u8], needle: &[u8]| pdf.windows(needle.len()).filter(|w| *w == needle).count();
+        for (conformance, images, smasks) in
+            [(PdfConformance::A2u, 4, 1), (PdfConformance::A1b, 3, 0)]
+        {
+            let Event::PdfExported { bytes, .. } = engine.do_export_pdf(conformance) else {
+                panic!("ExportPdf must succeed");
+            };
+            assert_eq!(count(&bytes, b"/Subtype /Image"), images, "{conformance:?}");
+            assert_eq!(count(&bytes, b"/SMask"), smasks, "{conformance:?}");
+            assert_eq!(count(&bytes, b"/DCTDecode"), 2, "{conformance:?}");
+        }
     }
 
     /// `image_geometry()` surfaces a float positioned against its frame:
@@ -17271,6 +18200,7 @@ mod tests {
                     wrap,
                     ..engine::FloatAnchor::default()
                 })),
+                source_xml: None,
             });
         }
         doc
@@ -17535,6 +18465,296 @@ mod tests {
         assert!((b.origin().y - spare / 2.0).abs() < 0.01);
     }
 
+    /* ------------------ Issue #165 — nested text boxes + a11y ------------------ */
+
+    fn plain_para(text: &str) -> engine::Block {
+        engine::Block::Paragraph(engine::Paragraph {
+            text: text.to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Give the text box anchored at `(host, at)` a `<wp:docPr>`.
+    fn name_text_box(doc: &mut DocumentTree, host: usize, doc_pr: &str) {
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(host)
+            && let Some(a) = p.inline_objects[0].anchor.as_mut()
+        {
+            a.doc_pr_xml = Some(doc_pr.to_string());
+        }
+    }
+
+    /// A body paragraph hosting a 3" × 2" floating box ("Sidebar") whose
+    /// story hosts a 0.75" × 0.5" floating box ("Inner", square wrap) at
+    /// the head of a long outer-story paragraph — the two-level nesting
+    /// the `.docx` reader models.
+    fn nested_text_box_doc() -> DocumentTree {
+        let outer_text = "Outer story text wraps beside the nested box. ".repeat(2);
+        let mut story = DocumentTree::from_blocks(vec![plain_para(&outer_text)]);
+        let (s2, h, a) = story.insert_text_box_at(
+            EnginePos {
+                path: EngineBlockPath::top(0),
+                offset: 0,
+            },
+            1_371_600,
+            548_640,
+        );
+        story = s2.with_updated_text_box(&h, a, vec![plain_para("Inner story")]);
+        name_text_box(&mut story, 0, r#"<wp:docPr id="7" name="Inner"/>"#);
+        let outer_body: Vec<engine::Block> = story.blocks.iter().cloned().collect();
+
+        let prose = "Body text wraps around the sidebar box and keeps going. ".repeat(6);
+        let doc = DocumentTree::from_blocks(vec![plain_para(&prose), plain_para("Tail")]);
+        let (doc, h0, a0) = doc.insert_text_box_at(
+            EnginePos {
+                path: EngineBlockPath::top(0),
+                offset: 0,
+            },
+            2_743_200,
+            2_743_200,
+        );
+        let mut doc = doc.with_updated_text_box(&h0, a0, outer_body);
+        name_text_box(
+            &mut doc,
+            0,
+            r#"<wp:docPr id="5" name="Sidebar" descr="Pull quote &amp; notes"/>"#,
+        );
+        doc
+    }
+
+    /// The nested box resolves as a float of its parent's story: laid
+    /// out inside the parent's content rect with its own story, the
+    /// parent story wraps around it, the scene paints (and clips) both
+    /// boxes, the PDF exporter walks both stories. Geometry pinned.
+    #[test]
+    fn nested_text_boxes_lay_out_wrap_and_paint() {
+        let engine = test_engine_with_doc(nested_text_box_doc());
+        let (pages, fonts, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let outer = pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("outer box");
+        let otb = outer.text_box.as_deref().expect("outer frame");
+        assert_eq!(otb.floats.len(), 1, "one nested box resolved");
+        let inner = &otb.floats[0];
+        let itb = inner.text_box.as_deref().expect("nested frame");
+        assert!(itb.floats.is_empty());
+        let ip = itb.blocks[0]
+            .as_paragraph()
+            .expect("nested story paragraph");
+        assert!(!ip.lines.is_empty() && !ip.lines[0].runs.is_empty());
+        /* Inside the parent's content rect (content-relative origin). */
+        let (_, inner_rect) = outer.text_box_content_rect().expect("content rect");
+        assert!(inner.origin.x >= -0.01 && inner.origin.y >= -0.01);
+        assert!(inner.origin.x + inner.size.width <= inner_rect.width + 0.5);
+        /* Square wrap: the outer story's lines beside the nested box
+        start right of it. */
+        let op = otb.blocks[0].as_paragraph().expect("outer story paragraph");
+        assert!(
+            op.lines
+                .iter()
+                .any(|l| l.segments.first().is_some_and(|s| s.x0 >= inner.size.width)),
+            "some outer-story band starts right of the nested box"
+        );
+        /* Scene: both boxes clip + stroke; the nested story paints. */
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let clips = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 2, "outer + nested clip");
+        let strokes = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::StrokeRect { .. }))
+            .count();
+        assert!(strokes >= 2);
+        let runs_in = |blocks: &[LayoutBlock]| -> usize {
+            blocks
+                .iter()
+                .filter_map(LayoutBlock::as_paragraph)
+                .map(|p| p.lines.iter().map(|l| l.runs.len()).sum::<usize>())
+                .sum()
+        };
+        let painted_runs = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::DrawGlyphRun(_)))
+            .count();
+        /* The fixture's stories fit their boxes (nothing is culled). */
+        let bottom = |blocks: &[LayoutBlock]| {
+            blocks
+                .iter()
+                .map(|b| b.origin().y + b.size().height)
+                .fold(0.0_f32, f32::max)
+        };
+        assert!(bottom(&otb.blocks) <= inner_rect.height);
+        let (_, nested_rect) = inner.text_box_content_rect().expect("nested rect");
+        assert!(bottom(&itb.blocks) <= nested_rect.height + 0.5);
+        assert!(
+            painted_runs >= runs_in(&pages[0].blocks) + runs_in(&otb.blocks) + runs_in(&itb.blocks),
+            "body, outer and nested story runs all paint"
+        );
+        let mut pdf = Vec::new();
+        format_pdf::export_pdf(&pages, &fonts, &[], format_pdf::PdfProfile::Plain, &mut pdf)
+            .expect("pdf");
+        assert!(pdf.starts_with(b"%PDF"));
+        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(PdfConformance::A2u) else {
+            panic!("engine pdf export");
+        };
+        assert!(bytes.starts_with(b"%PDF"));
+        /* Pinned: a change here moves the nested-box geometry. */
+        let fp = layout::geometry_fingerprint(&pages);
+        if std::env::var_os("NGE_PRINT_WRAP_FINGERPRINTS").is_some() {
+            eprintln!("ENGINE NESTED TEXT BOX FINGERPRINT = {fp:#x}");
+        }
+        assert_eq!(fp, PINNED_NESTED_TEXT_BOXES);
+    }
+
+    const PINNED_NESTED_TEXT_BOXES: u64 = 0x0effc1fd111fcc44;
+
+    /// A box nested past the layout cap (only a hand-built tree can carry
+    /// one) keeps its place in its parent story but is not resolved —
+    /// the recursion is bounded and nothing degrades.
+    #[test]
+    fn text_box_nesting_past_the_cap_is_not_laid_out() {
+        let mut doc = nested_text_box_doc();
+        /* Nest a third level inside "Inner". */
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0)
+            && let engine::InlineKind::TextBox { story, .. } = &mut p.inline_objects[0].kind
+            && let Some(engine::Block::Paragraph(sp)) = story.body.get_mut(0)
+            && let engine::InlineKind::TextBox { story: inner, .. } = &mut sp.inline_objects[0].kind
+        {
+            let third = DocumentTree::from_blocks(vec![plain_para("level two")]);
+            let (third, _, _) = third.insert_text_box_at(
+                EnginePos {
+                    path: EngineBlockPath::top(0),
+                    offset: 0,
+                },
+                300_000,
+                200_000,
+            );
+            inner.body = third.blocks.iter().cloned().collect();
+        } else {
+            panic!("fixture shape");
+        }
+        let engine = test_engine_with_doc(doc);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty());
+        let otb = pages[0].floats[0].text_box.as_deref().expect("outer");
+        let itb = otb.floats[0].text_box.as_deref().expect("nested");
+        assert!(itb.floats.is_empty(), "level three is past the cap");
+        assert!(!itb.blocks.is_empty(), "level two still lays out its story");
+    }
+
+    fn a11y_text(nodes: &[A11yNode]) -> Vec<String> {
+        nodes
+            .iter()
+            .map(|n| match n {
+                A11yNode::Paragraph(p) => p.runs.iter().map(|r| r.text.as_str()).collect(),
+                A11yNode::TextBox(b) => format!("[box {}]", b.id),
+                A11yNode::Table(_) => "[table]".to_string(),
+                A11yNode::Story(_) => "[story]".to_string(),
+            })
+            .collect()
+    }
+
+    /// The a11y tree mirrors every text box as a `TextBox` region right
+    /// after its anchor paragraph — named from `docPr`, holding the
+    /// body's exact paragraph shape — and a nested box inside its
+    /// parent's region after ITS anchor paragraph.
+    #[test]
+    fn a11y_tree_emits_text_box_regions_after_their_anchor_paragraphs() {
+        let engine = test_engine_with_doc(nested_text_box_doc());
+        let nodes = engine.build_a11y_nodes();
+        assert_eq!(nodes.len(), 3, "{:?}", a11y_text(&nodes));
+        assert!(matches!(nodes[0], A11yNode::Paragraph(_)));
+        assert!(matches!(nodes[2], A11yNode::Paragraph(_)));
+        let A11yNode::TextBox(outer) = &nodes[1] else {
+            panic!("region after the anchor paragraph: {:?}", nodes[1]);
+        };
+        assert_eq!(outer.id, "0@0");
+        assert_eq!(outer.name.as_deref(), Some("Sidebar"));
+        assert_eq!(outer.description.as_deref(), Some("Pull quote & notes"));
+        assert_eq!(outer.nodes.len(), 2);
+        let A11yNode::Paragraph(op) = &outer.nodes[0] else {
+            panic!("outer story paragraph");
+        };
+        assert!(op.runs.iter().any(|r| r.text.contains("Outer story text")));
+        let A11yNode::TextBox(inner) = &outer.nodes[1] else {
+            panic!("nested region after its anchor paragraph");
+        };
+        assert_eq!(inner.id, "0@0/0@0");
+        assert_eq!(inner.name.as_deref(), Some("Inner"));
+        assert_eq!(inner.description, None);
+        assert_eq!(a11y_text(&inner.nodes), ["Inner story"]);
+
+        /* Two sibling boxes in the #83 fixture: one region per anchor
+        paragraph, ids matching the story rid scheme, RTL text intact. */
+        let engine = test_engine_with_doc(text_box_doc());
+        let nodes = engine.build_a11y_nodes();
+        let got = a11y_text(&nodes);
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(got[1], "[box 0@0]");
+        assert_eq!(got[3], "[box 1@0]");
+        let A11yNode::TextBox(rtl) = &nodes[3] else {
+            panic!("rtl region");
+        };
+        assert_eq!(a11y_text(&rtl.nodes), ["صندوق نص من اليمين"]);
+    }
+
+    /// Documents without text boxes keep their pre-#165 a11y shape: one
+    /// node per top-level block, cells unchanged.
+    #[test]
+    fn a11y_tree_without_text_boxes_is_unchanged() {
+        let engine = test_engine_with_doc(DocumentTree::from_blocks(vec![
+            plain_para("one"),
+            plain_para("two"),
+        ]));
+        let nodes = engine.build_a11y_nodes();
+        assert_eq!(a11y_text(&nodes), ["one", "two"]);
+    }
+
+    /// Typing inside a text box patches ONLY that box's region — one
+    /// `Update` at the region's index — never a full-tree `Replace`; the
+    /// enter announcement names the region.
+    #[test]
+    fn a11y_delta_for_a_text_box_edit_patches_only_its_region() {
+        let mut engine = test_engine_with_doc(nested_text_box_doc());
+        let first = engine.build_a11y_delta();
+        assert!(matches!(first.as_slice(), [A11yPatch::Replace { .. }]));
+        engine.pending_announcements.clear();
+        engine.enter_text_box_story(EngineBlockPath::top(0), 0, 0, 0);
+        assert!(
+            engine
+                .pending_announcements
+                .iter()
+                .any(|(_, m)| m == "Editing text box: Sidebar"),
+            "{:?}",
+            engine.pending_announcements
+        );
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        let typed = engine.do_insert_text_interactive(caret, "Hello ".to_string());
+        assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+        let delta = engine.build_a11y_delta();
+        assert_eq!(delta.len(), 1, "{delta:?}");
+        let A11yPatch::Update {
+            index,
+            node: A11yNode::TextBox(region),
+        } = &delta[0]
+        else {
+            panic!("expected a region Update, got {delta:?}");
+        };
+        assert_eq!(*index, 1);
+        assert_eq!(region.id, "0@0");
+        let A11yNode::Paragraph(p) = &region.nodes[0] else {
+            panic!("story paragraph");
+        };
+        assert!(p.runs[0].text.starts_with("Hello "));
+    }
+
     /// `Command::SetImageWrap` switches the mode (one undo step), the
     /// behind / in-front modes stop cutting text, the image rect reports
     /// the new mode, and an inline image is an honest error.
@@ -17681,6 +18901,7 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: None,
+                source_xml: None,
             });
         }
         let inline = test_engine_with_doc(inline_doc);
@@ -17734,6 +18955,7 @@ mod tests {
             }],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         let mut engine = test_engine_with_doc(doc);
         let cell_path = BridgeBlockPath {
@@ -18052,8 +19274,8 @@ mod tests {
             pending_announcements: Vec::new(),
             tracking_changes: false,
             review_author: "You".to_string(),
-            /* Non-empty so `current_review_date` never reaches
-            `js_sys::Date`, which panics on native targets. */
+            /* A fixed date keeps stamped revisions deterministic in
+            tests (the clock itself is native-safe since issue #118). */
             review_date: "2026-01-01T00:00:00Z".to_string(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
@@ -19033,9 +20255,159 @@ mod tests {
             rows,
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(rtl("outro")));
         d
+    }
+
+    /// Issue #173 — a fixed-layout 2 × 2 table, 200 pt wide
+    /// (`<w:tblGrid>` 2000 + 2000 twips), narrower than the A4 column,
+    /// with `<w:jc>` / `<w:tblInd>` / `<w:bidiVisual>` as given. The
+    /// surrounding paragraphs are RTL when `bidi_visual` is set.
+    fn placed_table_doc(
+        alignment: Option<engine::Alignment>,
+        indent_twips: i32,
+        bidi_visual: bool,
+    ) -> DocumentTree {
+        let para = |text: &str| engine::Paragraph {
+            text: text.into(),
+            props: engine::ParaProperties {
+                direction: bidi_visual.then_some(engine::TextDirection::Rtl),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut d = DocumentTree::from_text("");
+        d.blocks.set(0, engine::Block::Paragraph(para("intro")));
+        let rows = (1..=2)
+            .map(|r| engine::TableRow {
+                props: engine::RowProperties::default(),
+                cells: (1..=2)
+                    .map(|c| engine::TableCell {
+                        props: engine::CellProperties::default(),
+                        blocks: vec![engine::Block::Paragraph(para(&format!("r{r}c{c}")))],
+                    })
+                    .collect(),
+            })
+            .collect();
+        d.blocks.push_back(engine::Block::Table(engine::Table {
+            grid: vec![2000, 2000],
+            props: engine::TableProperties {
+                alignment,
+                indent_twips,
+                bidi_visual,
+                layout: engine::TableLayout::Fixed,
+                borders: Some(engine::default_word_borders()),
+                ..Default::default()
+            },
+            rows,
+            dirty: true,
+            source_xml: None,
+            body_xml: None,
+        }));
+        d.blocks.push_back(engine::Block::Paragraph(para("outro")));
+        d
+    }
+
+    /// Issue #173 — `(table origin.x, column width, table width)` of the
+    /// first table at scale 1.0.
+    fn table_x(doc: DocumentTree) -> (f32, f32, f32) {
+        let e = test_engine_with_doc(doc);
+        let (pages, _, _, info) = e.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let page = &pages[0];
+        let cw = page.size.width - page.margins.left - page.margins.right;
+        let t = first_table(&pages);
+        (t.origin.x, cw, t.size.width)
+    }
+
+    /// Issue #173 — `<w:jc>` places a narrower-than-column table at the
+    /// left / centre / right of the column, `<w:tblInd>` shifts a
+    /// start-aligned table from its leading edge, and a `bidiVisual`
+    /// table's default `start` is the RIGHT margin.
+    #[test]
+    fn table_jc_and_tbl_ind_resolve_the_table_x_origin() {
+        use engine::Alignment as A;
+        let (x, cw, w) = table_x(placed_table_doc(None, 0, false));
+        assert_eq!(w, 200.0);
+        assert!(cw > w + 100.0, "column {cw} vs table {w}");
+        assert_eq!(x, 0.0, "LTR default start = left edge");
+        let at = |a, ind, rtl| table_x(placed_table_doc(a, ind, rtl)).0;
+        let near = |got: f32, want: f32| assert!((got - want).abs() < 1e-3, "{got} vs {want}");
+        near(at(Some(A::Start), 0, false), 0.0);
+        near(at(Some(A::Center), 0, false), (cw - w) / 2.0);
+        near(at(Some(A::End), 0, false), cw - w);
+        near(at(None, 720, false), 36.0);
+        near(at(Some(A::Center), 720, false), (cw - w) / 2.0);
+        near(at(None, -108, false), -5.4);
+        /* RTL (`bidiVisual`): start = right margin, indent from it. */
+        near(at(None, 0, true), cw - w);
+        near(at(Some(A::Start), 720, true), cw - w - 36.0);
+        near(at(Some(A::End), 0, true), 0.0);
+        near(at(Some(A::Center), 0, true), (cw - w) / 2.0);
+    }
+
+    /// Issue #173 — caret geometry and hit-testing follow the placed
+    /// table: every cell line shifts by exactly the table offset, and a
+    /// click inside the moved cell resolves to it.
+    #[test]
+    fn placed_table_geometry_and_hit_testing_follow_the_origin() {
+        let left = test_engine_with_doc(placed_table_doc(None, 0, false));
+        let right = test_engine_with_doc(placed_table_doc(Some(engine::Alignment::End), 0, false));
+        /* `table_x` lays out at scale 1.0; geometry is in the engine's
+        device scale. */
+        let (x, ..) = table_x(placed_table_doc(Some(engine::Alignment::End), 0, false));
+        assert!(x > 100.0);
+        let x = x * right.scale();
+        fn cell_line(geom: &[LineGeom], row: u32, col: u32) -> &LineGeom {
+            geom.iter()
+                .find(|g| {
+                    matches!(
+                        g.path.steps.get(1),
+                        Some(BridgePathStep::Cell { row: r, col: c }) if *r == row && *c == col
+                    )
+                })
+                .unwrap_or_else(|| panic!("line for cell ({row},{col})"))
+        }
+        let (gl, gr) = (
+            left.document_geometry().expect("geom"),
+            right.document_geometry().expect("geom"),
+        );
+        for (row, col) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let (a, b) = (cell_line(&gl, row, col), cell_line(&gr, row, col));
+            assert!(
+                (b.hit_left - a.hit_left - x).abs() < 1e-3,
+                "cell ({row},{col}) moved {} not {x}",
+                b.hit_left - a.hit_left
+            );
+            assert_eq!(a.y_top, b.y_top);
+            let hit = hit_test_geom(&gr, b.hit_left + 2.0, b.y_top + b.height / 2.0);
+            assert_eq!(
+                hit.path.steps.get(1),
+                Some(&BridgePathStep::Cell { row, col })
+            );
+        }
+    }
+
+    /// Issue #173 — an autofit table fills the column, so `<w:jc>` (and a
+    /// `bidiVisual` default start) has no slack to act on: geometry is
+    /// bit-identical to the unaligned table.
+    #[test]
+    fn full_width_autofit_table_is_unmoved_by_jc() {
+        let fp = |d: DocumentTree| {
+            let e = test_engine_with_doc(d);
+            let (pages, ..) = e.build_pages(1.0, false, None).expect("layout");
+            layout::geometry_fingerprint(&pages)
+        };
+        let plain = fp(table_doc());
+        for a in [engine::Alignment::Center, engine::Alignment::End] {
+            let mut d = table_doc();
+            if let Some(engine::Block::Table(t)) = d.blocks.get_mut(1) {
+                t.props.alignment = Some(a);
+            }
+            assert_eq!(fp(d), plain, "{a:?}");
+        }
     }
 
     fn first_table(pages: &[PageBox]) -> &TableBox {
@@ -19236,31 +20608,54 @@ mod tests {
         d
     }
 
+    /// Issue #95 — stamp `<w:widowControl>` onto every top-level
+    /// paragraph (`None` = unspecified, Word's default ON).
+    fn with_widow_control(mut doc: DocumentTree, widow: Option<bool>) -> DocumentTree {
+        for b in doc.blocks.iter_mut() {
+            if let engine::Block::Paragraph(p) = b {
+                p.props.widow_control = widow;
+            }
+        }
+        doc
+    }
+
     /// Every engine-level nominal shape: the 50-page perf fixture (full
     /// layout and a culled band, both at DPR 2), a forced page break, an
     /// autofit table and a long multi-page prose doc. Fingerprints pinned
     /// on the pre-#87 adapter — a changed value means the browser goldens
     /// would move.
-    fn engine_nominal_fixtures() -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
+    ///
+    /// Issue #95 — widow / orphan control is ON unless a document says
+    /// otherwise, which legitimately moves every fixture whose flow
+    /// leaves a single line at a page edge. The pre-#87 anchor therefore
+    /// runs with widow control explicitly OFF (`Some(false)`) — proving
+    /// nothing ELSE moved — and the default (`None`) variants are pinned
+    /// separately in [`PINNED_WIDOW_DEFAULT_FINGERPRINTS`].
+    fn engine_nominal_fixtures_with(
+        widow: Option<bool>,
+    ) -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
         let bytes = std::fs::read(path).expect("read 50p.docx fixture");
         let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
-        let engine = test_engine_with_doc(archive.document);
+        let engine = test_engine_with_doc(with_widow_control(archive.document, widow));
         let mut out = Vec::new();
         let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
         out.push(("50p_full_x2", pages, info.degradations));
         let (pages, _, _, info) = engine.build_pages(2.0, false, Some(2000.0)).expect("band");
         out.push(("50p_band_2000_x2", pages, info.degradations));
 
-        let engine = test_engine_with_doc(two_page_doc("alpha beta gamma", "delta epsilon"));
+        let engine = test_engine_with_doc(with_widow_control(
+            two_page_doc("alpha beta gamma", "delta epsilon"),
+            widow,
+        ));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
         out.push(("two_page_form_feed", pages, info.degradations));
 
-        let engine = test_engine_with_doc(table_doc());
+        let engine = test_engine_with_doc(with_widow_control(table_doc(), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
         out.push(("autofit_table", pages, info.degradations));
 
-        let engine = test_engine_with_doc(prose_doc(300));
+        let engine = test_engine_with_doc(with_widow_control(prose_doc(300), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
         out.push(("prose_300_full", pages, info.degradations));
         let (pages, _, _, info) = engine
@@ -19272,6 +20667,30 @@ mod tests {
         let engine = test_engine_with_doc(rtl_table_doc(true));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("rtl table");
         out.push(("rtl_bidi_visual_table", pages, info.degradations));
+
+        /* Issue #173 — fixed-width (200 pt) tables placed by `<w:jc>` /
+        `<w:tblInd>`, and a narrow `<w:bidiVisual>` table at its default
+        `start` = the right margin. */
+        for (name, alignment, indent, rtl) in [
+            (
+                "ltr_center_fixed_table",
+                Some(engine::Alignment::Center),
+                0,
+                false,
+            ),
+            (
+                "ltr_right_fixed_table",
+                Some(engine::Alignment::End),
+                0,
+                false,
+            ),
+            ("ltr_indented_fixed_table", None, 720, false),
+            ("rtl_narrow_bidi_visual_table", None, 0, true),
+        ] {
+            let engine = test_engine_with_doc(placed_table_doc(alignment, indent, rtl));
+            let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect(name);
+            out.push((name, pages, info.degradations));
+        }
         out
     }
 
@@ -19333,13 +20752,51 @@ mod tests {
         /* Issue #79 — recorded with the `<w:bidiVisual>` mirror in place
         (column 1 rightmost); every value above is unchanged by it. */
         ("rtl_bidi_visual_table", 0xa105472832896e3f),
+        /* Issue #173 — recorded with `<w:jc>` / `<w:tblInd>` placement in
+        place (new fixtures; every value above is unchanged by it —
+        autofit tables fill the column, so they have no slack to move). */
+        ("ltr_center_fixed_table", 0x392d9b82e26033b8),
+        ("ltr_right_fixed_table", 0x93457cced5c21beb),
+        ("ltr_indented_fixed_table", 0x327125e1450360f6),
+        ("rtl_narrow_bidi_visual_table", 0x840944f9156e942e),
+    ];
+
+    /// Issue #95 — the same fixtures with widow / orphan control at its
+    /// Word default (ON). Recorded via `--nocapture` when #95 landed:
+    /// only the 50-page perf document moves (its flow leaves single
+    /// lines at page edges); the other four equal the OFF anchor.
+    const PINNED_WIDOW_DEFAULT_FINGERPRINTS: &[(&str, u64)] = &[
+        ("50p_full_x2", 0xa7f584534ce2ac6f),
+        ("50p_band_2000_x2", 0x25ddf363691ee633),
+        ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("autofit_table", 0x92435b9636de4c72),
+        ("prose_300_full", 0xd3d662539c126b7d),
+        ("prose_300_band_1200", 0x5e704685f3cc770c),
     ];
 
     #[test]
     fn engine_nominal_fixtures_are_geometrically_identical_to_the_pre_watchdog_adapter() {
-        for (name, pages, degradations) in engine_nominal_fixtures() {
+        assert_fixtures_pinned(
+            engine_nominal_fixtures_with(Some(false)),
+            PINNED_ENGINE_FINGERPRINTS,
+        );
+    }
+
+    #[test]
+    fn engine_nominal_fixtures_with_default_widow_control_are_pinned() {
+        assert_fixtures_pinned(
+            engine_nominal_fixtures_with(None),
+            PINNED_WIDOW_DEFAULT_FINGERPRINTS,
+        );
+    }
+
+    fn assert_fixtures_pinned(
+        fixtures: Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)>,
+        pinned: &[(&str, u64)],
+    ) {
+        for (name, pages, degradations) in fixtures {
             let fp = layout::geometry_fingerprint(&pages);
-            match PINNED_ENGINE_FINGERPRINTS.iter().find(|(n, _)| *n == name) {
+            match pinned.iter().find(|(n, _)| *n == name) {
                 Some((_, want)) => assert_eq!(
                     fp,
                     *want,
@@ -19369,6 +20826,323 @@ mod tests {
         } else {
             std::time::Duration::from_millis(250)
         }
+    }
+
+    /* ================================================================
+    Issue #95 — keep-with-next wired from the model, widow / orphan
+    control, and the cull stop that respects keep chains.
+    ================================================================ */
+
+    fn para_of(text: &str, props: engine::ParaProperties) -> engine::Block {
+        engine::Block::Paragraph(engine::Paragraph {
+            text: text.into(),
+            props,
+            ..Default::default()
+        })
+    }
+
+    const BODY_TEXT: &str = "Body text follows the heading: sphinx of black quartz, judge my vow; \
+         pack my box with five dozen liquor jugs; the five boxing wizards jump quickly \
+         over the lazy dog while a quick brown fox watches from the riverbank, \
+         and then everything repeats again for good measure until the paragraph \
+         wraps onto several lines of the page.";
+
+    /// `filler` (≥ 1) prose paragraphs of two lines, then `filler & 1`
+    /// one-line paragraphs (so the sweep walks the heading one line at a
+    /// time), then a keep-with-next heading at block [`heading_index`]
+    /// and a multi-line body paragraph right after it.
+    fn heading_doc(filler: usize, keep_next: bool, widow: Option<bool>) -> DocumentTree {
+        let mut d = prose_doc(filler / 2 + 1);
+        for _ in 0..filler % 2 {
+            d.blocks
+                .push_back(para_of("short", engine::ParaProperties::default()));
+        }
+        d.blocks.push_back(para_of(
+            "Heading",
+            engine::ParaProperties {
+                keep_next,
+                widow_control: widow,
+                ..Default::default()
+            },
+        ));
+        d.blocks.push_back(para_of(
+            BODY_TEXT,
+            engine::ParaProperties {
+                widow_control: widow,
+                ..Default::default()
+            },
+        ));
+        d
+    }
+
+    fn heading_index(filler: usize) -> u32 {
+        (filler / 2 + 1 + filler % 2) as u32
+    }
+
+    /// Page index of every fragment of top-level block `idx`, with its
+    /// line count.
+    fn fragments_of(
+        pages: &[PageBox],
+        paths: &[Vec<EngineBlockPath>],
+        idx: u32,
+    ) -> Vec<(usize, usize)> {
+        let want = EngineBlockPath::top(idx);
+        let mut out = Vec::new();
+        for (pi, (page, pp)) in pages.iter().zip(paths).enumerate() {
+            for (b, path) in page.blocks.iter().zip(pp) {
+                if *path == want {
+                    out.push((pi, b.as_paragraph().map_or(0, |p| p.lines.len())));
+                }
+            }
+        }
+        out
+    }
+
+    /// Acceptance: a keepNext heading never ends a page alone. Swept over
+    /// every filler length that walks the heading across a page bottom;
+    /// the control run (keepNext off) proves the sweep hits the case.
+    #[test]
+    fn keep_next_heading_never_ends_a_page_alone() {
+        let mut control_hits = 0;
+        for filler in 56..96 {
+            for keep in [false, true] {
+                let engine = test_engine_with_doc(heading_doc(filler, keep, Some(false)));
+                let (pages, _, paths, info) = engine.build_pages(1.0, false, None).expect("pages");
+                /* The relocated chain's engine paths travel with it:
+                paths stay exactly parallel to the page blocks. */
+                assert_eq!(pages.len(), paths.len());
+                for (page, pp) in pages.iter().zip(&paths) {
+                    assert_eq!(page.blocks.len(), pp.len(), "filler {filler}");
+                }
+                let heading = fragments_of(&pages, &paths, heading_index(filler));
+                let body = fragments_of(&pages, &paths, heading_index(filler) + 1);
+                let alone = heading[0].0 != body[0].0;
+                if !keep {
+                    control_hits += usize::from(alone);
+                    continue;
+                }
+                assert!(
+                    !alone,
+                    "filler {filler}: heading on page {} alone",
+                    heading[0].0
+                );
+                assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+            }
+        }
+        assert!(
+            control_hits > 0,
+            "the sweep never put the heading at a page bottom"
+        );
+    }
+
+    /// Acceptance: widow / orphan control (the Word default — the model
+    /// leaves it unspecified) never leaves a single line of the body
+    /// paragraph on either side of a page break; the explicit-off
+    /// control run proves the sweep produces single-line fragments.
+    #[test]
+    fn widow_control_never_leaves_a_single_line() {
+        let mut control_hits = 0;
+        let mut splits = 0;
+        for filler in 56..96 {
+            for widow in [Some(false), None] {
+                let engine = test_engine_with_doc(heading_doc(filler, false, widow));
+                let (pages, _, paths, _) = engine.build_pages(1.0, false, None).expect("pages");
+                let body = fragments_of(&pages, &paths, heading_index(filler) + 1);
+                assert!(
+                    body.iter().map(|f| f.1).sum::<usize>() >= 3,
+                    "a multi-line body"
+                );
+                if body.len() < 2 {
+                    continue;
+                }
+                let single = body.iter().any(|f| f.1 == 1);
+                if widow.is_some() {
+                    control_hits += usize::from(single);
+                } else {
+                    splits += 1;
+                    assert!(!single, "filler {filler}: fragments {body:?}");
+                }
+            }
+        }
+        assert!(
+            control_hits > 0,
+            "the sweep never produced a widow or orphan"
+        );
+        assert!(splits > 0, "widow control still splits the paragraph");
+    }
+
+    /// A viewport-culled band never ends right behind a keep-with-next
+    /// paragraph: its follower decides where the chain lands. The cull
+    /// target is aimed so the budget runs out exactly on a heading that
+    /// sits at a page bottom (and moves once its body arrives); expanding
+    /// the band must verify as a prefix — no `FastPathMismatch`.
+    #[test]
+    fn expanding_through_keep_chains_never_demotes() {
+        /* Find a filler length that parks the heading on a page bottom. */
+        let (filler, page, heading_box) = (56..96)
+            .find_map(|filler| {
+                let engine = test_engine_with_doc(heading_doc(filler, false, Some(false)));
+                let (pages, _, paths, _) = engine.build_pages(1.0, false, None).expect("pages");
+                let h = fragments_of(&pages, &paths, heading_index(filler));
+                let b = fragments_of(&pages, &paths, heading_index(filler) + 1);
+                (h[0].0 != b[0].0).then(|| {
+                    let page = h[0].0;
+                    let want = EngineBlockPath::top(heading_index(filler));
+                    let blk = pages[page]
+                        .blocks
+                        .iter()
+                        .zip(&paths[page])
+                        .find(|(_, p)| **p == want)
+                        .map(|(b, _)| (b.origin().y, b.size().height))
+                        .expect("heading block");
+                    (filler, page, blk)
+                })
+            })
+            .expect("a heading at a page bottom");
+        let mut d = heading_doc(filler, true, Some(false));
+        for i in 0..200 {
+            d.blocks.push_back(para_of(
+                &format!("Trailing paragraph {i} keeps the band culled."),
+                engine::ParaProperties::default(),
+            ));
+        }
+        let engine = test_engine_with_doc(d);
+        let (full, _, _, _) = engine.build_pages(1.0, false, None).expect("full");
+        let gap = render::scene::PAGE_GAP_PT;
+        let above: f32 = full[..page].iter().map(|p| p.size.height + gap).sum();
+        let runway = lazy_runway(engine.lazy_layout.viewport_h, 1.0);
+        /* The committed height crosses the budget right after the heading
+        is pushed (before its body): origin.y < budget <= bottom. */
+        let target = above + heading_box.0 + heading_box.1 * 0.5 - runway;
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(target))
+            .expect("band 1");
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(target + 1500.0))
+            .expect("band 2");
+        let snap = engine.layout_snapshot.borrow();
+        let s = snap.as_ref().expect("snapshot");
+        assert!(s.info.degradations.is_empty(), "{:?}", s.info.degradations);
+        assert!(!s.info.is_full_layout, "still a culled band");
+        assert_eq!(layout::verify_prefix(&s.pages, &full), Ok(()));
+    }
+
+    /* ================================================================
+    Issue #93 — a culled band that ends inside a multi-column section a
+    continuous section follows (its column balance still pending).
+    ================================================================ */
+
+    /// `n` prose paragraphs in a 2-column section, then a continuous
+    /// single-column section of `tail` paragraphs.
+    fn two_column_then_continuous(n: usize, tail: usize) -> DocumentTree {
+        let mut d = prose_doc(n);
+        let mut sect = d.body_section.clone();
+        sect.columns = engine::ColumnSpec {
+            count: 2,
+            gutter_pt: 36.0,
+        };
+        if let Some(engine::Block::Paragraph(p)) = d.blocks.get_mut(n - 1) {
+            p.section_end = Some(Box::new(sect));
+        }
+        d.body_section.section_type = engine::SectionType::Continuous;
+        for i in 0..tail {
+            d.blocks.push_back(para_of(
+                &format!("Single-column paragraph {i} after the continuous break."),
+                engine::ParaProperties::default(),
+            ));
+        }
+        d
+    }
+
+    /// Acceptance: a band culled on the last page of a continuous
+    /// multi-column section (unbalanced there, balanced once the next
+    /// section is reached) flags that page provisional, expands without
+    /// a `FastPathMismatch`, and the final geometry equals a full layout.
+    #[test]
+    fn expanding_through_a_continuous_section_never_demotes() {
+        let gap = render::scene::PAGE_GAP_PT;
+        /* Find a section length whose last page holds more than one
+        column's worth but less than two — the case balancing reshuffles. */
+        let (n, page, full) = (60..160)
+            .step_by(3)
+            .find_map(|n| {
+                let engine = test_engine_with_doc(two_column_then_continuous(n, 120));
+                let (pages, _, paths, _) = engine.build_pages(1.0, false, None).expect("pages");
+                let last = EngineBlockPath::top(n as u32 - 1);
+                let page = paths.iter().position(|pp| pp.contains(&last))?;
+                let content_h =
+                    pages[page].size.height - pages[page].margins.top - pages[page].margins.bottom;
+                let in_section = |p: &EngineBlockPath| {
+                    matches!(p.steps.first(), Some(engine::PathStep::Block(i)) if (*i as usize) < n)
+                };
+                let section_h: f32 = pages[page]
+                    .blocks
+                    .iter()
+                    .zip(&paths[page])
+                    .filter(|(_, p)| in_section(p))
+                    .map(|(b, _)| b.size().height)
+                    .sum();
+                (page >= 2 && section_h > 1.1 * content_h && section_h < 1.7 * content_h)
+                    .then_some((n, page, pages))
+            })
+            .expect("a section whose last page balances");
+        let engine = test_engine_with_doc(two_column_then_continuous(n, 120));
+        let above: f32 = full[..page].iter().map(|p| p.size.height + gap).sum();
+        let content_h = full[page].size.height - full[page].margins.top - full[page].margins.bottom;
+        let runway = lazy_runway(engine.lazy_layout.viewport_h, 1.0);
+        /* Aim the cull at that page, deep enough into column 0 that the
+        band holds blocks the balance pass moves (swept: the cull only
+        stops at block boundaries). */
+        let target = (40..100)
+            .map(|pct| above + content_h * pct as f32 / 100.0 - runway)
+            .find(|&target| {
+                engine.invalidate_layout_snapshot();
+                engine
+                    .ensure_layout_snapshot(1.0, false, Some(target))
+                    .expect("band 1");
+                let snap = engine.layout_snapshot.borrow();
+                let s = snap.as_ref().expect("snapshot");
+                !s.info.is_full_layout
+                    && s.info.open_from_page == Some(page)
+                    && layout::verify_prefix(&s.pages, &full).is_err()
+            })
+            .expect("a band whose unbalanced page differs from the balanced one");
+        {
+            /* Everything before the provisional page is final. */
+            let snap = engine.layout_snapshot.borrow();
+            let s = snap.as_ref().expect("snapshot");
+            assert_eq!(
+                layout::verify_prefix_open(&s.pages, &full, Some(page)),
+                Ok(())
+            );
+        }
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(target + 1500.0))
+            .expect("band 2");
+        {
+            let snap = engine.layout_snapshot.borrow();
+            let s = snap.as_ref().expect("snapshot");
+            assert!(
+                s.info.degradations.is_empty(),
+                "no FastPathMismatch on expand: {:?}",
+                s.info.degradations
+            );
+            assert!(!s.info.is_full_layout, "still a culled band");
+            assert_eq!(s.info.open_from_page, None, "band 2 left the section");
+            assert_eq!(layout::verify_prefix(&s.pages, &full), Ok(()));
+        }
+        engine
+            .ensure_layout_snapshot(1.0, false, None)
+            .expect("full");
+        let snap = engine.layout_snapshot.borrow();
+        let s = snap.as_ref().expect("snapshot");
+        assert!(s.info.is_full_layout);
+        assert!(s.info.degradations.is_empty(), "{:?}", s.info.degradations);
+        assert_eq!(
+            layout::geometry_fingerprint(&s.pages),
+            layout::geometry_fingerprint(&full),
+            "final geometry equals a full layout"
+        );
     }
 
     /// A deeper `ExpandLayout` band verifies as a prefix of the previous
@@ -20379,5 +22153,783 @@ mod snapshot_tests {
         b.restore_from_bytes(&e.snapshot_bytes().unwrap()).unwrap();
         format_docx::check_document_xml_well_formed(&saved(&mut b))
             .expect("recovered session saves well-formed");
+    }
+}
+
+/// Issues #114–#118 — every wire value is validated at the command
+/// boundary: typed `Event::Error`, never a panic, never an unbounded
+/// allocation, and the selection invariant holds after every command.
+#[cfg(test)]
+mod wire_validation_tests {
+    use super::*;
+    use bridge::{BlockPath as WirePath, InsertSide, SelectionModifier};
+
+    /// `Engine::apply` has no internal `.await`; poll once (mirrors the
+    /// `fuzz-native` `block_on_ready`, available without the feature).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut fut = Box::pin(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("Engine::apply suspended in a native test"),
+        }
+    }
+
+    /// A real font + a cached layout config, exactly like
+    /// `test_engine_with_doc`: `selection_changed` reports geometry, which
+    /// needs both. Also what the shell re-seeds after a recovery.
+    fn seed_layout(e: &mut Engine) {
+        let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("test-latin".to_string(), bytes).expect("parse test font");
+        e.fonts.insert("test-latin".to_string(), Arc::new(font));
+        e.layout_cfg = Some(RenderConfig {
+            font_id: "test-latin".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 16.0,
+            line_height: 26.0,
+            alignment: Alignment::Start,
+            scale: 1.0,
+            base_scale: 1.0,
+            zoom: 1.0,
+        });
+    }
+
+    fn engine_with(doc: DocumentTree, caret: BridgeLogicalPos) -> Engine {
+        let mut e = assemble_engine(None, None);
+        seed_layout(&mut e);
+        e.undo = UndoStack::new(doc, 100);
+        e.selection = Some(SelectionState {
+            anchor: caret.clone(),
+            caret,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        e.review_date = "2026-01-01T00:00:00Z".into();
+        e
+    }
+
+    fn text_engine(text: &str) -> Engine {
+        engine_with(DocumentTree::from_text(text), bpos_top(0, 0))
+    }
+
+    /// `[Table 2×2, Paragraph "tail"]` with the caret in the paragraph.
+    fn table_engine() -> Engine {
+        let doc = DocumentTree::from_text("tail").insert_table(EngineBlockPath::top(0), 2, 2);
+        engine_with(doc, bpos_top(1, 0))
+    }
+
+    fn apply(e: &mut Engine, cmd: Command) -> Event {
+        block_on(e.apply(cmd))
+    }
+
+    fn text(e: &Engine) -> String {
+        e.undo.current().to_plain_text()
+    }
+
+    fn selection_valid(e: &Engine) -> bool {
+        match &e.selection {
+            None => true,
+            Some(sel) => e.with_selection_doc(|d| {
+                clamp_pos(d, sel.anchor.clone()) == sel.anchor
+                    && clamp_pos(d, sel.caret.clone()) == sel.caret
+            }),
+        }
+    }
+
+    fn bold_patch() -> TextAttrsPatch {
+        TextAttrsPatch {
+            bold: Some(true),
+            italic: None,
+            underline: None,
+            strike: None,
+            font_family: None,
+            font_size: None,
+            color: None,
+            bg_color: None,
+            script: None,
+            language: None,
+            caps: None,
+            small_caps: None,
+        }
+    }
+
+    fn range(a: BridgeLogicalPos, b: BridgeLogicalPos) -> BridgeLogicalRange {
+        BridgeLogicalRange { start: a, end: b }
+    }
+
+    fn table(e: &Engine) -> engine::Table {
+        e.undo.current().blocks[0].as_table().unwrap().clone()
+    }
+
+    const ARABIC: &str = "السلام"; // 12 bytes, six 2-byte letters
+
+    // ---- #117 selection -------------------------------------------------------
+
+    #[test]
+    fn set_selection_clamps_out_of_range_paths_and_offsets() {
+        let mut e = text_engine("hello world");
+        let far = BridgeLogicalPos {
+            path: WirePath::top(9),
+            offset: 1234,
+        };
+        let evt = apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(7, 99), far.clone()),
+                caret: far,
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(selection_valid(&e));
+        let sel = e.selection.clone().unwrap();
+        assert_eq!(sel.caret, bpos_top(0, 11));
+        assert_eq!(sel.anchor, bpos_top(0, 11));
+    }
+
+    #[test]
+    fn set_selection_snaps_mid_scalar_offsets_and_keeps_the_caret_end() {
+        let mut e = text_engine(ARABIC);
+        /* 1 is inside the first letter (→ 0), 3 inside the second (→ 2). */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(0, 1), bpos_top(0, 3)),
+                caret: bpos_top(0, 1),
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (2, 0));
+        assert!(selection_valid(&e));
+    }
+
+    /// #117 × #77 — the clamp runs FIRST (path + char boundary), then the
+    /// atomic-field widening sees only a resolvable position.
+    #[test]
+    fn set_selection_clamps_then_widens_over_fields() {
+        /* "ال" + field "12" at [4, 6) + "سلام". */
+        let doc = DocumentTree::from_text(ARABIC).insert_field_at(
+            engine::LogicalPos {
+                path: EngineBlockPath::top(0),
+                offset: 4,
+            },
+            "PAGE",
+            "12",
+        );
+        let mut e = engine_with(doc, bpos_top(0, 0));
+        /* start 1 is mid-scalar (→ 0); end 5 is inside the field (→ 6). */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(0, 1), bpos_top(0, 5)),
+                caret: bpos_top(0, 1),
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (6, 0));
+        assert!(selection_valid(&e));
+        /* A collapsed caret on a bogus path: the path falls back to the
+        last paragraph (offset kept, snapped), which lands inside the
+        field — so the clamped position is then widened over it. */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(3, 5), bpos_top(3, 5)),
+                caret: bpos_top(3, 5),
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!(sel.caret.path, WirePath::top(0));
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (4, 6));
+        assert!(selection_valid(&e));
+        /* A collapsed caret strictly inside the field selects it whole. */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(0, 5), bpos_top(0, 5)),
+                caret: bpos_top(0, 5),
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (4, 6));
+        /* ExtendSelection: clamp, then snap away from the anchor. */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(0, 0), bpos_top(0, 0)),
+                caret: bpos_top(0, 0),
+            },
+        );
+        apply(
+            &mut e,
+            Command::ExtendSelection {
+                to: bpos_top(0, 5),
+                modifier: SelectionModifier::Shift,
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (0, 6));
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn extend_selection_clamps() {
+        let mut e = text_engine("hello");
+        let evt = apply(
+            &mut e,
+            Command::ExtendSelection {
+                to: bpos_top(5, 77),
+                modifier: SelectionModifier::Shift,
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(selection_valid(&e));
+        assert_eq!(e.selection.clone().unwrap().caret, bpos_top(0, 5));
+    }
+
+    #[test]
+    fn select_all_on_a_table_first_document_stays_valid() {
+        let mut e = table_engine();
+        apply(&mut e, Command::SelectAll);
+        assert!(
+            selection_valid(&e),
+            "{:?}",
+            e.selection.as_ref().map(|s| (&s.anchor, &s.caret))
+        );
+    }
+
+    #[test]
+    fn doc_home_on_a_table_first_document_lands_in_the_first_cell() {
+        let mut e = table_engine();
+        let evt = apply(
+            &mut e,
+            Command::MoveCaret {
+                direction: MoveDirection::DocHome,
+                extend: false,
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(selection_valid(&e));
+        let caret = e.selection.clone().unwrap().caret;
+        assert_eq!(caret.path.steps.len(), 3, "{:?}", caret.path.steps);
+        assert_eq!(caret.offset, 0);
+    }
+
+    // ---- #115 char boundaries ------------------------------------------------
+
+    #[test]
+    fn delete_range_snaps_mid_scalar_offsets() {
+        let cases: &[(u32, u32, &str)] = &[
+            (1, 3, &ARABIC[2..]), // → [0, 2): the first letter goes
+            (3, 3, ARABIC),       // empty after snapping
+            (1, 200, ""),         // end clamps to len
+            (5, 1, &ARABIC[4..]), // reversed + snapped → [0, 4)
+        ];
+        for &(s, en, expected) in cases {
+            let mut e = text_engine(ARABIC);
+            let evt = apply(
+                &mut e,
+                Command::DeleteRange {
+                    range: range(bpos_top(0, s), bpos_top(0, en)),
+                },
+            );
+            assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+            assert_eq!(text(&e), expected, "DeleteRange({s}, {en})");
+            assert!(selection_valid(&e));
+        }
+    }
+
+    #[test]
+    fn replace_range_snaps_and_lands_the_caret_after_the_replacement() {
+        let mut e = text_engine(ARABIC);
+        apply(
+            &mut e,
+            Command::ReplaceRange {
+                range: range(bpos_top(0, 1), bpos_top(0, 3)),
+                text: "X".into(),
+            },
+        );
+        assert_eq!(text(&e), format!("X{}", &ARABIC[2..]));
+        assert_eq!(e.selection.clone().unwrap().caret, bpos_top(0, 1));
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn apply_formatting_with_an_explicit_mid_scalar_range_snaps() {
+        let mut e = text_engine(ARABIC);
+        let evt = apply(
+            &mut e,
+            Command::ApplyFormatting {
+                range: Some(range(bpos_top(0, 1), bpos_top(0, 5))),
+                attrs: bold_patch(),
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        let p = e.undo.current().blocks[0].as_paragraph().unwrap().clone();
+        assert_eq!((p.spans[0].start, p.spans[0].end), (0, 4));
+    }
+
+    #[test]
+    fn explicit_range_edits_on_a_missing_paragraph_are_typed_errors() {
+        let mut e = text_engine("hello");
+        let depth = e.undo.depth();
+        let bogus = range(bpos_top(5, 0), bpos_top(5, 2));
+        for cmd in [
+            Command::DeleteRange {
+                range: bogus.clone(),
+            },
+            Command::ReplaceRange {
+                range: bogus.clone(),
+                text: "x".into(),
+            },
+            Command::ApplyFormatting {
+                range: Some(bogus.clone()),
+                attrs: bold_patch(),
+            },
+            Command::InsertComment {
+                range: bogus,
+                text: "c".into(),
+                author: "a".into(),
+            },
+        ] {
+            let evt = apply(&mut e, cmd);
+            assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        }
+        e.selection = None;
+        let evt = apply(&mut e, Command::SplitParagraph { at: bpos_top(3, 0) });
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(text(&e), "hello");
+        assert_eq!(
+            e.undo.depth(),
+            depth,
+            "a rejected command pushes no undo step"
+        );
+    }
+
+    #[test]
+    fn interactive_insert_with_a_stale_caret_seed_is_clamped() {
+        let mut e = text_engine(ARABIC);
+        e.selection = None;
+        let evt = apply(
+            &mut e,
+            Command::InsertText {
+                at: Some(bpos_top(4, 3)),
+                text: "x".into(),
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(text(&e), format!("{}x{}", &ARABIC[..2], &ARABIC[2..]));
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn composition_overlays_shift_with_the_spliced_preview() {
+        /* "ورحمة " — a revision over the trailing space [10, 11). With a
+        2-byte composition at 6, the space sits at [12, 13) in the
+        spliced text; the old unshifted overlay cut at 11, inside 'ة'. */
+        let para = engine::Paragraph {
+            text: "ورحمة ".into(),
+            revisions: vec![engine::Revision {
+                start: 10,
+                end: 11,
+                kind: engine::RevisionKind::Insert,
+                author: "a".into(),
+                date: "d".into(),
+                id: None,
+                prev_attrs: None,
+            }],
+            hyperlinks: vec![
+                engine::Hyperlink {
+                    start: 0,
+                    end: 6,
+                    target: "x".into(),
+                },
+                engine::Hyperlink {
+                    start: 2,
+                    end: 8,
+                    target: "y".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let (links, revs) = composition_overlay_ranges(&para, 6, 2);
+        assert_eq!((revs[0].start, revs[0].end), (12, 13));
+        assert_eq!(
+            (links[0].start, links[0].end),
+            (0, 6),
+            "ends at off: stays before"
+        );
+        assert_eq!(
+            (links[1].start, links[1].end),
+            (2, 10),
+            "straddles: covers it"
+        );
+    }
+
+    #[test]
+    fn undo_with_a_failing_repaint_still_clamps_the_selection() {
+        let mut e = text_engine("hello");
+        apply(&mut e, Command::SplitParagraph { at: bpos_top(0, 5) });
+        assert_eq!(e.selection.clone().unwrap().caret, bpos_top(1, 0));
+        /* An unloaded font makes every repaint fail. */
+        if let Some(cfg) = e.layout_cfg.as_mut() {
+            cfg.font_id = "missing".into();
+        }
+        let evt = apply(&mut e, Command::Undo);
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(
+            selection_valid(&e),
+            "{:?}",
+            e.selection.as_ref().map(|s| &s.caret)
+        );
+    }
+
+    #[test]
+    fn insert_image_shifts_the_caret_past_the_sentinel() {
+        let mut e = text_engine("hello");
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(0, 1),
+            caret: bpos_top(0, 4),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        /* `at` names no paragraph → the image lands in the last one. */
+        let evt = apply(
+            &mut e,
+            Command::InsertImage {
+                at: bpos_top(7, 3),
+                image: bridge::ImageBlob {
+                    bytes: vec![0x89, b'P', b'N', b'G'],
+                    mime: "image/png".into(),
+                    width: 10,
+                    height: 10,
+                },
+                fit: ImageFit::Original,
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (1, 7));
+        assert!(selection_valid(&e));
+    }
+
+    // ---- #114 / #116 tables --------------------------------------------------
+
+    #[test]
+    fn insert_table_rejects_oversized_or_empty_dimensions() {
+        let mut e = text_engine("x");
+        let depth = e.undo.depth();
+        for (rows, cols) in [
+            (u32::MAX, u32::MAX),
+            (0, 3),
+            (3, 0),
+            (1, 64),
+            (32_768, 1),
+            (2_000, 63),
+        ] {
+            let evt = apply(
+                &mut e,
+                Command::InsertTable {
+                    at: WirePath::top(0),
+                    rows,
+                    cols,
+                },
+            );
+            assert!(matches!(evt, Event::Error { .. }), "{rows}x{cols}: {evt:?}");
+        }
+        assert_eq!(e.undo.depth(), depth);
+        assert_eq!(e.undo.current().blocks.len(), 1);
+        let evt = apply(
+            &mut e,
+            Command::InsertTable {
+                at: WirePath::top(0),
+                rows: 2,
+                cols: 3,
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert_eq!(e.undo.current().blocks.len(), 2);
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn table_commands_reject_out_of_range_targets_without_side_effects() {
+        let mut e = table_engine();
+        let depth = e.undo.depth();
+        let before = table(&e);
+        let t = WirePath::top(0);
+        let cmds = vec![
+            Command::InsertRow {
+                table_path: t.clone(),
+                row: 2,
+                side: InsertSide::Before,
+            },
+            Command::DeleteRow {
+                table_path: t.clone(),
+                row: 5,
+            },
+            Command::InsertColumn {
+                table_path: t.clone(),
+                col: 2,
+                side: InsertSide::After,
+            },
+            Command::DeleteColumn {
+                table_path: t.clone(),
+                col: 9,
+            },
+            Command::MergeCells {
+                table_path: t.clone(),
+                from_row: 0,
+                from_col: 0,
+                to_row: 5,
+                to_col: 5,
+            },
+            Command::MergeCells {
+                table_path: t.clone(),
+                from_row: 1,
+                from_col: 2,
+                to_row: 0,
+                to_col: 0,
+            },
+            Command::SplitCell {
+                table_path: t.clone(),
+                row: 3,
+                col: 0,
+            },
+            Command::SetCellShading {
+                table_path: t.clone(),
+                row: 0,
+                col: 7,
+                color: None,
+            },
+            Command::SetCellBorders {
+                table_path: t.clone(),
+                row: 1,
+                col: 2,
+                borders: bridge::BridgeCellBorders::default(),
+            },
+            /* Wrong kind of block / nothing there. */
+            Command::DeleteTable {
+                path: WirePath::top(1),
+            },
+            Command::DeleteRow {
+                table_path: WirePath::top(9),
+                row: 0,
+            },
+            Command::SetCellShading {
+                table_path: WirePath::root(),
+                row: 0,
+                col: 0,
+                color: None,
+            },
+        ];
+        for cmd in cmds {
+            let label = format!("{cmd:?}");
+            let evt = apply(&mut e, cmd);
+            assert!(matches!(evt, Event::Error { .. }), "{label}: {evt:?}");
+        }
+        assert_eq!(
+            e.undo.depth(),
+            depth,
+            "rejected table commands push no undo step"
+        );
+        assert_eq!(table(&e).rows.len(), before.rows.len());
+        assert_eq!(e.undo.current().blocks.len(), 2);
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn table_commands_accept_in_range_targets() {
+        let mut e = table_engine();
+        let t = WirePath::top(0);
+        let ok = |e: &mut Engine, cmd: Command| {
+            let label = format!("{cmd:?}");
+            let evt = apply(e, cmd);
+            assert!(
+                matches!(evt, Event::SelectionChanged { .. }),
+                "{label}: {evt:?}"
+            );
+            assert!(selection_valid(e));
+        };
+        ok(
+            &mut e,
+            Command::InsertRow {
+                table_path: t.clone(),
+                row: 1,
+                side: InsertSide::After,
+            },
+        );
+        assert_eq!(table(&e).rows.len(), 3);
+        ok(
+            &mut e,
+            Command::InsertColumn {
+                table_path: t.clone(),
+                col: 0,
+                side: InsertSide::Before,
+            },
+        );
+        assert_eq!(table(&e).column_count(), 3);
+        ok(
+            &mut e,
+            Command::MergeCells {
+                table_path: t.clone(),
+                from_row: 0,
+                from_col: 0,
+                to_row: 1,
+                to_col: 1,
+            },
+        );
+        ok(
+            &mut e,
+            Command::SplitCell {
+                table_path: t.clone(),
+                row: 0,
+                col: 0,
+            },
+        );
+        ok(
+            &mut e,
+            Command::SetCellShading {
+                table_path: t.clone(),
+                row: 2,
+                col: 2,
+                color: None,
+            },
+        );
+        ok(
+            &mut e,
+            Command::DeleteRow {
+                table_path: t.clone(),
+                row: 0,
+            },
+        );
+        ok(
+            &mut e,
+            Command::DeleteColumn {
+                table_path: t.clone(),
+                col: 0,
+            },
+        );
+        ok(&mut e, Command::DeleteTable { path: t });
+        assert_eq!(e.undo.current().blocks.len(), 1);
+    }
+
+    #[test]
+    fn insert_row_and_column_respect_the_growth_caps() {
+        let doc = DocumentTree::from_text("tail").insert_table(
+            EngineBlockPath::top(0),
+            1,
+            engine::MAX_TABLE_COLS,
+        );
+        let mut e = engine_with(doc, bpos_top(1, 0));
+        let evt = apply(
+            &mut e,
+            Command::InsertColumn {
+                table_path: WirePath::top(0),
+                col: 0,
+                side: InsertSide::After,
+            },
+        );
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(table(&e).column_count(), engine::MAX_TABLE_COLS as usize);
+    }
+
+    // ---- #118 clock ---------------------------------------------------------------
+
+    #[test]
+    fn iso8601_formatting_matches_js_to_iso_string() {
+        assert_eq!(format_iso8601_utc(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_iso8601_utc(951_782_400, 7),
+            "2000-02-29T00:00:00.007Z"
+        );
+        assert_eq!(
+            format_iso8601_utc(1_700_000_000, 123),
+            "2023-11-14T22:13:20.123Z"
+        );
+        assert_eq!(
+            format_iso8601_utc(4_102_444_799, 999),
+            "2099-12-31T23:59:59.999Z"
+        );
+        let now = now_iso8601();
+        assert_eq!(now.len(), 24, "{now}");
+        assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
+    }
+
+    #[test]
+    fn comments_and_replies_run_natively_through_the_engine_clock() {
+        let mut e = text_engine("hello world");
+        e.review_date = String::new(); // force the clock fallback
+        let evt = apply(
+            &mut e,
+            Command::InsertComment {
+                range: range(bpos_top(0, 0), bpos_top(0, 5)),
+                text: "note".into(),
+                author: "me".into(),
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let defs = e.undo.current().comment_defs.clone();
+        assert_eq!(defs.len(), 1);
+        let date = &defs.values().next().unwrap().date;
+        assert_eq!(date.len(), 24, "{date}");
+        let evt = apply(
+            &mut e,
+            Command::ReplyToComment {
+                parent_id: 1,
+                text: "reply".into(),
+                author: "you".into(),
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert_eq!(e.undo.current().comment_defs.len(), 2);
+        /* The override still wins when set. */
+        e.review_date = "2026-01-01T00:00:00Z".into();
+        apply(
+            &mut e,
+            Command::InsertComment {
+                range: range(bpos_top(0, 6), bpos_top(0, 11)),
+                text: "n2".into(),
+                author: "me".into(),
+            },
+        );
+        assert!(
+            e.undo
+                .current()
+                .comment_defs
+                .values()
+                .any(|d| d.date == "2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn recover_then_tracked_edit_stamps_natively() {
+        let mut e = text_engine("seed");
+        let evt = apply(
+            &mut e,
+            Command::Recover {
+                snapshot: Vec::new(),
+                log_tail: Vec::new(),
+            },
+        );
+        assert!(matches!(evt, Event::Recovered { .. }), "{evt:?}");
+        assert!(
+            e.review_date.is_empty(),
+            "recovery re-arms the clock fallback"
+        );
+        /* The shell re-loads fonts + re-asserts the device scale after a
+        recovery (`setupEngine(restored = true)`); mirror that. */
+        seed_layout(&mut e);
+        apply(&mut e, Command::ToggleTrackChanges { enabled: true });
+        let evt = apply(
+            &mut e,
+            Command::InsertText {
+                at: Some(bpos_top(0, 0)),
+                text: "abc".into(),
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(text(&e), "abc");
+        assert!(selection_valid(&e));
     }
 }

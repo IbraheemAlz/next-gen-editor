@@ -10,6 +10,7 @@ pub mod page;
 pub mod paginate;
 pub mod paragraph;
 pub mod table_bidi;
+pub mod table_place;
 mod table_split;
 pub mod watchdog;
 pub mod wrap;
@@ -19,11 +20,11 @@ mod wrap_fixtures;
 pub use boxes::{
     CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FloatWrap,
     FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, LineSegment,
-    MarkerBox, NoteBand, PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan,
+    MarkerBox, NoteBand, PageBox, ParaFlow, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan,
     TabLeaderKind, TableBox, TableCellBox, TableRowBox, TextAttrs, TextBoxFrame, TextBoxGlyph,
     VisualRun, WrapSide,
 };
-pub use floats::{ColumnLayout, resolve_page_floats};
+pub use floats::{ColumnLayout, resolve_page_floats, story_frame_page};
 pub use page::{A4Page, Margins};
 pub use paginate::{
     FOOTNOTE_SEPARATOR_HEIGHT_PT, HeaderBands, HeaderRole, NoteBody,
@@ -33,9 +34,11 @@ pub use paragraph::{
     InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
 };
 pub use table_bidi::mirror_bidi_visual;
+pub use table_place::{place_table, resolve_table_placement};
 pub use watchdog::{
     BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation,
     PageRefConvergence, Watchdog, converge_page_refs, geometry_fingerprint, verify_prefix,
+    verify_prefix_open,
 };
 pub use wrap::{
     FloatKey, WrapConvergence, WrapCutout, WrapPlan, WrapVerdict, cutouts_for_float, derive_plan,

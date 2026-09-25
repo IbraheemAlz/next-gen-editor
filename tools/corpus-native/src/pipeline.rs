@@ -13,6 +13,7 @@
 //! batch — the entire point of the harness is to survive the crashes it is
 //! looking for.
 
+use crate::drift;
 use crate::nativelayout;
 use crate::panics::{self, CaughtPanic};
 use format_docx::DocxArchive;
@@ -89,6 +90,23 @@ pub struct DocResult {
     pub document_xml_unchanged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_xml_delta_noedit_bytes: Option<u64>,
+    /// Issue #112 — `document.xml` reproduced byte for byte by the
+    /// zero-edit resave (the size delta above can be 0 while the bytes
+    /// still differ).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_xml_byte_identical: Option<bool>,
+    /// Issue #112 — raw offset of the first differing byte (see
+    /// [`crate::drift`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_drift_offset: Option<usize>,
+    /// Issue #112 — innermost element of the ORIGINAL part the first
+    /// differing byte falls in (`w:sectPr`, `#text`, `<prolog>`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_drift_element: Option<String>,
+    /// Issue #112 — `parent/element` bucket key for the drift histogram
+    /// (`w:body/w:sdt`, `/w:document`, `<prolog>`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_drift_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pdf_bytes_len: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,6 +135,10 @@ impl DocResult {
             sibling_drift_bytes: None,
             document_xml_unchanged: None,
             document_xml_delta_noedit_bytes: None,
+            document_xml_byte_identical: None,
+            first_drift_offset: None,
+            first_drift_element: None,
+            first_drift_context: None,
             pdf_bytes_len: None,
             pdf_pages: None,
             edit_check: None,
@@ -209,9 +231,29 @@ fn compare_siblings(a: &DocxArchive, b: &DocxArchive) -> (bool, u64) {
 /// Run the full pipeline on one document's raw bytes. `path_label` is the
 /// path relative to the corpus root, used only for the JSONL record and
 /// panic-reproduction pointer — never touched as a filesystem path here.
-pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: bool) -> DocResult {
+pub fn run_one(
+    path_label: &str,
+    bytes: &[u8],
+    fonts: &FontStack,
+    with_edit: bool,
+    dump_drift: Option<&std::path::Path>,
+) -> DocResult {
     let mut rec = DocResult::new(path_label, bytes.len() as u64);
     let overall_start = Instant::now();
+    /* Issue #112 — `--dump-drift DIR`: write the original and the resaved
+    `document.xml` of every document that does not round-trip byte for
+    byte (or whose resave fails the well-formedness guard) so the drift
+    can be diffed by hand. */
+    let dump = |suffix: &str, xml: &[u8]| {
+        if let Some(dir) = dump_drift {
+            let stem = std::path::Path::new(path_label)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "document".into());
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(dir.join(format!("{stem}.{suffix}.xml")), xml);
+        }
+    };
 
     macro_rules! stage {
         ($stage:literal, $expr:expr) => {{
@@ -259,12 +301,14 @@ pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: boo
     /* 3. PDF export of every page (native "render" — `crates/format-pdf`). */
     let para_texts_refs: Vec<&str> = para_texts_a.iter().map(String::as_str).collect();
     let mut pdf_bytes: Vec<u8> = Vec::new();
+    /* Issue #121 — images embed from the document's media parts. */
     stage!(
         "pdf_export",
-        format_pdf::export_pdf(
+        format_pdf::export_pdf_with_media(
             &pages_a,
             fonts,
             &para_texts_refs,
+            &archive_a.document.media,
             format_pdf::PdfProfile::Plain,
             &mut pdf_bytes,
         )
@@ -277,6 +321,15 @@ pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: boo
         "write_docx_noedit",
         format_docx::write_docx(&archive_a, &archive_a.document)
     );
+
+    /* Issue #112 — dump a drifting resave before any guard can end the
+    record, so a malformed resave is diffable too. */
+    if let (Ok(orig), Ok(resaved)) = (extract_doc_xml(bytes), extract_doc_xml(&resaved_bytes))
+        && orig != resaved
+    {
+        dump("orig", &orig);
+        dump("resaved", &resaved);
+    }
 
     /* 4b. Issue #110 — strict well-formedness of the saved part, BEFORE
     our own reader gets a say. A misaligned passthrough splice is
@@ -302,6 +355,18 @@ pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: boo
         let delta = (doc_xml_resaved.len() as i64 - doc_xml_orig.len() as i64).unsigned_abs();
         rec.document_xml_unchanged = Some(delta == 0);
         rec.document_xml_delta_noedit_bytes = Some(delta);
+        /* Issue #112 — true byte identity + the construct the first
+        differing byte belongs to, so the corpus histograms by bucket. */
+        match drift::first_difference(&doc_xml_orig, &doc_xml_resaved) {
+            None => rec.document_xml_byte_identical = Some(true),
+            Some(offset) => {
+                let point = drift::locate(&doc_xml_orig, offset);
+                rec.document_xml_byte_identical = Some(false);
+                rec.first_drift_offset = Some(point.offset);
+                rec.first_drift_element = Some(point.element);
+                rec.first_drift_context = Some(point.context);
+            }
+        }
     }
 
     /* 6c. No text loss. */

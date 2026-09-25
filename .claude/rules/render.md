@@ -58,6 +58,12 @@ hard failure so CI catches a new loop instead of a silent recovery.
   a full reflow on mismatch — never trust the prediction. A stale-layout
   bug becomes a perf blip plus a `FastPathMismatch` / `CacheMismatch`
   note, not corruption.
+- A band's geometry must be self-consistent where it stops: never cull
+  right behind a keep-with-next paragraph (issue #95), and mark pages
+  that a pending pass will still rewrite — a continuous section's column
+  balance — as provisional (`LazyLayoutInfo::open_from_page`, verified
+  with `layout::verify_prefix_open`, issue #93) instead of letting every
+  expand demote.
 - The nominal path stays output-identical: `geometry_fingerprint` pins
   the pre-watchdog geometry for every paginator and engine fixture. A
   self-defense change that moves a pinned fingerprint moves the goldens.

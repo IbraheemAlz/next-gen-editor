@@ -260,10 +260,33 @@ impl PartialEq for TextBoxGlyph {
 /// (the float rect inset by `source.insets`), with the vertical-anchor
 /// offset already folded into each block's `origin.y` — the renderer is
 /// a pure traversal. Lines past the content rect are clipped at paint.
+///
+/// Issue #165 — `floats` are the boxes nested in this box's story (a
+/// text box inside a text box), resolved against the content rect as a
+/// margin-less pseudo page ([`crate::floats::story_frame_page`]): their
+/// `origin`s are relative to this box's CONTENT rect, exactly as
+/// `blocks` are, and each carries its own laid-out frame. Recursion is
+/// bounded by the engine's text-box nesting cap; empty for every box
+/// without a nested one.
 #[derive(Debug, Clone)]
 pub struct TextBoxFrame {
     pub source: TextBoxGlyph,
     pub blocks: Vec<LayoutBlock>,
+    pub floats: Vec<FloatBox>,
+}
+
+impl TextBoxFrame {
+    /// Issue #165 — visit this frame's story blocks, then every nested
+    /// box's (depth-first, document order). Font collection and the PDF
+    /// `/ToUnicode` walk use it so a nested story is never missed.
+    pub fn for_each_story_blocks(&self, visit: &mut dyn FnMut(&[LayoutBlock])) {
+        visit(&self.blocks);
+        for f in &self.floats {
+            if let Some(tb) = f.text_box.as_deref() {
+                tb.for_each_story_blocks(visit);
+            }
+        }
+    }
 }
 
 impl PartialEq for TextBoxFrame {
@@ -521,10 +544,38 @@ pub struct ParagraphBox {
     /// `KeepChainDropped` note) when the chain is already at a page top
     /// or the watchdog reaches stage (a). A split paragraph's head never
     /// keeps (its keep is with its own tail); the tail inherits the flag.
-    /// Not yet wired from `engine::ParaProperties::keep_next` — the
-    /// engine adapter leaves it `false` until the golden corpus is
-    /// re-verified with keep-with-next enabled.
+    /// Engine-wasm sets it from the resolved (style-cascaded)
+    /// `engine::ParaProperties::keep_next` (issue #95).
     pub keep_next: bool,
+    /// Issues #94 / #95 — the paragraph's pagination properties beyond
+    /// keep-with-next: its resolved before / after spacing (so a block
+    /// the paginator re-places — a relocated keep-with-next chain —
+    /// keeps its gaps) and the keep-lines / widow-control constraints.
+    /// `Default` is "no spacing, no constraint", the historical
+    /// behaviour of every layout-only paragraph.
+    pub flow: ParaFlow,
+}
+
+/// Issues #94 / #95 — per-paragraph pagination inputs carried on the
+/// [`ParagraphBox`] so they survive a re-push (splits, keep-chain
+/// relocation).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ParaFlow {
+    /// Resolved `<w:spacing w:before>` in layout units (scale applied).
+    /// Stamped by [`crate::paginate::Paginator::push_block`] from its
+    /// `before` argument; a split tail carries `0.0` (a continuation
+    /// has no gap above it).
+    pub space_before: f32,
+    /// Resolved `<w:spacing w:after>` in layout units. A split head
+    /// carries `0.0` (its tail owns the gap below the paragraph).
+    pub space_after: f32,
+    /// `<w:keepLines/>` — do not split this paragraph across pages /
+    /// columns when it can move to the next one whole.
+    pub keep_lines: bool,
+    /// `<w:widowControl/>` — a split may not leave a single line on
+    /// either side (Word's default is ON; the engine adapter resolves
+    /// the default, this box-level flag defaults to off).
+    pub widow_control: bool,
 }
 
 impl ParagraphBox {
@@ -577,6 +628,15 @@ impl LayoutBlock {
             LayoutBlock::Table(t) => t.size,
         }
     }
+    /// Issue #173 — the block's horizontal offset within its band:
+    /// [`TableBox::placement_dx`] for a table, `0.0` for a paragraph
+    /// (whose indents and alignment live inside its own box).
+    pub fn placement_dx(&self) -> f32 {
+        match self {
+            LayoutBlock::Paragraph(_) => 0.0,
+            LayoutBlock::Table(t) => t.placement_dx,
+        }
+    }
     pub fn as_paragraph(&self) -> Option<&ParagraphBox> {
         match self {
             LayoutBlock::Paragraph(p) => Some(p),
@@ -607,6 +667,14 @@ pub struct TableBox {
     /// entire table rectangle. `None` per-edge ⇒ no stroke (Word's default
     /// table has no borders unless `<w:tblBorders>` says so).
     pub outer_borders: engine::CellBorders,
+    /// Issue #173 — signed offset of the table's left edge from the left
+    /// edge of the band it was laid out for (the column, a cell's content
+    /// box, a header/footer band), resolved from `<w:jc>`, `<w:tblInd>`
+    /// and `<w:bidiVisual>` by [`crate::place_table`]. Every placement site
+    /// sets `origin.x = band x + placement_dx`, so each page part of a
+    /// split table keeps the same x. `0.0` = flush with the band's left
+    /// edge (the pre-#173 placement of every table).
+    pub placement_dx: f32,
 }
 
 #[derive(Debug, Clone)]

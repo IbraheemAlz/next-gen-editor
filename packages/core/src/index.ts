@@ -98,6 +98,7 @@ export type {
     EngineCapabilities,
     A11yTree,
     A11yPatch,
+    A11yTextBox,
     AnnouncementPriority,
     BridgeSectionGeometry,
     BridgeCellProperties,

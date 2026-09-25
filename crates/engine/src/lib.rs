@@ -2,6 +2,39 @@
 //!
 //! Phase 1 weeks 15–18: plain-text paragraphs, in-place text insertion,
 //! cheap snapshots via `im::Vector` for undo/redo.
+//!
+//! # Wire-value validation policy (issues #114–#117)
+//!
+//! Every byte offset, block path and table dimension that reaches this
+//! crate ultimately comes off the RPC wire (or from a replayed event log),
+//! so nothing here may trust one. The rules, applied at the model
+//! boundary so no caller has to remember them:
+//!
+//! - **Byte offsets snap down** ([`snap_offset`] / [`Paragraph::snap_offset`]).
+//!   An offset is first capped at `text.len()`, then floored to the nearest
+//!   UTF-8 char boundary at or before it — *an offset strictly inside a
+//!   scalar denotes the boundary before that scalar*. Floor (not ceil,
+//!   not reject) because it extends the long-standing `min(len)` clamp
+//!   the same way for both range ends, is idempotent (so "clamping is a
+//!   no-op" is exactly the validity test), and turns a stale-by-a-byte
+//!   caret from an async shell into the nearest sensible position
+//!   instead of a worker trap. Every `Paragraph` primitive that slices or
+//!   stores an offset (`delete_text`, `split_at`, `apply_style`,
+//!   `with_spliced_range`, `word_bounds`, …) and every `DocumentTree`
+//!   mutation that stores one (`insert_text`, the tracked-change family,
+//!   fields, comments, inline objects) goes through it.
+//! - **Block paths never index unchecked.** The `*_in_top` / `*_in_vec`
+//!   helpers resolve every step with `get` and return `None` for a path
+//!   that does not address what the caller expects; an `im::Vector::set`
+//!   is always preceded by a bounds check.
+//! - **Table dimensions are capped before allocation**
+//!   ([`MAX_TABLE_ROWS`], [`MAX_TABLE_COLS`], [`MAX_TABLE_CELLS`]) and
+//!   every row / column / cell coordinate is resolved through
+//!   [`DocumentTree::resolve_table_target`], which returns a typed
+//!   [`TableError`] instead of panicking. The infallible mutation
+//!   helpers stay lenient (out-of-range → unchanged tree) for internal
+//!   callers; the `engine-wasm` command handlers use the checked
+//!   resolver so the shell gets an `Event::Error` it can show.
 
 use im::Vector;
 use serde::{Deserialize, Serialize};
@@ -64,6 +97,35 @@ impl Block {
             Block::Paragraph(_) => None,
         }
     }
+
+    /// Issue #120 — the block-level passthrough markup around this block.
+    pub fn body_xml(&self) -> Option<&BodyPassthrough> {
+        match self {
+            Block::Paragraph(p) => p.body_xml.as_deref(),
+            Block::Table(t) => t.body_xml.as_deref(),
+        }
+    }
+
+    /// Issue #120 — mutable slot for the block-level passthrough markup.
+    pub fn body_xml_mut(&mut self) -> &mut Option<Box<BodyPassthrough>> {
+        match self {
+            Block::Paragraph(p) => &mut p.body_xml,
+            Block::Table(t) => &mut t.body_xml,
+        }
+    }
+}
+
+/// Normalize a wire-supplied byte `offset` into `text` (issue #115) —
+/// the crate's single offset policy, see the module docs: cap at
+/// `text.len()`, then floor to the nearest UTF-8 char boundary at or
+/// before it. Idempotent; at most three steps back (a scalar is ≤ 4
+/// bytes). `text.len()` itself is always a boundary.
+pub fn snap_offset(text: &str, offset: u32) -> u32 {
+    let mut o = (offset as usize).min(text.len());
+    while o > 0 && !text.is_char_boundary(o) {
+        o -= 1;
+    }
+    o as u32
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -203,6 +265,13 @@ pub struct DocumentTree {
     /// them from, so the reader records them here. Empty for an
     /// engine-authored document.
     pub part_root_attrs: std::collections::BTreeMap<String, Vec<(String, String)>>,
+    /// Issue #112 — the source `word/document.xml`'s prolog, root start
+    /// tag, `<w:body>` tag and tail, verbatim (see [`DocumentEnvelope`]).
+    /// Every writer path re-emits them so a zero-edit resave is
+    /// byte-identical; empty (synthesized header) for an engine-authored
+    /// document. Rides the tree — like [`Self::document_root_attrs`] —
+    /// because the live editor saves without the source archive.
+    pub document_envelope: DocumentEnvelope,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -281,7 +350,7 @@ pub struct CommentRange {
 /// - `1440 twips / 20 = 72.0 pt`    ← Word default 1-inch margins
 ///
 /// Aspect ratio 841.9 / 595.3 = 1.4143, matching ISO 216's `1 : √2`.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(default)]
 pub struct PageGeometry {
     pub width: f32,
@@ -574,6 +643,10 @@ pub struct Section {
     pub footnote_props: NoteProps,
     /// Issue #80 — `<w:sectPr><w:endnotePr>` overrides.
     pub endnote_props: NoteProps,
+    /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes this section
+    /// was read from (see [`SectionProps::source_xml`]).
+    #[serde(default, with = "serde_bytes")]
+    pub source_xml: Option<Vec<u8>>,
 }
 
 /// Audit gap A.M11 — `<w:pgNumType>` descriptor.
@@ -717,7 +790,7 @@ impl Section {
 /// desync (the pre-Phase-3 `Vec<Section>` range-stamping never
 /// re-indexed on block-count changes, corrupting multi-section docs on
 /// the first edit).
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct SectionProps {
     pub geometry: PageGeometry,
@@ -739,6 +812,17 @@ pub struct SectionProps {
     pub footnote_props: NoteProps,
     /// Issue #80 — `<w:endnotePr>` overrides.
     pub endnote_props: NoteProps,
+    /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes these
+    /// properties were read from. The `.docx` writer re-emits them
+    /// verbatim as long as a re-parse of the bytes still yields these
+    /// exact properties (a *verified* passthrough: `<w:docGrid>`,
+    /// `w:rsidSect`, `w:gutter`, `<w:cols w:space>` and every other
+    /// unmodeled child survive a zero-edit resave), and regenerates from
+    /// the typed fields the moment page setup, a header reference or the
+    /// section type was changed in the editor. `None` for an
+    /// engine-authored section. Ignored by equality-of-properties checks.
+    #[serde(default, with = "serde_bytes")]
+    pub source_xml: Option<Vec<u8>>,
 }
 
 impl SectionProps {
@@ -756,6 +840,16 @@ impl SectionProps {
             section_type: self.section_type,
             footnote_props: self.footnote_props,
             endnote_props: self.endnote_props,
+            source_xml: self.source_xml,
+        }
+    }
+
+    /// Issue #112 — the typed properties only, `source_xml` cleared: what
+    /// the writer compares a re-parse of the source bytes against.
+    pub fn without_source(&self) -> Self {
+        Self {
+            source_xml: None,
+            ..self.clone()
         }
     }
 }
@@ -772,6 +866,7 @@ impl From<&Section> for SectionProps {
             section_type: s.section_type,
             footnote_props: s.footnote_props,
             endnote_props: s.endnote_props,
+            source_xml: s.source_xml.clone(),
         }
     }
 }
@@ -1281,6 +1376,148 @@ impl GrabBag {
     }
 }
 
+/// Issue #120 — one piece of block-level (`<w:body>` / `<w:tc>` child)
+/// markup that is not a paragraph or a table and that the typed model does
+/// not represent: a `<w:bookmarkStart/>` between two paragraphs, a
+/// `<w:sdt>` content-control envelope around a run of blocks, the
+/// whitespace of a pretty-printed part. The reader attaches these to the
+/// neighbouring block ([`BodyPassthrough`]) and the `.docx` writer
+/// re-emits them verbatim around that block, clean or regenerated.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum BodyFragment {
+    /// Self-contained markup emitted as-is (`<w:bookmarkStart …/>`, a
+    /// `<w:sdt>` whose content holds no block, inter-block whitespace).
+    Verbatim {
+        #[serde(with = "serde_bytes")]
+        xml: Vec<u8>,
+    },
+    /// Opens an envelope around this block and the ones that follow it
+    /// up to the matching [`Self::Close`]: `open_xml` is everything from
+    /// the container's start tag through the last byte before its first
+    /// inner block (`<w:sdt><w:sdtPr>…</w:sdtPr><w:sdtContent>`),
+    /// `close_xml` everything after its last inner block through its end
+    /// tag (`</w:sdtContent></w:sdt>`). The writer keeps a stack, so an
+    /// envelope whose other end was lost to an edit still closes
+    /// (well-formedness is never at the mercy of an edit) and a closer
+    /// without an opener is skipped.
+    Open {
+        id: u32,
+        #[serde(with = "serde_bytes")]
+        open_xml: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        close_xml: Vec<u8>,
+    },
+    /// Closes envelope `id` after this block.
+    Close { id: u32 },
+}
+
+/// Issue #120 — the block-level passthrough markup that surrounds one
+/// block: `before` is emitted ahead of the block's own XML, `after`
+/// behind it, both in source order. Boxed behind an `Option` on
+/// [`Paragraph`] / [`Table`] so the common case costs a pointer.
+///
+/// Travel rules mirror the paragraph mark: a split keeps `before` on the
+/// left half and `after` on the right (the envelope keeps wrapping both),
+/// a merge keeps the head's `before` and the tail's `after`, and
+/// clipboard fragments carry none (a paste never transplants a content
+/// control's envelope).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct BodyPassthrough {
+    pub before: Vec<BodyFragment>,
+    pub after: Vec<BodyFragment>,
+}
+
+impl BodyPassthrough {
+    pub fn is_empty(&self) -> bool {
+        self.before.is_empty() && self.after.is_empty()
+    }
+
+    /// The `before` half only (for the left side of a split).
+    pub fn before_only(this: &Option<Box<Self>>) -> Option<Box<Self>> {
+        this.as_deref().filter(|b| !b.before.is_empty()).map(|b| {
+            Box::new(Self {
+                before: b.before.clone(),
+                after: Vec::new(),
+            })
+        })
+    }
+
+    /// The `after` half only (for the right side of a split).
+    pub fn after_only(this: &Option<Box<Self>>) -> Option<Box<Self>> {
+        this.as_deref().filter(|b| !b.after.is_empty()).map(|b| {
+            Box::new(Self {
+                before: Vec::new(),
+                after: b.after.clone(),
+            })
+        })
+    }
+
+    /// Both blocks' markup, for a merge: `before` = head's then tail's,
+    /// `after` = head's then tail's. Markup that sat BETWEEN the two
+    /// (a bookmark, an empty content control, a closer / opener pair)
+    /// has no boundary to sit on any more and moves to the merged
+    /// block's edges instead of being dropped — an envelope grows to
+    /// cover the merge, it never loses its content control.
+    pub fn merged(head: &Option<Box<Self>>, tail: &Option<Box<Self>>) -> Option<Box<Self>> {
+        let mut before = head
+            .as_deref()
+            .map(|b| b.before.clone())
+            .unwrap_or_default();
+        before.extend(
+            tail.as_deref()
+                .map(|b| b.before.clone())
+                .unwrap_or_default(),
+        );
+        let mut after = head.as_deref().map(|b| b.after.clone()).unwrap_or_default();
+        after.extend(tail.as_deref().map(|b| b.after.clone()).unwrap_or_default());
+        (!before.is_empty() || !after.is_empty()).then(|| Box::new(Self { before, after }))
+    }
+}
+
+/// Issue #112 — the bytes of a source `word/document.xml` that surround
+/// the block list: everything the writer used to synthesize and that
+/// therefore drifted on every zero-edit resave (Word ends its XML
+/// declaration with `\r\n`, declares `xmlns:wpc` before `xmlns:w`, …).
+/// Captured by the `.docx` reader, re-emitted verbatim by every writer
+/// path (the live editor saves from the tree alone); empty for an
+/// engine-authored document, in which case the writer synthesizes the
+/// stock header and footer exactly as before.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct DocumentEnvelope {
+    /// Everything before the root start tag: BOM, XML declaration, the
+    /// newline after it, comments.
+    #[serde(with = "serde_bytes")]
+    pub prolog: Vec<u8>,
+    /// The root start tag itself (`<w:document …>`), attribute order and
+    /// spelling intact. The writer adds any binding a regenerated element
+    /// needs that the source root lacks (a picture pasted into a document
+    /// whose root never declared `wp:`).
+    #[serde(with = "serde_bytes")]
+    pub root_tag: Vec<u8>,
+    /// Bytes between the root start tag and the `<w:body>` start tag
+    /// (whitespace in a pretty-printed part).
+    #[serde(with = "serde_bytes")]
+    pub root_to_body: Vec<u8>,
+    /// The `<w:body …>` start tag.
+    #[serde(with = "serde_bytes")]
+    pub body_tag: Vec<u8>,
+    /// Everything after the trailing body-level `<w:sectPr>` (or the last
+    /// block when there is none): `</w:body>`, `</w:document>` and any
+    /// whitespace around them, to EOF.
+    #[serde(with = "serde_bytes")]
+    pub tail: Vec<u8>,
+}
+
+impl DocumentEnvelope {
+    /// `true` when the reader captured a usable envelope (root + body
+    /// tags + tail); an engine-authored document has none.
+    pub fn is_captured(&self) -> bool {
+        !self.root_tag.is_empty() && !self.body_tag.is_empty() && !self.tail.is_empty()
+    }
+}
+
 /// Inline style for a run of characters: font size, colour, the
 /// bold / italic / underline / strikethrough flags, a background (highlight)
 /// colour, and a font family. All are carried through layout and render.
@@ -1563,6 +1800,20 @@ pub struct InlineObject {
     /// pre-#69 snapshot envelope (format version 1) readable.
     #[serde(default)]
     pub anchor: Option<Box<FloatAnchor>>,
+    /// Issue #119 — the run-level source element this object was read
+    /// from, verbatim: the whole `<w:drawing>`, `<mc:AlternateContent>`
+    /// (DrawingML choice + VML fallback), `<w:pict>` or `<w:object>`.
+    /// The `.docx` writer re-emits it byte-for-byte while it still
+    /// describes the object (same picture, extent and anchor — verified
+    /// against a re-scan at write time) and regenerates from the typed
+    /// fields only once the object was resized or moved. It is the ONLY
+    /// representation of a text box, shape, chart, SmartArt or OLE object
+    /// (`InlineKind::Image` with an empty `rel_id`): the extent is
+    /// modeled so layout reserves the box, the content is not (text
+    /// boxes are issue #83), and such an object is always written from
+    /// these bytes. `None` for engine-authored objects.
+    #[serde(default, with = "serde_bytes")]
+    pub source_xml: Option<Vec<u8>>,
 }
 
 impl InlineObject {
@@ -1570,6 +1821,123 @@ impl InlineObject {
     pub fn is_floating(&self) -> bool {
         self.anchor.is_some()
     }
+
+    /// Issue #165 — the accessible `(name, description)` of a text box:
+    /// its `<wp:docPr name descr>` (read from the anchor's verbatim
+    /// `doc_pr_xml`, else from the first `<wp:docPr>` in the box's
+    /// verbatim source container — an in-line box keeps it there), or
+    /// the VML `<v:shape alt>` as the description for a bare VML box.
+    /// Blank values are `None`; `None` for anything but a text box.
+    pub fn text_box_label(&self) -> Option<(Option<String>, Option<String>)> {
+        let InlineKind::TextBox { story, .. } = &self.kind else {
+            return None;
+        };
+        let from_anchor = self
+            .anchor
+            .as_deref()
+            .and_then(|a| a.doc_pr_xml.as_deref())
+            .and_then(|x| start_tag(x, "<wp:docPr"));
+        let from_source = || {
+            story
+                .source_xml
+                .as_deref()
+                .and_then(|x| start_tag(x, "<wp:docPr"))
+        };
+        if let Some(tag) = from_anchor.or_else(from_source) {
+            return Some((xml_attr(tag, "name"), xml_attr(tag, "descr")));
+        }
+        let alt = story
+            .source_xml
+            .as_deref()
+            .and_then(|x| start_tag(x, "<v:shape"))
+            .and_then(|tag| xml_attr(tag, "alt"));
+        Some((None, alt))
+    }
+}
+
+/// Issue #165 — the first start tag in `xml` opening with `open` (e.g.
+/// `"<wp:docPr"`), up to its `>`: the element name must end right after
+/// `open` (so `<v:shape` never matches `<v:shapetype`).
+fn start_tag<'a>(xml: &'a str, open: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(rel) = xml[from..].find(open) {
+        let start = from + rel;
+        let after = start + open.len();
+        let next = xml[after..].chars().next()?;
+        if next.is_whitespace() || next == '>' || next == '/' {
+            let end = after + xml[after..].find('>')?;
+            return Some(&xml[start..end]);
+        }
+        from = after;
+    }
+    None
+}
+
+/// Issue #165 — the unescaped value of attribute `key` in a start tag
+/// (`"` or `'` quoted); `None` when absent or blank.
+fn xml_attr(tag: &str, key: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = tag[from..].find(key) {
+        let at = from + rel;
+        from = at + key.len();
+        let preceded = at > 0 && bytes[at - 1].is_ascii_whitespace();
+        let rest = tag[from..].trim_start();
+        if !preceded || !rest.starts_with('=') {
+            continue;
+        }
+        let rest = rest[1..].trim_start();
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let body = &rest[1..];
+        let value = &body[..body.find(quote)?];
+        let value = xml_unescape(value);
+        let value = value.trim();
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    None
+}
+
+/// The five predefined XML entities plus numeric character references.
+fn xml_unescape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let Some(semi) = tail.find(';') else {
+            out.push_str(tail);
+            return out;
+        };
+        let ent = &tail[1..semi];
+        let ch = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => ent
+                .strip_prefix("#x")
+                .or_else(|| ent.strip_prefix("#X"))
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| ent.strip_prefix('#').and_then(|d| d.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match ch {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Issue #69 — horizontal reference frame of a floating object
@@ -2150,9 +2518,24 @@ pub struct ParaProperties {
     /// a round-trip. The TOC heading collector reads the resolved value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outline_level: Option<u8>,
+    /// Issue #95 — `<w:widowControl>` resolved through the style
+    /// cascade: `Some(false)` is an explicit `w:val="0"` (which must be
+    /// able to switch an inherited ON off, hence `Option`), `None` means
+    /// never specified. Layout reads `None` as ON — Word's application
+    /// default, which diverges from the spec's "not applied". READ-ONLY
+    /// on the paragraph model like [`Self::outline_level`]: the direct
+    /// element rides the grab bag verbatim; style definitions emit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub widow_control: Option<bool>,
 }
 
 impl ParaProperties {
+    /// Issue #95 — the effective widow / orphan control (Word default:
+    /// on).
+    pub fn widow_control_on(&self) -> bool {
+        self.widow_control.unwrap_or(true)
+    }
+
     /// Overlay `patch` onto `self` using OOXML cascade semantics: a child
     /// style with a *set* (non-default) field overrides the parent. Used by
     /// the Phase 3 `format_docx::style_resolver` to fold a basedOn chain
@@ -2203,6 +2586,7 @@ impl ParaProperties {
             style sources never carry one, so nothing leaks downward. */
             grab_bag: patch.grab_bag.or(self.grab_bag),
             outline_level: patch.outline_level.or(self.outline_level),
+            widow_control: patch.widow_control.or(self.widow_control),
         }
     }
 }
@@ -2314,6 +2698,13 @@ pub struct Paragraph {
     /// `source_xml` untouched.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
+    /// Issue #120 — block-level passthrough markup surrounding this
+    /// paragraph in its source part (a `<w:sdt>` content-control envelope,
+    /// `<w:bookmarkStart/>` between paragraphs, inter-block whitespace).
+    /// See [`BodyPassthrough`] for the travel rules; the `.docx` writer
+    /// emits it around the paragraph whether the paragraph is clean or
+    /// regenerated.
+    pub body_xml: Option<Box<BodyPassthrough>>,
 }
 
 /// Issue #81 — one paragraph-scoped bookmark. `id` is the source
@@ -2343,8 +2734,8 @@ impl Paragraph {
     /// default-only spans dropped, so the representation stays minimal.
     pub fn apply_style(&self, start: u32, end: u32, patch: SpanStyle) -> Paragraph {
         let text_len = self.text.len() as u32;
-        let start = start.min(text_len);
-        let end = end.min(text_len);
+        let start = self.snap_offset(start);
+        let end = self.snap_offset(end);
         if start >= end {
             return self.clone();
         }
@@ -2407,7 +2798,14 @@ impl Paragraph {
             paragraph must never dissolve its section break. */
             section_end: self.section_end.clone(),
             bookmarks: self.bookmarks.clone(),
+            body_xml: self.body_xml.clone(),
         }
+    }
+
+    /// Normalize a wire byte offset into this paragraph's text — the
+    /// crate-wide snap-down policy ([`snap_offset`], module docs).
+    pub fn snap_offset(&self, offset: u32) -> u32 {
+        snap_offset(&self.text, offset)
     }
 
     /// Byte range `[start, end)` of the word containing caret position
@@ -2420,10 +2818,7 @@ impl Paragraph {
         if len == 0 {
             return (0, 0);
         }
-        let mut off = (offset as usize).min(len);
-        while off > 0 && !text.is_char_boundary(off) {
-            off -= 1;
-        }
+        let off = self.snap_offset(offset) as usize;
         /* Classify by the char to the right; at end-of-text, the char left. */
         let ws = text[off..]
             .chars()
@@ -2453,9 +2848,8 @@ impl Paragraph {
     /// Return a copy with bytes `[s, e)` removed. Style spans are clipped and
     /// shifted across the deletion.
     pub fn delete_text(&self, s: u32, e: u32) -> Paragraph {
-        let len = self.text.len() as u32;
-        let s = s.min(len);
-        let e = e.min(len);
+        let s = self.snap_offset(s);
+        let e = self.snap_offset(e);
         if s >= e {
             return self.clone();
         }
@@ -2549,6 +2943,7 @@ impl Paragraph {
                         at: o.at - gap,
                         kind: o.kind.clone(),
                         anchor: o.anchor.clone(),
+                        source_xml: o.source_xml.clone(),
                     })
                 } else {
                     None
@@ -2583,13 +2978,13 @@ impl Paragraph {
             an in-paragraph character deletion. */
             section_end: self.section_end.clone(),
             bookmarks: self.bookmarks.clone(),
+            body_xml: self.body_xml.clone(),
         }
     }
 
     /// Split into `[0, at)` and `[at, len)`. Spans straddling `at` are split.
     pub fn split_at(&self, at: u32) -> (Paragraph, Paragraph) {
-        let len = self.text.len() as u32;
-        let at = at.min(len);
+        let at = self.snap_offset(at);
         let mut left = Vec::new();
         let mut right = Vec::new();
         for run in &self.spans {
@@ -2661,6 +3056,7 @@ impl Paragraph {
                     at: o.at - at,
                     kind: o.kind.clone(),
                     anchor: o.anchor.clone(),
+                    source_xml: o.source_xml.clone(),
                 });
             }
         }
@@ -2687,6 +3083,10 @@ impl Paragraph {
                 /* Issue #81 — paragraph-scoped bookmarks anchor at the
                 paragraph START, which the left half keeps. */
                 bookmarks: self.bookmarks.clone(),
+                /* Issue #120 — the leading envelope markup stays with the
+                left half, the trailing markup moves right with the mark:
+                a content control wrapping the paragraph wraps both halves. */
+                body_xml: BodyPassthrough::before_only(&self.body_xml),
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -2707,6 +3107,7 @@ impl Paragraph {
                 the right half, so a section marker travels with it. */
                 section_end: self.section_end.clone(),
                 bookmarks: Vec::new(),
+                body_xml: BodyPassthrough::after_only(&self.body_xml),
             },
         )
     }
@@ -2758,6 +3159,7 @@ impl Paragraph {
                 at: o.at + shift,
                 kind: o.kind.clone(),
                 anchor: o.anchor.clone(),
+                source_xml: o.source_xml.clone(),
             });
         }
         Paragraph {
@@ -2784,6 +3186,11 @@ impl Paragraph {
             section's properties). Do not "fix" this to self.*. */
             section_end: other.section_end.clone(),
             bookmarks,
+            /* Issue #120 — the merged block sits where both did: it keeps
+            the HEAD's leading envelope markup and the TAIL's trailing
+            markup, so a content control wrapping both still wraps the
+            merge. */
+            body_xml: BodyPassthrough::merged(&self.body_xml, &other.body_xml),
         }
     }
 
@@ -2806,9 +3213,8 @@ impl Paragraph {
     /// destined for layout — it deliberately does NOT set `dirty` or
     /// clear `source_xml` (the model text is not being edited).
     pub fn with_spliced_range(&self, start: u32, end: u32, replacement: &str) -> Paragraph {
-        let len = self.text.len() as u32;
-        let start = start.min(len);
-        let end = end.clamp(start, len);
+        let start = self.snap_offset(start);
+        let end = self.snap_offset(end).max(start);
         let rep_len = replacement.len() as u32;
         let old_len = end - start;
         let mut text = self.text.clone();
@@ -2891,6 +3297,7 @@ impl Paragraph {
                 at: map_start(o.at),
                 kind: o.kind.clone(),
                 anchor: o.anchor.clone(),
+                source_xml: o.source_xml.clone(),
             })
             .collect();
         out
@@ -2904,7 +3311,7 @@ impl Paragraph {
     /// cluster instead of leaving an orphaned combining mark.
     pub fn prev_offset(&self, o: u32) -> u32 {
         use unicode_segmentation::UnicodeSegmentation;
-        let o = (o as usize).min(self.text.len());
+        let o = self.snap_offset(o) as usize;
         self.text[..o]
             .grapheme_indices(true)
             .next_back()
@@ -2916,7 +3323,7 @@ impl Paragraph {
     /// for the symmetric rationale.
     pub fn next_offset(&self, o: u32) -> u32 {
         use unicode_segmentation::UnicodeSegmentation;
-        let o = (o as usize).min(self.text.len());
+        let o = self.snap_offset(o) as usize;
         self.text[o..]
             .grapheme_indices(true)
             .nth(1)
@@ -3194,6 +3601,164 @@ pub struct Table {
     /// `None` for engine-synthesised tables.
     #[serde(with = "serde_bytes")]
     pub source_xml: Option<Vec<u8>>,
+    /// Issue #120 — block-level passthrough markup surrounding this table
+    /// (see [`Paragraph::body_xml`]).
+    pub body_xml: Option<Box<BodyPassthrough>>,
+}
+
+/* ===================================================================
+Issues #114 / #116 — table bounds + typed table errors.
+Every table dimension and coordinate off the wire is validated here,
+BEFORE any allocation or index. See the module docs.
+==================================================================== */
+
+/// Word's hard limit on table columns (`Insert Table` dialog, OOXML
+/// interoperability ceiling).
+pub const MAX_TABLE_COLS: u32 = 63;
+/// Word's hard limit on table rows.
+pub const MAX_TABLE_ROWS: u32 = 32_767;
+/// Engine-side cap on `rows × cols` for one table. Cells are eager
+/// (`TableCell` carries a real `Paragraph`), so a Word-legal 32 767 × 63
+/// request would still be ~2 M paragraphs — far past the 256 MiB
+/// per-worker soft budget. 65 535 cells ≈ a 1 000-row × 63-column grid,
+/// or a 32 767-row × 2-column one.
+pub const MAX_TABLE_CELLS: u64 = 65_535;
+
+/// Why a table command was rejected (issue #116). Every variant maps to
+/// a typed `Event::Error` in `engine-wasm`; none of them is ever a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableError {
+    /// The path does not address a `Block::Table`.
+    NotATable {
+        path: BlockPath,
+    },
+    /// The path addresses a table nested inside a cell; mutation of
+    /// nested tables is not supported yet (PR 3b).
+    NestedUnsupported {
+        path: BlockPath,
+    },
+    RowOutOfRange {
+        row: u32,
+        rows: usize,
+    },
+    ColOutOfRange {
+        col: u32,
+        cols: usize,
+    },
+    /// A zero row or column count.
+    ZeroDimension,
+    TooManyRows {
+        requested: u64,
+        max: u32,
+    },
+    TooManyCols {
+        requested: u64,
+        max: u32,
+    },
+    TooManyCells {
+        requested: u64,
+        max: u64,
+    },
+}
+
+impl std::fmt::Display for TableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TableError::NotATable { path } => {
+                write!(f, "path {:?} does not address a table", path.steps)
+            }
+            TableError::NestedUnsupported { path } => write!(
+                f,
+                "path {:?} addresses a nested table; nested-table editing is not supported yet",
+                path.steps
+            ),
+            TableError::RowOutOfRange { row, rows } => {
+                write!(f, "row {row} is out of range (table has {rows} rows)")
+            }
+            TableError::ColOutOfRange { col, cols } => {
+                write!(f, "column {col} is out of range (row has {cols} cells)")
+            }
+            TableError::ZeroDimension => write!(f, "a table needs at least one row and one column"),
+            TableError::TooManyRows { requested, max } => {
+                write!(f, "{requested} rows exceeds the {max}-row limit")
+            }
+            TableError::TooManyCols { requested, max } => {
+                write!(f, "{requested} columns exceeds the {max}-column limit")
+            }
+            TableError::TooManyCells { requested, max } => {
+                write!(f, "{requested} cells exceeds the {max}-cell limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TableError {}
+
+/// Validate a `rows × cols` request against the caps — pure arithmetic,
+/// no allocation. Issue #114.
+pub fn check_table_dims(rows: u32, cols: u32) -> Result<(), TableError> {
+    if rows == 0 || cols == 0 {
+        return Err(TableError::ZeroDimension);
+    }
+    if rows > MAX_TABLE_ROWS {
+        return Err(TableError::TooManyRows {
+            requested: rows as u64,
+            max: MAX_TABLE_ROWS,
+        });
+    }
+    if cols > MAX_TABLE_COLS {
+        return Err(TableError::TooManyCols {
+            requested: cols as u64,
+            max: MAX_TABLE_COLS,
+        });
+    }
+    let cells = rows as u64 * cols as u64;
+    if cells > MAX_TABLE_CELLS {
+        return Err(TableError::TooManyCells {
+            requested: cells,
+            max: MAX_TABLE_CELLS,
+        });
+    }
+    Ok(())
+}
+
+impl Table {
+    /// Logical column count — the grid width, falling back to the first
+    /// row's cell count for a grid-less (reader-synthesised) table.
+    pub fn column_count(&self) -> usize {
+        if self.grid.is_empty() {
+            self.rows.first().map_or(0, |r| r.cells.len())
+        } else {
+            self.grid.len()
+        }
+    }
+
+    /// Would adding `add_rows` rows and `add_cols` columns keep this table
+    /// inside the caps? Checked by `InsertRow` / `InsertColumn` before
+    /// they allocate (issue #114 sibling audit).
+    pub fn check_growth(&self, add_rows: u32, add_cols: u32) -> Result<(), TableError> {
+        let rows = self.rows.len() as u64 + add_rows as u64;
+        let cols = self.column_count() as u64 + add_cols as u64;
+        if rows > MAX_TABLE_ROWS as u64 {
+            return Err(TableError::TooManyRows {
+                requested: rows,
+                max: MAX_TABLE_ROWS,
+            });
+        }
+        if cols > MAX_TABLE_COLS as u64 {
+            return Err(TableError::TooManyCols {
+                requested: cols,
+                max: MAX_TABLE_COLS,
+            });
+        }
+        if rows * cols > MAX_TABLE_CELLS {
+            return Err(TableError::TooManyCells {
+                requested: rows * cols,
+                max: MAX_TABLE_CELLS,
+            });
+        }
+        Ok(())
+    }
 }
 
 /* ===================================================================
@@ -3251,6 +3816,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3274,6 +3840,7 @@ impl DocumentTree {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         }));
         Self {
             blocks,
@@ -3298,6 +3865,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3322,6 +3890,7 @@ impl DocumentTree {
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             }));
         }
         Self {
@@ -3347,6 +3916,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3380,6 +3950,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3413,6 +3984,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3499,6 +4071,7 @@ impl DocumentTree {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         }
     }
 
@@ -3766,6 +4339,7 @@ impl DocumentTree {
             at: 0,
             kind: InlineKind::NoteSelfRef { kind },
             anchor: None,
+            source_xml: None,
         });
         /* Word styles note bodies `FootnoteText` / `EndnoteText`; adopt
         the style when the document defines it so the body picks up the
@@ -3840,10 +4414,82 @@ impl DocumentTree {
         self.block_at(path)?.as_paragraph()
     }
 
+    /// Normalize a wire position's offset against the paragraph its path
+    /// addresses (issue #115, crate offset policy). The path is left
+    /// untouched; a path that does not resolve to a paragraph returns the
+    /// position unchanged — path fallback is the caller's decision.
+    pub fn snap_pos(&self, pos: LogicalPos) -> LogicalPos {
+        match self.paragraph_at_path(&pos.path) {
+            Some(p) => LogicalPos {
+                offset: p.snap_offset(pos.offset),
+                path: pos.path,
+            },
+            None => pos,
+        }
+    }
+
     /// Resolve a `BlockPath` to a borrowed reference to its terminal
     /// `Table`; `None` when the path does not terminate at one.
     pub fn table_at_path(&self, path: &BlockPath) -> Option<&Table> {
         self.block_at(path)?.as_table()
+    }
+
+    /// Issue #116 — resolve a wire `table_path` to the top-level table
+    /// every table mutation operates on. Typed errors, never a panic:
+    /// a path that addresses a paragraph, nothing, or a nested table.
+    pub fn resolve_table(&self, path: &BlockPath) -> Result<&Table, TableError> {
+        match path.steps.as_slice() {
+            [PathStep::Block(n)] => match self.blocks.get(*n as usize) {
+                Some(Block::Table(t)) => Ok(t),
+                _ => Err(TableError::NotATable { path: path.clone() }),
+            },
+            [PathStep::Block(_), _, ..] if self.table_at_path(path).is_some() => {
+                Err(TableError::NestedUnsupported { path: path.clone() })
+            }
+            _ => Err(TableError::NotATable { path: path.clone() }),
+        }
+    }
+
+    /// Issue #116 — the single validated boundary for every table
+    /// command: `table_path` must resolve ([`Self::resolve_table`]),
+    /// `row` (when given) must index an existing row, and `col` (when
+    /// given) must index an existing cell of that row — or, for a
+    /// column-only command, an existing logical column. Returns the
+    /// table so callers can run further shape checks without a second
+    /// lookup.
+    pub fn resolve_table_target(
+        &self,
+        path: &BlockPath,
+        row: Option<u32>,
+        col: Option<u32>,
+    ) -> Result<&Table, TableError> {
+        let t = self.resolve_table(path)?;
+        match (row, col) {
+            (Some(r), c) => {
+                let Some(row_box) = t.rows.get(r as usize) else {
+                    return Err(TableError::RowOutOfRange {
+                        row: r,
+                        rows: t.rows.len(),
+                    });
+                };
+                if let Some(c) = c
+                    && c as usize >= row_box.cells.len()
+                {
+                    return Err(TableError::ColOutOfRange {
+                        col: c,
+                        cols: row_box.cells.len(),
+                    });
+                }
+            }
+            (None, Some(c)) => {
+                let cols = t.column_count();
+                if c as usize >= cols {
+                    return Err(TableError::ColOutOfRange { col: c, cols });
+                }
+            }
+            (None, None) => {}
+        }
+        Ok(t)
     }
 
     /// Sprint 10 — walk `path` and return a borrowed reference to the
@@ -4188,6 +4834,13 @@ impl DocumentTree {
         }
         /* Empty doc: fall through to plain insert_text + stamp the
         Insert revision on paragraph 0. */
+        /* Issue #115 — resolve the landing offset against the PRE-insert
+        text: `insert_text` snaps a mid-scalar offset down to a char
+        boundary, and the same snap against the post-insert text could
+        land inside the freshly inserted run instead. */
+        let off_input = self
+            .paragraph_at_path(&at.path)
+            .map_or(at.offset, |p| p.snap_offset(at.offset));
         let mut doc = self.insert_text(at.clone(), text);
         let len = text.len() as u32;
         /* Resolve the path the insert actually landed on (insert_text
@@ -4199,7 +4852,6 @@ impl DocumentTree {
                 .unwrap_or(BlockPath::top(0))
         };
         let mut blocks = doc.blocks.clone();
-        let off_input = at.offset;
         let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
             /* `insert_text` clamps `at.offset` to `para.text.len()`
             BEFORE inserting; mirror that clamp so revision math
@@ -4340,8 +4992,15 @@ impl DocumentTree {
             return self.clone();
         }
         let target_path = start.path.clone();
-        let s_off = start.offset;
-        let e_off = end.offset;
+        /* Issue #115 — snap both ends to char boundaries before any
+        revision math or `replace_range` sees them. */
+        let (s_off, e_off) = match self.paragraph_at_path(&target_path) {
+            Some(p) => (p.snap_offset(start.offset), p.snap_offset(end.offset)),
+            None => (start.offset, end.offset),
+        };
+        if s_off >= e_off {
+            return self.clone();
+        }
         let mut blocks = self.blocks.clone();
         let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
             /* Range entirely inside a same-author Insert? If so, undo
@@ -4437,6 +5096,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4464,8 +5124,14 @@ impl DocumentTree {
             return self.clone();
         };
         let parent = start.path.parent();
-        let s_off = start.offset;
-        let e_off = end.offset;
+        /* Issue #115 — revision ranges are stored offsets the layout
+        slices by; snap them like every other stored offset. */
+        let s_off = self
+            .paragraph_at_path(&start.path)
+            .map_or(start.offset, |p| p.snap_offset(start.offset));
+        let e_off = self
+            .paragraph_at_path(&end.path)
+            .map_or(end.offset, |p| p.snap_offset(end.offset));
         let mut blocks = self.blocks.clone();
         let single_paragraph = s_idx == e_idx;
         for idx in s_idx..=e_idx {
@@ -4518,6 +5184,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4549,6 +5216,7 @@ impl DocumentTree {
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             }));
             return Self {
                 blocks,
@@ -4573,6 +5241,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -4586,7 +5255,7 @@ impl DocumentTree {
         };
         let off = at.offset;
         let mutated = mutate_paragraph_in_top(&mut blocks, &target, |para| {
-            let offset = (off as usize).min(para.text.len());
+            let offset = para.snap_offset(off) as usize;
             para.text.insert_str(offset, text);
             /* Shift styled spans across the insertion point — a span
             containing the point grows, spans wholly after it slide right. */
@@ -4650,6 +5319,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4711,6 +5381,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4749,6 +5420,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4806,6 +5478,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4869,6 +5542,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4937,6 +5611,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -4953,10 +5628,15 @@ impl DocumentTree {
         if cached.is_empty() || self.paragraph_at_path(&at.path).is_none() {
             return self.clone();
         }
+        /* Issue #115 — the field anchors where `insert_text` actually
+        landed: the offset snapped against the PRE-insert text (a
+        post-insert snap could land inside `cached` itself). */
+        let start = self
+            .paragraph_at_path(&at.path)
+            .map_or(0, |p| p.snap_offset(at.offset));
         let doc = self.insert_text(at.clone(), cached);
         let mut blocks = doc.blocks.clone();
         let ok = mutate_paragraph_in_top(&mut blocks, &at.path, |para| {
-            let start = at.offset.min(para.text.len() as u32);
             para.fields.push(Field {
                 start,
                 end: start + cached.len() as u32,
@@ -5069,6 +5749,7 @@ impl DocumentTree {
             settings_dirty: split.settings_dirty,
             document_root_attrs: split.document_root_attrs.clone(),
             part_root_attrs: split.part_root_attrs.clone(),
+            document_envelope: split.document_envelope.clone(),
         }
     }
 
@@ -5175,6 +5856,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5224,8 +5906,8 @@ impl DocumentTree {
                 _ => false,                            // text stays live
             };
             if delete_text {
-                let s = (rev.start as usize).min(para.text.len());
-                let e = (rev.end as usize).min(para.text.len());
+                let s = para.snap_offset(rev.start) as usize;
+                let e = para.snap_offset(rev.end) as usize;
                 if s < e {
                     let removed_len = (e - s) as u32;
                     para.text.replace_range(s..e, "");
@@ -5257,6 +5939,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5272,7 +5955,7 @@ impl DocumentTree {
         author: String,
         date: String,
     ) -> (Self, u32) {
-        let (start, end) = order_positions(start, end);
+        let (start, end) = order_positions(self.snap_pos(start), self.snap_pos(end));
         let new_id = self
             .comment_defs
             .keys()
@@ -5324,6 +6007,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         };
         (doc, new_id)
     }
@@ -5403,6 +6087,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         };
         Some((doc, new_id))
     }
@@ -5461,6 +6146,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5495,6 +6181,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5582,6 +6269,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5681,6 +6369,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5788,6 +6477,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5871,6 +6561,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5930,6 +6621,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -5986,6 +6678,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6110,6 +6803,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6183,6 +6877,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6235,6 +6930,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -6350,6 +7046,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6405,6 +7102,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6697,6 +7395,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -6737,6 +7436,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -6864,6 +7564,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -6900,6 +7601,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -6931,6 +7633,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -7091,6 +7794,7 @@ impl DocumentTree {
                     settings_dirty: self.settings_dirty,
                     document_root_attrs: self.document_root_attrs.clone(),
                     part_root_attrs: self.part_root_attrs.clone(),
+                    document_envelope: self.document_envelope.clone(),
                 }
                 .with_list_markers_refreshed(),
                 caret,
@@ -7141,6 +7845,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -7338,6 +8043,7 @@ impl DocumentTree {
                 settings_dirty: self.settings_dirty,
                 document_root_attrs: self.document_root_attrs.clone(),
                 part_root_attrs: self.part_root_attrs.clone(),
+                document_envelope: self.document_envelope.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -7355,8 +8061,8 @@ impl DocumentTree {
             let Some(p) = self.paragraph_at_path(&start.path) else {
                 return String::new();
             };
-            let lo = (start.offset as usize).min(p.text.len());
-            let hi = (end.offset as usize).min(p.text.len());
+            let lo = p.snap_offset(start.offset) as usize;
+            let hi = p.snap_offset(end.offset) as usize;
             if lo >= hi {
                 return String::new();
             }
@@ -7366,7 +8072,7 @@ impl DocumentTree {
             let Some(p) = self.paragraph_at_path(&start.path) else {
                 return String::new();
             };
-            let lo = (start.offset as usize).min(p.text.len());
+            let lo = p.snap_offset(start.offset) as usize;
             return p.text[lo..].to_string();
         }
         let Some(sp_idx) = start.path.last_block_index() else {
@@ -7385,12 +8091,12 @@ impl DocumentTree {
             };
             let len = para.text.len();
             let lo = if idx == sp_idx {
-                (start.offset as usize).min(len)
+                para.snap_offset(start.offset) as usize
             } else {
                 0
             };
             let hi = if idx == ep_idx {
-                (end.offset as usize).min(len)
+                para.snap_offset(end.offset) as usize
             } else {
                 len
             };
@@ -7415,9 +8121,30 @@ impl DocumentTree {
     /// by `at` (top-level path only — nested-cell insertion in 5b). The
     /// new table sits at top-level block index `at.steps[0]`; the
     /// existing block at that index slides down by one.
+    pub fn try_insert_table(
+        &self,
+        at: BlockPath,
+        rows: u32,
+        cols: u32,
+    ) -> Result<Self, TableError> {
+        check_table_dims(rows, cols)?;
+        Ok(self.insert_table(at, rows, cols))
+    }
+
+    /// Infallible sibling of [`Self::try_insert_table`] for internal
+    /// callers (fixtures, writer tests). Issue #114 — the dimensions are
+    /// clamped into the caps, so this can never allocate from an
+    /// unbounded wire value either; the command boundary uses the
+    /// checked variant so the shell sees a typed error instead of a
+    /// silently smaller table.
     pub fn insert_table(&self, at: BlockPath, rows: u32, cols: u32) -> Self {
         let idx = top_level_block_index(&at).unwrap_or(self.blocks.len() as u32);
-        let cols = cols.max(1) as usize;
+        let cols_u32 = cols.clamp(1, MAX_TABLE_COLS);
+        let rows = rows
+            .clamp(1, MAX_TABLE_ROWS)
+            .min((MAX_TABLE_CELLS / cols_u32 as u64) as u32)
+            .max(1);
+        let cols = cols_u32 as usize;
         /* Default column width — evenly divide A4 content width
         (9020 twips ≈ 6.26 in) so a fresh table fits the page on
         insert. Phase 5c will switch to `<w:tblLayout w:type="autofit"/>`
@@ -7425,8 +8152,8 @@ impl DocumentTree {
         the page is the pragmatic default. */
         let per_col = (DEFAULT_A4_CONTENT_TWIPS / cols as i32).max(720);
         let grid: Vec<i32> = vec![per_col; cols];
-        let mut row_vec: Vec<TableRow> = Vec::with_capacity(rows.max(1) as usize);
-        for _ in 0..rows.max(1) {
+        let mut row_vec: Vec<TableRow> = Vec::with_capacity(rows as usize);
+        for _ in 0..rows {
             let mut cells = Vec::with_capacity(cols);
             for _ in 0..cols {
                 cells.push(default_table_cell());
@@ -7450,6 +8177,7 @@ impl DocumentTree {
             save. */
             dirty: true,
             source_xml: None,
+            body_xml: None,
         };
         let mut blocks = self.blocks.clone();
         let insert_at = (idx as usize).min(blocks.len());
@@ -7489,6 +8217,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -7525,6 +8254,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 
@@ -7633,23 +8363,30 @@ impl DocumentTree {
             if r0 >= rcount {
                 return;
             }
-            let span = (c1 - c0 + 1) as u8;
+            let span = (c1 - c0 + 1).min(u8::MAX as u32) as u8;
             /* Horizontal collapse: top-row cells in the rectangle's
             column range merge into one cell with `grid_span = span`. */
-            if let Some(top_row) = t.rows.get_mut(r0 as usize) {
-                let drop_count = (c1.min(top_row.cells.len() as u32 - 1) - c0) as usize;
-                if (c0 as usize) < top_row.cells.len() {
-                    top_row.cells[c0 as usize].props.grid_span = span;
-                    top_row.cells[c0 as usize].props.v_merge = if r0 == r1 {
-                        VMergeRole::None
-                    } else {
-                        VMergeRole::Restart
-                    };
-                }
-                for _ in 0..drop_count {
-                    if (c0 as usize + 1) < top_row.cells.len() {
-                        top_row.cells.remove(c0 as usize + 1);
-                    }
+            let Some(top_row) = t.rows.get_mut(r0 as usize) else {
+                return;
+            };
+            /* Issue #116 — a cell-less row (or `c0` past the row's last
+            cell) used to underflow `len - 1 - c0`; nothing to merge. */
+            let Some(last) = (top_row.cells.len() as u32).checked_sub(1) else {
+                return;
+            };
+            if c0 > last {
+                return;
+            }
+            let drop_count = (c1.min(last) - c0) as usize;
+            top_row.cells[c0 as usize].props.grid_span = span;
+            top_row.cells[c0 as usize].props.v_merge = if r0 == r1 {
+                VMergeRole::None
+            } else {
+                VMergeRole::Restart
+            };
+            for _ in 0..drop_count {
+                if (c0 as usize + 1) < top_row.cells.len() {
+                    top_row.cells.remove(c0 as usize + 1);
                 }
             }
             /* Vertical: rows r0+1..=r1 collapse to Word's on-disk shape —
@@ -7817,6 +8554,7 @@ impl DocumentTree {
             settings_dirty: self.settings_dirty,
             document_root_attrs: self.document_root_attrs.clone(),
             part_root_attrs: self.part_root_attrs.clone(),
+            document_envelope: self.document_envelope.clone(),
         }
     }
 }
@@ -7853,10 +8591,7 @@ const DEFAULT_A4_CONTENT_TWIPS: i32 = 6765;
 fn push_paragraph_plain(p: &Paragraph, out: &mut String) {
     let mut cursor: usize = 0;
     for obj in &p.inline_objects {
-        let at = obj.at as usize;
-        if at > p.text.len() {
-            break;
-        }
+        let at = snap_offset(&p.text, obj.at) as usize;
         if at > cursor {
             out.push_str(&p.text[cursor..at]);
         }
@@ -7881,8 +8616,10 @@ fn push_paragraph_plain(p: &Paragraph, out: &mut String) {
                 }
             }
         }
-        /* Skip the 3-byte U+FFFC sentinel. */
-        cursor = at.saturating_add(3).min(p.text.len());
+        /* Skip the 3-byte U+FFFC sentinel. Snapped (issue #115): an
+        object offset that does not sit on its sentinel must not leave the
+        cursor mid-scalar; never step backwards past `cursor` either. */
+        cursor = cursor.max(snap_offset(&p.text, (at as u32).saturating_add(3)) as usize);
     }
     if cursor < p.text.len() {
         out.push_str(&p.text[cursor..]);
@@ -8236,6 +8973,9 @@ fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u
 /// part of the document.
 fn strip_section_marker(mut p: Paragraph) -> Paragraph {
     p.section_end = None;
+    /* Issue #120 — a clipboard fragment never transplants the block-level
+    envelope markup (a content control's `<w:sdt>`, a bookmark) either. */
+    p.body_xml = None;
     p
 }
 
@@ -8251,10 +8991,8 @@ fn strip_section_marker(mut p: Paragraph) -> Paragraph {
 fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) {
     const SENTINEL: char = '\u{FFFC}';
     let sentinel_len = SENTINEL.len_utf8() as u32;
-    let mut offset = (offset as usize).min(para.text.len());
-    while !para.text.is_char_boundary(offset) {
-        offset -= 1;
-    }
+    /* Issue #115 — the crate's single offset policy (module docs). */
+    let offset = para.snap_offset(offset) as usize;
     para.text.insert(offset, SENTINEL);
     let off = offset as u32;
     for s in &mut para.spans {
@@ -8298,6 +9036,7 @@ fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) {
         at: off,
         kind,
         anchor: None,
+        source_xml: None,
     });
     para.inline_objects.sort_by_key(|i| i.at);
     para.dirty = true;
@@ -8359,7 +9098,10 @@ fn strip_section_markers(blocks: Vec<Block>) -> Vec<Block> {
         .into_iter()
         .map(|b| match b {
             Block::Paragraph(p) => Block::Paragraph(strip_section_marker(p)),
-            table => table,
+            Block::Table(mut t) => {
+                t.body_xml = None;
+                Block::Table(t)
+            }
         })
         .collect()
 }
@@ -8475,6 +9217,11 @@ fn replace_block_in_top(
     };
     let n = *n as usize;
     if path.steps.len() == 1 {
+        /* Issue #116 — `im::Vector::set` panics (via `index_mut`) on an
+        out-of-range index; a stale wire path must be a no-op instead. */
+        if n >= top.len() {
+            return None;
+        }
         top.set(n, replacement);
         return Some(());
     }
@@ -8971,6 +9718,7 @@ mod tests {
                     height_emu: 0,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -8990,6 +9738,7 @@ mod tests {
                     height_emu: 914_400,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9018,6 +9767,7 @@ mod tests {
                     height_emu: 100,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9053,6 +9803,7 @@ mod tests {
                     height_emu: 914_400,
                 },
                 anchor: Some(Box::new(anchor)),
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9135,6 +9886,7 @@ mod tests {
                     height_emu: 100,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             ..Default::default()
         }));
@@ -9245,6 +9997,7 @@ mod tests {
                 behind_doc: true,
                 ..FloatAnchor::default()
             })),
+            source_xml: None,
         };
         let bytes = rmp_serde::to_vec_named(&obj).expect("encode");
         let back: InlineObject = rmp_serde::from_slice(&bytes).expect("decode");
@@ -9266,6 +10019,7 @@ mod tests {
                         height_emu: 1,
                     },
                     anchor: None,
+                    source_xml: None,
                 },
                 InlineObject {
                     at: 3,
@@ -9275,6 +10029,7 @@ mod tests {
                         height_emu: 1,
                     },
                     anchor: None,
+                    source_xml: None,
                 },
             ],
             ..Default::default()
@@ -9295,6 +10050,7 @@ mod tests {
                     custom_mark_follows: false,
                 },
                 anchor: None,
+                source_xml: None,
             },
             InlineObject {
                 at: 7,
@@ -9303,6 +10059,7 @@ mod tests {
                     custom_mark_follows: false,
                 },
                 anchor: None,
+                source_xml: None,
             },
         ];
         let after = d.insert_text(
@@ -9384,6 +10141,7 @@ mod tests {
             ],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         assert_eq!(d.to_plain_text(), "a\tb\nc\td");
     }
@@ -10162,6 +10920,7 @@ mod tests {
             }],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         let cell_pos = LogicalPos::new(
             BlockPath::top(1)
@@ -10233,6 +10992,7 @@ mod tests {
             }],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }));
         let path = BlockPath {
             steps: vec![
@@ -10617,6 +11377,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -10645,6 +11406,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -10670,6 +11432,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -10773,6 +11536,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -10812,6 +11576,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -11308,6 +12073,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -11353,6 +12119,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -11397,6 +12164,7 @@ mod tests {
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -11419,6 +12187,7 @@ mod tests {
                 direct_overrides: ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             },
         ];
         let (out, caret) = doc.insert_rich(
@@ -12011,6 +12780,7 @@ mod tests {
             settings_dirty: false,
             document_root_attrs: Vec::new(),
             part_root_attrs: Default::default(),
+            document_envelope: Default::default(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();
@@ -12610,6 +13380,74 @@ mod tests {
     }
 }
 
+/// Issue #165 — accessible labels of text boxes from `<wp:docPr>`.
+#[cfg(test)]
+mod text_box_label_tests {
+    use super::*;
+
+    fn text_box(anchor_doc_pr: Option<&str>, source: Option<&str>) -> InlineObject {
+        InlineObject {
+            at: 0,
+            kind: InlineKind::TextBox {
+                width_emu: 914_400,
+                height_emu: 457_200,
+                story: Box::new(TextBoxStory {
+                    source_xml: source.map(str::to_string),
+                    ..TextBoxStory::default()
+                }),
+            },
+            anchor: anchor_doc_pr.map(|x| {
+                Box::new(FloatAnchor {
+                    doc_pr_xml: Some(x.to_string()),
+                    ..FloatAnchor::default()
+                })
+            }),
+            source_xml: None,
+        }
+    }
+
+    #[test]
+    fn anchor_doc_pr_names_and_describes_the_box() {
+        let io = text_box(
+            Some(r#"<wp:docPr id="3" name="Callout &amp; note" descr='Side &#x2014; bar'/>"#),
+            None,
+        );
+        assert_eq!(
+            io.text_box_label(),
+            Some((
+                Some("Callout & note".to_string()),
+                Some("Side \u{2014} bar".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn inline_box_reads_the_outer_doc_pr_from_its_source() {
+        let src = r#"<w:drawing><wp:inline><wp:docPrX name="no"/><wp:docPr id="1" name="Outer" descr="  "/><wps:txbx><w:txbxContent><wp:docPr id="2" name="Inner"/></w:txbxContent></wps:txbx></wp:inline></w:drawing>"#;
+        let io = text_box(None, Some(src));
+        assert_eq!(io.text_box_label(), Some((Some("Outer".to_string()), None)));
+    }
+
+    #[test]
+    fn vml_alt_is_the_description_and_non_boxes_have_no_label() {
+        let src = r#"<w:pict><v:shapetype alt="x"/><v:shape id="s" alt="Pull quote"><v:textbox/></v:shape></w:pict>"#;
+        assert_eq!(
+            text_box(None, Some(src)).text_box_label(),
+            Some((None, Some("Pull quote".to_string())))
+        );
+        assert_eq!(text_box(None, None).text_box_label(), Some((None, None)));
+        let pic = InlineObject {
+            at: 0,
+            kind: InlineKind::NoteSelfRef {
+                kind: NoteKind::Footnote,
+            },
+            anchor: None,
+            source_xml: None,
+        };
+        assert_eq!(pic.text_box_label(), None);
+    }
+}
+
 /// Issue #85 — crash-recovery persistence of the undo stack.
 #[cfg(test)]
 mod undo_history_tests {
@@ -12699,5 +13537,471 @@ mod undo_history_tests {
         assert_eq!(trimmed.depth(), 4);
         assert_eq!(text(trimmed.current()), "9");
         assert_eq!(trimmed.cap(), 4);
+    }
+}
+
+/// Issues #114–#117 — wire-value validation at the model boundary. Table-
+/// driven over the scripts that broke the #90 sweep: Arabic (2-byte
+/// scalars), stacked combining marks, emoji (4-byte), ZWJ sequences.
+#[cfg(test)]
+mod wire_validation_tests {
+    use super::*;
+
+    const ARABIC: &str = "السلام"; // six 2-byte letters, 12 bytes
+
+    const SAMPLES: &[&str] = &[
+        "السلام عليكم ورحمة الله",
+        "e\u{0301}\u{0301}\u{0301}",
+        "🙂🙂 emoji run",
+        "👨\u{200D}👩\u{200D}👧 family",
+        "mixed عربي 🙂 e\u{0301} end",
+        "",
+        "a",
+    ];
+
+    fn every_offset(text: &str) -> impl Iterator<Item = u32> {
+        0..=(text.len() as u32 + 3)
+    }
+
+    fn pos(block: u32, offset: u32) -> LogicalPos {
+        LogicalPos {
+            path: BlockPath::top(block),
+            offset,
+        }
+    }
+
+    fn bold() -> SpanStyle {
+        SpanStyle {
+            bold: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn para(text: &str) -> Paragraph {
+        Paragraph {
+            text: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Every stored offset that later slices `text` sits on a char boundary.
+    fn assert_boundaries(p: &Paragraph) {
+        let ok = |o: u32| p.text.is_char_boundary(o as usize);
+        for s in &p.spans {
+            assert!(
+                ok(s.start) && ok(s.end),
+                "span {:?} in {:?}",
+                (s.start, s.end),
+                p.text
+            );
+        }
+        for f in &p.fields {
+            assert!(
+                ok(f.start) && ok(f.end),
+                "field {:?} in {:?}",
+                (f.start, f.end),
+                p.text
+            );
+        }
+        for r in &p.revisions {
+            assert!(
+                ok(r.start) && ok(r.end),
+                "revision {:?} in {:?}",
+                (r.start, r.end),
+                p.text
+            );
+        }
+    }
+
+    fn all_paragraphs(doc: &DocumentTree) -> Vec<&Paragraph> {
+        fn walk<'a>(b: &'a Block, out: &mut Vec<&'a Paragraph>) {
+            match b {
+                Block::Paragraph(p) => out.push(p),
+                Block::Table(t) => {
+                    for row in &t.rows {
+                        for cell in &row.cells {
+                            for cb in &cell.blocks {
+                                walk(cb, out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for b in doc.blocks.iter() {
+            walk(b, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn snap_offset_floors_to_char_boundary_and_is_idempotent() {
+        for text in SAMPLES {
+            for off in every_offset(text) {
+                let s = snap_offset(text, off);
+                let cap = (off as usize).min(text.len());
+                assert!(text.is_char_boundary(s as usize), "{text:?} @ {off}");
+                assert!(s as usize <= cap, "snap never moves forward");
+                assert_eq!(snap_offset(text, s), s, "idempotent");
+                /* Floor: no boundary strictly between the snap and the cap. */
+                for k in (s as usize + 1)..=cap {
+                    assert!(
+                        !text.is_char_boundary(k),
+                        "{text:?}: {k} is a closer boundary"
+                    );
+                }
+            }
+        }
+        assert_eq!(snap_offset(ARABIC, 1), 0);
+        assert_eq!(snap_offset(ARABIC, 3), 2);
+        assert_eq!(snap_offset(ARABIC, 12), 12);
+        assert_eq!(snap_offset(ARABIC, 13), 12);
+        assert_eq!(snap_offset("🙂", 2), 0);
+        assert_eq!(
+            snap_offset("e\u{0301}", 2),
+            1,
+            "a combining mark is its own scalar"
+        );
+    }
+
+    #[test]
+    fn paragraph_primitives_never_panic_at_any_offset_pair() {
+        for text in SAMPLES {
+            let p = para(text);
+            for a in every_offset(text) {
+                for b in every_offset(text) {
+                    let d = p.delete_text(a, b);
+                    assert_boundaries(&d);
+                    let (l, r) = p.split_at(a);
+                    assert_eq!(l.text.len() + r.text.len(), text.len());
+                    assert_boundaries(&l);
+                    assert_boundaries(&r);
+                    let styled = p.apply_style(a, b, bold());
+                    assert_boundaries(&styled);
+                    let spliced = p.with_spliced_range(a, b, "XY");
+                    assert_boundaries(&spliced);
+                    let (ws, we) = p.word_bounds(a);
+                    assert!(
+                        text.is_char_boundary(ws as usize) && text.is_char_boundary(we as usize)
+                    );
+                    assert!(text.is_char_boundary(p.prev_offset(a) as usize));
+                    assert!(text.is_char_boundary(p.next_offset(a) as usize));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn document_text_ops_snap_mid_scalar_offsets_and_never_panic() {
+        for text in SAMPLES {
+            let doc = DocumentTree::from_text(text);
+            for a in every_offset(text) {
+                for b in every_offset(text) {
+                    let results = [
+                        doc.delete_range(pos(0, a), pos(0, b)),
+                        doc.insert_text(pos(0, a), "x"),
+                        doc.split_paragraph(pos(0, a)),
+                        doc.apply_style(pos(0, a), pos(0, b), bold()),
+                        doc.tracked_delete_range(pos(0, a), pos(0, b), "a".into(), "d".into()),
+                        doc.tracked_insert_text(pos(0, a), "yz", "a".into(), "d".into()),
+                        doc.tracked_format_change(
+                            pos(0, a),
+                            pos(0, b),
+                            SpanStyle::default(),
+                            "a".into(),
+                            "d".into(),
+                        ),
+                        doc.insert_field_at(pos(0, a), "PAGE", "1"),
+                        doc.insert_comment(
+                            pos(0, a),
+                            pos(0, b),
+                            "c".into(),
+                            "a".into(),
+                            "d".into(),
+                        )
+                        .0,
+                    ];
+                    for d in &results {
+                        for p in all_paragraphs(d) {
+                            assert_boundaries(p);
+                        }
+                    }
+                    let _ = doc.text_range(pos(0, a), pos(0, b));
+                    let _ = doc.slice(pos(0, a), pos(0, b));
+                    let _ = doc.slice_blocks(pos(0, a), pos(0, b));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mid_scalar_offsets_resolve_to_the_boundary_before_the_scalar() {
+        let doc = DocumentTree::from_text(ARABIC);
+        /* [1, 3) snaps to [0, 2): exactly the first letter goes. */
+        let d = doc.delete_range(pos(0, 1), pos(0, 3));
+        assert_eq!(d.to_plain_text(), &ARABIC[2..]);
+        /* Insert at 3 lands at 2. */
+        let d = doc.insert_text(pos(0, 3), "x");
+        assert_eq!(
+            d.to_plain_text(),
+            format!("{}x{}", &ARABIC[..2], &ARABIC[2..])
+        );
+        /* Split at 3 splits at 2. */
+        let d = doc.split_paragraph(pos(0, 3));
+        assert_eq!(d.blocks[0].as_paragraph().unwrap().text, &ARABIC[..2]);
+        assert_eq!(d.blocks[1].as_paragraph().unwrap().text, &ARABIC[2..]);
+        /* A mid-scalar style range snaps to the enclosing boundaries. */
+        let d = doc.apply_style(pos(0, 1), pos(0, 5), bold());
+        let spans = &d.blocks[0].as_paragraph().unwrap().spans;
+        assert_eq!((spans[0].start, spans[0].end), (0, 4));
+        /* Reads agree with writes. */
+        assert_eq!(doc.text_range(pos(0, 1), pos(0, 5)), &ARABIC[0..4]);
+    }
+
+    #[test]
+    fn tracked_insert_revision_anchors_on_the_pre_insert_boundary() {
+        let doc = DocumentTree::from_text(ARABIC);
+        let d = doc.tracked_insert_text(pos(0, 3), "zz", "a".into(), "d".into());
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.text, format!("{}zz{}", &ARABIC[..2], &ARABIC[2..]));
+        assert_eq!(p.revisions.len(), 1);
+        assert_eq!((p.revisions[0].start, p.revisions[0].end), (2, 4));
+    }
+
+    #[test]
+    fn field_anchor_snaps_to_the_pre_insert_boundary() {
+        let doc = DocumentTree::from_text(ARABIC);
+        let d = doc.insert_field_at(pos(0, 3), "PAGE", "1");
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.text, format!("{}1{}", &ARABIC[..2], &ARABIC[2..]));
+        assert_eq!((p.fields[0].start, p.fields[0].end), (2, 3));
+    }
+
+    #[test]
+    fn out_of_range_block_paths_are_no_ops_not_panics() {
+        let doc = DocumentTree::from_text("one");
+        let far = pos(7, 2);
+        let _ = doc.delete_range(far.clone(), pos(9, 3));
+        let _ = doc.apply_style(far.clone(), pos(9, 3), bold());
+        let _ = doc.split_paragraph(far.clone());
+        let _ = doc.insert_text(far, "x");
+        let mut blocks = doc.blocks.clone();
+        assert!(
+            replace_block_in_top(
+                &mut blocks,
+                &BlockPath::top(5),
+                Block::Paragraph(Paragraph::default())
+            )
+            .is_none()
+        );
+        assert_eq!(blocks.len(), 1, "an out-of-range replace touched nothing");
+    }
+
+    // ---- tables (#114 / #116) -------------------------------------------------
+
+    #[test]
+    fn check_table_dims_enforces_the_caps_before_any_allocation() {
+        assert_eq!(check_table_dims(0, 3), Err(TableError::ZeroDimension));
+        assert_eq!(check_table_dims(3, 0), Err(TableError::ZeroDimension));
+        assert!(matches!(
+            check_table_dims(u32::MAX, u32::MAX),
+            Err(TableError::TooManyRows { .. })
+        ));
+        assert!(matches!(
+            check_table_dims(32_768, 1),
+            Err(TableError::TooManyRows { .. })
+        ));
+        assert!(matches!(
+            check_table_dims(1, 64),
+            Err(TableError::TooManyCols { .. })
+        ));
+        assert!(matches!(
+            check_table_dims(2_000, 63),
+            Err(TableError::TooManyCells { .. })
+        ));
+        for (r, c) in [(1, 1), (32_767, 2), (1_040, 63), (63, 63)] {
+            assert_eq!(check_table_dims(r, c), Ok(()), "{r}x{c} is legal");
+        }
+        let doc = DocumentTree::from_text("x");
+        /* The #114 reproducer: a ~128 GB request must return, not abort. */
+        assert!(matches!(
+            doc.try_insert_table(BlockPath::top(0), u32::MAX, u32::MAX),
+            Err(TableError::TooManyRows { .. })
+        ));
+        assert_eq!(
+            doc.try_insert_table(BlockPath::top(0), 0, 1).err(),
+            Some(TableError::ZeroDimension)
+        );
+        let ok = doc.try_insert_table(BlockPath::top(0), 2, 3).unwrap();
+        let t = ok.blocks[0].as_table().unwrap();
+        assert_eq!((t.rows.len(), t.rows[0].cells.len()), (2, 3));
+    }
+
+    #[test]
+    fn infallible_insert_table_clamps_into_the_caps() {
+        let doc = DocumentTree::from_text("x");
+        let t = doc.insert_table(BlockPath::top(0), 5, u32::MAX);
+        let t = t.blocks[0].as_table().unwrap();
+        assert_eq!(
+            (t.rows.len(), t.column_count()),
+            (5, MAX_TABLE_COLS as usize)
+        );
+        let t = doc.insert_table(BlockPath::top(0), u32::MAX, u32::MAX);
+        let t = t.blocks[0].as_table().unwrap();
+        assert_eq!(t.column_count(), MAX_TABLE_COLS as usize);
+        assert_eq!(t.rows.len() as u64, MAX_TABLE_CELLS / MAX_TABLE_COLS as u64);
+        let t = doc.insert_table(BlockPath::top(0), 0, 0);
+        let t = t.blocks[0].as_table().unwrap();
+        assert_eq!((t.rows.len(), t.column_count()), (1, 1));
+    }
+
+    #[test]
+    fn resolve_table_target_returns_typed_errors() {
+        let doc = DocumentTree::from_text("p").insert_table(BlockPath::top(0), 2, 3);
+        assert!(matches!(
+            doc.resolve_table(&BlockPath::top(1)),
+            Err(TableError::NotATable { .. })
+        ));
+        assert!(matches!(
+            doc.resolve_table(&BlockPath::top(9)),
+            Err(TableError::NotATable { .. })
+        ));
+        assert!(matches!(
+            doc.resolve_table(&BlockPath::root()),
+            Err(TableError::NotATable { .. })
+        ));
+        assert!(doc.resolve_table(&BlockPath::top(0)).is_ok());
+        assert_eq!(
+            doc.resolve_table_target(&BlockPath::top(0), Some(2), None)
+                .err(),
+            Some(TableError::RowOutOfRange { row: 2, rows: 2 })
+        );
+        assert_eq!(
+            doc.resolve_table_target(&BlockPath::top(0), Some(1), Some(3))
+                .err(),
+            Some(TableError::ColOutOfRange { col: 3, cols: 3 })
+        );
+        assert_eq!(
+            doc.resolve_table_target(&BlockPath::top(0), None, Some(3))
+                .err(),
+            Some(TableError::ColOutOfRange { col: 3, cols: 3 })
+        );
+        assert!(
+            doc.resolve_table_target(&BlockPath::top(0), Some(1), Some(2))
+                .is_ok()
+        );
+        assert!(
+            doc.resolve_table_target(&BlockPath::top(0), None, Some(2))
+                .is_ok()
+        );
+        /* A cell paragraph is not a table … */
+        let cell_para = BlockPath::top(0)
+            .push(PathStep::Cell { row: 0, col: 0 })
+            .push(PathStep::Block(0));
+        assert!(matches!(
+            doc.resolve_table(&cell_para),
+            Err(TableError::NotATable { .. })
+        ));
+        /* … and a real nested table is recognised but not editable yet. */
+        let mut nested = doc.clone();
+        let mut blocks = nested.blocks.clone();
+        let mut b = blocks[0].clone();
+        if let Block::Table(t) = &mut b {
+            t.rows[0].cells[0]
+                .blocks
+                .push(Block::Table(Table::default()));
+        }
+        blocks.set(0, b);
+        nested.blocks = blocks;
+        let nested_path = BlockPath::top(0)
+            .push(PathStep::Cell { row: 0, col: 0 })
+            .push(PathStep::Block(1));
+        assert!(matches!(
+            nested.resolve_table(&nested_path),
+            Err(TableError::NestedUnsupported { .. })
+        ));
+        /* Every error renders as a human-readable message. */
+        for e in [
+            TableError::NotATable {
+                path: BlockPath::top(1),
+            },
+            TableError::RowOutOfRange { row: 2, rows: 2 },
+            TableError::ZeroDimension,
+            TableError::TooManyCells {
+                requested: 1,
+                max: 1,
+            },
+        ] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn table_growth_is_capped() {
+        let wide = Table {
+            grid: vec![1; MAX_TABLE_COLS as usize],
+            rows: vec![TableRow::default()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            wide.check_growth(0, 1),
+            Err(TableError::TooManyCols { .. })
+        ));
+        assert_eq!(wide.check_growth(1, 0), Ok(()));
+        let tall = Table {
+            grid: vec![1; 2],
+            rows: (0..MAX_TABLE_ROWS).map(|_| TableRow::default()).collect(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            tall.check_growth(1, 0),
+            Err(TableError::TooManyRows { .. })
+        ));
+        assert!(matches!(
+            tall.check_growth(0, 1),
+            Err(TableError::TooManyCells { .. })
+        ));
+    }
+
+    #[test]
+    fn table_mutations_with_out_of_range_indices_never_panic() {
+        let doc = DocumentTree::from_text("p").insert_table(BlockPath::top(0), 2, 2);
+        let paths = [
+            BlockPath::top(0),
+            BlockPath::top(1),
+            BlockPath::top(7),
+            BlockPath::root(),
+            BlockPath::top(0).push(PathStep::Cell { row: 0, col: 0 }),
+        ];
+        for path in &paths {
+            for r in [0u32, 1, 2, 99] {
+                for c in [0u32, 1, 2, 99] {
+                    let _ = doc.insert_row(path.clone(), r as usize);
+                    let _ = doc.delete_row(path.clone(), r);
+                    let _ = doc.insert_column(path.clone(), c as usize);
+                    let _ = doc.delete_column(path.clone(), c);
+                    let _ = doc.merge_cells(path.clone(), r, c, 99, 99);
+                    let _ = doc.merge_cells(path.clone(), 99, 99, r, c);
+                    let _ = doc.merge_cells(path.clone(), r, c, 0, 0);
+                    let _ = doc.split_cell(path.clone(), r, c);
+                    let _ = doc.set_cell_shading(path.clone(), r, c, Some([1, 2, 3, 4]));
+                    let _ = doc.set_cell_borders(path.clone(), r, c, CellBorders::default());
+                }
+            }
+            let _ = doc.delete_table(path.clone());
+        }
+        /* The `len - 1` underflow: merge across a row that has no cells. */
+        let mut hollow = doc.clone();
+        let mut blocks = hollow.blocks.clone();
+        let mut b = blocks[0].clone();
+        if let Block::Table(t) = &mut b {
+            t.rows[0].cells.clear();
+        }
+        blocks.set(0, b);
+        hollow.blocks = blocks;
+        let _ = hollow.merge_cells(BlockPath::top(0), 0, 0, 1, 1);
+        let _ = hollow.merge_cells(BlockPath::top(0), 1, 0, 0, 1);
+        let _ = hollow.merge_cells(BlockPath::top(0), 1, 5, 1, 9);
     }
 }
