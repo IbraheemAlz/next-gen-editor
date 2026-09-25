@@ -378,9 +378,11 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
   regeneration didn't).
 - Every document that still rewrites source bytes gets a cheap root-cause
   tag (`hyperlink` / `comment anchor` / `form field` / `sdt` / `fldSimple`
-  / `move` / `table` / `rPr` / `other`) so the corpus can be tracked
-  against the filed issues (#242–#249) — see `tools/corpus-native`'s
-  `classify_rewrite` and `report.mjs`'s root-cause histogram.
+  / `move` / `table` / `rPr` / `other`, plus the one-byte shapes
+  `empty <w:p/>` (#267) and `t preserve`, issue #248) so the corpus can be
+  tracked against the filed issues (#242–#249) — see
+  `tools/corpus-native`'s `classify_rewrite` and `report.mjs`'s
+  root-cause histogram.
 - XML escapes: `&` `<` `>` only. `xml:space="preserve"` on every `<w:t>` to keep trailing whitespace.
 
 ## Bash / agent ergonomics

@@ -1455,6 +1455,12 @@ impl GrabBag {
 pub struct SourceAttr {
     pub name: String,
     pub value: String,
+    /// Issue #248 — the whitespace written before the attribute when it
+    /// is not a single space (a pretty-printed start tag that breaks its
+    /// attributes over several lines). `None` = one space. Skipped when
+    /// `None`, so a pre-#248 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ws: Option<String>,
 }
 
 /// Issues #199 / #106 — the paragraph's own `<w:pPr>` as read, plus the
@@ -4143,7 +4149,7 @@ pub enum RowHeight {
     Exact { twips: i32 },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct RowProperties {
     pub height: Option<RowHeight>,
@@ -4159,7 +4165,7 @@ pub struct RowProperties {
     pub grab_bag: Option<Box<GrabBag>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct CellProperties {
     pub grid_span: u8,
@@ -4189,7 +4195,7 @@ pub enum TableLayout {
     Fixed,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct TableProperties {
     pub width: Option<CellWidth>,
@@ -4223,6 +4229,11 @@ pub struct TableCell {
     /// 1-2 paragraphs, so persistent-vector overhead is not worth the
     /// structural-sharing win at that size (RFC §1.4).
     pub blocks: Vec<Block>,
+    /// Issue #248 — the source `<w:tc>` markup (see
+    /// [`CellSourceMarkup`]). Rides the cell object, so it follows the
+    /// cell through every table restructuring. Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_markup: Option<Box<CellSourceMarkup>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -4230,6 +4241,10 @@ pub struct TableCell {
 pub struct TableRow {
     pub props: RowProperties,
     pub cells: Vec<TableCell>,
+    /// Issue #248 — the source `<w:tr>` markup (see [`RowSourceMarkup`]).
+    /// Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_markup: Option<Box<RowSourceMarkup>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -4251,6 +4266,88 @@ pub struct Table {
     /// Issue #120 — block-level passthrough markup surrounding this table
     /// (see [`Paragraph::body_xml`]).
     pub body_xml: Option<Box<BodyPassthrough>>,
+    /// Issue #248 — the source `<w:tbl>` markup (see
+    /// [`TableSourceMarkup`]). Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_markup: Option<Box<TableSourceMarkup>>,
+}
+
+/// Issue #248 — one source property element of a table (`<w:tblPr>`,
+/// `<w:tblGrid>`, `<w:tblPrEx>`, `<w:trPr>`, `<w:tcPr>`) as read, with
+/// the model state it produced. `lead` is what the source wrote between
+/// the previous sibling (or the parent's start tag) and the element — the
+/// whitespace of a pretty-printed part — and is re-emitted whenever the
+/// element is written. `xml` is re-emitted verbatim only while the
+/// owner's live model still equals `model` (a *verified* passthrough, the
+/// `<w:pPr>` rule of #199); otherwise the element regenerates, adopting
+/// the source spelling of every unchanged empty child.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceElement<T> {
+    #[serde(with = "serde_bytes")]
+    pub lead: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub xml: Vec<u8>,
+    pub model: T,
+}
+
+/// Issue #248 — attribute-level + whitespace source markup of a
+/// `<w:tbl>` read from a `.docx`, the table counterpart of
+/// [`SourceMarkup`]. A clean table never consults it (its `source_xml`
+/// passthrough wins); a regenerated one (any cell edit or table command)
+/// uses it to stay byte-close to the source: the `<w:tbl>` attributes,
+/// the verified `<w:tblPr>` bytes and the verified `<w:tblGrid>` bytes
+/// (`<w:tblGridChange>` included). What sits between rows (whitespace,
+/// bookmarks, a row-level `<w:sdt>` wrapper) rides each row's
+/// [`RowSourceMarkup::body_xml`].
+///
+/// Nothing here is offset-anchored: the row / cell markup lives ON the
+/// row / cell objects, so a row or column insert / delete, a merge or a
+/// split carries it with the content it describes (a fresh row or cell
+/// has none and is written plainly), and the property bytes are
+/// re-verified against the model at every write — so the markup can
+/// never land on the wrong element.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct TableSourceMarkup {
+    /// `<w:tbl>` attributes, source order.
+    pub attrs: Vec<SourceAttr>,
+    pub tbl_pr: Option<SourceElement<TableProperties>>,
+    pub grid: Option<SourceElement<Vec<i32>>>,
+}
+
+/// Issue #248 — source markup of one `<w:tr>` (see [`TableSourceMarkup`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct RowSourceMarkup {
+    /// `<w:tr>` attributes (`w:rsidR`, `w14:paraId`, …), source order.
+    pub attrs: Vec<SourceAttr>,
+    /// Row-level passthrough between the rows of the table: whitespace
+    /// and range markers before the `<w:tr>` (`before`), a `<w:sdt>` /
+    /// `<w:customXml>` wrapper around one or more rows as an
+    /// `Open` / `Close` pair (issue #245's `Bug66263-table.docx`), the
+    /// whitespace before `</w:tbl>` (`after` of the last row). Same
+    /// fragments and writer stack as the block level (issue #120).
+    pub body_xml: Option<Box<BodyPassthrough>>,
+    /// Issue #103 — the row's `<w:tblPrEx>` (table property exceptions),
+    /// unmodeled: always re-emitted verbatim (`model` unused).
+    pub tbl_pr_ex: Option<SourceElement<()>>,
+    pub tr_pr: Option<SourceElement<RowProperties>>,
+}
+
+/// Issue #248 — source markup of one `<w:tc>` (see [`TableSourceMarkup`]).
+/// The whitespace inside the cell around its blocks rides the blocks'
+/// own `body_xml` (issue #120).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct CellSourceMarkup {
+    /// `<w:tc>` attributes, source order.
+    pub attrs: Vec<SourceAttr>,
+    /// Cell-level passthrough between the cells of a row (whitespace,
+    /// markers, a cell-level `<w:sdt>` / `<w:customXml>` wrapper; the
+    /// whitespace before `</w:tr>` is the last cell's `after`).
+    pub body_xml: Option<Box<BodyPassthrough>>,
+    pub tc_pr: Option<SourceElement<CellProperties>>,
 }
 
 /* ===================================================================
@@ -9231,6 +9328,7 @@ impl DocumentTree {
             row_vec.push(TableRow {
                 props: RowProperties::default(),
                 cells,
+                source_markup: None,
             });
         }
         let table = Table {
@@ -9248,6 +9346,7 @@ impl DocumentTree {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         };
         let mut blocks = self.blocks.clone();
         let insert_at = (idx as usize).min(blocks.len());
@@ -9381,6 +9480,7 @@ impl DocumentTree {
             let new_row = TableRow {
                 props: RowProperties::default(),
                 cells: (0..cols).map(|_| default_table_cell()).collect(),
+                source_markup: None,
             };
             let insert_at = at.min(t.rows.len());
             t.rows.insert(insert_at, new_row);
@@ -10111,6 +10211,7 @@ pub fn default_table_cell() -> TableCell {
             ..CellProperties::default()
         },
         blocks: vec![Block::Paragraph(Paragraph::default())],
+        source_markup: None,
     }
 }
 
@@ -11481,6 +11582,7 @@ mod tests {
                 text: s.into(),
                 ..Default::default()
             })],
+            source_markup: None,
         };
         d.blocks.push_back(Block::Table(Table {
             grid: vec![6765, 6765],
@@ -11489,15 +11591,18 @@ mod tests {
                 TableRow {
                     props: RowProperties::default(),
                     cells: vec![cell("a"), cell("b")],
+                    source_markup: None,
                 },
                 TableRow {
                     props: RowProperties::default(),
                     cells: vec![cell("c"), cell("d")],
+                    source_markup: None,
                 },
             ],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         assert_eq!(d.to_plain_text(), "a\tb\nc\td");
     }
@@ -12272,11 +12377,14 @@ mod tests {
                         text: "cell".into(),
                         ..Default::default()
                     })],
+                    source_markup: None,
                 }],
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         let cell_pos = LogicalPos::new(
             BlockPath::top(1)
@@ -12337,6 +12445,7 @@ mod tests {
                 text: "x".into(),
                 ..Default::default()
             })],
+            source_markup: None,
         };
         cell.props.shading = Some([0xff, 0, 0, 0xff]);
         d.blocks.push_back(Block::Table(Table {
@@ -12345,10 +12454,12 @@ mod tests {
             rows: vec![TableRow {
                 props: RowProperties::default(),
                 cells: vec![cell],
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         let path = BlockPath {
             steps: vec![
@@ -15534,6 +15645,7 @@ mod source_markup_tests {
             attrs: vec![SourceAttr {
                 name: "w:rsidR".into(),
                 value: rsid.into(),
+                ws: None,
             }],
             ..SourceRun::default()
         }
@@ -15557,10 +15669,12 @@ mod source_markup_tests {
                     SourceAttr {
                         name: "w14:paraId".into(),
                         value: "1A2B3C4D".into(),
+                        ws: None,
                     },
                     SourceAttr {
                         name: "w:rsidR".into(),
                         value: "00A1".into(),
+                        ws: None,
                     },
                 ],
                 ppr: None,

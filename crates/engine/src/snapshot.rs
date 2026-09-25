@@ -462,6 +462,7 @@ mod tests {
         let attr = |n: &str, v: &str| SourceAttr {
             name: n.into(),
             value: v.into(),
+            ws: None,
         };
         let mut doc = DocumentTree::from_text("Hello wrold");
         let plain = encode(&doc).unwrap();

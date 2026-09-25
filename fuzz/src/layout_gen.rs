@@ -91,7 +91,7 @@ fn gen_cell(u: &mut Unstructured) -> TableCell {
     TableCell {
         props: Default::default(),
         blocks,
-    }
+    source_markup: None,}
 }
 
 fn gen_table(u: &mut Unstructured) -> Table {
@@ -108,7 +108,7 @@ fn gen_table(u: &mut Unstructured) -> Table {
         rows.push(TableRow {
             props: Default::default(),
             cells,
-        });
+        source_markup: None,});
     }
     Table {
         grid,
@@ -117,7 +117,7 @@ fn gen_table(u: &mut Unstructured) -> Table {
         dirty: false,
         source_xml: None,
         body_xml: None,
-    }
+    source_markup: None,}
 }
 
 fn gen_block(u: &mut Unstructured, allow_table: bool) -> Block {

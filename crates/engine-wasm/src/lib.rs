@@ -18515,6 +18515,7 @@ mod tests {
                 body_xml: None,
                 source_markup: None,
             })],
+            source_markup: None,
         }
     }
 
@@ -18525,10 +18526,12 @@ mod tests {
             rows: vec![engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells,
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }
     }
 
@@ -21743,11 +21746,14 @@ mod tests {
                         text: "cell".into(),
                         ..Default::default()
                     })],
+                    source_markup: None,
                 }],
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         let mut engine = test_engine_with_doc(doc);
         let cell_path = BridgeBlockPath {
@@ -23343,6 +23349,7 @@ mod tests {
         let cell = |text: &str| engine::TableCell {
             props: engine::CellProperties::default(),
             blocks: vec![engine::Block::Paragraph(rtl(text))],
+            source_markup: None,
         };
         let mut d = DocumentTree::from_text("");
         d.blocks.set(0, engine::Block::Paragraph(rtl("intro")));
@@ -23350,6 +23357,7 @@ mod tests {
             .map(|r| engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells: (1..=3).map(|c| cell(&format!("r{r}c{c}"))).collect(),
+                source_markup: None,
             })
             .collect();
         d.blocks.push_back(engine::Block::Table(engine::Table {
@@ -23363,6 +23371,7 @@ mod tests {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(rtl("outro")));
         d
@@ -23394,8 +23403,10 @@ mod tests {
                     .map(|c| engine::TableCell {
                         props: engine::CellProperties::default(),
                         blocks: vec![engine::Block::Paragraph(para(&format!("r{r}c{c}")))],
+                        source_markup: None,
                     })
                     .collect(),
+                source_markup: None,
             })
             .collect();
         d.blocks.push_back(engine::Block::Table(engine::Table {
@@ -23412,6 +23423,7 @@ mod tests {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         d.blocks.push_back(engine::Block::Paragraph(para("outro")));
         d
@@ -23786,6 +23798,7 @@ mod tests {
         t.rows.push(engine::TableRow {
             props: engine::RowProperties::default(),
             cells: vec![cell_with_text("next A"), cell_with_text("next B")],
+            source_markup: None,
         });
         let mut d = DocumentTree::from_text("intro");
         d.blocks.push_back(engine::Block::Table(t));
@@ -24063,6 +24076,7 @@ mod tests {
             t.rows.push(engine::TableRow {
                 props: engine::RowProperties::default(),
                 cells: vec![cell_with_text(&format!("row {i}"))],
+                source_markup: None,
             });
         }
         d.blocks.push_back(engine::Block::Table(t));
