@@ -6506,7 +6506,11 @@ impl Engine {
                 DocFormat::Html => self.save_html_bytes(),
                 DocFormat::PlainText => self.save_plain_text_bytes(),
             },
-            Command::ExportPdf { conformance } => self.do_export_pdf(conformance),
+            Command::ExportPdf { conformance } => self.do_export_pdf(match conformance {
+                PdfConformance::A1b => format_pdf::PdfProfile::A1b,
+                PdfConformance::A2u => format_pdf::PdfProfile::A2u,
+                PdfConformance::X3 => format_pdf::PdfProfile::X3,
+            }),
             Command::CloseDocument => phase3_stub("CloseDocument"),
             Command::DeleteRange { range } => self.do_delete_range(range),
             Command::ReplaceRange { range, text } => self.do_replace_range(range, text),
@@ -8747,10 +8751,14 @@ impl Engine {
     /// Export the current document to a single-page PDF (D3.7). Always laid
     /// out at scale `1.0` — PDF user space is logical points, never device px.
     ///
-    /// `conformance` selects the output profile (D5.4 / issue #28): `A1b`
-    /// emits PDF/A-1b, `A2u` emits PDF/A-2u, `X3` emits PDF/X-3:2003 —
-    /// each maps 1:1 onto its `format_pdf::PdfProfile`.
-    fn do_export_pdf(&self, conformance: PdfConformance) -> Event {
+    /// `profile` selects the output (D5.4 / issue #28 / issue #210): the
+    /// `Command::ExportPdf` dispatch maps its wire-level `PdfConformance`
+    /// 1:1 onto `format_pdf::PdfProfile` before calling this; taking the
+    /// `format_pdf` type directly (rather than `PdfConformance`) also lets
+    /// a native test drive the plain (non-archival) profile, which has no
+    /// `PdfConformance` variant of its own — `Plain` is reachable only by
+    /// calling this method directly, never over the wire.
+    fn do_export_pdf(&self, profile: format_pdf::PdfProfile) -> Event {
         /* `false` — a PDF export is the committed document, never the
         in-progress IME composition. */
         /* `target_y: None` — PDF export is a full-document materialization,
@@ -8765,11 +8773,6 @@ impl Engine {
         ) {
             Ok(v) => v,
             Err(e) => return *e,
-        };
-        let profile = match conformance {
-            PdfConformance::A1b => format_pdf::PdfProfile::A1b,
-            PdfConformance::A2u => format_pdf::PdfProfile::A2u,
-            PdfConformance::X3 => format_pdf::PdfProfile::X3,
         };
         /* Phase 6 — `para_texts` is a flat per-document table indexed by
         `ParagraphBox::source_paragraph_id`. The walk order matches the
@@ -18440,15 +18443,15 @@ mod tests {
         let engine = test_engine_with_doc(doc);
         let count =
             |pdf: &[u8], needle: &[u8]| pdf.windows(needle.len()).filter(|w| *w == needle).count();
-        for (conformance, images, smasks) in
-            [(PdfConformance::A2u, 4, 1), (PdfConformance::A1b, 3, 0)]
+        for (profile, images, smasks) in
+            [(format_pdf::PdfProfile::A2u, 4, 1), (format_pdf::PdfProfile::A1b, 3, 0)]
         {
-            let Event::PdfExported { bytes, .. } = engine.do_export_pdf(conformance) else {
+            let Event::PdfExported { bytes, .. } = engine.do_export_pdf(profile) else {
                 panic!("ExportPdf must succeed");
             };
-            assert_eq!(count(&bytes, b"/Subtype /Image"), images, "{conformance:?}");
-            assert_eq!(count(&bytes, b"/SMask"), smasks, "{conformance:?}");
-            assert_eq!(count(&bytes, b"/DCTDecode"), 2, "{conformance:?}");
+            assert_eq!(count(&bytes, b"/Subtype /Image"), images, "{profile:?}");
+            assert_eq!(count(&bytes, b"/SMask"), smasks, "{profile:?}");
+            assert_eq!(count(&bytes, b"/DCTDecode"), 2, "{profile:?}");
         }
     }
 
@@ -18970,7 +18973,7 @@ mod tests {
         format_pdf::export_pdf(&pages, &fonts, &[], format_pdf::PdfProfile::Plain, &mut pdf)
             .expect("pdf");
         assert!(pdf.starts_with(b"%PDF"));
-        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(PdfConformance::A2u) else {
+        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(format_pdf::PdfProfile::A2u) else {
             panic!("engine pdf export");
         };
         assert!(bytes.starts_with(b"%PDF"));
@@ -19095,7 +19098,7 @@ mod tests {
             assert!((rect.y0 - want_y).abs() < 0.01, "{} vs {want_y}", rect.y0);
         }
         /* PDF: the picture is embedded and painted. */
-        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(PdfConformance::A2u) else {
+        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(format_pdf::PdfProfile::A2u) else {
             panic!("engine pdf export");
         };
         let count = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
@@ -23338,6 +23341,12 @@ mod mutation_signal_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;
+
+/// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
+/// `format_pdf::export_pdf` path, end to end (not the #144 acceptance
+/// test's `layout_paragraph`-simulated TOC-entry-shaped paragraph).
+#[cfg(test)]
+mod toc_pdf_export_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {
