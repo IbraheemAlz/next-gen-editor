@@ -138,6 +138,19 @@ pub enum Event {
         seq: u64,
         /// `engine::snapshot::FORMAT_VERSION` the bytes were written with.
         format_version: u8,
+        /// Issue #212 — set when the snapshot was taken with
+        /// `Command::Snapshot.detach_package` and the session holds a
+        /// retained source package: the content hash `bytes` records in
+        /// its place (the key the caller stores the package under).
+        #[serde(default)]
+        #[tsify(optional)]
+        package_hash: Option<String>,
+        /// Issue #212 — the detached package itself (an `engine::snapshot`
+        /// envelope of `engine::SourcePackage`), shipped only when the
+        /// caller's `known_package_hash` did not match `package_hash`.
+        #[serde(default, with = "serde_bytes")]
+        #[tsify(type = "Uint8Array", optional)]
+        package: Option<Vec<u8>>,
     },
 
     /* Document */
