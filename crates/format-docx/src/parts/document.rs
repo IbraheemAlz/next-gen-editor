@@ -1127,7 +1127,7 @@ pub fn parse_document_xml_with_warnings(
     when the element opens; mark the byte range covered when it
     closes. `target` is the rId at this stage — the archive resolver
     swaps it to a URL via the rels map in a second pass. */
-    let mut hyperlink_stack: Vec<(String, u32)> = Vec::new();
+    let mut hyperlink_stack: Vec<(String, u32, Vec<engine::SourceAttr>)> = Vec::new();
 
     /* Phase 6 — `<w:sectPr>` accumulators. A sectPr can live in two places:
     inside a paragraph's `<w:pPr>` (ends a section *at* that paragraph,
@@ -1510,7 +1510,10 @@ pub fn parse_document_xml_with_warnings(
                         let target = attr_val(&e, b"r:id")
                             .or_else(|| attr_val(&e, b"w:anchor").map(|a| format!("#{a}")))
                             .unwrap_or_default();
-                        hyperlink_stack.push((target, start));
+                        /* Issue #242 — the source attributes (`r:id`, `w:history`,
+                        `w:tooltip`, …) ride the link for regeneration. */
+                        let attrs = crate::schema::source_markup::raw_attrs(&e, &ns);
+                        hyperlink_stack.push((target, start, attrs));
                     }
                     b"w:t" => {
                         in_text_elt = true;
@@ -1932,7 +1935,8 @@ pub fn parse_document_xml_with_warnings(
                         }
                     }
                     b"w:commentRangeStart" => {
-                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok()) {
+                        let id: Option<u32> = attr_val(&e, b"w:id").and_then(|v| v.parse().ok());
+                        if let Some(id) = id {
                             let block_idx = out_blocks.len() as u32;
                             let off = (para_text.len() + run_text.len()) as u32;
                             open_comment_ranges.insert(id, (block_idx, off));
@@ -1944,10 +1948,47 @@ pub fn parse_document_xml_with_warnings(
                             if let Some(frag) = slice_fragment(xml, prev_pos, end) {
                                 envelopes.push_verbatim(frag);
                             }
+                        } else if let Some(id) = id
+                            && !in_run
+                            && !in_ppr
+                            && let Some(frag) =
+                                slice_fragment(xml, prev_pos, reader.buffer_position() as usize)
+                        {
+                            /* Issue #243 — inside a paragraph: a comment-
+                            anchor marker, verified against the tree. */
+                            markup.comment_marker(
+                                (para_text.len() + run_text.len()) as u32,
+                                frag,
+                                engine::CommentAnchor {
+                                    kind: engine::CommentAnchorKind::RangeStart,
+                                    id,
+                                },
+                                &ns,
+                            );
                         }
                     }
                     b"w:commentRangeEnd" => {
-                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok())
+                        let raw_id: Option<u32> =
+                            attr_val(&e, b"w:id").and_then(|v| v.parse().ok());
+                        if !at_block_level
+                            && let Some(id) = raw_id
+                            && !in_run
+                            && !in_ppr
+                            && let Some(frag) =
+                                slice_fragment(xml, prev_pos, reader.buffer_position() as usize)
+                        {
+                            /* Issue #243 — see `w:commentRangeStart`. */
+                            markup.comment_marker(
+                                (para_text.len() + run_text.len()) as u32,
+                                frag,
+                                engine::CommentAnchor {
+                                    kind: engine::CommentAnchorKind::RangeEnd,
+                                    id,
+                                },
+                                &ns,
+                            );
+                        }
+                        if let Some(id) = raw_id
                             && let Some((start_block, start_off)) = open_comment_ranges.remove(&id)
                         {
                             let end_block = out_blocks.len() as u32;
@@ -1973,9 +2014,14 @@ pub fn parse_document_xml_with_warnings(
                     }
                     b"w:commentReference" => {
                         /* The reference marker itself is invisible in the
-                        canvas (the sidebar UI shows the comment); the
-                        passthrough writer round-trips the markup byte-
-                        identical. Nothing to record here. */
+                        canvas (the sidebar UI shows the comment). Issue
+                        #243 — its run rides a regenerated paragraph as a
+                        comment-anchor marker. */
+                        if in_run
+                            && let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok())
+                        {
+                            markup.run_comment_reference(id);
+                        }
                     }
                     b"w:fldChar" => {
                         let depth_before = field_stack.len();
@@ -2326,10 +2372,15 @@ pub fn parse_document_xml_with_warnings(
                         }
                     }
                     b"w:hyperlink" => {
-                        if let Some((target, start)) = hyperlink_stack.pop() {
+                        if let Some((target, start, attrs)) = hyperlink_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
                             if end > start && !target.is_empty() {
-                                para_hyperlinks.push(engine::Hyperlink { start, end, target });
+                                para_hyperlinks.push(engine::Hyperlink {
+                                    start,
+                                    end,
+                                    target,
+                                    attrs,
+                                });
                             }
                         }
                     }

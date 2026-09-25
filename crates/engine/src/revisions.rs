@@ -217,7 +217,7 @@ fn merge_pair(head: &Paragraph, tail: &Paragraph) -> Paragraph {
         .extend(tail.hyperlinks.iter().map(|h| Hyperlink {
             start: h.start + shift,
             end: h.end + shift,
-            target: h.target.clone(),
+            ..h.clone()
         }));
     m.revisions = head.revisions.clone();
     m.revisions.extend(tail.revisions.iter().map(|r| Revision {

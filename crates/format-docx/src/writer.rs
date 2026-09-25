@@ -16,6 +16,7 @@ use crate::parts::document::parse_sect_pr_fragment;
 use crate::parts::footnotes::emit_note_pr;
 use crate::parts::numbering::build_numbering_xml;
 use crate::schema::block_envelope::EnvelopeStack;
+use crate::schema::comment_anchors;
 use crate::schema::ct_ppr::ppr_child_rank;
 use crate::schema::ct_rpr::rpr_child_rank;
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
@@ -889,6 +890,9 @@ fn serialize_paragraph(
         && para.hyperlinks.is_empty()
         && !has_break
         && !has_source_runs
+        && comment_anchors::paragraph_anchors(para)
+            .synthesize
+            .is_empty()
     {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
@@ -1154,6 +1158,30 @@ fn emit_styled_runs_with_objects(
     let source_runs: &[SourceRun] = markup.map_or(&[], |m| m.runs.as_slice());
     let markers = positioned_markers(para, &wrapper_ranges(para));
     let mut marker_cursor = 0usize;
+    let synth = comment_anchors::paragraph_anchors(para).synthesize;
+    let mut synth_cursor = 0usize;
+    for a in &synth {
+        if para.text.is_char_boundary(a.at as usize) {
+            cuts.insert(a.at as usize);
+        }
+    }
+    /* One positioned piece: a verbatim marker (an END of a comment may
+    need its reference run synthesized right behind it) or a synthesized
+    tree endpoint. */
+    let push_marker = |xml: &[u8], comment: Option<engine::CommentAnchor>, out: &mut String| {
+        push_utf8(xml, out);
+        if let Some(c) = comment
+            && c.kind == engine::CommentAnchorKind::RangeEnd
+        {
+            comment_anchors::after_range_end(c.id, out);
+        }
+    };
+    let push_synth = |a: &comment_anchors::TreeAnchor, out: &mut String| {
+        comment_anchors::push_range_marker(a.kind, a.id, out);
+        if a.kind == engine::CommentAnchorKind::RangeEnd {
+            comment_anchors::after_range_end(a.id, out);
+        }
+    };
     for r in source_runs {
         for b in [r.start as usize, r.end as usize] {
             if b <= len && para.text.is_char_boundary(b) {
@@ -1161,7 +1189,7 @@ fn emit_styled_runs_with_objects(
             }
         }
     }
-    for (at, _) in &markers {
+    for (at, _, _) in &markers {
         if para.text.is_char_boundary(*at) {
             cuts.insert(*at);
         }
@@ -1357,12 +1385,20 @@ fn emit_styled_runs_with_objects(
         }
         /* Issues #199 / #106 — in-paragraph source markers due at `lo`
         (`<w:proofErr/>`, bookmarks, whitespace), between the closes above
-        and the opens below: always a legal run-level position. */
-        while let Some((at, xml)) = markers.get(marker_cursor) {
+        and the opens below: always a legal run-level position. Issue #243
+        — synthesized comment endpoints first. */
+        while let Some(a) = synth.get(synth_cursor) {
+            if a.at as usize > lo {
+                break;
+            }
+            push_synth(a, out);
+            synth_cursor += 1;
+        }
+        while let Some((at, xml, comment)) = markers.get(marker_cursor) {
             if *at > lo {
                 break;
             }
-            push_utf8(xml, out);
+            push_marker(xml, *comment, out);
             marker_cursor += 1;
         }
         /* Open any hyperlinks that should be active at `lo`. A target the
@@ -1378,17 +1414,8 @@ fn emit_styled_runs_with_objects(
                 && !hyperlink_stack
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *h as *const _))
-                && (h.target.starts_with('#') || hyperlink_rel_map.contains_key(&h.target))
+                && open_hyperlink(h, hyperlink_rel_map, out)
             {
-                /* Issue #81 — `#name` is an internal bookmark anchor (a
-                TOC entry); everything else resolves to a relationship. */
-                if let Some(anchor) = h.target.strip_prefix('#') {
-                    out.push_str("<w:hyperlink w:anchor=\"");
-                    push_escaped_attr(anchor, out);
-                    out.push_str("\" w:history=\"1\">");
-                } else if let Some(rid) = hyperlink_rel_map.get(&h.target) {
-                    out.push_str(&format!("<w:hyperlink r:id=\"{rid}\">"));
-                }
                 hyperlink_stack.push(h);
             }
         }
@@ -1493,9 +1520,12 @@ fn emit_styled_runs_with_objects(
         emit_span_event(f, out);
     }
     /* Markers at the paragraph end (a trailing `_GoBack` bookmark, the
-    whitespace before `</w:p>`). */
-    for (_, xml) in markers.iter().skip(marker_cursor) {
-        push_utf8(xml, out);
+    whitespace before `</w:p>`), synthesized comment endpoints first. */
+    for a in synth.iter().skip(synth_cursor) {
+        push_synth(a, out);
+    }
+    for (_, xml, comment) in markers.iter().skip(marker_cursor) {
+        push_marker(xml, *comment, out);
     }
 }
 
@@ -1530,6 +1560,8 @@ struct PlacedMarker<'a> {
     at: usize,
     xml: &'a [u8],
     kind: PlacedKind,
+    /// Issue #243 — set on a comment-anchor marker.
+    comment: Option<engine::CommentAnchor>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1571,7 +1603,7 @@ fn nests_with(s: usize, e: usize, (ws, we): (usize, usize)) -> bool {
 fn positioned_markers<'a>(
     para: &'a Paragraph,
     wrappers: &[(usize, usize)],
-) -> Vec<(usize, &'a [u8])> {
+) -> Vec<(usize, &'a [u8], Option<engine::CommentAnchor>)> {
     let len = para.text.len();
     let Some(m) = para.source_markup.as_deref() else {
         return Vec::new();
@@ -1588,6 +1620,8 @@ fn positioned_markers<'a>(
         .markers
         .iter()
         .filter(|mk| valid || mk.role.must_survive())
+        /* Issue #243 — a comment anchor only while the tree agrees. */
+        .filter(|mk| comment_anchors::keep_marker(para, mk))
         .collect();
     if !valid && !kept.is_empty() {
         note(WriteNote::StaleMarkupClamped {
@@ -1610,6 +1644,7 @@ fn positioned_markers<'a>(
                     at,
                     xml: &mk.xml,
                     kind: PlacedKind::Open(pairs.len() - 1),
+                    comment: None,
                 });
             }
             engine::MarkerRole::Close { id } => {
@@ -1623,6 +1658,7 @@ fn positioned_markers<'a>(
                         at,
                         xml: if own { &mk.xml } else { close_xml },
                         kind: PlacedKind::Close(pi),
+                        comment: None,
                     });
                     if own {
                         break;
@@ -1633,6 +1669,7 @@ fn positioned_markers<'a>(
                 at,
                 xml: &mk.xml,
                 kind: PlacedKind::Plain,
+                comment: mk.comment,
             }),
         }
     }
@@ -1641,6 +1678,7 @@ fn positioned_markers<'a>(
             at: len,
             xml: close_xml,
             kind: PlacedKind::Close(pi),
+            comment: None,
         });
     }
     let conflict = |pairs: &[(u32, usize, usize)]| {
@@ -1651,7 +1689,10 @@ fn positioned_markers<'a>(
     if !conflict(&pairs) {
         /* Natural source order: stack-balanced, and monotone in offset. */
         placed.sort_by_key(|p| p.at);
-        return placed.into_iter().map(|p| (p.at, p.xml)).collect();
+        return placed
+            .into_iter()
+            .map(|p| (p.at, p.xml, p.comment))
+            .collect();
     }
     /* Widen to a fixpoint (ranges only grow, bounded by [0, len]; the
     round cap is a backstop — at worst every pair spans the paragraph,
@@ -1728,7 +1769,10 @@ fn positioned_markers<'a>(
         })
         .collect();
     keyed.sort_by_key(|(k, _)| *k);
-    keyed.into_iter().map(|(_, p)| (p.at, p.xml)).collect()
+    keyed
+        .into_iter()
+        .map(|(_, p)| (p.at, p.xml, p.comment))
+        .collect()
 }
 
 thread_local! {
@@ -2653,7 +2697,11 @@ fn build_document_xml_with_root(
     let envelope = &doc.document_envelope;
     let captured = envelope.is_captured() && std::str::from_utf8(&envelope.root_tag).is_ok();
     let mut body = String::with_capacity(2048);
+    /* Issue #243 — comment anchors of regenerated paragraphs come from
+    the tree (verified source bytes where they still match). */
+    let comment_scope = comment_anchors::publish(doc);
     emit_blocks(doc.blocks.iter(), &mut body, hyperlink_rel_map);
+    drop(comment_scope);
     emit_trailing_sect_pr(doc, captured, &mut body);
     if captured {
         push_utf8(&envelope.prolog, &mut out);
@@ -3285,18 +3333,21 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 need a part-local r:id. Clean paragraphs passthrough
                 their original markup, whose ids stay valid because
                 the rels splice below is strictly additive. */
-                let mut link_targets: Vec<String> = Vec::new();
+                let mut links: Vec<Hyperlink> = Vec::new();
                 for_each_hf_paragraph(blocks, &mut |para| {
                     if para.dirty {
-                        for h in &para.hyperlinks {
-                            if !link_targets.contains(&h.target) {
-                                link_targets.push(h.target.clone());
-                            }
-                        }
+                        /* Issue #81 — an internal `#name` anchor needs no
+                        relationship. */
+                        links.extend(
+                            para.hyperlinks
+                                .iter()
+                                .filter(|h| !h.target.starts_with('#'))
+                                .cloned(),
+                        );
                     }
                 });
                 let mut link_map: HashMap<String, String> = HashMap::new();
-                if !link_targets.is_empty() {
+                if !links.is_empty() {
                     let rels_name = hf_part_rels_name(&part_name);
                     let existing_bytes = archive
                         .other_entries
@@ -3316,7 +3367,14 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                                 .to_string()
                         });
                     let mut minted = 0u32;
-                    for target in &link_targets {
+                    for h in &links {
+                        /* Issue #242 — a still-valid source `r:id` stays. */
+                        if note_verified_source_rid(h, &parsed, &mut link_map)
+                            || link_map.contains_key(&h.target)
+                        {
+                            continue;
+                        }
+                        let target = &h.target;
                         if let Some(existing) = parsed.items.iter().find(|r| &r.target == target) {
                             link_map.insert(target.clone(), existing.id.clone());
                             continue;
@@ -4483,30 +4541,137 @@ fn inject_doc_rel<'a>(
     Cow::Owned(out)
 }
 
-/// Issue #60 — every hyperlink target belonging to a paragraph the
+/// Issue #242 — the lookup key under which [`hyperlink_rel_map`] records a
+/// *verified* source `r:id` (the rels part still maps it to the link's
+/// target). A NUL prefix can never collide with a target URL key.
+fn verified_rid_key(rid: &str) -> String {
+    format!("\u{0}{rid}")
+}
+
+/// Issue #242 — the `r:id` a regenerated `<w:hyperlink>` carried in the
+/// source, if any.
+fn source_rid(h: &Hyperlink) -> Option<&str> {
+    h.attrs
+        .iter()
+        .find(|a| a.name == "r:id")
+        .map(|a| a.value.as_str())
+}
+
+/// Issue #242 — the relationship id an external link is written with: its
+/// own source `r:id` while verified (so links sharing a URL keep their own
+/// rows), else the per-target id the pre-pass resolved.
+fn resolve_hyperlink_rid<'m>(
+    h: &Hyperlink,
+    hyperlink_rel_map: &'m HashMap<String, String>,
+) -> Option<&'m str> {
+    if let Some(rid) = source_rid(h)
+        && let Some((key, target)) = hyperlink_rel_map.get_key_value(&verified_rid_key(rid))
+        && *target == h.target
+    {
+        return Some(&key[1..]);
+    }
+    hyperlink_rel_map.get(&h.target).map(String::as_str)
+}
+
+/// Open one `<w:hyperlink>`. Returns `false` (nothing written) for an
+/// external link with no resolvable relationship — the runs then emit as
+/// plain text rather than a dangling `r:id`.
+///
+/// Issue #81 — `#name` is an internal bookmark anchor (a TOC entry);
+/// everything else resolves to a relationship. Issue #242 — a link read
+/// from `.docx` re-emits its source attributes in source order with the
+/// `r:id` / `w:anchor` value re-derived from the live target (verbatim
+/// when unchanged); an engine-authored link keeps the stock spelling.
+fn open_hyperlink(
+    h: &Hyperlink,
+    hyperlink_rel_map: &HashMap<String, String>,
+    out: &mut String,
+) -> bool {
+    let anchor = h.target.strip_prefix('#');
+    let rid = match anchor {
+        Some(_) => None,
+        None => match resolve_hyperlink_rid(h, hyperlink_rel_map) {
+            Some(rid) => Some(rid),
+            None => return false,
+        },
+    };
+    if h.attrs.is_empty() {
+        match (anchor, rid) {
+            (Some(anchor), _) => {
+                out.push_str("<w:hyperlink w:anchor=\"");
+                push_escaped_attr(anchor, out);
+                out.push_str("\" w:history=\"1\">");
+            }
+            (None, Some(rid)) => out.push_str(&format!("<w:hyperlink r:id=\"{rid}\">")),
+            (None, None) => return false,
+        }
+        return true;
+    }
+    let mut escaped_anchor = String::new();
+    if let Some(a) = anchor {
+        push_escaped_attr(a, &mut escaped_anchor);
+    }
+    out.push_str("<w:hyperlink");
+    let mut wrote_rid = false;
+    let mut wrote_anchor = false;
+    for a in &h.attrs {
+        let value = match a.name.as_str() {
+            /* An internal link has no relationship. */
+            "r:id" => match rid {
+                Some(rid) => {
+                    wrote_rid = true;
+                    rid
+                }
+                None => continue,
+            },
+            /* External links may carry a location inside the target —
+            kept verbatim; an internal link's anchor IS the target. */
+            "w:anchor" if anchor.is_some() => {
+                wrote_anchor = true;
+                escaped_anchor.as_str()
+            }
+            _ => a.value.as_str(),
+        };
+        out.push(' ');
+        out.push_str(&a.name);
+        out.push_str("=\"");
+        out.push_str(value);
+        out.push('"');
+    }
+    if let Some(rid) = rid
+        && !wrote_rid
+    {
+        out.push_str(&format!(" r:id=\"{rid}\""));
+    }
+    if anchor.is_some() && !wrote_anchor {
+        out.push_str(" w:anchor=\"");
+        out.push_str(&escaped_anchor);
+        out.push('"');
+    }
+    out.push('>');
+    true
+}
+
+/// Issue #60 — every external hyperlink belonging to a paragraph the
 /// writer is about to REGENERATE (`dirty`, walked recursively through
 /// table cells). A clean/passthrough paragraph keeps its original
 /// `<w:hyperlink r:id>` untouched inside its verbatim `source_xml`, so it
 /// never needs an entry here — only what THIS save actually re-derives
 /// from the `Paragraph.hyperlinks` overlay (which carries the resolved
-/// target URL, not the original rId) needs a fresh-or-reused id resolved.
-fn collect_dirty_hyperlink_targets(doc: &DocumentTree) -> Vec<String> {
-    fn walk_cell_blocks(blocks: &[Block], out: &mut Vec<String>) {
+/// target URL; the source `r:id` rides `Hyperlink::attrs`, issue #242)
+/// needs a verified, reused or fresh id resolved.
+fn collect_dirty_hyperlinks(doc: &DocumentTree) -> Vec<&Hyperlink> {
+    fn walk<'a>(blocks: impl IntoIterator<Item = &'a Block>, out: &mut Vec<&'a Hyperlink>) {
         for b in blocks {
             match b {
                 Block::Paragraph(p) if p.dirty => {
-                    out.extend(
-                        p.hyperlinks
-                            .iter()
-                            .filter(|h| !h.target.starts_with('#'))
-                            .map(|h| h.target.clone()),
-                    );
+                    out.extend(p.hyperlinks.iter().filter(|h| !h.target.starts_with('#')));
                 }
                 Block::Paragraph(_) => {}
                 Block::Table(t) => {
                     for row in &t.rows {
                         for cell in &row.cells {
-                            walk_cell_blocks(&cell.blocks, out);
+                            walk(&cell.blocks, out);
                         }
                     }
                 }
@@ -4514,33 +4679,36 @@ fn collect_dirty_hyperlink_targets(doc: &DocumentTree) -> Vec<String> {
         }
     }
     let mut out = Vec::new();
-    for b in &doc.blocks {
-        match b {
-            Block::Paragraph(p) if p.dirty => {
-                out.extend(
-                    p.hyperlinks
-                        .iter()
-                        .filter(|h| !h.target.starts_with('#'))
-                        .map(|h| h.target.clone()),
-                );
-            }
-            Block::Paragraph(_) => {}
-            Block::Table(t) => {
-                for row in &t.rows {
-                    for cell in &row.cells {
-                        walk_cell_blocks(&cell.blocks, &mut out);
-                    }
-                }
-            }
-        }
-    }
+    walk(&doc.blocks, &mut out);
     out
 }
 
-/// Issue #60 — resolve every dirty-paragraph hyperlink target to an
-/// `r:id`: reuse an existing rels entry whose `Target` already matches
-/// (mirrors `inject_doc_rel`'s own dedup-by-target), else mint the next
-/// unused sequential id starting from `next` (the caller has already
+/// Issue #242 — record `h`'s source `r:id` in `map` when the rels part
+/// still maps that id to the link's target (the link then keeps its own
+/// row, even when several rows share one URL). Returns whether it did.
+fn note_verified_source_rid(
+    h: &Hyperlink,
+    existing: &crate::opc::relationships::Relationships,
+    map: &mut HashMap<String, String>,
+) -> bool {
+    let Some(rid) = source_rid(h) else {
+        return false;
+    };
+    let verified = existing
+        .by_id(rid)
+        .is_some_and(|r| r.target == h.target && r.rel_type.ends_with("/hyperlink"));
+    if verified {
+        map.insert(verified_rid_key(rid), h.target.clone());
+    }
+    verified
+}
+
+/// Issue #60 — resolve every dirty-paragraph hyperlink to an `r:id`. A
+/// link whose source `r:id` is still valid keeps it (issue #242 — before
+/// that, links sharing one URL all collapsed onto the first matching
+/// row). Otherwise reuse an existing rels entry whose `Target` already
+/// matches (mirrors `inject_doc_rel`'s own dedup-by-target), else mint the
+/// next unused sequential id starting from `next` (the caller has already
 /// reserved whatever ids `synth_comments`/`synth_extended` are about to
 /// consume from the same rels part, so minting here can never collide
 /// with theirs). Returns the full lookup map (fed to `build_document_xml`
@@ -4553,10 +4721,11 @@ fn hyperlink_rel_map(
 ) -> (HashMap<String, String>, Vec<(String, String)>) {
     let mut map: HashMap<String, String> = HashMap::new();
     let mut new_entries: Vec<(String, String)> = Vec::new();
-    for target in collect_dirty_hyperlink_targets(doc) {
-        if map.contains_key(&target) {
+    for h in collect_dirty_hyperlinks(doc) {
+        if note_verified_source_rid(h, existing, &mut map) || map.contains_key(&h.target) {
             continue;
         }
+        let target = h.target.clone();
         if let Some(rid) = existing
             .items
             .iter()
@@ -5641,6 +5810,7 @@ mod tests {
             start: 10,
             end: 17,
             target: "https://fresh-example.com".to_string(),
+            ..Default::default()
         });
         para.dirty = true;
         let doc = DocumentTree::from_rich_paragraphs([para]);
@@ -5692,6 +5862,7 @@ mod tests {
             start: 10,
             end: 17,
             target: "https://fresh-example.com".to_string(),
+            ..Default::default()
         });
         para.dirty = true;
         let doc = DocumentTree::from_rich_paragraphs([para]);
@@ -8619,6 +8790,7 @@ mod tests {
                 start: 0,
                 end: 8,
                 target: "https://example.com/".into(),
+                ..Default::default()
             }],
             dirty: true,
             ..Default::default()
@@ -9700,6 +9872,361 @@ mod tests {
         assert!(out.contains("<w:spacing"), "{out}");
         /* The attributes still ride (no styles involved). */
         assert!(out.contains(r#"w:rsidR="00A1B2C3""#), "{out}");
+    }
+
+    /// Issue #242 — three external links (two sharing one URL, as Word
+    /// writes a re-pasted link) plus an internal anchor, every one with
+    /// source attributes the model does not read.
+    const LINK_RELS: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://b.example/" TargetMode="External"/>"#,
+        r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://a.example/" TargetMode="External"/>"#,
+        r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://a.example/" TargetMode="External"/>"#,
+        r#"</Relationships>"#,
+    );
+    const LINK_P: &str = concat!(
+        r#"<w:p w:rsidR="00A1B2C3"><w:r><w:t xml:space="preserve">See </w:t></w:r>"#,
+        r#"<w:hyperlink r:id="rId4" w:tooltip="First &amp; best" w:history="1"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>one</w:t></w:r></w:hyperlink>"#,
+        r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+        r#"<w:hyperlink r:id="rId5" w:history="1"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>two</w:t></w:r></w:hyperlink>"#,
+        r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+        r#"<w:hyperlink r:id="rId6" w:anchor="part2" w:tgtFrame="_blank" w:history="1"><w:r><w:t>three</w:t></w:r></w:hyperlink>"#,
+        r#"<w:r><w:t xml:space="preserve"> and </w:t></w:r>"#,
+        r#"<w:hyperlink w:anchor="_Toc1" w:docLocation="x" w:history="1"><w:r><w:t>four</w:t></w:r></w:hyperlink>"#,
+        r#"</w:p>"#,
+    );
+
+    fn link_archive() -> (String, DocxArchive) {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{LINK_P}<w:sectPr/></w:body></w:document>"#
+        );
+        let archive = read_docx(&zip_minimal_docx(&xml, Some(LINK_RELS))).expect("read links");
+        (xml, archive)
+    }
+
+    fn rels_of(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut f = z.by_name(RELS_XML).unwrap();
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+        s
+    }
+
+    /// Issue #242 — editing a paragraph with several links keeps every
+    /// link's own `r:id` (two links to one URL no longer collapse onto one
+    /// row) and every source attribute: the regenerated part is the source
+    /// plus the inserted bytes, the rels part is untouched.
+    #[test]
+    fn edited_paragraph_keeps_each_hyperlink_rid_and_attributes() {
+        let (xml, archive) = link_archive();
+        let p = archive.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.hyperlinks.len(), 4, "{:?}", p.hyperlinks);
+        assert_eq!(p.hyperlinks[0].target, "http://a.example/");
+        assert_eq!(p.hyperlinks[1].target, "http://a.example/");
+        assert_eq!(p.hyperlinks[2].target, "http://b.example/");
+        assert_eq!(p.hyperlinks[3].target, "#_Toc1");
+        let zero = write_docx(&archive, &archive.document).expect("zero-edit");
+        assert_eq!(document_xml_of(&zero), xml);
+
+        let edited = archive.document.insert_text(at(0, 2), "X");
+        let bytes = write_docx(&archive, &edited).expect("write");
+        assert_eq!(document_xml_of(&bytes), xml.replacen("See ", "SeXe ", 1));
+        assert_eq!(rels_of(&bytes), LINK_RELS, "no rel minted or rewritten");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+
+        let back = read_docx(&bytes).expect("re-read");
+        let targets: Vec<&str> = back
+            .document
+            .nth_paragraph(0)
+            .unwrap()
+            .hyperlinks
+            .iter()
+            .map(|h| h.target.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "http://a.example/",
+                "http://a.example/",
+                "http://b.example/",
+                "#_Toc1"
+            ]
+        );
+    }
+
+    /// Issue #242 — a link whose target changed no longer matches its
+    /// source row: it gets a fresh relationship but keeps its other
+    /// attributes; an internal link re-derives `w:anchor` in place.
+    #[test]
+    fn retargeted_hyperlink_mints_a_row_and_keeps_its_attributes() {
+        let (_, archive) = link_archive();
+        let mut doc = archive.document.clone();
+        if let Some(Block::Paragraph(p)) = doc.blocks.get_mut(0) {
+            p.hyperlinks[1].target = "http://c.example/".into();
+            p.hyperlinks[3].target = "#_Toc2".into();
+            p.dirty = true;
+        }
+        let bytes = write_docx(&archive, &doc).expect("write");
+        let out = document_xml_of(&bytes);
+        assert!(
+            out.contains(r#"<w:hyperlink r:id="rId7" w:history="1">"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<w:hyperlink w:anchor="_Toc2" w:docLocation="x" w:history="1">"#),
+            "{out}"
+        );
+        let rels = rels_of(&bytes);
+        assert!(rels.contains(r#"Id="rId7""#), "{rels}");
+        assert!(rels.contains(r#"Target="http://c.example/""#), "{rels}");
+        /* The untouched links keep their own rows. */
+        assert!(out.contains(r#"r:id="rId4" w:tooltip="First &amp; best""#));
+        assert!(out.contains(r#"r:id="rId6" w:anchor="part2" w:tgtFrame="_blank""#));
+    }
+
+    /// Issue #243 — a Word-shaped commented paragraph (range around
+    /// "comment ", reference run behind it with its own rsid and rPr) and
+    /// a paragraph holding only the reference of a second comment.
+    const COMMENT_P0: &str = concat!(
+        r#"<w:p w:rsidR="00B561CA"><w:r><w:t xml:space="preserve">this is a </w:t></w:r>"#,
+        r#"<w:commentRangeStart w:id="0"/><w:r><w:t xml:space="preserve">comment </w:t></w:r>"#,
+        r#"<w:commentRangeEnd w:id="0"/><w:r w:rsidR="002903BF"><w:rPr><w:rStyle w:val="a5"/></w:rPr><w:commentReference w:id="0"/></w:r>"#,
+        r#"<w:r><w:t>paragraph!</w:t></w:r></w:p>"#,
+    );
+    const COMMENT_P1: &str =
+        r#"<w:p><w:r><w:rPr></w:rPr><w:commentReference w:id="1"/></w:r></w:p>"#;
+    const COMMENTS_PART: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        r#"<w:comment w:id="0" w:author="A" w:date="2026-01-01T00:00:00Z"><w:p><w:r><w:t>first</w:t></w:r></w:p></w:comment>"#,
+        r#"<w:comment w:id="1" w:author="B" w:date="2026-01-01T00:00:00Z"><w:p><w:r><w:t>second</w:t></w:r></w:p></w:comment>"#,
+        r#"</w:comments>"#,
+    );
+
+    fn comment_archive() -> (String, DocxArchive) {
+        comment_archive_with(&format!("{COMMENT_P0}{COMMENT_P1}"))
+    }
+
+    fn comment_archive_with(body: &str) -> (String, DocxArchive) {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{body}<w:sectPr/></w:body></w:document>"#
+        );
+        let rels = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/>"#,
+            r#"</Relationships>"#,
+        );
+        let content_types = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+            r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#,
+            r#"<Default Extension="xml" ContentType="application/xml"/>"#,
+            r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#,
+            r#"<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/>"#,
+            r#"</Types>"#,
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/_rels/document.xml.rels", rels),
+                ("word/comments.xml", COMMENTS_PART),
+                ("word/document.xml", xml.as_str()),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let archive = read_docx(&buf).expect("read comments");
+        (xml, archive)
+    }
+
+    /// Issue #243 — an edit before, inside and after a commented range
+    /// keeps `<w:commentRangeStart/>`, `<w:commentRangeEnd/>` and the
+    /// reference run (verbatim, own rsid + rPr) at the right offsets: the
+    /// saved part is exactly source + the inserted bytes.
+    #[test]
+    fn edited_paragraph_keeps_comment_anchors() {
+        let (xml, archive) = comment_archive();
+        assert_eq!(archive.document.comment_ranges.len(), 1);
+        assert_eq!(archive.document.comment_defs.len(), 2);
+        let zero = write_docx(&archive, &archive.document).expect("zero-edit");
+        assert_eq!(document_xml_of(&zero), xml);
+
+        for (offset, from, to) in [
+            (2, "this is", "thXis is"),
+            ("this is a co".len(), "comment ", "coXmment "),
+            (
+                "this is a comment paragraph!".len(),
+                "paragraph!",
+                "paragraph!X",
+            ),
+        ] {
+            let edited = archive.document.insert_text(at(0, offset), "X");
+            let bytes = write_docx(&archive, &edited).expect("write");
+            assert_eq!(
+                document_xml_of(&bytes),
+                xml.replacen(from, to, 1),
+                "insert at {offset}"
+            );
+            crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+            let back = read_docx(&bytes).expect("re-read");
+            let r = &back.document.comment_ranges[0];
+            let p = back.document.nth_paragraph(0).unwrap();
+            assert_eq!(
+                &p.text[r.start.offset as usize..r.end.offset as usize],
+                if offset == "this is a co".len() {
+                    "coXmment "
+                } else {
+                    "comment "
+                }
+            );
+        }
+    }
+
+    /// Issue #243 — a paragraph whose only content is a comment reference
+    /// keeps it when it regenerates (it used to save as `<w:p/>`).
+    #[test]
+    fn reference_only_paragraph_keeps_its_reference() {
+        let (xml, archive) = comment_archive();
+        let edited = archive.document.insert_text(at(1, 0), "X");
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert!(
+            out.contains(concat!(
+                r#"<w:p><w:r><w:t xml:space="preserve">X</w:t></w:r>"#,
+                r#"<w:r><w:rPr></w:rPr><w:commentReference w:id="1"/></w:r></w:p>"#
+            )),
+            "{out}"
+        );
+        /* Dirty without a text change: exactly the source. */
+        let mut doc = archive.document.clone();
+        if let Some(Block::Paragraph(p)) = doc.blocks.get_mut(1) {
+            p.dirty = true;
+        }
+        assert_eq!(
+            document_xml_of(&write_docx(&archive, &doc).expect("write")),
+            xml
+        );
+    }
+
+    /// Issue #243 — a deleted comment's anchors are never resurrected from
+    /// the recorded source bytes.
+    #[test]
+    fn deleted_comment_anchors_are_dropped() {
+        let (_, archive) = comment_archive();
+        let edited = archive
+            .document
+            .delete_comment(0)
+            .insert_text(at(0, 0), "X");
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert!(!out.contains(r#"w:id="0""#), "{out}");
+        assert!(out.contains(r#"<w:commentReference w:id="1"/>"#), "{out}");
+    }
+
+    /// Issue #243 — with no usable source bytes (engine-minted comment, or
+    /// markup gone stale) the anchors are synthesized from the tree,
+    /// including a `CommentReference`-styled reference run.
+    #[test]
+    fn tree_comment_anchors_are_synthesized_without_source_markup() {
+        let (_, archive) = comment_archive();
+        let mut doc = archive.document.insert_text(at(0, 0), "X");
+        if let Some(Block::Paragraph(p)) = doc.blocks.get_mut(0) {
+            p.source_markup = None;
+        }
+        let bytes = write_docx(&archive, &doc).expect("write");
+        let out = document_xml_of(&bytes);
+        assert!(
+            out.contains(concat!(
+                r#"<w:commentRangeStart w:id="0"/><w:r><w:t xml:space="preserve">comment </w:t></w:r>"#,
+                r#"<w:commentRangeEnd w:id="0"/><w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="0"/></w:r>"#
+            )),
+            "{out}"
+        );
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+
+        /* An engine-minted comment on a regenerated paragraph. */
+        let (minted, id) = archive.document.insert_comment(
+            at(0, 0),
+            at(0, 4),
+            "note".into(),
+            "C".into(),
+            String::new(),
+        );
+        let minted = minted.insert_text(at(0, 2), "Y");
+        let out = document_xml_of(&write_docx(&archive, &minted).expect("write"));
+        let start = format!(r#"<w:commentRangeStart w:id="{id}"/>"#);
+        let end = format!(r#"<w:commentRangeEnd w:id="{id}"/>"#);
+        let reference = format!(r#"<w:commentReference w:id="{id}"/>"#);
+        assert_eq!(out.matches(&start).count(), 1, "{out}");
+        assert_eq!(out.matches(&end).count(), 1, "{out}");
+        assert_eq!(out.matches(&reference).count(), 1, "{out}");
+        assert!(out.find(&start) < out.find("thY") && out.find(&end) > out.find("thY"));
+    }
+
+    /// Issues #243 × #244 / #245 — comment anchors and hyperlinks compose
+    /// with the inline verbatim spans: a comment start captured inside a
+    /// legacy form field's `begin … end` content span rides the span's
+    /// bytes (never duplicated by synthesis), and a hyperlink inside a
+    /// run-level content control keeps its own `r:id` and attributes. The
+    /// edited save is exactly source + the inserted bytes.
+    #[test]
+    fn comment_anchors_and_hyperlinks_compose_with_inline_spans() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">a </w:t></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="C1"/><w:checkBox><w:default w:val="0"/></w:checkBox></w:ffData></w:fldChar></w:r>"#,
+            r#"<w:r><w:instrText xml:space="preserve"> FORMCHECKBOX </w:instrText></w:r>"#,
+            r#"<w:commentRangeStart w:id="0"/>"#,
+            r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+            r#"<w:r><w:t>box</w:t></w:r><w:commentRangeEnd w:id="0"/>"#,
+            r#"<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="0"/></w:r>"#,
+            r#"<w:sdt><w:sdtPr><w:tag w:val="t"/></w:sdtPr><w:sdtContent>"#,
+            r#"<w:hyperlink r:id="rId7" w:history="1"><w:r><w:t>link</w:t></w:r></w:hyperlink>"#,
+            r#"</w:sdtContent></w:sdt></w:p>"#,
+        );
+        let (xml, archive) = comment_archive_with(body);
+        let mut archive = archive;
+        for (name, bytes) in archive.other_entries.iter_mut() {
+            if name == RELS_XML {
+                let rels = String::from_utf8(bytes.clone()).unwrap().replace(
+                    "</Relationships>",
+                    r#"<Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://x.example/" TargetMode="External"/></Relationships>"#,
+                );
+                *bytes = rels.into_bytes();
+            }
+        }
+        let archive =
+            read_docx(&write_docx(&archive, &archive.document).expect("repack")).expect("re-read");
+        assert_eq!(archive.document.comment_ranges.len(), 1);
+        let p = archive.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.hyperlinks.len(), 1);
+        let m = p.source_markup.as_deref().expect("markup");
+        assert!(
+            m.markers
+                .iter()
+                .any(|mk| mk.role == engine::MarkerRole::Content
+                    && String::from_utf8_lossy(&mk.xml).contains("<w:commentRangeStart")),
+            "the comment start rides the form field's content span"
+        );
+        assert!(
+            m.markers
+                .iter()
+                .any(|mk| matches!(mk.role, engine::MarkerRole::Open { .. }))
+        );
+        let edited = archive.document.insert_text(at(0, 1), "X");
+        let bytes = write_docx(&archive, &edited).expect("write");
+        let out = document_xml_of(&bytes);
+        assert_eq!(out, xml.replacen(">a <", ">aX <", 1));
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
     }
 }
 
