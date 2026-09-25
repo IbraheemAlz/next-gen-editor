@@ -373,15 +373,22 @@ impl MarkupCapture {
     }
 }
 
+/// Raw `(qualified name, value)` attribute pairs of one element.
+type RawAttrs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// One top-level child of a property element: `(qname, attributes, raw
+/// bytes, empty)`.
+type Child = (Vec<u8>, RawAttrs, Vec<u8>, bool);
+
 /// The complete top-level children of a `<w:pPr>` / `<w:rPr>` fragment
-/// (`xml` includes the wrapper): `(qname, attributes, raw bytes, empty)`.
-fn top_level_children(xml: &[u8]) -> Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>, bool)> {
+/// (`xml` includes the wrapper).
+fn top_level_children(xml: &[u8]) -> Vec<Child> {
     let mut out = Vec::new();
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut depth = 0usize;
-    let mut open: Option<(usize, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> = None;
+    let mut open: Option<(usize, Vec<u8>, RawAttrs)> = None;
     let mut prev = 0usize;
     loop {
         let ev = match reader.read_event_into(&mut buf) {
@@ -396,15 +403,13 @@ fn top_level_children(xml: &[u8]) -> Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<
                 }
                 depth += 1;
             }
-            Event::Empty(e) => {
-                if depth == 1 {
-                    out.push((
-                        e.name().as_ref().to_vec(),
-                        attrs_of(&e),
-                        xml[prev..pos].to_vec(),
-                        true,
-                    ));
-                }
+            Event::Empty(e) if depth == 1 => {
+                out.push((
+                    e.name().as_ref().to_vec(),
+                    attrs_of(&e),
+                    xml[prev..pos].to_vec(),
+                    true,
+                ));
             }
             Event::End(_) => {
                 depth = depth.saturating_sub(1);
@@ -423,7 +428,7 @@ fn top_level_children(xml: &[u8]) -> Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Vec<
     out
 }
 
-fn attrs_of(e: &BytesStart) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn attrs_of(e: &BytesStart) -> RawAttrs {
     e.attributes()
         .with_checks(false)
         .flatten()
@@ -433,7 +438,7 @@ fn attrs_of(e: &BytesStart) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// One regenerated child element: `Some((qname, attrs))` when `xml` is a
 /// single empty element (`<w:u w:val="single"/>`).
-fn parse_empty_element(xml: &str) -> Option<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)> {
+fn parse_empty_element(xml: &str) -> Option<(Vec<u8>, RawAttrs)> {
     let mut reader = Reader::from_reader(xml.as_bytes());
     let mut buf = Vec::new();
     let first = match reader.read_event_into(&mut buf).ok()? {
