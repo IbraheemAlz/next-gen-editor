@@ -337,18 +337,31 @@ export function App() {
                         layout fills in (it can adjust in either
                         direction — AVG_BLOCK_HEIGHT_PT is a fudge).
                         Device px → CSS px via dpr. */}
+                    {/* Issue #280 — every page card is sized from the
+                        engine's reported page geometry (device px ÷ the
+                        device-px-per-CSS-px ratio), and the inter-page gap
+                        from the engine zoom, so a zoom visibly resizes the
+                        pages and the scroll range grows with them. */}
                     <div
                         class="editor-pages"
                         style={{
-                            'min-height': `${
+                            'min-height': `${store.deviceToCss(
                                 Math.max(
                                     store.estimatedDocumentHeight(),
                                     store.documentHeight(),
-                                ) / (window.devicePixelRatio || 1)
-                            }px`,
+                                ),
+                            )}px`,
+                            gap: `${store.pageGapCss()}px`,
                         }}
                     >
-                        <div class="editor-page" data-page-index="0">
+                        <div
+                            class="editor-page"
+                            data-page-index="0"
+                            style={{
+                                width: `${store.pageCardCss(0).w}px`,
+                                height: `${store.pageCardCss(0).h}px`,
+                            }}
+                        >
                             <For each={[canvasGen()]}>
                                 {(generation) => (
                                     <EditorCanvas

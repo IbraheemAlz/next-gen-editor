@@ -201,6 +201,14 @@ pub enum Event {
         /// Issue #26 — per-page heights in device px, index-aligned
         /// with `page_tops`.
         page_heights: Vec<f32>,
+        /// Issue #280 — per-page widths in device px, index-aligned
+        /// with `page_tops`. The shell sizes every page card's CSS box
+        /// from `page_widths` / `page_heights` (÷ its device-px-per-CSS-px
+        /// ratio), so a zoom or a landscape section visibly resizes the
+        /// page instead of only densifying a fixed A4 box. Additive;
+        /// empty from pre-#280 producers (consumers fall back to A4).
+        #[serde(default)]
+        page_widths: Vec<f32>,
         /// Issue #44 — count of inline images in the whole document. Lets
         /// the shell skip the `GetImageRects` refresh entirely for the
         /// (common) image-free document instead of paying an extra worker
