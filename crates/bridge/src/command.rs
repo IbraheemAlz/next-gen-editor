@@ -197,6 +197,27 @@ pub enum Command {
         range: Option<LogicalRange>,
         attrs: TextAttrsPatch,
     },
+    /// Issue #286 — flip one character attribute, computing the target
+    /// state ENGINE-side (the shell never reads its mirrored toolbar
+    /// state, which lags the engine's `SelectionChanged` reply at
+    /// typing speed). Binds to the engine-owned live selection:
+    /// - collapsed caret: reads the effective style the next keystroke
+    ///   would produce (the #276 typing rule + any armed pending style,
+    ///   i.e. exactly `SelectionChanged.attrs_at_caret`) and arms the
+    ///   inverse as pending (sticky) formatting;
+    /// - ranged selection: Word's rule — a flag that is mixed across the
+    ///   range turns ON; otherwise the range's first character decides,
+    ///   and the result applies to the whole range like `ApplyFormatting`.
+    ///
+    /// `underline_style` is the style used when underline turns ON
+    /// (default `Single`); ignored for every other attribute. No
+    /// selection replies `Event::Error`, like `ApplyFormatting`.
+    ToggleFormatting {
+        attr: FormattingToggle,
+        #[serde(default)]
+        #[tsify(optional)]
+        underline_style: Option<UnderlineStyle>,
+    },
     /// Break the paragraph at the caret (replacing any non-empty
     /// selection). Issue #64 — `at == None` splits at the engine's LIVE
     /// caret (interactive Enter passes `None`, so a keystroke racing a
@@ -1210,6 +1231,23 @@ pub struct BridgeStyleProperties {
     pub based_on: Option<String>,
     pub clear_based_on: Option<bool>,
     pub display_name: Option<String>,
+}
+
+/// Issue #286 — the attribute a [`Command::ToggleFormatting`] flips.
+/// `Superscript` / `Subscript` toggle between that script and `Normal`;
+/// `Caps` / `SmallCaps` turning ON clear the other (the toolbar's
+/// mutually-exclusive pair).
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum FormattingToggle {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Superscript,
+    Subscript,
+    Caps,
+    SmallCaps,
 }
 
 /// unchanged. The resolved counterpart is [`crate::TextAttrs`].

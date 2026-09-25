@@ -1,7 +1,8 @@
 /**
  * SuperSubButtons — Superscript (X²) + Subscript (X₂) toolbar toggles.
  *
- * Dispatches via createEditorCommands().setVerticalScript(...).
+ * Dispatches via createEditorCommands().toggleFormatting(...) (issue
+ * #286 — the engine computes Super/Sub ↔ Normal from its live state).
  *
  * Bridge note: `TextAttrsPatch.script` holds a `VerticalScript`
  * (Normal | Superscript | Subscript) on the wire — the field is *named*
@@ -25,11 +26,13 @@ export const SuperSubButtons: Component = () => {
     const isSuper = () => state.attrsAtCaret()?.script === 'Superscript';
     const isSub = () => state.attrsAtCaret()?.script === 'Subscript';
 
+    /* Issue #286 — the engine derives the target from its live state;
+     * `isSuper` / `isSub` only mirror it for the pressed styling. */
     const toggleSuper = async () => {
-        await cmd.setVerticalScript(isSuper() ? 'Normal' : 'Superscript');
+        await cmd.toggleFormatting('Superscript');
     };
     const toggleSub = async () => {
-        await cmd.setVerticalScript(isSub() ? 'Normal' : 'Subscript');
+        await cmd.toggleFormatting('Subscript');
     };
 
     return (

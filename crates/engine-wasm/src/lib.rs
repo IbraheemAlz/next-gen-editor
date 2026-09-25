@@ -6826,6 +6826,7 @@ impl Engine {
             | Command::DeleteAtCaret { .. }
             | Command::SplitParagraph { .. }
             | Command::ApplyFormatting { .. }
+            | Command::ToggleFormatting { .. }
             | Command::PastePlain { .. }
             | Command::SetSelection { .. }
             | Command::ExtendSelection { .. }
@@ -7150,6 +7151,10 @@ impl Engine {
             Command::DeleteRange { range } => self.do_delete_range(range),
             Command::ReplaceRange { range, text } => self.do_replace_range(range, text),
             Command::ApplyFormatting { range, attrs } => self.apply_formatting(range, attrs),
+            Command::ToggleFormatting {
+                attr,
+                underline_style,
+            } => self.toggle_formatting(attr, underline_style),
             Command::SplitParagraph { at } => self.do_split_paragraph(at),
             Command::MergeParagraph { .. } => phase3_stub("MergeParagraph"),
             // Sprint 3 (UI Edition) — wired now (was a Phase 3 stub
@@ -7667,6 +7672,97 @@ impl Engine {
                 attrs: resolved_attrs(&attrs, default_size),
             }
         }
+    }
+
+    /// Issue #286 — `Command::ToggleFormatting`. The target state is
+    /// derived HERE, from the engine's own view of the live selection,
+    /// never from the shell's mirrored toolbar state (which lags the
+    /// `SelectionChanged` reply at typing speed — Ctrl+B, type, Ctrl+B
+    /// used to toggle against the stale "not bold" mirror).
+    ///
+    /// The "current" value is the one rule the toolbar also reads:
+    /// [`Self::attrs_at`] — for a collapsed caret the #276 typing style
+    /// (`Paragraph::typing_style_at`) cascaded over the paragraph style
+    /// with any armed pending style overlaid; for a range its first
+    /// character. A range whose flag is mixed ([`Self::attrs_mixed_over`])
+    /// turns the flag ON (Word). The resulting patch goes through
+    /// [`Self::apply_formatting`] unchanged, so a collapsed caret arms
+    /// pending formatting and a range is restyled — body or story alike.
+    fn toggle_formatting(
+        &mut self,
+        attr: bridge::FormattingToggle,
+        underline_style: Option<UnderlineStyle>,
+    ) -> Event {
+        use bridge::FormattingToggle as T;
+        let Some(sel) = self.selection.clone() else {
+            return Event::Error {
+                message: "ToggleFormatting: no active selection".into(),
+            };
+        };
+        let (start, end) = ordered(sel.anchor, sel.caret);
+        let collapsed = start == end;
+        let current = self.attrs_at(start.clone(), collapsed);
+        let mixed = self.attrs_mixed_over(&start, &end);
+        let mut patch = TextAttrsPatch {
+            bold: None,
+            italic: None,
+            underline: None,
+            strike: None,
+            font_family: None,
+            font_size: None,
+            color: None,
+            bg_color: None,
+            script: None,
+            language: None,
+            caps: None,
+            small_caps: None,
+        };
+        match attr {
+            T::Bold => patch.bold = Some(mixed.bold || !current.bold),
+            T::Italic => patch.italic = Some(mixed.italic || !current.italic),
+            T::Strike => patch.strike = Some(mixed.strike || !current.strike),
+            T::Underline => {
+                let on = mixed.underline || matches!(current.underline, UnderlineStyle::None);
+                patch.underline = Some(if on {
+                    underline_style
+                        .filter(|s| !matches!(s, UnderlineStyle::None))
+                        .unwrap_or(UnderlineStyle::Single)
+                } else {
+                    UnderlineStyle::None
+                });
+            }
+            T::Superscript => {
+                patch.script = Some(if matches!(current.script, VerticalScript::Superscript) {
+                    VerticalScript::Normal
+                } else {
+                    VerticalScript::Superscript
+                });
+            }
+            T::Subscript => {
+                patch.script = Some(if matches!(current.script, VerticalScript::Subscript) {
+                    VerticalScript::Normal
+                } else {
+                    VerticalScript::Subscript
+                });
+            }
+            T::Caps => {
+                if current.caps {
+                    patch.caps = Some(false);
+                } else {
+                    patch.caps = Some(true);
+                    patch.small_caps = Some(false);
+                }
+            }
+            T::SmallCaps => {
+                if current.small_caps {
+                    patch.small_caps = Some(false);
+                } else {
+                    patch.small_caps = Some(true);
+                    patch.caps = Some(false);
+                }
+            }
+        }
+        self.apply_formatting(None, patch)
     }
 
     fn do_undo(&mut self) -> Event {
@@ -12408,7 +12504,9 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// Story `InsertText` — plain (untracked, no sticky format) insert.
+    /// Story `InsertText` — untracked insert. Issue #296 — any armed
+    /// sticky (pending) style is overlaid onto the typed run, the same
+    /// rule as the body path (`do_insert_text_interactive`).
     fn story_insert_text(&mut self, at: BridgeLogicalPos, text: String) -> Event {
         let sel = self.selection.clone().unwrap_or(SelectionState {
             anchor: at.clone(),
@@ -12427,10 +12525,21 @@ impl Engine {
             temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
-        let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        let mut new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
+        let inserted_end = start.offset + text.len() as u32;
+        if let Some(pending) = self.pending_format.clone() {
+            new_doc = new_doc.apply_style(
+                to_engine_pos(start.clone()),
+                EnginePos {
+                    path: bridge_to_engine_path(start.path.clone()),
+                    offset: inserted_end,
+                },
+                pending,
+            );
+        }
         let caret = BridgeLogicalPos {
             path: start.path,
-            offset: start.offset + text.len() as u32,
+            offset: inserted_end,
         };
         self.commit_story_edit(&new_doc, caret)
     }
@@ -12524,8 +12633,10 @@ impl Engine {
     }
 
     /// Story `ApplyFormatting` — span patch over the selection (or the
-    /// explicit range). Collapsed carets are a no-op in v1: sticky
-    /// pending formatting stays a body-only feature for now.
+    /// explicit range). Issue #296 — a collapsed caret arms sticky
+    /// pending formatting exactly like the body path, and
+    /// [`Self::story_insert_text`] overlays it onto typed text, so the
+    /// toolbar preview and the typed run agree in every story.
     fn story_apply_formatting(
         &mut self,
         range: Option<BridgeLogicalRange>,
@@ -12538,13 +12649,21 @@ impl Engine {
                 None => return self.selection_changed(),
             },
         };
+        let style = patch_to_span_style(&patch);
         if start == end {
+            if self.selection.is_some() {
+                let armed = self
+                    .pending_format
+                    .clone()
+                    .unwrap_or_default()
+                    .merged_with(style);
+                self.pending_format = Some(armed);
+            }
             return self.selection_changed();
         }
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
         };
-        let style = patch_to_span_style(&patch);
         let new_doc = temp.apply_style(
             to_engine_pos(start.clone()),
             to_engine_pos(end.clone()),
@@ -13221,6 +13340,9 @@ impl Engine {
     /// Shared exit: restore + clamp the stashed body selection.
     fn exit_story_to_body(&mut self) {
         self.active_story = StoryTarget::Body;
+        /* Issue #296 — a story can arm sticky formatting now; leaving it
+        is a caret move, which always discards the armed style. */
+        self.pending_format = None;
         let doc = self.undo.current();
         let restored = self.stashed_body_selection.take().map(|s| SelectionState {
             anchor: clamp_pos(doc, s.anchor),
@@ -26427,6 +26549,9 @@ mod a11y_direction_tests;
 
 #[cfg(test)]
 mod para_style_edit_tests;
+
+#[cfg(test)]
+mod toggle_formatting_tests;
 
 /// Issue #210 — the real `DocumentTree::regenerate_tocs` (#81) → layout →
 /// `format_pdf::export_pdf` path, end to end (not the #144 acceptance
