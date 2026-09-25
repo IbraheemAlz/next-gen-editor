@@ -2079,7 +2079,9 @@ fn run_rtl_table_roundtrip() -> Result<()> {
     if table_region(&doc_u)? != src_tbl {
         bail!("untouched RTL table drifted:\n{}", table_region(&doc_u)?);
     }
-    println!("[roundtrip] step 17a OK — bidiVisual modeled on read, untouched table byte-identical");
+    println!(
+        "[roundtrip] step 17a OK — bidiVisual modeled on read, untouched table byte-identical"
+    );
 
     /* c. edit grid cell 1 (the visually rightmost cell). */
     let cell0 = BlockPath::top(1)
@@ -2129,16 +2131,25 @@ fn run_rtl_table_roundtrip() -> Result<()> {
     let off = edited.set_table_bidi_visual(BlockPath::top(1), false);
     let off_bytes = write_docx(&archive_a, &off).context("write flag-off table")?;
     let off_xml = String::from_utf8(extract_doc_xml(&off_bytes)?).context("utf8 off")?;
-    if table_region(&off_xml)? != expected_tbl.replacen("<w:tblPr><w:bidiVisual/></w:tblPr>", "", 1) {
-        bail!("flag off must drop exactly the element:\n{}", table_region(&off_xml)?);
+    if table_region(&off_xml)? != expected_tbl.replacen("<w:tblPr><w:bidiVisual/></w:tblPr>", "", 1)
+    {
+        bail!(
+            "flag off must drop exactly the element:\n{}",
+            table_region(&off_xml)?
+        );
     }
     let on = off.set_table_bidi_visual(BlockPath::top(1), true);
     let on_bytes = write_docx(&archive_a, &on).context("write flag-on table")?;
     let on_xml = String::from_utf8(extract_doc_xml(&on_bytes)?).context("utf8 on")?;
     if table_region(&on_xml)? != expected_tbl {
-        bail!("flag on must restore the element:\n{}", table_region(&on_xml)?);
+        bail!(
+            "flag on must restore the element:\n{}",
+            table_region(&on_xml)?
+        );
     }
-    println!("[roundtrip] step 17c OK — toggling bidiVisual adds / removes exactly <w:bidiVisual/>");
+    println!(
+        "[roundtrip] step 17c OK — toggling bidiVisual adds / removes exactly <w:bidiVisual/>"
+    );
     Ok(())
 }
 
