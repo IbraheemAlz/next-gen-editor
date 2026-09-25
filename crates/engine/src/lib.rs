@@ -61,6 +61,9 @@ use serde::{Deserialize, Serialize};
 mod block_remap;
 pub use block_remap::CellMove;
 pub mod fields;
+#[cfg(test)]
+mod revision_tests;
+mod revisions;
 mod text_remap;
 pub use text_remap::TextEdit;
 pub mod html;
@@ -1485,6 +1488,11 @@ pub struct SourcePPr {
     pub props: ParaProperties,
     pub style_id: Option<String>,
     pub list_item: Option<ListItem>,
+    /// Issue #262 — the paragraph-mark revision `xml` spells (its
+    /// `<w:rPr><w:ins/>`): the bytes are re-emitted only while the
+    /// paragraph still carries exactly this one. Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark_revision: Option<Revision>,
 }
 
 /// Issues #199 / #106 — one source `<w:r>` covering the text bytes
@@ -1561,6 +1569,15 @@ pub struct SourceMarker {
     /// [`MarkerRole::Verbatim`], so a pre-#244 snapshot encodes unchanged.
     #[serde(skip_serializing_if = "MarkerRole::is_verbatim")]
     pub role: MarkerRole,
+    /// Issue #243 — `Some` when the marker is a comment anchor: a
+    /// `<w:commentRangeStart/>` / `<w:commentRangeEnd/>` or the run holding
+    /// a `<w:commentReference/>`. Unlike every other marker it is NOT
+    /// replayed blindly: the writer checks it against the tree-level
+    /// [`DocumentTree::comment_ranges`] / [`DocumentTree::comment_defs`]
+    /// (a deleted comment's anchor is dropped, a moved one is re-emitted
+    /// where the tree says).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<CommentAnchor>,
 }
 
 impl SourceMarker {
@@ -1570,6 +1587,7 @@ impl SourceMarker {
             at,
             xml,
             role: MarkerRole::Verbatim,
+            comment: None,
         }
     }
 }
@@ -1622,6 +1640,25 @@ impl MarkerRole {
     pub fn must_survive(&self) -> bool {
         !self.is_verbatim()
     }
+}
+
+/// Issue #243 — what a comment-anchor [`SourceMarker`] is.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CommentAnchor {
+    pub kind: CommentAnchorKind,
+    /// The comment's `w:id`.
+    pub id: u32,
+}
+
+/// Issue #243 — the three in-paragraph pieces of a comment's anchoring.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommentAnchorKind {
+    /// `<w:commentRangeStart/>`.
+    RangeStart,
+    /// `<w:commentRangeEnd/>`.
+    RangeEnd,
+    /// The run holding `<w:commentReference/>`.
+    Reference,
 }
 
 /// Issues #199 / #106 — attribute-level grab bag + in-paragraph source
@@ -2736,14 +2773,23 @@ impl Default for FloatAnchor {
 /// A hyperlink overlay on a contiguous byte range of a paragraph. Display
 /// styling (blue + underline if no explicit `<w:rPr>`) is applied at layout
 /// time; clicks are out of scope for Phase 7 (the model is read-only).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hyperlink {
     pub start: u32,
     pub end: u32,
-    /// External URL (`Target` from the `r:id`'s rel entry). Internal
-    /// document anchors (`<w:hyperlink w:anchor>`) are not modelled in
-    /// this initial cut.
+    /// External URL (`Target` from the `r:id`'s rel entry), or `#name`
+    /// for an internal bookmark anchor (`<w:hyperlink w:anchor>`, issue
+    /// #81).
     pub target: String,
+    /// Issue #242 — the source `<w:hyperlink>` attributes, source order
+    /// (`r:id`, `w:history`, `w:tooltip`, `w:anchor`, `w:tgtFrame`, …),
+    /// re-emitted when the paragraph regenerates. The writer keeps the
+    /// source `r:id` only while the package's rels part still maps it to
+    /// `target` (a *verified* id — two links to one URL keep their own
+    /// rows) and re-resolves it otherwise; an internal `target` re-derives
+    /// `w:anchor`. Empty for an engine-authored link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attrs: Vec<SourceAttr>,
 }
 
 /// Phase 2 audit (gap D.1) — complex field overlay on a paragraph byte
@@ -2915,6 +2961,47 @@ pub enum RevisionKind {
     /// Payload-free here to keep `RevisionKind: Copy`, which a dozen
     /// existing match sites rely on.
     FormatChange,
+    /// Issue #247 — `<w:moveFrom>`: the SOURCE side of a tracked move.
+    /// Text semantics are a deletion's (accept drops it, reject keeps
+    /// it); the reviewer sees it as moved-away text. The source spells
+    /// it with `<w:t>` (not `<w:delText>`). The pairing with its
+    /// destination rides [`Revision::move_name`].
+    MoveFrom,
+    /// Issue #247 — `<w:moveTo>`: the DESTINATION side of a tracked
+    /// move. Text semantics are an insertion's (accept keeps it, reject
+    /// drops it).
+    MoveTo,
+}
+
+impl RevisionKind {
+    /// Issue #247 — `true` when ACCEPTING this revision removes its
+    /// text (`Delete`, `MoveFrom`).
+    pub fn removes_on_accept(self) -> bool {
+        matches!(self, Self::Delete | Self::MoveFrom)
+    }
+
+    /// Issue #247 — `true` when REJECTING this revision removes its
+    /// text (`Insert`, `MoveTo`).
+    pub fn removes_on_reject(self) -> bool {
+        matches!(self, Self::Insert | Self::MoveTo)
+    }
+
+    /// Issue #247 — `true` for the kinds that wrap runs in the source
+    /// (`<w:ins>` / `<w:del>` / `<w:moveFrom>` / `<w:moveTo>`);
+    /// `FormatChange` rides the run's `<w:rPr>` instead.
+    pub fn wraps_text(self) -> bool {
+        !matches!(self, Self::FormatChange)
+    }
+
+    /// Issue #247 — the text is removed by exactly one of accept /
+    /// reject: `accept == true` asks for the accept outcome.
+    pub fn removes_text(self, accept: bool) -> bool {
+        if accept {
+            self.removes_on_accept()
+        } else {
+            self.removes_on_reject()
+        }
+    }
 }
 
 /// Phase 8b — one `<w:ins>` / `<w:del>` / `<w:rPrChange>` overlay on a
@@ -2937,6 +3024,15 @@ pub struct Revision {
     /// original look. `None` for `Insert` / `Delete` revisions where
     /// the attribute is irrelevant.
     pub prev_attrs: Option<SpanStyle>,
+    /// Issue #247 — for a `MoveFrom` / `MoveTo` revision, the `w:name`
+    /// of the enclosing `<w:moveFromRangeStart>` / `<w:moveToRangeStart>`
+    /// (the pair's shared name links a move's two halves). `None` for
+    /// every other kind and for a move read outside a named range. The
+    /// range markers themselves ride the paragraph's source markup as
+    /// positioned verbatim markers. Skipped when `None`, so a pre-#247
+    /// snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_name: Option<String>,
 }
 
 /// Phase 7 — a media blob stashed for the renderer to decode.
@@ -3372,6 +3468,22 @@ pub struct Paragraph {
     /// paragraphs. Boxed: `Paragraph` clones constantly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_markup: Option<Box<SourceMarkup>>,
+    /// Issue #262 — a tracked change on the paragraph MARK
+    /// (`<w:pPr><w:rPr><w:ins/>` / `<w:del/>` / `<w:moveFrom/>` /
+    /// `<w:moveTo/>`): an inserted mark is a tracked paragraph SPLIT, a
+    /// deleted one a tracked MERGE with the following paragraph. Only
+    /// `kind` / `author` / `date` / `id` / `move_name` are meaningful —
+    /// `start` / `end` are unused (0). Accepting a deleted (or moved-
+    /// away) mark, or rejecting an inserted (or moved-in) one, merges
+    /// this paragraph with the next ([`DocumentTree::resolve_all_revisions`]).
+    ///
+    /// Travel rules: the mark belongs to the paragraph END, so
+    /// `split_at` gives it to the RIGHT half (the left half gets a fresh
+    /// mark) and `concat` keeps the TAIL's (like `section_end`);
+    /// clipboard fragments clear it. Skipped when `None`, so a pre-#262
+    /// snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark_revision: Option<Revision>,
 }
 
 /// Issue #81 — one paragraph-scoped bookmark. `id` is the source
@@ -3521,6 +3633,7 @@ impl Paragraph {
             /* Issues #199 / #106 — no offset moves; the writer verifies
             each run's recorded `<w:rPr>` against the new style. */
             source_markup: self.source_markup.clone(),
+            mark_revision: self.mark_revision.clone(),
         }
     }
 
@@ -3708,6 +3821,8 @@ impl Paragraph {
             bookmarks: self.bookmarks.clone(),
             body_xml: self.body_xml.clone(),
             source_markup: markup,
+            /* Issue #262 — the paragraph mark is untouched. */
+            mark_revision: self.mark_revision.clone(),
         }
     }
 
@@ -3825,6 +3940,8 @@ impl Paragraph {
                 a content control wrapping the paragraph wraps both halves. */
                 body_xml: BodyPassthrough::before_only(&self.body_xml),
                 source_markup: markup_left,
+                /* Issue #262 — a fresh mark for the left half. */
+                mark_revision: None,
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -3847,6 +3964,8 @@ impl Paragraph {
                 bookmarks: Vec::new(),
                 body_xml: BodyPassthrough::after_only(&self.body_xml),
                 source_markup: markup_right,
+                /* Issue #262 — the original mark ends the right half. */
+                mark_revision: self.mark_revision.clone(),
             },
         )
     }
@@ -3936,6 +4055,9 @@ impl Paragraph {
                 &other.source_markup,
                 other.text.len() as u32,
             ),
+            /* Issue #262 — the head's mark is the one deleted: the
+            surviving mark (and its tracked change) is the tail's. */
+            mark_revision: other.mark_revision.clone(),
         }
     }
 
@@ -4004,7 +4126,7 @@ impl Paragraph {
                 (ns < ne).then(|| Hyperlink {
                     start: ns,
                     end: ne,
-                    target: h.target.clone(),
+                    ..h.clone()
                 })
             })
             .collect();
@@ -4825,6 +4947,7 @@ impl DocumentTree {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         }));
         Self {
             blocks,
@@ -4877,6 +5000,7 @@ impl DocumentTree {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             }));
         }
         Self {
@@ -5909,29 +6033,19 @@ impl DocumentTree {
             let pre_text_len = (para.text.len() as u32).saturating_sub(len);
             let off = off_input.min(pre_text_len);
 
-            /* Detect boundary state BEFORE shifting revisions so the
-            classifier sees the pre-insert geometry. */
-            let inside_insert_same_author = para.revisions.iter().any(|r| {
+            /* Detect boundary state on the PRE-insert geometry (the
+            same paragraph of `self`). `insert_text` already shifted the
+            revisions by `len` (issue #247): revisions starting at or
+            after `off` slid right; revisions containing `off` grew. */
+            let pre_revisions = self
+                .paragraph_at_path(&target_path)
+                .map_or(&[][..], |p| p.revisions.as_slice());
+            let inside_insert_same_author = pre_revisions.iter().any(|r| {
                 r.kind == RevisionKind::Insert && r.start < off && off < r.end && r.author == author
             });
-            let inside_delete = para
-                .revisions
+            let inside_delete = pre_revisions
                 .iter()
                 .any(|r| r.kind == RevisionKind::Delete && r.start <= off && off < r.end);
-
-            /* Shift trailing revisions by `len`. Mirrors the span-shift
-            in `insert_text`: revisions starting at or after `off`
-            slide right; revisions containing `off` grow (end +=
-            len). Inline `objects` + `hyperlinks` shifts are deferred
-            to a future sprint — Sprint 14 keeps the surface bounded. */
-            for r in &mut para.revisions {
-                if r.start >= off {
-                    r.start += len;
-                }
-                if r.end > off {
-                    r.end += len;
-                }
-            }
 
             /* If we landed inside a Delete, the shift above grew the
             Delete to span both halves. Split it back into the two
@@ -5955,6 +6069,7 @@ impl DocumentTree {
                             date: r.date.clone(),
                             id: None,
                             prev_attrs: None,
+                            move_name: None,
                         });
                     }
                     /* Right half [off + len, r.end) — note r.end was
@@ -5969,6 +6084,7 @@ impl DocumentTree {
                             date: r.date,
                             id: None,
                             prev_attrs: None,
+                            move_name: None,
                         });
                     }
                 }
@@ -5996,6 +6112,7 @@ impl DocumentTree {
                         date: date.clone(),
                         id: None,
                         prev_attrs: None,
+                        move_name: None,
                     });
                 }
             }
@@ -6107,6 +6224,7 @@ impl DocumentTree {
                     date: date.clone(),
                     id: None,
                     prev_attrs: None,
+                    move_name: None,
                 });
             }
             para.dirty = true;
@@ -6200,6 +6318,7 @@ impl DocumentTree {
                     date: date_local,
                     id: None,
                     prev_attrs: Some(prev_local),
+                    move_name: None,
                 });
                 para.dirty = true;
             });
@@ -6262,6 +6381,7 @@ impl DocumentTree {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             }));
             return Self {
                 blocks,
@@ -6343,14 +6463,39 @@ impl DocumentTree {
             a stale range would repaint the wrong bytes). Typing at a
             field's start boundary stays outside (shift); strictly inside
             grows the field (the cached result was hand-edited — the next
-            resolution overwrites it wholesale). Hyperlinks/revisions
-            keep their pre-existing #56 limitation. */
+            resolution overwrites it wholesale). */
             for f in &mut para.fields {
                 if f.start >= off {
                     f.start += len;
                     f.end += len;
                 } else if f.end > off {
                     f.end += len;
+                }
+            }
+            /* Issue #242 — hyperlinks follow their text the same way
+            (typing at either boundary stays outside the link); a stale
+            range re-anchored every link of an edited paragraph onto the
+            wrong bytes on save. */
+            for h in &mut para.hyperlinks {
+                if h.start >= off {
+                    h.start += len;
+                    h.end += len;
+                } else if h.end > off {
+                    h.end += len;
+                }
+            }
+            /* Issue #247 — tracked-change overlays (a move, an ins / del
+            read from the file) follow their text like a span: typing at
+            a revision's start stays outside it (shift), strictly inside
+            grows it, at its end stays outside. `tracked_insert_text`
+            builds on this shift (a Delete it lands in grows and is split
+            back around the new insertion there). */
+            for r in &mut para.revisions {
+                if r.start >= off {
+                    r.start += len;
+                }
+                if r.end > off {
+                    r.end += len;
                 }
             }
             /* Issue #69 / #80 — inline-object anchors (images, note
@@ -6981,6 +7126,20 @@ impl DocumentTree {
     }
 
     fn apply_revision_decision(&self, block: u32, start: u32, end: u32, accept: bool) -> Self {
+        /* Issue #262 — a paragraph-MARK revision is addressed as the
+        empty range at the paragraph end (`revisions_snapshot` lists it
+        so); text revisions are never empty. */
+        if start == end
+            && let Some(p) = self
+                .blocks
+                .get(block as usize)
+                .and_then(Block::as_paragraph)
+            && p.mark_revision.is_some()
+            && start as usize == p.text.len()
+            && !p.revisions.iter().any(|r| r.start == start && r.end == end)
+        {
+            return self.resolve_mark_revision_at(block, accept);
+        }
         let mut blocks = self.blocks.clone();
         let path = BlockPath::top(block);
         let mut removed_edit = None;
@@ -6996,11 +7155,17 @@ impl DocumentTree {
              * helper does not also `retain`-drop it (which would make
              * any post-shift index lookup brittle). */
             let rev = para.revisions.remove(idx);
-            let delete_text = match (rev.kind, accept) {
-                (RevisionKind::Insert, false) => true, // Reject Insert
-                (RevisionKind::Delete, true) => true,  // Accept Delete
-                _ => false,                            // text stays live
-            };
+            /* Issue #262 — a rejected formatting change restores the
+            recorded style. */
+            if !accept
+                && rev.kind == RevisionKind::FormatChange
+                && let Some(prev) = &rev.prev_attrs
+            {
+                revisions::restyle(para, rev.start, rev.end, prev);
+            }
+            /* Reject Insert / MoveTo, accept Delete / MoveFrom (issue
+            #247): the text goes; otherwise it stays live. */
+            let delete_text = rev.kind.removes_text(accept);
             if delete_text {
                 let s = para.snap_offset(rev.start);
                 let e = para.snap_offset(rev.end);
@@ -10604,6 +10769,8 @@ fn strip_section_marker(mut p: Paragraph) -> Paragraph {
     /* Issues #199 / #106 — nor the source paragraph's identity
     (`w14:paraId`) and rsids: a pasted copy is a new paragraph. */
     p.source_markup = None;
+    /* Issue #262 — nor a tracked change on the source paragraph's mark. */
+    p.mark_revision = None;
     p
 }
 
@@ -12276,6 +12443,7 @@ mod tests {
                 start: 9,
                 end: 11,
                 target: "https://example.com".into(),
+                ..Default::default()
             });
             p.inline_objects.push(InlineObject {
                 at: 11,
@@ -12934,6 +13102,7 @@ mod tests {
             start: 0,
             end: 5,
             target: "https://example.com".to_string(),
+            ..Default::default()
         });
         para.revisions.push(Revision {
             start: 6,
@@ -12943,6 +13112,7 @@ mod tests {
             date: "2026-01-01T00:00:00Z".to_string(),
             id: Some(1),
             prev_attrs: None,
+            move_name: None,
         });
         doc.blocks[0] = Block::Paragraph(para);
 
@@ -13236,6 +13406,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -13266,6 +13437,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -13293,6 +13465,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -13398,6 +13571,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -13439,6 +13613,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -13937,6 +14112,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -13984,6 +14160,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -14030,6 +14207,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -14054,6 +14232,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             },
         ];
         let (out, caret) = doc.insert_rich(

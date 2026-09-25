@@ -64,6 +64,12 @@ jobs:
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          # Pinned: the action's "latest" lookup is not deterministic (the
+          # 2026-09-25 QA run received v0.9.1 while the wasm job received
+          # v0.15.0 in the same minute; 0.9.1 cannot parse workspace-inherited
+          # `package.license`). Keep in step with the Homebrew wasm-pack.
+          version: 'v0.15.0'
 
       - name: Build engine-wasm (release)
         run: wasm-pack build --target web --release crates/engine-wasm
@@ -201,6 +207,12 @@ jobs:
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          # Pinned: the action's "latest" lookup is not deterministic (the
+          # 2026-09-25 QA run received v0.9.1 while the wasm job received
+          # v0.15.0 in the same minute; 0.9.1 cannot parse workspace-inherited
+          # `package.license`). Keep in step with the Homebrew wasm-pack.
+          version: 'v0.15.0'
 
       - name: Set up Node
         uses: actions/setup-node@v4

@@ -1209,13 +1209,27 @@ impl Engine {
                         block: block_idx as u32,
                         start: r.start,
                         end: r.end,
-                        kind: match r.kind {
-                            engine::RevisionKind::Insert => "insert",
-                            engine::RevisionKind::Delete => "delete",
-                            engine::RevisionKind::FormatChange => "format",
-                        },
+                        kind: revision_kind_label(r.kind),
                         author: r.author.clone(),
                         date: r.date.clone(),
+                        move_name: r.move_name.clone(),
+                        mark: false,
+                    });
+                }
+                /* Issue #262 — the paragraph-mark revision, addressed as
+                the empty range at the paragraph end (what
+                `AcceptRevision` / `RejectRevision` resolve it by). */
+                if let Some(r) = &p.mark_revision {
+                    let end = p.text.len() as u32;
+                    rows.push(RevisionOut {
+                        block: block_idx as u32,
+                        start: end,
+                        end,
+                        kind: revision_kind_label(r.kind),
+                        author: r.author.clone(),
+                        date: r.date.clone(),
+                        move_name: r.move_name.clone(),
+                        mark: true,
                     });
                 }
             }
@@ -1301,6 +1315,25 @@ struct RevisionOut {
     kind: &'static str,
     author: String,
     date: String,
+    /// Issue #247 — the move's range name (`MoveFrom` / `MoveTo` only):
+    /// the two halves of one move share it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    move_name: Option<String>,
+    /// Issue #262 — a paragraph-MARK revision (a tracked split / merge),
+    /// addressed by the empty range `start == end == text length`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mark: bool,
+}
+
+/// The `revisions_snapshot()` wire label of a revision kind.
+fn revision_kind_label(kind: engine::RevisionKind) -> &'static str {
+    match kind {
+        engine::RevisionKind::Insert => "insert",
+        engine::RevisionKind::Delete => "delete",
+        engine::RevisionKind::FormatChange => "format",
+        engine::RevisionKind::MoveFrom => "move-from",
+        engine::RevisionKind::MoveTo => "move-to",
+    }
 }
 
 #[derive(::serde::Serialize)]
@@ -1897,6 +1930,21 @@ const HYPERLINK_BLUE: [u8; 4] = [0x05, 0x63, 0xC1, 0xFF];
 /// with a later cut.
 const REVISION_INSERT_COLOR: [u8; 4] = [0x00, 0x80, 0x00, 0xFF];
 const REVISION_DELETE_COLOR: [u8; 4] = [0xCC, 0x00, 0x00, 0xFF];
+/// Issue #247 — tracked moves get their own tint (both halves), so a
+/// move reads differently from an unrelated insert / delete pair.
+const REVISION_MOVE_COLOR: [u8; 4] = [0x6A, 0x1B, 0x9A, 0xFF];
+
+/// Issue #262 — the pilcrow colour of a paragraph whose MARK carries a
+/// tracked change (paint-only review decoration), in the same tint as
+/// the matching text revision.
+fn review_mark_color(para: &engine::Paragraph) -> Option<[u8; 4]> {
+    para.mark_revision.as_ref().map(|r| match r.kind {
+        engine::RevisionKind::Insert => REVISION_INSERT_COLOR,
+        engine::RevisionKind::Delete => REVISION_DELETE_COLOR,
+        engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => REVISION_MOVE_COLOR,
+        engine::RevisionKind::FormatChange => REVISION_INSERT_COLOR,
+    })
+}
 
 /// Phase 8b — overlay each revision range so insertions render with
 /// `underline = true` + the insert colour and deletions render with
@@ -1952,6 +2000,22 @@ fn apply_revision_overlay(
                         sub.strike = true;
                         if sub.color == default_color {
                             sub.color = REVISION_DELETE_COLOR;
+                        }
+                    }
+                    /* Issue #247 — a move's source half reads like a
+                    deletion, its destination like an insertion (double
+                    underline), both in the move tint. Paint-only: glyph
+                    advances do not change. */
+                    engine::RevisionKind::MoveFrom => {
+                        sub.strike = true;
+                        if sub.color == default_color {
+                            sub.color = REVISION_MOVE_COLOR;
+                        }
+                    }
+                    engine::RevisionKind::MoveTo => {
+                        sub.underline = engine::UnderlineStyle::Double;
+                        if sub.color == default_color {
+                            sub.color = REVISION_MOVE_COLOR;
                         }
                     }
                     /* Sprint 14 (#14) — FormatChange has no text-wrap
@@ -3057,6 +3121,12 @@ fn paragraph_layout_key(
         r.start.hash(&mut h);
         r.end.hash(&mut h);
         matches!(r.kind, engine::RevisionKind::Insert).hash(&mut h);
+        /* Issue #247 — the move kinds paint differently from ins / del. */
+        matches!(
+            r.kind,
+            engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo
+        )
+        .hash(&mut h);
     }
     /* Audit gap A.M3 — tab stops affect glyph advances at the line
     builder's post-pass; without them in the key, two paragraphs with
@@ -3252,6 +3322,7 @@ fn layout_story_blocks_cut(
                 };
                 p.borders = para.props.borders.clone();
                 p.shading = para.props.shading;
+                p.review_mark = review_mark_color(para);
                 LayoutBlock::Paragraph(p)
             }
             engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
@@ -7294,6 +7365,8 @@ impl Engine {
             Command::RejectRevision { block, start, end } => {
                 self.do_reject_revision(block, start, end)
             }
+            Command::AcceptAllRevisions => self.do_resolve_all_revisions(true),
+            Command::RejectAllRevisions => self.do_resolve_all_revisions(false),
             Command::InsertComment {
                 range,
                 text,
@@ -9224,6 +9297,8 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
+                        /* Issue #262 — the pilcrow of a tracked mark. */
+                        para_box.review_mark = review_mark_color(para);
                         /* Issue #95 / #178 / #179 — pagination
                         constraints from the resolved (style-cascaded)
                         properties. keepNext/keepLines are tri-state
@@ -14731,6 +14806,45 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #262 — `Command::AcceptAllRevisions` /
+    /// `RejectAllRevisions`: every tracked change of the body resolved in
+    /// one tree edit, pushed as ONE undo step. Nothing to resolve → no
+    /// undo step. The selection is clamped back into the (possibly
+    /// merged / shortened) paragraphs.
+    fn do_resolve_all_revisions(&mut self, accept: bool) -> Event {
+        let doc = self.undo.current();
+        if !doc.has_revisions() {
+            self.announce(AnnouncementPriority::Polite, "No tracked changes");
+            return self.selection_changed();
+        }
+        let new_doc = doc.resolve_all_revisions(accept);
+        self.undo.push(new_doc);
+        /* Merged / shortened paragraphs: keep the caret on real text. */
+        if let Some(sel) = self.selection.clone() {
+            let doc = self.undo.current();
+            self.selection = Some(SelectionState {
+                anchor: clamp_pos(doc, sel.anchor),
+                caret: clamp_pos(doc, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+        }
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(
+            AnnouncementPriority::Polite,
+            if accept {
+                "All tracked changes accepted"
+            } else {
+                "All tracked changes rejected"
+            },
+        );
+        self.selection_changed()
+    }
+
     /// `Command::InsertComment` (Sprint 7 UI Edition). Stamped with the
     /// engine clock via `current_review_date` (issue #118 — the
     /// `SetReviewIdentity` override wins, else `Date` / `SystemTime`).
@@ -17203,6 +17317,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -17357,6 +17472,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -17395,6 +17511,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -18516,6 +18633,7 @@ mod tests {
             start: 10,
             end: 17,
             target: "https://example.com".to_string(),
+            ..Default::default()
         });
 
         let base_spans = build_style_spans(&para, empty_sctx(), 24.0, [0, 0, 0, 255], 1.0);
@@ -18568,6 +18686,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             })],
             source_markup: None,
         }
@@ -26407,6 +26526,9 @@ mod block_remap_tests;
 mod text_remap_tests;
 
 #[cfg(test)]
+mod revision_command_tests;
+
+#[cfg(test)]
 mod story_tab_tests;
 
 #[cfg(test)]
@@ -26792,17 +26914,20 @@ mod wire_validation_tests {
                 date: "d".into(),
                 id: None,
                 prev_attrs: None,
+                move_name: None,
             }],
             hyperlinks: vec![
                 engine::Hyperlink {
                     start: 0,
                     end: 6,
                     target: "x".into(),
+                    ..Default::default()
                 },
                 engine::Hyperlink {
                     start: 2,
                     end: 8,
                     target: "y".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()

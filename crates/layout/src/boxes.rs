@@ -554,6 +554,12 @@ pub struct ParagraphBox {
     /// `Default` is "no spacing, no constraint", the historical
     /// behaviour of every layout-only paragraph.
     pub flow: ParaFlow,
+    /// Issue #262 — review decoration: the paragraph MARK carries a
+    /// tracked change (an inserted / deleted mark), painted as a pilcrow
+    /// in this colour just past the end of the last line. Paint-only —
+    /// it never moves geometry (not part of any fingerprint); a split
+    /// gives it to the tail, which owns the mark.
+    pub review_mark: Option<[u8; 4]>,
 }
 
 /// Issues #94 / #95 — per-paragraph pagination inputs carried on the

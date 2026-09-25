@@ -520,6 +520,7 @@ mod tests {
                     at: 11,
                     xml: br#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#.to_vec(),
                     role: crate::MarkerRole::Content,
+                    comment: None,
                 },
                 SourceMarker {
                     /* Issue #245 — a content control's two ends. */
@@ -529,11 +530,23 @@ mod tests {
                         id: 7,
                         close_xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     },
+                    comment: None,
                 },
                 SourceMarker {
                     at: 5,
                     xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     role: crate::MarkerRole::Close { id: 7 },
+                    comment: None,
+                },
+                SourceMarker {
+                    /* Issue #243 — a comment anchor keeps its identity. */
+                    at: 5,
+                    xml: br#"<w:commentRangeEnd w:id="3"/>"#.to_vec(),
+                    comment: Some(crate::CommentAnchor {
+                        kind: crate::CommentAnchorKind::RangeEnd,
+                        id: 3,
+                    }),
+                    ..SourceMarker::default()
                 },
             ],
         };

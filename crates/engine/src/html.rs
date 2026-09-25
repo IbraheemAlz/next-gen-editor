@@ -1062,6 +1062,7 @@ impl ParaBuilder {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         })
     }
 }
@@ -1180,6 +1181,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -1205,6 +1207,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -1238,6 +1241,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(
             to_html(&[p]),
@@ -1274,6 +1278,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);
@@ -1437,6 +1442,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let html = to_html(&[p]);
         assert!(html.contains("data-rel-id=\"rId7\""));
