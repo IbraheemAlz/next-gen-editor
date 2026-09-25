@@ -33,10 +33,17 @@ function runStyle(r: A11yRun): string {
     return parts.join(';');
 }
 
-/** Build the `<p>` element for one accessibility paragraph. */
+/** Build the `<p>` element for one accessibility paragraph.
+ *
+ *  Issue #195 — `dir` is the paragraph's OWN resolved base direction
+ *  (explicit bidi → first-strong → document base, the engine's layout
+ *  resolution), never the document-wide `direction`: an RTL paragraph in
+ *  an LTR document must run UAX #9 with an RTL base for the screen reader.
+ *  Every `<p>` sets it, so container regions (text box, header / footer)
+ *  carry no `dir` and nothing is inherited. */
 function buildParagraph(p: A11yParagraph): HTMLParagraphElement {
     const el = document.createElement('p');
-    el.dir = p.direction === 'Rtl' ? 'rtl' : 'ltr';
+    el.dir = p.resolved_direction === 'Rtl' ? 'rtl' : 'ltr';
     for (const run of p.runs) {
         const span = document.createElement('span');
         const style = runStyle(run);

@@ -350,6 +350,20 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "text_boxes_nested.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 11,
+      "asserts": {
+        "paragraph_count": 2,
+        "paragraph_texts": [
+          "Intro paragraph.",
+          "￼Host paragraph."
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "text_boxes_wrap.docx": {
       "generator": "handcrafted",
       "phase_introduced": 11,

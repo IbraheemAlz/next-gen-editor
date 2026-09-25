@@ -64,14 +64,17 @@
 //! the `behindDoc` group before any text, the in-front group last, each
 //! sorted by `relativeHeight`. Each distinct media payload is written
 //! once and shared by every page that references it. JPEG passes through
-//! as `/DCTDecode` (dimensions from the SOF marker); PNG is decoded in pure
-//! Rust (`png` crate) and re-deflated. Transparency rule: plain output and
-//! PDF/A-2u carry PNG alpha as an `/SMask`; PDF/A-1b (which forbids
+//! as `/DCTDecode` (dimensions from the SOF marker); PNG, GIF (first frame,
+//! issue #189) and WebP (lossy + lossless, issue #189) are decoded in pure
+//! Rust (`png` / `gif` / `image-webp`; the latter two behind the default
+//! `gif` / `webp` features) and re-deflated. Transparency rule: plain
+//! output and PDF/A-2u carry alpha as an `/SMask`; PDF/A-1b (which forbids
 //! `/SMask`) and PDF/X-3:2003 (which forbids transparency) composite every
 //! pixel onto opaque white instead. No per-image ICC profile is embedded —
 //! samples are `DeviceRGB` / `DeviceGray` under the document's sRGB output
-//! intent; a CMYK JPEG is embedded only in plain output. GIF / WebP / EMF /
-//! WMF and corrupt or oversized images are skipped with a [`PdfWarning`].
+//! intent; a CMYK JPEG is embedded only in plain output. EMF / WMF (and GIF /
+//! WebP with their feature off) and corrupt or oversized images are skipped
+//! with a [`PdfWarning`].
 //!
 //! # Stream compression & text extraction
 //!
@@ -687,17 +690,40 @@ fn page_image_rels<'a>(page: &'a PageBox) -> Vec<&'a str> {
         for_each_paragraph(&hf.blocks, &mut collect);
     }
     let visible = |f: &&layout::FloatBox| !f.hidden && f.size.width > 0.0 && f.size.height > 0.0;
+    let mut frame_floats: Vec<&'a str> = Vec::new();
     for f in page.floats.iter().filter(visible) {
         if let Some(tb) = f.text_box.as_deref() {
-            for_each_paragraph(&tb.blocks, &mut collect);
+            collect_frame_image_rels(tb, &mut collect, &mut frame_floats);
         }
     }
+    rels.extend(frame_floats);
     for f in page.floats.iter().filter(visible) {
         if f.text_box.is_none() {
             rels.push(&f.rel_id);
         }
     }
     rels
+}
+
+/// Issue #165 / #197 — the images one visible text-box frame paints:
+/// inline image glyphs of its story, then (depth-first, bounded by the
+/// layout's nesting cap) every visible float of the story — a nested
+/// box recurses, a floating picture contributes its own rel id.
+fn collect_frame_image_rels<'a>(
+    tb: &'a layout::TextBoxFrame,
+    collect: &mut dyn FnMut(&'a ParagraphBox),
+    rels: &mut Vec<&'a str>,
+) {
+    for_each_paragraph(&tb.blocks, &mut |p| collect(p));
+    for f in &tb.floats {
+        if f.hidden || f.size.width <= 0.0 || f.size.height <= 0.0 {
+            continue;
+        }
+        match f.text_box.as_deref() {
+            Some(inner) => collect_frame_image_rels(inner, collect, rels),
+            None => rels.push(&f.rel_id),
+        }
+    }
 }
 
 /// Build the page content stream: one positioned glyph-show per glyph.
