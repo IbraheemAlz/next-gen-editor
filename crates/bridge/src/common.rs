@@ -188,6 +188,26 @@ pub struct ImageRect {
     /// — zoom / DPR independent, like the resize handles.
     pub frame_x: f32,
     pub frame_y: f32,
+    /// Issue #82 — the floating image's text-wrap mode (`None` for an
+    /// inline image, which flows with the text). Drives the wrap picker's
+    /// checked state; changed through `Command::SetImageWrap`.
+    #[serde(default)]
+    pub wrap: Option<ImageWrapMode>,
+}
+
+/// Issue #82 — the user-facing text-wrap modes of a floating image, as
+/// Word's "Wrap Text" menu names them. `BehindText` / `InFrontOfText` are
+/// both `<wp:wrapNone/>`, told apart by `behindDoc`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[serde(rename_all = "snake_case")]
+pub enum ImageWrapMode {
+    Square,
+    Tight,
+    Through,
+    TopAndBottom,
+    BehindText,
+    InFrontOfText,
 }
 
 /// Document container format.

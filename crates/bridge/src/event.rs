@@ -597,6 +597,17 @@ pub enum LayoutDegradeReason {
     /// The table autofit shrink solver hit its iteration cap; column
     /// floors were used as-is.
     AutofitCap,
+    /// Issue #82 — a floating object kept pushing its own anchor forward
+    /// through the text-wrap loop's per-object cap; its cutouts were
+    /// dropped and it paints over the text where it landed.
+    WrapObjectFrozen,
+    /// Issue #82 — the anchor → position → wrap → reflow loop oscillated
+    /// or hit its pass cap; the moving objects were frozen / the current
+    /// pages accepted.
+    WrapOscillation,
+    /// Issue #82 — a tight / through object had no usable wrap polygon;
+    /// its bounding box was used (square wrap).
+    WrapPolygonFallback,
 }
 
 /// Issue #87 — one degradation note on `Event::Painted`. `page` is the

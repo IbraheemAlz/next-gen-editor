@@ -19,8 +19,8 @@ use crate::schema::grab_bag::{
     NamespaceScope, capture_subtree, slice_element, slice_fragment, stash,
 };
 use crate::schema::wp_anchor::{
-    AnchorAxis, AnchorOffsetKind, anchor_from_start_tag, h_relative_from, is_wrap_element,
-    parse_offset, v_relative_from, wrap_kind_of,
+    AnchorAxis, AnchorOffsetKind, anchor_from_start_tag, apply_wrap_fragment, h_relative_from,
+    is_wrap_element, parse_offset, v_relative_from, wrap_kind_of,
 };
 use crate::style_resolver::StyleResolver;
 use engine::{
@@ -747,6 +747,7 @@ pub fn parse_document_xml_with_warnings(
                         if let Some(a) = cur_anchor.as_mut() {
                             a.wrap = wrap_kind_of(n).unwrap_or_default();
                             a.wrap_xml = frag.and_then(|f| String::from_utf8(f).ok());
+                            apply_wrap_fragment(a);
                         }
                     }
                     b"wp:docPr" if in_wp_anchor => {
@@ -887,6 +888,7 @@ pub fn parse_document_xml_with_warnings(
                             a.wrap = wrap_kind_of(n).unwrap_or_default();
                             a.wrap_xml = slice_fragment(xml, prev_pos, end)
                                 .and_then(|f| String::from_utf8(f).ok());
+                            apply_wrap_fragment(a);
                         }
                     }
                     b"wp:docPr" if in_wp_anchor => {
@@ -1690,11 +1692,93 @@ mod tests {
         );
         assert_eq!(a.wrap, engine::WrapKind::Tight);
         assert_eq!(a.wrap_xml.as_deref(), Some(wrap), "polygon rides verbatim");
+        /* Issue #82 — and is modeled too. */
+        assert_eq!(a.wrap_text, engine::WrapText::BothSides);
+        assert_eq!(
+            a.wrap_polygon.as_deref(),
+            Some(&[(0, 0), (0, 21600), (21600, 21600), (21600, 0), (0, 0)][..])
+        );
         assert_eq!(
             a.doc_pr_xml.as_deref(),
             Some(doc_pr),
             "docPr children ride verbatim"
         );
+    }
+
+    /// Issue #82 — every wrap child parses into typed fields: kind, the
+    /// `wrapText` side rule, and (tight / through) the polygon.
+    #[test]
+    fn anchored_picture_wrap_modes_parse_into_typed_fields() {
+        let cases: &[(&str, engine::WrapKind, engine::WrapText, usize)] = &[
+            (
+                r#"<wp:wrapNone/>"#,
+                engine::WrapKind::None,
+                engine::WrapText::BothSides,
+                0,
+            ),
+            (
+                r#"<wp:wrapSquare wrapText="left"/>"#,
+                engine::WrapKind::Square,
+                engine::WrapText::Left,
+                0,
+            ),
+            (
+                r#"<wp:wrapSquare wrapText="largest"><wp:effectExtent l="0" t="0" r="0" b="0"/></wp:wrapSquare>"#,
+                engine::WrapKind::Square,
+                engine::WrapText::Largest,
+                0,
+            ),
+            (
+                concat!(
+                    r#"<wp:wrapThrough wrapText="right"><wp:wrapPolygon edited="1">"#,
+                    r#"<wp:start x="10" y="0"/><wp:lineTo x="21600" y="10800"/>"#,
+                    r#"<wp:lineTo x="10" y="21600"/></wp:wrapPolygon></wp:wrapThrough>"#
+                ),
+                engine::WrapKind::Through,
+                engine::WrapText::Right,
+                3,
+            ),
+            (
+                r#"<wp:wrapTopAndBottom distT="0" distB="0"/>"#,
+                engine::WrapKind::TopAndBottom,
+                engine::WrapText::BothSides,
+                0,
+            ),
+        ];
+        for &(wrap, kind, text, n) in cases {
+            let body = format!(
+                concat!(
+                    r#"<w:p><w:r><w:drawing>"#,
+                    r#"<wp:anchor distT="1" distB="2" distL="3" distR="4" simplePos="0" "#,
+                    r#"relativeHeight="3" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">"#,
+                    r#"<wp:simplePos x="0" y="0"/>"#,
+                    r#"<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+                    r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+                    r#"<wp:extent cx="914400" cy="457200"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+                    "{wrap}",
+                    r#"<wp:docPr id="2" name="P"/>{pic}"#,
+                    r#"</wp:anchor></w:drawing></w:r></w:p>"#,
+                ),
+                wrap = wrap,
+                pic = PIC_GRAPHIC
+            );
+            let tree = parse_body(&body);
+            let p = tree.blocks[0].as_paragraph().expect("paragraph");
+            let a = p.inline_objects[0].anchor.as_deref().expect("floating");
+            assert_eq!(a.wrap, kind, "{wrap}");
+            assert_eq!(a.wrap_text, text, "{wrap}");
+            assert_eq!(a.wrap_polygon.as_ref().map_or(0, Vec::len), n, "{wrap}");
+            assert_eq!(
+                (
+                    a.dist_top_emu,
+                    a.dist_bottom_emu,
+                    a.dist_left_emu,
+                    a.dist_right_emu
+                ),
+                (1, 2, 3, 4)
+            );
+            assert_eq!(a.wrap_xml.as_deref(), Some(wrap));
+        }
     }
 
     /// A `<wp:anchor>` around a shape / text box has no `<a:blip>`: it is

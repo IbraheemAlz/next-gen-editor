@@ -32,6 +32,7 @@ export type {
     FontMetrics,
     ImageBlob,
     ImageFit,
+    ImageWrapMode,
     LogicalPos,
     LogicalRange,
     MoveDirection,

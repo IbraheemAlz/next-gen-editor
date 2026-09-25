@@ -10,12 +10,15 @@ pub mod page;
 pub mod paginate;
 pub mod paragraph;
 pub mod watchdog;
+pub mod wrap;
+#[cfg(test)]
+mod wrap_fixtures;
 
 pub use boxes::{
-    CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FontId,
-    FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, MarkerBox, NoteBand,
-    PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TableBox, TableCellBox,
-    TableRowBox, TextAttrs, VisualRun,
+    CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FloatWrap,
+    FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, LineSegment,
+    MarkerBox, NoteBand, PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TableBox,
+    TableCellBox, TableRowBox, TextAttrs, VisualRun, WrapSide,
 };
 pub use floats::{ColumnLayout, resolve_page_floats};
 pub use page::{A4Page, Margins};
@@ -23,8 +26,14 @@ pub use paginate::{
     FOOTNOTE_SEPARATOR_HEIGHT_PT, HeaderBands, HeaderRole, NoteBody,
     PageGeometry as PaginatePageGeometry, Paginator, collect_note_anchors, split_paragraph_at_line,
 };
-pub use paragraph::{InlineObjectInfo, ParagraphConfig, layout_paragraph};
+pub use paragraph::{
+    InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
+};
 pub use watchdog::{
     BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation, Watchdog,
     geometry_fingerprint, verify_prefix,
+};
+pub use wrap::{
+    FloatKey, WrapConvergence, WrapCutout, WrapPlan, WrapVerdict, cutouts_for_float, derive_plan,
+    float_key, next_band_edge, plans_equal, segments_for_band,
 };

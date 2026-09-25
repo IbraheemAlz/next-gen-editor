@@ -277,12 +277,9 @@ fn parse_table_bytes_at(
                         let start = p_start_byte.take().unwrap();
                         if let Some(raw) = slice_element(xml, start, p_end, b"w:p") {
                             if let Some(cell) = cur_cell.as_mut() {
-                                /* Phase 5 PR 2 — cell paragraphs are
-                                parsed via the existing single-paragraph
-                                helper, but for simplicity we extract
-                                the visible text and stash source bytes
-                                for round-trip. Full cascade + numbering
-                                inside cells lands in Phase 5 PR 3. */
+                                /* Issue #101 — cell paragraphs parse
+                                through the body run parser (runs, rPr
+                                grab bags, pictures, source bytes). */
                                 cell.blocks.push(Block::Paragraph(parse_cell_paragraph(
                                     &raw, resolver, ns,
                                 )));
@@ -305,155 +302,68 @@ fn parse_table_bytes_at(
     Ok((grid, props, rows))
 }
 
-/// Cell paragraph parser. Extracts the concatenated visible text,
-/// routes direct `<w:pPr>` children through the shared `apply_ppr`
-/// surface (plus `pBdr` edges and `tabs` stops — issue #32), and
-/// captures the raw `<w:p>` bytes for round-trip. Run-level `<w:rPr>`
-/// spans inside cells are still deferred (a refactor of
-/// `parts::document::parse_document_xml` to share its run-aware loop).
+/// Cell paragraph parser (issue #101). A cell `<w:p>` is parsed by the
+/// SAME run-aware loop as a body paragraph (`parts::document`), so it
+/// yields identical `StyleRun` spans (`<w:rPr>` via `schema::ct_rpr`,
+/// unmodeled children into the run grab bags), inline objects (inline /
+/// floating pictures, footnote refs), hyperlinks, tracked-change overlays,
+/// fields, the resolved paragraph cascade + list binding, and its own
+/// `source_xml` for the clean-paragraph passthrough.
+///
+/// Mechanism: the captured `<w:p>` bytes are re-rooted under a synthetic
+/// `<w:document><w:body>` whose root re-declares the enclosing part's
+/// namespace scope (`ns`), then handed to
+/// [`crate::parts::document::parse_document_xml`]. The body parser's
+/// reader offsets index the wrapper, where the paragraph sits verbatim, so
+/// its `source_xml` capture is exactly `xml`; grab-bag capture checks
+/// prefixes against the same root bindings the table walk uses. Before,
+/// this helper kept only the concatenated text — editing a cell collapsed
+/// the paragraph to one unstyled run and dropped `<w:drawing>` pictures.
+///
+/// Body-only state is discarded: a cell paragraph can never end a
+/// document section (`section_end`), and comment ranges stay
+/// body-paragraph-only as before.
 fn parse_cell_paragraph(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
     ns: &NamespaceScope,
 ) -> engine::Paragraph {
-    use crate::parts::document::{apply_pbdr_edge, parse_tab_stop};
-    use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
-    use crate::schema::ct_rpr::{attr_val, fold_rpr_fragment};
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
-    let mut text = String::new();
-    let mut in_text = false;
-    let mut in_ppr = false;
-    let mut in_num_pr = false;
-    let mut in_pbdr = false;
-    let mut in_tabs = false;
-    let mut p_style: Option<String> = None;
-    let mut pmark_rpr = engine::SpanStyle::default();
-    let mut direct_ppr = engine::ParaProperties::default();
-    let mut list_num_id: Option<u32> = None;
-    let mut list_ilvl: Option<u8> = None;
-    /* Issue #84 — byte offset of the event about to be read, for
-    grab-bag fragment capture (mirrors `parts::document`). */
-    let mut prev_pos: usize = 0;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match e.name().as_ref() {
-                b"w:t" => in_text = true,
-                b"w:pPr" => in_ppr = true,
-                b"w:rPr" if in_ppr => {
-                    /* Issue #84 — paragraph-mark `<w:rPr>`: whole element
-                    into the pPr grab bag, modeled children folded into
-                    the run baseline (see `parts::document`). */
-                    if let Ok(Some(frag)) = capture_subtree(xml, prev_pos, &mut reader, &e) {
-                        fold_rpr_fragment(&frag, &mut pmark_rpr);
-                        stash(&mut direct_ppr.grab_bag, frag, ns);
-                    }
-                }
-                b"w:numPr" if in_ppr => in_num_pr = true,
-                b"w:pBdr" if in_ppr => in_pbdr = true,
-                b"w:tabs" if in_ppr => in_tabs = true,
-                n if in_ppr && !in_num_pr && !in_pbdr && !in_tabs && !ppr_child_is_modeled(n) => {
-                    /* Issue #84 — unmodeled `<w:pPr>` container child. */
-                    if let Ok(Some(frag)) = capture_subtree(xml, prev_pos, &mut reader, &e) {
-                        stash(&mut direct_ppr.grab_bag, frag, ns);
-                    }
-                }
-                n if in_ppr && !in_num_pr && !in_pbdr && !in_tabs => {
-                    apply_ppr(n, &e, &mut direct_ppr);
-                }
-                _ => {}
-            },
-            Ok(Event::Empty(e)) => match e.name().as_ref() {
-                b"w:pStyle" if in_ppr => p_style = attr_val(&e, b"w:val"),
-                b"w:numId" if in_num_pr => {
-                    list_num_id = attr_val(&e, b"w:val").and_then(|v| v.trim().parse().ok());
-                }
-                b"w:ilvl" if in_num_pr => {
-                    list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.trim().parse().ok());
-                }
-                b"w:rPr" if in_ppr => {
-                    let end = reader.buffer_position() as usize;
-                    if let Some(frag) = slice_fragment(xml, prev_pos, end) {
-                        stash(&mut direct_ppr.grab_bag, frag, ns);
-                    }
-                }
-                n if in_ppr && in_pbdr => apply_pbdr_edge(n, &e, &mut direct_ppr),
-                n if in_ppr && in_tabs && n == b"w:tab" => {
-                    if let Some(stop) = parse_tab_stop(&e) {
-                        direct_ppr.tab_stops.push(stop);
-                    }
-                }
-                n if in_ppr && !in_num_pr && !in_pbdr && !in_tabs && !ppr_child_is_modeled(n) => {
-                    /* Issue #84 — unmodeled `<w:pPr>` leaf child. */
-                    let end = reader.buffer_position() as usize;
-                    if let Some(frag) = slice_fragment(xml, prev_pos, end) {
-                        stash(&mut direct_ppr.grab_bag, frag, ns);
-                    }
-                }
-                n if in_ppr && !in_num_pr && !in_pbdr && !in_tabs => {
-                    apply_ppr(n, &e, &mut direct_ppr);
-                }
-                _ => {}
-            },
-            Ok(Event::End(e)) => match e.name().as_ref() {
-                b"w:t" => in_text = false,
-                b"w:pPr" => in_ppr = false,
-                b"w:numPr" => in_num_pr = false,
-                b"w:pBdr" => in_pbdr = false,
-                b"w:tabs" => in_tabs = false,
-                _ => {}
-            },
-            Ok(Event::Text(t)) if in_text => {
-                if let Ok(s) = t.unescape() {
-                    text.push_str(&s);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-        prev_pos = reader.buffer_position() as usize;
-        buf.clear();
+    let mut wrapped: Vec<u8> = Vec::with_capacity(xml.len() + 256);
+    wrapped.extend_from_slice(b"<w:document");
+    if ns.uri("w").is_none() {
+        wrapped.extend_from_slice(b" xmlns:w=\"");
+        wrapped.extend_from_slice(crate::schema::NS_W.as_bytes());
+        wrapped.push(b'"');
     }
-    /* Audit gap A.M18 — resolve cell paragraph through the style cascade.
-    Doc defaults + pStyle chain + direct pPr overrides + the
-    paragraph-mark rPr all fold into the effective `props`. List binding
-    from a direct `<w:numPr>` wins over the cascade-inherited
-    `props.list_item`. */
-    let (props, _baseline) =
-        resolver.resolve_paragraph(p_style.as_deref(), direct_ppr.clone(), pmark_rpr);
-    let list_item = match (list_num_id, list_ilvl) {
-        (Some(num_id), ilvl) => Some(engine::ListItem {
-            num_id,
-            ilvl: ilvl.unwrap_or(0),
-        }),
-        (None, _) => props.list_item,
-    };
-    engine::Paragraph {
-        text,
-        spans: Vec::new(),
-        props,
-        list_item,
-        resolved_marker: None,
-        resolved_list_indent: None,
-        /* Cell paragraphs ride their parent table's passthrough — the
-        cell's raw `<w:p>` bytes are inside `Table.source_xml`. We don't
-        store a per-paragraph `source_xml` here because PR 2 always
-        emits the whole table verbatim on save. */
-        dirty: false,
-        source_xml: Some(xml.to_vec()),
-        inline_objects: Vec::new(),
-        hyperlinks: Vec::new(),
-        revisions: Vec::new(),
-        fields: Vec::new(),
-        /* Issue #32: direct pPr overrides now survive for the style
-         * re-application machinery, mirroring body paragraphs. */
-        style_id: p_style,
-        direct_overrides: direct_ppr,
-        /* Phase 3 (#40) — a cell paragraph can never terminate a
-        document section (interior sectPr is body-level-paragraph
-        only). */
-        section_end: None,
+    for (prefix, uri) in ns.declarations() {
+        wrapped.extend_from_slice(b" xmlns:");
+        wrapped.extend_from_slice(prefix.as_bytes());
+        wrapped.extend_from_slice(b"=\"");
+        wrapped.extend_from_slice(uri.as_bytes());
+        wrapped.push(b'"');
+    }
+    wrapped.extend_from_slice(b"><w:body>");
+    wrapped.extend_from_slice(xml);
+    wrapped.extend_from_slice(b"</w:body></w:document>");
+
+    let parsed = crate::parts::document::parse_document_xml(&wrapped, resolver)
+        .ok()
+        .and_then(|tree| match tree.blocks.front() {
+            Some(Block::Paragraph(p)) => Some(p.clone()),
+            _ => None,
+        });
+    match parsed {
+        Some(mut p) => {
+            p.section_end = None;
+            p
+        }
+        /* The slice already parsed once inside the table walk, so this is
+        unreachable in practice; never drop the cell's bytes regardless —
+        a clean paragraph with `source_xml` rides the passthrough. */
+        None => engine::Paragraph {
+            source_xml: Some(xml.to_vec()),
+            ..Default::default()
+        },
     }
 }
 
@@ -991,6 +901,87 @@ mod tests {
         let (levels, opaque) = typed_chain(&rows);
         assert_eq!(levels, MAX_TABLE_NESTING_DEPTH);
         assert!(opaque.is_none());
+    }
+
+    /// Issue #101 — a cell `<w:p>` reads through the body run parser: the
+    /// cell paragraph is IDENTICAL (text, spans + rPr grab bags, inline
+    /// pictures, hyperlinks, fields, props, source bytes) to what the same
+    /// `<w:p>` yields as a body paragraph. Before, the cell parser kept
+    /// only the concatenated text — one unstyled run, the picture gone.
+    #[test]
+    fn cell_paragraph_matches_the_body_parse_of_the_same_paragraph() {
+        let p = concat!(
+            r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr>"#,
+            r#"<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Bold</w:t></w:r>"#,
+            r#"<w:r><w:t xml:space="preserve"> plain </w:t></w:r>"#,
+            r#"<w:r><w:rPr><w:i/><w:color w:val="FF0000"/><w:sz w:val="28"/><w:lang w:val="en-GB"/><w14:glow w14:rad="1"/></w:rPr><w:t xml:space="preserve">red</w:t></w:r>"#,
+            r#"<w:hyperlink r:id="rId9"><w:r><w:t xml:space="preserve">link</w:t></w:r></w:hyperlink>"#,
+            r#"<w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="457200"/>"#,
+            r#"<a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic></a:graphicData></a:graphic>"#,
+            r#"</wp:inline></w:drawing></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+            "</w:p>",
+        );
+        let ns_decls = concat!(
+            r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+            r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+            r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+            r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+            r#"xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml""#,
+        );
+        let table = empty_resolver();
+        let resolver = StyleResolver::new(&table);
+
+        let body_xml = format!(
+            "<w:document {ns_decls}><w:body>{p}<w:tbl><w:tblGrid><w:gridCol w:w=\"2880\"/></w:tblGrid><w:tr><w:tc>{p}</w:tc></w:tr></w:tbl><w:sectPr/></w:body></w:document>"
+        );
+        let doc = crate::parts::document::parse_document_xml(body_xml.as_bytes(), &resolver)
+            .expect("parse document");
+        let body = doc.blocks[0].as_paragraph().expect("body paragraph");
+        let t = doc.blocks[1].as_table().expect("table");
+        let cell = t.rows[0].cells[0].blocks[0]
+            .as_paragraph()
+            .expect("cell paragraph");
+
+        assert_eq!(cell.text, body.text);
+        assert_eq!(cell.text, "Bold plain redlink\u{FFFC}1");
+        assert_eq!(cell.spans, body.spans);
+        assert!(
+            cell.spans.iter().any(|s| s.style.bold == Some(true)),
+            "{:?}",
+            cell.spans
+        );
+        let red = cell
+            .spans
+            .iter()
+            .find(|s| s.style.color == Some([0xFF, 0, 0, 0xFF]))
+            .expect("red span");
+        assert_eq!(red.style.italic, Some(true));
+        assert_eq!(red.style.font_size, Some(14.0));
+        assert_eq!(
+            GrabBag::fragments_of(&red.style.grab_bag),
+            &[
+                br#"<w:lang w:val="en-GB"/>"#.to_vec(),
+                br#"<w14:glow w14:rad="1"/>"#.to_vec()
+            ],
+            "root-bound foreign rPr children ride the cell run's grab bag"
+        );
+        assert_eq!(cell.inline_objects, body.inline_objects);
+        assert!(matches!(
+            &cell.inline_objects[..],
+            [o] if matches!(&o.kind, engine::InlineKind::Image { rel_id, .. } if rel_id == "rId5")
+        ));
+        assert_eq!(cell.hyperlinks, body.hyperlinks);
+        assert_eq!(cell.hyperlinks.len(), 1);
+        assert_eq!(cell.fields, body.fields);
+        assert_eq!(cell.fields.len(), 1);
+        assert_eq!(cell.props, body.props);
+        assert_eq!(cell.direct_overrides, body.direct_overrides);
+        assert_eq!(cell.source_xml.as_deref(), Some(p.as_bytes()));
+        assert!(!cell.dirty);
+        assert!(cell.section_end.is_none());
     }
 
     #[test]

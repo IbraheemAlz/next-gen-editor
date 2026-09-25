@@ -63,6 +63,13 @@ impl NamespaceScope {
             .find(|(p, _)| p == prefix)
             .map(|(_, u)| u.as_str())
     }
+
+    /// Every `(prefix, escaped-uri)` binding, document order — what a
+    /// synthesized wrapper root re-declares so a fragment parsed out of
+    /// context sees the same scope (issue #101, `parts::table`).
+    pub fn declarations(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.decls.iter().map(|(p, u)| (p.as_str(), u.as_str()))
+    }
 }
 
 /// `xml[start..end]` when the range is sane, else `None`. `start` is the

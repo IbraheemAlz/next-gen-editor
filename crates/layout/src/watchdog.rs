@@ -90,6 +90,19 @@ pub enum DegradeReason {
     /// The autofit shrink solver hit its iteration cap; column floors were
     /// used as-is.
     AutofitCap,
+    /// Issue #82 — a floating object kept pushing its own anchor forward
+    /// (down the flow or onto a later page) through the wrap loop's
+    /// per-object cap; its text cutouts were dropped and it paints in
+    /// front of the text where it landed.
+    WrapObjectFrozen,
+    /// Issue #82 — the anchor → position → wrap → reflow loop did not reach
+    /// a fixpoint: the float configuration oscillated (watchdog stage b)
+    /// or the pass cap was hit; the moving objects were frozen / the
+    /// current pages accepted.
+    WrapOscillation,
+    /// Issue #82 — a tight / through wrap object carried no usable
+    /// `<wp:wrapPolygon>`; its bounding box was used (square wrap).
+    WrapPolygonFallback,
 }
 
 impl DegradeReason {
@@ -106,6 +119,9 @@ impl DegradeReason {
             DegradeReason::FastPathMismatch => "FAST_PATH_MISMATCH",
             DegradeReason::CacheMismatch => "CACHE_MISMATCH",
             DegradeReason::AutofitCap => "AUTOFIT_CAP",
+            DegradeReason::WrapObjectFrozen => "WRAP_OBJECT_FROZEN",
+            DegradeReason::WrapOscillation => "WRAP_OSCILLATION",
+            DegradeReason::WrapPolygonFallback => "WRAP_POLYGON_FALLBACK",
         }
     }
 }
@@ -503,6 +519,17 @@ fn hash_paragraph(h: &mut impl Hasher, p: &ParagraphBox) {
         hash_f32(h, l.height);
         hash_f32(h, l.width);
         l.source_start.hash(h);
+        /* Issue #82 — line segments join the fingerprint ONLY when a
+        float cut the band, so every float-free pinned value is unchanged
+        by construction. */
+        if !l.segments.is_empty() {
+            (l.segments.len() as u64).hash(h);
+            for s in &l.segments {
+                hash_f32(h, s.x0);
+                hash_f32(h, s.x1);
+            }
+            l.segment.hash(h);
+        }
         (l.runs.len() as u64).hash(h);
         for r in &l.runs {
             r.source_range.start.hash(h);
@@ -704,6 +731,8 @@ mod tests {
                     runs: Vec::new(),
                     alignment: Alignment::Start,
                     source_start: 0,
+                    segments: Vec::new(),
+                    segment: 0,
                 })
                 .collect(),
             direction: ShapingDirection::Ltr,

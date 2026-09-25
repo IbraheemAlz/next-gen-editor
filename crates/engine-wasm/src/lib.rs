@@ -382,6 +382,9 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::FastPathMismatch => LayoutDegradeReason::FastPathMismatch,
         R::CacheMismatch => LayoutDegradeReason::CacheMismatch,
         R::AutofitCap => LayoutDegradeReason::AutofitCap,
+        R::WrapObjectFrozen => LayoutDegradeReason::WrapObjectFrozen,
+        R::WrapOscillation => LayoutDegradeReason::WrapOscillation,
+        R::WrapPolygonFallback => LayoutDegradeReason::WrapPolygonFallback,
     };
     LayoutDegraded {
         reason,
@@ -1760,6 +1763,48 @@ fn float_spec_from_anchor(anchor: &engine::FloatAnchor, scale: f32) -> layout::F
     }
 }
 
+/// Issue #82 — lower an engine `FloatAnchor`'s wrap contract (mode, side
+/// rule, `dist*` EMU, `<wp:wrapPolygon>`) into the layout's px-space
+/// `FloatWrap` at the current scale. The polygon stays in Word's
+/// 21600-unit shape space (layout scales it by the object's extent).
+fn float_wrap_from_anchor(anchor: &engine::FloatAnchor, scale: f32) -> layout::FloatWrap {
+    let px = |emu: i64| engine::emu_to_pt(emu) * scale;
+    layout::FloatWrap {
+        kind: anchor.wrap,
+        side: match anchor.wrap_text {
+            engine::WrapText::BothSides => layout::WrapSide::Both,
+            engine::WrapText::Left => layout::WrapSide::Left,
+            engine::WrapText::Right => layout::WrapSide::Right,
+            engine::WrapText::Largest => layout::WrapSide::Largest,
+        },
+        dist_top: px(anchor.dist_top_emu),
+        dist_bottom: px(anchor.dist_bottom_emu),
+        dist_left: px(anchor.dist_left_emu),
+        dist_right: px(anchor.dist_right_emu),
+        polygon: anchor.wrap_polygon.as_ref().map(|pts| {
+            pts.iter()
+                .map(|&(x, y)| layout::Point {
+                    x: x as f32,
+                    y: y as f32,
+                })
+                .collect()
+        }),
+    }
+}
+
+/// Issue #82 — the bridge's user-facing wrap mode of a floating anchor.
+fn image_wrap_mode(anchor: &engine::FloatAnchor) -> bridge::ImageWrapMode {
+    use bridge::ImageWrapMode as M;
+    match anchor.wrap {
+        engine::WrapKind::Square => M::Square,
+        engine::WrapKind::Tight => M::Tight,
+        engine::WrapKind::Through => M::Through,
+        engine::WrapKind::TopAndBottom => M::TopAndBottom,
+        engine::WrapKind::None if anchor.behind_doc => M::BehindText,
+        engine::WrapKind::None => M::InFrontOfText,
+    }
+}
+
 /// Phase 7 — build the layout-side inline object table for one paragraph.
 /// EMU dimensions become layout pixels at the current scale: 914400 EMU is
 /// one inch, one inch is 72 pt, so `px = emu * scale / 12700`. The
@@ -1791,6 +1836,7 @@ fn build_inline_object_infos(
                     Some(anchor) => layout::paragraph::InlineObjectInfoKind::FloatingImage {
                         rel_id: rel_id.clone(),
                         spec: float_spec_from_anchor(anchor, scale),
+                        wrap: float_wrap_from_anchor(anchor, scale),
                     },
                     None => layout::paragraph::InlineObjectInfoKind::Image {
                         rel_id: rel_id.clone(),
@@ -2753,6 +2799,12 @@ fn reshape_resolved_fields(
                 continue;
             };
             if !pb.fields.iter().any(|f| f.evaluated_text.is_some()) {
+                continue;
+            }
+            /* Issue #82 — a paragraph cut by a float was laid against the
+            wrap plan; re-laying it here at full width would drop its
+            segments. It keeps the cached field text instead. */
+            if pb.lines.iter().any(|l| !l.segments.is_empty()) {
                 continue;
             }
             let Some(path) = paths.get(bi) else { continue };
@@ -3829,6 +3881,26 @@ fn layout_paragraph_cached(
         cache.pop(&key);
         note_layout_degradation(LayoutDegradeReason::CacheMismatch);
     }
+    let laid = layout_paragraph_wrapped_uncached(para, fonts, cfg, scale, max_width, sctx, &[]);
+    cache.put(key, laid.clone());
+    laid
+}
+
+/// Lay out one engine paragraph from scratch (no cache), cut by the
+/// issue #82 wrap `cuts` (paragraph-box space; empty ⇒ the plain
+/// composer, byte-identical to the pre-#82 path). The body build calls
+/// this directly for a paragraph the wrap plan cuts — those layouts
+/// depend on page geometry the LRU key does not see, so they never
+/// enter the cache.
+fn layout_paragraph_wrapped_uncached(
+    para: &engine::Paragraph,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    max_width: f32,
+    sctx: StyleContext,
+    cuts: &[layout::WrapCutout],
+) -> ParagraphBox {
     let spans = apply_revision_overlay(
         apply_hyperlink_overlay(
             build_style_spans(para, sctx, cfg.px_size, [0, 0, 0, 255], scale),
@@ -3860,9 +3932,7 @@ fn layout_paragraph_cached(
         inline_objects: &inline_infos,
         tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
     };
-    let laid = layout_paragraph(para_cfg);
-    cache.put(key, laid.clone());
-    laid
+    layout::layout_paragraph_wrapped(para_cfg, cuts)
 }
 
 /// Issue #87 — post-conditions a cached `ParagraphBox` must satisfy for
@@ -4087,11 +4157,21 @@ fn collect_paragraph_line_geom(
             .unwrap_or(line.source_start);
         let runs = build_line_run_geom(line, line_x);
         let slots: Vec<CaretSlot> = runs.iter().flat_map(|r| r.slots.iter().copied()).collect();
+        /* Issue #82 — a line composed into one segment of a band cut by a
+        float hit-tests over ITS segment only: the band's sibling lines
+        share `y_top`, so the x rectangle is what routes a click (and an
+        Up / Down walk's ideal-x) to the right segment — the same
+        disambiguation sibling table cells use. The gap over the object
+        belongs to no line; `nearest_line` snaps it to the closer one. */
+        let (hit_left, hit_width) = match line.segment_range() {
+            Some(seg) => (para_x + seg.x0, seg.width()),
+            None => (container_left, container_width),
+        };
         out.push(LineGeom {
             path: path.clone(),
             start_x: line_x,
-            hit_left: container_left,
-            hit_width: container_width,
+            hit_left,
+            hit_width,
             y_top: line_y,
             height: line.height,
             start_byte,
@@ -4202,6 +4282,7 @@ fn collect_paragraph_image_rects(
                         floating: false,
                         frame_x: 0.0,
                         frame_y: 0.0,
+                        wrap: None,
                     });
                 }
                 pen += g.x_advance;
@@ -5530,6 +5611,7 @@ impl Engine {
                 offset_h_emu,
                 offset_v_emu,
             } => self.do_move_image(path, at, offset_h_emu, offset_v_emu),
+            Command::SetImageWrap { path, at, wrap } => self.do_set_image_wrap(path, at, wrap),
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => self.do_select_all(),
@@ -6532,6 +6614,18 @@ impl Engine {
     /// display offsets. PDF export passes the SOURCE tree as `Resolved`
     /// so what leaves the engine is always the result view, whatever the
     /// screen shows; the F9 / save-time restamp passes it as `Probe`.
+    ///
+    /// Issue #82 — this is the anchor → position → wrap → reflow loop:
+    /// a float's position depends on its anchor paragraph's flow and the
+    /// flow depends on the floats' wrap cutouts. Pass 1 lays out with no
+    /// cutouts (exactly the pre-#82 pipeline); [`layout::WrapConvergence`]
+    /// derives the per-paragraph cutouts from the resolved floats and the
+    /// build repeats against them until the plan reproduces itself. A
+    /// document with no wrapping float converges on pass 1 — one layout,
+    /// unchanged geometry. The loop is bounded by the convergence
+    /// object's per-object forward-move cap, its watchdog churn ladder
+    /// and a hard pass cap; every escape is a reported
+    /// `LayoutDegradeReason` on the final pass's notes.
     #[allow(clippy::type_complexity)]
     fn build_pages_of(
         &self,
@@ -6540,6 +6634,58 @@ impl Engine {
         with_composition: bool,
         target_y: Option<f32>,
         mode: FieldMode,
+    ) -> Result<
+        (
+            Vec<PageBox>,
+            FontStack,
+            Vec<Vec<EngineBlockPath>>,
+            LazyLayoutInfo,
+        ),
+        Box<Event>,
+    > {
+        let mut plan = layout::WrapPlan::new();
+        let mut built =
+            self.build_pages_pass(doc.clone(), scale, with_composition, target_y, mode, &plan)?;
+        let slab = self
+            .layout_cfg
+            .as_ref()
+            .map_or(12.0, |c| c.line_height * scale);
+        let mut conv = layout::WrapConvergence::new(slab);
+        loop {
+            match conv.observe(&built.0, &plan) {
+                layout::WrapVerdict::Converged | layout::WrapVerdict::Capped => break,
+                layout::WrapVerdict::Continue(next) => {
+                    plan = next;
+                    built = self.build_pages_pass(
+                        doc.clone(),
+                        scale,
+                        with_composition,
+                        target_y,
+                        mode,
+                        &plan,
+                    )?;
+                }
+            }
+        }
+        built
+            .3
+            .degradations
+            .extend(conv.take_notes().into_iter().map(bridge_degradation));
+        Ok(built)
+    }
+
+    /// One layout pass of [`Self::build_pages_of`] against the wrap
+    /// `plan` (cutouts keyed by `ParagraphBox::source_paragraph_id`, the
+    /// walk-order id this pass assigns; empty ⇒ nothing is cut).
+    #[allow(clippy::type_complexity)]
+    fn build_pages_pass(
+        &self,
+        doc: DocumentTree,
+        scale: f32,
+        with_composition: bool,
+        target_y: Option<f32>,
+        mode: FieldMode,
+        plan: &layout::WrapPlan,
     ) -> Result<
         (
             Vec<PageBox>,
@@ -6959,6 +7105,10 @@ impl Engine {
                                 && para.text.is_char_boundary(off as usize))
                             .then_some((c, off as usize))
                         });
+                        /* Issue #82 — this paragraph's wrap cutouts
+                        (the id `next_para_id` is about to be stamped). */
+                        let cuts: &[layout::WrapCutout] =
+                            plan.get(&next_para_id).map_or(&[], Vec::as_slice);
                         let para_box = if let Some((c, off)) = comp {
                             let mut text = String::with_capacity(para.text.len() + c.text.len());
                             text.push_str(&para.text[..off]);
@@ -6986,24 +7136,40 @@ impl Engine {
                             let tab_stops_px = tab_stops_to_layout_px(&para.props.tab_stops, scale);
                             let (lh_px, lh_exact) =
                                 resolve_line_height(para.props.line_height, cfg.line_height, scale);
-                            layout_paragraph(ParagraphConfig {
-                                text: &text,
-                                fonts: &font_stack,
-                                spans: &spans,
-                                base_direction,
-                                max_width: pag.column_width(),
-                                line_height: lh_px,
-                                line_height_exact: lh_exact,
-                                alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
-                                indent_start_px: ind_s,
-                                indent_end_px: ind_e,
-                                first_line_indent_px: ind_fl,
-                                hanging_indent_px: ind_h,
-                                marker_text: para.resolved_marker.clone(),
-                                px_size_for_marker: cfg.px_size * scale,
-                                inline_objects: &[],
-                                tab_stops_px: &tab_stops_px,
-                            })
+                            layout::layout_paragraph_wrapped(
+                                ParagraphConfig {
+                                    text: &text,
+                                    fonts: &font_stack,
+                                    spans: &spans,
+                                    base_direction,
+                                    max_width: pag.column_width(),
+                                    line_height: lh_px,
+                                    line_height_exact: lh_exact,
+                                    alignment: para
+                                        .props
+                                        .alignment
+                                        .map_or(cfg.alignment, layout_align),
+                                    indent_start_px: ind_s,
+                                    indent_end_px: ind_e,
+                                    first_line_indent_px: ind_fl,
+                                    hanging_indent_px: ind_h,
+                                    marker_text: para.resolved_marker.clone(),
+                                    px_size_for_marker: cfg.px_size * scale,
+                                    inline_objects: &[],
+                                    tab_stops_px: &tab_stops_px,
+                                },
+                                cuts,
+                            )
+                        } else if !cuts.is_empty() {
+                            layout_paragraph_wrapped_uncached(
+                                para,
+                                &font_stack,
+                                &cfg,
+                                scale,
+                                pag.column_width(),
+                                sctx,
+                                cuts,
+                            )
                         } else {
                             /* Issue #51/#34 — same shared LRU-backed
                             layout the table cells use. */
@@ -8535,6 +8701,8 @@ impl Engine {
                     floating: true,
                     frame_x: f.frame_origin.x,
                     frame_y: page_top + f.frame_origin.y,
+                    /* Filled from the document model below. */
+                    wrap: None,
                 });
             }
             page_top += page.size.height + gap;
@@ -8546,19 +8714,20 @@ impl Engine {
         let doc = self.undo.current();
         for im in &mut out {
             let epath = bridge_path_to_engine(&im.path);
-            if let Some(p) = doc.paragraph_at_path(&epath)
-                && let Some(engine::InlineKind::Image {
+            let io = doc
+                .paragraph_at_path(&epath)
+                .and_then(|p| p.inline_objects.iter().find(|io| io.at == im.at));
+            if let Some(io) = io
+                && let engine::InlineKind::Image {
                     width_emu,
                     height_emu,
                     ..
-                }) = p
-                    .inline_objects
-                    .iter()
-                    .find(|io| io.at == im.at)
-                    .map(|io| &io.kind)
+                } = &io.kind
             {
                 im.width_emu = *width_emu;
                 im.height_emu = *height_emu;
+                /* Issue #82 — the wrap picker's checked state. */
+                im.wrap = io.anchor.as_deref().map(image_wrap_mode);
             }
         }
         Ok(out)
@@ -12435,6 +12604,60 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// `Command::SetImageWrap` (issue #82) — set the text-wrap mode of
+    /// the floating image at `(path, at)`
+    /// ([`engine::DocumentTree::set_floating_image_wrap_at`]). The wrap
+    /// contract rides the sentinel glyph, so the paragraph layout LRU is
+    /// cleared before the re-pagination (which runs the wrap loop). An
+    /// address that holds no floating image is an honest `Event::Error`.
+    fn do_set_image_wrap(
+        &mut self,
+        path: BridgeBlockPath,
+        at: u32,
+        wrap: bridge::ImageWrapMode,
+    ) -> Event {
+        use bridge::ImageWrapMode as M;
+        let epath = bridge_to_engine_path(path);
+        let is_floating_image = self
+            .undo
+            .current()
+            .paragraph_at_path(&epath)
+            .is_some_and(|p| {
+                p.inline_objects.iter().any(|io| {
+                    io.at == at
+                        && io.is_floating()
+                        && matches!(io.kind, engine::InlineKind::Image { .. })
+                })
+            });
+        if !is_floating_image {
+            return Event::Error {
+                message: "SetImageWrap: no floating image at that address — an inline image \
+                          flows with the text and has no wrap mode (issue #82)"
+                    .into(),
+            };
+        }
+        let (kind, behind) = match wrap {
+            M::Square => (engine::WrapKind::Square, false),
+            M::Tight => (engine::WrapKind::Tight, false),
+            M::Through => (engine::WrapKind::Through, false),
+            M::TopAndBottom => (engine::WrapKind::TopAndBottom, false),
+            M::BehindText => (engine::WrapKind::None, true),
+            M::InFrontOfText => (engine::WrapKind::None, false),
+        };
+        let new_doc = self
+            .undo
+            .current()
+            .set_floating_image_wrap_at(&epath, at, kind, behind);
+        self.undo.push(new_doc);
+        self.layout_cache.get_mut().clear();
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.selection_changed()
+    }
+
     /// `Command::SetColumns` (Sprint 2 UI Edition) — set the multi-
     /// column layout on the section containing `at`. Mutates
     /// `Section.columns` via [`engine::DocumentTree::set_section_columns_at`]
@@ -13578,6 +13801,8 @@ mod tests {
             runs: vec![run],
             alignment: Alignment::Start,
             source_start: 0,
+            segments: Vec::new(),
+            segment: 0,
         };
         let geom = build_line_run_geom(&line, 0.0);
         assert_eq!(geom.len(), 1);
@@ -15857,6 +16082,214 @@ mod tests {
         );
     }
 
+    /* ---------------------------------------------------------------
+    Issue #82 — text wrap around floating images.
+    --------------------------------------------------------------- */
+
+    /// A long paragraph with a 1 × 0.5 in floating image 1.5 in into the
+    /// column, 0.25 in below the paragraph top, in `wrap` mode.
+    fn wrapped_image_doc(wrap: engine::WrapKind, v_frame: engine::VRelativeFrom) -> DocumentTree {
+        let body = "Wrapped text flows on both sides of the picture while the \
+                    paragraph continues for several more lines of prose. "
+            .repeat(6);
+        let mut doc = DocumentTree::from_text(&format!("\u{FFFC}{body}"));
+        if let Some(p) = doc.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(engine::InlineObject {
+                at: 0,
+                kind: engine::InlineKind::Image {
+                    rel_id: "nge_float_1".to_string(),
+                    width_emu: 914_400,
+                    height_emu: 457_200,
+                },
+                anchor: Some(Box::new(engine::FloatAnchor {
+                    position_h: engine::HPosition {
+                        relative_from: engine::HRelativeFrom::Column,
+                        offset: engine::FloatOffset::Emu(1_371_600),
+                    },
+                    position_v: engine::VPosition {
+                        relative_from: v_frame,
+                        offset: engine::FloatOffset::Emu(228_600),
+                    },
+                    dist_left_emu: 114_300,
+                    dist_right_emu: 114_300,
+                    wrap,
+                    ..engine::FloatAnchor::default()
+                })),
+            });
+        }
+        doc
+    }
+
+    /// Square wrap cuts the bands the image overlaps into two segments;
+    /// the two lines of a band share `y_top`, and a click over either
+    /// segment lands in THAT segment's line (the per-segment hit rect).
+    #[test]
+    fn square_wrap_cuts_bands_and_hit_tests_per_segment() {
+        let engine = test_engine_with_doc(wrapped_image_doc(
+            engine::WrapKind::Square,
+            engine::VRelativeFrom::Paragraph,
+        ));
+        let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let para = pages[0].blocks[0].as_paragraph().expect("paragraph");
+        assert!(
+            para.lines.iter().any(|l| l.segments.len() == 2),
+            "some band is cut in two"
+        );
+        let geom = engine.document_geometry().expect("geom");
+        let (left, right) = geom
+            .iter()
+            .enumerate()
+            .find_map(|(i, g)| {
+                let n = geom.get(i + 1)?;
+                (n.y_top == g.y_top && n.hit_left > g.hit_left + g.hit_width).then_some((g, n))
+            })
+            .expect("a band with two segment lines");
+        assert!(
+            right.start_byte >= left.end_byte,
+            "reading order = source order"
+        );
+        let y = left.y_top + left.height / 2.0;
+        let hit_l = hit_test_geom(&geom, left.hit_left + 2.0, y);
+        assert!(hit_l.offset >= left.start_byte && hit_l.offset <= left.end_byte);
+        let hit_r = hit_test_geom(&geom, right.hit_left + right.hit_width - 2.0, y);
+        assert!(
+            hit_r.offset >= right.start_byte && hit_r.offset <= right.end_byte,
+            "{hit_r:?} not in [{}, {}]",
+            right.start_byte,
+            right.end_byte
+        );
+        /* The image's own rect sits in the gap between the segments. */
+        let img = &engine.image_geometry().expect("images")[0];
+        assert_eq!(img.wrap, Some(bridge::ImageWrapMode::Square));
+        assert!(img.rect.x >= left.hit_left + left.hit_width - 0.5);
+        assert!(img.rect.x + img.rect.w <= right.hit_left + 0.5);
+        /* Pinned: a change here moves the wrap goldens. */
+        let fp = layout::geometry_fingerprint(&pages);
+        if std::env::var_os("NGE_PRINT_WRAP_FINGERPRINTS").is_some() {
+            eprintln!("ENGINE WRAP FINGERPRINT square_x2 = {fp:#x}");
+        }
+        assert_eq!(fp, PINNED_SQUARE_WRAP_X2);
+    }
+
+    const PINNED_SQUARE_WRAP_X2: u64 = 0xe26a96b1e1df3649;
+
+    /// `Command::SetImageWrap` switches the mode (one undo step), the
+    /// behind / in-front modes stop cutting text, the image rect reports
+    /// the new mode, and an inline image is an honest error.
+    #[test]
+    fn set_image_wrap_dispatch_switches_modes_and_rejects_inline() {
+        let mut engine = test_engine_with_doc(wrapped_image_doc(
+            engine::WrapKind::None,
+            engine::VRelativeFrom::Paragraph,
+        ));
+        let cut = |e: &Engine| {
+            let (pages, ..) = e.build_pages(2.0, false, None).expect("layout");
+            pages[0].blocks[0]
+                .as_paragraph()
+                .expect("paragraph")
+                .lines
+                .iter()
+                .any(|l| !l.segments.is_empty())
+        };
+        assert!(!cut(&engine), "in front of text cuts nothing");
+        assert_eq!(
+            engine.image_geometry().expect("g")[0].wrap,
+            Some(bridge::ImageWrapMode::InFrontOfText)
+        );
+        for (mode, cuts) in [
+            (bridge::ImageWrapMode::Square, true),
+            (bridge::ImageWrapMode::Tight, true),
+            (bridge::ImageWrapMode::Through, true),
+            (bridge::ImageWrapMode::TopAndBottom, true),
+            (bridge::ImageWrapMode::BehindText, false),
+            (bridge::ImageWrapMode::InFrontOfText, false),
+        ] {
+            let evt = engine.do_set_image_wrap(BridgeBlockPath::top(0), 0, mode);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+            assert_eq!(engine.image_geometry().expect("g")[0].wrap, Some(mode));
+            /* Top-and-bottom skips whole bands: no segments, but the text
+            below the image moved down. */
+            let segmented = cut(&engine);
+            match mode {
+                bridge::ImageWrapMode::TopAndBottom => assert!(!segmented),
+                _ => assert_eq!(segmented, cuts, "{mode:?}"),
+            }
+        }
+        let evt = engine.do_undo();
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        assert_eq!(
+            engine.image_geometry().expect("g")[0].wrap,
+            Some(bridge::ImageWrapMode::BehindText),
+            "undo is one step"
+        );
+        let mut inline = test_engine_with_doc(inline_image_doc());
+        let evt =
+            inline.do_set_image_wrap(BridgeBlockPath::top(0), 0, bridge::ImageWrapMode::Square);
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+    }
+
+    /// Top-and-bottom wrap moves the text under the image down past it.
+    #[test]
+    fn top_and_bottom_wrap_pushes_following_lines_below_the_image() {
+        let plain = test_engine_with_doc(wrapped_image_doc(
+            engine::WrapKind::None,
+            engine::VRelativeFrom::Paragraph,
+        ));
+        let tb = test_engine_with_doc(wrapped_image_doc(
+            engine::WrapKind::TopAndBottom,
+            engine::VRelativeFrom::Paragraph,
+        ));
+        let h = |e: &Engine| {
+            let (pages, ..) = e.build_pages(2.0, false, None).expect("layout");
+            pages[0].blocks[0].as_paragraph().expect("p").size.height
+        };
+        let img_h = engine::emu_to_pt(457_200) * 2.0;
+        assert!(
+            h(&tb) >= h(&plain) + img_h * 0.9,
+            "{} vs {}",
+            h(&tb),
+            h(&plain)
+        );
+    }
+
+    /// The oscillation #82 names: a top-and-bottom image positioned
+    /// against its own anchor LINE pushes that line below itself, then
+    /// follows it. The wrap loop must terminate within its caps, report
+    /// the escape on the paint's degradation notes, and drop no text.
+    #[test]
+    fn image_that_pushes_its_own_anchor_terminates_and_reports() {
+        let engine = test_engine_with_doc(wrapped_image_doc(
+            engine::WrapKind::TopAndBottom,
+            engine::VRelativeFrom::Line,
+        ));
+        let started = std::time::Instant::now();
+        let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("layout");
+        assert!(started.elapsed() < adversarial_budget() * 4);
+        assert!(
+            info.degradations.iter().any(|d| matches!(
+                d.reason,
+                LayoutDegradeReason::WrapObjectFrozen | LayoutDegradeReason::WrapOscillation
+            )),
+            "{:?}",
+            info.degradations
+        );
+        let text_len = engine.undo.current().blocks[0]
+            .as_paragraph()
+            .expect("p")
+            .text
+            .len() as u32;
+        let laid: u32 = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(LayoutBlock::as_paragraph)
+            .flat_map(|p| p.lines.iter())
+            .flat_map(|l| l.runs.iter())
+            .map(|r| r.source_range.end - r.source_range.start)
+            .sum();
+        assert!(laid + 8 >= text_len, "{laid} of {text_len} bytes laid out");
+    }
+
     /// No wrap yet: a floating image's sentinel reserves no width and grows
     /// no line — the caret geometry of "a\u{FFFC}b"+float equals "ab"'s,
     /// while the SAME image inline widens the line (so the test
@@ -17947,5 +18380,80 @@ mod snapshot_tests {
         b.restore_from_bytes(&engine::snapshot::encode(&stale).unwrap())
             .unwrap();
         assert!(matches!(b.active_story, StoryTarget::Body));
+    }
+
+    /// Issue #100 — the live editor's save path. Open a Word-shaped
+    /// document (`w14:paraId` on every `<w:p>`, bound only on the root),
+    /// edit one paragraph through `Command::InsertText`, `SaveDocx`: the
+    /// saved `word/document.xml` must be namespace-well-formed. It was
+    /// not — `build_minimal_docx` synthesized a bare `<w:document
+    /// xmlns:w>` root, leaving every untouched paragraph's `w14:` unbound.
+    /// A crash-recovered session (snapshot restore) must save the same.
+    #[test]
+    fn save_docx_of_a_word_document_keeps_root_namespace_bindings() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../../format-docx/tests/fixtures/w14_paraid_word.docx");
+        let saved = |e: &mut Engine| -> Vec<u8> {
+            match apply(e, Command::SaveDocx) {
+                Event::DocumentSaved { bytes, .. } => bytes,
+                other => panic!("expected DocumentSaved, got {other:?}"),
+            }
+        };
+        let mut e = engine();
+        /* Natively `current_review_date` would reach `js_sys::Date`; pin
+        it the way `new_headless` does. The dispatcher's edit path lays
+        out, so boot a real font + layout config (the interactive state). */
+        e.review_date = "2026-01-01T00:00:00Z".into();
+        let font_bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("test-latin".to_string(), font_bytes).expect("font");
+        e.fonts.insert("test-latin".to_string(), Arc::new(font));
+        e.layout_cfg = Some(RenderConfig {
+            font_id: "test-latin".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 16.0,
+            line_height: 26.0,
+            alignment: Alignment::Start,
+            scale: 2.0,
+            base_scale: 2.0,
+            zoom: 1.0,
+        });
+        let evt = apply(
+            &mut e,
+            Command::LoadDocx {
+                bytes: FIXTURE.to_vec(),
+            },
+        );
+        assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+        /* The live-caret path the UI's typing uses (`at: None`). */
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(0, 5),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let evt = apply(&mut e, insert(" edited"));
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        let bytes = saved(&mut e);
+        format_docx::check_document_xml_well_formed(&bytes)
+            .expect("UI save of a Word document must be namespace-well-formed");
+        let reread = format_docx::read_docx(&bytes).expect("re-read");
+        assert_eq!(
+            reread.document.paragraph_text(0),
+            Some("first edited paragraph")
+        );
+        assert!(
+            reread
+                .document_root_attrs
+                .iter()
+                .any(|(k, _)| k == "xmlns:w14"),
+            "{:?}",
+            reread.document_root_attrs
+        );
+
+        /* Crash recovery: the attrs ride the snapshot envelope. */
+        let mut b = engine();
+        b.restore_from_bytes(&e.snapshot_bytes().unwrap()).unwrap();
+        format_docx::check_document_xml_well_formed(&saved(&mut b))
+            .expect("recovered session saves well-formed");
     }
 }

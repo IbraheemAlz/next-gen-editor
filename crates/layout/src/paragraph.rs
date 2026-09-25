@@ -10,7 +10,8 @@
 //! opportunities. Acceptable for the PoC; Phase 3 will cache widths.
 
 use crate::boxes::{
-    LineBox, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TextAttrs, VisualRun,
+    LineBox, LineSegment, MarkerBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan,
+    TextAttrs, VisualRun,
 };
 use std::borrow::Cow;
 use std::mem::take;
@@ -59,6 +60,10 @@ pub enum InlineObjectInfoKind {
     FloatingImage {
         rel_id: String,
         spec: crate::boxes::FloatSpec,
+        /// Issue #82 — the object's wrap contract (kind, side, distances,
+        /// polygon) in layout px, carried to the paginator on the
+        /// [`crate::boxes::FloatGlyph`] so the wrap plan can cut text.
+        wrap: crate::boxes::FloatWrap,
     },
 }
 
@@ -322,6 +327,8 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
             alignment: cfg.alignment,
             /* Empty paragraph → caret at offset 0. */
             source_start: 0,
+            segments: Vec::new(),
+            segment: 0,
         });
         y = cfg.line_height;
     }
@@ -349,6 +356,357 @@ pub fn layout_paragraph(cfg: ParagraphConfig<'_>) -> ParagraphBox {
         shading: None,
         keep_next: false,
     }
+}
+
+/// Issue #82 — lay out a paragraph whose bands are cut by floating
+/// objects. `cutouts` are horizontal exclusion intervals in
+/// paragraph-box-relative px (x from the box's left edge, y from the top
+/// of the whole paragraph — see `crate::wrap::WrapCutout`).
+///
+/// **Empty `cutouts` is exactly [`layout_paragraph`]** — the pre-#82
+/// composer, byte-for-byte, so every document without a wrapping float
+/// keeps its pinned geometry fingerprint by construction.
+///
+/// With cutouts the composer walks the paragraph band by band (one band
+/// = one nominal line height at the running `y`):
+///
+/// * the content box (after indents; the first line's leading edge also
+///   takes the first-line / hanging offset) minus every cutout touching
+///   the band yields the band's [`LineSegment`]s — *a line is a set of
+///   horizontal ranges*;
+/// * segments narrower than [`crate::wrap::MIN_SEGMENT_LINE_HEIGHTS`]
+///   nominal line heights are skipped (a sliver beside an image);
+/// * the usable segments are filled in **reading order** (left → right
+///   for an LTR paragraph, right → left for RTL), one greedy line each,
+///   breaking only at UAX #14 opportunities — a word that fits nowhere in
+///   a cut band moves on; only a full-width band force-breaks inside a
+///   word, exactly like the unwrapped composer;
+/// * the lines of one band share `origin.y`, `baseline` and `height`
+///   (one band, one baseline); each is aligned inside its own segment;
+/// * a band with no usable segment (top-and-bottom wrap, a one-sided
+///   wrap rule, only slivers) or in which nothing fit jumps `y` to the
+///   next cutout bottom edge.
+///
+/// Termination by construction: every band either consumes text or
+/// moves `y` strictly past the bottom of a cutout it intersected, and
+/// there are finitely many cutouts. A defensive band cap backs that up —
+/// past it the remainder is composed ignoring the cutouts (it paints,
+/// nothing is dropped).
+pub fn layout_paragraph_wrapped(
+    cfg: ParagraphConfig<'_>,
+    cutouts: &[crate::wrap::WrapCutout],
+) -> ParagraphBox {
+    if cutouts.is_empty() || cfg.text.is_empty() {
+        return layout_paragraph(cfg);
+    }
+    use crate::wrap::{MIN_SEGMENT_LINE_HEIGHTS, next_band_edge, segments_for_band};
+
+    let rtl = matches!(cfg.base_direction, ShapingDirection::Rtl);
+    let content_width = (cfg.max_width - cfg.indent_start_px - cfg.indent_end_px).max(0.0);
+    let leading_off = if rtl {
+        cfg.indent_end_px
+    } else {
+        cfg.indent_start_px
+    };
+    /* Physical content box inside the paragraph box. `leading_off` is the
+    LEFT inset for LTR; for RTL the left inset is the trailing (`start`)
+    indent — i.e. `indent_end_px`, which is what `leading_off` holds. */
+    let box_x0 = leading_off;
+    let box_x1 = leading_off + content_width;
+    let has_marker = cfg.marker_text.as_deref().is_some_and(|t| !t.is_empty());
+    let hanging_for_lines = if has_marker {
+        0.0
+    } else {
+        cfg.hanging_indent_px
+    };
+    let band_h = if cfg.line_height > 0.5 {
+        cfg.line_height
+    } else {
+        12.0
+    };
+    let min_seg = MIN_SEGMENT_LINE_HEIGHTS * band_h;
+    let breaks = break_opportunities(cfg.text);
+    let soft = soft_break_segments(cfg.text);
+    let text_len = cfg.text.len();
+
+    let mut lines: Vec<LineBox> = Vec::new();
+    let mut y = 0.0_f32;
+    let mut soft_idx = 0_usize;
+    let mut start = soft[0].0;
+    /* Defensive cap (see the doc comment): generous — every byte could
+    be its own line and every cutout could force one skip. */
+    let band_cap = text_len + 2 * cutouts.len() + 16;
+    let mut bands = 0_usize;
+    while soft_idx < soft.len() {
+        bands += 1;
+        let ignore_cuts = bands > band_cap;
+        let cuts: &[crate::wrap::WrapCutout] = if ignore_cuts { &[] } else { cutouts };
+        let fl = first_line_offset_px(lines.len(), cfg.first_line_indent_px, hanging_for_lines);
+        let (cx0, cx1) = if rtl {
+            (box_x0, (box_x1 - fl).max(box_x0))
+        } else {
+            ((box_x0 + fl).min(box_x1), box_x1)
+        };
+        /* Compose the band against the nominal height first. A band whose
+        lines grow taller (a big run, an inline image) may reach a cutout
+        the nominal band missed — re-compose once against the measured
+        height, and keep the taller query if the segments changed. Two
+        attempts at most: bounded by construction. */
+        let mut query_h = band_h;
+        let mut band = compose_band(
+            &cfg,
+            &breaks,
+            &soft,
+            soft_idx,
+            start,
+            (cx0, cx1),
+            cuts,
+            y,
+            query_h,
+            min_seg,
+        );
+        if let Some(b) = &band
+            && b.height > query_h + 0.01
+        {
+            let taller = segments_for_band(cx0, cx1, cuts, y, y + b.height);
+            if taller != b.all {
+                query_h = b.height;
+                band = compose_band(
+                    &cfg,
+                    &breaks,
+                    &soft,
+                    soft_idx,
+                    start,
+                    (cx0, cx1),
+                    cuts,
+                    y,
+                    query_h,
+                    min_seg,
+                );
+            }
+        }
+        let Some(band) = band else {
+            /* Nothing usable / nothing fit: skip to where the band next
+            changes. `next_band_edge` is strictly below `y` whenever a
+            cutout touches the band — and one must, or the band would be
+            full-width and the force-break would have placed text. */
+            y = next_band_edge(cuts, y, y + query_h)
+                .filter(|&e| e > y)
+                .unwrap_or(y + band_h);
+            continue;
+        };
+        soft_idx = band.soft_idx;
+        start = band.start;
+        y += band.height;
+        lines.extend(band.lines);
+    }
+
+    let marker = build_marker(&cfg, leading_off, lines.first());
+    ParagraphBox {
+        origin: Point::default(),
+        size: Size {
+            width: cfg.max_width,
+            height: y,
+        },
+        lines,
+        direction: cfg.base_direction,
+        marker,
+        source_paragraph_id: ParagraphBox::NO_SOURCE_ID,
+        fields: Vec::new(),
+        page_break_after_line: Vec::new(),
+        borders: None,
+        shading: None,
+        keep_next: false,
+    }
+}
+
+/// Issue #82 — one composed band of [`layout_paragraph_wrapped`]: its
+/// finished lines (geometry set), total height, and the composer cursor
+/// after it.
+struct Band {
+    lines: Vec<LineBox>,
+    all: Vec<LineSegment>,
+    height: f32,
+    soft_idx: usize,
+    start: usize,
+}
+
+/// Issue #82 — compose the band at `y` (queried `query_h` tall) inside the
+/// physical content range `content`. Pure: the caller commits the cursor.
+/// `None` when no segment is usable or nothing fit (the caller skips to
+/// the next cutout edge).
+#[allow(clippy::too_many_arguments)]
+fn compose_band(
+    cfg: &ParagraphConfig<'_>,
+    breaks: &[usize],
+    soft: &[(usize, usize)],
+    mut soft_idx: usize,
+    mut start: usize,
+    content: (f32, f32),
+    cuts: &[crate::wrap::WrapCutout],
+    y: f32,
+    query_h: f32,
+    min_seg: f32,
+) -> Option<Band> {
+    let (cx0, cx1) = content;
+    let rtl = matches!(cfg.base_direction, ShapingDirection::Rtl);
+    let all = crate::wrap::segments_for_band(cx0, cx1, cuts, y, y + query_h);
+    let full = all.len() == 1 && all[0].x0 <= cx0 && all[0].x1 >= cx1;
+    /* Usable segments, in reading order, paired with their index in the
+    band's full segment list. */
+    let mut usable: Vec<(usize, LineSegment)> = all
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, s)| full || s.width() >= min_seg)
+        .collect();
+    if rtl {
+        usable.reverse();
+    }
+    let mut band: Vec<(LineBox, bool, usize, LineSegment)> = Vec::new();
+    let mut ended_paragraph = false;
+    for &(si, seg) in &usable {
+        let (_, hi) = soft[soft_idx];
+        let (end, broke) = if start >= hi {
+            /* An empty hard segment (doubled / edge soft break): one
+            zero-width placeholder line for the caret. */
+            (hi, false)
+        } else {
+            match fit_segment_line(cfg, breaks, start, hi, seg.width(), full) {
+                Some(fit) => fit,
+                None => continue,
+            }
+        };
+        band.push((build_line(cfg, start, end), broke, si, seg));
+        start = end;
+        if start >= hi {
+            /* The hard segment is exhausted: the next one (after a U+2028
+            soft break) starts on a fresh band, like a line break in Word;
+            the paragraph's last one ends the text. */
+            soft_idx += 1;
+            match soft.get(soft_idx) {
+                Some(&(lo, _)) => start = lo,
+                None => ended_paragraph = true,
+            }
+            break;
+        }
+    }
+    if band.is_empty() {
+        return None;
+    }
+    let last_in_band = band.len() - 1;
+    let mut ascent = 0.0_f32;
+    let mut descent = 0.0_f32;
+    let mut laid: Vec<LineBox> = Vec::with_capacity(band.len());
+    for (k, (mut line, broke, si, seg)) in band.into_iter().enumerate() {
+        apply_tab_advances(
+            &mut line,
+            cfg.text,
+            cfg.tab_stops_px,
+            cfg.indent_start_px,
+            cfg.base_direction,
+        );
+        let paragraph_last = ended_paragraph && k == last_in_band;
+        if cfg.alignment == Alignment::Justify && broke && !paragraph_last {
+            justify_line(&mut line, seg.width(), cfg.text, cfg.fonts);
+        }
+        let (a, d) = line_extents(&line, cfg.fonts, cfg.line_height, cfg.line_height_exact);
+        ascent = ascent.max(a);
+        descent = descent.max(d);
+        let inner = alignment_origin_x(line.width, seg.width(), line.alignment, cfg.base_direction);
+        line.origin = Point {
+            x: seg.x0 + inner,
+            y,
+        };
+        /* A band no cutout touched keeps the pre-#82 shape (no segment
+        list): only genuinely cut bands carry their ranges. */
+        if !full {
+            line.segments = all.clone();
+            line.segment = si;
+        }
+        laid.push(line);
+    }
+    for line in &mut laid {
+        line.baseline = ascent;
+        line.height = ascent + descent;
+    }
+    Some(Band {
+        lines: laid,
+        all,
+        height: ascent + descent,
+        soft_idx,
+        start,
+    })
+}
+
+/// Issue #82 — greedy fit of ONE line starting at `start` into a segment
+/// `width` px wide, never past the hard-segment end `hi`. Returns the
+/// line end and whether it ended at a break opportunity (`true`, the
+/// justify-eligible case) rather than at `hi`. `None` when not even the
+/// first word fits and `force` is off (a cut band: the caller tries the
+/// next segment / band). With `force` (a full-width band) an overlong
+/// word is broken at a character boundary, like [`compose_width_lines`].
+fn fit_segment_line(
+    cfg: &ParagraphConfig<'_>,
+    breaks: &[usize],
+    start: usize,
+    hi: usize,
+    width: f32,
+    force: bool,
+) -> Option<(usize, bool)> {
+    let mut last_fit = start;
+    let mut seg_from = start;
+    let mut acc = 0.0_f32;
+    let mut overflow = false;
+    for &b in breaks {
+        if b <= start || b > hi {
+            continue;
+        }
+        let w = measure_text(
+            cfg.fonts,
+            &cfg.text[seg_from..b],
+            seg_from as u32,
+            cfg.spans,
+            cfg.base_direction,
+            cfg.inline_objects,
+        );
+        if acc + w <= width {
+            acc += w;
+            last_fit = b;
+            seg_from = b;
+        } else {
+            overflow = true;
+            break;
+        }
+    }
+    if !overflow && last_fit < hi {
+        let w = measure_text(
+            cfg.fonts,
+            &cfg.text[seg_from..hi],
+            seg_from as u32,
+            cfg.spans,
+            cfg.base_direction,
+            cfg.inline_objects,
+        );
+        if acc + w <= width {
+            last_fit = hi;
+        }
+    }
+    if last_fit >= hi {
+        return Some((hi, false));
+    }
+    if last_fit > start {
+        return Some((last_fit, true));
+    }
+    if force {
+        let next_break = breaks
+            .iter()
+            .copied()
+            .find(|&b| b > start && b <= hi)
+            .unwrap_or(hi);
+        return Some((char_break_fit_width(cfg, start, next_break, width), true));
+    }
+    None
 }
 
 fn build_marker(
@@ -1013,6 +1371,17 @@ fn compose_width_lines(
 /// loop always makes progress (a single huge glyph then overflows the
 /// page by itself — better than an infinite loop).
 fn char_break_fit(cfg: &ParagraphConfig<'_>, start: usize, hard_end: usize) -> usize {
+    char_break_fit_width(cfg, start, hard_end, cfg.max_width)
+}
+
+/// [`char_break_fit`] against an explicit width — issue #82's segment
+/// composer fits into a line segment narrower than the content box.
+fn char_break_fit_width(
+    cfg: &ParagraphConfig<'_>,
+    start: usize,
+    hard_end: usize,
+    max_width: f32,
+) -> usize {
     let mut accept: Option<usize> = None;
     let mut first_char_end: Option<usize> = None;
     let mut iter = cfg.text[start..hard_end].char_indices();
@@ -1030,7 +1399,7 @@ fn char_break_fit(cfg: &ParagraphConfig<'_>, start: usize, hard_end: usize) -> u
             cfg.base_direction,
             cfg.inline_objects,
         );
-        if w <= cfg.max_width {
+        if w <= max_width {
             accept = Some(abs);
         } else {
             break;
@@ -1180,13 +1549,14 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                         glyph reserves NO width and grows NO line; the
                         payload rides to the paginator, which positions
                         the object against its reference frame. */
-                        Some(InlineObjectInfoKind::FloatingImage { rel_id, spec }) => (
+                        Some(InlineObjectInfoKind::FloatingImage { rel_id, spec, wrap }) => (
                             None,
                             Some(Box::new(crate::boxes::FloatGlyph {
                                 rel_id: rel_id.clone(),
                                 width: info.map_or(0.0, |i| i.width_px),
                                 height: info.map_or(0.0, |i| i.height_px),
                                 spec: *spec,
+                                wrap: wrap.clone(),
                             })),
                         ),
                         _ => (None, None),
@@ -1245,6 +1615,8 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
         /* The line's source offset — load-bearing when the range is empty
         (a soft-break placeholder line) and `runs` carries no byte info. */
         source_start: start as u32,
+        segments: Vec::new(),
+        segment: 0,
     }
 }
 
@@ -1871,6 +2243,8 @@ mod tests {
             runs,
             alignment: Alignment::Start,
             source_start: 0,
+            segments: Vec::new(),
+            segment: 0,
         }
     }
 

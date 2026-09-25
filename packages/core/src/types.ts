@@ -44,6 +44,7 @@ export type {
     Rect,
     Point,
     ImageRect,
+    ImageWrapMode,
     Color,
     Script,
     TextAttrs,

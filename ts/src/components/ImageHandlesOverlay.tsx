@@ -1,5 +1,8 @@
 /* Issue #44 — interactive image resize handles.
  * Issue #69 — body-drag repositioning of FLOATING images.
+ * Issue #82 — the image toolbar (`@nge/ui` `ImageWrapPicker`) floats just
+ * above the selected picture; it reads the engine-reported wrap mode from
+ * `ImageRectCss.wrap` and dispatches `SET_IMAGE_WRAP`.
  *
  * When an inline image is selected (`store.selectedImage()`, set by the
  * pointer path on an image click), this overlay draws a bounding outline
@@ -28,6 +31,7 @@
  * images have no body layer (their sentinel flows with the text; a press
  * on the body still reaches the canvas and keeps the image selected). */
 import { For, Show, createSignal } from 'solid-js';
+import { ImageWrapPicker } from '@nge/ui';
 import type { EngineClient } from '../engine/engine-client';
 import type { EngineStore, ImageRectCss } from '../state/engine-store';
 
@@ -251,6 +255,23 @@ export function ImageHandlesOverlay(props: {
                         height: `${b().h}px`,
                     }}
                 >
+                    {/* Issue #82 — the image toolbar: the wrap picker rides
+                        just above the selected picture (hidden mid-drag). */}
+                    <Show when={!liveSize() && !liveOffset()}>
+                        <div class="image-toolbar">
+                            <ImageWrapPicker
+                                image={() => {
+                                    const im = selected();
+                                    return im && {
+                                        path: im.path,
+                                        at: im.at,
+                                        floating: im.floating,
+                                        wrap: im.wrap,
+                                    };
+                                }}
+                            />
+                        </div>
+                    </Show>
                     <Show when={selected()?.floating}>
                         <div
                             class="image-body-drag"

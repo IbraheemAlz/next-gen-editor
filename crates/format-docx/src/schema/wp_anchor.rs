@@ -17,8 +17,11 @@
 //! `<wp:wrapPolygon>`) ride the anchor verbatim (`doc_pr_xml`,
 //! `wrap_xml`) so a regenerated paragraph stays byte-faithful.
 
-use engine::{FloatAlign, FloatAnchor, FloatOffset, HRelativeFrom, VRelativeFrom, WrapKind};
-use quick_xml::events::BytesStart;
+use engine::{
+    FloatAlign, FloatAnchor, FloatOffset, HRelativeFrom, VRelativeFrom, WrapKind, WrapText,
+};
+use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
 
 use super::ct_rpr::attr_val;
 
@@ -190,28 +193,129 @@ pub fn is_wrap_element(qname: &[u8]) -> bool {
     wrap_kind_of(qname).is_some()
 }
 
-/// The wrap element the writer synthesizes for an engine-authored anchor
-/// (no verbatim source). Tight / through need a polygon by schema — the
-/// full object rectangle in the 21600-unit shape space is Word's own
-/// "not yet edited" default.
-fn synthesized_wrap_xml(kind: WrapKind) -> &'static str {
-    match kind {
-        WrapKind::None => "<wp:wrapNone/>",
-        WrapKind::Square => "<wp:wrapSquare wrapText=\"bothSides\"/>",
-        WrapKind::Tight => {
-            "<wp:wrapTight wrapText=\"bothSides\"><wp:wrapPolygon edited=\"0\">\
-             <wp:start x=\"0\" y=\"0\"/><wp:lineTo x=\"0\" y=\"21600\"/>\
-             <wp:lineTo x=\"21600\" y=\"21600\"/><wp:lineTo x=\"21600\" y=\"0\"/>\
-             <wp:lineTo x=\"0\" y=\"0\"/></wp:wrapPolygon></wp:wrapTight>"
-        }
-        WrapKind::Through => {
-            "<wp:wrapThrough wrapText=\"bothSides\"><wp:wrapPolygon edited=\"0\">\
-             <wp:start x=\"0\" y=\"0\"/><wp:lineTo x=\"0\" y=\"21600\"/>\
-             <wp:lineTo x=\"21600\" y=\"21600\"/><wp:lineTo x=\"21600\" y=\"0\"/>\
-             <wp:lineTo x=\"0\" y=\"0\"/></wp:wrapPolygon></wp:wrapThrough>"
-        }
-        WrapKind::TopAndBottom => "<wp:wrapTopAndBottom/>",
+/// `wrapText` keyword (`ST_WrapText`, §20.4.3.7). Unknown → `bothSides`.
+pub fn wrap_text_from_str(v: Option<&str>) -> WrapText {
+    match v {
+        Some("left") => WrapText::Left,
+        Some("right") => WrapText::Right,
+        Some("largest") => WrapText::Largest,
+        _ => WrapText::BothSides,
     }
+}
+
+pub fn wrap_text_str(v: WrapText) -> &'static str {
+    match v {
+        WrapText::BothSides => "bothSides",
+        WrapText::Left => "left",
+        WrapText::Right => "right",
+        WrapText::Largest => "largest",
+    }
+}
+
+/// The typed content of a wrap element: kind, side rule, polygon.
+pub type WrapFragment = (WrapKind, WrapText, Option<Vec<(i64, i64)>>);
+
+/// Issue #82 — the typed content of one captured wrap element: its kind
+/// (by root element name), `wrapText`, and the `<wp:wrapPolygon>` vertices
+/// (`<wp:start>` then every `<wp:lineTo>`, in document order). `None` for
+/// a fragment whose root is not a wrap element. Tolerant: an unparsable
+/// coordinate drops that vertex, never the whole element.
+pub fn parse_wrap_fragment(xml: &str) -> Option<WrapFragment> {
+    let mut reader = Reader::from_str(xml);
+    let mut kind: Option<WrapKind> = None;
+    let mut text = WrapText::BothSides;
+    let mut poly: Vec<(i64, i64)> = Vec::new();
+    let mut saw_poly = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let q = name.as_ref();
+                if kind.is_none() {
+                    kind = Some(wrap_kind_of(q)?);
+                    text = wrap_text_from_str(attr_val(&e, b"wrapText").as_deref());
+                    continue;
+                }
+                match q {
+                    b"wp:wrapPolygon" => saw_poly = true,
+                    b"wp:start" | b"wp:lineTo" => {
+                        let c = |k: &[u8]| attr_val(&e, k).and_then(|v| v.trim().parse().ok());
+                        if let (Some(x), Some(y)) = (c(b"x"), c(b"y")) {
+                            poly.push((x, y));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    let polygon = (saw_poly && !poly.is_empty()).then_some(poly);
+    kind.map(|k| (k, text, polygon))
+}
+
+/// Issue #82 — fold the verbatim wrap element the reader captured into
+/// the anchor's typed wrap fields (`wrap_text`, `wrap_polygon`).
+pub fn apply_wrap_fragment(anchor: &mut FloatAnchor) {
+    if let Some((_, text, polygon)) = anchor.wrap_xml.as_deref().and_then(parse_wrap_fragment) {
+        anchor.wrap_text = text;
+        anchor.wrap_polygon = polygon;
+    }
+}
+
+/// Word's "not yet edited" wrap polygon: the full object rectangle in the
+/// 21600-unit shape space.
+const DEFAULT_POLYGON: [(i64, i64); 5] = [(0, 0), (0, 21600), (21600, 21600), (21600, 0), (0, 0)];
+
+/// The wrap element the writer synthesizes from the typed fields (an
+/// engine-authored anchor, or one whose wrap was edited). Tight / through
+/// need a polygon by schema — the anchor's own, else Word's full-rectangle
+/// default.
+fn synthesized_wrap_xml(anchor: &FloatAnchor) -> String {
+    let tag = match anchor.wrap {
+        WrapKind::None => return "<wp:wrapNone/>".into(),
+        WrapKind::TopAndBottom => return "<wp:wrapTopAndBottom/>".into(),
+        WrapKind::Square => {
+            return format!(
+                "<wp:wrapSquare wrapText=\"{}\"/>",
+                wrap_text_str(anchor.wrap_text)
+            );
+        }
+        WrapKind::Tight => "wp:wrapTight",
+        WrapKind::Through => "wp:wrapThrough",
+    };
+    let (edited, pts): (&str, &[(i64, i64)]) = match anchor.wrap_polygon.as_deref() {
+        Some(p) if !p.is_empty() => ("1", p),
+        _ => ("0", &DEFAULT_POLYGON),
+    };
+    let mut out = format!(
+        "<{tag} wrapText=\"{}\"><wp:wrapPolygon edited=\"{edited}\">",
+        wrap_text_str(anchor.wrap_text)
+    );
+    for (i, (x, y)) in pts.iter().enumerate() {
+        let el = if i == 0 { "wp:start" } else { "wp:lineTo" };
+        out.push_str(&format!("<{el} x=\"{x}\" y=\"{y}\"/>"));
+    }
+    out.push_str("</wp:wrapPolygon></");
+    out.push_str(tag);
+    out.push('>');
+    out
+}
+
+/// Issue #82 — may the verbatim wrap element be re-emitted? Only while it
+/// still says what the typed fields say; otherwise the model was edited
+/// and the element is regenerated. The typed defaults (`wrap_text ==
+/// BothSides`, `wrap_polygon == None`) are also what an anchor built
+/// before #82 modeled them (a pre-#82 snapshot, an engine-built anchor
+/// carrying a verbatim element) — they defer to the verbatim element
+/// instead of overwriting a real side rule / polygon with nothing.
+fn verbatim_wrap_is_current(anchor: &FloatAnchor, verbatim: &str) -> bool {
+    parse_wrap_fragment(verbatim).is_some_and(|(kind, text, polygon)| {
+        kind == anchor.wrap
+            && (anchor.wrap_text == WrapText::BothSides || text == anchor.wrap_text)
+            && (anchor.wrap_polygon.is_none() || polygon == anchor.wrap_polygon)
+    })
 }
 
 fn on_off_str(b: bool) -> &'static str {
@@ -313,8 +417,8 @@ pub fn emit_anchor_open(anchor: &FloatAnchor, cx: i64, cy: i64, out: &mut String
     out.push_str(&cy.to_string());
     out.push_str("\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>");
     match anchor.wrap_xml.as_deref() {
-        Some(verbatim) => out.push_str(verbatim),
-        None => out.push_str(synthesized_wrap_xml(anchor.wrap)),
+        Some(verbatim) if verbatim_wrap_is_current(anchor, verbatim) => out.push_str(verbatim),
+        _ => out.push_str(&synthesized_wrap_xml(anchor)),
     }
     match anchor.doc_pr_xml.as_deref() {
         Some(verbatim) => out.push_str(verbatim),
@@ -415,5 +519,69 @@ mod tests {
         assert!(out.contains("behindDoc=\"1\""));
         assert!(out.contains("<wp:posOffset>0</wp:posOffset>"));
         assert!(!out.contains("hidden="), "hidden is omitted when false");
+    }
+    /// Issue #82 — the verbatim wrap element is re-emitted only while it
+    /// still matches the typed fields; an edited mode / side / polygon is
+    /// regenerated from the model.
+    #[test]
+    fn wrap_element_is_verbatim_until_edited_then_regenerated() {
+        let verbatim = concat!(
+            r#"<wp:wrapTight wrapText="left"><wp:wrapPolygon edited="1">"#,
+            r#"<wp:start x="0" y="0"/><wp:lineTo x="21600" y="0"/>"#,
+            r#"<wp:lineTo x="10800" y="21600"/></wp:wrapPolygon></wp:wrapTight>"#
+        );
+        let mut anchor = FloatAnchor {
+            wrap: WrapKind::Tight,
+            wrap_xml: Some(verbatim.into()),
+            ..FloatAnchor::default()
+        };
+        apply_wrap_fragment(&mut anchor);
+        assert_eq!(anchor.wrap_text, WrapText::Left);
+        assert_eq!(anchor.wrap_polygon.as_ref().map(Vec::len), Some(3));
+        let mut out = String::new();
+        emit_anchor_open(&anchor, 1, 1, &mut out);
+        assert!(out.contains(verbatim), "unedited ⇒ byte-faithful");
+
+        /* Side rule edited → regenerated, polygon kept. */
+        anchor.wrap_text = WrapText::Right;
+        let mut out = String::new();
+        emit_anchor_open(&anchor, 1, 1, &mut out);
+        assert!(!out.contains(verbatim));
+        assert!(out.contains(r#"<wp:wrapTight wrapText="right"><wp:wrapPolygon edited="1"><wp:start x="0" y="0"/><wp:lineTo x="21600" y="0"/><wp:lineTo x="10800" y="21600"/></wp:wrapPolygon></wp:wrapTight>"#), "{out}");
+        /* Mode edited → regenerated. */
+        anchor.wrap = WrapKind::Square;
+        let mut out = String::new();
+        emit_anchor_open(&anchor, 1, 1, &mut out);
+        assert!(
+            out.contains(r#"<wp:wrapSquare wrapText="right"/>"#),
+            "{out}"
+        );
+
+        /* Every mode regenerates to a parseable element with its fields. */
+        for kind in [
+            WrapKind::None,
+            WrapKind::Square,
+            WrapKind::Tight,
+            WrapKind::Through,
+            WrapKind::TopAndBottom,
+        ] {
+            let a = FloatAnchor {
+                wrap: kind,
+                wrap_text: WrapText::Right,
+                ..FloatAnchor::default()
+            };
+            let xml = synthesized_wrap_xml(&a);
+            let (k, t, poly) = parse_wrap_fragment(&xml).expect("parses");
+            assert_eq!(k, kind);
+            if matches!(kind, WrapKind::Square | WrapKind::Tight | WrapKind::Through) {
+                assert_eq!(t, WrapText::Right);
+            }
+            assert_eq!(
+                poly.is_some(),
+                matches!(kind, WrapKind::Tight | WrapKind::Through),
+                "{xml}"
+            );
+        }
+        assert!(parse_wrap_fragment("<wp:docPr id=\"1\"/>").is_none());
     }
 }

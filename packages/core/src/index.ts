@@ -60,6 +60,8 @@ export type {
     PdfConformance,
     ImageFit,
     ImageBlob,
+    ImageRect,
+    ImageWrapMode,
     SelectionModifier,
     MoveDirection,
     BridgeBorderStyle,
