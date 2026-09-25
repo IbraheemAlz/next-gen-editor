@@ -121,7 +121,7 @@ fn save_both(
 /// row-level content control — saves as EXACTLY the source plus the
 /// insert (tblPrEx, tblGridChange, trPr / tcPr spellings, attribute
 /// whitespace all intact); (c) an inserted row is a pure insertion and a
-/// deleted one a pure deletion; (d) a merge regenerates only the owner's
+/// deleted one a pure deletion; (d) a merge keeps the merged-away content and regenerates only the owner's
 /// `<w:tcPr>`, adopting its unchanged children's source spelling.
 pub(crate) fn run_table_markup_roundtrip() -> Result<()> {
     let xml = word_document_xml(TABLE_MARKUP_BODY);
@@ -192,8 +192,12 @@ pub(crate) fn run_table_markup_roundtrip() -> Result<()> {
     let got = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
     let owner = r#"<w:tcPr><w:tcW w:w="2400" w:type="dxa"/><w:gridSpan w:val="2"/><w:shd w:val="clear" w:color="auto" w:fill="FFEB78" w:themeFill="accent1"/></w:tcPr>"#;
     let tr_pr = r#"<w:trPr><w:cnfStyle w:val="100000000000"/><w:trHeight w:val="400"/></w:trPr>"#;
-    if !got.contains(owner) || !got.contains(tr_pr) || got.contains(">B1<") {
-        bail!("step 30d: merge did not regenerate exactly the owner's tcPr:\n{got}");
+    /* Issue #263 — the merged-away cell's content is appended into the owner,
+    so `B1` must survive the merge (inside the owner cell). */
+    if !got.contains(owner) || !got.contains(tr_pr) || !got.contains(">B1<") {
+        bail!(
+            "step 30d: merge did not regenerate exactly the owner's tcPr (or lost the merged-away content):\n{got}"
+        );
     }
     let reread = read_docx(&bytes).context("re-read merged")?;
     let t = reread.document.blocks[1]
@@ -203,7 +207,7 @@ pub(crate) fn run_table_markup_roundtrip() -> Result<()> {
         bail!("step 30d: merged row re-read with the wrong shape");
     }
     println!(
-        "[roundtrip] step 30d OK — a merge regenerates only the owner's tcPr (source spelling adopted)"
+        "[roundtrip] step 30d OK — a merge regenerates only the owner's tcPr (source spelling adopted) and keeps the merged-away content (#263)"
     );
     Ok(())
 }
