@@ -34,6 +34,22 @@
 //!   replay log alone.
 //! * Never rename or repurpose a field; retire one by leaving it unread.
 //!
+//! ## Version history / migration notes
+//!
+//! * **v1** (issue #85) — the original envelope. Content keys were
+//!   length + FNV-1a 64: the detached-package key `pkg-<len>-<fnv>`
+//!   (`EngineSnapshotV1::package_hash`, #212) and `MediaRef::hash` (#134).
+//! * **v2** (issue #269) — content keys are SHA-256: the package key is
+//!   `sha256-<64 hex>` ([`crate::package::package_key`]) and a
+//!   [`crate::MediaRef`] carries `sha256` (its `hash` field is retired —
+//!   written as absent, read as `0`). No field changed meaning, so there
+//!   is no per-version default: the v1 forms are recognised by SHAPE (the
+//!   `pkg-` prefix, a `MediaRef` without `sha256`) and verified with the
+//!   legacy FNV check, which is what keeps a snapshot persisted by the
+//!   previous build recoverable. **One release only:** the next bump
+//!   raises [`MIN_SUPPORTED_VERSION`] to 2 and deletes the FNV path
+//!   (`package::legacy_*`, `MediaRef::hash`).
+//!
 //! Map-typed model fields serialize **sorted by key** ([`ser_sorted_map`]) so
 //! two snapshots of the same state are byte-identical regardless of
 //! `HashMap` iteration order — the recovery e2e gate compares the pre-trap
@@ -50,7 +66,7 @@ use serde::{Serialize, Serializer};
 /// MessagePack decoder as if it were a document.
 pub const MAGIC: [u8; 4] = *b"NGES";
 /// Format version this build writes.
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
 /// Oldest format version this build can still read.
 pub const MIN_SUPPORTED_VERSION: u8 = 1;
 /// Bytes preceding the payload: `MAGIC` + the version byte.

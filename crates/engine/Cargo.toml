@@ -13,6 +13,9 @@ im = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 rmp-serde = { workspace = true }
+# Issue #269 — SHA-256 content keys for the detached source package and
+# the snapshot media references (`package::package_key`, `MediaRef`).
+sha2 = { workspace = true }
 unicode-segmentation = { workspace = true }
 # Sprint 11 (#17) — UAX-#29 word segmentation for `word_count`.
 # `WordSegmenter::new_auto` is the same constructor `text-pipeline` already
