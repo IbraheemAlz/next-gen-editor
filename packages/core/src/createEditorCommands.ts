@@ -566,7 +566,11 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
         setCaps: (value, range) => fmt({ caps: value }, range),
         setSmallCaps: (value, range) => fmt({ small_caps: value }, range),
         toggleFormatting: (attr, underlineStyle) =>
-            dispatch({ type: 'TOGGLE_FORMATTING', attr, underline_style: underlineStyle }),
+            dispatch(
+                underlineStyle === undefined
+                    ? { type: 'TOGGLE_FORMATTING', attr }
+                    : { type: 'TOGGLE_FORMATTING', attr, underline_style: underlineStyle },
+            ),
 
         setParagraphAlign: (align, range) =>
             dispatch({

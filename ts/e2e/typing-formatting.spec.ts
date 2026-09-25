@@ -113,15 +113,49 @@ async function documentText(page: Page): Promise<string> {
     });
 }
 
-test('Ctrl+B, type, Ctrl+B, type at full speed gives two runs (#286)', async ({ page }) => {
-    await boot(page);
-    await caretAtStart(page);
-    /* No waits anywhere: every keystroke is posted before the previous
-       reply can refresh the shell's mirrored toolbar state. */
-    await page.keyboard.press('ControlOrMeta+KeyB');
-    await page.keyboard.type('bold');
-    await page.keyboard.press('ControlOrMeta+KeyB');
-    await page.keyboard.type(' end');
+/** Fire `steps` as ONE synchronous burst on the main thread: `'B'` is a
+ *  Ctrl/Cmd+B keydown on the hidden textarea, `'BTN'` a click on the
+ *  toolbar Bold button, anything else an `insertText` beforeinput. No
+ *  engine reply can land between two steps (the main thread never
+ *  yields), so the shell's mirrored toolbar state is guaranteed stale for
+ *  every toggle after the first — the deterministic form of "typing
+ *  speed". Playwright's `keyboard.type` round-trips through CDP per key,
+ *  which is slow enough for the reply to win and hide the #286 race. */
+async function burst(page: Page, steps: string[]): Promise<void> {
+    await page.evaluate((steps) => {
+        const ta = document.querySelector<HTMLTextAreaElement>('textarea[data-nge-hidden-input]');
+        const btn = document.querySelector<HTMLButtonElement>('.nge-tfmt__btn--bold');
+        if (!ta || !btn) throw new Error('editor input / bold button missing');
+        const mac = /Mac|iPhone|iPad/.test(navigator.platform);
+        for (const s of steps) {
+            if (s === 'B') {
+                ta.dispatchEvent(
+                    new KeyboardEvent('keydown', {
+                        key: 'b',
+                        code: 'KeyB',
+                        ctrlKey: !mac,
+                        metaKey: mac,
+                        bubbles: true,
+                        cancelable: true,
+                    }),
+                );
+            } else if (s === 'BTN') {
+                btn.click();
+            } else {
+                ta.dispatchEvent(
+                    new InputEvent('beforeinput', {
+                        inputType: 'insertText',
+                        data: s,
+                        bubbles: true,
+                        cancelable: true,
+                    }),
+                );
+            }
+        }
+    }, steps);
+}
+
+async function expectBoldThenPlain(page: Page): Promise<void> {
     const out = await boldOf(page, [
         [0, 4],
         [4, 8],
@@ -130,22 +164,34 @@ test('Ctrl+B, type, Ctrl+B, type at full speed gives two runs (#286)', async ({ 
     expect(out.runs[1], '" end" is plain').toEqual({ bold: false, mixed: false });
     const text = await documentText(page);
     expect(text.startsWith('bold end'), JSON.stringify(text.slice(0, 40))).toBe(true);
+}
+
+test('Ctrl+B, type, Ctrl+B, type with zero waits gives two runs (#286)', async ({ page }) => {
+    await boot(page);
+    await caretAtStart(page);
+    await burst(page, ['B', 'b', 'o', 'l', 'd', 'B', ' ', 'e', 'n', 'd']);
+    await expectBoldThenPlain(page);
 });
 
-test('toolbar Bold button, type, button, type at full speed gives two runs (#286)', async ({
+test('real Ctrl+B keystrokes interleaved with typing give two runs (#286)', async ({ page }) => {
+    await boot(page);
+    await caretAtStart(page);
+    /* The same sequence through the real keyboard pipeline (no waits). */
+    await page.keyboard.press('ControlOrMeta+KeyB');
+    await page.keyboard.type('bold');
+    await page.keyboard.press('ControlOrMeta+KeyB');
+    await page.keyboard.type(' end');
+    await expectBoldThenPlain(page);
+});
+
+test('toolbar Bold button, type, button, type with zero waits gives two runs (#286)', async ({
     page,
 }) => {
     await boot(page);
     await caretAtStart(page);
     const btn = page.locator('.nge-tfmt__btn--bold');
     await expect(btn).toBeEnabled();
-    const input = page.locator('textarea[data-nge-hidden-input]');
-    await btn.click();
-    await input.focus();
-    await page.keyboard.type('bold');
-    await btn.click();
-    await input.focus();
-    await page.keyboard.type(' end');
+    await burst(page, ['BTN', 'b', 'o', 'l', 'd', 'BTN', ' ', 'e', 'n', 'd']);
     const out = await boldOf(page, [
         [0, 4],
         [4, 8],

@@ -339,11 +339,7 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
        lags the reply at typing speed, so toggling against it lost the
        second Ctrl+B of "Ctrl+B, type, Ctrl+B, type". */
     const toggleFormat = (attr: FormattingToggle): void => {
-        void props.client.dispatch({
-            type: 'TOGGLE_FORMATTING',
-            attr,
-            underline_style: undefined,
-        });
+        void props.client.dispatch({ type: 'TOGGLE_FORMATTING', attr });
     };
 
     /* §12 — clipboard. The native copy/cut/paste events fire inside a
