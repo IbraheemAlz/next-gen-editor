@@ -172,8 +172,11 @@ pub fn apply_ppr(name: &[u8], e: &BytesStart, props: &mut ParaProperties) {
             matching the cell `<w:tcPr><w:shd>` path. */
             props.shading = attr_val(e, b"w:fill").and_then(|v| parse_hex_color(&v));
         }
-        b"w:keepNext" => props.keep_next = toggle_on(e),
-        b"w:keepLines" => props.keep_lines = toggle_on(e),
+        /* Issue #178 — tri-state: an explicit `w:val="0"` must be able
+        to override an inherited style's ON (see `ParaProperties::
+        keep_next` / `merged_with`). */
+        b"w:keepNext" => props.keep_next = Some(toggle_on(e)),
+        b"w:keepLines" => props.keep_lines = Some(toggle_on(e)),
         b"w:pageBreakBefore" => props.page_break_before = toggle_on(e),
         /* Issue #81 — read-only (see `ParaProperties::outline_level`):
         styles.xml feeds the TOC heading cascade; a direct one also
@@ -341,9 +344,47 @@ mod tests {
     #[test]
     fn keep_and_page_break_flags() {
         let p = parse_ppr(br#"<w:pPr><w:keepNext/><w:keepLines/><w:pageBreakBefore/></w:pPr>"#);
-        assert!(p.keep_next);
-        assert!(p.keep_lines);
+        assert_eq!(p.keep_next, Some(true));
+        assert_eq!(p.keep_lines, Some(true));
         assert!(p.page_break_before);
+    }
+
+    /// Issue #178 — `<w:keepNext>` / `<w:keepLines>` are tri-state: an
+    /// explicit `w:val="0"` reads as `Some(false)`, and — the whole point
+    /// — a direct `Some(false)` beats an inherited style's `Some(true)`
+    /// through `merged_with` (a plain-bool OR merge could never do this).
+    #[test]
+    fn keep_next_and_keep_lines_are_read_tri_state_and_direct_off_wins_the_cascade() {
+        assert_eq!(parse_ppr(br#"<w:pPr/>"#).keep_next, None);
+        assert_eq!(
+            parse_ppr(br#"<w:pPr><w:keepNext/></w:pPr>"#).keep_next,
+            Some(true)
+        );
+        for off in ["0", "false", "off"] {
+            let xml = format!(r#"<w:pPr><w:keepNext w:val="{off}"/></w:pPr>"#);
+            assert_eq!(parse_ppr(xml.as_bytes()).keep_next, Some(false));
+            let xml = format!(r#"<w:pPr><w:keepLines w:val="{off}"/></w:pPr>"#);
+            assert_eq!(parse_ppr(xml.as_bytes()).keep_lines, Some(false));
+        }
+        let style_on = ParaProperties {
+            keep_next: Some(true),
+            keep_lines: Some(true),
+            ..Default::default()
+        };
+        let direct_off = ParaProperties {
+            keep_next: Some(false),
+            keep_lines: Some(false),
+            ..Default::default()
+        };
+        let merged = style_on.clone().merged_with(direct_off);
+        assert_eq!(merged.keep_next, Some(false));
+        assert_eq!(merged.keep_lines, Some(false));
+        assert!(!merged.keep_next_on());
+        assert!(!merged.keep_lines_on());
+        /* An unset direct override still inherits the style's ON. */
+        let inherited = style_on.merged_with(ParaProperties::default());
+        assert_eq!(inherited.keep_next, Some(true));
+        assert_eq!(inherited.keep_lines, Some(true));
     }
 
     /// Issue #95 — `<w:widowControl>` is read into the model (tri-state:

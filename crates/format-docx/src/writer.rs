@@ -516,11 +516,28 @@ fn emit_ppr(
         s.push_str("\"/>");
         ch.push(rank(b"w:pStyle"), s);
     }
-    if props.keep_next {
-        ch.push(rank(b"w:keepNext"), "<w:keepNext/>".into());
+    /* Issue #178 — tri-state: `Some(false)` must round-trip as an
+    explicit `w:val="0"`, not silent omission (omission means "inherit",
+    which a style cascade can resolve to ON). */
+    if let Some(on) = props.keep_next {
+        ch.push(
+            rank(b"w:keepNext"),
+            if on {
+                "<w:keepNext/>".into()
+            } else {
+                "<w:keepNext w:val=\"0\"/>".into()
+            },
+        );
     }
-    if props.keep_lines {
-        ch.push(rank(b"w:keepLines"), "<w:keepLines/>".into());
+    if let Some(on) = props.keep_lines {
+        ch.push(
+            rank(b"w:keepLines"),
+            if on {
+                "<w:keepLines/>".into()
+            } else {
+                "<w:keepLines w:val=\"0\"/>".into()
+            },
+        );
     }
     if props.page_break_before {
         ch.push(rank(b"w:pageBreakBefore"), "<w:pageBreakBefore/>".into());
@@ -4240,7 +4257,7 @@ mod tests {
         let (parsed, xml) = regenerate_dirty(document_xml);
         let para = parsed.document.nth_paragraph(0).unwrap();
         assert_eq!(para.props.alignment, Some(engine::Alignment::Center));
-        assert!(para.props.keep_next);
+        assert_eq!(para.props.keep_next, Some(true));
         assert_eq!(
             para.spans[0].style.bold,
             Some(true),
@@ -6083,8 +6100,8 @@ mod tests {
             },
             line_height: Some(LineHeight::Auto { twips: 360 }),
             direction: Some(TextDirection::Rtl),
-            keep_next: true,
-            keep_lines: false,
+            keep_next: Some(true),
+            keep_lines: Some(false),
             page_break_before: false,
             borders: None,
             tab_stops: Vec::new(),
@@ -6180,8 +6197,8 @@ mod tests {
                     ..Default::default()
                 },
                 direction: Some(TextDirection::Rtl),
-                keep_next: true,
-                keep_lines: true,
+                keep_next: Some(true),
+                keep_lines: Some(true),
                 page_break_before: true,
                 shading: Some([0xFF, 0xEE, 0xDD, 0xFF]),
                 ..Default::default()
