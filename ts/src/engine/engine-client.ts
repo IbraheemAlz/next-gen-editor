@@ -16,7 +16,14 @@ import type {
     Event,
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
-import { loadLatestEventLog } from './event-log';
+import {
+    clearRendererStreak,
+    loadRendererStreak,
+    loadRecoveryLog,
+    saveRendererStreak,
+    type RecoveryLog,
+    type RendererStreak,
+} from './event-log';
 
 type WorkerReply = {
     ok: boolean;
@@ -35,6 +42,15 @@ type WorkerReply = {
     restored?: boolean;
     /** Issue #85 — RECOVER reply: replay-tail commands applied. */
     appliedCommands?: number;
+    /** Issue #240 — INIT reply: whether the worker probed the GPU backend
+     *  (`false` when the client forced Canvas2D). */
+    probed?: boolean;
+    /** Issue #241 — RECOVER reply: newer snapshots skipped because they
+     *  would not restore before one did (or the log base was used). */
+    snapshotFallbacks?: number;
+    /** Issue #241 — RECOVER reply: whether the event log still reached
+     *  back to the session's first command. */
+    logComplete?: boolean;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -93,6 +109,16 @@ export interface RecoveryInfo {
     /** Issue #99 — set when this generation was forced onto Canvas2D after
      *  a crash loop on Vello (the engine's echo on `Event::Recovered`). */
     rendererDowngrade: RendererDowngrade | undefined;
+    /** Issue #241 — persisted snapshots that were skipped (unreadable)
+     *  before the one that restored; `0` on an ordinary recovery. */
+    snapshotFallbacks: number;
+    /**
+     * Issue #241 — no snapshot restored AND pruning had already dropped
+     * the head of the command log, so the replay could not rebuild the
+     * document (only reachable when every retained snapshot is
+     * unreadable). The shell re-seeds; the flag makes the loss visible.
+     */
+    logTruncated: boolean;
 }
 
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
@@ -102,6 +128,65 @@ export const VELLO_TRAP_LIMIT = 2;
 /** Issue #99 — a generation that stays up this long ends the streak: two
  *  unrelated traps an hour apart are not a crash loop. */
 const STABLE_GENERATION_MS = 60_000;
+/** Issue #240 — a persisted crash-loop streak older than this is ignored
+ *  at boot: a driver update or a GPU fix since then deserves a new try. */
+export const CRASH_LOOP_DECAY_MS = 24 * 60 * 60 * 1000;
+/** Issue #240 — `localStorage` key a clean shutdown (`pagehide`) writes
+ *  the live generation's token to. Synchronous, so it survives the
+ *  unload an IndexedDB write started in `pagehide` does not reliably
+ *  survive; the next boot reads and removes it. */
+const CLEAN_EXIT_KEY = 'nge.renderer.clean-exit';
+
+function takeCleanExitToken(): string | undefined {
+    try {
+        const token = globalThis.localStorage?.getItem(CLEAN_EXIT_KEY) ?? undefined;
+        globalThis.localStorage?.removeItem(CLEAN_EXIT_KEY);
+        return token;
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Issue #240 — what a boot does with the persisted streak: the streak to
+ * resume counting from and, once it reached `VELLO_TRAP_LIMIT`, the
+ * downgrade to boot with (Canvas2D, no GPU probe). A record still marked
+ * `live` belongs to a generation that neither proved stable nor shut
+ * down cleanly — it died with its tab — and counts as one more failure.
+ * `record` is the folded record to write back (`null` = delete it).
+ */
+export function crashLoopBootPolicy(
+    persisted: RendererStreak | undefined,
+    now: number,
+    cleanExitToken?: string,
+): {
+    streak: number;
+    downgrade: RendererDowngrade | undefined;
+    record: RendererStreak | null | undefined;
+} {
+    if (!persisted) return { streak: 0, downgrade: undefined, record: undefined };
+    const age = now - persisted.at;
+    if (persisted.renderer !== 'vello' || age > CRASH_LOOP_DECAY_MS || age < -CRASH_LOOP_DECAY_MS) {
+        return { streak: 0, downgrade: undefined, record: null };
+    }
+    /* Live, and no clean shutdown recorded for exactly that generation
+       ⇒ it died with its tab. */
+    const died =
+        persisted.live &&
+        (persisted.token === undefined || persisted.token !== cleanExitToken);
+    const count = persisted.count + (died ? 1 : 0);
+    const record: RendererStreak | undefined = persisted.live
+        ? { renderer: persisted.renderer, count, at: now, live: false }
+        : undefined;
+    return {
+        streak: count,
+        downgrade:
+            count >= VELLO_TRAP_LIMIT
+                ? { from: 'vello', to: 'canvas2d', reason: 'CRASH_LOOP', consecutive_traps: count }
+                : undefined,
+        record,
+    };
+}
 
 type Resolver = (v: WorkerReply) => void;
 
@@ -136,8 +221,18 @@ export class EngineClient {
     private lastRecoveryInfo: RecoveryInfo | undefined;
     /** Issue #99 — traps in a row whose generation painted with Vello. */
     private velloTrapStreak = 0;
-    /** Issue #99 — sticky for the session once the crash loop tripped. */
+    /** Issue #99 — sticky for the session once the crash loop tripped.
+     *  Issue #240 — also set at boot from the persisted streak. */
     private downgrade: RendererDowngrade | undefined;
+    /** Issue #240 — listeners for `downgrade` changes (the Dev HUD). */
+    private downgradeListeners = new Set<(d: RendererDowngrade | undefined) => void>();
+    /** Issue #240 — whether the boot worker probed the GPU backend. */
+    private bootProbed = true;
+    /** Issue #240 — the persisted streak currently marks a live Vello
+     *  generation (cleared on a clean `pagehide`). */
+    private streakLive = false;
+    /** Issue #240 — token of the live Vello generation's record. */
+    private liveToken: string | undefined;
     private stableTimer: ReturnType<typeof setTimeout> | undefined;
     /** Worker generations spawned so far (1 = the boot worker). */
     private generations = 0;
@@ -160,6 +255,51 @@ export class EngineClient {
         this.documentId = documentId;
         this.onCrash = onCrash;
         this.spawn();
+        /* Issue #240 — a clean shutdown (reload, navigation, tab close) is
+           not a crash: leave the live generation's token in localStorage
+           (synchronous — an IndexedDB write started here is routinely
+           dropped by the unload) so the next boot does not count it. */
+        globalThis.addEventListener?.('pagehide', () => {
+            if (this.streakLive && this.liveToken !== undefined) {
+                this.streakLive = false;
+                try {
+                    globalThis.localStorage?.setItem(CLEAN_EXIT_KEY, this.liveToken);
+                } catch {
+                    /* storage blocked: the next boot counts one failure */
+                }
+            }
+        });
+    }
+
+    /** Issue #240 — write the streak for the generation now running (or
+     *  that just trapped) off the critical path. */
+    private persistStreak(live: boolean): void {
+        const record: RendererStreak = {
+            renderer: 'vello',
+            count: this.velloTrapStreak,
+            at: Date.now(),
+            live,
+        };
+        if (live && this.liveToken !== undefined) record.token = this.liveToken;
+        void saveRendererStreak(record).catch((e: unknown) =>
+            console.warn('[recovery] renderer streak not persisted', e),
+        );
+    }
+
+    /** Issue #240 — a worker generation came up on `activeRenderer`. */
+    private noteGenerationStart(): void {
+        if (this.activeRenderer === 'vello') {
+            this.streakLive = true;
+            this.liveToken = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+            this.persistStreak(true);
+        } else {
+            this.streakLive = false;
+        }
+    }
+
+    private setDowngrade(d: RendererDowngrade | undefined): void {
+        this.downgrade = d;
+        for (const fn of this.downgradeListeners) fn(d);
     }
 
     private spawn(): void {
@@ -178,19 +318,75 @@ export class EngineClient {
     }
 
     async init(canvas: OffscreenCanvas): Promise<void> {
+        /* Issue #240 — honour a crash loop that spanned reloads / tab
+           deaths: resume its count, and once it reached the limit boot on
+           Canvas2D without probing the GPU. An unreadable log is no
+           streak. */
+        const cleanExit = takeCleanExitToken();
+        const policy = crashLoopBootPolicy(
+            await loadRendererStreak().catch(() => undefined),
+            Date.now(),
+            cleanExit,
+        );
+        this.velloTrapStreak = policy.streak;
+        if (policy.record === null) {
+            void clearRendererStreak().catch(() => undefined);
+        } else if (policy.record) {
+            void saveRendererStreak(policy.record).catch(() => undefined);
+        }
+        if (policy.downgrade) {
+            this.setDowngrade(policy.downgrade);
+            console.warn(
+                `[boot] ${policy.downgrade.consecutive_traps} consecutive Vello failures ` +
+                    'persisted (< 24 h) — booting on Canvas2D without probing the GPU',
+            );
+        }
         const r = await this.send(
             {
                 type: 'INIT',
                 canvas,
                 documentId: this.documentId,
                 ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
+                ...(this.downgrade ? { forceRenderer: 'canvas2d' } : {}),
             },
             [canvas],
         );
         if (!r.ok) throw new Error(r.error);
         this.workerIsolated = r.crossOriginIsolated === true;
         this.activeRenderer = r.renderer ?? 'canvas2d';
+        this.bootProbed = r.probed !== false;
+        this.noteGenerationStart();
         this.armStableTimer();
+    }
+
+    /** Issue #240 — whether the boot worker probed the GPU backend
+     *  (`false` when a persisted crash loop forced Canvas2D). */
+    get rendererProbed(): boolean {
+        return this.bootProbed;
+    }
+
+    /** Issue #240 — observe the crash-loop downgrade (set at boot from the
+     *  persisted streak, or by a recovery). Returns the unsubscribe. */
+    onRendererDowngrade(fn: (d: RendererDowngrade | undefined) => void): () => void {
+        this.downgradeListeners.add(fn);
+        return () => {
+            this.downgradeListeners.delete(fn);
+        };
+    }
+
+    /**
+     * Issue #240 — the Dev HUD's "retry Vello": forget the persisted
+     * streak and reload. A reload is the only honest retry — the live
+     * canvases' contexts are fixed for life, and a fresh probe needs a
+     * fresh page (the event log's document is not carried across it, as
+     * with any reload).
+     */
+    async retryGpuRenderer(): Promise<void> {
+        await clearRendererStreak().catch((e: unknown) =>
+            console.warn('[recovery] renderer streak not cleared', e),
+        );
+        this.streakLive = false;
+        globalThis.location?.reload();
     }
 
     /** Worker generations spawned so far (1 = boot; +1 per recovery). */
@@ -212,6 +408,13 @@ export class EngineClient {
         this.stableTimer = setTimeout(() => {
             this.stableTimer = undefined;
             this.velloTrapStreak = 0;
+            /* Issue #240 — a STABLE Vello generation ends the persisted
+               streak too. A Canvas2D generation says nothing about the
+               GPU path: a persisted downgrade keeps decaying on its own. */
+            if (this.activeRenderer === 'vello') {
+                this.streakLive = false;
+                void clearRendererStreak().catch(() => undefined);
+            }
         }, STABLE_GENERATION_MS);
     }
 
@@ -237,29 +440,33 @@ export class EngineClient {
     }
 
     /**
-     * Recover after a trap: load the latest snapshot + command tail, spawn a
-     * fresh worker, and replay via `Command::Recover`. `canvas` must be a
+     * Recover after a trap: load the persisted snapshots + command log,
+     * spawn a fresh worker, and replay via `Command::Recover` (newest
+     * snapshot first, falling back to older ones — issue #241). `canvas` must be a
      * brand-new OffscreenCanvas — the trapped surface is gone.
      */
     async recover(canvas: OffscreenCanvas): Promise<void> {
         /* An event-log read failure (IndexedDB rejection / corruption) must
            not strand a dead client — respawn with an empty log instead. */
-        const { snapshot, log, snapshotSeq, lastSeq } = await loadLatestEventLog(
-            this.documentId,
-        ).catch((e: unknown): { snapshot: Uint8Array; log: Command[]; snapshotSeq: number; lastSeq: number } => {
+        const recoveryLog = await loadRecoveryLog().catch((e: unknown): RecoveryLog => {
             console.error('event log unreadable; recovering with an empty log', e);
-            return { snapshot: new Uint8Array(0), log: [], snapshotSeq: 0, lastSeq: 0 };
+            return {
+                candidates: [{ seq: 0, snapshot: new Uint8Array(0) }],
+                commands: [],
+                lastSeq: 0,
+                logComplete: false,
+            };
         });
         /* Issue #99 — N traps in a row on Vello: stop re-probing the GPU
            (it would pick Vello again and crash-loop) and force Canvas2D for
            this and every later generation of the session. */
         if (this.downgrade === undefined && this.velloTrapStreak >= VELLO_TRAP_LIMIT) {
-            this.downgrade = {
+            this.setDowngrade({
                 from: 'vello',
                 to: 'canvas2d',
                 reason: 'CRASH_LOOP',
                 consecutive_traps: this.velloTrapStreak,
-            };
+            });
             console.warn(
                 `[recovery] ${this.velloTrapStreak} consecutive traps on Vello — ` +
                     'booting the recovered engine on Canvas2D',
@@ -274,16 +481,27 @@ export class EngineClient {
             {
                 type: 'RECOVER',
                 canvas,
-                snapshot,
-                log,
-                snapshotSeq,
-                lastSeq,
+                candidates: recoveryLog.candidates,
+                commands: recoveryLog.commands,
+                lastSeq: recoveryLog.lastSeq,
+                logComplete: recoveryLog.logComplete,
                 ...(this.mockBackend ? { mockBackend: this.mockBackend } : {}),
                 ...(this.downgrade
                     ? { forceRenderer: 'canvas2d', rendererDowngrade: this.downgrade }
                     : {}),
             },
-            [canvas, snapshot.buffer as ArrayBuffer],
+            [
+                canvas,
+                /* Issue #212 — candidates naming one package share its
+                   bytes: each buffer is transferred once. */
+                ...new Set(
+                    recoveryLog.candidates.flatMap((c) =>
+                        [c.snapshot, c.package]
+                            .filter((b): b is Uint8Array => b !== undefined)
+                            .map((b) => b.buffer as ArrayBuffer),
+                    ),
+                ),
+            ],
         );
         if (!r.ok) throw new Error(r.error);
         this.activeRenderer = r.renderer ?? 'canvas2d';
@@ -297,7 +515,16 @@ export class EngineClient {
             deviceScale,
             layoutRestored: r.restored === true || deviceScale !== undefined,
             rendererDowngrade: recovered?.renderer_downgrade,
+            snapshotFallbacks: r.snapshotFallbacks ?? 0,
+            logTruncated: r.restored !== true && r.logComplete === false,
         };
+        this.noteGenerationStart();
+        if (this.lastRecoveryInfo.logTruncated) {
+            console.error(
+                '[recovery] no persisted snapshot restored and the event log was pruned — ' +
+                    'the document could not be rebuilt',
+            );
+        }
         this.armStableTimer();
     }
 
@@ -485,6 +712,16 @@ export class EngineClient {
             this.stableTimer = undefined;
         }
         this.velloTrapStreak = this.activeRenderer === 'vello' ? this.velloTrapStreak + 1 : 0;
+        /* Issue #240 — persist it: a reload mid-loop resumes the count.
+           A non-Vello trap ends the streak, unless a downgrade is in force
+           (then the record keeps decaying on its own clock). */
+        if (this.activeRenderer === 'vello') {
+            this.streakLive = false;
+            this.persistStreak(false);
+        } else if (this.downgrade === undefined) {
+            this.streakLive = false;
+            void clearRendererStreak().catch(() => undefined);
+        }
         for (const resolve of this.pending.values()) {
             resolve({ ok: false, error: 'engine worker trapped; recovering', trap: true });
         }
