@@ -50,7 +50,7 @@ export function noteDomId(id: string): string {
 }
 
 /** Issue #203 — "Footnote 3" / "Endnote iv" (bare kind for a custom mark). */
-function noteLabel(kind: A11yNoteKind, marker: string): string {
+function noteLabel(kind: A11yNoteKind | undefined, marker: string): string {
     const word = kind === 'Endnote' ? 'Endnote' : 'Footnote';
     return marker ? `${word} ${marker}` : word;
 }
@@ -63,10 +63,10 @@ function buildRun(run: A11yRun): HTMLElement {
     if (run.note_ref !== undefined) {
         const a = document.createElement('a');
         a.setAttribute('role', 'doc-noteref');
-        a.href = `#${noteDomId(run.note_ref.id)}`;
+        a.href = `#${noteDomId(run.note_ref.id ?? '')}`;
         a.tabIndex = -1;
         a.setAttribute('aria-label', noteLabel(run.note_ref.kind, run.text));
-        a.dataset.noteRef = run.note_ref.id;
+        a.dataset.noteRef = run.note_ref.id ?? '';
         el = a;
     } else {
         el = document.createElement('span');
@@ -157,11 +157,14 @@ function buildNote(node: Extract<A11yNode, { kind: 'NOTE' }>): HTMLElement {
     const endnote = node.note_kind === 'Endnote';
     const el = document.createElement(endnote ? 'li' : 'aside');
     if (!endnote) el.setAttribute('role', 'doc-footnote');
-    el.id = noteDomId(node.id);
-    el.setAttribute('aria-label', noteLabel(node.note_kind, node.marker));
-    el.dataset.storyId = node.id;
+    /* The note fields are `#[serde(default)]` on the Rust side, which
+       tsify renders as optional; the engine always sets them. */
+    const id = node.id ?? '';
+    el.id = noteDomId(id);
+    el.setAttribute('aria-label', noteLabel(node.note_kind, node.marker ?? ''));
+    el.dataset.storyId = id;
     el.dataset.noteKind = endnote ? 'endnote' : 'footnote';
-    for (const child of node.nodes) el.appendChild(buildNode(child));
+    for (const child of node.nodes ?? []) el.appendChild(buildNode(child));
     return el;
 }
 
