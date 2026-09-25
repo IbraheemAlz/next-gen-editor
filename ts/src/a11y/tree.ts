@@ -22,6 +22,13 @@
  * nests nodes one level below the mirror root, patch indices address a
  * LOGICAL slot list (`slots`), not `root.children` directly.
  *
+ * Issue #215: an inline image / text box's `U+FFFC` placeholder is an
+ * `A11yRun` carrying `object` instead of raw placeholder text (`text` is
+ * empty). An image run becomes `<img role="img" alt="…">` (alt from the
+ * picture's `descr`/`name`); a text box run becomes a plain `<a>` linking
+ * to its `TEXT_BOX` region's DOM id (`textBoxDomId`), the same way a note
+ * reference links to its note region.
+ *
  * Phase 5 PR 3b: nodes are now `A11yNode` (`Paragraph | Table`), not flat
  * paragraphs. Tables render as `<table role="table">` with `<tr role="row">`
  * and `<td role="gridcell" aria-rowspan aria-colspan>`. Continue-rows of a
@@ -32,7 +39,15 @@
  * bare `ref` host and never touches what is inside it. Patches are positional:
  * the engine's prefix/suffix diff emits Updates first, then either Inserts
  * (ascending index) or Removes, so applying them in array order is correct. */
-import type { A11yCell, A11yNode, A11yNoteKind, A11yParagraph, A11yPatch, A11yRun } from '../engine/types';
+import type {
+    A11yCell,
+    A11yNode,
+    A11yNoteKind,
+    A11yObjectRef,
+    A11yParagraph,
+    A11yPatch,
+    A11yRun,
+} from '../engine/types';
 
 /** Inline CSS for a run, so a screen reader can announce its formatting. */
 function runStyle(r: A11yRun): string {
@@ -49,24 +64,54 @@ export function noteDomId(id: string): string {
     return `nge-a11y-${id}`;
 }
 
+/** Issue #215 — the DOM id of a text-box region (`A11yTextBox.id` is the
+ *  engine's stable `<path>@<at>` story address). */
+export function textBoxDomId(id: string): string {
+    return `nge-a11y-tb-${id}`;
+}
+
 /** Issue #203 — "Footnote 3" / "Endnote iv" (bare kind for a custom mark). */
-function noteLabel(kind: A11yNoteKind | undefined, marker: string): string {
+function noteLabel(kind: A11yNoteKind, marker: string): string {
     const word = kind === 'Endnote' ? 'Endnote' : 'Footnote';
     return marker ? `${word} ${marker}` : word;
 }
 
-/** Build the element for one run — a `<span>`, or (issue #203) an
- *  `<a role="doc-noteref">` for a footnote / endnote reference mark. The
- *  link is kept out of the tab order: the hidden textarea owns focus. */
+/** Issue #215 — build the element for an inline object run: an
+ *  `<img role="img">` for a picture (alt from the engine's `descr`/`name`,
+ *  falling back to a generic label so an unlabeled picture is still
+ *  discoverable rather than treated as decorative), or a plain `<a>`
+ *  referencing the `TEXT_BOX` region for a text box — the object IS the
+ *  run's content, so `run.text` is empty and never rendered here. */
+function buildObjectRun(object: A11yObjectRef): HTMLElement {
+    if (object.kind === 'IMAGE') {
+        const img = document.createElement('img');
+        img.setAttribute('role', 'img');
+        img.alt = object.alt ?? 'Image';
+        return img;
+    }
+    const a = document.createElement('a');
+    a.href = `#${textBoxDomId(object.id)}`;
+    a.tabIndex = -1;
+    a.setAttribute('aria-label', object.alt ? `Text box: ${object.alt}` : 'Text box');
+    a.dataset.objectRef = object.id;
+    return a;
+}
+
+/** Build the element for one run — a `<span>`, (issue #203) an
+ *  `<a role="doc-noteref">` for a footnote / endnote reference mark, or
+ *  (issue #215) an inline image / text box object. Links are kept out of
+ *  the tab order: the hidden textarea owns focus. */
 function buildRun(run: A11yRun): HTMLElement {
     let el: HTMLElement;
-    if (run.note_ref !== undefined) {
+    if (run.object !== undefined) {
+        el = buildObjectRun(run.object);
+    } else if (run.note_ref !== undefined) {
         const a = document.createElement('a');
         a.setAttribute('role', 'doc-noteref');
-        a.href = `#${noteDomId(run.note_ref.id ?? '')}`;
+        a.href = `#${noteDomId(run.note_ref.id)}`;
         a.tabIndex = -1;
         a.setAttribute('aria-label', noteLabel(run.note_ref.kind, run.text));
-        a.dataset.noteRef = run.note_ref.id ?? '';
+        a.dataset.noteRef = run.note_ref.id;
         el = a;
     } else {
         el = document.createElement('span');
@@ -138,12 +183,15 @@ function buildStory(node: Extract<A11yNode, { kind: 'STORY' }>): HTMLElement {
 /** Issue #165 — one text box story mirrored as a `role="group"` region,
  *  named from the box's `docPr` name (description → `aria-description`).
  *  `data-story-id` is the box address the engine also reports as
- *  `editing_story.rid`, so the active region can be marked. */
+ *  `editing_story.rid`, so the active region can be marked. Issue #215 —
+ *  the element's real DOM `id` (`textBoxDomId`) is the link target of
+ *  its anchor paragraph's `object` run. */
 function buildTextBox(node: Extract<A11yNode, { kind: 'TEXT_BOX' }>): HTMLElement {
     const el = document.createElement('div');
     el.setAttribute('role', 'group');
     el.setAttribute('aria-label', node.name ?? 'Text box');
     if (node.description !== undefined) el.setAttribute('aria-description', node.description);
+    el.id = textBoxDomId(node.id);
     el.dataset.storyId = node.id;
     for (const child of node.nodes) el.appendChild(buildNode(child));
     return el;
@@ -157,14 +205,11 @@ function buildNote(node: Extract<A11yNode, { kind: 'NOTE' }>): HTMLElement {
     const endnote = node.note_kind === 'Endnote';
     const el = document.createElement(endnote ? 'li' : 'aside');
     if (!endnote) el.setAttribute('role', 'doc-footnote');
-    /* The note fields are `#[serde(default)]` on the Rust side, which
-       tsify renders as optional; the engine always sets them. */
-    const id = node.id ?? '';
-    el.id = noteDomId(id);
-    el.setAttribute('aria-label', noteLabel(node.note_kind, node.marker ?? ''));
-    el.dataset.storyId = id;
+    el.id = noteDomId(node.id);
+    el.setAttribute('aria-label', noteLabel(node.note_kind, node.marker));
+    el.dataset.storyId = node.id;
     el.dataset.noteKind = endnote ? 'endnote' : 'footnote';
-    for (const child of node.nodes ?? []) el.appendChild(buildNode(child));
+    for (const child of node.nodes) el.appendChild(buildNode(child));
     return el;
 }
 

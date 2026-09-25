@@ -367,8 +367,33 @@ pub enum Event {
         /// `RenderPage`). `SetZoom` / `SetDeviceScale` answer with this
         /// event, so every zoom control mirrors the ENGINE's value — one
         /// source of truth instead of one local signal per widget.
+        /// Issue #239 — that's true once a `RenderPage` has run; a
+        /// `SetZoom` / `SetDeviceScale` sent BEFORE the first one answers
+        /// with `Event::ZoomPending` instead (there is no selection yet
+        /// to build this event around).
         #[serde(default = "default_zoom")]
         zoom: f32,
+    },
+    /// Issue #239 — reply to `SetZoom` / `SetDeviceScale` when no
+    /// `RenderPage` has run yet: there is no layout config to fold the
+    /// value into, and no selection either (`render_page` always resets
+    /// it), so answering with `SelectionChanged` would mean fabricating
+    /// a selection over a document that doesn't exist yet. The engine
+    /// stashes the value and composes it into the config the first
+    /// `RenderPage` builds; this reply reports the (clamped) value
+    /// directly instead of a misleading `Event::Error` for what is
+    /// actually a successful, queued command.
+    ZoomPending {
+        /// The pending user-zoom fraction — the value just set by
+        /// `SetZoom`, or the previously-queued one when this reply
+        /// answers a `SetDeviceScale`.
+        zoom: f32,
+        /// The pending device scale, when one has been queued (by a
+        /// `SetDeviceScale`, this one or an earlier one); `None` if only
+        /// zoom has been set so far.
+        #[serde(default)]
+        #[tsify(optional)]
+        device_scale: Option<f32>,
     },
 
     /* IME */
@@ -760,7 +785,6 @@ pub enum A11yNoteKind {
 /// `role="doc-endnotes"` section. A note is its own node, so an edit
 /// inside it patches only that region (`A11yPatch::Update`).
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(default)]
 pub struct A11yNote {
     /// Footnote or endnote. (Not `kind`: that is the node's tag.)
     pub note_kind: A11yNoteKind,
@@ -783,10 +807,39 @@ pub struct A11yNote {
 /// renders the run as `role="doc-noteref"` linking to the region whose
 /// [`A11yNote::id`] equals `id`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(default)]
 pub struct A11yNoteRef {
     pub kind: A11yNoteKind,
     pub id: String,
+}
+
+/// Issue #215 — which inline object family an [`A11yObjectRef`] names.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum A11yObjectKind {
+    Image,
+    TextBox,
+}
+
+/// Issue #215 — the inline image / text box a run's `U+FFFC` placeholder
+/// stood for: the mirror renders an [`A11yObjectKind::Image`] run as
+/// `<img role="img" alt="…">` (from `alt`), and an
+/// [`A11yObjectKind::TextBox`] run as a reference to the
+/// [`A11yTextBox`] region whose `id` equals this one's `id`. `text` on
+/// the carrying [`A11yRun`] is empty — the object IS the run's content,
+/// not a marker like a note reference's display number.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct A11yObjectRef {
+    pub kind: A11yObjectKind,
+    /// [`A11yObjectKind::Image`] — the engine's `DocumentTree::media` key
+    /// (issue #188) the picture paints from. [`A11yObjectKind::TextBox`]
+    /// — the region's [`A11yTextBox::id`].
+    pub id: String,
+    /// The picture's `<wp:docPr descr>` / `name` (issue #44), or the text
+    /// box's `<wp:docPr descr>` / `name` (issue #165); `None` when the
+    /// source object carries neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub alt: Option<String>,
 }
 
 /// Issue #165 — one text box story mirrored into the screen-reader DOM as
@@ -860,6 +913,14 @@ pub struct A11yRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tsify(optional)]
     pub note_ref: Option<A11yNoteRef>,
+    /// Issue #215 — set on the run that stands in for an inline image's
+    /// or inline text box's `U+FFFC` placeholder (`text` is then empty):
+    /// the object it names. Absent on every other run — and off the
+    /// wire, so a document without inline objects serializes exactly as
+    /// before. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub object: Option<A11yObjectRef>,
 }
 
 /// Table node — mirrored as `<table role="table">` in the DOM. PR 3b
@@ -926,11 +987,13 @@ mod a11y_note_wire_tests {
             italic: false,
             underline: false,
             note_ref,
+            object: None,
         }
     }
 
     /// Issue #203 — a run without a reference mark serializes exactly as
     /// before (no `note_ref` key), and an old payload deserializes.
+    /// Issue #215 — same for `object`.
     #[test]
     fn plain_runs_keep_their_wire_shape() {
         let json = serde_json::to_string(&run("a", None)).unwrap();
@@ -940,6 +1003,40 @@ mod a11y_note_wire_tests {
         );
         let back: A11yRun = serde_json::from_str(&json).unwrap();
         assert_eq!(back, run("a", None));
+    }
+
+    /// Issue #215 — an image object reference rides the wire only when
+    /// present, and `alt` is omitted (not `null`) when the picture has
+    /// no `descr`/`name`.
+    #[test]
+    fn object_ref_rides_the_wire_only_when_present() {
+        let mut r = run("", None);
+        r.object = Some(A11yObjectRef {
+            kind: A11yObjectKind::Image,
+            id: "word/media/image2.png".into(),
+            alt: Some("A flow diagram".into()),
+        });
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(
+                r#""object":{"kind":"IMAGE","id":"word/media/image2.png","alt":"A flow diagram"}"#
+            ),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<A11yRun>(&json).unwrap(), r);
+
+        let mut no_alt = run("", None);
+        no_alt.object = Some(A11yObjectRef {
+            kind: A11yObjectKind::TextBox,
+            id: "0@5".into(),
+            alt: None,
+        });
+        let json = serde_json::to_string(&no_alt).unwrap();
+        assert!(
+            json.contains(r#""object":{"kind":"TEXT_BOX","id":"0@5"}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<A11yRun>(&json).unwrap(), no_alt);
     }
 
     #[test]

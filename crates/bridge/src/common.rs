@@ -167,7 +167,17 @@ pub struct Point {
 pub struct ImageRect {
     pub path: BlockPath,
     pub at: u32,
+    /// Issue #224 — deprecated: this is already the `DocumentTree::media`
+    /// key (issue #188), not an OOXML relationship id (part-scoped ids can
+    /// collide across parts, e.g. a header's `rId5` and the body's
+    /// `rId5`). Kept populated for one release; use [`Self::media_key`].
     pub rel_id: String,
+    /// Issue #224 — the `DocumentTree::media` key this rect's picture
+    /// paints from. Same value [`Self::rel_id`] already carried; this is
+    /// the correctly-named field going forward. Always populated (issue
+    /// #214's audit: no reason to make tsify-next mark this optional when
+    /// the engine always emits it).
+    pub media_key: String,
     pub rect: Rect,
     /// Current display extent in EMU (`<wp:extent>`). Lets the resize
     /// handles scale by a pure CSS-px ratio (`new_emu = emu × new_px /

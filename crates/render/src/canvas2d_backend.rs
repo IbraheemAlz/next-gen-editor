@@ -217,13 +217,13 @@ pub fn render_canvas2d(
                 ctx.set_fill_style_str("#ffffff");
                 ctx.fill_rect(rect.x0, rect.y0, rect.width(), rect.height());
             }
-            DisplayCmd::DrawImage { rect, rel_id } => {
+            DisplayCmd::DrawImage { rect, media_key } => {
                 /* Phase 7 — inline image. If the worker has already
                 decoded the bytes into an `ImageBitmap`, draw it at
                 `rect` (Canvas2D's `drawImage` respects clip + transform).
                 Cache miss falls back to a gray placeholder rectangle so
                 the layout still shows the image's footprint. */
-                if let Some(bitmap) = resolve_image(rel_id) {
+                if let Some(bitmap) = resolve_image(media_key) {
                     ctx.draw_image_with_image_bitmap_and_dw_and_dh(
                         &bitmap,
                         rect.x0,

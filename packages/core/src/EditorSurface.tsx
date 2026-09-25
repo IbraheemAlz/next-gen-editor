@@ -38,6 +38,16 @@ export interface EditorSurfaceProps {
      *  that need to compose with the surface but never draw on the
      *  canvas itself. */
     overlays?: JSX.Element;
+    /**
+     * Issue #239 — a starting user-zoom fraction, dispatched as `SET_ZOOM`
+     * right after `engine.init()`. The engine now queues a `SetZoom` sent
+     * before its first `RenderPage` instead of dropping it (composing it
+     * into the layout config the first paint builds), so this is safe
+     * regardless of when the host's own boot sequence calls `RenderPage`
+     * / `OpenDocument` relative to `init()`. Omit to boot at the engine's
+     * default (100 %).
+     */
+    initialZoom?: number;
 }
 
 export const EditorSurface: Component<EditorSurfaceProps> = (props) => {
@@ -55,6 +65,9 @@ export const EditorSurface: Component<EditorSurfaceProps> = (props) => {
         el.style.height = `${props.height}px`;
         const off = el.transferControlToOffscreen();
         await engine.init(off);
+        if (props.initialZoom !== undefined) {
+            await engine.dispatch({ type: 'SET_ZOOM', scale: props.initialZoom });
+        }
     };
 
     const handleCrash = () => {
