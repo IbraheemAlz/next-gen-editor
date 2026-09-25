@@ -679,17 +679,40 @@ fn page_image_rels<'a>(page: &'a PageBox) -> Vec<&'a str> {
         for_each_paragraph(&hf.blocks, &mut collect);
     }
     let visible = |f: &&layout::FloatBox| !f.hidden && f.size.width > 0.0 && f.size.height > 0.0;
+    let mut frame_floats: Vec<&'a str> = Vec::new();
     for f in page.floats.iter().filter(visible) {
         if let Some(tb) = f.text_box.as_deref() {
-            for_each_paragraph(&tb.blocks, &mut collect);
+            collect_frame_image_rels(tb, &mut collect, &mut frame_floats);
         }
     }
+    rels.extend(frame_floats);
     for f in page.floats.iter().filter(visible) {
         if f.text_box.is_none() {
             rels.push(&f.rel_id);
         }
     }
     rels
+}
+
+/// Issue #165 / #197 — the images one visible text-box frame paints:
+/// inline image glyphs of its story, then (depth-first, bounded by the
+/// layout's nesting cap) every visible float of the story — a nested
+/// box recurses, a floating picture contributes its own rel id.
+fn collect_frame_image_rels<'a>(
+    tb: &'a layout::TextBoxFrame,
+    collect: &mut dyn FnMut(&'a ParagraphBox),
+    rels: &mut Vec<&'a str>,
+) {
+    for_each_paragraph(&tb.blocks, &mut |p| collect(p));
+    for f in &tb.floats {
+        if f.hidden || f.size.width <= 0.0 || f.size.height <= 0.0 {
+            continue;
+        }
+        match f.text_box.as_deref() {
+            Some(inner) => collect_frame_image_rels(inner, collect, rels),
+            None => rels.push(&f.rel_id),
+        }
+    }
 }
 
 /// Build the page content stream: one positioned glyph-show per glyph.

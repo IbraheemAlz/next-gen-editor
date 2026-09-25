@@ -627,6 +627,14 @@ enum StoryTarget {
         page: u32,
         /// Top-level block of the host paragraph.
         section_block: u32,
+        /// Issue #196 — `Some((host, at))` when the story being edited
+        /// is the box NESTED in this box's story: its anchor, addressed
+        /// story-rooted inside the outer story (`Block(i)` = the outer
+        /// story's i-th block). Selection paths are then rooted in the
+        /// nested story. One level only — the layout / reader nesting
+        /// cap ([`MAX_TEXT_BOX_LAYOUT_DEPTH`]) is two.
+        #[serde(default)]
+        inner: Option<(EngineBlockPath, u32)>,
     },
     Note {
         kind: engine::NoteKind,
@@ -647,8 +655,9 @@ enum StoryPart {
     Header(String),
     Footer(String),
     Note(engine::NoteKind, i32),
-    /// Issue #83 — `(host paragraph path, anchor byte)`.
-    TextBox(EngineBlockPath, u32),
+    /// Issue #83 — `(host paragraph path, anchor byte)`; issue #196 —
+    /// plus the nested box inside that box's story, when editing it.
+    TextBox(EngineBlockPath, u32, Option<(EngineBlockPath, u32)>),
 }
 
 impl StoryPart {
@@ -659,10 +668,17 @@ impl StoryPart {
             StoryPart::Header(rid) => real.with_updated_header_part(rid, blocks),
             StoryPart::Footer(rid) => real.with_updated_footer_part(rid, blocks),
             StoryPart::Note(kind, id) => real.with_updated_note_story(*kind, *id, blocks),
-            StoryPart::TextBox(host, at) => real.with_updated_text_box(host, *at, blocks),
+            StoryPart::TextBox(host, at, inner) => {
+                write_text_box_story(real, host, *at, inner.as_ref(), blocks)
+            }
         }
     }
 }
+
+/// Issue #196 — the address of a text-box story: the body box
+/// `(host path, anchor byte)` plus, when the story is the box nested in
+/// that box's story, the nested box's story-rooted `(host, at)`.
+type TextBoxAddr = (EngineBlockPath, u32, Option<(EngineBlockPath, u32)>);
 
 /// One laid-out line flattened for pointer hit-testing and caret/selection
 /// geometry. All coordinates are absolute page points (= canvas device px).
@@ -855,6 +871,16 @@ pub struct Engine {
     /// mutation, the explicit `RequestPaint` path, and the IME preview
     /// repaint all count as "the most recent paint".
     last_paint_ms: f32,
+    /// Issue #194 — monotonic "the document changed" counter: bumped once
+    /// per `apply` whose command changed the document (the undo stack's
+    /// revision moved — push / undo / redo / replace — or a whole new stack
+    /// was installed by a load / reset / restore). Never decreases, never
+    /// resets (a reload restarts the undo revision at 0; this does not
+    /// follow it down). The worker compares it across a command to decide
+    /// whether to broadcast an accessibility delta + synthetic `Painted`,
+    /// replacing a hand-kept per-command allowlist; `Event::Painted`
+    /// carries it too.
+    mutation_seq: u64,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -908,6 +934,7 @@ fn assemble_engine(
         review_date: String::new(),
         last_command_ms: 0.0,
         last_paint_ms: 0.0,
+        mutation_seq: 0,
     }
 }
 
@@ -1049,8 +1076,20 @@ impl Engine {
             page_content_bottoms: dims.page_content_bottoms,
             layout_degraded: dims.layout_degraded,
             paint_ms: dims.paint_ms,
+            mutation_seq: self.mutation_seq,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
+    }
+
+    /// Issue #194 — the engine's own "the document changed" signal: a
+    /// monotonic counter bumped once per command that changed the
+    /// document (see the `mutation_seq` field). The worker reads it after
+    /// every command and broadcasts an accessibility delta whenever it
+    /// moved past the last value it broadcast for — no per-command
+    /// allowlist. An `f64` (exact below 2^53) so JS sees a `number`, not
+    /// a `BigInt`.
+    pub fn document_mutation_seq(&self) -> f64 {
+        self.mutation_seq as f64
     }
 
     /// Sprint 10 — drain queued `aria-live` announcements as
@@ -1156,6 +1195,9 @@ struct PaintDimsOut {
     page_content_bottoms: Vec<f32>,
     /// Issue #87 — degradation notes (mirrors `Event::Painted`).
     layout_degraded: Vec<LayoutDegraded>,
+    /// Issue #194 — the document mutation counter (mirrors
+    /// `Event::Painted.mutation_seq`).
+    mutation_seq: u64,
     /// Issue #86 — mirrors `Event::Painted.paint_ms` (see `LastPaintDims`).
     paint_ms: f32,
 }
@@ -2072,6 +2114,40 @@ fn build_inline_object_infos(
         .collect()
 }
 
+/// Issue #196 — the visible text box NESTED in page float `f`'s story
+/// under the PAGE-LOCAL point `at` (in-front before behind-text, higher
+/// z-order first), as its story-rooted `(host path, anchor byte)`.
+/// `None` when the point is on the outer story itself. The caller has
+/// already hit `f`'s shape rect, which clips every nested box's paint.
+fn nested_text_box_at(f: &layout::FloatBox, at: BridgePoint) -> Option<(EngineBlockPath, u32)> {
+    let tb = f.text_box.as_deref()?;
+    if tb.floats.is_empty() {
+        return None;
+    }
+    let (origin, _) = f.text_box_content_rect()?;
+    let (x, y) = (at.x - origin.x, at.y - origin.y);
+    let mut hits: Vec<&layout::FloatBox> = tb
+        .floats
+        .iter()
+        .filter(|nf| {
+            nf.text_box.is_some()
+                && !nf.hidden
+                && x >= nf.origin.x
+                && x <= nf.origin.x + nf.size.width
+                && y >= nf.origin.y
+                && y <= nf.origin.y + nf.size.height
+        })
+        .collect();
+    hits.sort_by_key(|nf| (!nf.behind_doc, nf.z_order));
+    let nf = hits.last()?;
+    /* The nested boxes resolved against the story's pseudo page, whose
+    block `i` is story block `i`. */
+    let story_paths: Vec<EngineBlockPath> = (0..tb.blocks.len() as u32)
+        .map(EngineBlockPath::top)
+        .collect();
+    Some((float_host_path(&story_paths, nf)?, nf.at))
+}
+
 /// Issue #83 / #69 — the body block path of the paragraph a float is
 /// anchored in (`paths` = the page's block paths). `None` for header /
 /// footer anchors, which no body path addresses.
@@ -2126,19 +2202,23 @@ struct TextBoxLayoutCtx<'a> {
     page_number: u32,
 }
 
-/// `true` when `blocks` (table cells included) carry a text box — the
-/// cheap model-side gate that keeps a box without nested boxes on the
-/// exact pre-#165 single pass.
-fn story_has_text_box(blocks: &[engine::Block]) -> bool {
+/// `true` when `blocks` (table cells included) carry an object the
+/// story frame resolves as a float of the box: a text box (any
+/// placement) while `boxes` (the nesting depth is under the cap), or —
+/// issue #197, at any depth — a floating picture. The cheap model-side
+/// gate that keeps a plain story on the exact pre-#165 single pass.
+fn story_has_frame_float(blocks: &[engine::Block], boxes: bool) -> bool {
     blocks.iter().any(|b| match b {
-        engine::Block::Paragraph(p) => p
-            .inline_objects
-            .iter()
-            .any(|io| matches!(io.kind, engine::InlineKind::TextBox { .. })),
-        engine::Block::Table(t) => t
-            .rows
-            .iter()
-            .any(|r| r.cells.iter().any(|c| story_has_text_box(&c.blocks))),
+        engine::Block::Paragraph(p) => p.inline_objects.iter().any(|io| match io.kind {
+            engine::InlineKind::TextBox { .. } => boxes,
+            engine::InlineKind::Image { .. } => io.is_floating(),
+            _ => false,
+        }),
+        engine::Block::Table(t) => t.rows.iter().any(|r| {
+            r.cells
+                .iter()
+                .any(|c| story_has_frame_float(&c.blocks, boxes))
+        }),
     })
 }
 
@@ -2157,11 +2237,15 @@ fn story_has_text_box(blocks: &[engine::Block]) -> bool {
 /// shifts the story AND its nested boxes together (`Center` / `Bottom`
 /// split the spare height; an overflowing story stays top-anchored and
 /// clips at paint).
+///
+/// Issue #196 — `nested_comp` routes the live IME composition to the
+/// nested box being edited: `(host, at)` story-rooted in this story.
 fn lay_text_box_frame(
     f: &mut layout::FloatBox,
     ctx: &TextBoxLayoutCtx<'_>,
     cache: &mut LruCache<u64, ParagraphBox>,
     comp: Option<&CompositionState>,
+    nested_comp: Option<(&EngineBlockPath, u32, &CompositionState)>,
     depth: u32,
     notes: &mut Vec<layout::LayoutDegradation>,
 ) {
@@ -2189,7 +2273,8 @@ fn lay_text_box_frame(
     let mut plan = layout::WrapPlan::new();
     let mut blocks = lay(&plan, cache);
     let mut nested: Vec<layout::FloatBox> = Vec::new();
-    if depth < MAX_TEXT_BOX_LAYOUT_DEPTH && story_has_text_box(&story.body) {
+    let boxes = depth < MAX_TEXT_BOX_LAYOUT_DEPTH;
+    if story_has_frame_float(&story.body, boxes) {
         let size = layout::Size {
             width: inner_w,
             height: inner_h,
@@ -2208,9 +2293,10 @@ fn lay_text_box_frame(
             }
             let mut page = layout::story_frame_page(blocks, size, ctx.page_number);
             let mut floats = layout::resolve_page_floats(&page, layout::ColumnLayout::default());
-            /* Only nested TEXT BOXES are in scope: a floating picture in
-            a story is neither painted nor wrapped (pre-#165 behaviour). */
-            floats.retain(|nf| nf.text_box.is_some());
+            /* Nested text boxes (under the cap) and — issue #197 —
+            floating pictures: both are floats of the box story. A box
+            past the cap keeps its place in the story unresolved. */
+            floats.retain(|nf| boxes || nf.text_box.is_none());
             page.floats = floats;
             page
         };
@@ -2239,8 +2325,13 @@ fn lay_text_box_frame(
                 p.source_paragraph_id = id;
             }
         }
-        for nf in nested.iter_mut() {
-            lay_text_box_frame(nf, ctx, cache, None, depth + 1, notes);
+        let story_paths: Vec<EngineBlockPath> =
+            (0..blocks.len() as u32).map(EngineBlockPath::top).collect();
+        for nf in nested.iter_mut().filter(|nf| nf.text_box.is_some()) {
+            let inner_comp = nested_comp.and_then(|(h, a, c)| {
+                (nf.at == a && float_host_path(&story_paths, nf).as_ref() == Some(h)).then_some(c)
+            });
+            lay_text_box_frame(nf, ctx, cache, inner_comp, None, depth + 1, notes);
         }
     }
     let used = blocks
@@ -3661,13 +3752,22 @@ fn attach_block_paths(
 ///    paragraphs with no explicit setting.
 /// 3. `cfg.base_direction` — document-wide default seeded at boot.
 fn resolve_base_direction(p: &engine::Paragraph, cfg: &RenderConfig) -> ShapingDirection {
+    paragraph_base_direction(p, cfg.base_direction)
+}
+
+/// The precedence of [`resolve_base_direction`] against an explicit
+/// document-base `fallback` — the single resolution shared by layout, the
+/// caret's paragraph-direction read-back and the accessibility mirror
+/// (issue #195), so the screen reader's `dir` can never disagree with the
+/// direction the paragraph was laid out in.
+fn paragraph_base_direction(p: &engine::Paragraph, fallback: ShapingDirection) -> ShapingDirection {
     if let Some(d) = p.props.direction {
         return match d {
             engine::TextDirection::Ltr => ShapingDirection::Ltr,
             engine::TextDirection::Rtl => ShapingDirection::Rtl,
         };
     }
-    first_strong_direction(&p.text).unwrap_or(cfg.base_direction)
+    first_strong_direction(&p.text).unwrap_or(fallback)
 }
 
 /// Pull the four Phase-2 indent fields off `para.props`, convert to layout
@@ -5762,6 +5862,63 @@ fn text_box_rid(host: &EngineBlockPath, at: u32) -> String {
     format!("{path}@{at}")
 }
 
+/// Issue #196 — the rid of the story `(host, at)` + optional nested box:
+/// the outer rid, then `/` and the nested box's story-rooted rid — the
+/// same id the a11y mirror gives the nested region (`"0@5/0@0"`).
+fn text_box_story_rid(
+    host: &EngineBlockPath,
+    at: u32,
+    inner: Option<&(EngineBlockPath, u32)>,
+) -> String {
+    match inner {
+        None => text_box_rid(host, at),
+        Some((ih, ia)) => format!("{}/{}", text_box_rid(host, at), text_box_rid(ih, *ia)),
+    }
+}
+
+/// Issue #196 — the story blocks of the text box at `(host, at)` or,
+/// with `inner`, of the box nested in its story (addressed story-rooted
+/// inside the outer story). `None` when either box is gone.
+fn text_box_story_blocks(
+    doc: &DocumentTree,
+    host: &EngineBlockPath,
+    at: u32,
+    inner: Option<&(EngineBlockPath, u32)>,
+) -> Option<Vec<engine::Block>> {
+    let outer = doc.text_box_at(host, at)?;
+    match inner {
+        None => Some(outer.body.clone()),
+        Some((ih, ia)) => DocumentTree::from_blocks(outer.body.clone())
+            .text_box_at(ih, *ia)
+            .map(|s| s.body.clone()),
+    }
+}
+
+/// Issue #196 — write `blocks` into the story [`text_box_story_blocks`]
+/// reads: a nested story is written into a story tree of the outer box
+/// (the nested box goes dirty, its host paragraph keeps its passthrough
+/// bytes), and that outer story back into `real` (the outer box goes
+/// dirty) — the writer then splices both containers.
+fn write_text_box_story(
+    real: &DocumentTree,
+    host: &EngineBlockPath,
+    at: u32,
+    inner: Option<&(EngineBlockPath, u32)>,
+    blocks: Vec<engine::Block>,
+) -> DocumentTree {
+    match inner {
+        None => real.with_updated_text_box(host, at, blocks),
+        Some((ih, ia)) => {
+            let Some(outer) = real.text_box_at(host, at) else {
+                return real.clone();
+            };
+            let story = DocumentTree::from_blocks(outer.body.clone())
+                .with_updated_text_box(ih, *ia, blocks);
+            real.with_updated_text_box(host, at, story.blocks.iter().cloned().collect())
+        }
+    }
+}
+
 /// Build the accessibility nodes for a block list: one node per block
 /// (paragraphs → `A11yNode::Paragraph`; tables walk rows and cells,
 /// resolving `<w:gridSpan>` → `col_span` and counting consecutive
@@ -5802,8 +5959,19 @@ fn push_a11y_paragraph(
     scope: A11yScope<'_>,
     path: &str,
 ) {
+    /* Issue #195 — the paragraph's OWN base direction (explicit bidi →
+    first-strong → document base), exactly as layout resolves it. */
+    let fallback = match direction {
+        Direction::Rtl => ShapingDirection::Rtl,
+        Direction::Ltr => ShapingDirection::Ltr,
+    };
+    let resolved_direction = match paragraph_base_direction(p, fallback) {
+        ShapingDirection::Rtl => Direction::Rtl,
+        ShapingDirection::Ltr => Direction::Ltr,
+    };
     out.push(A11yNode::Paragraph(A11yParagraph {
         direction,
+        resolved_direction,
         runs: a11y_runs(p),
     }));
     if scope.depth >= MAX_TEXT_BOX_LAYOUT_DEPTH {
@@ -6158,7 +6326,30 @@ impl Engine {
         }
     }
 
+    /// The production dispatcher: [`Engine::apply_command`] plus the
+    /// issue-#194 mutation signal. The document changed iff the undo
+    /// stack's revision moved (every document edit goes through
+    /// `push` / `undo` / `redo` / `replace_current`) or a new stack was
+    /// installed ([`Engine::install_undo_stack`] bumps the seq itself).
     async fn apply(&mut self, cmd: Command) -> Event {
+        let seq_before = self.mutation_seq;
+        let revision_before = self.undo.revision();
+        let evt = self.apply_command(cmd).await;
+        if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
+            self.mutation_seq += 1;
+        }
+        evt
+    }
+
+    /// Issue #194 — replace the whole undo stack (load / reset / restore).
+    /// A fresh stack restarts its revision at 0, which `apply`'s revision
+    /// comparison cannot see, so the swap is itself a mutation.
+    fn install_undo_stack(&mut self, stack: UndoStack) {
+        self.undo = stack;
+        self.mutation_seq += 1;
+    }
+
+    async fn apply_command(&mut self, cmd: Command) -> Event {
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
         }
@@ -6649,7 +6840,7 @@ impl Engine {
     /// `cfg` so subsequent InsertText/Undo/Redo commands repaint without
     /// re-specifying params, then paint the first frame.
     fn render_page(&mut self, text: String, cfg: RenderConfig) -> Event {
-        self.undo = UndoStack::new(DocumentTree::from_text(&text), 100);
+        self.install_undo_stack(UndoStack::new(DocumentTree::from_text(&text), 100));
         self.layout_cfg = Some(cfg);
         /* A RenderPage reset is a fresh document; a surviving selection
         or IME preview from the previous session would be load-bearing
@@ -6915,7 +7106,7 @@ impl Engine {
     /// context, which cannot be re-transferred.
     fn reset_session_state(&mut self) {
         self.fonts.clear();
-        self.undo = UndoStack::new(DocumentTree::new(), UNDO_CAP);
+        self.install_undo_stack(UndoStack::new(DocumentTree::new(), UNDO_CAP));
         self.layout_cfg = None;
         self.selection = None;
         self.composition = None;
@@ -7093,7 +7284,11 @@ impl Engine {
     }
 
     fn restore_snapshot(&mut self, s: EngineSnapshotV1) {
-        self.undo = UndoStack::from_history(s.doc_history, s.undo_cursor as usize, UNDO_CAP);
+        self.install_undo_stack(UndoStack::from_history(
+            s.doc_history,
+            s.undo_cursor as usize,
+            UNDO_CAP,
+        ));
         self.layout_cfg = s.layout_cfg.and_then(LayoutCfgSnapshot::restore);
         self.active_story = s.active_story;
         self.selection = s.selection;
@@ -7422,10 +7617,13 @@ impl Engine {
     }
 
     /// Issue #83 — `(host paragraph path, anchor byte)` of the text box
-    /// whose story is being edited, if any.
-    fn active_text_box(&self) -> Option<(EngineBlockPath, u32)> {
+    /// whose story is being edited, if any; issue #196 — plus the nested
+    /// box inside its story when that is the story being edited.
+    fn active_text_box(&self) -> Option<TextBoxAddr> {
         match &self.active_story {
-            StoryTarget::TextBox { host, at, .. } => Some((host.clone(), *at)),
+            StoryTarget::TextBox {
+                host, at, inner, ..
+            } => Some((host.clone(), *at, inner.clone())),
             _ => None,
         }
     }
@@ -7477,14 +7675,20 @@ impl Engine {
                     continue;
                 }
                 let host = float_host_path(page_paths, f);
-                let comp = if with_composition
-                    && active
-                        .as_ref()
-                        .is_some_and(|(h, a)| Some(h) == host.as_ref() && *a == f.at)
-                {
+                let this = active
+                    .as_ref()
+                    .filter(|(h, a, _)| Some(h) == host.as_ref() && *a == f.at);
+                let live = if with_composition {
                     self.composition.as_ref()
                 } else {
                     None
+                };
+                /* The composition previews in the story being edited:
+                this box's own, or (issue #196) its nested box's. */
+                let (comp, nested_comp) = match (this, live) {
+                    (Some((_, _, None)), Some(c)) => (Some(c), None),
+                    (Some((_, _, Some((ih, ia)))), Some(c)) => (None, Some((ih, *ia, c))),
+                    _ => (None, None),
                 };
                 let mut frame_notes = Vec::new();
                 lay_text_box_frame(
@@ -7498,6 +7702,7 @@ impl Engine {
                     },
                     &mut cache,
                     comp,
+                    nested_comp,
                     1,
                     &mut frame_notes,
                 );
@@ -8757,6 +8962,7 @@ impl Engine {
             page_content_tops: dims.page_content_tops,
             page_content_bottoms: dims.page_content_bottoms,
             layout_degraded: dims.layout_degraded,
+            mutation_seq: self.mutation_seq,
         }
     }
 
@@ -8820,6 +9026,7 @@ impl Engine {
             page_content_tops: stats.page_content_tops,
             page_content_bottoms: stats.page_content_bottoms,
             layout_degraded: stats.layout_degraded,
+            mutation_seq: self.mutation_seq,
         }
     }
 
@@ -8846,9 +9053,9 @@ impl Engine {
             StoryTarget::Note { kind, id, .. } => {
                 doc.note_stories(*kind).get(id).map(|s| s.body.clone())
             }
-            StoryTarget::TextBox { host, at, .. } => {
-                doc.text_box_at(host, *at).map(|s| s.body.clone())
-            }
+            StoryTarget::TextBox {
+                host, at, inner, ..
+            } => text_box_story_blocks(doc, host, *at, inner.as_ref()),
         }
     }
 
@@ -9297,10 +9504,13 @@ impl Engine {
                 at,
                 page,
                 section_block,
+                inner,
             } => {
                 return Some(bridge::BridgeStoryRef {
                     area: bridge::HeaderFooterArea::TextBox,
-                    rid: text_box_rid(host, *at),
+                    /* Issue #196 — a nested story's rid is the a11y
+                    region id of the nested box (`outer/inner`). */
+                    rid: text_box_story_rid(host, *at, inner.as_ref()),
                     page: *page,
                     role: bridge::BridgeHfRole::Default,
                     linked: false,
@@ -9506,9 +9716,11 @@ impl Engine {
             StoryTarget::Header { page, .. } => return self.story_geometry(*page, true),
             StoryTarget::Footer { page, .. } => return self.story_geometry(*page, false),
             StoryTarget::Note { kind, id, .. } => return self.note_geometry(*kind, *id),
-            StoryTarget::TextBox { host, at, .. } => {
-                let (host, at) = (host.clone(), *at);
-                return self.text_box_geometry(&host, at);
+            StoryTarget::TextBox {
+                host, at, inner, ..
+            } => {
+                let (host, at, inner) = (host.clone(), *at, inner.clone());
+                return self.text_box_geometry(&host, at, inner.as_ref());
             }
             StoryTarget::Body => {}
         }
@@ -10885,22 +11097,16 @@ impl Engine {
     ///    always carry a config once `render_document` has run).
     fn paragraph_direction_at(&self, path: &BridgeBlockPath) -> ShapingDirection {
         let engine_path = bridge_to_engine_path(path.clone());
-        let resolved = self.with_selection_doc(|d| {
-            let p = d.paragraph_at_path(&engine_path)?;
-            if let Some(dir) = p.props.direction {
-                return Some(match dir {
-                    engine::TextDirection::Ltr => ShapingDirection::Ltr,
-                    engine::TextDirection::Rtl => ShapingDirection::Rtl,
-                });
-            }
-            first_strong_direction(&p.text)
-        });
-        resolved.unwrap_or_else(|| {
-            self.layout_cfg
-                .as_ref()
-                .map(|c| c.base_direction)
-                .unwrap_or(ShapingDirection::Ltr)
+        let fallback = self
+            .layout_cfg
+            .as_ref()
+            .map(|c| c.base_direction)
+            .unwrap_or(ShapingDirection::Ltr);
+        self.with_selection_doc(|d| {
+            d.paragraph_at_path(&engine_path)
+                .map(|p| paragraph_base_direction(p, fallback))
         })
+        .unwrap_or(fallback)
     }
 
     /// Tri-state paragraph direction across the selection: `Some(dir)`
@@ -11060,7 +11266,9 @@ impl Engine {
             StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
             StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
             StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
-            StoryTarget::TextBox { host, at, .. } => StoryPart::TextBox(host.clone(), *at),
+            StoryTarget::TextBox {
+                host, at, inner, ..
+            } => StoryPart::TextBox(host.clone(), *at, inner.clone()),
             StoryTarget::Body => {
                 return Event::Error {
                     message: "commit_story_edit outside a story".into(),
@@ -11239,7 +11447,9 @@ impl Engine {
             StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
             StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
             StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
-            StoryTarget::TextBox { host, at, .. } => StoryPart::TextBox(host.clone(), *at),
+            StoryTarget::TextBox {
+                host, at, inner, ..
+            } => StoryPart::TextBox(host.clone(), *at, inner.clone()),
             StoryTarget::Body => unreachable!("guarded by caller"),
         };
         let mut blocks: Vec<engine::Block> = new_doc.blocks.iter().cloned().collect();
@@ -11584,10 +11794,16 @@ impl Engine {
     /// = frame block `j`): the caret, selection and hit-test adapters of
     /// the text-box story. Lines are clipped to nothing — a caret in an
     /// overflowing line still resolves (Word scrolls; we keep geometry).
+    ///
+    /// Issue #196 — with `inner`, the frame of the box nested in that
+    /// box's story (found among the outer frame's floats by its
+    /// story-rooted anchor); its content rect is offset by the outer
+    /// content origin (nested float origins are relative to it).
     fn text_box_geometry(
         &self,
         host: &EngineBlockPath,
         at: u32,
+        inner: Option<&(EngineBlockPath, u32)>,
     ) -> Result<Vec<LineGeom>, Box<Event>> {
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
         self.ensure_layout_snapshot(self.scale(), false, target_y)?;
@@ -11610,7 +11826,27 @@ impl Engine {
                 let Some((origin, size)) = f.text_box_content_rect() else {
                     continue;
                 };
-                let (cx, cy) = (origin.x, page_top + origin.y);
+                let (mut cx, mut cy) = (origin.x, page_top + origin.y);
+                let (mut tb, mut size) = (tb, size);
+                if let Some((ih, ia)) = inner {
+                    let story_paths: Vec<EngineBlockPath> = (0..tb.blocks.len() as u32)
+                        .map(EngineBlockPath::top)
+                        .collect();
+                    let Some(nf) = tb.floats.iter().find(|nf| {
+                        nf.at == *ia && float_host_path(&story_paths, nf).as_ref() == Some(ih)
+                    }) else {
+                        return Ok(geom);
+                    };
+                    let (Some(ntb), Some((n_origin, n_size))) =
+                        (nf.text_box.as_deref(), nf.text_box_content_rect())
+                    else {
+                        return Ok(geom);
+                    };
+                    cx += n_origin.x;
+                    cy += n_origin.y;
+                    tb = ntb;
+                    size = n_size;
+                }
                 for (j, block) in tb.blocks.iter().enumerate() {
                     let idx = j as u32;
                     match block {
@@ -11645,7 +11881,12 @@ impl Engine {
     /// on page `page_idx`, as `(host path, anchor byte)`: in-front boxes
     /// before behind-text ones, higher z-order first. Header / footer
     /// boxes are painted but not enterable (no body path).
-    fn text_box_at_point(&self, page_idx: u32, at: BridgePoint) -> Option<(EngineBlockPath, u32)> {
+    ///
+    /// Issue #196 — the third element is the box NESTED in that box's
+    /// story under the point (same z rule, clipped to the outer box —
+    /// that is where it paints), story-rooted. One level down only: the
+    /// nesting cap is two, so the descent is bounded by construction.
+    fn text_box_at_point(&self, page_idx: u32, at: BridgePoint) -> Option<TextBoxAddr> {
         let snap_cell = self.layout_snapshot.borrow();
         let snap = snap_cell.as_ref()?;
         let page = snap.pages.get(page_idx as usize)?;
@@ -11668,7 +11909,8 @@ impl Engine {
             .collect();
         hits.sort_by_key(|f| (!f.behind_doc, f.z_order));
         let f = hits.last()?;
-        Some((float_host_path(paths, f)?, f.at))
+        let host = float_host_path(paths, f)?;
+        Some((host, f.at, nested_text_box_at(f, at)))
     }
 
     /// Issue #83 — story routing for a pointer press: enter the text box
@@ -11686,17 +11928,18 @@ impl Engine {
         let target_y = Some(self.lazy_layout.min_target_y * self.scale());
         self.ensure_layout_snapshot(self.scale(), false, target_y)?;
         match self.text_box_at_point(page_idx, at) {
-            Some((host, box_at)) => {
+            Some((host, box_at, inner)) => {
                 let already = matches!(
                     &self.active_story,
-                    StoryTarget::TextBox { host: h, at: a, .. } if *h == host && *a == box_at
+                    StoryTarget::TextBox { host: h, at: a, inner: i, .. }
+                        if *h == host && *a == box_at && *i == inner
                 );
                 if !already {
                     let section_block = host.steps.first().map_or(0, |s| match s {
                         EnginePathStep::Block(i) => *i,
                         EnginePathStep::Cell { .. } => 0,
                     });
-                    self.enter_text_box_story(host, box_at, page_idx, section_block);
+                    self.enter_text_box_story(host, box_at, inner, page_idx, section_block);
                 }
                 Ok(true)
             }
@@ -11713,22 +11956,39 @@ impl Engine {
     /// Issue #83 — switch the caret into the text box at `(host, at)`:
     /// stash the body selection (when coming from the body), home the
     /// selection at the story's first paragraph, announce.
+    ///
+    /// Issue #196 — `inner` enters the box nested in that box's story.
     fn enter_text_box_story(
         &mut self,
         host: EngineBlockPath,
         at: u32,
+        inner: Option<(EngineBlockPath, u32)>,
         page: u32,
         section_block: u32,
     ) {
         if !self.story_active() {
             self.stashed_body_selection = self.selection.clone();
         }
-        let (host_for_label, at_for_label) = (host.clone(), at);
+        /* The label comes from the box being entered: the nested box's
+        `docPr` lives in the outer story. */
+        let label_source: Option<DocumentTree> = match &inner {
+            None => None,
+            Some(_) => self
+                .undo
+                .current()
+                .text_box_at(&host, at)
+                .map(|s| DocumentTree::from_blocks(s.body.clone())),
+        };
+        let (host_for_label, at_for_label) = match &inner {
+            None => (host.clone(), at),
+            Some((ih, ia)) => (ih.clone(), *ia),
+        };
         self.active_story = StoryTarget::TextBox {
             host,
             at,
             page,
             section_block,
+            inner,
         };
         let home = self
             .story_doc()
@@ -11750,9 +12010,9 @@ impl Engine {
         /* Issue #165 — the live announcement names the region the a11y
         mirror gives the box (its `docPr` name), so a screen-reader user
         hears which group the caret entered. */
-        let label = self
-            .undo
-            .current()
+        let label = label_source
+            .as_ref()
+            .unwrap_or_else(|| self.undo.current())
             .paragraph_at_path(&host_for_label)
             .and_then(|p| {
                 p.inline_objects
@@ -11847,7 +12107,7 @@ impl Engine {
             EnginePathStep::Block(i) => *i,
             EnginePathStep::Cell { .. } => 0,
         });
-        self.enter_text_box_story(host, box_at, page, section_block);
+        self.enter_text_box_story(host, box_at, None, page, section_block);
         self.selection_changed()
     }
 
@@ -12466,7 +12726,9 @@ impl Engine {
             StoryTarget::Header { rid, .. } => StoryPart::Header(rid.clone()),
             StoryTarget::Footer { rid, .. } => StoryPart::Footer(rid.clone()),
             StoryTarget::Note { kind, id, .. } => StoryPart::Note(*kind, *id),
-            StoryTarget::TextBox { host, at, .. } => StoryPart::TextBox(host.clone(), *at),
+            StoryTarget::TextBox {
+                host, at, inner, ..
+            } => StoryPart::TextBox(host.clone(), *at, inner.clone()),
             StoryTarget::Body => {
                 return Event::Error {
                     message: "story_mutate outside a story".into(),
@@ -13837,7 +14099,7 @@ impl Engine {
         match format_docx::read_docx(bytes) {
             Ok(archive) => {
                 let paragraph_count = archive.document.paragraph_count();
-                self.undo = UndoStack::new(archive.document, 100);
+                self.install_undo_stack(UndoStack::new(archive.document, 100));
                 self.selection = Some(SelectionState {
                     anchor: bpos_top(0, 0),
                     caret: bpos_top(0, 0),
@@ -15210,6 +15472,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -15678,6 +15941,7 @@ mod tests {
     fn a11y_para(text: &str) -> A11yNode {
         A11yNode::Paragraph(A11yParagraph {
             direction: Direction::Ltr,
+            resolved_direction: Direction::Ltr,
             runs: vec![A11yRun {
                 text: text.to_string(),
                 bold: false,
@@ -16032,6 +16296,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -16088,6 +16353,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -16135,6 +16401,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -16259,6 +16526,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -16804,6 +17072,7 @@ mod tests {
                 review_date: String::new(),
                 last_command_ms: 0.0,
                 last_paint_ms: 0.0,
+                mutation_seq: 0,
             }
         }
 
@@ -18627,6 +18896,453 @@ mod tests {
 
     const PINNED_NESTED_TEXT_BOXES: u64 = 0x0effc1fd111fcc44;
 
+    /// Issue #197 — a 0.75" × 0.5" square-wrapped floating picture
+    /// anchored at the head of a story paragraph.
+    fn story_float_image(rel: &str) -> engine::InlineObject {
+        engine::InlineObject {
+            at: 0,
+            kind: engine::InlineKind::Image {
+                rel_id: rel.to_string(),
+                width_emu: 685_800,
+                height_emu: 457_200,
+            },
+            anchor: Some(Box::new(engine::FloatAnchor {
+                dist_right_emu: 57_150,
+                wrap: engine::WrapKind::Square,
+                ..engine::FloatAnchor::default()
+            })),
+            source_xml: None,
+        }
+    }
+
+    /// Issue #197 — a body paragraph hosting a 3" × 2" floating box whose
+    /// story opens with a floating picture (square wrap) followed by a
+    /// long run of prose; the picture's bytes live in the document media.
+    fn boxed_float_image_doc() -> DocumentTree {
+        let story_text = format!(
+            "\u{FFFC}{}",
+            "Story text wraps beside the picture inside the box. ".repeat(3)
+        );
+        let mut story = DocumentTree::from_text(&story_text);
+        if let Some(p) = story.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(story_float_image("rIdBoxPic"));
+        }
+        let story_body: Vec<engine::Block> = story.blocks.iter().cloned().collect();
+        let prose = "Body text wraps around the framed picture box. ".repeat(6);
+        let doc = DocumentTree::from_blocks(vec![plain_para(&prose), plain_para("Tail")]);
+        let (doc, h0, a0) = doc.insert_text_box_at(
+            EnginePos {
+                path: EngineBlockPath::top(0),
+                offset: 0,
+            },
+            2_743_200,
+            1_828_800,
+        );
+        let mut doc = doc.with_updated_text_box(&h0, a0, story_body);
+        doc.media.insert(
+            "rIdBoxPic".into(),
+            engine::ImageBlob {
+                content_type: "image/jpeg".to_string(),
+                data: format_pdf::test_images::jpeg(24, 16, 3),
+            },
+        );
+        doc
+    }
+
+    /// Issue #197 — a floating picture anchored in a text-box story is a
+    /// float of the box's content rect: it resolves into the frame's
+    /// `floats`, the story wraps around it (square wrap), the scene draws
+    /// it inside the box clip, and the PDF embeds + paints it. Pinned.
+    #[test]
+    fn floating_picture_in_text_box_story_wraps_and_paints() {
+        let engine = test_engine_with_doc(boxed_float_image_doc());
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let outer = pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("box float");
+        let tb = outer.text_box.as_deref().expect("frame");
+        assert_eq!(tb.floats.len(), 1, "the story picture resolves");
+        let pic = &tb.floats[0];
+        assert!(pic.text_box.is_none());
+        assert_eq!(pic.rel_id, "rIdBoxPic");
+        let (origin, content) = outer.text_box_content_rect().expect("content rect");
+        assert!(pic.origin.x >= -0.01 && pic.origin.y >= -0.01);
+        assert!(pic.origin.x + pic.size.width <= content.width + 0.5);
+        assert!((pic.size.width - 54.0).abs() < 0.5, "0.75in = 54pt");
+        /* Square wrap: story lines beside the picture start right of it. */
+        let sp = tb.blocks[0].as_paragraph().expect("story paragraph");
+        assert!(
+            sp.lines
+                .iter()
+                .any(|l| l.segments.first().is_some_and(|s| s.x0 >= pic.size.width)),
+            "some story band starts right of the picture"
+        );
+        /* Scene: the picture draws inside the box clip, at the content
+        origin + its content-relative offset (page float origins are
+        page-relative, so no extra base on page 0). */
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let cmds = &scene.cmds;
+        let clip = cmds
+            .iter()
+            .position(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .expect("box clip");
+        let draw = cmds
+            .iter()
+            .position(|c| {
+                matches!(c, render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdBoxPic")
+            })
+            .expect("story picture paints");
+        let pop = cmds
+            .iter()
+            .position(|c| matches!(c, render::scene::DisplayCmd::PopClip))
+            .expect("pop");
+        assert!(clip < draw && draw < pop, "inside the box clip");
+        if let render::scene::DisplayCmd::DrawImage { rect, .. } = &cmds[draw] {
+            let want_x = f64::from(origin.x + pic.origin.x);
+            let want_y = f64::from(origin.y + pic.origin.y);
+            assert!((rect.x0 - want_x).abs() < 0.01, "{} vs {want_x}", rect.x0);
+            assert!((rect.y0 - want_y).abs() < 0.01, "{} vs {want_y}", rect.y0);
+        }
+        /* PDF: the picture is embedded and painted. */
+        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(PdfConformance::A2u) else {
+            panic!("engine pdf export");
+        };
+        let count = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
+        assert_eq!(count(b"/Subtype /Image"), 1, "story picture embedded");
+        let fp = layout::geometry_fingerprint(&pages);
+        if std::env::var_os("NGE_PRINT_WRAP_FINGERPRINTS").is_some() {
+            eprintln!("ENGINE BOXED FLOAT IMAGE FINGERPRINT = {fp:#x}");
+        }
+        assert_eq!(fp, PINNED_BOXED_FLOAT_IMAGE);
+    }
+
+    const PINNED_BOXED_FLOAT_IMAGE: u64 = 0xce020097437da437;
+
+    /// Issue #196 — the committed `text_boxes_nested.docx` (outer box at
+    /// 1", 3" on the page, 3" × 2"; nested box 1" / 0.5" into its
+    /// content rect, 1.5" × 0.6"): a press at the geometry the e2e spec
+    /// uses enters the nested story, a press lower in the outer box its
+    /// story. Pins the e2e's coordinate assumptions natively.
+    #[test]
+    fn nested_text_box_fixture_routes_presses_by_geometry() {
+        let bytes = include_bytes!("../../format-docx/tests/fixtures/text_boxes_nested.docx");
+        let archive = format_docx::read_docx(bytes).expect("fixture");
+        let mut engine = test_engine_with_doc(archive.document);
+        let scale = engine.scale();
+        let px = |inches: f32| inches * 72.0 * scale;
+        let at = |x: f32, y: f32| BridgePoint { x: px(x), y: px(y) };
+        let evt = engine.do_place_caret_at_point(0, at(2.85, 3.8));
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert_eq!(
+            editing_story.as_ref().map(|s| s.rid.as_str()),
+            Some("1@0/1@0")
+        );
+        let evt = engine.do_place_caret_at_point(0, at(1.5, 4.6));
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert_eq!(editing_story.as_ref().map(|s| s.rid.as_str()), Some("1@0"));
+    }
+
+    /// Issue #196 — page-space `(x, y, w, h)` of the outer box of
+    /// [`nested_text_box_doc`] and of the box nested in its story.
+    /// `(x, y, w, h)` in page space.
+    type BoxRect = (f32, f32, f32, f32);
+
+    fn nested_box_rects(engine: &Engine) -> (BoxRect, BoxRect) {
+        let _ = engine.document_geometry().expect("layout");
+        let snap_cell = engine.layout_snapshot.borrow();
+        let snap = snap_cell.as_ref().expect("snapshot");
+        let f = snap.pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("outer box");
+        let (co, _) = f.text_box_content_rect().expect("content rect");
+        let nf = &f.text_box.as_deref().expect("frame").floats[0];
+        (
+            (f.origin.x, f.origin.y, f.size.width, f.size.height),
+            (
+                co.x + nf.origin.x,
+                co.y + nf.origin.y,
+                nf.size.width,
+                nf.size.height,
+            ),
+        )
+    }
+
+    fn nested_story_text(engine: &Engine) -> String {
+        let doc = engine.undo.current();
+        text_box_story_blocks(
+            doc,
+            &EngineBlockPath::top(0),
+            0,
+            Some(&(EngineBlockPath::top(0), 0)),
+        )
+        .and_then(|b| {
+            b.first()
+                .and_then(|b| b.as_paragraph())
+                .map(|p| p.text.clone())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Issue #196 — a press inside a NESTED box enters the nested story
+    /// (rid = its a11y region id), the caret / hit-test geometry is the
+    /// nested frame's (inside the nested rect), typing edits the nested
+    /// story only (both boxes go dirty for the writer), a press on the
+    /// outer story switches to it, and the edit survives save + reload.
+    #[test]
+    fn clicking_a_nested_text_box_enters_and_edits_its_story() {
+        let mut engine = test_engine_with_doc(nested_text_box_doc());
+        let (outer, inner) = nested_box_rects(&engine);
+        let inside = |b: BoxRect, x: f32, y: f32| {
+            x >= b.0 - 0.5 && x <= b.0 + b.2 + 0.5 && y >= b.1 - 0.5 && y <= b.1 + b.3 + 0.5
+        };
+        let evt = engine.do_place_caret_at_point(
+            0,
+            BridgePoint {
+                x: inner.0 + inner.2 / 2.0,
+                y: inner.1 + inner.3 / 3.0,
+            },
+        );
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        let story = editing_story.as_ref().expect("a story is active");
+        assert_eq!(story.area, bridge::HeaderFooterArea::TextBox);
+        assert_eq!(story.rid, "0@0/0@0", "the nested region's a11y id");
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { host, at: 0, inner: Some((ih, 0)), .. }
+                if *host == EngineBlockPath::top(0) && *ih == EngineBlockPath::top(0)
+        ));
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret.path.steps, vec![BridgePathStep::Block { idx: 0 }]);
+        /* The press hit-tests the NESTED story's line: mid-box lands
+        mid-"Inner story". */
+        assert!(
+            caret.offset > 0 && caret.offset < "Inner story".len() as u32,
+            "{caret:?}"
+        );
+        /* Caret geometry is the nested story's line, inside the nested
+        box. */
+        let geom = engine.document_geometry().expect("nested geometry");
+        assert_eq!(geom.len(), 1, "one nested story line");
+        let line = &geom[0];
+        assert_eq!(line.end_byte, "Inner story".len() as u32);
+        assert!(inside(inner, line.hit_left, line.y_top));
+        assert!(inside(inner, line.hit_left + line.hit_width, line.y_top));
+
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 0),
+                end: bpos_top(0, 0),
+            },
+            bpos_top(0, 0),
+        );
+        let typed = engine.do_insert_text_interactive(bpos_top(0, 0), "typed ".to_string());
+        assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+        assert_eq!(nested_story_text(&engine), "typed Inner story");
+        let doc = engine.undo.current();
+        let outer_story = doc
+            .text_box_at(&EngineBlockPath::top(0), 0)
+            .expect("outer story");
+        assert!(outer_story.dirty, "the outer container regenerates");
+        assert!(
+            outer_story.body[0]
+                .as_paragraph()
+                .is_some_and(|p| p.text.contains("Outer story text")),
+            "the outer story text is untouched"
+        );
+        /* The caret stays in the nested story, after the typed text. */
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        assert_eq!(caret.offset, "typed ".len() as u32);
+
+        /* A press on the outer story (below the nested box) switches to
+        it; a press back in the nested box re-enters it. */
+        let evt = engine.do_place_caret_at_point(
+            0,
+            BridgePoint {
+                x: outer.0 + outer.2 - 12.0,
+                y: outer.1 + outer.3 - 12.0,
+            },
+        );
+        let Event::SelectionChanged { editing_story, .. } = &evt else {
+            panic!("{evt:?}");
+        };
+        assert_eq!(editing_story.as_ref().map(|s| s.rid.as_str()), Some("0@0"));
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { inner: None, .. }
+        ));
+        let (_, inner) = nested_box_rects(&engine);
+        engine.do_place_caret_at_point(
+            0,
+            BridgePoint {
+                x: inner.0 + inner.2 / 2.0,
+                y: inner.1 + inner.3 / 3.0,
+            },
+        );
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { inner: Some(_), .. }
+        ));
+
+        /* Undo the keystroke: the nested story stays active, clamped. */
+        let evt = engine.do_undo();
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { inner: Some(_), .. }
+        ));
+        assert_eq!(nested_story_text(&engine), "Inner story");
+        let _ = engine.do_redo();
+        assert_eq!(nested_story_text(&engine), "typed Inner story");
+
+        /* Save → reload: the nested edit round-trips. */
+        let _ = engine.do_exit_header_footer();
+        let Event::DocumentSaved { bytes, .. } = engine.save_docx_bytes("test") else {
+            panic!("save");
+        };
+        let back = format_docx::read_docx(&bytes).expect("re-read");
+        let outer_back = back
+            .document
+            .text_box_at(&EngineBlockPath::top(0), 0)
+            .expect("outer box re-reads");
+        let nested_back = DocumentTree::from_blocks(outer_back.body.clone())
+            .text_box_at(&EngineBlockPath::top(0), 0)
+            .map(|s| s.body[0].as_paragraph().map(|p| p.text.clone()));
+        assert_eq!(nested_back.flatten().as_deref(), Some("typed Inner story"));
+    }
+
+    /// Issue #196 — the IME preview renders inside the ACTIVE nested
+    /// story only (not the outer story, not the body).
+    #[test]
+    fn ime_preview_renders_inside_the_active_nested_text_box() {
+        let mut engine = test_engine_with_doc(nested_text_box_doc());
+        let (_, inner) = nested_box_rects(&engine);
+        engine.do_place_caret_at_point(
+            0,
+            BridgePoint {
+                x: inner.0 + inner.2 / 2.0,
+                y: inner.1 + inner.3 / 3.0,
+            },
+        );
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { inner: Some(_), .. }
+        ));
+        let glyphs = |blocks: &[LayoutBlock]| -> usize {
+            blocks
+                .iter()
+                .filter_map(LayoutBlock::as_paragraph)
+                .flat_map(|p| p.lines.iter())
+                .flat_map(|l| l.runs.iter())
+                .map(|r| r.glyphs.len())
+                .sum()
+        };
+        let (pages, ..) = engine
+            .build_pages(engine.scale(), true, None)
+            .expect("layout");
+        let otb = pages[0].floats[0].text_box.as_deref().expect("outer");
+        let (outer_before, inner_before) = (
+            glyphs(&otb.blocks),
+            glyphs(&otb.floats[0].text_box.as_deref().expect("nested").blocks),
+        );
+        engine.composition = Some(CompositionState {
+            at: bpos_top(0, 0),
+            text: "ime".to_string(),
+        });
+        let (pages, ..) = engine
+            .build_pages(engine.scale(), true, None)
+            .expect("layout");
+        let otb = pages[0].floats[0].text_box.as_deref().expect("outer");
+        let itb = otb.floats[0].text_box.as_deref().expect("nested");
+        assert_eq!(
+            glyphs(&itb.blocks),
+            inner_before + 3,
+            "preview in the nested story"
+        );
+        assert_eq!(glyphs(&otb.blocks), outer_before, "outer story untouched");
+    }
+
+    /// Issue #196 — the nesting cap bounds hit-testing too: a box nested
+    /// past level two is not laid out, so a press over where it would be
+    /// enters the level-two story, never a third level.
+    #[test]
+    fn nested_hit_testing_stops_at_the_nesting_cap() {
+        let mut doc = nested_text_box_doc();
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0)
+            && let engine::InlineKind::TextBox { story, .. } = &mut p.inline_objects[0].kind
+            && let Some(engine::Block::Paragraph(sp)) = story.body.get_mut(0)
+            && let engine::InlineKind::TextBox { story: inner, .. } = &mut sp.inline_objects[0].kind
+        {
+            let third = DocumentTree::from_blocks(vec![plain_para("level two")]);
+            let (third, _, _) = third.insert_text_box_at(
+                EnginePos {
+                    path: EngineBlockPath::top(0),
+                    offset: 0,
+                },
+                300_000,
+                200_000,
+            );
+            inner.body = third.blocks.iter().cloned().collect();
+        } else {
+            panic!("fixture shape");
+        }
+        let mut engine = test_engine_with_doc(doc);
+        let (_, inner) = nested_box_rects(&engine);
+        engine.do_place_caret_at_point(
+            0,
+            BridgePoint {
+                x: inner.0 + 4.0,
+                y: inner.1 + 4.0,
+            },
+        );
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { inner: Some(_), .. }
+        ));
+    }
+
+    /// Issue #197 — a picture in a NESTED box's story (level two) resolves
+    /// too: the nesting cap bounds box recursion, not pictures.
+    #[test]
+    fn floating_picture_in_nested_box_story_resolves() {
+        let mut doc = nested_text_box_doc();
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0)
+            && let engine::InlineKind::TextBox { story, .. } = &mut p.inline_objects[0].kind
+            && let Some(engine::Block::Paragraph(sp)) = story.body.get_mut(0)
+            && let engine::InlineKind::TextBox { story: inner, .. } = &mut sp.inline_objects[0].kind
+        {
+            let mut level2 = DocumentTree::from_text("\u{FFFC}pic");
+            if let Some(ip) = level2.blocks[0].as_paragraph_mut() {
+                ip.inline_objects.push(story_float_image("rIdInnerPic"));
+            }
+            inner.body = level2.blocks.iter().cloned().collect();
+        } else {
+            panic!("fixture shape");
+        }
+        let engine = test_engine_with_doc(doc);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let otb = pages[0].floats[0].text_box.as_deref().expect("outer");
+        let itb = otb.floats[0].text_box.as_deref().expect("nested");
+        assert_eq!(itb.floats.len(), 1);
+        assert_eq!(itb.floats[0].rel_id, "rIdInnerPic");
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        assert!(scene.cmds.iter().any(|c| matches!(
+            c,
+            render::scene::DisplayCmd::DrawImage { rel_id, .. } if rel_id == "rIdInnerPic"
+        )));
+    }
+
     /// A box nested past the layout cap (only a hand-built tree can carry
     /// one) keeps its place in its parent story but is not resolved —
     /// the recursion is bounded and nothing degrades.
@@ -18738,7 +19454,7 @@ mod tests {
         let first = engine.build_a11y_delta();
         assert!(matches!(first.as_slice(), [A11yPatch::Replace { .. }]));
         engine.pending_announcements.clear();
-        engine.enter_text_box_story(EngineBlockPath::top(0), 0, 0, 0);
+        engine.enter_text_box_story(EngineBlockPath::top(0), 0, None, 0, 0);
         assert!(
             engine
                 .pending_announcements
@@ -19291,6 +20007,7 @@ mod tests {
             review_date: "2026-01-01T00:00:00Z".to_string(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         }
     }
 
@@ -22259,6 +22976,12 @@ mod snapshot_tests {
 /// Issues #114–#118 — every wire value is validated at the command
 /// boundary: typed `Event::Error`, never a panic, never an unbounded
 /// allocation, and the selection invariant holds after every command.
+#[cfg(test)]
+mod mutation_signal_tests;
+
+#[cfg(test)]
+mod a11y_direction_tests;
+
 #[cfg(test)]
 mod wire_validation_tests {
     use super::*;

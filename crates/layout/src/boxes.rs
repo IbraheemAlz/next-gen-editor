@@ -261,13 +261,13 @@ impl PartialEq for TextBoxGlyph {
 /// offset already folded into each block's `origin.y` — the renderer is
 /// a pure traversal. Lines past the content rect are clipped at paint.
 ///
-/// Issue #165 — `floats` are the boxes nested in this box's story (a
-/// text box inside a text box), resolved against the content rect as a
+/// Issue #165 / #197 — `floats` are the floats anchored in this box's
+/// story — nested text boxes (each carrying its own laid-out frame) and
+/// floating pictures — resolved against the content rect as a
 /// margin-less pseudo page ([`crate::floats::story_frame_page`]): their
 /// `origin`s are relative to this box's CONTENT rect, exactly as
-/// `blocks` are, and each carries its own laid-out frame. Recursion is
-/// bounded by the engine's text-box nesting cap; empty for every box
-/// without a nested one.
+/// `blocks` are. Box recursion is bounded by the engine's text-box
+/// nesting cap; empty for every story without a float.
 #[derive(Debug, Clone)]
 pub struct TextBoxFrame {
     pub source: TextBoxGlyph,
