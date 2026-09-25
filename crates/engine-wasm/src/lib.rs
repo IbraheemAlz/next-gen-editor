@@ -54,7 +54,9 @@ struct RenderConfig {
     px_size: f32,
     line_height: f32,
     alignment: Alignment,
-    /// Effective device scale — always `base_scale × zoom`. Layout + paint
+    /// Effective device scale — `base_scale × zoom`, capped at
+    /// `MAX_PAINT_SCALE` (issue #280, never below `base_scale`; see
+    /// `compose_paint_scale`). Layout + paint
     /// are scaled by this; `px_size` and `line_height` stay logical (the
     /// toolbar + document model use them raw).
     scale: f32,
@@ -65,6 +67,28 @@ struct RenderConfig {
     base_scale: f32,
     /// User zoom fraction set by `SetZoom`, clamped to `[0.25, 4.0]`.
     zoom: f32,
+}
+
+/// Issue #280 — ceiling on the effective paint scale (device px per
+/// layout pt) that a user zoom may push the backing store to. Zoom now
+/// visibly grows every page card, and its canvas backing store grows with
+/// it (`page.size × scale`); uncapped, 400 % on a `devicePixelRatio` 2
+/// display is a ~6350 × 8980 px (≈ 228 MB) canvas PER mounted page —
+/// past Safari's 16.7 M px canvas limit and far past the 256 MiB worker
+/// budget once a few pages are mounted (#63). At `4.0` an A4 page stays
+/// ≤ 2381 × 3368 px (≈ 32 MB). Past the cap the engine keeps painting at
+/// the capped density and the shell stretches the (slightly softer)
+/// bitmap to the full zoomed CSS size — the page still grows exactly
+/// with the zoom. The cap never pushes the scale below the boot
+/// `base_scale`, so 100 % is always rendered at full device resolution.
+/// MIRRORED in `ts/src/state/engine-store.ts` (`MAX_PAINT_SCALE`): the
+/// shell derives its device-px ↔ CSS-px ratio from the same formula.
+const MAX_PAINT_SCALE: f32 = 4.0;
+
+/// Issue #280 — `scale = base_scale × zoom`, capped at
+/// [`MAX_PAINT_SCALE`] (never below `base_scale`).
+fn compose_paint_scale(base_scale: f32, zoom: f32) -> f32 {
+    (base_scale * zoom).min(MAX_PAINT_SCALE.max(base_scale))
 }
 
 /// Bound on the undo stack (`UndoStack::new(_, UNDO_CAP)`).
@@ -146,7 +170,7 @@ impl LayoutCfgSnapshot {
                 "CENTER" => Alignment::Center,
                 _ => Alignment::Start,
             },
-            scale: base_scale * zoom,
+            scale: compose_paint_scale(base_scale, zoom),
             base_scale,
             zoom,
         })
@@ -564,6 +588,8 @@ struct LastPaintDims {
     /// between real paints.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Issue #280 — per-page widths (device px), index-aligned.
+    page_widths: Vec<f32>,
     /// Phase 3 (#39) — per-page top/bottom margins (device px) for the
     /// shell's header/footer double-click zone gate.
     page_margin_tops: Vec<f32>,
@@ -1140,6 +1166,7 @@ impl Engine {
             is_full_layout: dims.is_full_layout,
             page_tops: dims.page_tops,
             page_heights: dims.page_heights,
+            page_widths: dims.page_widths,
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: dims.page_margin_tops,
             page_margin_bottoms: dims.page_margin_bottoms,
@@ -1283,6 +1310,8 @@ struct PaintDimsOut {
     /// Issue #26 — per-page absolute tops + heights in device px.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Issue #280 — per-page widths (device px), index-aligned.
+    page_widths: Vec<f32>,
     /// Issue #44 — inline-image count, so the broadcast PAINTED can gate
     /// the shell's `GetImageRects` refresh (mirrors `Event::Painted`).
     image_count: u32,
@@ -7523,7 +7552,7 @@ impl Engine {
         if let Some(zoom) = self.pending_zoom.take() {
             cfg.zoom = zoom;
         }
-        cfg.scale = cfg.base_scale * cfg.zoom;
+        cfg.scale = compose_paint_scale(cfg.base_scale, cfg.zoom);
         self.layout_cfg = Some(cfg);
         /* A RenderPage reset is a fresh document; a surviving selection
         or IME preview from the previous session would be load-bearing
@@ -7896,7 +7925,7 @@ impl Engine {
             if let Some(zoom) = pending_zoom {
                 cfg.zoom = zoom.clamp(0.25, 4.0);
             }
-            cfg.scale = cfg.base_scale * cfg.zoom;
+            cfg.scale = compose_paint_scale(cfg.base_scale, cfg.zoom);
         }
         self.layout_cfg = stashed_cfg;
         /* Replay side effects the user must not see twice: an IME preview
@@ -9548,6 +9577,7 @@ impl Engine {
         them from uniform-A4 constants. */
         let mut page_tops = Vec::with_capacity(pages.len());
         let mut page_heights = Vec::with_capacity(pages.len());
+        let mut page_widths = Vec::with_capacity(pages.len());
         let mut page_margin_tops = Vec::with_capacity(pages.len());
         let mut page_margin_bottoms = Vec::with_capacity(pages.len());
         let mut page_content_tops = Vec::with_capacity(pages.len());
@@ -9556,6 +9586,7 @@ impl Engine {
         for page in pages {
             page_tops.push(top_acc);
             page_heights.push(page.size.height);
+            page_widths.push(page.size.width);
             /* Phase 3 (#39) — per-page margins for the shell's
             header/footer zone gate; exact under mixed-geometry
             sections. */
@@ -9591,6 +9622,7 @@ impl Engine {
             page_count: pages.len() as u32,
             page_tops,
             page_heights,
+            page_widths,
             page_margin_tops,
             page_margin_bottoms,
             page_content_tops,
@@ -9626,6 +9658,7 @@ impl Engine {
                 is_full_layout: stats.is_full_layout,
                 page_tops: stats.page_tops.clone(),
                 page_heights: stats.page_heights.clone(),
+                page_widths: stats.page_widths.clone(),
                 page_margin_tops: stats.page_margin_tops.clone(),
                 page_margin_bottoms: stats.page_margin_bottoms.clone(),
                 page_content_tops: stats.page_content_tops.clone(),
@@ -9691,6 +9724,7 @@ impl Engine {
             is_full_layout: stats.is_full_layout,
             page_tops: stats.page_tops.clone(),
             page_heights: stats.page_heights.clone(),
+            page_widths: stats.page_widths.clone(),
             page_margin_tops: stats.page_margin_tops.clone(),
             page_margin_bottoms: stats.page_margin_bottoms.clone(),
             page_content_tops: stats.page_content_tops.clone(),
@@ -9970,6 +10004,7 @@ impl Engine {
             estimated_document_height: dims.estimated_document_height,
             page_tops: dims.page_tops,
             page_heights: dims.page_heights,
+            page_widths: dims.page_widths,
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: dims.page_margin_tops,
             page_margin_bottoms: dims.page_margin_bottoms,
@@ -10034,6 +10069,7 @@ impl Engine {
             estimated_document_height: stats.estimated_document_height,
             page_tops: stats.page_tops,
             page_heights: stats.page_heights,
+            page_widths: stats.page_widths,
             image_count: self.undo.current().count_inline_images(),
             page_margin_tops: stats.page_margin_tops,
             page_margin_bottoms: stats.page_margin_bottoms,
@@ -15506,7 +15542,7 @@ impl Engine {
             };
         };
         cfg.zoom = zoom;
-        cfg.scale = cfg.base_scale * zoom;
+        cfg.scale = compose_paint_scale(cfg.base_scale, zoom);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -15539,7 +15575,7 @@ impl Engine {
             };
         };
         cfg.base_scale = base;
-        cfg.scale = base * cfg.zoom;
+        cfg.scale = compose_paint_scale(base, cfg.zoom);
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -16786,6 +16822,8 @@ struct RenderStats {
     /// Issue #26 — absolute per-page tops + heights in device px.
     page_tops: Vec<f32>,
     page_heights: Vec<f32>,
+    /// Issue #280 — per-page widths (device px), index-aligned.
+    page_widths: Vec<f32>,
     /// Phase 3 (#39) — per-page top/bottom margins in device px,
     /// index-aligned with `page_tops`; the shell's header/footer
     /// double-click zone gate.
@@ -22883,6 +22921,48 @@ mod tests {
         let evt = engine.do_set_zoom(100.0);
         assert!(!matches!(evt, Event::Error { .. }));
         assert_eq!(engine.layout_cfg.as_ref().unwrap().zoom, 4.0);
+    }
+
+    /// Issue #280 — the effective paint scale follows `base × zoom` up to
+    /// `MAX_PAINT_SCALE` and never drops below the boot `base_scale`;
+    /// the painted page grows with it and the backing store stays bounded.
+    #[test]
+    fn zoom_paint_scale_is_capped_at_the_backing_store_budget() {
+        assert_eq!(compose_paint_scale(4.0 / 3.0, 1.5), 2.0);
+        assert_eq!(compose_paint_scale(4.0 / 3.0, 0.25), 1.0 / 3.0);
+        assert_eq!(compose_paint_scale(8.0 / 3.0, 2.0), MAX_PAINT_SCALE);
+        // A base already past the cap is kept (100 % stays full-res) and
+        // zooming in does not grow it further.
+        assert_eq!(compose_paint_scale(5.0, 1.0), 5.0);
+        assert_eq!(compose_paint_scale(5.0, 2.0), 5.0);
+
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
+        let _ = engine.do_set_device_scale(8.0 / 3.0);
+        let _ = engine.do_set_zoom(4.0);
+        let cfg = engine.layout_cfg.as_ref().unwrap();
+        assert_eq!(cfg.zoom, 4.0, "the user zoom itself is not capped");
+        assert_eq!(cfg.scale, MAX_PAINT_SCALE);
+        let Event::Painted {
+            page_widths,
+            page_heights,
+            ..
+        } = engine.do_request_paint(
+            BridgeRect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            None,
+        )
+        else {
+            panic!("expected Painted");
+        };
+        assert_eq!(page_widths.len(), page_heights.len());
+        assert!(!page_widths.is_empty());
+        // A4 portrait at the capped scale: 595.3 × 841.9 pt × 4.
+        assert!((page_widths[0] - 595.3 * MAX_PAINT_SCALE).abs() < 2.0);
+        assert!((page_heights[0] - 841.9 * MAX_PAINT_SCALE).abs() < 2.0);
     }
 
     /// Issue #52 — `SetZoom` answers with a `SelectionChanged` that

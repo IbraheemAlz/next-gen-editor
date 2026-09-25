@@ -11,7 +11,10 @@
    visually breaking the A4 portrait aspect ratio (the page appears as tall
    as the viewport). Anchoring at the top lets the page take its own height
    and the viewport scrollbar exposes overflow.
-   `justify-content: center` centres the page horizontally inside the desk. */
+   Horizontal centring is `margin-inline: auto` on `.editor-pages`, NOT
+   `justify-content: center` (issue #280): a zoomed page wider than the
+   desk must overflow to the RIGHT (scrollable) — a centred flex item
+   overflows both edges and its left part becomes unreachable. */
 .editor-viewport {
     flex: 1 1 auto;
     min-width: 0;
@@ -19,7 +22,6 @@
     overflow: auto;
     display: flex;
     align-items: flex-start;
-    justify-content: center;
     /* Generous breathing room above + below the first / last page card
        so the shadow has room to fall without clipping at the viewport
        edge. Horizontal padding keeps the page off the side rails. */
@@ -46,11 +48,15 @@
    so the engine's internal page-top accumulator (used for
    `HIT_TEST_IN_PAGE` offset math) aligns with the visible CSS
    inter-page gap. `48 pt / 72 × 96 = 64 CSS px`. */
+/* Issue #280 — the `gap` here is the 100 % fallback; `App` overrides it
+   inline with `PAGE_GAP_CSS × zoom` so it tracks the engine's zoomed
+   `PAGE_GAP_PT`. */
 .editor-pages {
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 64px;
+    margin-inline: auto;
 }
 
 .editor-page {
@@ -62,7 +68,11 @@
        that page, never the full document. Multi-page documents grow
        by mounting more `<canvas>` elements, not by stretching one
        canvas past the browser's hardware-accelerated size limits
-       (Safari 4096 px, Chrome ~32 k). */
+       (Safari 4096 px, Chrome ~32 k).
+       Issue #280 — these are only the pre-paint A4-at-100 % fallback:
+       `App` / `ExtraPageCanvas` size every card inline from the engine's
+       reported page geometry (device px ÷ the device-px-per-CSS-px
+       ratio), so a zoom or a landscape section resizes the card. */
     width: 794px;
     height: 1123px;
     background: #ffffff;

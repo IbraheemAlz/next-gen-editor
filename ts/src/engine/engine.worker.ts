@@ -1191,6 +1191,8 @@ function broadcastPaintDims(): void {
             is_full_layout: boolean;
             page_tops: number[];
             page_heights: number[];
+            /** Issue #280 — per-page widths (device px). */
+            page_widths: number[];
             image_count: number;
             page_margin_tops: number[];
             page_margin_bottoms: number[];
@@ -1215,6 +1217,9 @@ function broadcastPaintDims(): void {
                 estimated_document_height: dims.estimated_document_height,
                 page_tops: dims.page_tops,
                 page_heights: dims.page_heights,
+                /* Issue #280 — the page cards size from these; both
+                Painted producers must carry them. */
+                page_widths: dims.page_widths ?? [],
                 image_count: dims.image_count,
                 /* Phase 3 (#39) — the double-click header/footer zone
                 gate reads per-page margins; BOTH Painted producers (the

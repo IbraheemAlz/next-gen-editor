@@ -85,9 +85,12 @@ export interface EditorState {
      * device px, index-aligned, straight from the paginator. Empty
      * arrays until the first paginated paint. Exact under
      * mixed-orientation sections — consumers must not derive page tops
-     * from uniform page-size constants.
+     * from uniform page-size constants. Issue #280 — `widths` are the
+     * per-page widths (device px, index-aligned; empty from a pre-#280
+     * engine); a host sizes its page cards from `widths` / `heights`
+     * so a zoom visibly resizes the page.
      */
-    pageGeometry: Accessor<{ tops: number[]; heights: number[] }>;
+    pageGeometry: Accessor<{ tops: number[]; heights: number[]; widths: number[] }>;
     /** Active renderer reported by the worker at INIT, re-reported by the
      *  engine on every `RECOVERED` (issue #66). */
     renderer: Accessor<string>;
@@ -274,7 +277,8 @@ export function createEditorState(): EditorState {
     const [pageGeometry, setPageGeometry] = createSignal<{
         tops: number[];
         heights: number[];
-    }>({ tops: [], heights: [] });
+        widths: number[];
+    }>({ tops: [], heights: [], widths: [] });
     const [renderer, setRenderer] = createSignal(engine.renderer);
     const [sectionGeometry, setSectionGeometry] =
         createSignal<BridgeSectionGeometry | undefined>(undefined);
@@ -346,7 +350,11 @@ export function createEditorState(): EditorState {
                 setEstimatedDocumentHeight(evt.estimated_document_height);
                 setLayoutDegraded(evt.layout_degraded ?? []);
                 if (evt.page_tops.length > 0) {
-                    setPageGeometry({ tops: evt.page_tops, heights: evt.page_heights });
+                    setPageGeometry({
+                        tops: evt.page_tops,
+                        heights: evt.page_heights,
+                        widths: evt.page_widths ?? [],
+                    });
                 }
                 break;
             }

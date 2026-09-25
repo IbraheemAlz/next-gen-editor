@@ -13,7 +13,7 @@ import { createEffect, onCleanup, onMount } from 'solid-js';
 import { attachPointer } from '../input/pointer';
 import type { EngineClient } from '../engine/engine-client';
 import type { EngineStore } from '../state/engine-store';
-import { PAGE_H_PT, SCREEN_DPI_SCALE } from '../state/engine-store';
+import { PAGE_H_PT, deviceRatio, paintScale } from '../state/engine-store';
 
 export interface EditorCanvasProps {
     client: EngineClient;
@@ -38,8 +38,11 @@ export function EditorCanvas(props: EditorCanvasProps) {
         const canvas = canvasRef!;
 
         /* Size the backing store in device pixels so text stays crisp on
-           high-DPI displays; CSS holds the element at viewport size. */
-        const dpr = window.devicePixelRatio || 1;
+           high-DPI displays; CSS holds the element at the page card's
+           size. Issue #280 — the card is already at the engine's zoom
+           (a recovery at 150 % mounts a 150 % card), and `deviceRatio`
+           is the device-px-per-CSS-px ratio the engine paints at. */
+        const dpr = deviceRatio();
         canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
         canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
 
@@ -68,7 +71,9 @@ export function EditorCanvas(props: EditorCanvasProps) {
         const pushViewport = (): void => {
             rafId = 0;
             if (!scroller) return;
-            const dpr = window.devicePixelRatio || 1;
+            /* Issue #280 — engine device px per CSS px at the current
+               zoom (`devicePixelRatio` until the paint-scale cap). */
+            const dpr = deviceRatio();
             const r = canvas.getBoundingClientRect();
             const v = scroller.getBoundingClientRect();
             const rect = {
@@ -78,7 +83,9 @@ export function EditorCanvas(props: EditorCanvasProps) {
                 h: scroller.clientHeight * dpr,
             };
             void props.client.dispatch({ type: 'SET_VIEWPORT', rect });
-            const scale = dpr * SCREEN_DPI_SCALE;
+            /* Issue #280 — the engine's EFFECTIVE scale includes the zoom;
+               `dpr × 4/3` alone mis-sized the expand band at any zoom ≠ 1. */
+            const scale = paintScale();
             const laidOutPt = props.store.documentHeight() / scale;
             const bottomPt = (rect.y + rect.h) / scale;
             const targetPt = bottomPt + 2 * PAGE_H_PT;
@@ -113,6 +120,10 @@ export function EditorCanvas(props: EditorCanvasProps) {
         scroller?.addEventListener('scroll', schedule, { passive: true });
         resizeObserver = new ResizeObserver(schedule);
         resizeObserver.observe(scroller ?? canvas);
+        /* Issue #280 — a zoom resizes the page column (not the scroller):
+           75 % brings more pages into view, which must extend the band. */
+        const pagesEl = canvas.closest('.editor-pages');
+        if (pagesEl) resizeObserver.observe(pagesEl);
         schedule();
         detachViewport = () => {
             if (rafId !== 0) cancelAnimationFrame(rafId);
@@ -127,9 +138,9 @@ export function EditorCanvas(props: EditorCanvasProps) {
         detachPointer = attachPointer(canvas, props.client, 0);
     });
 
-    /* Phase 6c — multi-canvas DOM: each `.editor-page` element keeps its
-       fixed A4 dimensions (CSS `width: 794px; min-height: 1123px`),
-       and the canvas inside fills it. No more growing `min-height`
+    /* Phase 6c — multi-canvas DOM: each `.editor-page` element is sized
+       from the engine's page geometry (issue #280 — zoom-aware), and the
+       canvas inside fills it. No more growing `min-height`
        per paginated page — multi-page documents grow by mounting
        more `<canvas>` elements (see `ExtraPageCanvas`), not by
        stretching one. The `documentHeight` signal is now informational
