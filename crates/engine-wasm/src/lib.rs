@@ -5950,6 +5950,42 @@ fn selection_rects_geom(
     rects
 }
 
+/// Issue #276 — typing over (or replacing) a non-empty selection gives the
+/// new text the formatting of the FIRST replaced character, as Word does —
+/// and as the toolbar already reports for a range (`attrs_at` reads the
+/// selection start). `None` for a collapsed caret (plain insertion inherits
+/// the character before the caret inside `DocumentTree::insert_text`) or
+/// when the selection starts at a paragraph end (nothing replaced there).
+fn replaced_text_style(
+    doc: &DocumentTree,
+    start: &BridgeLogicalPos,
+    end: &BridgeLogicalPos,
+) -> Option<SpanStyle> {
+    if start == end {
+        return None;
+    }
+    let p = doc.paragraph_at_path(&bridge_to_engine_path(start.path.clone()))?;
+    ((start.offset as usize) < p.text.len()).then(|| p.style_at(start.offset))
+}
+
+/// Issue #276 — apply [`replaced_text_style`]'s result to the `len` bytes
+/// just inserted at `start`.
+fn restyle_replacement(
+    doc: DocumentTree,
+    style: Option<SpanStyle>,
+    start: &BridgeLogicalPos,
+    len: usize,
+) -> DocumentTree {
+    match style {
+        Some(style) if len > 0 => doc.set_span_style(
+            to_engine_pos(start.clone()),
+            start.offset + len as u32,
+            style,
+        ),
+        _ => doc,
+    }
+}
+
 /// Order two positions into document order (path, then offset).
 fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, BridgeLogicalPos) {
     use core::cmp::Ordering;
@@ -11531,7 +11567,6 @@ impl Engine {
             Some(ShapingDirection::Rtl) => Direction::Rtl,
             _ => Direction::Ltr,
         };
-        let probe = self.attrs_probe(&start, &end);
         Event::SelectionChanged {
             range: BridgeLogicalRange {
                 start: start.clone(),
@@ -11548,7 +11583,7 @@ impl Engine {
             rects,
             /* A collapsed caret reflects any armed pending style; a real
             selection reports the document's own attributes (Backlog #11). */
-            attrs_at_caret: self.attrs_at(probe, start == end),
+            attrs_at_caret: self.attrs_at(start.clone(), start == end),
             paragraph_alignment: self.paragraph_alignment_at(&sel.caret.path),
             paragraph_style_id: self.with_selection_doc(|d| {
                 d.paragraph_at_path(&bridge_to_engine_path(sel.caret.path.clone()))
@@ -12026,31 +12061,19 @@ impl Engine {
         Some(head)
     }
 
-    /// The offset whose style the toolbar should reflect: the selection start
-    /// for a range, or the char before a collapsed caret (the style typing
-    /// there would extend). `style_at(caret)` alone reads the char *after* the
-    /// caret, which is unstyled right after formatting a selection.
-    fn attrs_probe(&self, start: &BridgeLogicalPos, end: &BridgeLogicalPos) -> BridgeLogicalPos {
-        if start != end || start.offset == 0 {
-            return start.clone();
-        }
-        let engine_path = bridge_to_engine_path(start.path.clone());
-        let prev = self.with_selection_doc(|d| {
-            d.paragraph_at_path(&engine_path)
-                .map_or(start.offset, |p| p.prev_offset(start.offset))
-        });
-        BridgeLogicalPos {
-            path: start.path.clone(),
-            offset: prev,
-        }
-    }
-
     /// Resolved text attributes at `pos`. Spans carry size + colour + the
     /// bold/italic/underline flags; `strike`, `bg_color`, `script` and
-    /// `language` default until those land. When `apply_pending` is set (a
-    /// collapsed caret), any armed sticky style is overlaid so the toolbar
-    /// previews what the next keystroke will adopt (Backlog #11).
-    fn attrs_at(&self, pos: BridgeLogicalPos, apply_pending: bool) -> TextAttrs {
+    /// `language` default until those land.
+    ///
+    /// `collapsed` (a caret, not a range): the toolbar previews what the
+    /// next keystroke will produce — issue #276: the very style
+    /// `DocumentTree::insert_text` continues (`Paragraph::typing_style_at`:
+    /// the character before the caret, at the paragraph start the one
+    /// after it, never an inline-object anchor's), with any armed sticky
+    /// style overlaid (Backlog #11). A range reports its first character
+    /// — which is also what typing over it produces.
+    fn attrs_at(&self, pos: BridgeLogicalPos, collapsed: bool) -> TextAttrs {
+        let apply_pending = collapsed;
         let engine_path = bridge_to_engine_path(pos.path.clone());
         /* Issue #29 — fold the paragraph's style-chain run base UNDER
         the direct span style so the toolbar reads the same cascaded
@@ -12059,8 +12082,13 @@ impl Engine {
         let mut style = self.with_selection_doc(|doc| {
             doc.paragraph_at_path(&engine_path)
                 .map_or_else(SpanStyle::default, |p| {
+                    let direct = if collapsed {
+                        p.typing_style_at(pos.offset)
+                    } else {
+                        p.style_at(pos.offset)
+                    };
                     doc.resolve_style_run_cascade(p.style_id.as_deref())
-                        .merged_with(p.style_at(pos.offset))
+                        .merged_with(direct)
                 })
         });
         if apply_pending && let Some(pending) = self.pending_format.as_ref() {
@@ -12190,12 +12218,14 @@ impl Engine {
         let Some(temp) = self.story_doc() else {
             return self.story_vanished();
         };
+        let replaced = replaced_text_style(&temp, &start, &end);
         let base = if start == end {
             temp
         } else {
             temp.delete_range(to_engine_pos(start.clone()), to_engine_pos(end))
         };
         let new_doc = base.insert_text(to_engine_pos(start.clone()), &text);
+        let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,
@@ -13725,6 +13755,7 @@ impl Engine {
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
+        let replaced = replaced_text_style(self.undo.current(), &start, &end);
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
@@ -13752,6 +13783,7 @@ impl Engine {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
         let inserted_end = start.offset + text.len() as u32;
+        new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         /* Sticky formatting (Backlog #11): overlay any armed pending style
         onto the just-inserted run. It is intentionally NOT cleared here — it
         stays armed across consecutive keystrokes so a whole typed run shares
@@ -13790,6 +13822,7 @@ impl Engine {
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
+        let replaced = replaced_text_style(self.undo.current(), &start, &end);
         let base = if start == end {
             self.undo.current().clone()
         } else if tracking {
@@ -13809,6 +13842,7 @@ impl Engine {
         } else {
             base.insert_text(to_engine_pos(start.clone()), &text)
         };
+        let new_doc = restyle_replacement(new_doc, replaced, &start, text.len());
         let caret = BridgeLogicalPos {
             path: start.path,
             offset: start.offset + text.len() as u32,

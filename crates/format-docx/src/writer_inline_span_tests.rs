@@ -302,15 +302,11 @@ fn run_level_sdt_survives_edits_outside_and_inside() {
         (0, 3, ">Before <", ">BefINSore <"),
         /* Inside the control's run. */
         (0, 10, ">SDT Run with RPr<", ">SDTINS Run with RPr<"),
-        /* At the control's end: inside the control. `insert_text` does
-        not extend the bold span at its end, so the text is its own run
-        (the source run's attributes and whitespace, no rPr). */
-        (
-            0,
-            23,
-            "RPr</w:t>\n                    </w:r>",
-            "RPr</w:t>\n                    </w:r><w:r>\n                        <w:t>INS</w:t>\n                    </w:r>",
-        ),
+        /* At the control's end: inside the control. Issue #276 — the
+        typed text continues the bold run before it (Word), so the save
+        is a pure insertion inside that run (it used to be a separate,
+        unformatted `<w:r>`). */
+        (0, 23, ">SDT Run with RPr<", ">SDT Run with RPrINS<"),
         /* Outside, after the control. */
         (0, 26, "> After<", "> AfINSter<"),
         /* Inside the nested controls. */
@@ -430,9 +426,11 @@ fn simple_field_keeps_its_form_through_edits() {
         save(&archive, &edited),
         xml.replacen(
             "</w:fldSimple>",
-            /* `insert_text` does not extend the noProof span at its end:
-            the typed text is plain, in its own run. */
-            r#"</w:fldSimple><w:r><w:t xml:space="preserve"> X</w:t></w:r>"#,
+            /* Issue #276 — the typed text inherits the noProof of the
+            field result before it (Word continues the preceding
+            character's formatting); it still lands AFTER the field, so
+            it is its own run, carrying the same rPr. */
+            r#"</w:fldSimple><w:r><w:rPr><w:noProof/></w:rPr><w:t xml:space="preserve"> X</w:t></w:r>"#,
             1
         )
     );

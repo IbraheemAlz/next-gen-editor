@@ -9486,6 +9486,22 @@ mod tests {
         assert_eq!(back.document.paragraph_text(0), Some("Hello wr"));
     }
 
+    /// Issue #276 — typing at the END of a formatted run (the underlined
+    /// one) continues it: the typed text inherits the run's formatting, so
+    /// the save is exactly source + the inserted bytes inside that run —
+    /// same rsid, same verbatim `<w:rPr>` — instead of a fresh plain
+    /// `<w:r>` after it.
+    #[test]
+    fn typing_after_a_formatted_run_continues_it() {
+        let (xml, archive) = markup_archive();
+        let end = "Hello wrold underlined".len();
+        let edited = archive.document.insert_text(at(0, end), "ZZ");
+        let p = edited.nth_paragraph(0).unwrap();
+        assert!(p.style_at(end as u32 + 1).underline.is_some());
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(out, xml.replacen(" underlined<", " underlinedZZ<", 1));
+    }
+
     /// Issues #199 / #106 — a minimal package ships no `styles.xml`, so the
     /// recorded source pPr / rPr bytes are not reused there: the resolved
     /// properties are baked instead (the docDefaults spacing appears).
