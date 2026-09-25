@@ -105,8 +105,9 @@ jobs:
     name: Playwright e2e suite
     needs: wasm
     runs-on: ubuntu-24.04
-    # Issue #230 — the suite itself runs in ~1.3 min locally (51 tests,
-    # `workers: 1` — several are timing-sensitive, see playwright.config.ts).
+    # Issue #230 — the suite itself runs in under a minute locally
+    # (`workers: 1` — several specs are timing-sensitive, see
+    # playwright.config.ts).
     # No Rust toolchain / wasm-pack build in this job (the `wasm` job's
     # artifact is reused below), so the whole job should land well inside
     # this cap; the cap exists to catch a Vite dev-server boot stall, not
