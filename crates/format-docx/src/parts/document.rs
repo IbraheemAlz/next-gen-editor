@@ -22,7 +22,7 @@ use crate::schema::grab_bag::{
     NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
 use crate::schema::source_markup::{
-    MarkupCapture, is_inline_marker, is_modeled_textless_run_child,
+    MarkupCapture, is_balanced_fragment, is_inline_marker, is_modeled_textless_run_child,
 };
 use crate::style_resolver::StyleResolver;
 use engine::{
@@ -97,6 +97,125 @@ struct FieldBuilder {
     /// overlay is stamped back onto that paragraph, the Tail onto the
     /// current one.
     cached_block: Option<(usize, bool)>,
+    /// Issue #246 — byte offset of the `<w:r` holding the `begin`, when
+    /// that run had no text before it (the prologue can be kept).
+    begin_run: Option<usize>,
+    /// Issue #246 — text offset of the `begin`.
+    begin_at: u32,
+    /// Issue #246 — `MarkupCapture::markers_len()` at the `begin`.
+    marker_mark: usize,
+    /// Issue #246 — `(start, end, markers_len)` of the verbatim prologue
+    /// (begin run … separate run), once the separate run closed cleanly.
+    prologue: Option<(usize, usize, usize)>,
+}
+
+/// Issue #246 — the source form of the fields of the paragraph being
+/// read ([`engine::FieldSource`]): the complex field's prologue (begin …
+/// separate runs) and end run, captured at the run closes that complete
+/// them.
+#[derive(Default)]
+struct FieldSourceTracker {
+    /// `(stack depth, run text length at the separate)`: the run holding
+    /// the `separate` of a field whose prologue may be kept.
+    sep_pending: Option<(usize, usize)>,
+    /// `(index in the paragraph's fields, run start byte)`: the run
+    /// holding the `end` of a field that got a source prologue.
+    end_pending: Option<(usize, usize)>,
+}
+
+impl FieldSourceTracker {
+    fn begin(
+        &mut self,
+        stack: &mut [FieldBuilder],
+        run_start: Option<usize>,
+        at: u32,
+        markers_len: usize,
+    ) {
+        if let Some(top) = stack.last_mut() {
+            top.begin_run = run_start;
+            top.begin_at = at;
+            top.marker_mark = markers_len;
+        }
+    }
+
+    fn separate(&mut self, stack: &[FieldBuilder], at: u32, run_text_len: usize) {
+        self.sep_pending = stack
+            .last()
+            .filter(|top| top.begin_run.is_some() && top.begin_at == at)
+            .map(|_| (stack.len(), run_text_len));
+    }
+
+    /// The `end` of `ending` (the builder as it was before the pop)
+    /// produced the local field `fields[idx]`.
+    #[allow(clippy::too_many_arguments)]
+    fn end(
+        &mut self,
+        ending: Option<FieldBuilder>,
+        fields: &mut [engine::Field],
+        idx: Option<usize>,
+        xml: &[u8],
+        ns: &NamespaceScope,
+        markup: &mut MarkupCapture,
+        run_start: Option<usize>,
+    ) {
+        self.sep_pending = None;
+        let (Some(b), Some(idx)) = (ending, idx) else {
+            return;
+        };
+        let Some((ps, pe, mend)) = b.prologue else {
+            return;
+        };
+        let Some(open) = xml.get(ps..pe) else {
+            return;
+        };
+        if !(is_balanced_fragment(open) && bound_by_root(open, ns)) {
+            return;
+        }
+        let Some(f) = fields.get_mut(idx) else {
+            return;
+        };
+        f.source = Some(Box::new(engine::FieldSource {
+            instruction: f.instruction.clone(),
+            open: open.to_vec(),
+            close: Vec::new(),
+        }));
+        /* The markers captured inside the prologue (a form field's name
+        bookmark, text-less runs) ride its bytes now. */
+        markup.drain_markers(b.marker_mark, mend);
+        self.end_pending = run_start.map(|r| (idx, r));
+    }
+
+    /// A `</w:r>` ended at byte `end`; `run_text_len` is the run's text
+    /// length.
+    #[allow(clippy::too_many_arguments)]
+    fn run_closed(
+        &mut self,
+        stack: &mut [FieldBuilder],
+        fields: &mut [engine::Field],
+        xml: &[u8],
+        end: usize,
+        run_text_len: usize,
+        markers_len: usize,
+        ns: &NamespaceScope,
+    ) {
+        if let Some((depth, rtl)) = self.sep_pending.take()
+            && run_text_len == rtl
+            && let Some(b) = stack.get_mut(depth.wrapping_sub(1))
+            && let Some(start) = b.begin_run
+        {
+            b.prologue = Some((start, end, markers_len));
+        }
+        if let Some((idx, start)) = self.end_pending.take()
+            && run_text_len == 0
+            && let Some(frag) = xml.get(start..end)
+            && frag.starts_with(b"<w:r")
+            && is_balanced_fragment(frag)
+            && bound_by_root(frag, ns)
+            && let Some(src) = fields.get_mut(idx).and_then(|f| f.source.as_deref_mut())
+        {
+            src.close = frag.to_vec();
+        }
+    }
 }
 
 /// Issue #81 — where the fldChar machine is in the block stream.
@@ -164,12 +283,14 @@ fn handle_fld_char(
                             end: len,
                             instruction,
                             span: Some(engine::FieldSpan::Head),
+                            source: None,
                         });
                         out_fields.push(engine::Field {
                             start: 0,
                             end,
                             instruction: String::new(),
                             span: Some(engine::FieldSpan::Tail),
+                            source: None,
                         });
                     }
                     return;
@@ -187,12 +308,14 @@ fn handle_fld_char(
                         end: len,
                         instruction,
                         span: Some(engine::FieldSpan::Head),
+                        source: None,
                     });
                     out_fields.push(engine::Field {
                         start: 0,
                         end,
                         instruction: String::new(),
                         span: Some(engine::FieldSpan::Tail),
+                        source: None,
                     });
                     return;
                 }
@@ -202,11 +325,47 @@ fn handle_fld_char(
                         end,
                         instruction,
                         span: None,
+                        source: None,
                     });
                 }
             }
         }
         _ => { /* Unknown fldCharType — ignore. */ }
+    }
+}
+
+/// Issue #244 — what [`track_field_span`] needs to know about one
+/// `<w:fldChar>` event, sampled around [`handle_fld_char`].
+struct FieldSpanCtx<'a> {
+    /// `field_stack.len()` before the event.
+    depth_before: usize,
+    /// The field stack after the event.
+    stack: &'a [FieldBuilder],
+    /// Text offset of the event.
+    here: u32,
+    /// The open run produced no text before the event.
+    run_text_empty: bool,
+    /// The event turned a field into a model overlay.
+    modeled: bool,
+}
+
+/// Issue #244 — feed one `<w:fldChar>` to the paragraph's markup capture
+/// so a field with no result (a legacy form field: `FORMCHECKBOX`,
+/// `FORMDROPDOWN`, an empty `FORMTEXT`, carrying `<w:ffData>`) survives a
+/// regeneration as ONE verbatim content span instead of vanishing. A
+/// `begin` is eligible when its run has no text before it and every
+/// enclosing field is already in its result part (a field nested in an
+/// instruction stays inside that instruction).
+fn track_field_span(e: &BytesStart<'_>, markup: &mut MarkupCapture, cx: FieldSpanCtx<'_>) {
+    let kind = attr_val(e, b"w:fldCharType").unwrap_or_default();
+    match kind.trim() {
+        "begin" if cx.stack.len() > cx.depth_before => {
+            let enclosing = &cx.stack[..cx.stack.len() - 1];
+            let eligible = cx.run_text_empty && enclosing.iter().all(|f| f.cached_start.is_some());
+            markup.field_begin(cx.here, cx.stack.len(), eligible);
+        }
+        "end" if cx.depth_before > 0 => markup.field_end(cx.depth_before, cx.here, cx.modeled),
+        _ => {}
     }
 }
 
@@ -744,7 +903,11 @@ pub fn parse_document_xml_with_warnings(
     the compact single-element field form Word emits for simple PAGE /
     DATE fields. Stack of (instruction, cached-start); the close tag
     seals the byte range exactly like fldChar's begin/separate/end. */
-    let mut fld_simple_stack: Vec<(String, u32)> = Vec::new();
+    let mut fld_simple_stack: Vec<(String, u32, Option<Vec<u8>>)> = Vec::new();
+    /* Issue #246 — complex-field source forms, and the byte offset of
+    the open `<w:r>`. */
+    let mut field_sources = FieldSourceTracker::default();
+    let mut run_start_byte: usize = 0;
     let mut in_instr_text = false;
 
     /* Phase 8b — tracked-change wrapper state. A `<w:ins>` or `<w:del>`
@@ -961,7 +1124,37 @@ pub fn parse_document_xml_with_warnings(
                 if in_run && is_modeled_textless_run_child(name.as_ref()) {
                     markup.run_modeled();
                 }
+                if in_run && !in_rpr && name.as_ref() != b"w:rPr" {
+                    markup.run_child_start();
+                }
+                let in_para = p_start_byte.is_some() && !in_run;
                 match name.as_ref() {
+                    /* Issue #245 — a run-level content control: its runs
+                    stay paragraph content; the wrapper (`<w:sdt>` …
+                    `<w:sdtContent>` / `</w:sdtContent></w:sdt>`) rides the
+                    paragraph's source markup as a positioned opener /
+                    closer pair. The property subtrees are skipped whole
+                    (their bytes are inside the opener) so nothing in them
+                    can leak into the live run state. */
+                    b"w:sdt" if in_para => {
+                        markup.sdt_start(prev_pos);
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    b"w:sdtPr" | b"w:sdtEndPr" if in_para => {
+                        let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    b"w:sdtContent" if in_para => {
+                        let end = reader.buffer_position() as usize;
+                        markup.sdt_content_start(xml, end, para_text.len() as u32, &ns, false);
+                        prev_pos = end;
+                        buf.clear();
+                        continue;
+                    }
                     /* Issue #119 — a run-level object element: capture the
                     whole subtree, lower the modeled facts out of it, and
                     anchor ONE inline object carrying the bytes. A picture
@@ -1117,6 +1310,7 @@ pub fn parse_document_xml_with_warnings(
                     }
                     b"w:r" => {
                         in_run = true;
+                        run_start_byte = prev_pos;
                         r_style_id = None;
                         direct_rpr = SpanStyle::default();
                         run_text.clear();
@@ -1199,6 +1393,13 @@ pub fn parse_document_xml_with_warnings(
                         attribute value lives on the start tag's `w:fldCharType`
                         attribute. `Start(...)` and `Empty(...)` both end up
                         here — match `Empty` below as well for completeness. */
+                        let depth_before = field_stack.len();
+                        let fields_before = para_fields.len();
+                        let here = (para_text.len() + run_text.len()) as u32;
+                        let kind = attr_val(&e, b"w:fldCharType").unwrap_or_default();
+                        let ending = (kind.trim() == "end")
+                            .then(|| field_stack.last().cloned())
+                            .flatten();
                         handle_fld_char(
                             &e,
                             &mut field_stack,
@@ -1211,11 +1412,59 @@ pub fn parse_document_xml_with_warnings(
                             &mut para_fields,
                             &mut out_blocks,
                         );
+                        /* Issue #244 — a zero-result field (legacy form
+                        field) is kept whole as a content marker. */
+                        track_field_span(
+                            &e,
+                            &mut markup,
+                            FieldSpanCtx {
+                                depth_before,
+                                stack: &field_stack,
+                                here,
+                                run_text_empty: run_text.is_empty(),
+                                modeled: para_fields.len() != fields_before,
+                            },
+                        );
+                        /* Issue #246 — the field's source form. */
+                        let clean_run = (in_run && run_text.is_empty()).then_some(run_start_byte);
+                        match kind.trim() {
+                            "begin" if field_stack.len() > depth_before => {
+                                field_sources.begin(
+                                    &mut field_stack,
+                                    clean_run.filter(|_| p_start_byte.is_some()),
+                                    here,
+                                    markup.markers_len(),
+                                );
+                            }
+                            "separate" => {
+                                field_sources.separate(&field_stack, here, run_text.len());
+                            }
+                            "end" => {
+                                let local = (para_fields.len() == fields_before + 1
+                                    && para_fields.last().is_some_and(|f| f.is_local()))
+                                .then(|| para_fields.len() - 1);
+                                field_sources.end(
+                                    ending,
+                                    &mut para_fields,
+                                    local,
+                                    xml,
+                                    &ns,
+                                    &mut markup,
+                                    clean_run,
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                     b"w:fldSimple" => {
                         let instr = attr_val(&e, b"w:instr").unwrap_or_default();
                         let start = (para_text.len() + run_text.len()) as u32;
-                        fld_simple_stack.push((instr, start));
+                        /* Issue #246 — the start tag, for the simple form. */
+                        let tag = xml
+                            .get(prev_pos..reader.buffer_position() as usize)
+                            .filter(|t| bound_by_root(t, &ns))
+                            .map(<[u8]>::to_vec);
+                        fld_simple_stack.push((instr, start, tag));
                     }
                     b"w:ins" | b"w:del" => {
                         let kind = if name.as_ref() == b"w:ins" {
@@ -1284,6 +1533,9 @@ pub fn parse_document_xml_with_warnings(
                 if in_run && is_modeled_textless_run_child(name.as_ref()) {
                     markup.run_modeled();
                 }
+                if in_run && !in_rpr && name.as_ref() != b"w:rPr" {
+                    markup.run_child_start();
+                }
                 /* Issues #199 / #106 — in-paragraph markup the model does
                 not represent: the empty `<w:pPr/>`, an empty run `<w:rPr/>`,
                 a leading `<w:lastRenderedPageBreak/>`, and the positioned
@@ -1291,6 +1543,14 @@ pub fn parse_document_xml_with_warnings(
                 let in_para = p_start_byte.is_some() && in_tbl == 0;
                 let here = reader.buffer_position() as usize;
                 match name.as_ref() {
+                    /* Issue #245 — an empty run-level content control. */
+                    b"w:sdtContent" if in_para && !in_run => {
+                        markup.sdt_content_start(xml, here, para_text.len() as u32, &ns, true);
+                    }
+                    b"w:sdt" if in_para && !in_run => {
+                        markup.sdt_start(prev_pos);
+                        markup.sdt_end(xml, here, para_text.len() as u32, &ns);
+                    }
                     b"w:pPr" if in_para && !in_run => markup.close_ppr(xml, here, &ns),
                     b"w:rPr" if in_para && in_run => {
                         if let Some(frag) = slice_fragment(xml, prev_pos, here) {
@@ -1565,6 +1825,13 @@ pub fn parse_document_xml_with_warnings(
                         identical. Nothing to record here. */
                     }
                     b"w:fldChar" => {
+                        let depth_before = field_stack.len();
+                        let fields_before = para_fields.len();
+                        let here = (para_text.len() + run_text.len()) as u32;
+                        let kind = attr_val(&e, b"w:fldCharType").unwrap_or_default();
+                        let ending = (kind.trim() == "end")
+                            .then(|| field_stack.last().cloned())
+                            .flatten();
                         handle_fld_char(
                             &e,
                             &mut field_stack,
@@ -1577,6 +1844,49 @@ pub fn parse_document_xml_with_warnings(
                             &mut para_fields,
                             &mut out_blocks,
                         );
+                        /* Issue #244 — a zero-result field (legacy form
+                        field) is kept whole as a content marker. */
+                        track_field_span(
+                            &e,
+                            &mut markup,
+                            FieldSpanCtx {
+                                depth_before,
+                                stack: &field_stack,
+                                here,
+                                run_text_empty: run_text.is_empty(),
+                                modeled: para_fields.len() != fields_before,
+                            },
+                        );
+                        /* Issue #246 — the field's source form. */
+                        let clean_run = (in_run && run_text.is_empty()).then_some(run_start_byte);
+                        match kind.trim() {
+                            "begin" if field_stack.len() > depth_before => {
+                                field_sources.begin(
+                                    &mut field_stack,
+                                    clean_run.filter(|_| p_start_byte.is_some()),
+                                    here,
+                                    markup.markers_len(),
+                                );
+                            }
+                            "separate" => {
+                                field_sources.separate(&field_stack, here, run_text.len());
+                            }
+                            "end" => {
+                                let local = (para_fields.len() == fields_before + 1
+                                    && para_fields.last().is_some_and(|f| f.is_local()))
+                                .then(|| para_fields.len() - 1);
+                                field_sources.end(
+                                    ending,
+                                    &mut para_fields,
+                                    local,
+                                    xml,
+                                    &ns,
+                                    &mut markup,
+                                    clean_run,
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                     b"w:rPr" if in_ppr && !in_run => {
                         /* Issue #84 — an empty paragraph-mark `<w:rPr/>`
@@ -1678,6 +1988,21 @@ pub fn parse_document_xml_with_warnings(
                     markup.whitespace(para_text.len() as u32, frag);
                 }
             }
+            Event::Text(t)
+                if p_start_byte.is_some()
+                    && in_tbl == 0
+                    && in_run
+                    && !in_rpr
+                    && !in_instr_text
+                    && t.iter().all(u8::is_ascii_whitespace) =>
+            {
+                /* Issue #245 — pretty-print whitespace between a run's
+                children rides the source run. */
+                let end = reader.buffer_position() as usize;
+                if let Some(frag) = xml.get(prev_pos..end) {
+                    markup.run_whitespace(frag);
+                }
+            }
             Event::Text(t) if in_instr_text && in_tbl == 0 => {
                 /* `<w:instrText>` content accumulates onto the innermost
                 open field's instruction buffer. The text may straddle
@@ -1739,7 +2064,23 @@ pub fn parse_document_xml_with_warnings(
                     buf.clear();
                     continue;
                 }
+                if in_run && !in_rpr && name.as_ref() != b"w:r" {
+                    markup.run_child_end();
+                }
                 match name.as_ref() {
+                    /* Issue #245 — the run-level content control's content
+                    and element close. */
+                    b"w:sdtContent" if p_start_byte.is_some() && !in_run => {
+                        markup.sdt_content_end(prev_pos);
+                    }
+                    b"w:sdt" if p_start_byte.is_some() && !in_run => {
+                        markup.sdt_end(
+                            xml,
+                            reader.buffer_position() as usize,
+                            para_text.len() as u32,
+                            &ns,
+                        );
+                    }
                     b"w:t" => in_text_elt = false,
                     b"w:delText" => in_del_text_elt = false,
                     b"w:instrText" => in_instr_text = false,
@@ -1810,15 +2151,27 @@ pub fn parse_document_xml_with_warnings(
                         less or instruction-less fldSimple leaves no
                         anchor to re-evaluate; skip it (matches the
                         fldChar machine's guards). */
-                        if let Some((instr, start)) = fld_simple_stack.pop() {
+                        if let Some((instr, start, tag)) = fld_simple_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
                             let instr = instr.trim().to_string();
                             if end > start && !instr.is_empty() {
+                                /* Issue #246 — remember the simple form. */
+                                let close = xml
+                                    .get(prev_pos..reader.buffer_position() as usize)
+                                    .map(<[u8]>::to_vec);
+                                let source = tag.zip(close).map(|(open, close)| {
+                                    Box::new(engine::FieldSource {
+                                        instruction: instr.clone(),
+                                        open,
+                                        close,
+                                    })
+                                });
                                 para_fields.push(engine::Field {
                                     start,
                                     end,
                                     instruction: instr,
                                     span: None,
+                                    source,
                                 });
                             }
                         }
@@ -1870,6 +2223,15 @@ pub fn parse_document_xml_with_warnings(
                     }
                     b"w:r" => {
                         in_run = false;
+                        field_sources.run_closed(
+                            &mut field_stack,
+                            &mut para_fields,
+                            xml,
+                            reader.buffer_position() as usize,
+                            run_text.len(),
+                            markup.markers_len(),
+                            &ns,
+                        );
                         let start = para_text.len() as u32;
                         para_text.push_str(&run_text);
                         let end = para_text.len() as u32;
@@ -1916,7 +2278,12 @@ pub fn parse_document_xml_with_warnings(
                             r_style_id.as_deref(),
                             direct_rpr.clone(),
                         );
-                        markup.close_text_run(start, end, &style);
+                        markup.close_text_run(
+                            start,
+                            end,
+                            &style,
+                            &para_text[start as usize..end as usize],
+                        );
                         if style != SpanStyle::default() {
                             match spans.last_mut() {
                                 Some(last) if last.end == start && last.style == style => {

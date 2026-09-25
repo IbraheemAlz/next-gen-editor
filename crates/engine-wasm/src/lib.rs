@@ -22260,6 +22260,7 @@ mod tests {
                         end: 7,
                         instruction: "PAGE".into(),
                         span: None,
+                        source: None,
                     }],
                     ..Default::default()
                 })],
@@ -22313,6 +22314,7 @@ mod tests {
                         end: 4,
                         instruction: "NUMPAGES".into(),
                         span: None,
+                        source: None,
                     }],
                     ..Default::default()
                 })],
@@ -22478,6 +22480,7 @@ mod tests {
                 end: 4,
                 instruction: "DATE".into(),
                 span: None,
+                source: None,
             }],
             ..Default::default()
         })]);
@@ -22627,12 +22630,14 @@ mod tests {
                     end: 7,
                     instruction: "PAGE".into(),
                     span: None,
+                    source: None,
                 },
                 engine::Field {
                     start: 11,
                     end: 13,
                     instruction: "NUMPAGES".into(),
                     span: None,
+                    source: None,
                 },
             ],
             ..Default::default()
@@ -22840,12 +22845,14 @@ mod tests {
                         end: 7,
                         instruction: "PAGE".into(),
                         span: None,
+                        source: None,
                     },
                     engine::Field {
                         start: 11,
                         end: 12,
                         instruction: "NUMPAGES".into(),
                         span: None,
+                        source: None,
                     },
                 ],
                 ..Default::default()
@@ -22866,12 +22873,14 @@ mod tests {
                         end: 4,
                         instruction: "AUTHOR".into(),
                         span: None,
+                        source: None,
                     },
                     engine::Field {
                         start: 8,
                         end: 9,
                         instruction: "FILENAME \\p".into(),
                         span: None,
+                        source: None,
                     },
                 ],
                 ..Default::default()

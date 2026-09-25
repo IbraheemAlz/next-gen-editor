@@ -1108,6 +1108,7 @@ mod tests {
             end,
             instruction: instr.into(),
             span: None,
+            source: None,
         }
     }
 

@@ -1505,6 +1505,33 @@ pub struct SourceRun {
     #[serde(with = "serde_bytes")]
     pub lead: Vec<u8>,
     pub t_attrs: Option<Vec<SourceAttr>>,
+    /// Issue #245 — the pretty-print whitespace inside the source `<w:r>`
+    /// (`None` for a compact part). Skipped when `None`, so a pre-#245
+    /// snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pad: Option<Box<RunPad>>,
+    /// Issue #245 — the source wrote this run's text with edge whitespace
+    /// in a bare `<w:t>` (no `xml:space`); the reader kept the whitespace,
+    /// so the writer keeps the source spelling instead of adding
+    /// `xml:space="preserve"` to text it did not change the meaning of.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bare_edge_ws: bool,
+}
+
+/// Issue #245 — whitespace between the children of a pretty-printed
+/// source `<w:r>`: after the start tag (`open`), after the `<w:rPr>`
+/// (`after_rpr`) and before the end tag (`close`). Re-emitted on every
+/// regenerated piece of the run, so an edit inside a pretty-printed part
+/// rewrites only the bytes it changed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RunPad {
+    #[serde(with = "serde_bytes")]
+    pub open: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub after_rpr: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub close: Vec<u8>,
 }
 
 /// Issues #199 / #106 — unmodeled in-paragraph markup at text offset `at`:
@@ -1518,6 +1545,71 @@ pub struct SourceMarker {
     pub at: u32,
     #[serde(with = "serde_bytes")]
     pub xml: Vec<u8>,
+    /// What the bytes are to the writer (issue #244). Skipped when
+    /// [`MarkerRole::Verbatim`], so a pre-#244 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "MarkerRole::is_verbatim")]
+    pub role: MarkerRole,
+}
+
+impl SourceMarker {
+    /// A [`MarkerRole::Verbatim`] marker.
+    pub fn verbatim(at: u32, xml: Vec<u8>) -> Self {
+        Self {
+            at,
+            xml,
+            role: MarkerRole::Verbatim,
+        }
+    }
+}
+
+/// Issue #244 — how the writer treats a [`SourceMarker`].
+///
+/// - [`Self::Verbatim`]: positioned formatting-neutral markup (`proofErr`,
+///   bookmarks, pretty-print whitespace). Written only while the
+///   paragraph's offsets are in sync — a stale marker is dropped rather
+///   than misplaced.
+/// - [`Self::Content`]: unmodeled paragraph *content* kept whole, e.g. a
+///   zero-result legacy form field (`FORMCHECKBOX` / `FORMDROPDOWN` — the
+///   `fldChar begin … end` byte range, `<w:ffData>` included). PRD Tier 3:
+///   never dropped — when the offsets go stale it is still written, at its
+///   offset clamped to the text (a best-effort position beats losing the
+///   control).
+/// - [`Self::Open`] / [`Self::Close`] (issue #245): the two ends of an
+///   unmodeled run-level WRAPPER around a text range — a `<w:sdt>` content
+///   control. `xml` of the opener is `<w:sdt>…<w:sdtPr>…</w:sdtPr>
+///   <w:sdtContent>`, of the closer `</w:sdtContent></w:sdt>`; `id` pairs
+///   them. They travel with the text like any marker (an insertion at the
+///   closer's offset lands INSIDE the control, as typing at the end of a
+///   run continues it). The writer pairs them with a stack and keeps the
+///   part well-formed whatever an edit did: an opener that lost its
+///   closer (a split) closes with `close_xml` at the paragraph end, a
+///   closer without an opener is skipped, and a range that would cross a
+///   regenerated wrapper (hyperlink, revision, field) is widened to
+///   enclose it. Tier 3 like [`Self::Content`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub enum MarkerRole {
+    #[default]
+    Verbatim,
+    Content,
+    Open {
+        id: u32,
+        #[serde(with = "serde_bytes")]
+        close_xml: Vec<u8>,
+    },
+    Close {
+        id: u32,
+    },
+}
+
+impl MarkerRole {
+    pub fn is_verbatim(&self) -> bool {
+        matches!(self, Self::Verbatim)
+    }
+
+    /// `true` for markup that must survive stale offsets.
+    pub fn must_survive(&self) -> bool {
+        !self.is_verbatim()
+    }
 }
 
 /// Issues #199 / #106 — attribute-level grab bag + in-paragraph source
@@ -1693,7 +1785,7 @@ impl SourceMarkup {
                 } else {
                     right.markers.push(SourceMarker {
                         at: mk.at - at,
-                        xml: mk.xml.clone(),
+                        ..mk.clone()
                     });
                 }
             }
@@ -1751,7 +1843,7 @@ impl SourceMarkup {
         for mk in &t.markers {
             out.markers.push(SourceMarker {
                 at: mk.at + head_len,
-                xml: mk.xml.clone(),
+                ..mk.clone()
             });
         }
         Some(Box::new(out))
@@ -2615,6 +2707,43 @@ pub struct Field {
     /// `None` = the ordinary paragraph-local field (#43 / #77).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<FieldSpan>,
+    /// Issue #246 — the field's source markup, for a field read from
+    /// `.docx`; `None` for an engine-authored one. Skipped when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Box<FieldSource>>,
+}
+
+/// Issue #246 — how a field read from `.docx` was spelled, so a
+/// regenerated paragraph writes it back in the SAME form: a
+/// `<w:fldSimple>` stays simple (instead of growing into a
+/// `fldChar begin / instrText / separate … end` complex field), and a
+/// complex field keeps its source prologue — the begin run with its
+/// `<w:ffData>` (a `FORMTEXT` with a result), rsids, the instruction runs
+/// with their spacing — and its end run.
+///
+/// Verified: the writer uses the bytes only while the field's live
+/// `instruction` still equals the one they produced; an edited
+/// instruction regenerates the standard complex form. The result runs in
+/// between always regenerate from the text.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct FieldSource {
+    /// The (trimmed) instruction the bytes produced.
+    pub instruction: String,
+    /// `<w:fldSimple …>` start tag, or the complex field's runs from the
+    /// begin `fldChar` through the `separate` one.
+    #[serde(with = "serde_bytes")]
+    pub open: Vec<u8>,
+    /// `</w:fldSimple>`, or the complex field's end-`fldChar` run.
+    #[serde(with = "serde_bytes")]
+    pub close: Vec<u8>,
+}
+
+impl FieldSource {
+    /// The source bytes still spell `instruction`.
+    pub fn is_current(&self, instruction: &str) -> bool {
+        self.instruction == instruction
+    }
 }
 
 /// Issue #81 — the multi-paragraph field representation. OOXML lets a
@@ -6366,6 +6495,7 @@ impl DocumentTree {
                 end: start + cached.len() as u32,
                 instruction: instruction.to_string(),
                 span: None,
+                source: None,
             });
             para.fields.sort_by_key(|f| f.start);
         });
@@ -14336,6 +14466,7 @@ mod tests {
                 end: 8,
                 instruction: "PAGE".into(),
                 span: None,
+                source: None,
             }],
             ..Default::default()
         };
@@ -14362,6 +14493,7 @@ mod tests {
                 end: 4,
                 instruction: "PAGE".into(),
                 span: None,
+                source: None,
             }],
             ..Default::default()
         };
@@ -14396,6 +14528,7 @@ mod tests {
                     end: 6,
                     instruction: "PAGE".into(),
                     span: None,
+                    source: None,
                 });
             });
             d.blocks = blocks;
@@ -14435,6 +14568,7 @@ mod tests {
                 end: 8,
                 instruction: "NUMPAGES".into(),
                 span: None,
+                source: None,
             }],
             spans: vec![
                 StyleRun {
@@ -14477,6 +14611,7 @@ mod tests {
             end: 1,
             instruction: "DATE \\@ \"dd/MM/yyyy\" \\* MERGEFORMAT".into(),
             span: None,
+            source: None,
         };
         assert_eq!(f.date_picture().as_deref(), Some("dd/MM/yyyy"));
         let bare = Field {
@@ -14484,6 +14619,7 @@ mod tests {
             end: 1,
             instruction: "DATE".into(),
             span: None,
+            source: None,
         };
         assert_eq!(bare.date_picture(), None);
     }
@@ -15308,6 +15444,7 @@ mod source_markup_tests {
         SourceMarker {
             at,
             xml: b"<w:proofErr/>".to_vec(),
+            ..SourceMarker::default()
         }
     }
 
