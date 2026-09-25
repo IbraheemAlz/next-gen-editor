@@ -42,8 +42,9 @@ export const UnderlineStyleDropdown: Component<UnderlineStyleDropdownProps> = (p
         return attrs ? attrs.underline !== 'None' : false;
     };
 
+    /* Issue #286 — engine-side toggle; `lastStyle` is what turns ON. */
     const applyToggle = async () => {
-        await cmd.setUnderline(isActive() ? 'None' : lastStyle());
+        await cmd.toggleFormatting('Underline', lastStyle());
     };
 
     const choose = async (style: UnderlineStyle) => {

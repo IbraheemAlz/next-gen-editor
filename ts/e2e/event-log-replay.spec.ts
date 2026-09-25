@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 
 /* D2.6 exit gate: event-log replay + sequence continuity. Flood enough
    commands to trigger a snapshot (SNAPSHOT_EVERY = 200), force a crash,
@@ -138,24 +139,26 @@ for (const corrupt of ['newest', 'all'] as const) {
             const readLog = () =>
                 withDb(
                     (db) =>
-                        new Promise<{ cmd: number[]; snap: number[]; pruned: number }>(
-                            (resolve, reject) => {
-                                const tx = db.transaction(
-                                    ['commands', 'snapshots', 'meta'],
-                                    'readonly',
-                                );
-                                const cmd = tx.objectStore('commands').getAllKeys();
-                                const snap = tx.objectStore('snapshots').getAllKeys();
-                                const pruned = tx.objectStore('meta').get('pruned');
-                                tx.oncomplete = () =>
-                                    resolve({
-                                        cmd: cmd.result as number[],
-                                        snap: snap.result as number[],
-                                        pruned: (pruned.result?.through as number) ?? 0,
-                                    });
-                                tx.onerror = () => reject(tx.error);
-                            },
-                        ),
+                        new Promise<{
+                            cmd: number[];
+                            snap: number[];
+                            pruned: number;
+                            pinned: number | undefined;
+                        }>((resolve, reject) => {
+                            const tx = db.transaction(['commands', 'snapshots', 'meta'], 'readonly');
+                            const cmd = tx.objectStore('commands').getAllKeys();
+                            const snap = tx.objectStore('snapshots').getAllKeys();
+                            const pruned = tx.objectStore('meta').get('pruned');
+                            const pinned = tx.objectStore('meta').get('pinned');
+                            tx.oncomplete = () =>
+                                resolve({
+                                    cmd: cmd.result as number[],
+                                    snap: snap.result as number[],
+                                    pruned: (pruned.result?.through as number) ?? 0,
+                                    pinned: pinned.result?.seq as number | undefined,
+                                });
+                            tx.onerror = () => reject(tx.error);
+                        }),
                 );
             const documentText = async (): Promise<string> => {
                 await dispatch({ type: 'SELECT_ALL' });
@@ -215,16 +218,21 @@ for (const corrupt of ['newest', 'all'] as const) {
         /* Pruning really happened: the head of the log (the boot
            RENDER_PAGE) is gone, and so is every snapshot at or before
            the pruning point — only newer ones, each with its full tail,
-           remain. */
+           remain. Issue #268 — except the pinned base, which is never
+           pruned (its own tail is). */
         expect(r.before.pruned).toBeGreaterThanOrEqual(200);
         expect(Math.min(...r.before.cmd)).toBe(r.before.pruned + 1);
-        expect(Math.min(...r.before.snap)).toBeGreaterThan(r.before.pruned);
+        const regular = r.before.snap.filter((s: number) => s !== r.before.pinned);
+        expect(Math.min(...regular)).toBeGreaterThan(r.before.pruned);
+        expect(r.before.snap).toContain(r.before.pinned);
 
         if (corrupt === 'newest') {
             expect(r.info.snapshotFallbacks).toBe(1);
             expect(r.info.restored).toBe(true);
             expect(r.info.layoutRestored).toBe(true);
             expect(r.info.logTruncated).toBe(false);
+            expect(r.info.pinnedBase).toBe(false);
+            expect(r.info.tailDropped).toBe(false);
             expect(r.text).toBe(`KEEP-241 ${SEED}`);
         } else {
             expect(r.info.snapshotFallbacks).toBe(r.before.snap.length);
@@ -233,3 +241,166 @@ for (const corrupt of ['newest', 'all'] as const) {
         }
     });
 }
+
+/* Issue #268 — the pinned base. A document's first snapshot is pinned
+   (the session's first, and the first after every OPEN_DOCUMENT): never
+   pruned, so even when pruning has dropped its tail and EVERY other
+   snapshot is unreadable, recovery restores it instead of losing the
+   document (the #241 'all' case above corrupts the pinned row too). Its
+   tail is gone, so the document comes back as of the pinned snapshot —
+   the edit made after it is lost, and `RecoveryInfo.tailDropped` says so.
+   The recovered engine then snapshots at the log head straight away, so
+   the next recovery does not replay rows it never applied. */
+const PIN_FIXTURE = new URL(
+    '../../crates/format-docx/tests/fixtures/simple_text.docx',
+    import.meta.url,
+);
+test('pruned log + all but the pinned base unreadable: the pinned base restores', async ({
+    page,
+}) => {
+    test.setTimeout(90_000);
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+
+    const result = await page.evaluate(async (b64: string) => {
+        const w = window as any;
+        const dispatch = w.__dispatch as (cmd: unknown) => Promise<any>;
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        const withDb = <T,>(fn: (db: IDBDatabase) => Promise<T>): Promise<T> =>
+            new Promise((resolve, reject) => {
+                const open = indexedDB.open('engine-log');
+                open.onsuccess = () => {
+                    const db = open.result;
+                    fn(db).then(
+                        (v) => {
+                            db.close();
+                            resolve(v);
+                        },
+                        (e) => {
+                            db.close();
+                            reject(e);
+                        },
+                    );
+                };
+                open.onerror = () => reject(open.error);
+            });
+        type Log = { cmd: number[]; snap: number[]; pruned: number; pinned: number | undefined };
+        const readLog = () =>
+            withDb(
+                (db) =>
+                    new Promise<Log>((resolve, reject) => {
+                        const tx = db.transaction(['commands', 'snapshots', 'meta'], 'readonly');
+                        const cmd = tx.objectStore('commands').getAllKeys();
+                        const snap = tx.objectStore('snapshots').getAllKeys();
+                        const pruned = tx.objectStore('meta').get('pruned');
+                        const pinned = tx.objectStore('meta').get('pinned');
+                        tx.oncomplete = () =>
+                            resolve({
+                                cmd: cmd.result as number[],
+                                snap: snap.result as number[],
+                                pruned: (pruned.result?.through as number) ?? 0,
+                                pinned: pinned.result?.seq as number | undefined,
+                            });
+                        tx.onerror = () => reject(tx.error);
+                    }),
+            );
+        const documentText = async (): Promise<string> => {
+            await dispatch({ type: 'SELECT_ALL' });
+            const p = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+            return p.type === 'CLIPBOARD_PAYLOAD' ? p.plain : `<${p.type}>`;
+        };
+
+        const awaitPin = async (after: number): Promise<Log> => {
+            for (let i = 0; i < 200; i++) {
+                const l = await readLog();
+                if (l.pinned !== undefined && l.pinned > after) return l;
+                await sleep(50);
+            }
+            throw new Error(`no pinned snapshot after ${after}`);
+        };
+        /* The session's first snapshot (the idle one after boot) is pinned;
+           waiting for it leaves no idle snapshot pending. */
+        const boot = await awaitPin(0);
+        /* A new document: the next snapshot — the idle one after the
+           insert — is ITS pinned base, holding the insert. */
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const opened = await dispatch({ type: 'OPEN_DOCUMENT', bytes, format: 'docx', name: 'p.docx' });
+        if (opened.type === 'ERROR') return { failed: `open: ${opened.message}` };
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'PIN-268 ' });
+        let log = await awaitPin(boot.pinned!);
+        const pinned = log.pinned!;
+        const pinnedText = await documentText();
+
+        /* An edit after the pin, then four cadence snapshots: pruning
+           drops the pinned base's tail (the edit included). */
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'LOST ' });
+        for (let i = 0; i < 850; i++) await dispatch({ type: 'PING' });
+        await sleep(2_500);
+        log = await readLog();
+        for (let i = 0; i < 100 && (log.pruned <= pinned || log.snap.length < 4); i++) {
+            await sleep(50);
+            log = await readLog();
+        }
+        const before = log;
+        const preMaxSeq = Math.max(...before.cmd);
+
+        /* Every snapshot but the pinned base becomes unreadable. */
+        await withDb(
+            (db) =>
+                new Promise<void>((resolve, reject) => {
+                    const tx = db.transaction('snapshots', 'readwrite');
+                    for (const seq of before.snap) {
+                        if (seq === pinned) continue;
+                        tx.objectStore('snapshots').put({
+                            seq,
+                            bytes: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+                        });
+                    }
+                    tx.oncomplete = () => resolve();
+                    tx.onerror = () => reject(tx.error);
+                }),
+        );
+
+        await w.__engineClient.armTrap(1);
+        await dispatch({ type: 'PING' }).catch(() => undefined);
+        for (let i = 0; i < 600 && w.__recovered !== true; i++) await sleep(50);
+        if (w.__recovered !== true) return { failed: 'recovery did not complete' };
+        const info = w.__engineClient.lastRecovery;
+        const text = await documentText();
+        /* The immediate re-snapshot at the log head. */
+        let after = await readLog();
+        for (let i = 0; i < 100 && Math.max(...after.snap) < preMaxSeq; i++) {
+            await sleep(50);
+            after = await readLog();
+        }
+        return { pinned, pinnedText, before, preMaxSeq, info, text, after };
+    }, readFileSync(PIN_FIXTURE).toString('base64'));
+
+    expect((result as any).failed, 'in-page failure').toBeUndefined();
+    const r = result as any;
+    console.log(
+        `[event-log #268] pinned=${r.pinned} snaps=${r.before.snap.join(',')} ` +
+            `pruned<=${r.before.pruned} fallbacks=${r.info.snapshotFallbacks} ` +
+            `pinnedBase=${r.info.pinnedBase} tailDropped=${r.info.tailDropped} ` +
+            `after=${r.after.snap.join(',')}`,
+    );
+    /* Set-up: the pinned base survived pruning, which passed it. */
+    expect(r.before.snap).toContain(r.pinned);
+    expect(r.before.pruned).toBeGreaterThan(r.pinned);
+    expect(r.before.snap.length).toBeGreaterThanOrEqual(4);
+
+    expect(r.info.restored, 'the pinned base restored').toBe(true);
+    expect(r.info.pinnedBase).toBe(true);
+    expect(r.info.tailDropped).toBe(true);
+    expect(r.info.logTruncated).toBe(false);
+    expect(r.info.layoutRestored).toBe(true);
+    expect(r.info.snapshotFallbacks).toBe(r.before.snap.length - 1);
+    /* The document survives, as of the pinned snapshot. */
+    expect(r.pinnedText).toContain('PIN-268 ');
+    expect(r.text).toBe(r.pinnedText);
+    expect(r.text).not.toContain('LOST');
+    /* Re-based at the log head: the next recovery replays nothing stale. */
+    expect(Math.max(...r.after.snap)).toBeGreaterThanOrEqual(r.preMaxSeq);
+});

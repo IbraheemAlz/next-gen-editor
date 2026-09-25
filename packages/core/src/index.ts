@@ -60,6 +60,7 @@ export type {
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,
+    FormattingToggle,
     Alignment,
     Direction,
     PdfConformance,

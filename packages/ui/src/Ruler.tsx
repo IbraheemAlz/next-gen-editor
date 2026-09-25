@@ -41,6 +41,7 @@
  * horizontally (Word's ruler does the same).
  */
 import {
+    createEffect,
     createMemo,
     createSignal,
     onCleanup,
@@ -226,6 +227,11 @@ export const Ruler: Component<RulerProps> = (props) => {
             const ro = new ResizeObserver(() => measurePage());
             if (rulerEl) ro.observe(rulerEl);
             if (viewport) ro.observe(viewport);
+            /* Issue #280 — the page card itself resizes with the zoom. */
+            const page0 = document.querySelector<HTMLElement>(
+                '.editor-page[data-page-index="0"]',
+            );
+            if (page0) ro.observe(page0);
             onCleanup(() => ro.disconnect());
         }
 
@@ -233,6 +239,17 @@ export const Ruler: Component<RulerProps> = (props) => {
          * changes size (e.g. devtools dock toggling the inner width). */
         window.addEventListener('resize', onScroll);
         onCleanup(() => window.removeEventListener('resize', onScroll));
+    });
+
+    /* Issue #280 — a zoom resizes the page card (and so re-centres it in
+     * the desk) without resizing the ruler or the viewport; re-measure on
+     * the frame after the engine's zoom lands, once the card's new CSS
+     * size has been laid out. The page-card ResizeObserver above covers
+     * the later geometry `PAINTED`; this covers the reply itself. */
+    createEffect(() => {
+        void state.zoom();
+        const raf = requestAnimationFrame(measurePage);
+        onCleanup(() => cancelAnimationFrame(raf));
     });
 
     const geom = () => state.sectionGeometry();
@@ -296,8 +313,13 @@ export const Ruler: Component<RulerProps> = (props) => {
         return g?.width_pt ?? A4_FALLBACK.width_pt;
     };
 
+    /** Issue #280 — CSS px per pt at the ENGINE's zoom: the page card now
+     * grows with the zoom, so the ruler's scale must follow it or the
+     * marks drift off the paper at anything but 100 %. */
+    const pxPerPt = () => PX_PER_PT * state.zoom();
+
     /** pt → CSS px (for absolute positioning inside the ruler). */
-    const ptToPx = (pt: number) => pt * PX_PER_PT;
+    const ptToPx = (pt: number) => pt * pxPerPt();
 
     /** Map a pointer client-x to a LOGICAL pt offset from the 0-mark (the
      * content-area leading edge). The pointer's physical distance from the
@@ -305,7 +327,7 @@ export const Ruler: Component<RulerProps> = (props) => {
      * logical offset via the leading-edge physical anchor; RTL flips the
      * axis. */
     const clientXToContentPt = (clientX: number, rect: DOMRect): number => {
-        const physPt = (clientX - rect.left) / PX_PER_PT;
+        const physPt = (clientX - rect.left) / pxPerPt();
         const raw = isRtl()
             ? leadingEdgePhysPt() - physPt
             : physPt - leadingEdgePhysPt();
@@ -518,7 +540,7 @@ export const Ruler: Component<RulerProps> = (props) => {
     const onTabPointerUp = (e: PointerEvent, index: number, stop: BridgeTabStop) => {
         const d = drag();
         if (!d || d.kind !== 'tab-move') return;
-        const moved = Math.abs(d.livePt - stop.position_pt) * PX_PER_PT > 4;
+        const moved = Math.abs(d.livePt - stop.position_pt) * pxPerPt() > 4;
         /* `moved` is HORIZONTAL only. A drag straight DOWN to remove the stop
          * has no horizontal delta, so without the `d.discard` guard it would
          * be mistaken for a click (kind-cycle) and cancel the removal. When

@@ -332,6 +332,8 @@ fn run_default() -> Result<()> {
     table_markup::run_table_markup_roundtrip()?;
     revisions::run_tracked_moves_roundtrip()?;
     revisions::run_paragraph_mark_revisions_roundtrip()?;
+    run_hyperlink_identity_roundtrip()?;
+    run_comment_anchor_roundtrip()?;
     note_containers::run_note_containers_roundtrip()?;
 
     println!("\nPASS");
@@ -2841,6 +2843,287 @@ fn run_source_markup_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/* ============================================ hyperlink identity (#242) ==== */
+
+/// Issue #242 — the rels part of the hyperlink fixture: two rows share one
+/// URL (Word writes one row per inserted link, `58618.docx`).
+const HYPERLINK_RELS: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    r#"<Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://b.example/" TargetMode="External"/>"#,
+    r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://a.example/" TargetMode="External"/>"#,
+    r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://a.example/" TargetMode="External"/>"#,
+    r#"</Relationships>"#,
+);
+
+/// Issue #242 — three external links (two to one URL) and an internal
+/// anchor, carrying `w:history` / `w:tooltip` / `w:anchor` /
+/// `w:tgtFrame` / `w:docLocation`.
+const HYPERLINK_BODY: &str = concat!(
+    r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r>"#,
+    r#"<w:hyperlink r:id="rId4" w:tooltip="First &amp; best" w:history="1"><w:r><w:t>one</w:t></w:r></w:hyperlink>"#,
+    r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+    r#"<w:hyperlink r:id="rId5" w:history="1"><w:r><w:t>two</w:t></w:r></w:hyperlink>"#,
+    r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+    r#"<w:hyperlink r:id="rId6" w:anchor="part2" w:tgtFrame="_blank" w:history="1"><w:r><w:t>three</w:t></w:r></w:hyperlink>"#,
+    r#"<w:r><w:t xml:space="preserve"> and </w:t></w:r>"#,
+    r#"<w:hyperlink w:anchor="_Toc1" w:docLocation="x" w:history="1"><w:r><w:t>four</w:t></w:r></w:hyperlink>"#,
+    r#"</w:p>"#,
+);
+
+fn build_hyperlink_identity_docx() -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{HYPERLINK_BODY}{BARE_SECT_PR}</w:body></w:document>"#
+    );
+    package_document_xml_with_rels(&document_xml, HYPERLINK_RELS)
+}
+
+/// Issue #242 — step 33: typing before, between and after the links of a
+/// regenerated paragraph keeps every link's own `r:id` (two links to one
+/// URL no longer collapse onto one row), every source attribute and the
+/// rels part byte-identical: the saved `document.xml` is exactly source +
+/// the inserted bytes, on both save paths; the re-read resolves the same
+/// four targets.
+fn run_hyperlink_identity_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+
+    let at = |offset: usize| LogicalPos {
+        path: BlockPath::top(0),
+        offset: offset as u32,
+    };
+    let fixture_bytes = build_hyperlink_identity_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read hyperlink fixture")?;
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
+        bail!("untouched hyperlink document drifted");
+    }
+    println!("[roundtrip] step 33a OK — untouched save byte-identical");
+
+    /* Before the first link, right after a middle link, after the last
+    one. Typing at a link's end stays outside the link (the engine's
+    travel rule); it continues the link's source run, which the link
+    boundary then cuts into a run of its own. */
+    let edited = archive_a
+        .document
+        .insert_text(at("See one two three and four".len()), INSERT_TEXT)
+        .insert_text(at("See one two".len()), INSERT_TEXT)
+        .insert_text(at("Se".len()), INSERT_TEXT);
+    let expected_xml = doc_a
+        .replacen("See ", &format!("Se{INSERT_TEXT}e "), 1)
+        .replacen(
+            "two</w:t></w:r></w:hyperlink>",
+            &format!(
+                r#"two</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve">{INSERT_TEXT}</w:t></w:r>"#
+            ),
+            1,
+        )
+        .replacen(
+            "four</w:t></w:r></w:hyperlink>",
+            &format!(
+                r#"four</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve">{INSERT_TEXT}</w:t></w:r>"#
+            ),
+            1,
+        );
+    for (path, bytes) in [
+        (
+            "write_docx",
+            write_docx(&archive_a, &edited).context("write edited")?,
+        ),
+        (
+            "save_docx",
+            format_docx::save_docx(&edited).context("ui save edited")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&bytes).context("edited hyperlink .docx")?;
+        let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+        if xml != expected_xml {
+            bail!(
+                "{path}: edited hyperlink paragraph is not source + edit\n--- expected ---\n{expected_xml}\n--- got ---\n{xml}"
+            );
+        }
+        let rels = zip_entries(&bytes)?
+            .into_iter()
+            .find(|(n, _)| n == "word/_rels/document.xml.rels")
+            .context("rels part")?
+            .1;
+        if rels != HYPERLINK_RELS.as_bytes() {
+            bail!("{path}: rels part rewritten");
+        }
+        let back = read_docx(&bytes).context("re-read edited")?;
+        let targets: Vec<String> = back
+            .document
+            .nth_paragraph(0)
+            .context("p0")?
+            .hyperlinks
+            .iter()
+            .map(|h| h.target.clone())
+            .collect();
+        if targets
+            != [
+                "http://a.example/",
+                "http://a.example/",
+                "http://b.example/",
+                "#_Toc1",
+            ]
+        {
+            bail!("{path}: re-read targets {targets:?}");
+        }
+    }
+    println!(
+        "[roundtrip] step 33b OK — edited link paragraph keeps each r:id + attribute; rels untouched on both save paths"
+    );
+    Ok(())
+}
+
+/* ============================================== comment anchors (#243) ==== */
+
+/// Issue #243 — a commented range with a Word-shaped reference run
+/// (own rsid + rPr) behind it, and a paragraph holding only the reference
+/// of a second comment (`comment.docx` shape).
+const COMMENT_ANCHOR_BODY: &str = concat!(
+    r#"<w:p w:rsidR="00B561CA"><w:r><w:t xml:space="preserve">this is a </w:t></w:r>"#,
+    r#"<w:commentRangeStart w:id="0"/><w:r><w:t xml:space="preserve">comment </w:t></w:r>"#,
+    r#"<w:commentRangeEnd w:id="0"/><w:r w:rsidR="002903BF"><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="0"/></w:r>"#,
+    r#"<w:r><w:t>paragraph!</w:t></w:r></w:p>"#,
+    r#"<w:p><w:r><w:rPr></w:rPr><w:commentReference w:id="1"/></w:r></w:p>"#,
+);
+
+const COMMENT_ANCHOR_COMMENTS: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    r#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+    r#"<w:comment w:id="0" w:author="A" w:date="2026-01-01T00:00:00Z"><w:p><w:r><w:t>first</w:t></w:r></w:p></w:comment>"#,
+    r#"<w:comment w:id="1" w:author="B" w:date="2026-01-01T00:00:00Z"><w:p><w:r><w:t>second</w:t></w:r></w:p></w:comment>"#,
+    r#"</w:comments>"#,
+);
+
+fn build_comment_anchor_docx() -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{COMMENT_ANCHOR_BODY}{BARE_SECT_PR}</w:body></w:document>"#
+    );
+    let rels = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/>"#,
+        r#"</Relationships>"#,
+    );
+    package_document_xml_with_parts(
+        &document_xml,
+        rels,
+        &[("word/comments.xml", COMMENT_ANCHOR_COMMENTS)],
+    )
+}
+
+/// Issue #243 — step 34: comment anchors of a regenerated paragraph.
+///
+/// a. An untouched save is byte-identical.
+/// b. Typing before, inside and after the commented range keeps
+///    `<w:commentRangeStart/>`, `<w:commentRangeEnd/>` and the reference
+///    run at the right offsets — the saved part is exactly source + the
+///    inserted bytes on both save paths, and the re-read range covers the
+///    same (grown) text.
+/// c. The reference-only paragraph keeps its reference when it
+///    regenerates (it used to save as `<w:p/>`); deleting the comment
+///    drops its anchors instead of resurrecting them.
+fn run_comment_anchor_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+
+    let at = |block: u32, offset: usize| LogicalPos {
+        path: BlockPath::top(block),
+        offset: offset as u32,
+    };
+    let fixture_bytes = build_comment_anchor_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read comment fixture")?;
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
+        bail!("untouched comment document drifted");
+    }
+    println!("[roundtrip] step 34a OK — untouched save byte-identical");
+
+    for (offset, from, to, covered) in [
+        (
+            "th".len(),
+            "this is",
+            format!("th{INSERT_TEXT}is is"),
+            "comment ".to_string(),
+        ),
+        (
+            "this is a co".len(),
+            "comment ",
+            format!("co{INSERT_TEXT}mment "),
+            format!("co{INSERT_TEXT}mment "),
+        ),
+        (
+            "this is a comment paragraph!".len(),
+            "paragraph!",
+            format!("paragraph!{INSERT_TEXT}"),
+            "comment ".to_string(),
+        ),
+    ] {
+        let edited = archive_a.document.insert_text(at(0, offset), INSERT_TEXT);
+        let expected_xml = doc_a.replacen(from, &to, 1);
+        for (path, bytes) in [
+            (
+                "write_docx",
+                write_docx(&archive_a, &edited).context("write edited")?,
+            ),
+            (
+                "save_docx",
+                format_docx::save_docx(&edited).context("ui save edited")?,
+            ),
+        ] {
+            assert_document_xml_well_formed(&bytes).context("edited comment .docx")?;
+            let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+            if xml != expected_xml {
+                bail!(
+                    "{path}: insert at {offset} is not source + edit\n--- expected ---\n{expected_xml}\n--- got ---\n{xml}"
+                );
+            }
+            let back = read_docx(&bytes).context("re-read edited")?;
+            let r = back
+                .document
+                .comment_ranges
+                .first()
+                .context("comment range lost")?;
+            let p = back.document.nth_paragraph(0).context("p0")?;
+            let got = p
+                .text
+                .get(r.start.offset as usize..r.end.offset as usize)
+                .unwrap_or_default();
+            if got != covered {
+                bail!("{path}: insert at {offset}: range covers {got:?}, expected {covered:?}");
+            }
+        }
+    }
+    println!(
+        "[roundtrip] step 34b OK — edits before / inside / after a commented range keep its anchors (source + insert, both save paths)"
+    );
+
+    let edited = archive_a.document.insert_text(at(1, 0), INSERT_TEXT);
+    let bytes = write_docx(&archive_a, &edited).context("write reference-only")?;
+    let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+    if !xml.contains(r#"<w:r><w:rPr></w:rPr><w:commentReference w:id="1"/></w:r></w:p>"#) {
+        bail!("reference-only paragraph lost its reference: {xml}");
+    }
+    let deleted = archive_a
+        .document
+        .delete_comment(0)
+        .insert_text(at(0, 0), INSERT_TEXT);
+    let bytes = write_docx(&archive_a, &deleted).context("write deleted")?;
+    assert_document_xml_well_formed(&bytes).context("deleted comment .docx")?;
+    let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+    if xml.contains(r#"w:id="0""#) {
+        bail!("deleted comment's anchors resurrected: {xml}");
+    }
+    println!(
+        "[roundtrip] step 34c OK — reference-only paragraph keeps its reference; a deleted comment's anchors are dropped"
+    );
+    Ok(())
+}
+
 /* ================================================ table placement (#173) ==== */
 
 /// Issue #173 — step 18: the `<w:jc>` / `<w:tblInd>` round-trip contract
@@ -4883,6 +5166,25 @@ fn build_table_fixture(body_intro_text: &str, inner_tbl_xml: &str) -> Vec<u8> {
 /// Wrap one complete `word/document.xml` part (declaration included) in
 /// the minimal OPC skeleton the Phase 5+ handcrafted fixtures share.
 fn package_document_xml(document_xml: &str) -> Vec<u8> {
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>"#;
+    package_document_xml_with_rels(document_xml, doc_rels)
+}
+
+/// [`package_document_xml`] with a caller-supplied
+/// `word/_rels/document.xml.rels` (hyperlink rows, issue #242).
+fn package_document_xml_with_rels(document_xml: &str, doc_rels: &str) -> Vec<u8> {
+    package_document_xml_with_parts(document_xml, doc_rels, &[])
+}
+
+/// [`package_document_xml_with_rels`] plus `extra` `(entry, body)` parts
+/// (`word/comments.xml`, issue #243).
+fn package_document_xml_with_parts(
+    document_xml: &str,
+    doc_rels: &str,
+    extra: &[(&str, &str)],
+) -> Vec<u8> {
     use std::io::Write;
     use zip::write::{SimpleFileOptions, ZipWriter};
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4895,9 +5197,6 @@ fn package_document_xml(document_xml: &str) -> Vec<u8> {
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>"#;
-    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-</Relationships>"#;
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
@@ -4909,7 +5208,10 @@ fn package_document_xml(document_xml: &str) -> Vec<u8> {
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
             ("word/document.xml", document_xml),
-        ] {
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
         }

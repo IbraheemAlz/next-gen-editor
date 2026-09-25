@@ -172,7 +172,7 @@ const WANT_REFS: [(u32, NoteContainer); 4] = [
     (3, NoteContainer::TextBox),
 ];
 
-/// Issue #278 — step 33: note references in a header, a table cell and a
+/// Issue #278 — step 35: note references in a header, a table cell and a
 /// text box.
 ///
 /// a. All four references read, in document order (the header's first —
@@ -208,7 +208,7 @@ pub(crate) fn run_note_containers_roundtrip() -> Result<()> {
         }
     }
     println!(
-        "[roundtrip] step 33a OK — header / cell / text-box footnote references read, number 1-4 and export"
+        "[roundtrip] step 35a OK — header / cell / text-box footnote references read, number 1-4 and export"
     );
 
     let zero = write_docx(&a, doc).context("zero-edit save")?;
@@ -221,7 +221,7 @@ pub(crate) fn run_note_containers_roundtrip() -> Result<()> {
             bail!("`{part}` drifted on a zero-edit save");
         }
     }
-    println!("[roundtrip] step 33b OK — zero-edit save is byte-identical");
+    println!("[roundtrip] step 35b OK — zero-edit save is byte-identical");
 
     let story = &doc.footnote_stories[&1];
     let story_doc = DocumentTree::from_blocks(story.body.iter().cloned());
@@ -257,7 +257,7 @@ pub(crate) fn run_note_containers_roundtrip() -> Result<()> {
         );
     }
     println!(
-        "[roundtrip] step 33c OK — a regenerated footnotes.xml keeps the header / cell / box notes"
+        "[roundtrip] step 35c OK — a regenerated footnotes.xml keeps the header / cell / box notes"
     );
     Ok(())
 }

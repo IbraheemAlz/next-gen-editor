@@ -12,7 +12,8 @@ import type { Point } from '../engine/types';
 import {
     PAGE_GAP_PT,
     PAGE_H_PT,
-    SCREEN_DPI_SCALE,
+    deviceRatio,
+    paintScale,
     editingStoryForPointer,
     enginePageTopDevice,
     headerFooterZoneAt,
@@ -61,7 +62,7 @@ export function attachPointer(
        gap mirrors the engine's `PAGE_GAP_PT`. */
     const toLocal = (e: PointerEvent | MouseEvent): Point => {
         const r = canvas.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
+        const dpr = deviceRatio();
         return {
             x: (e.clientX - r.left) * dpr,
             y: (e.clientY - r.top) * dpr,
@@ -76,12 +77,11 @@ export function attachPointer(
        heights are tracked separately. */
     const toGlobal = (e: PointerEvent | MouseEvent): Point => {
         const local = toLocal(e);
-        const dpr = window.devicePixelRatio || 1;
         /* Engine-reported page top (device px, exact under mixed
            orientations — issue #26); uniform-A4 fallback pre-paint. */
         const pageOffsetY =
             enginePageTopDevice(pageIdx) ??
-            pageIdx * (PAGE_H_PT + PAGE_GAP_PT) * dpr * SCREEN_DPI_SCALE;
+            pageIdx * (PAGE_H_PT + PAGE_GAP_PT) * paintScale();
         return { x: local.x, y: local.y + pageOffsetY };
     };
 
@@ -133,7 +133,7 @@ export function attachPointer(
             if (e.button === 2) {
                 const sel = selectionViewForPointer();
                 if (sel.kind.kind !== 'TABLE_CELLS') {
-                    const dpr = window.devicePixelRatio || 1;
+                    const dpr = deviceRatio();
                     const g = toGlobal(e);
                     const cx = g.x / dpr;
                     const cy = g.y / dpr;
@@ -218,7 +218,7 @@ export function attachPointer(
            through to the story's own routing. */
         const imageStory = editingStoryForPointer();
         if (!imageStory || imageStory.area === 'TextBox') {
-            const dpr = window.devicePixelRatio || 1;
+            const dpr = deviceRatio();
             const gCss = toGlobal(e);
             if (selectImageByPoint(gCss.x / dpr, gCss.y / dpr, imageStory !== undefined)) {
                 gesture += 1;
