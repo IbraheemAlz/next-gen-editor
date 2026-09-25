@@ -30,6 +30,7 @@
 //! Exit 0 on PASS, non-zero on FAIL.
 
 mod inline_spans;
+mod revisions;
 mod table_markup;
 
 use anyhow::{Context, Result, bail};
@@ -328,6 +329,8 @@ fn run_default() -> Result<()> {
     inline_spans::run_content_controls_roundtrip()?;
     inline_spans::run_field_source_form_roundtrip()?;
     table_markup::run_table_markup_roundtrip()?;
+    revisions::run_tracked_moves_roundtrip()?;
+    revisions::run_paragraph_mark_revisions_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4052,6 +4055,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         }]),
     };
     vec![

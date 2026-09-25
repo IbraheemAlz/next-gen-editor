@@ -379,6 +379,12 @@ export interface EditorCommands {
     snapshot(): Promise<Event>;
     acceptRevision(block: number, start: number, end: number): Promise<Event>;
     rejectRevision(block: number, start: number, end: number): Promise<Event>;
+    /** Issue #262 — accept every tracked change of the document in ONE
+     *  engine command (one undo step; paragraph-mark revisions merge
+     *  paragraphs). */
+    acceptAllRevisions(): Promise<Event>;
+    /** Issue #262 — reject every tracked change in one engine command. */
+    rejectAllRevisions(): Promise<Event>;
     insertComment(
         text: string,
         author: string,
@@ -793,6 +799,8 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             dispatch({ type: 'ACCEPT_REVISION', block, start, end }),
         rejectRevision: (block, start, end) =>
             dispatch({ type: 'REJECT_REVISION', block, start, end }),
+        acceptAllRevisions: () => dispatch({ type: 'ACCEPT_ALL_REVISIONS' }),
+        rejectAllRevisions: () => dispatch({ type: 'REJECT_ALL_REVISIONS' }),
         insertComment: (text, author, range) =>
             dispatch({
                 type: 'INSERT_COMMENT',

@@ -824,6 +824,18 @@ pub enum Command {
         start: u32,
         end: u32,
     },
+    /// Issue #262 — accept EVERY tracked change of the body (table cells
+    /// included) in document order, as one undo step: deletions and move
+    /// sources lose their text, insertions and move destinations keep
+    /// it, and a deleted (or moved-away) paragraph mark merges its
+    /// paragraph with the next. A document without revisions is a no-op
+    /// (no undo step).
+    AcceptAllRevisions,
+    /// Issue #262 — reject every tracked change of the body, as one undo
+    /// step: insertions and move destinations lose their text, a tracked
+    /// formatting change restores its recorded style, and an inserted
+    /// (or moved-in) paragraph mark merges its paragraph with the next.
+    RejectAllRevisions,
     /// Sprint 7 (UI Edition) — insert a new `<w:comment>` anchored
     /// to `range`. Engine assigns a fresh sequential `w:id`.
     InsertComment {
