@@ -182,18 +182,21 @@ jobs:
           retention-days: 7
 
   qa-harness:
-    name: QA harnesses (visual-diff + memory)
+    name: QA harnesses (visual-diff + pdf-validate)
     runs-on: ubuntu-24.04
     # Non-blocking (Phase 5 D5.1/D5.2): golden pixel-reproducibility on the
     # GitHub runner's Chrome is not yet proven, so a mismatch must surface
     # without breaking main. Promote to a required check once verified.
     continue-on-error: true
     # Bound the runtime — visual-diff alone runs in ~1 min on a clean
-    # runner. The 5-min cap catches dev-server boot stalls without
-    # letting the whole job burn an hour of runner time.
-    # continue-on-error keeps the overall workflow green when the cap
-    # fires.
-    timeout-minutes: 5
+    # runner, pdf-validate (issue #258) under 15 s more (measured ~9 s
+    # locally: 6 tier-a documents, browser export + structural checks;
+    # veraPDF itself is not installed on the runner, so external
+    # conformance is skipped there — the structural check is CI's gate).
+    # The 7-min cap catches dev-server boot stalls without letting the
+    # whole job burn an hour of runner time. continue-on-error keeps the
+    # overall workflow green when the cap fires.
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v6
 
@@ -262,3 +265,27 @@ jobs:
           kill "$DEV_PID" 2>/dev/null || true
           echo "visual-diff exit=$VD"
           [ "$VD" -eq 0 ]
+
+      - name: Run pdf-validate harness
+        # Issue #258 — the tier-a corpus (6 documents: TOC leaders, inline
+        # images, a bordered/shaded table, justified Arabic Kashida,
+        # footnotes + endnotes, a text box) exported through the real
+        # engine and checked for the PDF/A-1b structural markers
+        # `crates/format-pdf` must emit. veraPDF is not installed on this
+        # runner, so external conformance validation is skipped here (a
+        # WARNING, not a failure) — that full check runs locally
+        # (`node tools/pdf-validate/run.mjs`, veraPDF via Homebrew) and is
+        # this job's reason for staying non-blocking regardless.
+        run: |
+          set -uo pipefail
+          pnpm --dir ts dev &
+          DEV_PID=$!
+          for _ in $(seq 1 60); do
+            curl -sf http://localhost:5173 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          timeout 60 node tools/pdf-validate/run.mjs --corpus tier-a --profile 1b
+          PV=$?
+          kill "$DEV_PID" 2>/dev/null || true
+          echo "pdf-validate exit=$PV"
+          [ "$PV" -eq 0 ]

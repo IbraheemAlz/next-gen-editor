@@ -6,7 +6,9 @@
   "description": "PDF/A-1b validation harness (Phase 5 D5.4) — exports the engine's PDF output and checks it with veraPDF.",
   "scripts": {
     "run": "node run.mjs",
-    "strict": "node run.mjs --strict"
+    "strict": "node run.mjs --strict",
+    "regen": "node run.mjs --regen",
+    "check-fixtures": "node run.mjs --check-fixtures"
   },
   "devDependencies": {
     "playwright": "^1.60.0"

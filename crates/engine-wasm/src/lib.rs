@@ -26984,6 +26984,13 @@ mod toggle_formatting_tests;
 #[cfg(test)]
 mod toc_pdf_export_tests;
 
+/// Issue #258 — the rest of the `tools/pdf-validate` tier-a corpus:
+/// images, a bordered/shaded table, justified Arabic (Kashida), and
+/// footnotes + endnotes, each a `#[ignore]`d regenerator in the same idiom
+/// as `toc_pdf_export_tests`'s own fixture generator.
+#[cfg(test)]
+mod pdf_validate_fixtures_tests;
+
 #[cfg(test)]
 mod a11y_note_tests;
 
