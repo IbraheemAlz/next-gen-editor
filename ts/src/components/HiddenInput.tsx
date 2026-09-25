@@ -10,7 +10,6 @@ import { emptyPatch } from '@nge/core';
 import type { EngineClient } from '../engine/engine-client';
 import type {
     Command,
-    LogicalPos,
     MoveDirection,
     TextAttrs,
     TextAttrsPatch,
@@ -24,7 +23,7 @@ import {
 import { ClipboardWriteError, copy, cut, paste } from '../input/clipboard';
 
 /** Map a non-composition `InputEvent` to an engine command. */
-function mapInputEventToCommand(e: InputEvent, caret: LogicalPos): Command | null {
+function mapInputEventToCommand(e: InputEvent): Command | null {
     switch (e.inputType) {
         case 'insertText':
             /* Issue #53 — `at: undefined` = "at the engine's live
@@ -39,7 +38,9 @@ function mapInputEventToCommand(e: InputEvent, caret: LogicalPos): Command | nul
            model has only paragraphs, so a hard Enter splits the block. */
         case 'insertParagraph':
         case 'insertLineBreak':
-            return { type: 'SPLIT_PARAGRAPH', at: caret };
+            /* Issue #64 — split at the engine's live caret, same
+               reasoning as INSERT_TEXT above. */
+            return { type: 'SPLIT_PARAGRAPH', at: undefined };
         case 'deleteContentBackward':
             return { type: 'DELETE_AT_CARET', forward: false, by_word: false };
         case 'deleteContentForward':
@@ -105,8 +106,12 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     });
 
     const onCompositionStart = (): void => {
-        const caret = props.store.caretLogical();
-        if (caret) void props.client.dispatch({ type: 'BEGIN_COMPOSITION', at: caret });
+        /* Issue #64 — anchor at the engine's live caret (`at:
+           undefined`); the UI mirror may still hold the pre-click
+           position. The mirror is only a readiness gate here. */
+        if (props.store.caretLogical()) {
+            void props.client.dispatch({ type: 'BEGIN_COMPOSITION', at: undefined });
+        }
     };
     const onCompositionUpdate = (e: CompositionEvent): void => {
         void props.client.dispatch({
@@ -123,9 +128,11 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     const onBeforeInput = (e: InputEvent): void => {
         if (e.isComposing) return; /* the composition handlers own this */
         e.preventDefault();
-        const caret = props.store.caretLogical();
-        if (caret) {
-            const cmd = mapInputEventToCommand(e, caret);
+        /* The mirror caret is only a readiness gate (no selection yet
+           ⇒ nothing to edit); every mapped command is caret-relative and
+           resolves against the engine's LIVE selection (#53/#64). */
+        if (props.store.caretLogical()) {
+            const cmd = mapInputEventToCommand(e);
             if (cmd) void props.client.dispatch(cmd);
         }
         if (ref) ref.value = '';

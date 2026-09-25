@@ -138,7 +138,11 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
             range: range(u),
             text: text(u),
         },
-        4 => Command::SplitParagraph { at: pos(u) },
+        // Issue #64 — `at` is optional now; the curated arm keeps its
+        // explicit position (and its exact byte consumption, so committed
+        // corpus seeds still decode to the same scenarios). `None` — split
+        // at the live caret — is reached via the blind `arbitrary()` half.
+        4 => Command::SplitParagraph { at: Some(pos(u)) },
         // ---- format ------------------------------------------------------------
         5 => Command::ApplyFormatting {
             range: if u.ratio(1, 2).unwrap_or(true) {
@@ -625,6 +629,7 @@ pub fn classify_variant(cmd: &Command) -> VariantInfo {
         Command::HitTest { .. } => v("HitTest", false),
         Command::HitTestInPage { .. } => v("HitTestInPage", false),
         Command::PlaceCaretAtPoint { .. } => v("PlaceCaretAtPoint", false),
+        Command::ExtendSelectionToPoint { .. } => v("ExtendSelectionToPoint", false),
         Command::GetImageRects => v("GetImageRects", false),
         Command::SelectWordAt { .. } => v("SelectWordAt", false),
         Command::SelectParagraphAt { .. } => v("SelectParagraphAt", false),
@@ -901,6 +906,7 @@ mod tests {
         "HitTest",
         "HitTestInPage",
         "PlaceCaretAtPoint",
+        "ExtendSelectionToPoint",
         "GetImageRects",
         "SelectWordAt",
         "SelectParagraphAt",

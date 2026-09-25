@@ -181,7 +181,9 @@ fn mutating_cases() -> Vec<Case> {
             "text: split",
             text_doc,
             vec![],
-            Command::SplitParagraph { at: bpos_top(0, 5) },
+            Command::SplitParagraph {
+                at: Some(bpos_top(0, 5)),
+            },
         ),
         case(
             "text: paste plain",
@@ -201,7 +203,9 @@ fn mutating_cases() -> Vec<Case> {
             "ime: commit",
             text_doc,
             vec![
-                Command::BeginComposition { at: bpos_top(0, 0) },
+                Command::BeginComposition {
+                    at: Some(bpos_top(0, 0)),
+                },
                 Command::UpdateComposition {
                     text: "ع".into(),
                     target_range: None,
@@ -581,7 +585,9 @@ fn query_cases() -> Vec<Case> {
         case(
             "ime: preview only",
             text_doc,
-            vec![Command::BeginComposition { at: bpos_top(0, 0) }],
+            vec![Command::BeginComposition {
+                at: Some(bpos_top(0, 0)),
+            }],
             Command::UpdateComposition {
                 text: "ع".into(),
                 target_range: None,

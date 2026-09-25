@@ -115,7 +115,9 @@ export interface EditorCommands {
     deleteRange(range: LogicalRange): Promise<Event>;
     replaceRange(range: LogicalRange, text: string): Promise<Event>;
     deleteAtCaret(forward: boolean, byWord?: boolean): Promise<Event>;
-    splitParagraph(at: LogicalPos): Promise<Event>;
+    /** Split the paragraph. Issue #64 — omit `at` to split at the
+     *  engine's LIVE caret (the race-free interactive path). */
+    splitParagraph(at?: LogicalPos): Promise<Event>;
     /**
      * Insert a soft line break (Shift+Enter) at `at` (defaults to the
      * current caret). A soft break wraps to the next line WITHOUT

@@ -163,8 +163,14 @@ pub enum Command {
         range: Option<LogicalRange>,
         attrs: TextAttrsPatch,
     },
+    /// Break the paragraph at the caret (replacing any non-empty
+    /// selection). Issue #64 — `at == None` splits at the engine's LIVE
+    /// caret (interactive Enter passes `None`, so a keystroke racing a
+    /// click can never carry the UI mirror's stale position). An explicit
+    /// `at` is consulted only when no selection exists (API / harness
+    /// callers); `None` with no selection at all replies `Event::Error`.
     SplitParagraph {
-        at: LogicalPos,
+        at: Option<LogicalPos>,
     },
     MergeParagraph {
         left: ParagraphId,
@@ -246,8 +252,11 @@ pub enum Command {
     },
 
     /* IME */
+    /// Start an IME composition. Issue #64 — `at == None` anchors the
+    /// composition at the engine's LIVE caret (what `HiddenInput` sends);
+    /// an explicit `at` is honoured verbatim for API callers.
     BeginComposition {
-        at: LogicalPos,
+        at: Option<LogicalPos>,
     },
     UpdateComposition {
         text: String,
@@ -325,6 +334,19 @@ pub enum Command {
     /// fast keystroke's `InsertText` entered the worker queue ahead of
     /// the `SetSelection` and executed against the stale caret.
     PlaceCaretAtPoint {
+        page: u32,
+        at: Point,
+    },
+
+    /// Issue #64 — single-hop selection EXTENSION: hit-test the
+    /// page-local pixel (same coordinate contract as
+    /// [`Command::PlaceCaretAtPoint`]) and move the caret there keeping
+    /// the anchor, in ONE serialized dispatch; replies
+    /// `Event::SelectionChanged`. Replaces the shell's two-hop
+    /// `HitTestInPage` → `ExtendSelection` for drag and shift-click, so a
+    /// keystroke posted right after a shift-click executes against the
+    /// extended selection.
+    ExtendSelectionToPoint {
         page: u32,
         at: Point,
     },
