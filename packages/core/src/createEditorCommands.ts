@@ -33,6 +33,7 @@ import type {
     ImageBlob,
     ImageFit,
     ImageWrapMode,
+    TextBoxHop,
     MoveDirection,
     LogicalPos,
     LogicalRange,
@@ -164,6 +165,7 @@ export interface EditorCommands {
         at: number,
         widthEmu: number,
         heightEmu: number,
+        story?: TextBoxHop[],
     ): Promise<Event>;
     /** Issue #69 — reposition the FLOATING (`<wp:anchor>`) image at
      *  `(path, at)`: both axes become fixed EMU offsets inside their
@@ -176,6 +178,7 @@ export interface EditorCommands {
         at: number,
         offsetHEmu: number,
         offsetVEmu: number,
+        story?: TextBoxHop[],
     ): Promise<Event>;
     /** Issue #82 — set the text-wrap mode of the FLOATING image at
      *  `(path, at)` (Word's "Wrap Text" menu: square, tight, through,
@@ -183,10 +186,17 @@ export interface EditorCommands {
      *  cut around the image on the next layout. The engine answers
      *  `ERROR` for an inline image — only rects with `ImageRect.floating`
      *  have a wrap mode (`ImageRect.wrap`). */
-    setImageWrap(path: BlockPath, at: number, wrap: ImageWrapMode): Promise<Event>;
+    setImageWrap(
+        path: BlockPath,
+        at: number,
+        wrap: ImageWrapMode,
+        story?: TextBoxHop[],
+    ): Promise<Event>;
     /** Issue #44 — query every inline image's on-canvas rect + resize
      *  address. Resolve the `Event` and read `images` when it is an
-     *  `IMAGE_RECTS` reply. */
+     *  `IMAGE_RECTS` reply. Issue #206 — pictures inside text-box stories
+     *  are listed too: pass a rect's `story` back as the optional `story`
+     *  argument of `resizeImage` / `moveImage` / `setImageWrap`. */
     getImageRects(): Promise<Event>;
 
     /* Tables — every method maps 1:1 onto a `Command` variant in
@@ -536,23 +546,26 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             dispatch({ type: 'INSERT_IMAGE', at: currentCaret(), image, fit }, [
                 image.bytes.buffer as ArrayBuffer,
             ]),
-        resizeImage: (path, at, widthEmu, heightEmu) =>
+        resizeImage: (path, at, widthEmu, heightEmu, story) =>
             dispatch({
                 type: 'RESIZE_IMAGE',
                 path,
                 at,
                 width_emu: widthEmu,
                 height_emu: heightEmu,
+                story: story ?? [],
             }),
-        moveImage: (path, at, offsetHEmu, offsetVEmu) =>
+        moveImage: (path, at, offsetHEmu, offsetVEmu, story) =>
             dispatch({
                 type: 'MOVE_IMAGE',
                 path,
                 at,
                 offset_h_emu: offsetHEmu,
                 offset_v_emu: offsetVEmu,
+                story: story ?? [],
             }),
-        setImageWrap: (path, at, wrap) => dispatch({ type: 'SET_IMAGE_WRAP', path, at, wrap }),
+        setImageWrap: (path, at, wrap, story) =>
+            dispatch({ type: 'SET_IMAGE_WRAP', path, at, wrap, story: story ?? [] }),
         getImageRects: () => dispatch({ type: 'GET_IMAGE_RECTS' }),
 
         insertTable: (at, rows, cols) =>

@@ -5,7 +5,7 @@ use tsify_next::Tsify;
 
 use crate::common::{
     Alignment, BlockPath, Color, Direction, DocFormat, ImageWrapMode, LogicalPos, LogicalRange,
-    Point, Rect, UnderlineStyle, VerticalScript,
+    Point, Rect, TextBoxHop, UnderlineStyle, VerticalScript,
 };
 
 /// A command issued to the engine. Serialized internally-tagged
@@ -186,6 +186,10 @@ pub enum Command {
         at: u32,
         width_emu: i64,
         height_emu: i64,
+        /// Issue #206 — the text-box story `path` is rooted in (the
+        /// `ImageRect.story` of the picture); empty / absent ⇒ the body.
+        #[serde(default)]
+        story: Vec<TextBoxHop>,
     },
     /// Issue #69 — reposition the FLOATING (`<wp:anchor>`) image anchored
     /// at `(path, at)`: both positioning axes become fixed EMU offsets
@@ -201,6 +205,10 @@ pub enum Command {
         at: u32,
         offset_h_emu: i64,
         offset_v_emu: i64,
+        /// Issue #206 — the text-box story `path` is rooted in (the
+        /// `ImageRect.story` of the picture); empty / absent ⇒ the body.
+        #[serde(default)]
+        story: Vec<TextBoxHop>,
     },
     /// Issue #82 — set the text-wrap mode of the FLOATING image anchored
     /// at `(path, at)` (Word's "Wrap Text" menu): the body text is cut
@@ -212,6 +220,10 @@ pub enum Command {
         path: BlockPath,
         at: u32,
         wrap: ImageWrapMode,
+        /// Issue #206 — the text-box story `path` is rooted in (the
+        /// `ImageRect.story` of the picture); empty / absent ⇒ the body.
+        #[serde(default)]
+        story: Vec<TextBoxHop>,
     },
 
     /* Selection */
