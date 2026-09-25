@@ -37,6 +37,7 @@
 //! tool failing. Exit is non-zero only for a setup problem (missing/empty
 //! corpus dir, or `--worker` invoked on an unreadable file).
 
+mod drift;
 mod fonts;
 mod nativelayout;
 mod panics;
@@ -56,6 +57,10 @@ struct Args {
     with_edit: bool,
     timeout_secs: u64,
     worker: Option<PathBuf>,
+    /// Issue #112 — `--dump-drift DIR`: write `<name>.orig.xml` /
+    /// `<name>.resaved.xml` for every document whose zero-edit resave is
+    /// not byte-identical, so the drift can be diffed.
+    dump_drift: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -65,6 +70,7 @@ fn parse_args() -> Args {
     let mut with_edit = true;
     let mut timeout_secs: u64 = 60;
     let mut worker = None;
+    let mut dump_drift = None;
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -103,6 +109,12 @@ fn parse_args() -> Args {
                     worker = Some(PathBuf::from(v));
                 }
             }
+            "--dump-drift" => {
+                i += 1;
+                if let Some(v) = raw.get(i) {
+                    dump_drift = Some(PathBuf::from(v));
+                }
+            }
             other => {
                 eprintln!("[corpus-native] warning: unrecognized arg `{other}`");
             }
@@ -117,6 +129,7 @@ fn parse_args() -> Args {
         with_edit,
         timeout_secs,
         worker,
+        dump_drift,
     }
 }
 
@@ -124,7 +137,7 @@ fn parse_args() -> Args {
 /// print its JSON record to stdout. This process is expected to sometimes
 /// die abnormally (that IS the thing being tested) — the parent driver
 /// interprets a non-JSON stdout / non-zero exit as [`pipeline::Outcome::Crash`].
-fn run_worker(path: &Path, with_edit: bool) -> ExitCode {
+fn run_worker(path: &Path, with_edit: bool, dump_drift: Option<&Path>) -> ExitCode {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -137,7 +150,7 @@ fn run_worker(path: &Path, with_edit: bool) -> ExitCode {
     };
     let fonts = fonts::bundled_stack();
     let label = path.to_string_lossy();
-    let rec = pipeline::run_one(&label, &bytes, &fonts, with_edit);
+    let rec = pipeline::run_one(&label, &bytes, &fonts, with_edit, dump_drift);
     match serde_json::to_string(&rec) {
         Ok(json) => {
             println!("{json}");
@@ -162,11 +175,15 @@ fn run_in_subprocess(
     size_bytes: u64,
     with_edit: bool,
     timeout: Duration,
+    dump_drift: Option<&Path>,
 ) -> pipeline::DocResult {
     let mut cmd = Command::new(exe);
     cmd.arg("--worker").arg(doc_path);
     if !with_edit {
         cmd.arg("--no-edit");
+    }
+    if let Some(dir) = dump_drift {
+        cmd.arg("--dump-drift").arg(dir);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -285,7 +302,7 @@ fn main() -> ExitCode {
     let args = parse_args();
 
     if let Some(worker_path) = &args.worker {
-        return run_worker(worker_path, args.with_edit);
+        return run_worker(worker_path, args.with_edit, args.dump_drift.as_deref());
     }
 
     if !args.corpus_dir.is_dir() {
@@ -352,6 +369,12 @@ fn main() -> ExitCode {
     let mut panicked = 0usize;
     let mut timed_out = 0usize;
     let mut crashed = 0usize;
+    /* Issue #112 — zero-edit `document.xml` drift, bucketed by the
+    construct the first differing byte falls in (see `drift.rs`). */
+    let mut noedit_checked = 0usize;
+    let mut noedit_identical = 0usize;
+    let mut drift_histogram: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
 
     for (i, path) in files.iter().enumerate() {
         let label = path
@@ -361,13 +384,33 @@ fn main() -> ExitCode {
             .replace('\\', "/");
         let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-        let rec = run_in_subprocess(&exe, path, &label, size_bytes, args.with_edit, timeout);
+        let rec = run_in_subprocess(
+            &exe,
+            path,
+            &label,
+            size_bytes,
+            args.with_edit,
+            timeout,
+            args.dump_drift.as_deref(),
+        );
         match rec.outcome {
             pipeline::Outcome::Ok => ok += 1,
             pipeline::Outcome::Error => errors += 1,
             pipeline::Outcome::Panic => panicked += 1,
             pipeline::Outcome::Timeout => timed_out += 1,
             pipeline::Outcome::Crash => crashed += 1,
+        }
+        if let Some(identical) = rec.document_xml_byte_identical {
+            noedit_checked += 1;
+            if identical {
+                noedit_identical += 1;
+            } else {
+                let key = rec
+                    .first_drift_context
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".into());
+                *drift_histogram.entry(key).or_insert(0) += 1;
+            }
         }
 
         if let Err(e) = writeln!(
@@ -398,6 +441,18 @@ fn main() -> ExitCode {
         files.len(),
         run_start.elapsed().as_secs_f32()
     );
+    /* Issue #112 — the drift histogram, largest bucket first. */
+    println!(
+        "[corpus-native] zero-edit document.xml byte-identical: {noedit_identical}/{noedit_checked}"
+    );
+    if !drift_histogram.is_empty() {
+        let mut buckets: Vec<(&String, &usize)> = drift_histogram.iter().collect();
+        buckets.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        println!("[corpus-native] first-differing-element histogram (docs):");
+        for (key, count) in buckets {
+            println!("[corpus-native]   {count:5}  {key}");
+        }
+    }
     println!("[corpus-native] JSONL written to {}", args.out.display());
     ExitCode::SUCCESS
 }

@@ -284,8 +284,10 @@ fn run_default() -> Result<()> {
     run_wrap_modes_roundtrip()?;
     run_toc_roundtrip()?;
     run_text_boxes_roundtrip()?;
+    run_nested_text_boxes_roundtrip()?;
     run_rtl_table_roundtrip()?;
     run_table_jc_tblind_roundtrip()?;
+    run_body_passthrough_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -1161,6 +1163,191 @@ fn text_boxes_document_xml() -> String {
         prose = TB_PROSE,
         arabic = TB_ARABIC
     )
+}
+
+/* ============================================ nested text boxes (#196) ==== */
+
+const TBN_OUTER: &str = "Outer story text.";
+const TBN_INNER: &str = "Inner story text.";
+
+/// Issue #196 fixture: a page-anchored 3" × 2" text box (at 1", 3" on
+/// the page) whose story hosts a second, nested 1.5" × 0.6" box placed
+/// 1" right / 0.5" down inside the outer box's content rect. Both are
+/// bare `<w:drawing>` shapes; every paragraph is in the writer's
+/// canonical shape so an edited nested story regenerates byte-identical
+/// modulo the edit. The e2e spec `ts/e2e/nested-text-box.spec.ts`
+/// clicks into the nested box by this geometry.
+fn nested_text_boxes_document_xml() -> String {
+    let drawing = |x: i64, y: i64, cx: i64, cy: i64, id: u32, story: &str| {
+        format!(
+            concat!(
+                r#"<w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="{id}" "#,
+                r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>"#,
+                r#"<wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH>"#,
+                r#"<wp:positionV relativeFrom="page"><wp:posOffset>{y}</wp:posOffset></wp:positionV>"#,
+                r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+                r#"<wp:wrapSquare wrapText="bothSides"/><wp:docPr id="{id}" name="Text Box {id}"/>"#,
+                r#"<wp:cNvGraphicFramePr/>"#,
+                r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+                r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>"#,
+                r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#,
+                r#"<a:ln w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></wps:spPr>"#,
+                r#"<wps:txbx><w:txbxContent>{story}</w:txbxContent></wps:txbx>"#,
+                r#"<wps:bodyPr rot="0" vert="horz" wrap="square" lIns="91440" tIns="45720" rIns="91440" bIns="45720" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>"#,
+                r#"</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>"#,
+            ),
+            x = x,
+            y = y,
+            cx = cx,
+            cy = cy,
+            id = id,
+            story = story
+        )
+    };
+    let inner_story =
+        format!(r#"<w:p><w:r><w:t xml:space="preserve">{TBN_INNER}</w:t></w:r></w:p>"#);
+    let inner = drawing(914_400, 457_200, 1_371_600, 548_640, 2, &inner_story);
+    let outer_story = format!(
+        concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">{outer}</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r>{inner}</w:r><w:r><w:t xml:space="preserve">Nested host.</w:t></w:r></w:p>"#,
+        ),
+        outer = TBN_OUTER,
+        inner = inner
+    );
+    let outer = drawing(914_400, 2_743_200, 2_743_200, 1_828_800, 1, &outer_story);
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+            r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+            r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+            r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            "<w:body>",
+            r#"<w:p><w:r><w:t xml:space="preserve">Intro paragraph.</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r>{outer}</w:r><w:r><w:t xml:space="preserve">Host paragraph.</w:t></w:r></w:p>"#,
+            "<w:sectPr/></w:body></w:document>",
+        ),
+        outer = outer
+    )
+}
+
+/// Issue #196 fixture builder. Rides the `--fixtures` passthrough at
+/// drift 0, the default harness's nested step and the e2e spec.
+fn build_nested_text_boxes_docx() -> Vec<u8> {
+    package_document_xml(&nested_text_boxes_document_xml())
+}
+
+/// Issue #196 — the nested text-box round-trip contract: (a) the outer
+/// box and the box nested in its story both parse (two levels); (b) a
+/// zero-edit save is byte-identical; (c) typing into the NESTED story
+/// through the engine's nested write path (outer story tree →
+/// `with_updated_text_box(inner)` → `with_updated_text_box(outer)`)
+/// regenerates ONLY the nested story paragraph — the whole part equals
+/// the source plus the inserted text; (d) the edit re-reads.
+fn run_nested_text_boxes_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+
+    let fixture = build_nested_text_boxes_docx();
+    let archive = read_docx(&fixture).context("read nested text-box fixture")?;
+    let doc = &archive.document;
+    let outer_addr = (BlockPath::top(1), 0u32);
+    let inner_addr = (BlockPath::top(1), 0u32);
+    let nested_text = |d: &DocumentTree| -> Option<String> {
+        let outer = d.text_box_at(&outer_addr.0, outer_addr.1)?;
+        let tree = DocumentTree::from_blocks(outer.body.clone());
+        let inner = tree.text_box_at(&inner_addr.0, inner_addr.1)?;
+        inner
+            .body
+            .first()
+            .and_then(engine::Block::as_paragraph)
+            .map(|p| p.text.clone())
+    };
+    if doc.text_box_addresses() != vec![outer_addr.clone()] {
+        bail!(
+            "nested text-box fixture: expected one body box at {outer_addr:?}, got {:?}",
+            doc.text_box_addresses()
+        );
+    }
+    if nested_text(doc).as_deref() != Some(TBN_INNER) {
+        bail!("nested text-box fixture: the nested story parsed wrongly");
+    }
+    println!("[roundtrip] step 20a OK — a box nested in a box's story parses (two levels)");
+
+    let src = String::from_utf8(extract_doc_xml(&fixture)?).context("utf8 source")?;
+    let zero = write_docx(&archive, doc).context("zero-edit write")?;
+    if String::from_utf8(extract_doc_xml(&zero)?).context("utf8 zero")? != src {
+        bail!("nested text-box fixture: zero-edit save drifted");
+    }
+    println!("[roundtrip] step 20b OK — zero-edit save is byte-identical");
+
+    /* (c) Type into the nested story exactly like the engine's nested
+    story adapter (`write_text_box_story`) does. */
+    let outer = doc
+        .text_box_at(&outer_addr.0, outer_addr.1)
+        .context("outer box")?;
+    let outer_tree = DocumentTree::from_blocks(outer.body.clone());
+    let inner = outer_tree
+        .text_box_at(&inner_addr.0, inner_addr.1)
+        .context("nested box")?;
+    let typed = DocumentTree::from_blocks(inner.body.clone()).insert_text(
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        },
+        INSERT_TEXT,
+    );
+    let outer_edited = outer_tree.with_updated_text_box(
+        &inner_addr.0,
+        inner_addr.1,
+        typed.blocks.iter().cloned().collect(),
+    );
+    let edited = doc.with_updated_text_box(
+        &outer_addr.0,
+        outer_addr.1,
+        outer_edited.blocks.iter().cloned().collect(),
+    );
+    let bytes = write_docx(&archive, &edited).context("write edited nested text box")?;
+    assert_document_xml_well_formed(&bytes).context("edited nested text-box .docx")?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+    let needle = format!(r#"<w:t xml:space="preserve">{TBN_INNER}</w:t>"#);
+    let want = src.replace(
+        &needle,
+        &format!(r#"<w:t xml:space="preserve">{INSERT_TEXT}{TBN_INNER}</w:t>"#),
+    );
+    if src.matches(&needle).count() != 1 || out != want {
+        bail!(
+            "nested text-box fixture: edited save is not source + edit\n--- expected ---\n{want}\n--- got ---\n{out}"
+        );
+    }
+    let drift = out.len() - src.len();
+    if drift > 2 * INSERT_TEXT.len() {
+        bail!("nested text-box fixture: drift {drift} B exceeds the bound");
+    }
+    println!(
+        "[roundtrip] step 20c OK — a nested story edit splices only the nested story (Δ {drift} B)"
+    );
+
+    let reread = read_docx(&bytes).context("re-read edited nested text box")?;
+    if nested_text(&reread.document) != Some(format!("{INSERT_TEXT}{TBN_INNER}")) {
+        bail!("nested text-box fixture: the nested edit did not re-read");
+    }
+    let outer_text = reread
+        .document
+        .text_box_at(&outer_addr.0, outer_addr.1)
+        .and_then(|s| {
+            s.body
+                .first()
+                .and_then(engine::Block::as_paragraph)
+                .map(|p| p.text.clone())
+        });
+    if outer_text.as_deref() != Some(TBN_OUTER) {
+        bail!("nested text-box fixture: the outer story changed ({outer_text:?})");
+    }
+    println!("[roundtrip] step 20d OK — the nested edit re-reads, the outer story untouched");
+    Ok(())
 }
 
 /// Issue #83 fixture builder. Rides the `--fixtures` passthrough at
@@ -2724,6 +2911,7 @@ fn ppr_fixtures() -> Vec<SeedFixture> {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         }]),
     };
     vec![
@@ -3015,8 +3203,10 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 2,
                     paragraph_texts: vec!["first".into(), "second".into()],
                 },
+                /* Issue #112 — the BOM, the declaration and the pinned
+                sectPr are all source bytes now: drift 0. */
                 roundtrip: RoundtripBounds {
-                    document_xml_drift_bytes: 3 + sect_pr_compaction_delta(),
+                    document_xml_drift_bytes: 0,
                 },
             },
         },
@@ -3119,6 +3309,25 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 roundtrip: RoundtripBounds::default(),
             },
         },
+        /* Issue #196 — a text box nested in a text box's story.
+        Passthrough at drift 0; the default harness's step 20 edits the
+        nested story; the e2e spec clicks into it. */
+        PrebuiltFixture {
+            name: "text_boxes_nested.docx",
+            bytes: build_nested_text_boxes_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec![
+                        "Intro paragraph.".into(),
+                        "\u{FFFC}Host paragraph.".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
         PrebuiltFixture {
             name: "table_nested_200_deep.docx",
             bytes: build_table_nested_deep_docx(200),
@@ -3150,6 +3359,58 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         "mid one".into(),
                         "mid two".into(),
                         "after".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issues #120 / #112 — every body-level construct the typed model
+        does not represent, in a Word-shaped part (CRLF declaration, root
+        attributes in Word's order, rsids / docGrid on the sectPr): an
+        `<w:sdt>` envelope (nested, one empty) around body paragraphs and
+        a table, a self-closing `<w:p …/>`, body-level bookmark / proofErr
+        / commentRangeEnd markers and pretty-print whitespace. Zero-edit
+        drift 0; the default harness's step 19 edits inside the control. */
+        PrebuiltFixture {
+            name: "body_level_passthrough.docx",
+            bytes: build_body_level_passthrough_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 6,
+                    paragraph_texts: vec![
+                        "intro".into(),
+                        "first inside".into(),
+                        "second inside".into(),
+                        "nested inside".into(),
+                        String::new(),
+                        "after".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #119 — run-level objects the model keeps only as bytes: a
+        DrawingML text box with its VML fallback (an #83 story), Word's VML
+        horizontal rule, an OLE object, plus a picture with alt text and
+        an `<a:extLst>`. Zero-edit drift 0; step 19 edits both paragraphs
+        and resizes the picture. */
+        PrebuiltFixture {
+            name: "drawing_objects_preserved.docx",
+            bytes: build_drawing_objects_preserved_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec![
+                        "a \u{FFFC}\u{FFFC}\u{FFFC} z".into(),
+                        "pic \u{FFFC} end".into(),
                     ],
                 },
                 roundtrip: RoundtripBounds {
@@ -3485,6 +3746,277 @@ fn build_table_nested_deep_docx(depth: usize) -> Vec<u8> {
 }
 
 /* ============================================================= helpers ==== */
+
+/* ================================ body passthrough (#120 / #112 / #119) ==== */
+
+/// A Word-shaped root: `xmlns:w` is NOT first, foreign prefixes and
+/// `mc:Ignorable` ride along, exactly as Word writes it.
+const WORD_ROOT: &str = concat!(
+    r#"<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" "#,
+    r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" "#,
+    r#"xmlns:o="urn:schemas-microsoft-com:office:office" "#,
+    r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+    r#"xmlns:v="urn:schemas-microsoft-com:vml" "#,
+    r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" "#,
+    r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+    r#"xmlns:w10="urn:schemas-microsoft-com:office:word" "#,
+    r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+    r#"xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" "#,
+    r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" "#,
+    r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+    r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+    r#"mc:Ignorable="w14 wp14">"#,
+);
+
+/// Word's trailing sectPr: rsids, `w:gutter`, `<w:cols w:space>` and
+/// `<w:docGrid>` — none of which the typed model carries.
+const WORD_SECT_PR: &str = concat!(
+    r#"<w:sectPr w:rsidR="00B44B3E" w:rsidSect="00E64C2A">"#,
+    r#"<w:pgSz w:w="11906" w:h="16838"/>"#,
+    r#"<w:pgMar w:top="1417" w:right="1417" w:bottom="1134" w:left="1417" w:header="708" w:footer="708" w:gutter="0"/>"#,
+    r#"<w:cols w:space="708"/><w:docGrid w:linePitch="360"/></w:sectPr>"#,
+);
+
+/// `word/document.xml` the way Word writes it around `body`: CRLF after
+/// the declaration and around the root's children.
+fn word_document_xml(body: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n{WORD_ROOT}\r\n<w:body>{body}{WORD_SECT_PR}</w:body>\r\n</w:document>\r\n"
+    )
+}
+
+/// Every #120 / #112 construct at once (see the fixture's manifest note).
+const BODY_LEVEL_CONSTRUCTS: &str = concat!(
+    r#"<w:p w:rsidR="00A1" w14:paraId="1F2E3D4C"><w:r><w:t>intro</w:t></w:r></w:p>"#,
+    "\r\n  ",
+    r#"<w:bookmarkStart w:id="0" w:name="_GoBack"/>"#,
+    r#"<w:sdt><w:sdtPr><w:alias w:val="Block"/><w:id w:val="-2035718510"/>"#,
+    r#"<w:rPr><w:b/></w:rPr><w:text w:multiLine="1"/></w:sdtPr><w:sdtEndPr><w:rPr><w:i/></w:rPr></w:sdtEndPr><w:sdtContent>"#,
+    r#"<w:p><w:r><w:t xml:space="preserve">first inside</w:t></w:r></w:p>"#,
+    r#"<w:sdt><w:sdtPr/><w:sdtContent/></w:sdt>"#,
+    r#"<w:p><w:r><w:t xml:space="preserve">second inside</w:t></w:r></w:p>"#,
+    r#"<w:sdt><w:sdtPr><w:tag w:val="nested"/></w:sdtPr><w:sdtContent>"#,
+    r#"<w:p><w:r><w:t xml:space="preserve">nested inside</w:t></w:r></w:p>"#,
+    r#"</w:sdtContent></w:sdt>"#,
+    r#"</w:sdtContent></w:sdt>"#,
+    r#"<w:bookmarkEnd w:id="0"/>"#,
+    r#"<w:p w:rsidR="009B100C" w:rsidRDefault="009B100C" w:rsidP="00A54197"/>"#,
+    r#"<w:proofErr w:type="spellStart"/>"#,
+    r#"<w:sdt><w:sdtPr><w:tag w:val="table"/></w:sdtPr><w:sdtContent>"#,
+    r#"<w:tbl><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>"#,
+    r#"</w:sdtContent></w:sdt>"#,
+    r#"<w:p><w:r><w:t>after</w:t></w:r></w:p>"#,
+    r#"<w:commentRangeEnd w:id="3"/>"#,
+    "\r\n  ",
+);
+
+fn build_body_level_passthrough_docx() -> Vec<u8> {
+    package_document_xml(&word_document_xml(BODY_LEVEL_CONSTRUCTS))
+}
+
+/// The text box (DrawingML choice + VML fallback), the VML rule and the
+/// OLE object of `drawing_objects_preserved.docx`, plus its picture.
+const TEXT_BOX_OBJECT: &str = concat!(
+    r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>"#,
+    r#"<wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="1828800" cy="914400"/>"#,
+    r#"<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="1" name="Text Box 1"/>"#,
+    r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+    r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></a:xfrm>"#,
+    r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>"#,
+    r#"<wps:txbx><w:txbxContent><w:p><w:r><w:t>in the box</w:t></w:r></w:p></w:txbxContent></wps:txbx>"#,
+    r#"<wps:bodyPr rot="0"/></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice>"#,
+    r##"<mc:Fallback><w:pict><v:shape id="Text Box 1" o:spid="_x0000_s1026" type="#_x0000_t202" style="width:144pt;height:1in">"##,
+    r#"<v:textbox><w:txbxContent><w:p><w:r><w:t>in the box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback>"#,
+    r#"</mc:AlternateContent>"#,
+);
+const VML_RULE_OBJECT: &str = r##"<w:pict><v:rect id="_x0000_i1025" style="width:0;height:1.5pt" o:hralign="center" o:hrstd="t" o:hr="t" fillcolor="#a0a0a0" stroked="f"/></w:pict>"##;
+const OLE_OBJECT: &str = r##"<w:object w:dxaOrig="1440" w:dyaOrig="720"><v:shape id="_x0000_i1027" type="#_x0000_t75" style="width:72pt;height:36pt" o:ole=""><v:imagedata r:id="rId9" o:title=""/></v:shape><o:OLEObject Type="Embed" ProgID="Package" ShapeID="_x0000_i1027" DrawAspect="Content" ObjectID="_1234" r:id="rId10"/></w:object>"##;
+const PICTURE_OBJECT: &str = concat!(
+    r#"<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" wp14:anchorId="1A2B3C4D">"#,
+    r#"<wp:extent cx="914400" cy="457200"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+    r#"<wp:docPr id="3" name="Picture 3" descr="alt text that must survive"/>"#,
+    r#"<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>"#,
+    r#"<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>"#,
+    r#"<pic:nvPicPr><pic:cNvPr id="3" name="photo.png"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+    r#"<pic:blipFill><a:blip r:embed="rId5"><a:extLst><a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}"/></a:extLst></a:blip>"#,
+    r#"<a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+    r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>"#,
+    r#"</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>"#,
+);
+
+fn drawing_objects_body() -> String {
+    format!(
+        concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">a </w:t></w:r><w:r>{tb}</w:r>"#,
+            r#"<w:r><w:rPr><w:noProof/></w:rPr>{rule}</w:r><w:r>{ole}</w:r>"#,
+            r#"<w:r><w:t xml:space="preserve"> z</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t xml:space="preserve">pic </w:t></w:r><w:r><w:rPr><w:noProof/></w:rPr>{pic}</w:r>"#,
+            r#"<w:r><w:t xml:space="preserve"> end</w:t></w:r></w:p>"#,
+        ),
+        tb = TEXT_BOX_OBJECT,
+        rule = VML_RULE_OBJECT,
+        ole = OLE_OBJECT,
+        pic = PICTURE_OBJECT
+    )
+}
+
+fn build_drawing_objects_preserved_docx() -> Vec<u8> {
+    package_document_xml(&word_document_xml(&drawing_objects_body()))
+}
+
+/// Issues #120 / #112 / #119 — step 19: the body-level passthrough
+/// contract. (a) both fixtures resave byte-identical with zero edits, on
+/// the archive AND the UI save path; (b) an edit inside a content control
+/// regenerates that paragraph only — envelope, markers, prolog, root tag
+/// and sectPr are the source bytes; (c) an edit in a paragraph holding a
+/// text box, a VML rule, an OLE object and a picture re-emits every object
+/// byte for byte; (d) a resized picture regenerates from the typed fields.
+fn run_body_passthrough_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+
+    let body_xml = word_document_xml(BODY_LEVEL_CONSTRUCTS);
+    let body_docx = build_body_level_passthrough_docx();
+    let drawing_xml = word_document_xml(&drawing_objects_body());
+    let drawing_docx = build_drawing_objects_preserved_docx();
+
+    /* (a) zero-edit, both save paths. */
+    for (label, docx, xml) in [
+        ("body_level_passthrough", &body_docx, &body_xml),
+        ("drawing_objects_preserved", &drawing_docx, &drawing_xml),
+    ] {
+        let parsed = read_docx(docx).with_context(|| format!("read {label}"))?;
+        if !parsed.document.document_envelope.is_captured() {
+            bail!("{label}: the document envelope was not captured");
+        }
+        let resaved = write_docx(&parsed, &parsed.document).context("write_docx")?;
+        assert_document_xml_well_formed(&resaved)?;
+        if extract_doc_xml(&resaved)? != xml.as_bytes() {
+            bail!("{label}: zero-edit archive resave is not byte-identical");
+        }
+        let ui = build_minimal_docx(&parsed.document).context("build_minimal_docx")?;
+        assert_document_xml_well_formed(&ui)?;
+        if extract_doc_xml(&ui)? != xml.as_bytes() {
+            bail!("{label}: zero-edit UI-path resave is not byte-identical");
+        }
+    }
+    println!(
+        "[roundtrip] step 19a OK — body-level markup, envelope and objects resave byte-identical on both save paths"
+    );
+
+    /* (b) edit inside the content control. */
+    let parsed = read_docx(&body_docx).context("read body fixture")?;
+    let edited = parsed.document.insert_text(
+        LogicalPos {
+            path: BlockPath::top(1),
+            offset: "first".len() as u32,
+        },
+        "+X",
+    );
+    let bytes = write_docx(&parsed, &edited).context("write edited body")?;
+    assert_document_xml_well_formed(&bytes)?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+    let expected = body_xml.replacen("first inside", "first+X inside", 1);
+    if out != expected {
+        bail!(
+            "edit inside a content control must change only its paragraph\n--- expected ---\n{expected}\n--- got ---\n{out}"
+        );
+    }
+    let back = read_docx(&bytes).context("re-read edited body")?;
+    if back.document.paragraph_text(1) != Some("first+X inside") {
+        bail!("edited paragraph did not persist inside the control");
+    }
+    println!(
+        "[roundtrip] step 19b OK — an edit inside an <w:sdt> keeps its envelope, markers and sectPr byte-for-byte"
+    );
+
+    /* (c) edit a paragraph holding preserved objects. */
+    let parsed = read_docx(&drawing_docx).context("read drawing fixture")?;
+    let p0 = parsed
+        .document
+        .nth_paragraph(0)
+        .context("first paragraph")?;
+    if p0.inline_objects.len() != 3 {
+        bail!(
+            "expected 3 objects in paragraph 0, got {}",
+            p0.inline_objects.len()
+        );
+    }
+    if !matches!(
+        p0.inline_objects[0].kind,
+        engine::InlineKind::TextBox { .. }
+    ) {
+        bail!("the AlternateContent text box must read as a text-box story");
+    }
+    let edited = parsed
+        .document
+        .insert_text(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 1,
+            },
+            "bc",
+        )
+        .insert_text(
+            LogicalPos {
+                path: BlockPath::top(1),
+                offset: 0,
+            },
+            "A ",
+        );
+    let bytes = write_docx(&parsed, &edited).context("write edited drawings")?;
+    assert_document_xml_well_formed(&bytes)?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+    let expected =
+        drawing_xml
+            .replacen("a </w:t>", "abc </w:t>", 1)
+            .replacen("pic </w:t>", "A pic </w:t>", 1);
+    if out != expected {
+        bail!(
+            "editing around preserved objects must re-emit them byte-for-byte\n--- expected ---\n{expected}\n--- got ---\n{out}"
+        );
+    }
+    let back = read_docx(&bytes).context("re-read edited drawings")?;
+    if back
+        .document
+        .nth_paragraph(0)
+        .map(|p| p.inline_objects.len())
+        != Some(3)
+    {
+        bail!("objects lost on re-read");
+    }
+    println!(
+        "[roundtrip] step 19c OK — text box, VML rule, OLE object and picture survive an edit in their paragraph byte-for-byte"
+    );
+
+    /* (d) a resized picture regenerates. */
+    let mut resized = parsed.document.clone();
+    let mut p1 = resized
+        .nth_paragraph(1)
+        .context("second paragraph")?
+        .clone();
+    if let engine::InlineKind::Image { width_emu, .. } = &mut p1.inline_objects[0].kind {
+        *width_emu = 1_828_800;
+    } else {
+        bail!("paragraph 1 must hold the picture");
+    }
+    p1.dirty = true;
+    p1.source_xml = None;
+    resized.blocks.set(1, engine::Block::Paragraph(p1));
+    let bytes = write_docx(&parsed, &resized).context("write resized")?;
+    assert_document_xml_well_formed(&bytes)?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8")?;
+    if !out.contains(r#"<wp:extent cx="1828800" cy="457200"/>"#) {
+        bail!("resized picture must regenerate with the new extent:\n{out}");
+    }
+    if !out.contains(TEXT_BOX_OBJECT) || !out.contains(VML_RULE_OBJECT) || !out.contains(OLE_OBJECT)
+    {
+        bail!("the untouched objects must still be verbatim after a picture resize");
+    }
+    println!(
+        "[roundtrip] step 19d OK — a resized picture regenerates from the typed fields, everything else stays verbatim"
+    );
+    Ok(())
+}
 
 /// Issue #110 — every `write_docx` in this harness is followed by a strict
 /// re-parse of the saved `word/document.xml`. A misaligned passthrough

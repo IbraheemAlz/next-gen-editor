@@ -11,11 +11,14 @@ use crate::opc::archive::{
 use crate::parts::comments::{
     build_comments_extended_xml, build_comments_extended_xml_with_overrides, build_comments_xml,
 };
+use crate::parts::document::parse_sect_pr_fragment;
 use crate::parts::footnotes::emit_note_pr;
 use crate::parts::numbering::build_numbering_xml;
+use crate::schema::block_envelope::EnvelopeStack;
 use crate::schema::ct_ppr::ppr_child_rank;
 use crate::schema::ct_rpr::rpr_child_rank;
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
+use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::fragment_qname;
 use crate::schema::wp_anchor::emit_anchor_open;
 use engine::{
@@ -56,7 +59,6 @@ const DOC_XML_HEADER_WITH_DRAWING: &str = concat!(
     r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing">"#,
     "<w:body>",
 );
-const DOC_XML_FOOTER: &str = "<w:sectPr/></w:body></w:document>";
 
 /// Issue #60 — header for documents that carry a `<w:hyperlink r:id>` but
 /// no inline images: needs `xmlns:r` (which `<w:hyperlink>`'s `r:id`
@@ -1054,7 +1056,7 @@ fn emit_styled_runs_with_objects(
         }
 
         if let Some(obj) = obj_at.get(&lo) {
-            emit_inline_object(obj, out, hyperlink_rel_map);
+            emit_inline_object(obj, &style_at(lo), out, hyperlink_rel_map);
             /* Skip to the byte after the anchor's UTF-8 length — the
             object consumes the full anchor character. The cut set
             already placed a boundary at `lo + OBJECT_REPLACE_UTF8.len()`,
@@ -1157,8 +1159,24 @@ fn emit_tab_run(style: &SpanStyle, _delete_kind: bool, out: &mut String) {
 /// anchor for `InlineObject` in a paragraph's `text`).
 const OBJECT_REPLACE_UTF8: &str = "\u{FFFC}";
 
+/// Issue #119 — `true` when the object's verbatim source element still
+/// describes it: the same picture, extent and (typed) anchor come out of
+/// a re-scan of the bytes. A resize, a drag or a wrap change makes the
+/// model diverge and the writer regenerates from the typed fields.
+fn preserved_drawing_is_current(obj: &InlineObject, src: &[u8]) -> bool {
+    let scan = scan_drawing(src);
+    let (rel_id, cx, cy) = scan.image_fields();
+    let same_image = matches!(
+        &obj.kind,
+        InlineKind::Image { rel_id: r, width_emu: w, height_emu: h }
+            if *r == rel_id && *w == cx && *h == cy
+    );
+    same_image && scan.anchor == obj.anchor
+}
+
 fn emit_inline_object(
     obj: &InlineObject,
+    style: &SpanStyle,
     out: &mut String,
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
@@ -1172,18 +1190,20 @@ fn emit_inline_object(
             height_emu,
             story,
         } => {
-            let emit_blocks = |blocks: &[Block], o: &mut String| {
-                for b in blocks {
-                    emit_block(b, o, hyperlink_rel_map);
-                }
+            /* Issue #120 — a story's blocks carry block-level markup too
+            (a content control inside the box), so they go through the
+            envelope-aware block loop. */
+            let emit_story = |blocks: &[Block], o: &mut String| {
+                emit_blocks(blocks, o, hyperlink_rel_map);
             };
             out.push_str("<w:r>");
+            emit_rpr(style, out);
             out.push_str(&crate::parts::textbox::container_xml(
                 *width_emu,
                 *height_emu,
                 obj.anchor.as_deref(),
                 story,
-                &emit_blocks,
+                &emit_story,
             ));
             out.push_str("</w:r>");
         }
@@ -1191,13 +1211,36 @@ fn emit_inline_object(
             rel_id,
             width_emu,
             height_emu,
-        } => match obj.anchor.as_deref() {
-            /* Issue #69 — a floating picture is a `<wp:anchor>` run. */
-            Some(anchor) => {
-                emit_anchored_image_drawing(rel_id, *width_emu, *height_emu, anchor, out)
+        } => {
+            /* Issue #119 — verified passthrough of the source element
+            (`<w:drawing>`, `<mc:AlternateContent>`, `<w:pict>`,
+            `<w:object>`): byte-for-byte while the model agrees with it.
+            An object without a picture (a text box, shape, chart, OLE
+            object) has no typed regeneration and is ALWAYS written from
+            its bytes — never dropped. */
+            if let Some(src) = obj.source_xml.as_deref()
+                && let Ok(verbatim) = std::str::from_utf8(src)
+                && (rel_id.is_empty() || preserved_drawing_is_current(obj, src))
+            {
+                out.push_str("<w:r>");
+                emit_rpr(style, out);
+                out.push_str(verbatim);
+                out.push_str("</w:r>");
+                return;
             }
-            None => emit_image_drawing(rel_id, *width_emu, *height_emu, out),
-        },
+            if rel_id.is_empty() {
+                /* No picture and no bytes (a pre-#119 snapshot, or a
+                fragment the part root could not bind): nothing to write. */
+                return;
+            }
+            match obj.anchor.as_deref() {
+                /* Issue #69 — a floating picture is a `<wp:anchor>` run. */
+                Some(anchor) => {
+                    emit_anchored_image_drawing(rel_id, *width_emu, *height_emu, anchor, style, out)
+                }
+                None => emit_image_drawing(rel_id, *width_emu, *height_emu, style, out),
+            }
+        }
         InlineKind::FootnoteRef {
             id,
             custom_mark_follows,
@@ -1242,10 +1285,20 @@ fn emit_inline_object(
 /// precedes `cNvGraphicFramePr` precedes `graphic`. Re-ordering any
 /// pair makes Word reject the file with the "unreadable content"
 /// recovery prompt.
-fn emit_image_drawing(rel_id: &str, width_emu: i64, height_emu: i64, out: &mut String) {
+fn emit_image_drawing(
+    rel_id: &str,
+    width_emu: i64,
+    height_emu: i64,
+    style: &SpanStyle,
+    out: &mut String,
+) {
     let cx = width_emu.max(1);
     let cy = height_emu.max(1);
-    out.push_str("<w:r><w:drawing>");
+    out.push_str("<w:r>");
+    /* Issue #119 — the picture run's own `<w:rPr>` (`<w:noProof/>`, a
+    grab-bagged `<w:lang>`, …) rides the span covering the sentinel. */
+    emit_rpr(style, out);
+    out.push_str("<w:drawing>");
     out.push_str(&format!(
         "<wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
          <wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\
@@ -1267,11 +1320,14 @@ fn emit_anchored_image_drawing(
     width_emu: i64,
     height_emu: i64,
     anchor: &engine::FloatAnchor,
+    style: &SpanStyle,
     out: &mut String,
 ) {
     let cx = width_emu.max(1);
     let cy = height_emu.max(1);
-    out.push_str("<w:r><w:drawing>");
+    out.push_str("<w:r>");
+    emit_rpr(style, out);
+    out.push_str("<w:drawing>");
     emit_anchor_open(anchor, cx, cy, out);
     emit_pic_graphic(rel_id, cx, cy, out);
     out.push_str("</wp:anchor></w:drawing></w:r>");
@@ -1341,6 +1397,32 @@ fn emit_paragraph(para: &Paragraph, out: &mut String, hyperlink_rel_map: &HashMa
     } else {
         serialize_paragraph(para, out, hyperlink_rel_map);
     }
+}
+
+/// Issue #120 — emit one block container's block list with the
+/// block-level passthrough markup around each block: `before` fragments
+/// (a `<w:sdt>` envelope opener, `<w:bookmarkStart/>`, inter-block
+/// whitespace) ahead of the block, `after` fragments (the envelope
+/// closer) behind it, clean or regenerated alike. The
+/// [`EnvelopeStack`] keeps every envelope balanced whatever an edit did
+/// to its ends. The one loop every container uses — body, table cell,
+/// header / footer part, note story.
+fn emit_blocks<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    out: &mut String,
+    hyperlink_rel_map: &HashMap<String, String>,
+) {
+    let mut envelopes = EnvelopeStack::new();
+    for block in blocks {
+        if let Some(bx) = block.body_xml() {
+            envelopes.emit(&bx.before, out);
+        }
+        emit_block(block, out, hyperlink_rel_map);
+        if let Some(bx) = block.body_xml() {
+            envelopes.emit(&bx.after, out);
+        }
+    }
+    envelopes.finish(out);
 }
 
 /// Phase 5 PR 1 block dispatcher. `Block::Paragraph` rides the existing
@@ -1515,9 +1597,7 @@ fn emit_table_cell(
     if cell.blocks.is_empty() {
         out.push_str("<w:p/>");
     } else {
-        for block in &cell.blocks {
-            emit_block(block, out, hyperlink_rel_map);
-        }
+        emit_blocks(&cell.blocks, out, hyperlink_rel_map);
     }
     out.push_str("</w:tc>");
 }
@@ -1688,47 +1768,87 @@ fn build_document_xml_with_root(
     root_attrs: &[(String, String)],
 ) -> String {
     let mut out = String::with_capacity(2048);
+    /* Issue #112 — the read-time page-size fallback (issue #109) the
+    verified sectPr passthrough re-parses against; see
+    `sect_pr_source_is_current`. */
+    WRITE_DEFAULT_GEOMETRY.with(|g| g.set(doc.settings.default_page_size.geometry()));
     let top: Vec<Block> = doc.blocks.iter().cloned().collect();
     /* Issue #83 — a text box is DrawingML too: its container (verbatim or
     synthesized) uses the `wp` / `a` / `r` prefixes the drawing header
     binds, and an engine-authored one also needs `wps`. */
     let has_text_box = crate::parts::textbox::blocks_have_text_box(&top);
+    let needs_wps = crate::parts::textbox::blocks_need_wps(&top);
     let mut root_attrs: Vec<(String, String)> = root_attrs.to_vec();
-    if crate::parts::textbox::blocks_need_wps(&top) {
+    if needs_wps {
         root_attrs.push((
             "xmlns:wps".to_string(),
             crate::parts::textbox::NS_WPS.to_string(),
         ));
     }
     let root_attrs = root_attrs.as_slice();
-    let header = if doc_has_inline_images(doc) || has_text_box {
-        DOC_XML_HEADER_WITH_DRAWING
-    } else if doc_has_hyperlinks(doc) || doc_has_section_hf_refs(doc) {
-        /* Phase 3 (#40) — `<w:headerReference r:id>` (freshly emitted OR
-        riding a clean marker paragraph's passthrough bytes) needs
-        `xmlns:r` bound at the root exactly like `<w:hyperlink r:id>`. */
-        DOC_XML_HEADER_WITH_RELS
+    let has_images = doc_has_inline_images(doc) || has_text_box;
+    let has_rels = doc_has_hyperlinks(doc) || doc_has_section_hf_refs(doc);
+    /* Issue #112 — a document read from `.docx` carries its source
+    prolog, root start tag, `<w:body>` tag and tail on the tree; re-emit
+    them verbatim (adding only a binding the body actually USES that the
+    source root never declared — a Word 2007 root has no `wp14`, and a
+    zero-edit resave regenerates nothing that would need it) so a
+    zero-edit resave is byte-identical. An engine-authored document
+    synthesizes the stock header exactly as before. The body is rendered
+    first so the bindings can be derived from it. */
+    let envelope = &doc.document_envelope;
+    let captured = envelope.is_captured() && std::str::from_utf8(&envelope.root_tag).is_ok();
+    let mut body = String::with_capacity(2048);
+    emit_blocks(doc.blocks.iter(), &mut body, hyperlink_rel_map);
+    emit_trailing_sect_pr(doc, captured, &mut body);
+    if captured {
+        push_utf8(&envelope.prolog, &mut out);
+        out.push_str(&patch_root_bindings(
+            &envelope.root_tag,
+            &bindings_used_by(&body, needs_wps),
+        ));
+        push_utf8(&envelope.root_to_body, &mut out);
+        push_utf8(&envelope.body_tag, &mut out);
+        out.push_str(&body);
+        push_utf8(&envelope.tail, &mut out);
     } else {
-        DOC_XML_HEADER
-    };
-    let extra = extra_root_attrs(header, root_attrs);
-    if extra.is_empty() {
-        out.push_str(header);
-    } else {
-        /* Every header constant closes the root tag right before
-        `<w:body>`; splice the carried declarations in there. */
-        out.push_str(&header.replacen("><w:body>", &format!("{extra}><w:body>"), 1));
+        let header = if has_images {
+            DOC_XML_HEADER_WITH_DRAWING
+        } else if has_rels {
+            /* Phase 3 (#40) — `<w:headerReference r:id>` (freshly emitted OR
+            riding a clean marker paragraph's passthrough bytes) needs
+            `xmlns:r` bound at the root exactly like `<w:hyperlink r:id>`. */
+            DOC_XML_HEADER_WITH_RELS
+        } else {
+            DOC_XML_HEADER
+        };
+        let extra = extra_root_attrs(header, root_attrs);
+        if extra.is_empty() {
+            out.push_str(header);
+        } else {
+            /* Every header constant closes the root tag right before
+            `<w:body>`; splice the carried declarations in there. */
+            out.push_str(&header.replacen("><w:body>", &format!("{extra}><w:body>"), 1));
+        }
+        out.push_str(&body);
+        out.push_str("</w:body></w:document>");
     }
-    for block in &doc.blocks {
-        emit_block(block, &mut out, hyperlink_rel_map);
-    }
+    out
+}
+
+/// The trailing body-level `<w:sectPr>` (see the comment inside).
+fn emit_trailing_sect_pr(doc: &DocumentTree, captured: bool, out: &mut String) {
     /* Phase 3 (#40, closing bug B3) — the trailing body-level
     `<w:sectPr>` now emits the final section's FULL payload (geometry,
     header/footer references, titlePg, cols, pgNumType, type) via
     `emit_sect_pr`. The bare `<w:sectPr/>` form survives only for the
     all-stock case so plain-document roundtrip fixtures stay
     byte-identical. Interior sections emit through their marker
-    paragraph's `<w:pPr>` (see `emit_ppr`). */
+    paragraph's `<w:pPr>` (see `emit_ppr`). Issue #112 — a section whose
+    source bytes still describe it is written from those bytes
+    (`emit_sect_pr`'s verified passthrough), which also covers the source
+    `<w:sectPr/>`; a captured document that never had a body sectPr gets
+    none back. */
     let trailing = engine::SectionProps::from(&doc.effective_sections().pop().unwrap_or_default());
     let needs_full = !trailing.header_refs.is_empty()
         || !trailing.footer_refs.is_empty()
@@ -1739,13 +1859,121 @@ fn build_document_xml_with_root(
         || !trailing.footnote_props.is_empty()
         || !trailing.endnote_props.is_empty()
         || !geometry_is_stock_a4(&trailing.geometry);
-    if needs_full {
-        emit_sect_pr(&trailing, &mut out);
-        out.push_str("</w:body></w:document>");
-    } else {
-        out.push_str(DOC_XML_FOOTER);
+    if needs_full || sect_pr_source_is_current(&trailing) {
+        emit_sect_pr(&trailing, out);
+    } else if !captured || trailing.source_xml.is_some() {
+        out.push_str("<w:sectPr/>");
     }
-    out
+}
+
+/// Append raw source bytes (valid UTF-8 by construction — they were
+/// sliced out of a part quick-xml decoded); anything else is skipped.
+fn push_utf8(bytes: &[u8], out: &mut String) {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        out.push_str(s);
+    }
+}
+
+/// Issue #112 — `true` when a re-parse of the section's source bytes
+/// yields exactly its live properties, i.e. the bytes can stand in for a
+/// regenerated `<w:sectPr>`.
+fn sect_pr_source_is_current(props: &engine::SectionProps) -> bool {
+    /* The re-parse fills a `<w:sectPr>` that omits `<w:pgSz>` / `<w:pgMar>`
+    with the same fallback the reader used (issue #109's default page
+    size, stamped on the tree and published by `build_document_xml_with_root`
+    for this write), so an untouched section compares equal and an edited
+    one does not. */
+    let default_geometry = WRITE_DEFAULT_GEOMETRY.with(|g| g.get());
+    props
+        .source_xml
+        .as_deref()
+        .is_some_and(|src| parse_sect_pr_fragment(src, default_geometry) == props.without_source())
+}
+
+thread_local! {
+    /// Issue #112 — the page-size fallback of the document currently being
+    /// written (see [`sect_pr_source_is_current`]); `emit_sect_pr` has no
+    /// document in hand.
+    static WRITE_DEFAULT_GEOMETRY: std::cell::Cell<engine::PageGeometry> =
+        const { std::cell::Cell::new(engine::PageGeometry::a4()) };
+}
+
+/// Issue #112 — the namespace bindings the rendered `body` needs from the
+/// root, among those a regenerated element can introduce (`w` always; `r`
+/// for hyperlinks / references; the DrawingML set for pictures; `wps` for
+/// an engine-authored text box), with the URIs the synthesized headers
+/// bind. A prefix counts only when the body uses it WITHOUT declaring it
+/// on an ancestor of its own (`grab_bag::unbound_prefixes`) — Word declares
+/// `a` / `pic` on `<a:graphic>` / `<pic:pic>` inline, and a root that never
+/// bound them must stay byte-identical.
+fn bindings_used_by(body: &str, needs_wps: bool) -> Vec<(&'static str, &'static str)> {
+    let unbound = crate::schema::grab_bag::unbound_prefixes(body.as_bytes());
+    const CANDIDATES: [(&str, &str); 7] = [
+        ("w", crate::schema::NS_W),
+        (
+            "r",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        ),
+        (
+            "wp",
+            "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        ),
+        ("a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+        (
+            "pic",
+            "http://schemas.openxmlformats.org/drawingml/2006/picture",
+        ),
+        (
+            "wp14",
+            "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing",
+        ),
+        ("wps", crate::parts::textbox::NS_WPS),
+    ];
+    CANDIDATES
+        .into_iter()
+        .filter(|(prefix, _)| {
+            *prefix == "w" || (*prefix == "wps" && needs_wps) || unbound.contains(*prefix)
+        })
+        .collect()
+}
+
+/// `true` when `tag` (a start tag) carries an `xmlns:{prefix}=` attribute,
+/// whatever whitespace precedes it (Word writes spaces; other producers
+/// break attributes across lines).
+fn declares_prefix(tag: &str, prefix: &str) -> bool {
+    let probe = format!("xmlns:{prefix}=");
+    let mut from = 0;
+    while let Some(at) = tag[from..].find(&probe) {
+        let idx = from + at;
+        if idx > 0 && tag.as_bytes()[idx - 1].is_ascii_whitespace() {
+            return true;
+        }
+        from = idx + probe.len();
+    }
+    false
+}
+
+/// Issue #112 — the source root start tag with every `required` binding
+/// it lacks appended before its closing `>`. A Word-authored root already
+/// declares them all, so the common case is the tag verbatim.
+fn patch_root_bindings(root_tag: &[u8], required: &[(&str, &str)]) -> String {
+    let tag = String::from_utf8_lossy(root_tag).into_owned();
+    let mut extra = String::new();
+    for (prefix, uri) in required {
+        if !declares_prefix(&tag, prefix) {
+            extra.push_str(&format!(" xmlns:{prefix}=\"{uri}\""));
+        }
+    }
+    if extra.is_empty() {
+        return tag;
+    }
+    match tag.strip_suffix("/>") {
+        Some(head) => format!("{head}{extra}/>"),
+        None => match tag.strip_suffix('>') {
+            Some(head) => format!("{head}{extra}>"),
+            None => tag,
+        },
+    }
 }
 
 /// Audit gap A.M11 — emit `<w:pgNumType w:start w:fmt/>`. Skips entirely
@@ -1831,6 +2059,19 @@ fn emit_hf_references(elem: &str, refs: &engine::HeaderFooterRefs, out: &mut Str
 /// children skip their defaults. `w:orient="landscape"` rides pgSz when
 /// width exceeds height, closing audit gap C.5's metadata loss.
 fn emit_sect_pr(props: &engine::SectionProps, out: &mut String) {
+    /* Issue #112 — verified passthrough: the source `<w:sectPr>` bytes
+    stand in for the regenerated element while a re-parse of them still
+    yields these exact properties (so `<w:docGrid>`, `w:rsidSect`,
+    `w:gutter`, `<w:cols w:space>` and every other unmodeled child
+    survive a resave); a changed page setup / reference / type falls
+    through to regeneration. */
+    if sect_pr_source_is_current(props)
+        && let Some(src) = props.source_xml.as_deref()
+        && let Ok(verbatim) = std::str::from_utf8(src)
+    {
+        out.push_str(verbatim);
+        return;
+    }
     out.push_str("<w:sectPr>");
     emit_hf_references("w:headerReference", &props.header_refs, out);
     emit_hf_references("w:footerReference", &props.footer_refs, out);
@@ -2868,9 +3109,7 @@ fn build_hf_xml(
     caller minted/spliced `word/_rels/<part>.xml.rels`) — hyperlinks
     in regenerated paragraphs keep working instead of degrading to
     plain text. */
-    for b in blocks {
-        emit_block(b, &mut out, hyperlink_rel_map);
-    }
+    emit_blocks(blocks, &mut out, hyperlink_rel_map);
     out.push_str("</");
     out.push_str(tag);
     out.push('>');
@@ -2980,9 +3219,7 @@ fn build_notes_xml(
             engine::NoteType::ContinuationNotice => out.push_str(" w:type=\"continuationNotice\""),
         }
         out.push_str(&format!(" w:id=\"{id}\">"));
-        for b in &story.body {
-            emit_block(b, &mut out, &no_links);
-        }
+        emit_blocks(&story.body, &mut out, &no_links);
         out.push_str("</");
         out.push_str(entry);
         out.push('>');
@@ -3244,6 +3481,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3284,6 +3522,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3328,6 +3567,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3386,6 +3626,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3430,6 +3671,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -3532,6 +3774,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -3976,13 +4219,14 @@ mod tests {
             s
         };
         assert!(
-            xml.contains("<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p><w:sectPr/></w:body>"),
+            xml.contains("<w:body><w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p></w:body>"),
             "passthrough paragraphs must be spliced byte-exact: {xml}"
         );
-        assert!(
-            !xml.contains('\u{FEFF}'),
-            "the writer synthesizes its own declaration — no BOM"
-        );
+        /* Issue #112 — the prolog (BOM + declaration), the root tag and
+        the tail are the source's own bytes: a zero-edit resave is the
+        original part, byte for byte (a body without a `<w:sectPr>` gets
+        none back). */
+        assert_eq!(xml, document_xml, "zero-edit resave must be byte-identical");
     }
 
     const HYPERLINK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -5387,6 +5631,7 @@ mod tests {
                 direct_overrides: engine::ParaProperties::default(),
                 section_end: None,
                 bookmarks: Vec::new(),
+                body_xml: None,
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -5444,6 +5689,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -5545,6 +5791,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5574,6 +5821,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -5631,6 +5879,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: Some(Box::new(engine::SectionProps::default())),
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -6173,6 +6422,7 @@ mod tests {
                     height_emu: 1_524_000,
                 },
                 anchor: None,
+                source_xml: None,
             }],
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
@@ -6181,6 +6431,7 @@ mod tests {
             direct_overrides: engine::ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -6234,6 +6485,7 @@ mod tests {
                     height_emu: 457_200,
                 },
                 anchor: Some(Box::new(anchor)),
+                source_xml: None,
             }],
             ..Default::default()
         }
@@ -6817,6 +7069,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -7467,5 +7720,491 @@ mod tests {
             format!("#{}", heading.bookmarks[0].name)
         );
         assert_eq!(back.document.toc_regions().len(), 1);
+    }
+
+    /* ===================================================================
+    Issues #119 / #120 / #112 — body-level passthrough, drawing objects,
+    the document envelope.
+    =================================================================== */
+
+    /// A Word-shaped root: `xmlns:w` is NOT first, foreign prefixes and
+    /// `mc:Ignorable` ride along, exactly as Word writes it.
+    const WORD_ROOT: &str = concat!(
+        r#"<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" "#,
+        r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" "#,
+        r#"xmlns:o="urn:schemas-microsoft-com:office:office" "#,
+        r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+        r#"xmlns:v="urn:schemas-microsoft-com:vml" "#,
+        r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" "#,
+        r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+        r#"xmlns:w10="urn:schemas-microsoft-com:office:word" "#,
+        r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+        r#"xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" "#,
+        r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" "#,
+        r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+        r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+        r#"mc:Ignorable="w14 wp14">"#,
+    );
+
+    /// Word's trailing sectPr: rsids, `w:gutter`, `<w:cols w:space>` and
+    /// `<w:docGrid>` — none of which the typed model carries.
+    const WORD_SECT_PR: &str = concat!(
+        r#"<w:sectPr w:rsidR="00B44B3E" w:rsidSect="00E64C2A">"#,
+        r#"<w:pgSz w:w="11906" w:h="16838"/>"#,
+        r#"<w:pgMar w:top="1417" w:right="1417" w:bottom="1134" w:left="1417" w:header="708" w:footer="708" w:gutter="0"/>"#,
+        r#"<w:cols w:space="708"/><w:docGrid w:linePitch="360"/></w:sectPr>"#,
+    );
+
+    fn word_document(body: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n{WORD_ROOT}\r\n<w:body>{body}{WORD_SECT_PR}</w:body>\r\n</w:document>\r\n"
+        )
+    }
+
+    /// Every #120 / #112 construct at once; a zero-edit resave must
+    /// reproduce the part byte for byte.
+    const BODY_LEVEL_CONSTRUCTS: &str = concat!(
+        r#"<w:p w:rsidR="00A1" w14:paraId="1F2E3D4C"><w:r><w:t>intro</w:t></w:r></w:p>"#,
+        "\r\n  ",
+        r#"<w:bookmarkStart w:id="0" w:name="_GoBack"/>"#,
+        r#"<w:sdt><w:sdtPr><w:alias w:val="Block"/><w:id w:val="-2035718510"/>"#,
+        r#"<w:rPr><w:b/></w:rPr><w:text w:multiLine="1"/></w:sdtPr><w:sdtEndPr><w:rPr><w:i/></w:rPr></w:sdtEndPr><w:sdtContent>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">first inside</w:t></w:r></w:p>"#,
+        r#"<w:sdt><w:sdtPr/><w:sdtContent/></w:sdt>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">second inside</w:t></w:r></w:p>"#,
+        r#"<w:sdt><w:sdtPr><w:tag w:val="nested"/></w:sdtPr><w:sdtContent>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">nested inside</w:t></w:r></w:p>"#,
+        r#"</w:sdtContent></w:sdt>"#,
+        r#"</w:sdtContent></w:sdt>"#,
+        r#"<w:bookmarkEnd w:id="0"/>"#,
+        r#"<w:p w:rsidR="009B100C" w:rsidRDefault="009B100C" w:rsidP="00A54197"/>"#,
+        r#"<w:proofErr w:type="spellStart"/>"#,
+        r#"<w:sdt><w:sdtPr><w:tag w:val="table"/></w:sdtPr><w:sdtContent>"#,
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>"#,
+        r#"</w:sdtContent></w:sdt>"#,
+        r#"<w:p><w:r><w:t>after</w:t></w:r></w:p>"#,
+        r#"<w:commentRangeEnd w:id="3"/>"#,
+        "\r\n  ",
+    );
+
+    fn document_xml_bytes(docx: &[u8]) -> Vec<u8> {
+        let mut zip = zip::ZipArchive::new(Cursor::new(docx)).expect("zip");
+        let mut part = zip.by_name(DOC_XML).expect("document.xml");
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut part, &mut out).expect("read");
+        out
+    }
+
+    #[test]
+    fn zero_edit_resave_is_byte_identical_for_body_level_constructs() {
+        let xml = word_document(BODY_LEVEL_CONSTRUCTS);
+        let parsed = read_docx(&zip_minimal_docx(&xml, None)).expect("read");
+        let texts: Vec<&str> = parsed
+            .document
+            .blocks
+            .iter()
+            .filter_map(Block::as_paragraph)
+            .map(|p| p.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "intro",
+                "first inside",
+                "second inside",
+                "nested inside",
+                "",
+                "after"
+            ],
+            "the sdt content is body content; the self-closing <w:p/> is a block"
+        );
+        assert!(parsed.document.document_envelope.is_captured());
+        let resaved = write_docx(&parsed, &parsed.document).expect("write");
+        crate::check_document_xml_well_formed(&resaved).expect("well-formed");
+        assert_eq!(
+            String::from_utf8(document_xml_bytes(&resaved)).unwrap(),
+            xml,
+            "zero-edit resave must be byte-identical"
+        );
+        /* And it survives a second read → write. */
+        let again = read_docx(&resaved).expect("re-read");
+        let twice = write_docx(&again, &again.document).expect("write again");
+        assert_eq!(document_xml_bytes(&twice), xml.as_bytes());
+    }
+
+    /// Editing a paragraph INSIDE the content control regenerates that
+    /// paragraph only: the envelope, the markers, the prolog / root / tail
+    /// and every other block are the source bytes.
+    #[test]
+    fn edit_inside_a_content_control_keeps_its_envelope() {
+        let xml = word_document(BODY_LEVEL_CONSTRUCTS);
+        let parsed = read_docx(&zip_minimal_docx(&xml, None)).expect("read");
+        let pos = engine::LogicalPos {
+            path: engine::BlockPath::top(1),
+            offset: "first".len() as u32,
+        };
+        let edited = parsed.document.insert_text(pos, "+X");
+        let bytes = write_docx(&parsed, &edited).expect("write");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        let expected = xml.replacen("first inside", "first+X inside", 1);
+        assert_eq!(out, expected, "only the edited paragraph's text changes");
+        let back = read_docx(&bytes).expect("re-read");
+        assert_eq!(
+            back.document.paragraph_text(1),
+            Some("first+X inside"),
+            "the edit persisted inside the control"
+        );
+    }
+
+    /// Splitting / merging / deleting the control's inner paragraphs
+    /// never breaks the envelope's well-formedness, and the envelope
+    /// keeps wrapping the surviving content.
+    #[test]
+    fn content_control_envelope_survives_split_merge_and_delete() {
+        let xml = word_document(BODY_LEVEL_CONSTRUCTS);
+        let parsed = read_docx(&zip_minimal_docx(&xml, None)).expect("read");
+        let doc = &parsed.document;
+        let p1 = doc.nth_paragraph(1).unwrap().clone();
+        let p2 = doc.nth_paragraph(2).unwrap().clone();
+
+        /* Split the first inner paragraph: opener stays on the left half. */
+        let (l, r) = p1.split_at(5);
+        let mut split = doc.clone();
+        split.blocks.set(1, Block::Paragraph(l));
+        split.blocks.insert(2, Block::Paragraph(r));
+        let bytes = write_docx(&parsed, &split).expect("write split");
+        crate::check_document_xml_well_formed(&bytes).expect("split well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        let open_at = out.find("<w:sdt><w:sdtPr><w:alias").expect("opener");
+        let first_at = out.find("first").expect("first half");
+        let close_at = out
+            .rfind("</w:sdtContent></w:sdt><w:bookmarkEnd")
+            .expect("closer");
+        assert!(open_at < first_at && first_at < close_at);
+        assert_eq!(out.matches("<w:sdtContent>").count(), 3);
+        assert_eq!(out.matches("</w:sdtContent>").count(), 3);
+        let back = read_docx(&bytes).expect("re-read split");
+        assert_eq!(back.document.paragraph_text(1), Some("first"));
+        assert_eq!(back.document.paragraph_text(2), Some(" inside"));
+
+        /* Merge the first two inner paragraphs: head's opener + tail's
+        (empty) closer, the nested control's closer unaffected. */
+        let mut merged = doc.clone();
+        merged.blocks.set(1, Block::Paragraph(p1.concat(&p2)));
+        merged.blocks.remove(2);
+        let bytes = write_docx(&parsed, &merged).expect("write merged");
+        crate::check_document_xml_well_formed(&bytes).expect("merge well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        assert!(out.contains("first insidesecond inside"));
+        assert_eq!(out.matches("<w:sdt>").count(), 4, "{out}");
+        assert_eq!(out.matches("</w:sdt>").count(), 4);
+
+        /* Delete the FIRST inner paragraph outright: the opener is gone,
+        so the orphaned closer is skipped and the file stays well-formed
+        (the control degrades, the content does not). */
+        let mut deleted = doc.clone();
+        deleted.blocks.remove(1);
+        let bytes = write_docx(&parsed, &deleted).expect("write deleted");
+        crate::check_document_xml_well_formed(&bytes).expect("delete well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        assert!(
+            !out.contains("<w:alias"),
+            "the outer control's opener went with its paragraph"
+        );
+        assert_eq!(
+            out.matches("<w:sdt>").count(),
+            out.matches("</w:sdt>").count()
+        );
+        assert!(out.contains("second inside") && out.contains("nested inside"));
+    }
+
+    /// Issue #119 — a text box (`mc:AlternateContent`), a VML horizontal
+    /// rule (`w:pict`) and an OLE object (`w:object`) in an EDITED
+    /// paragraph are re-emitted byte-for-byte; the paragraph regenerates
+    /// around them.
+    #[test]
+    fn drawing_objects_survive_an_edit_in_their_paragraph() {
+        let text_box = concat!(
+            r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>"#,
+            r#"<wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="1828800" cy="914400"/>"#,
+            r#"<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="1" name="Text Box 1"/>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></a:xfrm>"#,
+            r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>"#,
+            r#"<wps:txbx><w:txbxContent><w:p><w:r><w:t>in the box</w:t></w:r></w:p></w:txbxContent></wps:txbx>"#,
+            r#"<wps:bodyPr rot="0"/></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice>"#,
+            r##"<mc:Fallback><w:pict><v:shape id="Text Box 1" o:spid="_x0000_s1026" type="#_x0000_t202" style="width:144pt;height:1in">"##,
+            r#"<v:textbox><w:txbxContent><w:p><w:r><w:t>in the box</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback>"#,
+            r#"</mc:AlternateContent>"#,
+        );
+        let rule = r##"<w:pict><v:rect id="_x0000_i1025" style="width:0;height:1.5pt" o:hralign="center" o:hrstd="t" o:hr="t" fillcolor="#a0a0a0" stroked="f"/></w:pict>"##;
+        let ole = r##"<w:object w:dxaOrig="1440" w:dyaOrig="720"><v:shape id="_x0000_i1027" type="#_x0000_t75" style="width:72pt;height:36pt" o:ole=""><v:imagedata r:id="rId9" o:title=""/></v:shape><o:OLEObject Type="Embed" ProgID="Package" ShapeID="_x0000_i1027" DrawAspect="Content" ObjectID="_1234" r:id="rId10"/></w:object>"##;
+        let body = format!(
+            concat!(
+                r#"<w:p><w:r><w:t xml:space="preserve">a </w:t></w:r><w:r>{text_box}</w:r>"#,
+                r#"<w:r><w:rPr><w:noProof/></w:rPr>{rule}</w:r><w:r>{ole}</w:r>"#,
+                r#"<w:r><w:t xml:space="preserve"> z</w:t></w:r></w:p>"#,
+            ),
+            text_box = text_box,
+            rule = rule,
+            ole = ole
+        );
+        let xml = word_document(&body);
+        let parsed = read_docx(&zip_minimal_docx(&xml, None)).expect("read");
+        let p = parsed.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "a \u{FFFC}\u{FFFC}\u{FFFC} z");
+        assert_eq!(p.inline_objects.len(), 3);
+        let kinds: Vec<(String, i64, i64)> = p
+            .inline_objects
+            .iter()
+            .map(|o| match &o.kind {
+                InlineKind::Image {
+                    rel_id,
+                    width_emu,
+                    height_emu,
+                } => (rel_id.clone(), *width_emu, *height_emu),
+                /* Issue #83 — the text box is a story; its container
+                rides the story, not the object. */
+                InlineKind::TextBox {
+                    width_emu,
+                    height_emu,
+                    story,
+                } => {
+                    assert!(
+                        story
+                            .source_xml
+                            .as_deref()
+                            .is_some_and(|s| s.starts_with("<mc:AlternateContent"))
+                    );
+                    ("<textbox>".into(), *width_emu, *height_emu)
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("<textbox>".into(), 1_828_800, 914_400),
+                (String::new(), 0, 19_050),
+                ("rId9".into(), 914_400, 457_200)
+            ]
+        );
+        assert!(p.inline_objects[1..].iter().all(|o| o.source_xml.is_some()));
+
+        /* Zero-edit: byte-identical (passthrough). */
+        let resaved = write_docx(&parsed, &parsed.document).expect("write");
+        assert_eq!(document_xml_bytes(&resaved), xml.as_bytes());
+
+        /* Edit the paragraph: regenerated around the three preserved
+        objects, byte-exact — the run rPr (`<w:noProof/>`) included. */
+        let pos = engine::LogicalPos {
+            path: engine::BlockPath::top(0),
+            offset: 1,
+        };
+        let edited = parsed.document.insert_text(pos, "bc");
+        let bytes = write_docx(&parsed, &edited).expect("write edited");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        assert_eq!(out, xml.replacen("a </w:t>", "abc </w:t>", 1));
+        let back = read_docx(&bytes).expect("re-read");
+        assert_eq!(
+            back.document.nth_paragraph(0).unwrap().inline_objects.len(),
+            3
+        );
+    }
+
+    /// Issue #119 — a picture's source element is verbatim (docPr name /
+    /// descr, `<a:extLst>` kept) until the picture is resized, then it
+    /// regenerates from the typed fields.
+    #[test]
+    fn picture_source_is_verbatim_until_resized() {
+        let drawing = concat!(
+            r#"<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" wp14:anchorId="1A2B3C4D">"#,
+            r#"<wp:extent cx="914400" cy="457200"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+            r#"<wp:docPr id="3" name="Picture 3" descr="alt text that must survive"/>"#,
+            r#"<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>"#,
+            r#"<pic:nvPicPr><pic:cNvPr id="3" name="photo.png"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+            r#"<pic:blipFill><a:blip r:embed="rId5"><a:extLst><a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}"/></a:extLst></a:blip>"#,
+            r#"<a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+            r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>"#,
+            r#"</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>"#,
+        );
+        let body = format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">pic </w:t></w:r><w:r><w:rPr><w:noProof/></w:rPr>{drawing}</w:r><w:r><w:t xml:space="preserve"> end</w:t></w:r></w:p>"#
+        );
+        let xml = word_document(&body);
+        let parsed = read_docx(&zip_minimal_docx(&xml, None)).expect("read");
+        let pos = engine::LogicalPos {
+            path: engine::BlockPath::top(0),
+            offset: 0,
+        };
+        let edited = parsed.document.insert_text(pos, "A ");
+        let bytes = write_docx(&parsed, &edited).expect("write edited");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        assert_eq!(out, xml.replacen("pic </w:t>", "A pic </w:t>", 1));
+
+        /* Resize → regenerated picture: new extent, typed shape. */
+        let mut resized = parsed.document.clone();
+        let mut p = resized.nth_paragraph(0).unwrap().clone();
+        if let InlineKind::Image { width_emu, .. } = &mut p.inline_objects[0].kind {
+            *width_emu = 1_828_800;
+        }
+        p.dirty = true;
+        p.source_xml = None;
+        resized.blocks.set(0, Block::Paragraph(p));
+        let bytes = write_docx(&parsed, &resized).expect("write resized");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        assert!(
+            out.contains(r#"<wp:extent cx="1828800" cy="457200"/>"#),
+            "{out}"
+        );
+        assert!(
+            !out.contains("alt text that must survive"),
+            "regenerated from the typed fields"
+        );
+        assert!(
+            out.contains(r#"<w:r><w:rPr><w:noProof/></w:rPr><w:drawing>"#),
+            "{out}"
+        );
+    }
+
+    /// Issue #112 — the trailing `<w:sectPr>` is the source's bytes until
+    /// page setup changes, then it regenerates.
+    #[test]
+    fn section_source_is_verbatim_until_page_setup_changes() {
+        let xml = word_document(r#"<w:p><w:r><w:t>x</w:t></w:r></w:p>"#);
+        let parsed = read_docx(&zip_minimal_docx(&xml, None)).expect("read");
+        assert_eq!(
+            parsed.document.body_section.source_xml.as_deref(),
+            Some(WORD_SECT_PR.as_bytes())
+        );
+        let mut landscape = parsed.document.clone();
+        landscape.body_section.geometry.width = 842.0;
+        landscape.body_section.geometry.height = 595.0;
+        let bytes = write_docx(&parsed, &landscape).expect("write");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        assert!(
+            out.contains(r#"<w:pgSz w:w="16840" w:h="11900" w:orient="landscape"/>"#),
+            "{out}"
+        );
+        assert!(
+            !out.contains("w:docGrid"),
+            "regenerated: unmodeled children gone"
+        );
+        assert!(out.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<w:document xmlns:wpc="));
+        assert!(out.ends_with("</w:sectPr></w:body>\r\n</w:document>\r\n"));
+    }
+
+    /// Issue #120 — a cell-level `<w:sdt>` and a self-closing cell `<w:p/>`
+    /// survive a table regeneration.
+    #[test]
+    fn cell_level_envelope_and_self_closing_paragraph_survive_a_cell_edit() {
+        let body = concat!(
+            r#"<w:tbl><w:tblGrid><w:gridCol w:w="2400"/><w:gridCol w:w="2400"/></w:tblGrid><w:tr>"#,
+            r#"<w:tc><w:sdt><w:sdtPr><w:tag w:val="cell"/></w:sdtPr><w:sdtContent>"#,
+            r#"<w:p><w:r><w:t xml:space="preserve">cell</w:t></w:r></w:p></w:sdtContent></w:sdt></w:tc>"#,
+            r#"<w:tc><w:p w:rsidR="00AA"/></w:tc>"#,
+            r#"</w:tr></w:tbl><w:p><w:r><w:t>tail</w:t></w:r></w:p>"#,
+        );
+        let xml = word_document(body);
+        let parsed = read_docx(&zip_minimal_docx(&xml, None)).expect("read");
+        let t = parsed.document.blocks[0].as_table().unwrap();
+        assert_eq!(t.rows[0].cells[0].blocks.len(), 1);
+        assert_eq!(
+            t.rows[0].cells[1].blocks.len(),
+            1,
+            "the <w:p/> cell has its paragraph"
+        );
+        let resaved = write_docx(&parsed, &parsed.document).expect("write");
+        assert_eq!(document_xml_bytes(&resaved), xml.as_bytes());
+
+        let pos = engine::LogicalPos {
+            path: engine::BlockPath::top(0)
+                .push(engine::PathStep::Cell { row: 0, col: 0 })
+                .push(engine::PathStep::Block(0)),
+            offset: 4,
+        };
+        let edited = parsed.document.insert_text(pos, "!");
+        let bytes = write_docx(&parsed, &edited).expect("write edited");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        assert!(
+            out.contains(r#"<w:tc><w:sdt><w:sdtPr><w:tag w:val="cell"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t xml:space="preserve">cell!</w:t></w:r></w:p></w:sdtContent></w:sdt></w:tc>"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<w:tc><w:p w:rsidR="00AA"/></w:tc>"#),
+            "{out}"
+        );
+        let back = read_docx(&bytes).expect("re-read");
+        let t = back.document.blocks[0].as_table().unwrap();
+        assert_eq!(
+            t.rows[0].cells[0].blocks[0].as_paragraph().unwrap().text,
+            "cell!"
+        );
+    }
+
+    /// Issue #112 — the live editor's save path (`build_minimal_docx`, no
+    /// archive) re-emits the envelope too.
+    #[test]
+    fn ui_save_path_keeps_the_document_envelope() {
+        let xml = word_document(BODY_LEVEL_CONSTRUCTS);
+        let parsed = read_docx(&zip_minimal_docx(&xml, None)).expect("read");
+        let bytes = build_minimal_docx(&parsed.document).expect("UI save");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+        assert_eq!(document_xml_bytes(&bytes), xml.as_bytes());
+        /* A fresh document still gets the stock synthesized header. */
+        let fresh = build_minimal_docx(&DocumentTree::from_text("x")).expect("fresh");
+        let out = String::from_utf8(document_xml_bytes(&fresh)).unwrap();
+        assert!(out.starts_with(DOC_XML_HEADER));
+        assert!(out.ends_with("<w:sectPr/></w:body></w:document>"));
+    }
+
+    /// A root that never declared the DrawingML prefixes gets them added
+    /// when a picture is pasted in — never an unbound prefix.
+    #[test]
+    fn missing_root_bindings_are_patched_in_for_regenerated_content() {
+        let xml = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:p><w:r><w:t>plain</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#,
+        );
+        let parsed = read_docx(&zip_minimal_docx(xml, None)).expect("read");
+        let doc = parsed.document.insert_inline_image_at(
+            engine::LogicalPos {
+                path: engine::BlockPath::top(0),
+                offset: 5,
+            },
+            engine::ImageBlob {
+                content_type: "image/png".into(),
+                data: vec![0x89, b'P', b'N', b'G'],
+            },
+            914_400,
+            457_200,
+        );
+        let bytes = write_docx(&parsed, &doc).expect("write");
+        crate::check_document_xml_well_formed(&bytes)
+            .expect("patched root binds the picture prefixes");
+        let out = String::from_utf8(document_xml_bytes(&bytes)).unwrap();
+        assert!(
+            out.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<w:document xmlns:w=")
+        );
+        assert!(
+            out.contains(" xmlns:wp=\"") && out.contains(" xmlns:pic=\""),
+            "{out}"
+        );
+        assert_eq!(
+            patch_root_bindings(b"<w:document xmlns:w=\"x\">", &[("w", "x")]),
+            "<w:document xmlns:w=\"x\">"
+        );
+        assert_eq!(
+            patch_root_bindings(b"<w:document xmlns:w=\"x\"/>", &[("r", "y")]),
+            "<w:document xmlns:w=\"x\" xmlns:r=\"y\"/>"
+        );
     }
 }

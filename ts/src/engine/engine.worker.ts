@@ -114,6 +114,11 @@ let pendingLogWrites: Promise<unknown> = Promise.resolve();
 /* Issue #85 — fault-injection countdown; `null` = disarmed. */
 let trapAfterCommands: number | null = null;
 
+/* Issue #194 — the engine `document_mutation_seq` the last accessibility
+   delta was broadcast for. A fresh engine (INIT, crash recovery — a new
+   worker every time) starts at 0, matching this. */
+let broadcastMutationSeq = 0;
+
 /* Highest `version` seen on a real `Painted` event — synthetic paint-dims
    broadcasts reuse it so `paintVersion` consumers never see a reset to 0. */
 let lastPaintVersion = 0;
@@ -876,6 +881,8 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             const delta = await dispatch({ type: 'REQUEST_ACCESSIBILITY_DELTA' });
             if (delta.type === 'ACCESSIBILITY_TREE_DELTA') {
                 self.postMessage({ evt: delta });
+                /* Issue #194 — the replace covers every replayed edit. */
+                broadcastMutationSeq = engine.document_mutation_seq();
             }
         }
     } catch (e: unknown) {
@@ -884,55 +891,10 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
 }
 
 /**
- * Commands whose dispatch changes document content — they invalidate the
- * accessibility tree, so the worker re-broadcasts it afterward (§10).
- */
-function mutatesDocument(cmd: Command): boolean {
-    switch (cmd.type) {
-        case 'INSERT_TEXT':
-        case 'DELETE_RANGE':
-        case 'DELETE_AT_CARET':
-        case 'REPLACE_RANGE':
-        case 'SPLIT_PARAGRAPH':
-        case 'MERGE_PARAGRAPH':
-        case 'APPLY_FORMATTING':
-        case 'SET_PARAGRAPH_ALIGN':
-        case 'INSERT_IMAGE':
-        /* Issue #165 — a new text box is a new a11y region. */
-        case 'INSERT_TEXT_BOX':
-        case 'PASTE_PLAIN':
-        case 'PASTE_HTML':
-        case 'END_COMPOSITION':
-        case 'UNDO':
-        case 'REDO':
-        case 'RENDER_PAGE':
-        case 'LOAD_DOCX':
-        case 'OPEN_DOCUMENT':
-        /* Phase 5 PR 3 table mutations. Each one flips a Table's
-           `dirty` bit; the worker must broadcast a fresh a11y delta so
-           the TablePanel's `tables` signal re-renders and the mirror
-           DOM exposes the new structure to screen readers. */
-        case 'INSERT_TABLE':
-        case 'DELETE_TABLE':
-        case 'INSERT_ROW':
-        case 'DELETE_ROW':
-        case 'INSERT_COLUMN':
-        case 'DELETE_COLUMN':
-        case 'MERGE_CELLS':
-        case 'SPLIT_CELL':
-        case 'SET_CELL_SHADING':
-        case 'SET_CELL_BORDERS':
-            return true;
-        default:
-            return false;
-    }
-}
-
-/**
  * Whether a successfully dispatched command belongs in the durable event
  * log. Recovery replays the tail through `dispatch`, so anything that moves
  * engine state a later logged command depends on must be kept — document
- * mutations (see `mutatesDocument`), selection/caret moves (caret-relative
+ * mutations, selection/caret moves (caret-relative
  * edits like `INSERT_TEXT` at `undefined` replay wrong without them),
  * composition, font loads, and view state. Pure read-back queries are
  * skipped: they replay as no-ops, and the per-pointermove `HIT_TEST` alone
@@ -1002,8 +964,19 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
         /* §10 / Backlog #10: after a document mutation, broadcast an
            accessibility delta. The message carries no `id`, so EngineClient
            fans it out to subscribers — the mirror DOM reconciler patches only
-           the paragraphs that changed. */
-        if (mutatesDocument(msg.cmd)) {
+           the paragraphs that changed.
+
+           Issue #194 — "was this a mutation?" is the ENGINE's answer, not a
+           hand-kept list of command types (that list drifted: styles, lists,
+           header/footer + note edits, fields, sections, table properties,
+           image moves, TOC… never refreshed the mirror). The engine bumps
+           `document_mutation_seq` once per command that changed the
+           document; comparing it to the last value we broadcast for also
+           catches worker-internal dispatches (boot, render date) that
+           restamped the document between client commands. */
+        const mutationSeq = engine.document_mutation_seq();
+        if (mutationSeq !== broadcastMutationSeq) {
+            broadcastMutationSeq = mutationSeq;
             const delta = await dispatch({ type: 'REQUEST_ACCESSIBILITY_DELTA' } as Command);
             self.postMessage({ evt: delta });
             /* Bug-fix sprint after Phase 8b — every mutating command rendered
@@ -1051,6 +1024,8 @@ function broadcastPaintDims(): void {
             /** Issue #86 — real cost (ms) of the last actual paint, replayed
              *  here since this side-channel doesn't repaint. */
             paint_ms: number;
+            /** Issue #194 — the engine's document-mutation counter. */
+            mutation_seq: number;
         };
         self.postMessage({
             evt: {
@@ -1080,6 +1055,8 @@ function broadcastPaintDims(): void {
                 ride the synthetic side-channel too, so a consumer never
                 sees a degraded paint "heal" on the next mutation. */
                 layout_degraded: dims.layout_degraded ?? [],
+                /* Issue #194 — same counter the real paint carries. */
+                mutation_seq: dims.mutation_seq,
             },
         });
     } catch (e: unknown) {

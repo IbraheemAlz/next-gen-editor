@@ -147,12 +147,21 @@ fn prefix_of(qname: &[u8]) -> Option<String> {
 /// fragment relying on a binding from some intermediate ancestor cannot
 /// be preserved safely and reports `false`.
 pub fn bound_by_root(fragment: &[u8], scope: &NamespaceScope) -> bool {
-    let mut used: BTreeSet<String> = BTreeSet::new();
-    let mut declared_on_root: BTreeSet<String> = BTreeSet::new();
     let mut reader = Reader::from_reader(fragment);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
-    let mut seen_root = false;
+    /* Issue #119 — declarations are scoped: a prefix declared on an
+    element (or any ancestor inside the fragment) binds that element
+    and its subtree, exactly as XML Namespaces resolve it. A drawing
+    fragment declaring `xmlns:wps` on its `<wps:wsp>` is self-contained
+    and stays so wherever the writer splices it. */
+    let mut declared_stack: Vec<Vec<String>> = Vec::new();
+    let in_scope = |p: &str, stack: &[Vec<String>]| -> bool {
+        p == "w"
+            || p == "xml"
+            || stack.iter().any(|d| d.iter().any(|q| q == p))
+            || scope.uri(p).is_some()
+    };
     loop {
         let ev = match reader.read_event_into(&mut buf) {
             Ok(ev) => ev,
@@ -161,8 +170,11 @@ pub fn bound_by_root(fragment: &[u8], scope: &NamespaceScope) -> bool {
             bytes rather than lose them. */
             Err(_) => return true,
         };
+        let is_empty = matches!(ev, Event::Empty(_));
         match ev {
             Event::Start(e) | Event::Empty(e) => {
+                let mut declared: Vec<String> = Vec::new();
+                let mut used: BTreeSet<String> = BTreeSet::new();
                 if let Some(p) = prefix_of(e.name().as_ref()) {
                     used.insert(p);
                 }
@@ -172,24 +184,87 @@ pub fn bound_by_root(fragment: &[u8], scope: &NamespaceScope) -> bool {
                         continue;
                     }
                     if let Some(p) = key.strip_prefix(b"xmlns:") {
-                        if !seen_root {
-                            declared_on_root.insert(String::from_utf8_lossy(p).into_owned());
-                        }
+                        declared.push(String::from_utf8_lossy(p).into_owned());
                         continue;
                     }
                     if let Some(p) = prefix_of(key) {
                         used.insert(p);
                     }
                 }
-                seen_root = true;
+                declared_stack.push(declared);
+                if !used.iter().all(|p| in_scope(p, &declared_stack)) {
+                    return false;
+                }
+                if is_empty {
+                    declared_stack.pop();
+                }
+            }
+            Event::End(_) => {
+                declared_stack.pop();
             }
             Event::Eof => break,
             _ => {}
         }
         buf.clear();
     }
-    used.iter()
-        .all(|p| p == "w" || p == "xml" || declared_on_root.contains(p) || scope.uri(p).is_some())
+    true
+}
+
+/// Issue #112 — every namespace prefix `xml` (a body: a sequence of
+/// sibling elements, no root of its own) uses without an in-scope
+/// declaration of its own, i.e. the prefixes the enclosing root MUST bind.
+/// `w` and `xml` are always reported bound-elsewhere and never returned.
+/// A prefix declared on an ancestor inside the sequence (`<a:graphic
+/// xmlns:a=…>`, the way Word writes DrawingML) does not count.
+pub fn unbound_prefixes(xml: &[u8]) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut declared_stack: Vec<Vec<String>> = Vec::new();
+    while let Ok(ev) = reader.read_event_into(&mut buf) {
+        let is_empty = matches!(ev, Event::Empty(_));
+        match ev {
+            Event::Start(e) | Event::Empty(e) => {
+                let mut declared: Vec<String> = Vec::new();
+                let mut used: BTreeSet<String> = BTreeSet::new();
+                if let Some(p) = prefix_of(e.name().as_ref()) {
+                    used.insert(p);
+                }
+                for a in e.attributes().flatten() {
+                    let key = a.key.as_ref();
+                    if key == b"xmlns" {
+                        continue;
+                    }
+                    if let Some(p) = key.strip_prefix(b"xmlns:") {
+                        declared.push(String::from_utf8_lossy(p).into_owned());
+                        continue;
+                    }
+                    if let Some(p) = prefix_of(key) {
+                        used.insert(p);
+                    }
+                }
+                declared_stack.push(declared);
+                for p in used {
+                    let bound =
+                        p == "w" || p == "xml" || declared_stack.iter().any(|d| d.contains(&p));
+                    if !bound {
+                        out.insert(p);
+                    }
+                }
+                if is_empty {
+                    declared_stack.pop();
+                }
+            }
+            Event::End(_) => {
+                declared_stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
 }
 
 /// Append `fragment` to the bag behind `slot` when the writer can keep it
@@ -305,6 +380,22 @@ mod tests {
         /* Out-of-range / inverted ranges. */
         assert_eq!(slice_element(xml, 0, xml.len() + 1, b"w:body"), None);
         assert_eq!(slice_element(xml, 10, 8, b"w:p"), None);
+    }
+
+    /// Issue #112 — only prefixes the body uses WITHOUT an in-scope
+    /// declaration of its own need the root; `w` / `xml` never count.
+    #[test]
+    fn unbound_prefixes_ignores_locally_declared_ones() {
+        let body = concat!(
+            r#"<w:p w14:paraId="1"><w:r><w:t xml:space="preserve">x</w:t>"#,
+            r#"<w:drawing><wp:inline><a:graphic xmlns:a="urn:a"><a:graphicData>"#,
+            r#"<pic:pic xmlns:pic="urn:pic"><pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic>"#,
+            r#"</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>plain a: text pic: text</w:t></w:r></w:p>"#,
+        );
+        let unbound: Vec<String> = unbound_prefixes(body.as_bytes()).into_iter().collect();
+        assert_eq!(unbound, ["r", "w14", "wp"]);
+        assert!(unbound_prefixes(b"<w:p><w:r><w:t>a: b</w:t></w:r></w:p>").is_empty());
     }
 
     #[test]
