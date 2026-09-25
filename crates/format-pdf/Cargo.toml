@@ -15,12 +15,15 @@ flate2 = { workspace = true }
 png = { workspace = true }
 gif = { workspace = true, optional = true }
 image-webp = { workspace = true, optional = true }
+tiff = { workspace = true, optional = true }
 
 [features]
-# Issue #189 — pure-Rust GIF / WebP decoders for PDF image XObjects. On by
-# default; drop either (`default-features = false`) if the 15 MiB compressed
-# wasm budget is ever threatened — the format then degrades to the typed
-# `UnsupportedFormat` skip warning it had before.
-default = ["gif", "webp"]
+# Issue #189 — pure-Rust GIF / WebP decoders for PDF image XObjects. Issue
+# #207 adds TIFF the same way (BMP is hand-written, no feature needed — see
+# `src/image.rs`). All on by default; drop any (`default-features = false`)
+# if the 15 MiB compressed wasm budget is ever threatened — the format then
+# degrades to the typed `UnsupportedFormat` skip warning it had before.
+default = ["gif", "webp", "tiff"]
 gif = ["dep:gif"]
 webp = ["dep:image-webp"]
+tiff = ["dep:tiff"]
