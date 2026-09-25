@@ -563,6 +563,12 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
             push_escaped_attr(parent, &mut out);
             out.push_str("\"/>");
         }
+        /* Issue #277 — CT_Style order: name, aliases, basedOn, next. */
+        if let Some(next) = &def.next {
+            out.push_str("<w:next w:val=\"");
+            push_escaped_attr(next, &mut out);
+            out.push_str("\"/>");
+        }
         emit_ppr(&def.para, None, None, None, None, &mut out);
         emit_rpr(&def.run, &mut out);
         out.push_str("</w:style>");
@@ -6831,6 +6837,30 @@ mod tests {
         assert!(!out.contains("widowControl"), "{out}");
     }
 
+    /// Issue #277 — a regenerated `styles.xml` keeps `<w:next>` (after
+    /// `<w:basedOn>`, CT_Style order) and the reader maps it back.
+    #[test]
+    fn styles_xml_round_trips_the_next_style() {
+        let mut doc = engine::DocumentTree::default();
+        doc.styles.insert(
+            "Heading1".into(),
+            engine::ParagraphStyle {
+                id: "Heading1".into(),
+                name: "heading 1".into(),
+                based_on: Some("Normal".into()),
+                next: Some("Normal".into()),
+                ..Default::default()
+            },
+        );
+        let xml = String::from_utf8(build_styles_xml(&doc)).expect("utf8");
+        assert!(
+            xml.contains(r#"<w:basedOn w:val="Normal"/><w:next w:val="Normal"/>"#),
+            "{xml}"
+        );
+        let table = crate::parts::styles::parse_styles_xml(xml.as_bytes()).expect("parse");
+        assert_eq!(table.by_id["Heading1"].next.as_deref(), Some("Normal"));
+    }
+
     #[test]
     fn round_trip_para_properties() {
         use engine::{Indent, LineHeight, Spacing, TextDirection};
@@ -9564,6 +9594,22 @@ mod tests {
             .expect("well-formed");
         let back = read_docx(&write_docx(&archive, &edited).unwrap()).expect("re-read");
         assert_eq!(back.document.paragraph_text(0), Some("Hello wr"));
+    }
+
+    /// Issue #276 — typing at the END of a formatted run (the underlined
+    /// one) continues it: the typed text inherits the run's formatting, so
+    /// the save is exactly source + the inserted bytes inside that run —
+    /// same rsid, same verbatim `<w:rPr>` — instead of a fresh plain
+    /// `<w:r>` after it.
+    #[test]
+    fn typing_after_a_formatted_run_continues_it() {
+        let (xml, archive) = markup_archive();
+        let end = "Hello wrold underlined".len();
+        let edited = archive.document.insert_text(at(0, end), "ZZ");
+        let p = edited.nth_paragraph(0).unwrap();
+        assert!(p.style_at(end as u32 + 1).underline.is_some());
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(out, xml.replacen(" underlined<", " underlinedZZ<", 1));
     }
 
     /// Issues #199 / #106 — a minimal package ships no `styles.xml`, so the

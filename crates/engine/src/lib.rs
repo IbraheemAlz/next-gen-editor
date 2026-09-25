@@ -332,6 +332,12 @@ pub struct ParagraphStyle {
     /// `<w:rPr>` overrides this style contributes — applied to spans
     /// during cascade resolution since issue #29 (closed).
     pub run: SpanStyle,
+    /// Issue #277 — `<w:next w:val>`: the style Word gives the NEW
+    /// paragraph when Enter is pressed at the very end of a paragraph
+    /// in this style (Heading 1 → Normal). `None` ⇒ the same style.
+    /// Skipped when `None`, so a pre-#277 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// Phase 8a — author + date + body for one entry of `word/comments.xml`.
@@ -2047,6 +2053,30 @@ pub struct SpanStyle {
 }
 
 impl SpanStyle {
+    /// Issue #276 — this run's formatting as continued by text typed
+    /// next to it: everything except revision records. A grab-bag
+    /// `<w:rPrChange>` (a tracked formatting change) belongs to the text
+    /// it was recorded on; copying it onto new text would forge a
+    /// revision and duplicate its `w:id`.
+    pub fn for_typing(&self) -> SpanStyle {
+        let Some(bag) = self.grab_bag.as_deref() else {
+            return self.clone();
+        };
+        let kept: Vec<Vec<u8>> = bag
+            .fragments
+            .iter()
+            .filter(|f| !f.starts_with(b"<w:rPrChange"))
+            .cloned()
+            .collect();
+        if kept.len() == bag.fragments.len() {
+            return self.clone();
+        }
+        SpanStyle {
+            grab_bag: (!kept.is_empty()).then(|| Box::new(GrabBag { fragments: kept })),
+            ..self.clone()
+        }
+    }
+
     /// Overlay `patch`'s set fields onto `self`.
     pub fn merged_with(self, patch: SpanStyle) -> SpanStyle {
         SpanStyle {
@@ -3370,6 +3400,58 @@ impl Paragraph {
     /// merges the patch's set fields. Adjacent equal spans are coalesced and
     /// default-only spans dropped, so the representation stays minimal.
     pub fn apply_style(&self, start: u32, end: u32, patch: SpanStyle) -> Paragraph {
+        self.restyle_with(start, end, |style| style.merged_with(patch.clone()))
+    }
+
+    /// Issue #276 — the style typing at byte `at` produces (before any
+    /// sticky formatting): the character before `at`, or at the
+    /// paragraph start the character after it, never an inline-object anchor.
+    pub fn typing_style_at(&self, at: u32) -> SpanStyle {
+        self.inheriting_span(self.snap_offset(at))
+            .map_or_else(SpanStyle::default, |i| self.spans[i].style.for_typing())
+    }
+
+    /// Issue #276 — index of the style span an insertion at (snapped)
+    /// byte `off` continues: the one holding the character BEFORE `off`
+    /// (`start < off <= end`), or at the paragraph start the one holding
+    /// the character after it (`start == 0`). `None` ⇒ that character is
+    /// unstyled, so the inserted text is too. Mirrors
+    /// `SourceMarkup::note_insert`'s run choice.
+    ///
+    /// An inline-object anchor (image, note reference, text box — its
+    /// U+FFFC sentinel) never passes its run formatting on: typing after
+    /// a footnote reference must not come out superscript, nor text after
+    /// a picture inherit its `noProof` / language tagging.
+    fn inheriting_span(&self, off: u32) -> Option<usize> {
+        let donor = if off == 0 {
+            0
+        } else {
+            let before = self.text[..off as usize].chars().next_back()?;
+            off - before.len_utf8() as u32
+        };
+        if self.inline_objects.iter().any(|o| o.at == donor) {
+            return None;
+        }
+        if off == 0 {
+            self.spans.iter().position(|s| s.start == 0 && s.end > 0)
+        } else {
+            self.spans
+                .iter()
+                .position(|s| s.start < off && off <= s.end)
+        }
+    }
+
+    /// Issue #276 — return a copy whose bytes `[start, end)` carry
+    /// exactly `style` (replacing, not merging, whatever they had).
+    /// Typing over a selection gives the new text the formatting of the
+    /// first replaced character, as Word does.
+    pub fn set_style(&self, start: u32, end: u32, style: SpanStyle) -> Paragraph {
+        self.restyle_with(start, end, |_| style.clone())
+    }
+
+    /// Shared body of [`Self::apply_style`] / [`Self::set_style`]: every
+    /// sub-range of `[start, end)` gets `f(current style)`.
+    fn restyle_with(&self, start: u32, end: u32, f: impl Fn(SpanStyle) -> SpanStyle) -> Paragraph {
         let text_len = self.text.len() as u32;
         let start = self.snap_offset(start);
         let end = self.snap_offset(end);
@@ -3393,7 +3475,7 @@ impl Paragraph {
             let (a, b) = (win[0], win[1]);
             let mut style = self.style_at(a);
             if a >= start && b <= end {
-                style = style.merged_with(patch.clone());
+                style = f(style);
             }
             if style == SpanStyle::default() {
                 continue;
@@ -3613,8 +3695,12 @@ impl Paragraph {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields,
-            style_id: None,
-            direct_overrides: ParaProperties::default(),
+            /* Issue #277 — the paragraph style binding and the direct
+            paragraph formatting are not offset-anchored (same class as
+            `apply_style`, issue #56): deleting characters inside a
+            Heading must not demote it to an unstyled paragraph. */
+            style_id: self.style_id.clone(),
+            direct_overrides: self.direct_overrides.clone(),
             /* Phase 3 (#40) — NOT cleared with the overlays above: the
             marker has no byte offsets and the paragraph mark survives
             an in-paragraph character deletion. */
@@ -3719,8 +3805,14 @@ impl Paragraph {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: fields_left,
-                style_id: None,
-                direct_overrides: ParaProperties::default(),
+                /* Issue #277 — both halves keep the paragraph style and
+                the direct paragraph formatting (Word: a mid-paragraph
+                split leaves two paragraphs in the same style). The
+                next-style rule for Enter at the paragraph END is
+                `DocumentTree::split_paragraph`'s business, not this
+                primitive's (a clipboard slice must keep the style). */
+                style_id: self.style_id.clone(),
+                direct_overrides: self.direct_overrides.clone(),
                 /* Phase 3 (#40) — the LEFT half receives a brand-new
                 paragraph mark; the original mark (and any section
                 marker riding it) belongs to the right half. */
@@ -3747,8 +3839,8 @@ impl Paragraph {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: fields_right,
-                style_id: None,
-                direct_overrides: ParaProperties::default(),
+                style_id: self.style_id.clone(),
+                direct_overrides: self.direct_overrides.clone(),
                 /* Phase 3 (#40) — the ORIGINAL paragraph mark terminates
                 the right half, so a section marker travels with it. */
                 section_end: self.section_end.clone(),
@@ -6224,20 +6316,41 @@ impl DocumentTree {
         let off = at.offset;
         let mut edit = None;
         let mutated = mutate_paragraph_in_top(&mut blocks, &target, |para| {
+            /* Issue #276 — pick the span to continue on the PRE-edit
+            paragraph, at the offset `splice_text` snaps to. */
+            let grow = para.inheriting_span(para.snap_offset(off.min(para.text.len() as u32)));
             /* Issues #199 / #106 / #252 — ONE splice drives the source
             markup here and the comment anchors below. */
             let e = para.splice_text(off, 0, text);
             edit = Some(e);
-            /* Shift styled spans across the insertion point — a span
-            containing the point grows, spans wholly after it slide right. */
+            /* Issue #276 — the inserted text continues the formatting of
+            the character BEFORE the insertion point (at the paragraph
+            start: the character after it), as in Word: the span holding
+            that character grows over the insertion, every span at/after
+            the point slides right. This is exactly the source run
+            `SourceMarkup::note_insert` extends, so a save continues the
+            source `<w:r>` (rsids included, #199) instead of minting a
+            fresh unformatted one. Sticky (pending) formatting is layered
+            on top by the interactive caller. */
             let off = e.at;
             let len = text.len() as u32;
-            for s in &mut para.spans {
-                if s.start >= off {
-                    s.start += len;
-                }
-                if s.end > off {
+            let donor = grow.map(|i| para.spans[i].style.clone());
+            for (i, s) in para.spans.iter_mut().enumerate() {
+                if Some(i) == grow {
                     s.end += len;
+                } else if s.start >= off {
+                    s.start += len;
+                    s.end += len;
+                }
+            }
+            /* ... minus revision records: a donor run's tracked
+            formatting change (`<w:rPrChange>`, grab bag) describes an
+            edit of THAT text, not of the new text — and re-emitting it
+            would duplicate its `w:id`. */
+            if let Some(donor) = donor {
+                let typed = donor.for_typing();
+                if typed != donor {
+                    *para = para.set_style(off, off + len, typed);
                 }
             }
             /* Issue #43 — FIELD anchors shift too (they render live now;
@@ -6360,6 +6473,18 @@ impl DocumentTree {
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
         }
+    }
+
+    /// Issue #276 — give bytes `[at.offset, end)` of the paragraph at
+    /// `at.path` exactly `style` ([`Paragraph::set_style`]). Used to
+    /// restyle text just typed over a selection; a no-op when the path
+    /// does not address a paragraph.
+    pub fn set_span_style(&self, at: LogicalPos, end: u32, style: SpanStyle) -> Self {
+        let mut out = self.clone();
+        let _ = mutate_paragraph_in_top(&mut out.blocks, &at.path, |para| {
+            *para = para.set_style(at.offset, end, style);
+        });
+        out
     }
 
     fn apply_style_single(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
@@ -7268,6 +7393,16 @@ impl DocumentTree {
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
         }
+    }
+
+    /// Issue #277 — the style a paragraph created by Enter at the end
+    /// of a `style_id` paragraph takes: the style's `<w:next>` when it
+    /// names a DIFFERENT style this document defines, else `None`
+    /// (keep the same style).
+    pub fn next_style_after(&self, style_id: Option<&str>) -> Option<String> {
+        let id = style_id?;
+        let next = self.styles.get(id)?.next.as_deref()?;
+        (next != id && self.styles.contains_key(next)).then(|| next.to_owned())
     }
 
     /// Sprint 12 (#11) — resolve the paragraph cascade for `style_id`
@@ -8688,7 +8823,19 @@ impl DocumentTree {
         let Some(p) = self.paragraph_at_path(&at.path) else {
             return self.clone();
         };
-        let (left, right) = p.split_at(at.offset);
+        let (left, mut right) = p.split_at(at.offset);
+        /* Issue #277 — Word's "next style" rule: Enter at the very END
+        of a paragraph gives the NEW paragraph its style's `<w:next>`
+        (Heading 1 → Normal); a split anywhere else keeps the style on
+        both halves (`split_at`). An unknown / absent next keeps the
+        same style. The direct paragraph formatting and the list binding
+        survive the switch, exactly as `set_paragraph_style` keeps them. */
+        if p.snap_offset(at.offset) as usize == p.text.len()
+            && let Some(next) = self.next_style_after(right.style_id.as_deref())
+        {
+            right.style_id = Some(next);
+            recompute_paragraph_props(&mut right, &self.styles, &self.style_defaults);
+        }
         replace_block_in_top(&mut blocks, &at.path, Block::Paragraph(left));
         insert_block_after_path_in_top(&mut blocks, &at.path, Block::Paragraph(right));
         let mut split = Self {
@@ -11497,6 +11644,99 @@ mod tests {
     /// Issue #80 — typing before an inline anchor slides it right with
     /// its sentinel byte; typing after leaves it alone.
     #[test]
+    fn typing_after_a_note_reference_does_not_inherit_its_superscript() {
+        let mut d = DocumentTree::from_text("ab\u{FFFC}");
+        let sup = SpanStyle {
+            vert_align: Some(VertAlign::Superscript),
+            ..SpanStyle::default()
+        };
+        {
+            let p = d.blocks[0].as_paragraph_mut().unwrap();
+            p.inline_objects = vec![InlineObject {
+                at: 2,
+                kind: InlineKind::FootnoteRef {
+                    id: 1,
+                    custom_mark_follows: false,
+                },
+                anchor: None,
+                source_xml: None,
+            }];
+            p.spans = vec![StyleRun {
+                start: 2,
+                end: 5,
+                style: sup.clone(),
+            }];
+        }
+        let at = |o| LogicalPos {
+            path: BlockPath::top(0),
+            offset: o,
+        };
+        /* Issue #276 — the anchor's run formatting is not continued. */
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().typing_style_at(5),
+            SpanStyle::default()
+        );
+        let after = d.insert_text(at(5), " more");
+        let p = after.nth_paragraph(0).unwrap();
+        assert_eq!(p.style_at(2), sup, "the reference keeps its own style");
+        assert_eq!(p.style_at(5), SpanStyle::default());
+        assert_eq!(p.style_at(9), SpanStyle::default());
+    }
+
+    /// Issue #276 — typed text continues a run's formatting but never its
+    /// tracked-formatting record (`<w:rPrChange>` in the grab bag).
+    #[test]
+    fn typing_after_a_run_with_a_format_change_drops_the_revision_record() {
+        let mut bag = None;
+        GrabBag::push_into(&mut bag, b"<w:lang w:val=\"de-DE\"/>".to_vec());
+        GrabBag::push_into(&mut bag, b"<w:rPrChange w:id=\"8\"/>".to_vec());
+        let donor = SpanStyle {
+            bold: Some(true),
+            grab_bag: bag,
+            ..SpanStyle::default()
+        };
+        let d = DocumentTree::from_text("ab cd").apply_style(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
+            donor.clone(),
+        );
+        let typed = donor.for_typing();
+        assert_eq!(typed.bold, Some(true));
+        assert_eq!(
+            GrabBag::fragments_of(&typed.grab_bag),
+            &[b"<w:lang w:val=\"de-DE\"/>".to_vec()]
+        );
+        for at in [5, 2] {
+            let after = d.insert_text(
+                LogicalPos {
+                    path: BlockPath::top(0),
+                    offset: at,
+                },
+                "XY",
+            );
+            let p = after.nth_paragraph(0).unwrap();
+            assert_eq!(p.style_at(at), typed, "typed text at {at}");
+            assert_eq!(p.style_at(at + 1), typed);
+            assert_eq!(p.style_at(0), donor, "the source text keeps it");
+            /* Mid-run: the tail of the split donor span keeps it too. */
+            assert_eq!(
+                p.style_at(6),
+                if at == 2 {
+                    donor.clone()
+                } else {
+                    typed.clone()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn insert_text_shifts_inline_anchors_past_the_insertion_point() {
         let mut d = DocumentTree::from_text("ab\u{FFFC}cd\u{FFFC}");
         d.blocks[0].as_paragraph_mut().unwrap().inline_objects = vec![
@@ -11702,6 +11942,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         d
@@ -11782,6 +12023,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         d.styles.insert(
@@ -11796,6 +12038,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         let p0 = LogicalPos {
@@ -12600,6 +12843,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         let mut para = doc.nth_paragraph(0).unwrap().clone();
@@ -15720,6 +15964,47 @@ mod source_markup_tests {
             ranges(markup(d.nth_paragraph(0).unwrap())),
             vec![(0, 7), (7, 12)]
         );
+    }
+
+    /// Issue #276 — style spans follow the SAME run choice as the source
+    /// markup: the span holding the character before the insertion grows
+    /// over it (at the paragraph start: the span holding the first
+    /// character), so typed text continues that run's formatting.
+    #[test]
+    fn insert_continues_the_style_span_before_the_caret() {
+        let bold = SpanStyle {
+            bold: Some(true),
+            ..SpanStyle::default()
+        };
+        let mut p = para();
+        p.spans = vec![StyleRun {
+            start: 0,
+            end: 6,
+            style: bold.clone(),
+        }];
+        let doc = DocumentTree {
+            blocks: vec![Block::Paragraph(p)].into(),
+            ..DocumentTree::default()
+        };
+        let pos = |o| LogicalPos {
+            path: BlockPath::top(0),
+            offset: o,
+        };
+        /* At the bold span's end: it grows, exactly like source run 0. */
+        let d = doc.insert_text(pos(6), "XY");
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!((p.spans[0].start, p.spans[0].end), (0, 8));
+        assert_eq!(ranges(markup(p)), vec![(0, 8), (8, 13)]);
+        assert_eq!(p.typing_style_at(8), bold);
+        /* At the paragraph start: the first span. */
+        let d = doc.insert_text(pos(0), ">");
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!((p.spans[0].start, p.spans[0].end), (0, 7));
+        /* After unstyled text: stays unstyled. */
+        let d = doc.insert_text(pos(11), "!");
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.spans.len(), 1);
+        assert_eq!(p.style_at(11), SpanStyle::default());
     }
 
     #[test]
