@@ -37,8 +37,8 @@
 
 use crate::schema::grab_bag::{NamespaceScope, bound_by_root};
 use engine::{
-    ListItem, MarkerRole, ParaProperties, RunPad, SourceAttr, SourceMarker, SourceMarkup,
-    SourcePPr, SourceRun, SpanStyle,
+    CommentAnchor, CommentAnchorKind, ListItem, MarkerRole, ParaProperties, RunPad, SourceAttr,
+    SourceMarker, SourceMarkup, SourcePPr, SourceRun, SpanStyle,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -155,8 +155,10 @@ pub fn attrs_xml(attrs: &[SourceAttr], out: &mut String) {
 /// In-paragraph empty elements the model does not represent that ride a
 /// regenerated paragraph as positioned verbatim markers. Comment ranges
 /// and references are deliberately NOT here: they are modeled at the tree
-/// level (`DocumentTree::comment_ranges`), and a verbatim copy would
-/// resurrect a comment the user deleted.
+/// level (`DocumentTree::comment_ranges`), and a blind verbatim copy would
+/// resurrect a comment the user deleted — they ride as *comment-anchor*
+/// markers the writer verifies against the tree instead (issue #243,
+/// [`MarkupCapture::comment_marker`]).
 pub fn is_inline_marker(qname: &[u8]) -> bool {
     matches!(
         qname,
@@ -176,16 +178,16 @@ pub fn is_inline_marker(qname: &[u8]) -> bool {
 }
 
 /// Run children that carry modeled content even though they add no text
-/// to the run (field machinery, note / comment references). A text-less
-/// run holding one of these regenerates from the model; any OTHER
-/// text-less run is kept verbatim as a marker.
+/// to the run (field machinery, note references). A text-less run holding
+/// one of these regenerates from the model; any OTHER text-less run is
+/// kept verbatim as a marker — a `<w:commentReference/>` run as a
+/// *comment-anchor* marker (issue #243, [`MarkupCapture::run_comment_reference`]).
 pub fn is_modeled_textless_run_child(qname: &[u8]) -> bool {
     matches!(
         qname,
         b"w:fldChar"
             | b"w:instrText"
             | b"w:delInstrText"
-            | b"w:commentReference"
             | b"w:footnoteReference"
             | b"w:endnoteReference"
             | b"w:footnoteRef"
@@ -212,6 +214,8 @@ struct RunCapture {
     /// Whitespace since the last child ended (becomes `pad.close` at the
     /// run end).
     trail: Vec<u8>,
+    /// Issue #243 — the `w:id` of a `<w:commentReference>` in the run.
+    comment_ref: Option<u32>,
 }
 
 /// Issue #245 — where run-level whitespace lands in [`RunPad`].
@@ -466,6 +470,7 @@ impl MarkupCapture {
                         id,
                         close_xml: b"</w:sdtContent></w:sdt>".to_vec(),
                     },
+                    comment: None,
                 });
             }
             /* `<w:sdtContent/>`: nothing to wrap, the element is whole at
@@ -515,6 +520,7 @@ impl MarkupCapture {
                 role: MarkerRole::Close {
                     id: top.start as u32,
                 },
+                comment: None,
             });
         } else if let Some(frag) = xml.get(top.start..end)
             && bound_by_root(frag, ns)
@@ -525,6 +531,7 @@ impl MarkupCapture {
                 at,
                 xml: frag.to_vec(),
                 role: MarkerRole::Content,
+                comment: None,
             });
         }
     }
@@ -688,6 +695,7 @@ impl MarkupCapture {
                 at,
                 xml: frag.to_vec(),
                 role: MarkerRole::Content,
+                comment: None,
             });
             return;
         }
@@ -696,7 +704,15 @@ impl MarkupCapture {
             && frag.starts_with(b"<w:r")
             && bound_by_root(frag, ns)
         {
-            self.markers.push(SourceMarker::verbatim(at, frag.to_vec()));
+            /* Issue #243 — a `<w:commentReference>` run is a comment-anchor
+            marker the writer verifies against the tree. */
+            self.markers.push(SourceMarker {
+                comment: r.comment_ref.map(|id| CommentAnchor {
+                    kind: CommentAnchorKind::Reference,
+                    id,
+                }),
+                ..SourceMarker::verbatim(at, frag.to_vec())
+            });
         }
     }
 
@@ -747,6 +763,36 @@ impl MarkupCapture {
         }
     }
 
+    /// Issue #243 — a `<w:commentRangeStart/>` / `<w:commentRangeEnd/>`
+    /// between runs: a comment-anchor marker the writer verifies against
+    /// the tree-level `comment_ranges` before replaying it.
+    pub fn comment_marker(
+        &mut self,
+        at: u32,
+        frag: Vec<u8>,
+        anchor: CommentAnchor,
+        ns: &NamespaceScope,
+    ) {
+        if !self.open || self.run.is_some() {
+            return;
+        }
+        self.content(at);
+        if bound_by_root(&frag, ns) {
+            self.markers.push(SourceMarker {
+                comment: Some(anchor),
+                ..SourceMarker::verbatim(at, frag)
+            });
+        }
+    }
+
+    /// Issue #243 — the open run holds `<w:commentReference w:id>`: a
+    /// text-less one is kept whole as a comment-anchor marker.
+    pub fn run_comment_reference(&mut self, id: u32) {
+        if let Some(r) = self.run.as_mut() {
+            r.comment_ref = Some(id);
+        }
+    }
+
     /// `</w:p>`: the finished record, `None` when there is nothing worth
     /// keeping. `props` / `style_id` / `list_item` are the model state the
     /// paragraph was built with — the writer's verification baseline.
@@ -768,6 +814,8 @@ impl MarkupCapture {
             props: props.clone(),
             style_id: style_id.clone(),
             list_item,
+            /* Issue #262 — stamped by the part parser. */
+            mark_revision: None,
         });
         Some(Box::new(SourceMarkup {
             text_len,

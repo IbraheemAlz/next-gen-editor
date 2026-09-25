@@ -1,8 +1,8 @@
 name: fuzz-nightly
 
-# D5.5 scaled up (issue #90) — nightly `cargo +nightly fuzz run` for each of
-# the four structure-aware targets in `fuzz/`. `ci.yml`'s `rust-native` job
-# only compile-checks `fuzz/` on stable
+# D5.5 scaled up (issue #90; the 5th target added by issue #227) — nightly
+# `cargo +nightly fuzz run` for each structure-aware target in `fuzz/`.
+# `ci.yml`'s `rust-native` job only compile-checks `fuzz/` on stable
 # (`cargo check --manifest-path fuzz/Cargo.toml`); running the targets for
 # real wall-clock time needs the nightly toolchain + libFuzzer sanitizer
 # runtime, which is why this lives in its own scheduled workflow rather
@@ -45,7 +45,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [docx_reader, docx_roundtrip, rpc_command, layout_paginate]
+        # `corpus_dir` usually equals `target` — it differs only for
+        # `format_pdf_image_decode` (issue #227), whose seeds live under
+        # `fuzz/corpus/image_decode/` (issue #208's naming, predating this
+        # target — the directory describes the seeds' SUBJECT, not any
+        # one target's bin name).
+        include:
+          - target: docx_reader
+            corpus_dir: docx_reader
+          - target: docx_roundtrip
+            corpus_dir: docx_roundtrip
+          - target: rpc_command
+            corpus_dir: rpc_command
+          - target: layout_paginate
+            corpus_dir: layout_paginate
+          - target: format_pdf_image_decode
+            corpus_dir: image_decode
     steps:
       - uses: actions/checkout@v6
 
@@ -68,7 +83,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            fuzz/corpus/${{ matrix.target }}
+            fuzz/corpus/${{ matrix.corpus_dir }}
             fuzz/artifacts/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
@@ -88,7 +103,7 @@ jobs:
         working-directory: fuzz
         run: |
           set -uo pipefail
-          mkdir -p "corpus/${{ matrix.target }}" "artifacts/${{ matrix.target }}"
+          mkdir -p "corpus/${{ matrix.corpus_dir }}" "artifacts/${{ matrix.target }}"
           DURATION="${{ github.event.inputs.duration_secs || '1800' }}"
           # `-fork=4`: libFuzzer runs testcases in forked worker processes
           # and restarts a worker that crashes instead of ending the whole
@@ -101,7 +116,7 @@ jobs:
           # few seconds and never explore anything else. Each worker
           # crash still gets minimized + filed exactly the same way.
           cargo +nightly fuzz run "${{ matrix.target }}" -- \
-            "corpus/${{ matrix.target }}" \
+            "corpus/${{ matrix.corpus_dir }}" \
             -fork=4 \
             -ignore_crashes=1 \
             -ignore_ooms=1 \

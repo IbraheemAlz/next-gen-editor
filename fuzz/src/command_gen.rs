@@ -128,7 +128,7 @@ fn text(u: &mut Unstructured) -> String {
     s
 }
 
-/// Issue #229 — reserved marker consumed by `gen_targeted_command`'s
+/// Issue #229 — reserved marker consumed by [`gen_command_sequence`]'s
 /// scenario fast path (see [`Scenario`]). Any fixed byte works; the only
 /// requirement is that `Scenario::peek` can recognize it before deciding
 /// to consume it, so a normal (non-scenario) byte stream is never
@@ -136,9 +136,10 @@ fn text(u: &mut Unstructured) -> String {
 /// match both this byte and a valid scenario index.
 const SCENARIO_SENTINEL: u8 = 0xFE;
 
-/// Issue #229 — the #186/#187 regression corpus seeds
-/// (`repro_186_nan_zoom`, `repro_186_nan_device_scale`,
-/// `repro_187_bad_render_date` under `fuzz/corpus/rpc_command/`) used to be
+/// Issue #229 (extended by #261) — every committed regression seed under
+/// `fuzz/corpus/rpc_command/` is a [`Scenario`], never hand-tuned raw
+/// bytes. The original #186/#187 seeds (`repro_186_nan_zoom`,
+/// `repro_186_nan_device_scale`, `repro_187_bad_render_date`) used to be
 /// raw bytes hand-tuned to survive `gen_command_sequence`'s generic bucket
 /// dispatch plus however many of `gen_targeted_command`'s OTHER arms fired
 /// first. #206 grew `MoveImage`/`SetImageWrap`'s byte footprint (the new
@@ -146,20 +147,29 @@ const SCENARIO_SENTINEL: u8 = 0xFE;
 /// arm — which shifted every `Unstructured` read downstream of any command
 /// those arms happened to generate earlier in a committed sequence, so the
 /// seeds silently stopped reaching their scenario. Nothing caught it: the
-/// seeds are raw bytes, not derived from anything that would have flagged
-/// the drift.
+/// seeds were raw bytes, not derived from anything that would have flagged
+/// the drift. #261 found the same fragility in the older #115/#116/#117
+/// seeds (`repro_115_*`, `repro_116_1`, `repro_117_*`) and converted them
+/// the same way, extending `Scenario` from one `Command` to an ordered
+/// `Vec<Command>` (several of those regressions only reproduce as a short
+/// sequence — insert multi-byte text then address it, create a table then
+/// merge past its shape, select then undo the very edit selected).
 ///
 /// `Scenario` replaces "hope the raw bytes still parse the same way" with
-/// an explicit, named encoding that does not depend on the generic arms at
-/// all: `gen_targeted_command` peeks its next two bytes for
-/// `[SCENARIO_SENTINEL, scenario_index]` **before** running any generic
-/// arm, and — only on a match — hands off to [`Scenario::build`], which
-/// takes no `Unstructured` input whatsoever, so no other arm's
-/// byte-consumption change can ever perturb it again.
+/// an explicit, named encoding that does not depend on any generic arm at
+/// all: [`gen_command_sequence`] peeks its next two bytes for
+/// `[SCENARIO_SENTINEL, scenario_index]` **first, every iteration**,
+/// before its percentage-bucket dispatch runs, and — only on a match —
+/// splices in [`Scenario::build`]'s commands, which take no `Unstructured`
+/// input whatsoever, so no other arm's byte-consumption change (nor the
+/// seed text pool's) can ever perturb them again.
 ///
-/// Regenerate the committed seeds after touching this mechanism (or the
-/// upstream decoding contract it rides on — `gen_seed_text`'s pool
-/// selection, `gen_command_sequence`'s bucket dispatch) with:
+/// **New regression seeds must be [`Scenario`] variants, never hand-tuned
+/// raw bytes** — add the variant, regenerate, extend
+/// `committed_seed_bytes_match_scenario_builder`. Regenerate the committed
+/// seeds after touching this mechanism (or the upstream decoding contract
+/// it rides on — `gen_seed_text`'s pool selection, `gen_command_sequence`'s
+/// bucket dispatch) with:
 ///
 /// ```text
 /// cargo run --manifest-path fuzz/Cargo.toml --example regen-seeds
@@ -179,14 +189,57 @@ pub enum Scenario {
     /// Issue #187 — `SetRenderDate` with the exact out-of-range `month`
     /// the original fuzz run sent (`960_639_140`).
     BadRenderDate,
+    /// Issue #115 / #261 — `DeleteRange` whose ends land inside a
+    /// multi-byte UTF-8 scalar (Arabic BEH, ×3). Was
+    /// `repro_115_1`'s raw-byte reproducer.
+    TextRangeCharBoundaryDeleteRange,
+    /// Issue #115 / #261 — `ReplaceRange` landing inside a combining
+    /// mark. Was `repro_115_2`.
+    TextRangeCharBoundaryReplaceRange,
+    /// Issue #115 / #261 — `SplitParagraph` landing inside an emoji
+    /// scalar. Was `repro_115_3`.
+    TextRangeCharBoundarySplitParagraph,
+    /// Issue #115 / #261 — `ApplyFormatting { range: Some(_) }` landing
+    /// inside a multi-byte scalar. Was `repro_115_4`.
+    TextRangeCharBoundaryApplyFormatting,
+    /// Issue #115 / #261 — the INTERACTIVE `InsertText { at: Some(_) }`
+    /// path (`clamp_pos`, not `resolve_edit_pos`) landing inside a
+    /// multi-byte scalar. Was `repro_115_5`.
+    TextRangeCharBoundaryInsertText,
+    /// Issue #115 / #261 — an IME composition anchored mid-scalar
+    /// (`BeginComposition` stores `at` verbatim; the snap only happens
+    /// at commit time). Was `repro_115_composition_overlay`.
+    TextRangeCharBoundaryCompositionCommit,
+    /// Issue #116 / #261 — `MergeCells` addressing a row/column rectangle
+    /// past the table's actual shape. Was `repro_116_1`.
+    TableMergeCellsOutOfRange,
+    /// Issue #117 / #261 — `SetSelection` with a wildly out-of-range
+    /// range/caret (including a path naming a block that doesn't exist).
+    /// Was `repro_117_1`.
+    SelectionClampOutOfRange,
+    /// Issue #117 / #261 — a valid selection at the end of the document,
+    /// then `Undo` reverts the very edit it addressed — the selection
+    /// must be re-clamped before the post-undo repaint, not left
+    /// dangling for a later command to "self-heal". Was
+    /// `repro_117_undo_repaint_error`.
+    SelectionClampAfterUndo,
 }
 
 impl Scenario {
     /// Every scenario, in the fixed order [`Scenario::index`] encodes.
-    pub const ALL: [Scenario; 3] = [
+    pub const ALL: [Scenario; 12] = [
         Scenario::NanZoom,
         Scenario::NanDeviceScale,
         Scenario::BadRenderDate,
+        Scenario::TextRangeCharBoundaryDeleteRange,
+        Scenario::TextRangeCharBoundaryReplaceRange,
+        Scenario::TextRangeCharBoundarySplitParagraph,
+        Scenario::TextRangeCharBoundaryApplyFormatting,
+        Scenario::TextRangeCharBoundaryInsertText,
+        Scenario::TextRangeCharBoundaryCompositionCommit,
+        Scenario::TableMergeCellsOutOfRange,
+        Scenario::SelectionClampOutOfRange,
+        Scenario::SelectionClampAfterUndo,
     ];
 
     /// The committed corpus file this scenario's seed lives at, relative
@@ -196,6 +249,15 @@ impl Scenario {
             Scenario::NanZoom => "repro_186_nan_zoom",
             Scenario::NanDeviceScale => "repro_186_nan_device_scale",
             Scenario::BadRenderDate => "repro_187_bad_render_date",
+            Scenario::TextRangeCharBoundaryDeleteRange => "repro_115_1",
+            Scenario::TextRangeCharBoundaryReplaceRange => "repro_115_2",
+            Scenario::TextRangeCharBoundarySplitParagraph => "repro_115_3",
+            Scenario::TextRangeCharBoundaryApplyFormatting => "repro_115_4",
+            Scenario::TextRangeCharBoundaryInsertText => "repro_115_5",
+            Scenario::TextRangeCharBoundaryCompositionCommit => "repro_115_composition_overlay",
+            Scenario::TableMergeCellsOutOfRange => "repro_116_1",
+            Scenario::SelectionClampOutOfRange => "repro_117_1",
+            Scenario::SelectionClampAfterUndo => "repro_117_undo_repaint_error",
         }
     }
 
@@ -208,28 +270,281 @@ impl Scenario {
             .expect("every Scenario appears in ALL") as u8
     }
 
-    /// The one `Command` this scenario builds. Deliberately takes no
-    /// `Unstructured` input — nothing left for another arm's
-    /// byte-consumption change to perturb.
-    fn build(self) -> Command {
+    /// Issue #115/#261 scenario setup — reset the document to a single
+    /// paragraph of `text` AND clear the live selection to `None` (the
+    /// `Command::RenderPage` / Phase-1 contract — see `render_page`'s doc
+    /// comment). Several commands below (`SplitParagraph`, the
+    /// interactive `InsertText { at: Some(_) }`, `BeginComposition` /
+    /// `EndComposition`) consult their own explicit position argument
+    /// ONLY when no selection exists; `Engine::new_headless` otherwise
+    /// always seeds one (fresh-document caret at the top), which would
+    /// silently redirect the edit to the LIVE caret instead of the
+    /// mid-scalar offset each scenario means to exercise. A plain
+    /// `Command::InsertText { at: None, .. }` does NOT clear the
+    /// selection this way — it just moves it — so it cannot substitute
+    /// here (verified: it was this file's first draft, and every
+    /// selection-dependent scenario below failed until switched to this).
+    /// `font_id` must match the bundled font `Engine::new_headless` loads
+    /// ("fuzz-latin") so the render this triggers has something to shape
+    /// with.
+    fn seed_text_no_selection(text: &str) -> Command {
+        Command::RenderPage {
+            text: text.to_string(),
+            font_id: "fuzz-latin".to_string(),
+            base_direction: "ltr".to_string(),
+            px_size: 16.0,
+            line_height: 26.0,
+            align: "start".to_string(),
+            device_pixel_ratio: None,
+        }
+    }
+
+    /// The ordered `Command` sequence this scenario builds. Deliberately
+    /// takes no `Unstructured` input — nothing left for another arm's
+    /// byte-consumption change to perturb. Issue #261 widened this from a
+    /// single `Command` to a `Vec<Command>`: several of the #115/#116/#117
+    /// regressions only reproduce as a short SEQUENCE (insert the
+    /// multi-byte text, THEN address it; create a table, THEN merge past
+    /// its shape; select, THEN undo the edit the selection addressed) —
+    /// see [`gen_command_sequence`]'s scenario fast path, which splices in
+    /// every command this returns before resuming the generic dispatch.
+    ///
+    /// The #115 scenarios below insert their own seed text via an
+    /// explicit `Command::InsertText` rather than steering
+    /// `gen_seed_text`'s pool — a scenario must stay immune to EVERY
+    /// upstream generator's byte layout, seed text included, not just the
+    /// command dispatch #229 originally fixed.
+    fn build(self) -> Vec<Command> {
         match self {
-            Scenario::NanZoom => Command::SetZoom { scale: f32::NAN },
-            Scenario::NanDeviceScale => Command::SetDeviceScale { scale: f32::NAN },
+            Scenario::NanZoom => vec![Command::SetZoom { scale: f32::NAN }],
+            Scenario::NanDeviceScale => vec![Command::SetDeviceScale { scale: f32::NAN }],
             // The exact #187 repro payload — `validate_render_date` rejects
             // this `month` regardless of the other fields.
-            Scenario::BadRenderDate => Command::SetRenderDate {
+            Scenario::BadRenderDate => vec![Command::SetRenderDate {
                 year: 2026,
                 month: 960_639_140,
                 day: 1,
                 hour: None,
                 minute: None,
-            },
+            }],
+            Scenario::TextRangeCharBoundaryDeleteRange => vec![
+                // "ببب" — 3 Arabic BEH letters, 2 bytes each (char
+                // boundaries at 0/2/4/6). Offsets 1 and 5 both land
+                // strictly inside a scalar — the exact `is_char_boundary`
+                // panic shape #115 fixed.
+                Command::InsertText {
+                    at: None,
+                    text: "ببب".to_string(),
+                },
+                Command::DeleteRange {
+                    range: LogicalRange {
+                        start: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 1,
+                        },
+                        end: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 5,
+                        },
+                    },
+                },
+            ],
+            Scenario::TextRangeCharBoundaryReplaceRange => vec![
+                // A base letter plus 3 stacked combining marks (the exact
+                // shape `gen_seed_text`'s own pool uses for this bug
+                // class). Boundaries 0/1/3/5/7; offsets 2 and 6 land
+                // inside a mark.
+                Command::InsertText {
+                    at: None,
+                    text: "e\u{0301}\u{0301}\u{0301}".to_string(),
+                },
+                Command::ReplaceRange {
+                    range: LogicalRange {
+                        start: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 2,
+                        },
+                        end: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 6,
+                        },
+                    },
+                    text: "Z".to_string(),
+                },
+            ],
+            Scenario::TextRangeCharBoundarySplitParagraph => vec![
+                // Two emoji, 4 bytes each (boundaries 0/4/8); offset 2
+                // lands inside the first scalar. `do_split_paragraph`
+                // only consults its `at` argument when there is no live
+                // selection — see `seed_text_no_selection`.
+                Self::seed_text_no_selection("\u{1F642}\u{1F642}"),
+                Command::SplitParagraph {
+                    at: Some(LogicalPos {
+                        path: BlockPath::top(0),
+                        offset: 2,
+                    }),
+                },
+            ],
+            Scenario::TextRangeCharBoundaryApplyFormatting => vec![
+                // No live selection ⇒ `apply_formatting`'s tail reports
+                // `FormattingChanged { range, .. }` with the FLOORED
+                // range visible in the event (with a selection it
+                // reports the unrelated `SelectionChanged` instead —
+                // see `seed_text_no_selection`).
+                Self::seed_text_no_selection("بببب"),
+                Command::ApplyFormatting {
+                    range: Some(LogicalRange {
+                        start: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 1,
+                        },
+                        end: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 7,
+                        },
+                    }),
+                    attrs: TextAttrsPatch {
+                        bold: Some(true),
+                        italic: None,
+                        underline: None,
+                        strike: None,
+                        font_family: None,
+                        font_size: None,
+                        color: None,
+                        bg_color: None,
+                        script: None,
+                        language: None,
+                        caps: None,
+                        small_caps: None,
+                    },
+                },
+            ],
+            Scenario::TextRangeCharBoundaryInsertText => vec![
+                // No live selection ⇒ the interactive `InsertText`'s
+                // `at` argument actually seeds the edit position (with a
+                // selection it is discarded in favor of the live caret —
+                // see `seed_text_no_selection`). This exercises
+                // `clamp_pos`, not `resolve_edit_pos` — a distinct #115
+                // code path from the explicit-range commands above.
+                Self::seed_text_no_selection("بببب"),
+                Command::InsertText {
+                    at: Some(LogicalPos {
+                        path: BlockPath::top(0),
+                        offset: 3,
+                    }),
+                    text: "X".to_string(),
+                },
+            ],
+            Scenario::TextRangeCharBoundaryCompositionCommit => vec![
+                // No live selection ⇒ the eventual commit's
+                // `do_insert_text_interactive` call actually seeds from
+                // the composition's OWN anchor instead of discarding it
+                // for a live caret — see `seed_text_no_selection`.
+                // `BeginComposition` stores `at` VERBATIM (issue #64) —
+                // the char-boundary snap only happens at commit time,
+                // through `do_insert_text_interactive`'s `clamp_pos`.
+                // Composing at a mid-scalar anchor and committing is
+                // `repro_115_composition_overlay`'s shape: the IME
+                // preview used to cut Arabic mid-scalar.
+                Self::seed_text_no_selection("بببب"),
+                Command::BeginComposition {
+                    at: Some(LogicalPos {
+                        path: BlockPath::top(0),
+                        offset: 3,
+                    }),
+                },
+                Command::UpdateComposition {
+                    text: "Y".to_string(),
+                    target_range: Some(LogicalRange {
+                        start: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 3,
+                        },
+                        end: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 5,
+                        },
+                    }),
+                },
+                Command::EndComposition { commit: true },
+            ],
+            Scenario::TableMergeCellsOutOfRange => vec![
+                Command::InsertTable {
+                    at: BlockPath::top(0),
+                    rows: 1,
+                    cols: 1,
+                },
+                // Every corner of a `MergeCells` rectangle must exist;
+                // this table only has one. `resolve_table_target` must
+                // reject it with a typed error, never index the table's
+                // rows/cells out of bounds.
+                Command::MergeCells {
+                    table_path: BlockPath::top(0),
+                    from_row: 5,
+                    from_col: 5,
+                    to_row: 9,
+                    to_col: 9,
+                },
+            ],
+            Scenario::SelectionClampOutOfRange => vec![
+                Command::InsertText {
+                    at: None,
+                    text: "hello".to_string(),
+                },
+                // Wildly out-of-range offsets AND a path (`top(5)`)
+                // naming a block that doesn't exist — `SetSelection`
+                // must clamp both ends through `clamp_pos`, the same as
+                // every other selection-mutating path.
+                Command::SetSelection {
+                    range: LogicalRange {
+                        start: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 999_999,
+                        },
+                        end: LogicalPos {
+                            path: BlockPath::top(5),
+                            offset: 999_999,
+                        },
+                    },
+                    caret: LogicalPos {
+                        path: BlockPath::top(0),
+                        offset: 999_999,
+                    },
+                },
+            ],
+            Scenario::SelectionClampAfterUndo => vec![
+                Command::InsertText {
+                    at: None,
+                    text: "hello world".to_string(),
+                },
+                // A VALID selection at the end of the current document...
+                Command::SetSelection {
+                    range: LogicalRange {
+                        start: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 11,
+                        },
+                        end: LogicalPos {
+                            path: BlockPath::top(0),
+                            offset: 11,
+                        },
+                    },
+                    caret: LogicalPos {
+                        path: BlockPath::top(0),
+                        offset: 11,
+                    },
+                },
+                // ...that `Undo` then invalidates by reverting the very
+                // text it addressed — `repro_117_undo_repaint_error`'s
+                // shape (a stale selection surviving a tree swap).
+                Command::Undo,
+            ],
         }
     }
 
     /// Peek (never consume on a miss) whether `u`'s next two bytes select a
-    /// scenario. `gen_targeted_command` checks this before its generic
-    /// per-variant dispatch runs.
+    /// scenario. [`gen_command_sequence`] checks this FIRST every
+    /// iteration, before its generic percentage-bucket dispatch runs.
     fn peek(u: &Unstructured) -> Option<Scenario> {
         let bytes = u.peek_bytes(2)?;
         if bytes[0] != SCENARIO_SENTINEL {
@@ -241,35 +556,31 @@ impl Scenario {
     /// The full corpus seed for this scenario, built through the real
     /// `gen_seed_text` / `gen_command_sequence` decoding contract instead
     /// of hand-picked raw bytes:
-    /// - byte 0 selects `gen_seed_text`'s `POOL[0]` (an empty string — its
-    ///   content is irrelevant to this scenario, only the one byte it
-    ///   consumes matters);
-    /// - byte 1 selects `gen_command_sequence`'s bucket 0, which routes to
-    ///   `gen_targeted_command`;
-    /// - bytes 2–3 are `[SCENARIO_SENTINEL, self.index()]`, consumed by the
-    ///   scenario fast path above before any generic arm runs.
+    /// - byte 0 selects `gen_seed_text`'s `POOL[0]` (an empty string —
+    ///   every scenario either doesn't need seed text or supplies its own
+    ///   via an explicit `Command::InsertText`, so the seed document's
+    ///   initial text is irrelevant here);
+    /// - bytes 1–2 are `[SCENARIO_SENTINEL, self.index()]`, checked by
+    ///   `gen_command_sequence` before ANY generic arm runs (issue #261 —
+    ///   previously this went through the bucket dispatch first, which
+    ///   needed a 3rd prefix byte; checking it first removes even that
+    ///   dependency).
     ///
-    /// Exactly 4 bytes: `gen_command_sequence`'s `u.is_empty()` check then
-    /// stops the sequence right after this one command, so the resulting
-    /// `Vec<Command>` has exactly one element.
+    /// Exactly 3 bytes: `gen_command_sequence`'s `u.is_empty()` check then
+    /// stops the sequence right after this scenario's commands are
+    /// spliced in.
     pub fn seed_bytes(self) -> Vec<u8> {
-        vec![0x00, 0x00, SCENARIO_SENTINEL, self.index()]
+        vec![0x00, SCENARIO_SENTINEL, self.index()]
     }
 }
 
 /// One curated, small-bounded command spanning the issue's named
 /// categories: insert / delete / format / table / section / story.
 ///
-/// Issue #229 — checks [`Scenario::peek`] first: a fixed-prefix fast path
-/// for the #186/#187 regression scenarios that bypasses every arm below
-/// (see `Scenario`'s doc comment for why).
+/// Issue #229/#261 — [`gen_command_sequence`] checks [`Scenario::peek`]
+/// before EVERY arm (this one included) gets a chance to run, so no
+/// scenario fast path lives here any more (see `Scenario`'s doc comment).
 fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
-    if let Some(scenario) = Scenario::peek(u) {
-        // Consume exactly the two bytes `peek` looked at; `build` itself
-        // reads no further bytes, by design.
-        let _ = u.bytes(2);
-        return Some(scenario.build());
-    }
     let variant = small(u, 26);
     Some(match variant {
         // ---- insert / delete -------------------------------------------------
@@ -649,6 +960,11 @@ fn story_chain(u: &mut Unstructured) -> Vec<TextBoxHop> {
 }
 
 /// Build a sequence of up to `max_len` commands, mixing:
+/// - A [`Scenario`] tag (issue #229/#261), checked FIRST every iteration —
+///   `[SCENARIO_SENTINEL, index]` bypasses every percentage bucket below
+///   entirely and splices in that scenario's fixed command list. See
+///   `Scenario`'s doc comment for why this has to run before anything
+///   else gets a chance to consume a byte.
 /// - ~40% curated, small-bounded commands (`gen_targeted_command`) —
 ///   insert / delete / format / table / section / story, per issue #90.
 /// - ~15% selection / undo / caret motion (`gen_selection_command`).
@@ -668,6 +984,25 @@ pub fn gen_command_sequence(u: &mut Unstructured, max_len: usize) -> Vec<Command
     for _ in 0..max_len {
         if u.is_empty() {
             break;
+        }
+        if let Some(scenario) = Scenario::peek(u) {
+            // Issue #229/#261 — consume exactly the two bytes `peek`
+            // looked at; `build` itself reads no further bytes, by
+            // design, so no other arm's byte-consumption change (nor a
+            // multi-command scenario's own length) can ever perturb this
+            // again.
+            let _ = u.bytes(2);
+            for cmd in scenario.build() {
+                record_coverage(&cmd);
+                out.push(cmd);
+                if out.len() >= max_len {
+                    return out;
+                }
+            }
+            if u.is_empty() {
+                break;
+            }
+            continue;
         }
         let bucket = small(u, 99);
         let cmd = match bucket {
@@ -785,6 +1120,7 @@ classify_variants! {
     DeleteRange { .. } => true, // gen_targeted_command
     ReplaceRange { .. } => true, // gen_targeted_command
     ApplyFormatting { .. } => true, // gen_targeted_command
+    ToggleFormatting { .. } => false, // #286 — blind-only (curated arms keep their byte layout)
     SplitParagraph { .. } => true, // gen_targeted_command
     MergeParagraph { .. } => false,
     InsertImage { .. } => true, // gen_image_command
@@ -863,6 +1199,8 @@ classify_variants! {
     ToggleTrackChanges { .. } => false,
     AcceptRevision { .. } => false,
     RejectRevision { .. } => false,
+    AcceptAllRevisions => false,
+    RejectAllRevisions => false,
     InsertComment { .. } => false,
     DeleteComment { .. } => false,
     SetTabStops { .. } => false,
@@ -899,6 +1237,228 @@ fn record_coverage(cmd: &Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge::Event;
+
+    /// Issue #261 — apply a [`Scenario`]'s seed bytes through the REAL
+    /// `gen_seed_text` / `gen_command_sequence` decode path (proving the
+    /// committed corpus file, once regenerated, still decodes to this
+    /// exact scenario) and then through a real headless
+    /// `engine_wasm::Engine` (proving the ENGINE survives it, not just the
+    /// generator) — a decode alone isn't enough for the #115/#116/#117
+    /// regressions, which are all about what the engine does when it
+    /// actually receives the sequence. Returns every event, in order, so
+    /// a test can inspect any command's result — usually the last one.
+    fn apply_scenario(scenario: Scenario) -> (engine_wasm::Engine, Vec<Event>) {
+        let bytes = scenario.seed_bytes();
+        let mut u = Unstructured::new(&bytes);
+        let seed_text = gen_seed_text(&mut u);
+        let cmds = gen_command_sequence(&mut u, 64);
+        let mut engine =
+            engine_wasm::Engine::new_headless(engine::DocumentTree::from_text(&seed_text));
+        let mut events = Vec::with_capacity(cmds.len());
+        for cmd in cmds {
+            events.push(engine.apply_sync(cmd));
+        }
+        (engine, events)
+    }
+
+    /// Issue #115/#261 (`repro_115_1`) — `DeleteRange` whose ends land
+    /// inside a multi-byte scalar used to panic
+    /// (`assertion failed: self.is_char_boundary(idx)`). The fix floors
+    /// both ends to the nearest char boundary at or before the wire
+    /// offset (offsets 1 and 5 both floor into the boundary set
+    /// {0, 2, 4, 6} of "ببب") instead of panicking or rejecting, so the
+    /// command must SUCCEED with the floored range, never error.
+    #[test]
+    fn text_range_char_boundary_delete_range_snaps_instead_of_panicking() {
+        let (engine, events) = apply_scenario(Scenario::TextRangeCharBoundaryDeleteRange);
+        assert!(engine.selection_is_valid());
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::SelectionChanged { range, .. })
+                    if range.start.offset == 0 && range.end.offset == 0
+            ),
+            "DeleteRange across a mid-scalar range must snap-and-succeed \
+             at the floored boundary (0), not error or panic: {:?}",
+            events.last()
+        );
+    }
+
+    /// Issue #115/#261 (`repro_115_2`) — `ReplaceRange` landing inside a
+    /// combining mark (boundary set {0, 1, 3, 5, 7}; offsets 2 and 6 both
+    /// floor to 1 and 5).
+    #[test]
+    fn text_range_char_boundary_replace_range_snaps_instead_of_panicking() {
+        let (engine, events) = apply_scenario(Scenario::TextRangeCharBoundaryReplaceRange);
+        assert!(engine.selection_is_valid());
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::SelectionChanged { range, .. })
+                    if range.start.offset == 2 && range.end.offset == 2
+            ),
+            "ReplaceRange across a mid-mark range must snap-and-succeed, \
+             caret landing right after the inserted text: {:?}",
+            events.last()
+        );
+    }
+
+    /// Issue #115/#261 (`repro_115_3`) — `SplitParagraph` at an explicit
+    /// `at` landing inside an emoji scalar (boundary set {0, 4, 8};
+    /// offset 2 floors to 0).
+    #[test]
+    fn text_range_char_boundary_split_paragraph_snaps_instead_of_panicking() {
+        let (engine, events) = apply_scenario(Scenario::TextRangeCharBoundarySplitParagraph);
+        assert!(engine.selection_is_valid());
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::SelectionChanged { range, .. })
+                    if range.start.offset == 0 && range.end.offset == 0
+            ),
+            "SplitParagraph at a mid-scalar position must snap-and-succeed, \
+             landing the caret at the start of the new paragraph: {:?}",
+            events.last()
+        );
+    }
+
+    /// Issue #115/#261 (`repro_115_4`) — `ApplyFormatting { range:
+    /// Some(_) }` whose ends land inside a multi-byte scalar (boundary set
+    /// {0, 2, 4, 6, 8}; offsets 1 and 7 floor to 0 and 6). With no active
+    /// selection this returns `FormattingChanged` (not `SelectionChanged`
+    /// — see `apply_formatting`'s Phase-1 harness branch), carrying the
+    /// FLOORED range back.
+    #[test]
+    fn text_range_char_boundary_apply_formatting_snaps_instead_of_panicking() {
+        let (engine, events) = apply_scenario(Scenario::TextRangeCharBoundaryApplyFormatting);
+        assert!(engine.selection_is_valid());
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::FormattingChanged { range, .. })
+                    if range.start.offset == 0 && range.end.offset == 6
+            ),
+            "ApplyFormatting across a mid-scalar range must snap-and-succeed \
+             at the floored range (0, 6), not error or panic: {:?}",
+            events.last()
+        );
+    }
+
+    /// Issue #115/#261 (`repro_115_5`) — the INTERACTIVE `InsertText {
+    /// at: Some(_) }` path, which validates through `clamp_pos` rather
+    /// than `resolve_edit_pos` (a distinct code path from the explicit-
+    /// range commands above). Offset 3 floors into "بببب"'s boundary set
+    /// {0, 2, 4, 6, 8} to 2; the inserted "X" then lands the caret at 3.
+    #[test]
+    fn text_range_char_boundary_insert_text_snaps_instead_of_panicking() {
+        let (engine, events) = apply_scenario(Scenario::TextRangeCharBoundaryInsertText);
+        assert!(engine.selection_is_valid());
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::SelectionChanged { range, .. })
+                    if range.start.offset == 3 && range.end.offset == 3
+            ),
+            "interactive InsertText at a mid-scalar position must snap via \
+             clamp_pos and succeed, not error or panic: {:?}",
+            events.last()
+        );
+    }
+
+    /// Issue #115/#261 (`repro_115_composition_overlay`) — `BeginComposition`
+    /// stores its `at` VERBATIM (issue #64), so a mid-scalar composition
+    /// anchor only gets caught at commit time, through
+    /// `do_insert_text_interactive`'s `clamp_pos` — previously the IME
+    /// preview cut Arabic mid-scalar here. Same expected landing offset
+    /// (3) as the plain interactive-insert scenario above, reached via
+    /// `EndComposition { commit: true }` instead.
+    #[test]
+    fn text_range_char_boundary_composition_commit_snaps_instead_of_panicking() {
+        let (engine, events) = apply_scenario(Scenario::TextRangeCharBoundaryCompositionCommit);
+        assert!(engine.selection_is_valid());
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::SelectionChanged { range, .. })
+                    if range.start.offset == 3 && range.end.offset == 3
+            ),
+            "committing a composition anchored mid-scalar must snap via \
+             clamp_pos and succeed, not error or panic: {:?}",
+            events.last()
+        );
+    }
+
+    /// Issue #116/#261 (`repro_116_1`) — `MergeCells` addressing a
+    /// row/column rectangle past a 1×1 table's actual shape used to index
+    /// an `im::Vector` out of bounds. `resolve_table_target` must reject
+    /// it with a typed `Event::Error`, never panic.
+    #[test]
+    fn table_merge_cells_out_of_range_errors_instead_of_panicking() {
+        let (engine, events) = apply_scenario(Scenario::TableMergeCellsOutOfRange);
+        assert!(engine.selection_is_valid());
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::Error { message }) if message.contains("MergeCells")
+            ),
+            "MergeCells past the table's shape must return a typed Error \
+             naming the command, not panic: {:?}",
+            events.last()
+        );
+    }
+
+    /// Issue #117/#261 (`repro_117_1`) — `SetSelection` with a wildly
+    /// out-of-range range/caret, including a path (`top(5)`) naming a
+    /// block that doesn't exist in a one-paragraph document. Every field
+    /// must clamp through `clamp_pos` — same as every other selection
+    /// path — landing the whole selection at the document end (offset 5,
+    /// `"hello".len()`).
+    #[test]
+    fn selection_clamp_out_of_range_snaps_instead_of_leaving_garbage() {
+        let (engine, events) = apply_scenario(Scenario::SelectionClampOutOfRange);
+        assert!(
+            engine.selection_is_valid(),
+            "issue #117 — SetSelection must never leave an out-of-bounds \
+             selection, even momentarily"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::SelectionChanged { range, .. })
+                    if range.start.offset == 5 && range.end.offset == 5
+            ),
+            "SetSelection with wildly out-of-range fields must clamp to \
+             the document end, not error or panic: {:?}",
+            events.last()
+        );
+    }
+
+    /// Issue #117/#261 (`repro_117_undo_repaint_error`) — a VALID
+    /// selection at the end of the document, then `Undo` reverts the very
+    /// edit that selection addressed. `do_undo` must re-clamp the
+    /// selection into the RESTORED (now-empty) document before the
+    /// repaint runs, landing at offset 0 — not leave a stale selection
+    /// dangling for a later command to "self-heal".
+    #[test]
+    fn selection_reclamps_after_undo_reverts_its_own_edit() {
+        let (engine, events) = apply_scenario(Scenario::SelectionClampAfterUndo);
+        assert!(
+            engine.selection_is_valid(),
+            "issue #117 — Undo must re-clamp the selection into the \
+             restored document before repainting, not leave it stale"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::SelectionChanged { range, .. })
+                    if range.start.offset == 0 && range.end.offset == 0
+            ),
+            "Undo reverting the edit a selection addressed must re-clamp \
+             that selection into the restored (now-empty) paragraph: {:?}",
+            events.last()
+        );
+    }
 
     /// Issues #186 / #187 — the committed corpus seeds
     /// `repro_186_nan_zoom` / `repro_186_nan_device_scale` /
@@ -1092,7 +1652,7 @@ mod tests {
                 "duplicate variant name in ALL_VARIANT_NAMES: {name}"
             );
         }
-        const EXPECTED_VARIANT_COUNT: usize = 104;
+        const EXPECTED_VARIANT_COUNT: usize = 107;
         assert_eq!(
             ALL_VARIANT_NAMES.len(),
             EXPECTED_VARIANT_COUNT,

@@ -21,7 +21,19 @@
  * retained snapshot. So (a) the log is never pruned while no snapshot is
  * present, and (b) EVERY retained snapshot still has its complete tail,
  * which is what lets recovery fall back to an older snapshot when the
- * newest one turns out unreadable (`loadRecoveryLog` → candidates). */
+ * newest one turns out unreadable (`loadRecoveryLog` → candidates).
+ *
+ * Issue #268 — the PINNED base: the first snapshot persisted for a
+ * document (`persistSnapshot(…, { pin: true })`, requested by the worker
+ * after the log opens and after every document-replacing command) is
+ * recorded in the `meta` row `pinned` and never pruned while it stays
+ * pinned; pinning a newer one hands the old row back to ordinary pruning.
+ * Its command tail IS pruned (the log stays bounded), so once pruning has
+ * passed it the pinned base restores ALONE — the document as of that
+ * snapshot, a last resort that beats losing the document when every
+ * other snapshot is unreadable. It is persisted detached like every
+ * snapshot, so its size is bounded by the #212 detachment, and the
+ * package it names is kept by the same reference count. */
 import type { Command } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 const DB_NAME = 'engine-log';
@@ -58,6 +70,18 @@ interface PrunedRow {
     through: number;
 }
 const PRUNED_ID = 'pruned';
+/** Issue #268 — `meta` row: the seq of the document's pinned base
+ *  snapshot (exempt from pruning). */
+interface PinnedRow {
+    id: 'pinned';
+    seq: number;
+}
+const PINNED_ID = 'pinned';
+/** Issue #268 — options of `persistSnapshot`. */
+export interface PersistSnapshotOptions {
+    /** Make this snapshot the document's pinned base (see the header). */
+    pin?: boolean;
+}
 /** Issue #212 — snapshots index over `packageHash` (package GC). */
 const PACKAGE_INDEX = 'packageHash';
 
@@ -79,6 +103,14 @@ export interface RecoveryCandidate {
      *  writer). */
     packageHash?: string;
     package?: Uint8Array;
+    /** Issue #268 — every logged command after `seq` is still in the log
+     *  (always, except for a pinned base that pruning has passed, and for
+     *  the snapshot-less base of a pruned log). A candidate without it is
+     *  restored WITHOUT a replay — its gapped tail would replay edits out
+     *  of context. Absent = `true`. */
+    tailComplete?: boolean;
+    /** Issue #268 — this is the document's pinned base snapshot. */
+    pinned?: boolean;
 }
 
 /** Everything `EngineClient.recover()` hands the respawned worker. */
@@ -176,6 +208,7 @@ export async function openEventLog(documentId: string): Promise<void> {
     tx.objectStore('packages').clear();
     tx.objectStore('meta').put({ id: 'document', documentId, openedAt: Date.now() });
     tx.objectStore('meta').put({ id: PRUNED_ID, through: 0 } satisfies PrunedRow);
+    tx.objectStore('meta').delete(PINNED_ID);
     await txDone(tx);
 }
 
@@ -192,27 +225,36 @@ export async function appendCommand(seq: number, cmd: Command): Promise<void> {
  *  Issue #212 — `pkg` names the detached source package the snapshot was
  *  taken without; its bytes (first snapshot of a document) go to the
  *  `packages` store in the same transaction, so a snapshot row never
- *  lands without the package it names. */
+ *  lands without the package it names. Issue #268 — `opts.pin` makes it
+ *  the document's pinned base (exempt from pruning; see the header). */
 export async function persistSnapshot(
     seq: number,
     bytes: Uint8Array,
     pkg?: SnapshotPackage,
+    opts?: PersistSnapshotOptions,
 ): Promise<void> {
     const db = await getDb();
     const tx = db.transaction(['snapshots', 'commands', 'meta', 'packages'], 'readwrite');
     const store = tx.objectStore('snapshots');
     const packages = tx.objectStore('packages');
+    const meta = tx.objectStore('meta');
     const row: SnapshotRow = pkg ? { seq, bytes, packageHash: pkg.hash } : { seq, bytes };
     if (pkg?.bytes) {
         packages.put({ hash: pkg.hash, bytes: pkg.bytes } satisfies PackageRow);
     }
     store.put(row);
+    if (opts?.pin) meta.put({ id: PINNED_ID, seq } satisfies PinnedRow);
+    /* Requests complete in issue order, so this read sees the pin above. */
+    const pinnedReq = meta.get(PINNED_ID);
     /* Prune the oldest. getAllKeys() yields keys in ascending `seq` order, so
        everything before the last SNAPSHOTS_KEPT is stale. The deletes are
-       issued synchronously inside onsuccess to stay within this transaction. */
+       issued synchronously inside onsuccess to stay within this transaction.
+       Issue #268 — the pinned base is not part of that window: it is never
+       pruned, and it does not hold any other snapshot's slot. */
     const keysReq = store.getAllKeys();
     keysReq.onsuccess = () => {
-        const keys = keysReq.result as number[];
+        const pinnedSeq = (pinnedReq.result as PinnedRow | undefined)?.seq;
+        const keys = (keysReq.result as number[]).filter((k) => k !== pinnedSeq);
         const pruned = keys.slice(0, -SNAPSHOTS_KEPT);
         const oldestRetained = keys.slice(-SNAPSHOTS_KEPT)[0];
         for (const key of pruned) {
@@ -234,7 +276,6 @@ export async function persistSnapshot(
             newestPruned < oldestRetained
         ) {
             tx.objectStore('commands').delete(IDBKeyRange.upperBound(newestPruned));
-            const meta = tx.objectStore('meta');
             const prev = meta.get(PRUNED_ID);
             prev.onsuccess = () => {
                 const before = (prev.result as PrunedRow | undefined)?.through ?? 0;
@@ -273,6 +314,7 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
     const snapReq = tx.objectStore('snapshots').getAll();
     const cmdReq = tx.objectStore('commands').getAll();
     const prunedReq = tx.objectStore('meta').get(PRUNED_ID);
+    const pinnedReq = tx.objectStore('meta').get(PINNED_ID);
     const pkgReq = tx.objectStore('packages').getAll();
     await txDone(tx);
     const packages = new Map(
@@ -282,11 +324,18 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
     const snapshots = (snapReq.result as SnapshotRow[]).slice().sort((a, b) => b.seq - a.seq);
     const commands = (cmdReq.result as CommandRow[]).map((row) => ({ seq: row.seq, cmd: row.cmd }));
     const prunedThrough = (prunedReq.result as PrunedRow | undefined)?.through ?? 0;
+    const pinnedSeq = (pinnedReq.result as PinnedRow | undefined)?.seq;
     const newestSnapshotSeq = snapshots[0]?.seq ?? 0;
     return {
         candidates: [
             ...snapshots.map((row): RecoveryCandidate => {
-                const candidate: RecoveryCandidate = { seq: row.seq, snapshot: row.bytes };
+                const candidate: RecoveryCandidate = {
+                    seq: row.seq,
+                    snapshot: row.bytes,
+                    /* Every command after `row.seq` survives pruning. */
+                    tailComplete: row.seq >= prunedThrough,
+                };
+                if (row.seq === pinnedSeq) candidate.pinned = true;
                 if (row.packageHash !== undefined) {
                     candidate.packageHash = row.packageHash;
                     const pkg = packages.get(row.packageHash);
@@ -294,7 +343,7 @@ export async function loadRecoveryLog(): Promise<RecoveryLog> {
                 }
                 return candidate;
             }),
-            { seq: 0, snapshot: new Uint8Array(0) },
+            { seq: 0, snapshot: new Uint8Array(0), tailComplete: prunedThrough === 0 },
         ],
         commands,
         /* getAll() yields rows in ascending seq order. */

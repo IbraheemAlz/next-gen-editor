@@ -51,6 +51,14 @@ type WorkerReply = {
     /** Issue #241 — RECOVER reply: whether the event log still reached
      *  back to the session's first command. */
     logComplete?: boolean;
+    /** Issue #268 — RECOVER reply: see `RecoveryInfo.packageFallbacks`. */
+    packageFallbacks?: number;
+    /** Issue #268 — RECOVER reply: see `RecoveryInfo.packageLost`. */
+    packageLost?: boolean;
+    /** Issue #268 — RECOVER reply: see `RecoveryInfo.pinnedBase`. */
+    pinnedBase?: boolean;
+    /** Issue #268 — RECOVER reply: see `RecoveryInfo.tailDropped`. */
+    tailDropped?: boolean;
     /** Phase 8a — payload of a `GET_COMMENTS` side-channel reply. */
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
@@ -80,9 +88,16 @@ export interface RevisionSnapshot {
     block: number;
     start: number;
     end: number;
-    kind: 'insert' | 'delete';
+    /** Issue #247 — `move-from` / `move-to` are the two halves of a
+     *  tracked move; `format` a tracked formatting change. */
+    kind: 'insert' | 'delete' | 'format' | 'move-from' | 'move-to';
     author: string;
     date: string;
+    /** Issue #247 — the move's range name; both halves share it. */
+    move_name?: string;
+    /** Issue #262 — a paragraph-MARK revision (a tracked paragraph split
+     *  or merge), addressed by the empty range at the paragraph end. */
+    mark?: boolean;
 }
 
 /** Issue #85 — what the most recent `recover()` achieved. */
@@ -119,6 +134,31 @@ export interface RecoveryInfo {
      * unreadable). The shell re-seeds; the flag makes the loss visible.
      */
     logTruncated: boolean;
+    /**
+     * Issue #268 — readable snapshots passed over because the source
+     * package they name was missing from the event log (a failed
+     * `packages` write): recovery preferred an older base that still has
+     * its package. `0` on an ordinary recovery.
+     */
+    packageFallbacks: number;
+    /**
+     * Issue #268 — the downgrade: the recovered document came from a
+     * snapshot whose retained source package could not be re-attached
+     * (no retained base had it), so saving goes through the minimal-
+     * package writer and drops the `.docx`'s sibling parts (styles,
+     * headers, settings, embedded fonts…).
+     */
+    packageLost: boolean;
+    /** Issue #268 — recovery restored the document's pinned base snapshot
+     *  (the last-resort base that is never pruned). */
+    pinnedBase: boolean;
+    /**
+     * Issue #268 — the pinned base was restored WITHOUT its replay tail
+     * (pruning had passed it): the document is as of that snapshot and
+     * the edits made after it are lost. Only reachable when every newer
+     * snapshot is unreadable; better than `logTruncated`'s total loss.
+     */
+    tailDropped: boolean;
 }
 
 /** Issue #99 — consecutive traps on the Vello backend after which recovery
@@ -517,12 +557,28 @@ export class EngineClient {
             rendererDowngrade: recovered?.renderer_downgrade,
             snapshotFallbacks: r.snapshotFallbacks ?? 0,
             logTruncated: r.restored !== true && r.logComplete === false,
+            packageFallbacks: r.packageFallbacks ?? 0,
+            packageLost: r.packageLost === true,
+            pinnedBase: r.pinnedBase === true,
+            tailDropped: r.tailDropped === true,
         };
         this.noteGenerationStart();
         if (this.lastRecoveryInfo.logTruncated) {
             console.error(
                 '[recovery] no persisted snapshot restored and the event log was pruned — ' +
                     'the document could not be rebuilt',
+            );
+        }
+        if (this.lastRecoveryInfo.tailDropped) {
+            console.error(
+                '[recovery] only the pinned base snapshot restored — edits made after it ' +
+                    'were lost',
+            );
+        }
+        if (this.lastRecoveryInfo.packageLost) {
+            console.error(
+                '[recovery] the recovered document lost its source package — saving ' +
+                    'drops the original file’s sibling parts',
             );
         }
         this.armStableTimer();

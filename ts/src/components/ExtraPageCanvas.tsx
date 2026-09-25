@@ -13,7 +13,7 @@
  * page, never the full document. */
 import { onCleanup, onMount } from 'solid-js';
 import type { EngineClient } from '../engine/engine-client';
-import type { EngineStore } from '../state/engine-store';
+import { deviceRatio, type EngineStore } from '../state/engine-store';
 import { attachPointer } from '../input/pointer';
 import { PageSelectionOverlay } from './PageSelectionOverlay';
 import { CaretOverlay } from './CaretOverlay';
@@ -32,11 +32,11 @@ export function ExtraPageCanvas(props: ExtraPageCanvasProps) {
 
     onMount(async () => {
         const canvas = canvasRef!;
-        const dpr = window.devicePixelRatio || 1;
-        /* Pre-sized to the A4-at-96-DPI page so the transferred backing
-           store matches the engine's first paint. The worker resizes
-           per-page if the section's geometry differs (Phase 6 section
-           support). */
+        /* Pre-sized to the card (already at the engine's page geometry +
+           zoom, issue #280) so the transferred backing store matches the
+           engine's first paint. The worker resizes per-page if the
+           section's geometry differs (Phase 6 section support). */
+        const dpr = deviceRatio();
         canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
         canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
         const offscreen = canvas.transferControlToOffscreen();
@@ -56,7 +56,16 @@ export function ExtraPageCanvas(props: ExtraPageCanvasProps) {
     onCleanup(() => detach?.());
 
     return (
-        <div class="editor-page" data-page-index={props.pageIdx}>
+        <div
+            class="editor-page"
+            data-page-index={props.pageIdx}
+            style={{
+                /* Issue #280 — sized from the engine's page geometry, so
+                   zoom (and a landscape section) resizes the card. */
+                width: `${props.store.pageCardCss(props.pageIdx).w}px`,
+                height: `${props.store.pageCardCss(props.pageIdx).h}px`,
+            }}
+        >
             <canvas ref={canvasRef} class="editor-canvas" />
             <PageSelectionOverlay store={props.store} pageIdx={props.pageIdx} />
             <CaretOverlay store={props.store} pageIdx={props.pageIdx} />

@@ -369,6 +369,123 @@ fn track_field_span(e: &BytesStart<'_>, markup: &mut MarkupCapture, cx: FieldSpa
     }
 }
 
+/// Phase 8b / issue #247 — a run-wrapping revision (`<w:ins>`, `<w:del>`,
+/// `<w:moveFrom>`, `<w:moveTo>`) open at the cursor.
+struct RevisionOpen {
+    kind: engine::RevisionKind,
+    author: String,
+    date: String,
+    id: Option<u32>,
+    start: u32,
+    move_name: Option<String>,
+}
+
+/// Issue #262 — lift the paragraph-mark revision (`<w:ins>` / `<w:del>` /
+/// `<w:moveFrom>` / `<w:moveTo>`, the leading `EG_ParaRPrTrackChanges`
+/// children of CT_ParaRPr) out of a captured `<w:pPr>/<w:rPr>` fragment.
+/// Returns the first one found (a second stays in the fragment verbatim)
+/// and the fragment without its bytes.
+pub(crate) fn split_mark_revision(frag: Vec<u8>) -> (Option<engine::Revision>, Vec<u8>) {
+    let mut reader = Reader::from_reader(frag.as_slice());
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut depth = 0usize;
+    let mut prev = 0usize;
+    loop {
+        let ev = match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(ev) => ev,
+        };
+        let here = reader.buffer_position() as usize;
+        match ev {
+            Event::Start(e) => {
+                if depth == 1
+                    && let Some(kind) = mark_revision_kind(e.name().as_ref())
+                {
+                    /* `<w:ins …></w:ins>`: skip to the matching end. */
+                    let end_tag = e.to_end().into_owned();
+                    let mut skip = Vec::new();
+                    if reader.read_to_end_into(end_tag.name(), &mut skip).is_err() {
+                        break;
+                    }
+                    let end = reader.buffer_position() as usize;
+                    return (Some(mark_revision(kind, &e)), cut(&frag, prev, end));
+                }
+                depth += 1;
+            }
+            Event::Empty(e) => {
+                if depth == 1
+                    && let Some(kind) = mark_revision_kind(e.name().as_ref())
+                {
+                    return (Some(mark_revision(kind, &e)), cut(&frag, prev, here));
+                }
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        prev = here;
+        buf.clear();
+    }
+    (None, frag)
+}
+
+fn mark_revision_kind(qname: &[u8]) -> Option<engine::RevisionKind> {
+    match qname {
+        b"w:ins" => Some(engine::RevisionKind::Insert),
+        b"w:del" => Some(engine::RevisionKind::Delete),
+        b"w:moveFrom" => Some(engine::RevisionKind::MoveFrom),
+        b"w:moveTo" => Some(engine::RevisionKind::MoveTo),
+        _ => None,
+    }
+}
+
+fn mark_revision(kind: engine::RevisionKind, e: &BytesStart<'_>) -> engine::Revision {
+    engine::Revision {
+        start: 0,
+        end: 0,
+        kind,
+        author: attr_val(e, b"w:author").unwrap_or_default(),
+        date: attr_val(e, b"w:date").unwrap_or_default(),
+        id: attr_val(e, b"w:id").and_then(|v| v.trim().parse().ok()),
+        prev_attrs: None,
+        move_name: None,
+    }
+}
+
+fn cut(frag: &[u8], s: usize, e: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(frag.len() - (e - s));
+    out.extend_from_slice(&frag[..s]);
+    out.extend_from_slice(&frag[e..]);
+    out
+}
+
+/// Issue #247 — one open `<w:moveFromRangeStart>` / `<w:moveToRangeStart>`.
+struct MoveRangeOpen {
+    from: bool,
+    id: Option<String>,
+    name: Option<String>,
+}
+
+/// Issue #247 — track the move ranges open at the cursor from their
+/// (empty) start / end markers.
+fn note_move_range(qname: &[u8], e: &BytesStart<'_>, open: &mut Vec<MoveRangeOpen>) {
+    match qname {
+        b"w:moveFromRangeStart" | b"w:moveToRangeStart" => open.push(MoveRangeOpen {
+            from: qname == b"w:moveFromRangeStart",
+            id: attr_val(e, b"w:id"),
+            name: attr_val(e, b"w:name"),
+        }),
+        b"w:moveFromRangeEnd" | b"w:moveToRangeEnd" => {
+            let from = qname == b"w:moveFromRangeEnd";
+            let id = attr_val(e, b"w:id");
+            if let Some(i) = open.iter().rposition(|r| r.from == from && r.id == id) {
+                open.remove(i);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Issue #120 — the self-contained elements a `<w:body>` / `<w:tc>` may
 /// hold between two blocks (ECMA-376 §17.2.2 `EG_RunLevelElements` at
 /// block level, plus `<w:altChunk>`) that the typed model does not
@@ -916,8 +1033,13 @@ pub fn parse_document_xml_with_warnings(
     covering the byte range produced inside. Stack-shaped so a
     nested ins/del (rare but legal — an insertion inside a deletion)
     still resolves correctly. */
-    let mut revision_stack: Vec<(engine::RevisionKind, String, String, Option<u32>, u32)> =
-        Vec::new();
+    let mut revision_stack: Vec<RevisionOpen> = Vec::new();
+    /* Issue #247 — the move ranges open at the cursor
+    (`<w:moveFromRangeStart w:id w:name>` … `<w:moveFromRangeEnd w:id>`,
+    likewise `moveTo`), innermost last: a `<w:moveFrom>` / `<w:moveTo>`
+    wrapper takes the name of the innermost open range of its side. The
+    markers themselves ride the source markup / block envelope verbatim. */
+    let mut open_move_ranges: Vec<MoveRangeOpen> = Vec::new();
     /* Phase 8b — `<w:delText>` is the OOXML synonym for `<w:t>` inside a
     `<w:del>` wrapper. The parser collapses both into `run_text` so
     deleted text rides alongside live content; the `Revision` overlay
@@ -950,6 +1072,9 @@ pub fn parse_document_xml_with_warnings(
     let mut p_style_id: Option<String> = None;
     let mut direct_ppr = ParaProperties::default();
     let mut pmark_rpr = SpanStyle::default();
+    /* Issue #262 — the tracked change on the paragraph mark
+    (`<w:pPr><w:rPr><w:ins/>`), lifted out of the mark's rPr grab bag. */
+    let mut para_mark_revision: Option<engine::Revision> = None;
     /* Phase 4 — `<w:numPr>/<w:numId>` + `<w:ilvl>` accumulators. We don't
     inherit either field from a paragraph style here; that's a separate
     cascade source Phase 4 ships without modelling. */
@@ -1002,7 +1127,7 @@ pub fn parse_document_xml_with_warnings(
     when the element opens; mark the byte range covered when it
     closes. `target` is the rId at this stage — the archive resolver
     swaps it to a URL via the rels map in a second pass. */
-    let mut hyperlink_stack: Vec<(String, u32)> = Vec::new();
+    let mut hyperlink_stack: Vec<(String, u32, Vec<engine::SourceAttr>)> = Vec::new();
 
     /* Phase 6 — `<w:sectPr>` accumulators. A sectPr can live in two places:
     inside a paragraph's `<w:pPr>` (ends a section *at* that paragraph,
@@ -1307,6 +1432,7 @@ pub fn parse_document_xml_with_warnings(
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pmark_rpr = SpanStyle::default();
+                        para_mark_revision = None;
                     }
                     b"w:r" => {
                         in_run = true;
@@ -1327,6 +1453,13 @@ pub fn parse_document_xml_with_warnings(
                         overriding the live formatting. */
                         if let Some(frag) = capture_subtree(xml, prev_pos, &mut reader, &e)? {
                             fold_rpr_fragment(&frag, &mut pmark_rpr);
+                            /* Issue #262 — the mark's tracked change is
+                            modeled (`Paragraph::mark_revision`); the bag
+                            keeps the rest and the writer re-injects it. */
+                            let (mark, frag) = split_mark_revision(frag);
+                            if para_mark_revision.is_none() {
+                                para_mark_revision = mark;
+                            }
                             stash(&mut direct_ppr.grab_bag, frag, &ns);
                         }
                     }
@@ -1377,7 +1510,10 @@ pub fn parse_document_xml_with_warnings(
                         let target = attr_val(&e, b"r:id")
                             .or_else(|| attr_val(&e, b"w:anchor").map(|a| format!("#{a}")))
                             .unwrap_or_default();
-                        hyperlink_stack.push((target, start));
+                        /* Issue #242 — the source attributes (`r:id`, `w:history`,
+                        `w:tooltip`, …) ride the link for regeneration. */
+                        let attrs = crate::schema::source_markup::raw_attrs(&e, &ns);
+                        hyperlink_stack.push((target, start, attrs));
                     }
                     b"w:t" => {
                         in_text_elt = true;
@@ -1466,17 +1602,34 @@ pub fn parse_document_xml_with_warnings(
                             .map(<[u8]>::to_vec);
                         fld_simple_stack.push((instr, start, tag));
                     }
-                    b"w:ins" | b"w:del" => {
-                        let kind = if name.as_ref() == b"w:ins" {
-                            engine::RevisionKind::Insert
-                        } else {
-                            engine::RevisionKind::Delete
+                    b"w:ins" | b"w:del" | b"w:moveFrom" | b"w:moveTo" => {
+                        let kind = match name.as_ref() {
+                            b"w:ins" => engine::RevisionKind::Insert,
+                            b"w:del" => engine::RevisionKind::Delete,
+                            b"w:moveFrom" => engine::RevisionKind::MoveFrom,
+                            _ => engine::RevisionKind::MoveTo,
                         };
-                        let author = attr_val(&e, b"w:author").unwrap_or_default();
-                        let date = attr_val(&e, b"w:date").unwrap_or_default();
-                        let id = attr_val(&e, b"w:id").and_then(|v| v.trim().parse().ok());
-                        let start = (para_text.len() + run_text.len()) as u32;
-                        revision_stack.push((kind, author, date, id, start));
+                        /* Issue #247 — a move wrapper names its move by
+                        the innermost open range of its side. */
+                        let move_name = match kind {
+                            engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => {
+                                let from = kind == engine::RevisionKind::MoveFrom;
+                                open_move_ranges
+                                    .iter()
+                                    .rev()
+                                    .find(|r| r.from == from)
+                                    .and_then(|r| r.name.clone())
+                            }
+                            _ => None,
+                        };
+                        revision_stack.push(RevisionOpen {
+                            kind,
+                            author: attr_val(&e, b"w:author").unwrap_or_default(),
+                            date: attr_val(&e, b"w:date").unwrap_or_default(),
+                            id: attr_val(&e, b"w:id").and_then(|v| v.trim().parse().ok()),
+                            start: (para_text.len() + run_text.len()) as u32,
+                            move_name,
+                        });
                     }
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
@@ -1580,6 +1733,9 @@ pub fn parse_document_xml_with_warnings(
                     }
                     _ => {}
                 }
+                /* Issue #247 — move range names (the markers themselves
+                are captured verbatim above / by the block envelope). */
+                note_move_range(name.as_ref(), &e, &mut open_move_ranges);
                 match name.as_ref() {
                     b"w:p" if at_block_level => {
                         /* Issue #120 — a self-closing `<w:p …/>` (an empty
@@ -1779,7 +1935,8 @@ pub fn parse_document_xml_with_warnings(
                         }
                     }
                     b"w:commentRangeStart" => {
-                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok()) {
+                        let id: Option<u32> = attr_val(&e, b"w:id").and_then(|v| v.parse().ok());
+                        if let Some(id) = id {
                             let block_idx = out_blocks.len() as u32;
                             let off = (para_text.len() + run_text.len()) as u32;
                             open_comment_ranges.insert(id, (block_idx, off));
@@ -1791,10 +1948,47 @@ pub fn parse_document_xml_with_warnings(
                             if let Some(frag) = slice_fragment(xml, prev_pos, end) {
                                 envelopes.push_verbatim(frag);
                             }
+                        } else if let Some(id) = id
+                            && !in_run
+                            && !in_ppr
+                            && let Some(frag) =
+                                slice_fragment(xml, prev_pos, reader.buffer_position() as usize)
+                        {
+                            /* Issue #243 — inside a paragraph: a comment-
+                            anchor marker, verified against the tree. */
+                            markup.comment_marker(
+                                (para_text.len() + run_text.len()) as u32,
+                                frag,
+                                engine::CommentAnchor {
+                                    kind: engine::CommentAnchorKind::RangeStart,
+                                    id,
+                                },
+                                &ns,
+                            );
                         }
                     }
                     b"w:commentRangeEnd" => {
-                        if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok())
+                        let raw_id: Option<u32> =
+                            attr_val(&e, b"w:id").and_then(|v| v.parse().ok());
+                        if !at_block_level
+                            && let Some(id) = raw_id
+                            && !in_run
+                            && !in_ppr
+                            && let Some(frag) =
+                                slice_fragment(xml, prev_pos, reader.buffer_position() as usize)
+                        {
+                            /* Issue #243 — see `w:commentRangeStart`. */
+                            markup.comment_marker(
+                                (para_text.len() + run_text.len()) as u32,
+                                frag,
+                                engine::CommentAnchor {
+                                    kind: engine::CommentAnchorKind::RangeEnd,
+                                    id,
+                                },
+                                &ns,
+                            );
+                        }
+                        if let Some(id) = raw_id
                             && let Some((start_block, start_off)) = open_comment_ranges.remove(&id)
                         {
                             let end_block = out_blocks.len() as u32;
@@ -1820,9 +2014,14 @@ pub fn parse_document_xml_with_warnings(
                     }
                     b"w:commentReference" => {
                         /* The reference marker itself is invisible in the
-                        canvas (the sidebar UI shows the comment); the
-                        passthrough writer round-trips the markup byte-
-                        identical. Nothing to record here. */
+                        canvas (the sidebar UI shows the comment). Issue
+                        #243 — its run rides a regenerated paragraph as a
+                        comment-anchor marker. */
+                        if in_run
+                            && let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok())
+                        {
+                            markup.run_comment_reference(id);
+                        }
                     }
                     b"w:fldChar" => {
                         let depth_before = field_stack.len();
@@ -2079,18 +2278,19 @@ pub fn parse_document_xml_with_warnings(
                     b"w:t" => in_text_elt = false,
                     b"w:delText" => in_del_text_elt = false,
                     b"w:instrText" => in_instr_text = false,
-                    b"w:ins" | b"w:del" => {
-                        if let Some((kind, author, date, id, start)) = revision_stack.pop() {
+                    b"w:ins" | b"w:del" | b"w:moveFrom" | b"w:moveTo" => {
+                        if let Some(open) = revision_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
-                            if end > start {
+                            if end > open.start {
                                 para_revisions.push(engine::Revision {
-                                    start,
+                                    start: open.start,
                                     end,
-                                    kind,
-                                    author,
-                                    date,
-                                    id,
+                                    kind: open.kind,
+                                    author: open.author,
+                                    date: open.date,
+                                    id: open.id,
                                     prev_attrs: None,
+                                    move_name: open.move_name,
                                 });
                             }
                         }
@@ -2172,10 +2372,15 @@ pub fn parse_document_xml_with_warnings(
                         }
                     }
                     b"w:hyperlink" => {
-                        if let Some((target, start)) = hyperlink_stack.pop() {
+                        if let Some((target, start, attrs)) = hyperlink_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
                             if end > start && !target.is_empty() {
-                                para_hyperlinks.push(engine::Hyperlink { start, end, target });
+                                para_hyperlinks.push(engine::Hyperlink {
+                                    start,
+                                    end,
+                                    target,
+                                    attrs,
+                                });
                             }
                         }
                     }
@@ -2330,12 +2535,18 @@ pub fn parse_document_xml_with_warnings(
                             }),
                             (None, _) => props.list_item,
                         };
-                        let source_markup = markup.finish(
+                        let mut source_markup = markup.finish(
                             para_text.len() as u32,
                             &props,
                             &style_id_for_paragraph,
                             list_item,
                         );
+                        /* Issue #262 — the recorded pPr bytes carry the
+                        mark revision: verified against it on write. */
+                        if let Some(sp) = source_markup.as_deref_mut().and_then(|m| m.ppr.as_mut())
+                        {
+                            sp.mark_revision = para_mark_revision.clone();
+                        }
                         out_blocks.push(Block::Paragraph(Paragraph {
                             text: std::mem::take(&mut para_text),
                             spans: std::mem::take(&mut spans),
@@ -2364,6 +2575,7 @@ pub fn parse_document_xml_with_warnings(
                             opener, whitespace) attaches before this one. */
                             body_xml: envelopes.take_before(),
                             source_markup,
+                            mark_revision: para_mark_revision.take(),
                         }));
                         envelopes.note_block_end(p_end_byte);
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this

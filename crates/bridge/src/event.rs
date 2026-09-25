@@ -127,6 +127,15 @@ pub enum Event {
         #[serde(default)]
         #[tsify(optional)]
         renderer_downgrade: Option<RendererDowngrade>,
+        /// Issue #268 — the restored base snapshot named a retained source
+        /// package (#134 / #212) that could not be re-attached (not
+        /// supplied, mismatched or unreadable), and the replayed tail did
+        /// not replace the document: the recovered session saves through
+        /// the minimal-package writer, dropping the sibling parts. The
+        /// shell uses it to prefer an older base that still has its
+        /// package, and reports it when none does. `false` otherwise.
+        #[serde(default)]
+        package_lost: bool,
     },
     /// Reply to `Command::Snapshot` (issue #85): the versioned snapshot
     /// envelope (`engine::snapshot`, magic + format version + payload).
@@ -201,6 +210,14 @@ pub enum Event {
         /// Issue #26 — per-page heights in device px, index-aligned
         /// with `page_tops`.
         page_heights: Vec<f32>,
+        /// Issue #280 — per-page widths in device px, index-aligned
+        /// with `page_tops`. The shell sizes every page card's CSS box
+        /// from `page_widths` / `page_heights` (÷ its device-px-per-CSS-px
+        /// ratio), so a zoom or a landscape section visibly resizes the
+        /// page instead of only densifying a fixed A4 box. Additive;
+        /// empty from pre-#280 producers (consumers fall back to A4).
+        #[serde(default)]
+        page_widths: Vec<f32>,
         /// Issue #44 — count of inline images in the whole document. Lets
         /// the shell skip the `GetImageRects` refresh entirely for the
         /// (common) image-free document instead of paying an extra worker

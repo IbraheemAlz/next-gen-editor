@@ -23,3 +23,10 @@
     outline: 2px solid var(--nge-color-primary);
     outline-offset: 1px;
 }
+
+/* Issue #280 — the sticky Fit-width mode reads as a pressed toggle. */
+.nge-zoom__fit[aria-pressed='true'] {
+    background: var(--nge-color-primary);
+    border-color: var(--nge-color-primary);
+    color: var(--nge-color-bg);
+}

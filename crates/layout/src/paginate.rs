@@ -102,6 +102,14 @@ The protocol (clean-room design notes: PRD_LIBREOFFICE §4C, the
 - Endnotes are a trailing story: [`Paginator::push_trailing_notes`]
   stacks them beneath the body at section / document end, splitting
   across pages the same way.
+- Issue #278 — references outside the body flow. A table cell's ride
+  its row (the row is the flow item). A text box's story is laid out
+  after pagination, so its references ride the box's SENTINEL glyph
+  (`TextBoxGlyph::note_anchors`) and reserve on the anchor line. A
+  header / footer band's references open the band of the first page
+  showing it, before any body line is fitted
+  (`Paginator::seed_band_notes`, no loop: the rest of the band notes
+  carry), once per document (`band_notes_placed`).
 
 Termination (issue #87): no negotiation loop re-pushes a block. The only
 loop is the carry-over drain — each page consumes at least one line of
@@ -294,6 +302,15 @@ pub struct Paginator {
     /// Set once the cap is hit; every later block is appended to the
     /// current page atomically, without a page break.
     capped: bool,
+    /// Issue #278 — the in-progress page's header / footer note
+    /// references have been committed to its band (see
+    /// [`Self::seed_band_notes`]). Cleared on every page flush.
+    band_notes_seeded: bool,
+    /// Issue #278 — footnotes a header / footer band already placed (on
+    /// this paginator's pages, or — via [`Self::with_placed_band_notes`]
+    /// — an earlier paginator's): a band repeats on every page, its note
+    /// appears once, on the first page that shows it.
+    band_notes_placed: std::collections::HashSet<NoteAnchor>,
 }
 
 impl Paginator {
@@ -334,6 +351,8 @@ impl Paginator {
             watchdog: Watchdog::default(),
             page_cap: DEFAULT_PAGE_CAP,
             capped: false,
+            band_notes_seeded: false,
+            band_notes_placed: std::collections::HashSet::new(),
         };
         /* Issue #71 (design review B3) — page 1 opens BELOW its
         header band when the band is taller than the top margin. */
@@ -632,6 +651,14 @@ impl Paginator {
         self
     }
 
+    /// Issue #278 — footnotes an earlier paginator's pages already
+    /// carry: a header / footer band referencing one of them does not
+    /// place it again.
+    pub fn with_placed_band_notes(mut self, placed: impl IntoIterator<Item = NoteAnchor>) -> Self {
+        self.band_notes_placed.extend(placed);
+        self
+    }
+
     /// Issue #80 — install the laid-out `continuationNotice` story
     /// (appended to a note's head on the page where it is cut).
     pub fn with_continuation_notice(mut self, notice: Option<NoteBody>) -> Self {
@@ -844,6 +871,9 @@ impl Paginator {
     /// construction (tails shrink, the oversize guard clips) and still
     /// honours the stage the follower's churn has reached.
     fn push_block_inner(&mut self, block: LayoutBlock, before: f32, after: f32, observe: bool) {
+        /* Issue #278 — the page's header / footer notes open its band
+        before any body line is fitted against it. */
+        self.seed_band_notes();
         /* Apply the paragraph's `<w:spacing w:before>` first — the engine
         layer already had this concept; we keep it here so the paginator
         owns every Y-coordinate. */
@@ -1161,6 +1191,148 @@ impl Paginator {
         };
     }
 
+    /// Issue #278 — commit the footnotes the in-progress page's header /
+    /// footer bands reference to its footnote band, once per page and
+    /// before any body line is fitted (the band shows on the page, so
+    /// its notes are the page's first references after a carried
+    /// continuation — matching the numbering walk, which counts a part's
+    /// references ahead of its first section's body). A note is placed
+    /// on the FIRST page showing its band only (`band_notes_placed`);
+    /// endnotes are left to the trailing band.
+    ///
+    /// No loop: the notes take at most `1 - NOTE_BODY_RESERVE_FRACTION`
+    /// of the page's remaining body budget; the first that does not fit
+    /// whole splits at a line boundary and every later one is carried
+    /// whole — both through the ordinary carry, which the next page's
+    /// flush drains under its own termination rule. A note too tall to
+    /// split into the allowance places its first slice anyway, clipped
+    /// (`FootnoteOverflow`). Past the page cap everything lands whole.
+    fn seed_band_notes(&mut self) {
+        if self.band_notes_seeded {
+            return;
+        }
+        self.band_notes_seeded = true;
+        let role = self.page_role();
+        let mut anchors: Vec<(NoteAnchor, String)> = Vec::new();
+        for band in [self.headers.resolve(role), self.footers.resolve(role)]
+            .into_iter()
+            .flatten()
+        {
+            for b in &band.blocks {
+                anchors.extend(collect_note_anchors(b));
+            }
+        }
+        if anchors.is_empty() {
+            return;
+        }
+        let mut fresh: Vec<(NoteAnchor, String, Vec<LayoutBlock>)> = Vec::new();
+        for (anchor, marker) in anchors {
+            if anchor.kind != engine::NoteKind::Footnote
+                || self.band_notes_placed.contains(&anchor)
+                || self.cur_notes.iter().any(|n| n.anchor == anchor)
+                || self.footnote_carry.iter().any(|c| c.anchor == anchor)
+                || fresh.iter().any(|(a, _, _)| *a == anchor)
+            {
+                continue;
+            }
+            let Some(body) = self.note_bodies.get(&anchor).filter(|b| !b.is_empty()) else {
+                continue;
+            };
+            fresh.push((anchor, marker, body.clone()));
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let sep = if self.cur_notes.is_empty() {
+            FOOTNOTE_SEPARATOR_HEIGHT_PT
+        } else {
+            0.0
+        };
+        let budget = (self.geometry.content_height()
+            - self.cur_y
+            - self.cur_footnote_height
+            - self.footer_intrusion(role))
+        .max(0.0);
+        let allowance = if self.capped {
+            f32::INFINITY
+        } else {
+            (budget * (1.0 - NOTE_BODY_RESERVE_FRACTION) - sep).max(0.0)
+        };
+        let notice_h = self
+            .continuation_notice
+            .as_deref()
+            .map_or(0.0, blocks_height);
+        let mut used = 0.0_f32;
+        let mut split_done = false;
+        for (anchor, marker, blocks) in fresh {
+            self.band_notes_placed.insert(anchor);
+            if split_done {
+                self.footnote_carry.push(NoteCarry {
+                    anchor,
+                    marker,
+                    blocks,
+                    first_block_index: 0,
+                    continued: false,
+                });
+                continue;
+            }
+            let h = blocks_height(&blocks);
+            if used + h <= allowance {
+                self.cur_notes.push(PendingNote {
+                    anchor,
+                    marker,
+                    blocks,
+                    height: h,
+                    first_block_index: 0,
+                    continued_from_previous: false,
+                    continues_on_next: false,
+                });
+                used += h;
+                continue;
+            }
+            let split_budget = allowance - used - notice_h;
+            let (mut head, mut tail, mut tail_first) = if split_budget > 0.0 {
+                split_note_blocks(&blocks, split_budget)
+            } else {
+                (Vec::new(), blocks.clone(), 0)
+            };
+            if head.is_empty() {
+                let (h0, t0, f0) = first_note_slice(&blocks);
+                head = h0;
+                tail = t0;
+                tail_first = f0;
+                let page = self.cur_page_index();
+                self.watchdog.note(DegradeReason::FootnoteOverflow, page);
+            }
+            let continues = !tail.is_empty();
+            if continues {
+                if let Some(notice) = self.continuation_notice.as_deref() {
+                    append_stacked(&mut head, notice);
+                }
+                self.footnote_carry.push(NoteCarry {
+                    anchor,
+                    marker: marker.clone(),
+                    blocks: tail,
+                    first_block_index: tail_first,
+                    continued: true,
+                });
+            }
+            let hh = blocks_height(&head);
+            self.cur_notes.push(PendingNote {
+                anchor,
+                marker,
+                blocks: head,
+                height: hh,
+                first_block_index: 0,
+                continued_from_previous: false,
+                continues_on_next: continues,
+            });
+            used += hh;
+            split_done = true;
+        }
+        self.recompute_footnote_height();
+    }
+
     /// Issue #80 — open a fresh page's footnote band with the carried
     /// continuation(s). The continuation may take at most
     /// `1 - NOTE_BODY_RESERVE_FRACTION` of the body budget; what does not
@@ -1285,6 +1457,9 @@ impl Paginator {
             })
             .collect();
         while let Some(c) = queue.pop_front() {
+            /* Issue #278 — a page the endnotes open still shows its
+            header / footer notes (a no-op once seeded). */
+            self.seed_band_notes();
             let band_open = !self.cur_endnotes.is_empty();
             let sep = if band_open {
                 0.0
@@ -2181,6 +2356,10 @@ impl Paginator {
     }
 
     fn flush_page(&mut self) {
+        /* Issue #278 — a page flushed before any block reached it (a
+        section's blank page, the note-drain pages of `finish`) still
+        shows its bands, and so their notes. */
+        self.seed_band_notes();
         let blocks = std::mem::take(&mut self.cur_blocks);
         /* `cur_y` is re-seeded at the END of this fn — the opening
         offset depends on the NEXT page's role, which is only known
@@ -2354,6 +2533,8 @@ impl Paginator {
         the section. Subsequent pages in the same section pick
         `Default` or `Even`. */
         self.section_first_page_pending = false;
+        /* Issue #278 — the next page seeds its own band notes. */
+        self.band_notes_seeded = false;
         /* Design review B3 — NOW the next page's role is computable
         (pages.len() bumped, pending flag settled): open below its own
         header band. */
@@ -2737,12 +2918,20 @@ fn band_flow_items(lines: &[LineBox]) -> (Vec<FlowItem>, Vec<usize>) {
     (items, ends)
 }
 
+///
+/// Issue #278 — a text box's sentinel glyph contributes the references
+/// inside its story ([`crate::boxes::TextBoxGlyph::note_anchors`]): the
+/// story paints after pagination, on the page of its anchor line, so
+/// that line reserves the notes.
 fn anchors_on_line(line: &LineBox) -> Vec<(NoteAnchor, String)> {
     let mut out = Vec::new();
     for run in &line.runs {
         for g in &run.glyphs {
             if let Some(anchor) = g.inline_note_anchor {
                 out.push((anchor, g.inline_footnote_marker.clone().unwrap_or_default()));
+            }
+            if let Some(tb) = g.float.as_deref().and_then(|f| f.text_box.as_deref()) {
+                out.extend(tb.note_anchors.iter().cloned());
             }
         }
     }
@@ -2765,12 +2954,19 @@ fn anchors_in_row(row: &TableRowBox) -> Vec<(NoteAnchor, String)> {
     out
 }
 
-/// `true` when any line of `p` carries a note reference.
+/// `true` when any line of `p` carries a note reference (issue #278: a
+/// text box whose story references a note counts).
 fn paragraph_has_note_anchors(p: &ParagraphBox) -> bool {
     p.lines.iter().any(|l| {
-        l.runs
-            .iter()
-            .any(|r| r.glyphs.iter().any(|g| g.inline_note_anchor.is_some()))
+        l.runs.iter().any(|r| {
+            r.glyphs.iter().any(|g| {
+                g.inline_note_anchor.is_some()
+                    || g.float
+                        .as_deref()
+                        .and_then(|f| f.text_box.as_deref())
+                        .is_some_and(|tb| !tb.note_anchors.is_empty())
+            })
+        })
     })
 }
 
@@ -2864,6 +3060,7 @@ pub fn split_paragraph_at_line(
             space_after: 0.0,
             ..para.flow
         },
+        review_mark: None,
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -2886,6 +3083,8 @@ pub fn split_paragraph_at_line(
             page_break_before: false,
             ..para.flow
         },
+        /* Issue #262 — the paragraph mark ends the tail. */
+        review_mark: para.review_mark,
     };
     (Some(head), Some(tail))
 }
@@ -2955,6 +3154,7 @@ pub fn split_paragraph_at_line_index(
             space_after: 0.0,
             ..para.flow
         },
+        review_mark: None,
     };
     let tail = ParagraphBox {
         origin: Point { x: 0.0, y: 0.0 },
@@ -2977,6 +3177,8 @@ pub fn split_paragraph_at_line_index(
             page_break_before: false,
             ..para.flow
         },
+        /* Issue #262 — the paragraph mark ends the tail. */
+        review_mark: para.review_mark,
     };
     (Some(head), Some(tail))
 }
@@ -3058,6 +3260,7 @@ mod tests {
             shading: None,
             keep_next: false,
             flow: ParaFlow::default(),
+            review_mark: None,
         }
     }
 
@@ -3319,6 +3522,7 @@ mod tests {
                 shading: None,
                 keep_next: false,
                 flow: ParaFlow::default(),
+                review_mark: None,
             })],
             source_rid: None,
         }
@@ -3372,6 +3576,7 @@ mod tests {
             shading: None,
             keep_next: false,
             flow: ParaFlow::default(),
+            review_mark: None,
         }
     }
 
@@ -6421,5 +6626,155 @@ mod tests {
         let got = page_note_ordinals(&pages[1..], |_| Some(5));
         let ids: Vec<(u32, u32)> = got.iter().map(|(a, n)| (a.id, *n)).collect();
         assert_eq!(ids, vec![(4, 5), (5, 6)]);
+    }
+
+    /* ================================================================
+    Issue #278 — note references outside the body flow: header /
+    footer bands and text-box stories.
+    ================================================================ */
+
+    /// A header band whose single line references footnote `id`.
+    fn header_with_footnote_ref(id: u32) -> HeaderFooterBox {
+        HeaderFooterBox {
+            blocks: vec![LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(
+                id, 1, 12.0,
+            ))],
+            source_rid: None,
+        }
+    }
+
+    fn band_ids(page: &PageBox) -> Vec<(u32, bool, bool)> {
+        page.footnotes
+            .entries
+            .iter()
+            .map(|e| (e.id, e.continued_from_previous, e.continues_on_next))
+            .collect()
+    }
+
+    /// A header note opens the band of the FIRST page showing the header
+    /// (ahead of that page's body notes) and is never repeated.
+    #[test]
+    fn header_band_note_is_placed_once_on_the_first_page() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(5, 2, 14.0), (1, 1, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, Some(header_with_footnote_ref(5)), None)
+            .with_note_bodies(bodies)
+            .with_strict_watchdog(true);
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 80, 16.0)),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(pages.len() >= 2);
+        assert_eq!(
+            band_ids(&pages[0]),
+            vec![(5, false, false), (1, false, false)]
+        );
+        for p in &pages[1..] {
+            assert!(p.footnotes.entries.is_empty(), "note repeated: {p:?}");
+        }
+        /* The body stops above the band on page 1. */
+        let body_bottom = pages[0]
+            .blocks
+            .iter()
+            .map(|b| b.origin().y + b.size().height)
+            .fold(0.0_f32, f32::max)
+            + geom.margins.top;
+        assert!(body_bottom <= pages[0].footnotes.y - FOOTNOTE_SEPARATOR_HEIGHT_PT + 0.01);
+    }
+
+    /// A header note too tall for its page's allowance splits at a line
+    /// boundary and continues through the ordinary carry — no loop, no
+    /// degradation; and a band note an earlier paginator placed
+    /// (`with_placed_band_notes`) is not placed again.
+    #[test]
+    fn oversized_header_note_splits_and_placed_notes_are_skipped() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(5, 80, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, Some(header_with_footnote_ref(5)), None)
+            .with_note_bodies(bodies.clone())
+            .with_strict_watchdog(true);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(10, 16.0)), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(band_ids(&pages[0]), vec![(5, false, true)]);
+        assert_eq!(band_ids(&pages[1])[0], (5, true, pages.len() > 2));
+        let lines: usize = pages
+            .iter()
+            .flat_map(|p| p.footnotes.entries.iter())
+            .flat_map(|e| e.blocks.iter())
+            .filter_map(LayoutBlock::as_paragraph)
+            .map(|p| p.lines.len())
+            .sum();
+        assert_eq!(lines, 80, "every line of the note paints exactly once");
+
+        let mut pag = Paginator::with_default_bands(geom, Some(header_with_footnote_ref(5)), None)
+            .with_note_bodies(bodies)
+            .with_placed_band_notes([fn_anchor(5)]);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(10, 16.0)), 0.0, 0.0);
+        let pages = pag.finish();
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].footnotes.entries.is_empty());
+    }
+
+    /// A text box's story references ride its sentinel glyph: the line
+    /// carrying the sentinel reserves the notes, so they land on the
+    /// anchor's page — here the SECOND page, where the host paragraph
+    /// flows after a full first page.
+    #[test]
+    fn text_box_sentinel_reserves_its_story_notes_on_the_anchor_page() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(3, 2, 14.0)]);
+        /* A one-line paragraph with one glyph, turned into the box's
+        sentinel (no reference of its own). */
+        let mut host = fake_paragraph_with_footnote_ref(99, 1, 16.0);
+        let sentinel = &mut host.lines[0].runs[0].glyphs[0];
+        sentinel.inline_note_anchor = None;
+        sentinel.inline_footnote_marker = None;
+        sentinel.float = Some(Box::new(crate::boxes::FloatGlyph {
+            rel_id: String::new(),
+            width: 100.0,
+            height: 40.0,
+            spec: crate::boxes::FloatSpec {
+                h_frame: engine::HRelativeFrom::Character,
+                h_offset: crate::boxes::FloatOffsetPx::Px(0.0),
+                v_frame: engine::VRelativeFrom::Line,
+                v_offset: crate::boxes::FloatOffsetPx::Align(engine::FloatAlign::Top),
+                simple_pos: None,
+                z_order: 0,
+                behind_doc: false,
+                hidden: false,
+            },
+            wrap: crate::boxes::FloatWrap::default(),
+            text_box: Some(Box::new(crate::boxes::TextBoxGlyph {
+                story: std::sync::Arc::new(engine::TextBoxStory::default()),
+                key: 1,
+                insets: [0.0; 4],
+                v_align: engine::TextBoxVAlign::Top,
+                fill: None,
+                outline: None,
+                inline: true,
+                note_anchors: vec![(fn_anchor(3), "3".to_string())],
+            })),
+        }));
+        assert!(paragraph_has_note_anchors(&host));
+        let mut pag = Paginator::with_default_bands(geom, None, None)
+            .with_note_bodies(bodies)
+            .with_strict_watchdog(true);
+        let page_lines = (geom.content_height() / 16.0).floor() as usize;
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph(page_lines, 16.0)),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(host), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].footnotes.entries.is_empty());
+        assert_eq!(band_ids(&pages[1]), vec![(3, false, false)]);
+        assert_eq!(pages[1].footnotes.entries[0].marker, "3");
     }
 }
