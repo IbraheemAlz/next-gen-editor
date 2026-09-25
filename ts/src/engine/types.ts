@@ -37,6 +37,7 @@ export type {
     ImageBlob,
     ImageFit,
     ImageWrapMode,
+    TextBoxHop,
     LogicalPos,
     LogicalRange,
     MoveDirection,

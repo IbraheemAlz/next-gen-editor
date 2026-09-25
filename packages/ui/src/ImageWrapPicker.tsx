@@ -15,9 +15,17 @@
  * the engine (it answers `ERROR`), so for an inline image the picker is
  * visibly gated — disabled, with the amber "Engine pending" badge (Honest
  * UX; the conversion is a tracked gap of the #82 follow-up).
+ *
+ * Issue #206 — a picture inside a text-box story carries its `story`
+ * chain; the picker hands it back so the wrap applies inside the box.
  */
 import { For, Show, createMemo, type Component } from 'solid-js';
-import { createEditorCommands, type BlockPath, type ImageWrapMode } from '@nge/core';
+import {
+    createEditorCommands,
+    type BlockPath,
+    type ImageWrapMode,
+    type TextBoxHop,
+} from '@nge/core';
 import { focusEditorInput } from './focus';
 import './ImageWrapPicker.css';
 
@@ -29,6 +37,9 @@ export interface ImageWrapTarget {
     floating: boolean;
     /** The engine-reported mode (`ImageRect.wrap`); `undefined` inline. */
     wrap: ImageWrapMode | undefined;
+    /** Issue #206 — the text-box story chain (`ImageRect.story`) of a
+     *  picture inside a text box; absent / empty for a body picture. */
+    story?: TextBoxHop[];
 }
 
 export interface ImageWrapPickerProps {
@@ -63,7 +74,7 @@ export const ImageWrapPicker: Component<ImageWrapPickerProps> = (props) => {
     const choose = async (mode: ImageWrapMode) => {
         const im = target();
         if (!im || !im.floating || im.wrap === mode) return;
-        await cmd.setImageWrap(im.path, im.at, mode);
+        await cmd.setImageWrap(im.path, im.at, mode, im.story);
         focusEditorInput();
     };
 

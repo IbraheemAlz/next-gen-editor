@@ -193,6 +193,32 @@ pub struct ImageRect {
     /// checked state; changed through `Command::SetImageWrap`.
     #[serde(default)]
     pub wrap: Option<ImageWrapMode>,
+    /// Issue #206 — the text-box story the picture lives in: empty for a
+    /// body (or table-cell) picture; otherwise one [`TextBoxHop`] per box
+    /// descended into, outermost first (a picture in a box nested in a
+    /// box carries two). `path` is then rooted in the LAST hop's story
+    /// (`Block(i)` = that story's i-th block). Hand it back verbatim as
+    /// the `story` of `Command::ResizeImage` / `MoveImage` /
+    /// `SetImageWrap` to address the picture.
+    #[serde(default)]
+    pub story: Vec<TextBoxHop>,
+    /// Issue #206 — the owning story's id in the `outer/inner` form
+    /// `SelectionChanged.editing_story.rid` and the a11y text-box regions
+    /// use (`"1@0"`, `"1@0/1@0"`); empty for a body picture.
+    #[serde(default)]
+    pub story_rid: String,
+}
+
+/// Issue #206 — one step into a text-box story: the text box anchored at
+/// byte `at` (its `U+FFFC` sentinel) of the paragraph at `path`. The
+/// first hop's `path` is body-rooted; every later hop's is rooted in the
+/// previous hop's story. Depth is bounded by the text-box nesting cap
+/// (two) — a longer chain addresses nothing.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct TextBoxHop {
+    pub path: BlockPath,
+    pub at: u32,
 }
 
 /// Issue #82 — the user-facing text-wrap modes of a floating image, as
