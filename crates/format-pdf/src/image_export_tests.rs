@@ -529,8 +529,8 @@ fn missing_and_unsupported_media_warn_and_paint_nothing() {
     m.insert(
         "rIdFloat".into(),
         ImageBlob {
-            content_type: "image/gif".into(),
-            data: b"GIF89a\x01\x00\x01\x00".to_vec(),
+            content_type: "image/x-wmf".into(),
+            data: vec![0xD7, 0xCD, 0xC6, 0x9A, 0, 0],
         },
     );
     let mut pdf = Vec::new();
@@ -553,7 +553,7 @@ fn missing_and_unsupported_media_warn_and_paint_nothing() {
             },
             PdfWarning::ImageSkipped {
                 rel_id: "rIdFloat".into(),
-                reason: ImageSkipReason::UnsupportedFormat { format: "GIF" },
+                reason: ImageSkipReason::UnsupportedFormat { format: "WMF" },
             },
         ]
     );
@@ -651,4 +651,203 @@ fn shared_image_across_pages_is_embedded_once() {
             .unwrap();
     assert_eq!(report.images_embedded, 3);
     assert_eq!(images(&objects(&pdf)).len(), 4);
+}
+
+/* ---- Issue #189: GIF + WebP reach the PDF like PNG ------------------- */
+
+/// The fixture page's three relationships re-pointed at a GIF (palette +
+/// transparent index, 3×2), a lossless WebP with alpha (3×2) and a lossy
+/// WebP with an alpha plane (4×4).
+#[cfg(all(feature = "gif", feature = "webp"))]
+fn gif_webp_media() -> HashMap<String, ImageBlob> {
+    use super::image::test_images::{WEBP_LOSSY_ALPHA_4X4_BLUE, gif, webp_lossless_rgba};
+    /* Red, green, blue, white; index 2 transparent. */
+    let palette = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+    let lossless = [
+        255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, //
+        10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 64,
+    ];
+    let mut m = HashMap::new();
+    m.insert(
+        "rIdPng".to_string(),
+        ImageBlob {
+            content_type: "image/gif".into(),
+            data: gif(3, 2, &palette, 0, 0, 3, 2, &[0, 1, 2, 3, 2, 0], Some(2)),
+        },
+    );
+    m.insert(
+        "rIdJpg".to_string(),
+        ImageBlob {
+            content_type: "image/webp".into(),
+            data: webp_lossless_rgba(3, 2, &lossless),
+        },
+    );
+    m.insert(
+        "rIdFloat".to_string(),
+        ImageBlob {
+            content_type: "image/webp".into(),
+            data: WEBP_LOSSY_ALPHA_4X4_BLUE.to_vec(),
+        },
+    );
+    m
+}
+
+#[cfg(all(feature = "gif", feature = "webp"))]
+fn export_gif_webp(profile: PdfProfile) -> (Vec<u8>, PdfExportReport) {
+    let stack = liberation_stack();
+    let page = image_page(&stack);
+    let mut out = Vec::new();
+    let report = export_pdf_with_media(
+        std::slice::from_ref(&page),
+        &stack,
+        &[TEXT],
+        &gif_webp_media(),
+        profile,
+        &mut out,
+    )
+    .expect("export");
+    (out, report)
+}
+
+/// The `nth` base (non-mask) RGB image XObject of the given size.
+#[cfg(all(feature = "gif", feature = "webp"))]
+fn base_image(objs: &[Obj], w: i64, h: i64, nth: usize) -> &Obj {
+    images(objs)
+        .into_iter()
+        .filter(|o| o.dict.contains("/DeviceRGB"))
+        .filter(|o| {
+            dict_int(&o.dict, "/Width") == Some(w) && dict_int(&o.dict, "/Height") == Some(h)
+        })
+        .nth(nth)
+        .expect("image XObject")
+}
+
+#[cfg(all(feature = "gif", feature = "webp"))]
+fn soft_mask_of(objs: &[Obj], img: &Obj) -> Vec<u8> {
+    let num = dict_int(&img.dict, "/SMask").expect("/SMask") as u32;
+    let mask = objs.iter().find(|o| o.num == num).expect("mask object");
+    assert!(mask.dict.contains("/DeviceGray"));
+    inflate(mask.stream.as_ref().unwrap())
+}
+
+#[cfg(all(feature = "gif", feature = "webp"))]
+#[test]
+fn gif_and_webp_embed_as_flate_xobjects_with_soft_masks() {
+    let (pdf, report) = export_gif_webp(PdfProfile::Plain);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.images_embedded, 3);
+    let objs = objects(&pdf);
+    /* 3 images, each with transparency → 3 soft masks. */
+    assert_eq!(images(&objs).len(), 6);
+    assert_eq!(
+        images(&objs)
+            .iter()
+            .filter(|o| o.dict.contains("/SMask"))
+            .count(),
+        3
+    );
+    for o in images(&objs) {
+        assert!(o.dict.contains("/FlateDecode"), "{}", o.dict);
+        assert_eq!(dict_int(&o.dict, "/BitsPerComponent"), Some(8));
+    }
+
+    /* GIF (first 3×2 RGB image in resource order): opaque red at (0,0),
+    white at (0,1); alpha 0 on the transparent index. */
+    let gif = base_image(&objs, 3, 2, 0);
+    let rgb = inflate(gif.stream.as_ref().unwrap());
+    assert_eq!(rgb.len(), 18);
+    assert_eq!(&rgb[0..3], &[255, 0, 0]);
+    assert_eq!(&rgb[9..12], &[255, 255, 255]);
+    assert_eq!(soft_mask_of(&objs, gif), vec![255, 255, 0, 255, 0, 255]);
+
+    /* Lossless WebP: bit-exact samples, alpha 128 / 0 / 64 in the mask. */
+    let webp = base_image(&objs, 3, 2, 1);
+    let rgb = inflate(webp.stream.as_ref().unwrap());
+    assert_eq!(&rgb[9..18], &[10, 20, 30, 40, 50, 60, 70, 80, 90]);
+    assert_eq!(soft_mask_of(&objs, webp), vec![255, 128, 0, 255, 255, 64]);
+
+    /* Lossy WebP 4×4: top half opaque blue, bottom half clear. */
+    let lossy = base_image(&objs, 4, 4, 0);
+    let rgb = inflate(lossy.stream.as_ref().unwrap());
+    assert_eq!(rgb.len(), 48);
+    assert!(rgb[2] > 150 && rgb[0] < 80, "{:?}", &rgb[0..3]);
+    let alpha = soft_mask_of(&objs, lossy);
+    assert!(alpha[..8].iter().all(|&a| a == 255));
+    assert!(alpha[8..].iter().all(|&a| a == 0));
+
+    /* Every placement is painted (inline GIF + in-front GIF float, inline
+    WebP, floating WebP). */
+    let content = page_content(&objs);
+    assert_eq!(content.matches(" Do").count(), 4);
+}
+
+#[cfg(all(feature = "gif", feature = "webp"))]
+#[test]
+fn gif_and_webp_flatten_on_white_under_pdfa1b_and_x3() {
+    for profile in [PdfProfile::A1b, PdfProfile::X3] {
+        let (pdf, report) = export_gif_webp(profile);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.images_embedded, 3);
+        assert!(find(&pdf, b"/SMask", 0).is_none(), "{profile:?}");
+        /* The tools/pdf-validate structural markers these profiles gate on. */
+        assert!(pdf.starts_with(b"%PDF-1.4"));
+        assert!(find(&pdf, b"/OutputIntent", 0).is_some());
+        assert!(find(&pdf, b"/DestOutputProfile", 0).is_some());
+        assert!(find(&pdf, b"/JPXDecode", 0).is_none());
+        assert!(pdf.trim_ascii_end().ends_with(b"%%EOF"));
+        let objs = objects(&pdf);
+        assert_eq!(images(&objs).len(), 3);
+
+        let gif = inflate(base_image(&objs, 3, 2, 0).stream.as_ref().unwrap());
+        assert_eq!(
+            gif,
+            vec![
+                255, 0, 0, 0, 255, 0, 255, 255, 255, //
+                255, 255, 255, 255, 255, 255, 255, 0, 0,
+            ]
+        );
+        let webp = inflate(base_image(&objs, 3, 2, 1).stream.as_ref().unwrap());
+        assert_eq!(&webp[6..9], &[255, 255, 255], "alpha 0 → white");
+        let expect: Vec<u8> = [70u8, 80, 90]
+            .iter()
+            .map(|&c| image::flatten_on_white(c, 64))
+            .collect();
+        assert_eq!(&webp[15..18], expect.as_slice());
+        let lossy = inflate(base_image(&objs, 4, 4, 0).stream.as_ref().unwrap());
+        assert!(lossy[24..].iter().all(|&v| v == 255), "clear rows → white");
+    }
+}
+
+#[cfg(all(feature = "gif", feature = "webp"))]
+#[test]
+fn corrupt_gif_and_webp_warn_and_paint_nothing() {
+    let stack = liberation_stack();
+    let page = image_page(&stack);
+    let mut m = gif_webp_media();
+    let gif = m["rIdPng"].data.clone();
+    m.get_mut("rIdPng").unwrap().data = gif[..gif.len() / 2].to_vec();
+    m.get_mut("rIdFloat").unwrap().data = b"RIFF\0\0\0\0WEBPjunk".to_vec();
+    let mut pdf = Vec::new();
+    let report = export_pdf_with_media(
+        std::slice::from_ref(&page),
+        &stack,
+        &[TEXT],
+        &m,
+        PdfProfile::A2u,
+        &mut pdf,
+    )
+    .expect("export still succeeds");
+    assert_eq!(report.images_embedded, 1, "only the lossless WebP");
+    let skipped: Vec<&str> = report
+        .warnings
+        .iter()
+        .map(|w| match w {
+            PdfWarning::ImageSkipped {
+                rel_id,
+                reason: ImageSkipReason::Malformed { .. },
+            } => rel_id.as_str(),
+            other => panic!("unexpected warning {other:?}"),
+        })
+        .collect();
+    assert_eq!(skipped, vec!["rIdPng", "rIdFloat"]);
 }

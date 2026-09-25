@@ -14,7 +14,19 @@
 //!   stripped), and re-deflated as `/FlateDecode` samples. Alpha becomes a
 //!   separate 8-bit `/SMask` stream **or** is flattened onto white — see
 //!   [`AlphaMode`].
-//! - **GIF / WebP / EMF / WMF / BMP / TIFF / SVG / unknown** are typed skips
+//! - **GIF** (issue #189, `gif` feature) is decoded with the `gif` crate:
+//!   the *first frame* only (what a static print shows; later animation
+//!   frames are ignored), palette expanded to RGB, the transparent index
+//!   becoming alpha 0, composited at its frame offset onto a transparent
+//!   logical-screen canvas — the same picture `createImageBitmap` paints.
+//! - **WebP** (issue #189, `webp` feature) is decoded with `image-webp`:
+//!   lossy (VP8, with an optional `ALPH` plane) and lossless (VP8L); for an
+//!   animated file, the first frame.
+//! - Decoded GIF / WebP pixels take exactly the PNG path from there: raw RGB
+//!   `/FlateDecode` samples plus an `/SMask` or a flatten onto white
+//!   ([`AlphaMode`]). With a feature off, that format falls back to the
+//!   typed [`ImageSkipReason::UnsupportedFormat`] skip.
+//! - **EMF / WMF / BMP / TIFF / SVG / unknown** are typed skips
 //!   ([`ImageSkipReason::UnsupportedFormat`]) — never a panic.
 //!
 //! Every failure is an [`ImageSkipReason`]; the exporter turns it into a
@@ -45,8 +57,9 @@ pub enum AlphaMode {
 pub enum ImageSkipReason {
     /// The layout references a relationship id the media map lacks.
     MissingMedia,
-    /// A format the pure-Rust pipeline does not handle (Tier 3): GIF, WebP,
-    /// EMF, WMF, BMP, TIFF, SVG or unrecognized bytes.
+    /// A format the pure-Rust pipeline does not handle (Tier 3): EMF, WMF,
+    /// BMP, TIFF, SVG or unrecognized bytes — and GIF / WebP when the
+    /// crate's `gif` / `webp` decoder feature is off.
     UnsupportedFormat { format: &'static str },
     /// A JPEG variant `/DCTDecode` cannot carry (lossless, arithmetic-coded,
     /// 12-bit) or a colour model the profile forbids without a full decode
@@ -96,6 +109,8 @@ pub struct PreparedImage {
 pub enum MediaFormat {
     Png,
     Jpeg,
+    Gif,
+    WebP,
     Other(&'static str),
 }
 
@@ -110,10 +125,10 @@ pub fn sniff(data: &[u8], content_type: &str) -> MediaFormat {
         return MediaFormat::Jpeg;
     }
     if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-        return MediaFormat::Other("GIF");
+        return MediaFormat::Gif;
     }
     if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        return MediaFormat::Other("WebP");
+        return MediaFormat::WebP;
     }
     if data.len() >= 44 && data[0..4] == [1, 0, 0, 0] && &data[40..44] == b" EMF" {
         return MediaFormat::Other("EMF");
@@ -132,8 +147,10 @@ pub fn sniff(data: &[u8], content_type: &str) -> MediaFormat {
         "image/x-wmf" | "image/wmf" => "WMF",
         "image/x-emf" | "image/emf" => "EMF",
         "image/svg+xml" => "SVG",
-        "image/gif" => "GIF",
-        "image/webp" => "WebP",
+        /* Declared GIF / WebP without the magic: the decoder reports the
+        corruption as `Malformed`. */
+        "image/gif" => return MediaFormat::Gif,
+        "image/webp" => return MediaFormat::WebP,
         "image/bmp" => "BMP",
         "image/tiff" => "TIFF",
         _ => "unknown",
@@ -154,6 +171,14 @@ pub fn prepare_image(
     match sniff(data, content_type) {
         MediaFormat::Jpeg => prepare_jpeg(data, allow_cmyk),
         MediaFormat::Png => prepare_png(data, alpha),
+        #[cfg(feature = "gif")]
+        MediaFormat::Gif => prepare_gif(data, alpha),
+        #[cfg(not(feature = "gif"))]
+        MediaFormat::Gif => Err(ImageSkipReason::UnsupportedFormat { format: "GIF" }),
+        #[cfg(feature = "webp")]
+        MediaFormat::WebP => prepare_webp(data, alpha),
+        #[cfg(not(feature = "webp"))]
+        MediaFormat::WebP => Err(ImageSkipReason::UnsupportedFormat { format: "WebP" }),
         MediaFormat::Other(format) => Err(ImageSkipReason::UnsupportedFormat { format }),
     }
 }
@@ -320,10 +345,52 @@ fn prepare_png(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, Imag
             detail: format!("PNG bit depth {:?} after normalization", info.bit_depth),
         });
     }
+    let layout = PixelLayout {
+        width,
+        height,
+        color,
+        color_channels,
+        has_alpha,
+        /* Rows are tightly packed at 8 bits (`line_size` = width × stride). */
+        row_bytes: info.line_size,
+    };
+    split_samples(layout, &buf, alpha_mode)
+}
+
+/// Shape of a decoded 8-bit, row-major, interleaved pixel buffer.
+#[derive(Debug, Clone, Copy)]
+struct PixelLayout {
+    width: u32,
+    height: u32,
+    color: ImageColor,
+    /// 1 (gray) or 3 (RGB) colour samples per pixel.
+    color_channels: usize,
+    /// One trailing alpha sample per pixel.
+    has_alpha: bool,
+    /// Bytes from one row's start to the next (≥ width × stride).
+    row_bytes: usize,
+}
+
+/// Split a decoded interleaved buffer into PDF colour samples plus an
+/// optional `/SMask` plane, or flatten the alpha onto white — shared by the
+/// PNG, GIF and WebP paths. A buffer shorter than the layout claims is a
+/// [`ImageSkipReason::Malformed`], never an out-of-bounds panic.
+fn split_samples(
+    layout: PixelLayout,
+    buf: &[u8],
+    alpha_mode: AlphaMode,
+) -> Result<PreparedImage, ImageSkipReason> {
+    let PixelLayout {
+        width,
+        height,
+        color,
+        color_channels,
+        has_alpha,
+        row_bytes,
+    } = layout;
     let pixels = width as usize * height as usize;
     let stride = color_channels + usize::from(has_alpha);
-    /* Rows are tightly packed at 8 bits (`line_size` = width × stride). */
-    let row = info.line_size;
+    let line_len = width as usize * stride;
     let mut samples = Vec::with_capacity(pixels * color_channels);
     let mut alpha = if has_alpha {
         Some(Vec::with_capacity(pixels))
@@ -331,7 +398,9 @@ fn prepare_png(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, Imag
         None
     };
     for y in 0..height as usize {
-        let line = &buf[y * row..y * row + width as usize * stride];
+        let line = buf
+            .get(y * row_bytes..y * row_bytes + line_len)
+            .ok_or_else(|| malformed("decoded pixel buffer shorter than the image"))?;
         for px in line.chunks_exact(stride) {
             let (c, a) = px.split_at(color_channels);
             match (alpha.as_mut(), a.first().copied()) {
@@ -361,6 +430,102 @@ fn prepare_png(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, Imag
         invert_cmyk: false,
         alpha,
     })
+}
+
+/// Reject a zero or over-budget canvas before anything is allocated.
+#[cfg(any(feature = "gif", feature = "webp"))]
+fn check_dimensions(format: &str, width: u32, height: u32) -> Result<(), ImageSkipReason> {
+    if width == 0 || height == 0 {
+        return Err(malformed(&format!("{format}: zero dimension")));
+    }
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(ImageSkipReason::TooLarge { width, height });
+    }
+    Ok(())
+}
+
+/// GIF → first frame, RGBA. The frame is composited at its `(left, top)`
+/// offset onto a fully transparent canvas the size of the logical screen
+/// (or of the frame's extent when the screen descriptor says 0×0), clipped
+/// to it; the transparent colour index decodes to alpha 0.
+#[cfg(feature = "gif")]
+fn prepare_gif(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, ImageSkipReason> {
+    let mut opts = gif::DecodeOptions::new();
+    opts.set_color_output(gif::ColorOutput::RGBA);
+    /* Bounds the frame buffer the decoder allocates (RGBA = 4 B/px). */
+    if let Some(limit) = std::num::NonZeroU64::new(MAX_IMAGE_PIXELS * 4) {
+        opts.set_memory_limit(gif::MemoryLimit::Bytes(limit));
+    }
+    let mut decoder = opts
+        .read_info(Cursor::new(data))
+        .map_err(|e| malformed(&format!("GIF header: {e}")))?;
+    let (screen_w, screen_h) = (u32::from(decoder.width()), u32::from(decoder.height()));
+    if screen_w != 0 && screen_h != 0 {
+        check_dimensions("GIF", screen_w, screen_h)?;
+    }
+    let frame = decoder
+        .read_next_frame()
+        .map_err(|e| malformed(&format!("GIF data: {e}")))?
+        .ok_or_else(|| malformed("GIF: no image frame"))?;
+    let (left, top) = (usize::from(frame.left), usize::from(frame.top));
+    let (fw, fh) = (usize::from(frame.width), usize::from(frame.height));
+    let (width, height) = if screen_w == 0 || screen_h == 0 {
+        ((left + fw) as u32, (top + fh) as u32)
+    } else {
+        (screen_w, screen_h)
+    };
+    check_dimensions("GIF", width, height)?;
+    let (cw, ch) = (width as usize, height as usize);
+    let mut canvas = vec![0u8; cw * ch * 4];
+    if fw > 0 && left < cw {
+        let n = fw.min(cw - left) * 4;
+        for (y, row) in frame.buffer.chunks_exact(fw * 4).take(fh).enumerate() {
+            let cy = top + y;
+            if cy >= ch {
+                break;
+            }
+            let dst = (cy * cw + left) * 4;
+            canvas[dst..dst + n].copy_from_slice(&row[..n]);
+        }
+    }
+    let layout = PixelLayout {
+        width,
+        height,
+        color: ImageColor::Rgb,
+        color_channels: 3,
+        has_alpha: true,
+        row_bytes: cw * 4,
+    };
+    split_samples(layout, &canvas, alpha_mode)
+}
+
+/// WebP → RGB or RGBA via `image-webp` (lossy VP8 + `ALPH`, lossless VP8L,
+/// first frame of an animation).
+#[cfg(feature = "webp")]
+fn prepare_webp(data: &[u8], alpha_mode: AlphaMode) -> Result<PreparedImage, ImageSkipReason> {
+    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(data))
+        .map_err(|e| malformed(&format!("WebP header: {e}")))?;
+    let (width, height) = decoder.dimensions();
+    check_dimensions("WebP", width, height)?;
+    decoder.set_memory_limit((MAX_IMAGE_PIXELS * 4) as usize);
+    let has_alpha = decoder.has_alpha();
+    let size = decoder
+        .output_buffer_size()
+        .ok_or(ImageSkipReason::TooLarge { width, height })?;
+    let mut buf = vec![0u8; size];
+    decoder
+        .read_image(&mut buf)
+        .map_err(|e| malformed(&format!("WebP data: {e}")))?;
+    let stride = if has_alpha { 4 } else { 3 };
+    let layout = PixelLayout {
+        width,
+        height,
+        color: ImageColor::Rgb,
+        color_channels: 3,
+        has_alpha,
+        row_bytes: width as usize * stride,
+    };
+    split_samples(layout, &buf, alpha_mode)
 }
 
 /// Source-over composite of one 8-bit channel onto opaque white, rounded:
@@ -482,6 +647,81 @@ pub mod test_images {
         j.extend_from_slice(&[0xFF, 0xD9]);
         j
     }
+
+    /// A GIF89a with one image frame of `indices` (row-major colour-table
+    /// indices, `frame_w`×`frame_h`) at `(left, top)` on a
+    /// `screen_w`×`screen_h` logical screen, `palette` (RGB triples) as the
+    /// global colour table and `transparent` as the frame's transparent
+    /// index. Encoded with the `gif` crate's own encoder (LZW) — tiny,
+    /// deterministic, no blob in the tree.
+    #[cfg(feature = "gif")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gif(
+        screen_w: u16,
+        screen_h: u16,
+        palette: &[u8],
+        left: u16,
+        top: u16,
+        frame_w: u16,
+        frame_h: u16,
+        indices: &[u8],
+        transparent: Option<u8>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc =
+                ::gif::Encoder::new(&mut out, screen_w, screen_h, palette).expect("gif header");
+            let frame = ::gif::Frame {
+                left,
+                top,
+                width: frame_w,
+                height: frame_h,
+                transparent,
+                buffer: std::borrow::Cow::Borrowed(indices),
+                ..::gif::Frame::default()
+            };
+            enc.write_frame(&frame).expect("gif frame");
+        }
+        out
+    }
+
+    /// A lossless (VP8L) WebP of 8-bit RGBA pixels, encoded with
+    /// `image-webp`'s own encoder.
+    #[cfg(feature = "webp")]
+    pub fn webp_lossless_rgba(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(pixels, width, height, image_webp::ColorType::Rgba8)
+            .expect("webp encode");
+        out
+    }
+
+    /// A 4×4 lossy (simple-format `VP8 `) WebP of a flat (200, 40, 40) —
+    /// 72 bytes. `image-webp` has no lossy encoder, so these bytes were
+    /// produced once by libwebp (`quality=100`) and are spelled out here;
+    /// decoders reproduce the colour to within YUV 4:2:0 rounding.
+    pub const WEBP_LOSSY_4X4_RED: [u8; 72] = [
+        0x52, 0x49, 0x46, 0x46, 0x40, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x20, 0x34, 0x00, 0x00, 0x00, 0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x04, 0x00, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x25, 0xa0, 0x02, 0x74, 0xba, 0x01, 0xf8, 0x01, 0xfa, 0x00, 0x03, 0xc8,
+        0x00, 0xfe, 0xfe, 0xeb, 0xbc, 0xbf, 0xfa, 0x8d, 0x5f, 0xaa, 0x03, 0x7f, 0xfd, 0x46, 0xcf,
+        0xff, 0xd8, 0x6c, 0x3c, 0x1f, 0x89, 0x03, 0xff, 0xec, 0x1f, 0x00, 0x00,
+    ];
+
+    /// A 4×4 lossy WebP with an alpha plane (extended format: `VP8X` +
+    /// `ALPH` + `VP8 `) — flat (40, 40, 200); rows 0–1 opaque, rows 2–3
+    /// fully transparent. 112 bytes, produced once by libwebp
+    /// (`quality=100`, `alpha_quality=100`, `exact`).
+    pub const WEBP_LOSSY_ALPHA_4X4_BLUE: [u8; 112] = [
+        0x52, 0x49, 0x46, 0x46, 0x68, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x58, 0x0a, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x41, 0x4c, 0x50, 0x48, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x10, 0x0b, 0x26, 0xf9, 0x4b, 0x77,
+        0xcd, 0x21, 0x22, 0x72, 0x02, 0x56, 0x50, 0x38, 0x20, 0x36, 0x00, 0x00, 0x00, 0x10, 0x02,
+        0x00, 0x9d, 0x01, 0x2a, 0x04, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x25, 0xa0, 0x02, 0x74,
+        0xba, 0x01, 0xf8, 0x01, 0xf8, 0x00, 0x03, 0xc8, 0x00, 0xfe, 0xff, 0xb9, 0x03, 0x2f, 0xff,
+        0xd8, 0x6c, 0x7f, 0xb0, 0xd8, 0xff, 0x61, 0xb1, 0xff, 0xec, 0x36, 0x3f, 0xfa, 0xca, 0xaf,
+        0x92, 0xa3, 0xf6, 0xcc, 0x00, 0x00, 0x00,
+    ];
 }
 
 #[cfg(test)]
@@ -496,11 +736,10 @@ mod tests {
             MediaFormat::Png
         );
         assert_eq!(sniff(&jpeg(8, 8, 1), "image/png"), MediaFormat::Jpeg);
-        assert_eq!(sniff(b"GIF89a....", ""), MediaFormat::Other("GIF"));
-        assert_eq!(
-            sniff(b"RIFF\0\0\0\0WEBPVP8 ", ""),
-            MediaFormat::Other("WebP")
-        );
+        assert_eq!(sniff(b"GIF89a....", ""), MediaFormat::Gif);
+        assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 ", ""), MediaFormat::WebP);
+        assert_eq!(sniff(b"????", "image/gif"), MediaFormat::Gif);
+        assert_eq!(sniff(b"????", "image/webp"), MediaFormat::WebP);
         assert_eq!(
             sniff(&[0xD7, 0xCD, 0xC6, 0x9A, 0, 0], ""),
             MediaFormat::Other("WMF")
@@ -632,9 +871,9 @@ mod tests {
     #[test]
     fn tier3_formats_are_typed_skips() {
         for (bytes, fmt) in [
-            (&b"GIF89a\x01\x00\x01\x00"[..], "GIF"),
-            (&b"RIFF\0\0\0\0WEBPVP8 "[..], "WebP"),
             (&[0xD7, 0xCD, 0xC6, 0x9A, 0, 0][..], "WMF"),
+            (&b"BM\0\0"[..], "BMP"),
+            (&b"II*\0"[..], "TIFF"),
         ] {
             assert_eq!(
                 prepare_image(bytes, "", AlphaMode::SoftMask, true),
@@ -648,5 +887,253 @@ mod tests {
         assert_eq!(flatten_on_white(0, 0), 255);
         assert_eq!(flatten_on_white(0, 255), 0);
         assert_eq!(flatten_on_white(200, 255), 200);
+    }
+
+    /* ---- Issue #189: GIF + WebP ------------------------------------- */
+
+    /// Red, green, blue, white.
+    #[cfg(feature = "gif")]
+    const GIF_PALETTE: [u8; 12] = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+
+    /// 3×2, indices `0 1 2 / 3 2 0`, index 2 (blue) transparent.
+    #[cfg(feature = "gif")]
+    fn gif_3x2_transparent() -> Vec<u8> {
+        test_images::gif(3, 2, &GIF_PALETTE, 0, 0, 3, 2, &[0, 1, 2, 3, 2, 0], Some(2))
+    }
+
+    #[cfg(feature = "gif")]
+    #[test]
+    fn gif_palette_expands_and_transparent_index_becomes_alpha() {
+        let data = gif_3x2_transparent();
+        let soft = prepare_image(&data, "image/gif", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!(
+            (soft.width, soft.height, soft.color, soft.encoding),
+            (3, 2, ImageColor::Rgb, ImageEncoding::Raw)
+        );
+        assert_eq!(soft.alpha, Some(vec![255, 255, 0, 255, 0, 255]));
+        /* Opaque pixels carry their palette colour. */
+        assert_eq!(&soft.data[0..6], &[255, 0, 0, 0, 255, 0]);
+        assert_eq!(&soft.data[9..12], &[255, 255, 255]);
+        assert_eq!(&soft.data[15..18], &[255, 0, 0]);
+
+        let flat = prepare_image(&data, "image/gif", AlphaMode::FlattenOnWhite, false).unwrap();
+        assert!(flat.alpha.is_none());
+        assert_eq!(
+            flat.data,
+            vec![
+                255, 0, 0, 0, 255, 0, 255, 255, 255, //
+                255, 255, 255, 255, 255, 255, 255, 0, 0,
+            ],
+            "transparent index → white under PDF/A-1b / X-3"
+        );
+    }
+
+    #[cfg(feature = "gif")]
+    #[test]
+    fn gif_opaque_first_frame_has_no_soft_mask() {
+        let data = test_images::gif(2, 1, &GIF_PALETTE, 0, 0, 2, 1, &[2, 3], None);
+        let p = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert!(p.alpha.is_none());
+        assert_eq!(p.data, vec![0, 0, 255, 255, 255, 255]);
+    }
+
+    #[cfg(feature = "gif")]
+    #[test]
+    fn gif_frame_is_composited_at_its_offset_on_a_transparent_screen() {
+        /* 4×3 screen, a 2×1 red/green frame at (1, 1). */
+        let data = test_images::gif(4, 3, &GIF_PALETTE, 1, 1, 2, 1, &[0, 1], None);
+        let soft = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!((soft.width, soft.height), (4, 3));
+        let mut alpha = vec![0u8; 12];
+        alpha[5] = 255;
+        alpha[6] = 255;
+        assert_eq!(soft.alpha, Some(alpha));
+        assert_eq!(&soft.data[15..21], &[255, 0, 0, 0, 255, 0]);
+        let flat = prepare_image(&data, "", AlphaMode::FlattenOnWhite, false).unwrap();
+        assert_eq!(&flat.data[0..3], &[255, 255, 255]);
+        assert_eq!(&flat.data[15..21], &[255, 0, 0, 0, 255, 0]);
+
+        /* A frame hanging off the screen is clipped, not a panic. */
+        let data = test_images::gif(2, 2, &GIF_PALETTE, 1, 1, 3, 3, &[1; 9], None);
+        let p = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!((p.width, p.height), (2, 2));
+        assert_eq!(p.alpha, Some(vec![0, 0, 0, 255]));
+
+        /* A 0×0 logical screen falls back to the frame's extent. */
+        let data = test_images::gif(0, 0, &GIF_PALETTE, 1, 0, 1, 1, &[3], None);
+        let p = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!((p.width, p.height), (2, 1));
+        assert_eq!(p.alpha, Some(vec![0, 255]));
+    }
+
+    #[cfg(feature = "gif")]
+    #[test]
+    fn gif_oversize_screen_is_skipped_before_decoding() {
+        let mut data = gif_3x2_transparent();
+        /* Logical screen descriptor: width, height (LE u16) at bytes 6..10. */
+        data[6..10].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            prepare_image(&data, "", AlphaMode::SoftMask, false),
+            Err(ImageSkipReason::TooLarge {
+                width: 65535,
+                height: 65535
+            })
+        );
+    }
+
+    /// 3×2 RGBA with every alpha level class: opaque, partial, clear.
+    #[cfg(feature = "webp")]
+    const WEBP_PX: [u8; 24] = [
+        255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, //
+        10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 64,
+    ];
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn webp_lossless_round_trips_exactly_with_alpha() {
+        let data = test_images::webp_lossless_rgba(3, 2, &WEBP_PX);
+        assert_eq!(sniff(&data, ""), MediaFormat::WebP);
+        let soft = prepare_image(&data, "image/webp", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!(
+            (soft.width, soft.height, soft.color, soft.encoding),
+            (3, 2, ImageColor::Rgb, ImageEncoding::Raw)
+        );
+        assert_eq!(soft.alpha, Some(vec![255, 128, 0, 255, 255, 64]));
+        /* Opaque / partial pixels are bit-exact (lossless). */
+        assert_eq!(&soft.data[0..6], &[255, 0, 0, 0, 255, 0]);
+        assert_eq!(&soft.data[9..18], &[10, 20, 30, 40, 50, 60, 70, 80, 90]);
+
+        let flat = prepare_image(&data, "", AlphaMode::FlattenOnWhite, false).unwrap();
+        assert!(flat.alpha.is_none());
+        assert_eq!(&flat.data[0..3], &[255, 0, 0]);
+        assert_eq!(&flat.data[6..9], &[255, 255, 255], "alpha 0 → white");
+        let expect: Vec<u8> = [70u8, 80, 90]
+            .iter()
+            .map(|&c| flatten_on_white(c, 64))
+            .collect();
+        assert_eq!(&flat.data[15..18], expect.as_slice());
+    }
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn webp_lossless_opaque_has_no_soft_mask() {
+        let px: Vec<u8> = [9u8, 8, 7, 255].repeat(4);
+        let data = test_images::webp_lossless_rgba(2, 2, &px);
+        let p = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert!(p.alpha.is_none());
+        assert_eq!(p.data, [9u8, 8, 7].repeat(4));
+    }
+
+    /// Lossy samples land within YUV 4:2:0 rounding of the source colour.
+    #[cfg(feature = "webp")]
+    fn near(got: &[u8], want: [u8; 3]) -> bool {
+        got.iter()
+            .zip(want)
+            .all(|(&g, w)| (i16::from(g) - i16::from(w)).abs() <= 8)
+    }
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn webp_lossy_decodes_to_rgb() {
+        let data = test_images::WEBP_LOSSY_4X4_RED;
+        let p = prepare_image(&data, "image/webp", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!((p.width, p.height, p.color), (4, 4, ImageColor::Rgb));
+        assert!(p.alpha.is_none());
+        assert_eq!(p.data.len(), 4 * 4 * 3);
+        for px in p.data.chunks_exact(3) {
+            assert!(near(px, [200, 40, 40]), "{px:?}");
+        }
+    }
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn webp_lossy_alpha_plane_is_a_soft_mask_or_flattened() {
+        let data = test_images::WEBP_LOSSY_ALPHA_4X4_BLUE;
+        let soft = prepare_image(&data, "", AlphaMode::SoftMask, false).unwrap();
+        assert_eq!((soft.width, soft.height), (4, 4));
+        let mut alpha = vec![255u8; 8];
+        alpha.extend([0u8; 8]);
+        assert_eq!(soft.alpha, Some(alpha));
+        assert!(near(&soft.data[0..3], [40, 40, 200]), "{:?}", &soft.data[0..3]);
+
+        let flat = prepare_image(&data, "", AlphaMode::FlattenOnWhite, false).unwrap();
+        assert!(flat.alpha.is_none());
+        assert!(near(&flat.data[0..3], [40, 40, 200]));
+        assert!(flat.data[24..].iter().all(|&v| v == 255), "clear rows → white");
+    }
+
+    /// Fuzz-style robustness: every truncation, plus deterministic byte
+    /// corruption, of every GIF / WebP fixture is `Ok` or a typed skip —
+    /// never a panic (the wasm build is `panic = "abort"`, so a decoder
+    /// panic would kill the worker mid-export).
+    #[test]
+    fn truncated_and_corrupt_gif_webp_never_panic() {
+        /* Only mutated when a decoder feature adds its encoder fixtures. */
+        #[cfg_attr(not(any(feature = "gif", feature = "webp")), allow(unused_mut))]
+        let mut fixtures: Vec<Vec<u8>> = vec![
+            b"GIF89a".to_vec(),
+            b"RIFF\0\0\0\0WEBP".to_vec(),
+            test_images::WEBP_LOSSY_4X4_RED.to_vec(),
+            test_images::WEBP_LOSSY_ALPHA_4X4_BLUE.to_vec(),
+        ];
+        #[cfg(feature = "gif")]
+        {
+            fixtures.push(gif_3x2_transparent());
+            fixtures.push(test_images::gif(4, 3, &GIF_PALETTE, 1, 1, 2, 1, &[0, 1], None));
+        }
+        #[cfg(feature = "webp")]
+        fixtures.push(test_images::webp_lossless_rgba(3, 2, &WEBP_PX));
+
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for fixture in &fixtures {
+            for cut in 0..fixture.len() {
+                for mode in [AlphaMode::SoftMask, AlphaMode::FlattenOnWhite] {
+                    let r = prepare_image(&fixture[..cut], "image/gif", mode, false);
+                    if cut < 13 {
+                        assert!(r.is_err(), "cut {cut} of {fixture:?}");
+                    }
+                    let _ = prepare_image(&fixture[..cut], "image/webp", mode, false);
+                }
+            }
+            for _ in 0..400 {
+                let mut m = fixture.clone();
+                /* Keep the magic so the decoder (not the sniffer) sees it. */
+                for _ in 0..1 + next() % 4 {
+                    let at = 4 + (next() as usize) % (m.len() - 4);
+                    m[at] = next() as u8;
+                }
+                if let Ok(p) = prepare_image(&m, "", AlphaMode::SoftMask, false) {
+                    assert_eq!(
+                        p.data.len(),
+                        p.width as usize * p.height as usize * 3,
+                        "decoded size matches the dimensions"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gif"))]
+    #[test]
+    fn gif_without_the_feature_is_an_unsupported_format() {
+        assert_eq!(
+            prepare_image(b"GIF89a\x01\x00\x01\x00", "", AlphaMode::SoftMask, false),
+            Err(ImageSkipReason::UnsupportedFormat { format: "GIF" })
+        );
+    }
+
+    #[cfg(not(feature = "webp"))]
+    #[test]
+    fn webp_without_the_feature_is_an_unsupported_format() {
+        assert_eq!(
+            prepare_image(&test_images::WEBP_LOSSY_4X4_RED, "", AlphaMode::SoftMask, false),
+            Err(ImageSkipReason::UnsupportedFormat { format: "WebP" })
+        );
     }
 }
