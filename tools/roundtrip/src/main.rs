@@ -287,6 +287,7 @@ fn run_default() -> Result<()> {
     run_rtl_table_roundtrip()?;
     run_table_jc_tblind_roundtrip()?;
     run_body_passthrough_roundtrip()?;
+    run_package_media_insert()?;
 
     println!("\nPASS");
     Ok(())
@@ -2432,6 +2433,456 @@ fn run_toc_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/* ============================ Word package parts (#135 / #134) ==== */
+
+/// Issues #134 / #135 — a Word-shaped PACKAGE, not just a Word-shaped
+/// body: every sibling part a real Word file carries and the model does
+/// not regenerate on a text edit — styles, numbering, settings, fontTable,
+/// theme, a header and a footer (with its own rels), comments, core / app
+/// properties, a custom XML item — plus two body pictures behind `rId9` /
+/// `rId10`. The live editor's save path (`format_docx::save_docx`) must
+/// re-emit every one of them byte-identical (#134), and a third picture
+/// inserted through the model must land beside them without disturbing
+/// either (#135).
+const PKG_W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const PKG_R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PKG_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PKG_CT_WML: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml";
+
+/// One inline picture run behind `rid`.
+fn package_picture_run(rid: &str, id: u32) -> String {
+    format!(
+        concat!(
+            "<w:r><w:drawing>",
+            r#"<wp:inline distT="0" distB="0" distL="0" distR="0">"#,
+            r#"<wp:extent cx="914400" cy="457200"/>"#,
+            r#"<wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+            r#"<wp:docPr id="{id}" name="Picture {id}"/>"#,
+            "<wp:cNvGraphicFramePr/>",
+            "<a:graphic>",
+            r#"<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+            "<pic:pic>",
+            r#"<pic:nvPicPr><pic:cNvPr id="0" name="Image"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+            r#"<pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+            r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>"#,
+            r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>"#,
+            "</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>",
+        ),
+        rid = rid,
+        id = id,
+    )
+}
+
+fn word_package_document_xml() -> String {
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\r\n",
+            r#"<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" "#,
+            r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" "#,
+            r#"xmlns:r="{r}" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+            r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+            r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+            r#"xmlns:w="{w}" "#,
+            r#"xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" "#,
+            r#"mc:Ignorable="w14">"#,
+            "<w:body>",
+            r#"<w:p w14:paraId="10000001" w14:textId="20000001" w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3">"#,
+            r#"<w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Package title</w:t></w:r></w:p>"#,
+            r#"<w:p w14:paraId="10000002" w14:textId="20000002" w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3">"#,
+            r#"<w:pPr><w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>"#,
+            r#"<w:r><w:t>first item</w:t></w:r></w:p>"#,
+            r#"<w:p w14:paraId="10000003" w14:textId="20000003" w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3">"#,
+            r#"<w:commentRangeStart w:id="0"/><w:r><w:t xml:space="preserve">commented text</w:t></w:r>"#,
+            r#"<w:commentRangeEnd w:id="0"/><w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr>"#,
+            r#"<w:commentReference w:id="0"/></w:r></w:p>"#,
+            r#"<w:p w14:paraId="10000004" w14:textId="20000004" w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3">"#,
+            r#"<w:r><w:t xml:space="preserve">pictures </w:t></w:r>{pic1}{pic2}</w:p>"#,
+            r#"<w:p w14:paraId="10000005" w14:textId="20000005" w:rsidR="00A1B2C3" w:rsidRDefault="00A1B2C3">"#,
+            r#"<w:r><w:t>last paragraph</w:t></w:r></w:p>"#,
+            r#"<w:sectPr w:rsidR="00A1B2C3"><w:headerReference w:type="default" r:id="rId6"/>"#,
+            r#"<w:footerReference w:type="default" r:id="rId7"/>"#,
+            r#"<w:pgSz w:w="11906" w:h="16838"/>"#,
+            r#"<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>"#,
+            r#"<w:cols w:space="708"/><w:docGrid w:linePitch="360"/></w:sectPr>"#,
+            "</w:body></w:document>",
+        ),
+        r = PKG_R_NS,
+        w = PKG_W_NS,
+        pic1 = package_picture_run("rId9", 1),
+        pic2 = package_picture_run("rId10", 2),
+    )
+}
+
+/// The sibling parts, in the order Word writes them.
+fn word_package_parts() -> Vec<(&'static str, Vec<u8>)> {
+    let xml = |s: String| s.into_bytes();
+    let decl = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n";
+    let content_types = format!(
+        concat!(
+            "{decl}",
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+            r#"<Default Extension="png" ContentType="image/png"/>"#,
+            r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#,
+            r#"<Default Extension="xml" ContentType="application/xml"/>"#,
+            r#"<Override PartName="/word/document.xml" ContentType="{ct}.document.main+xml"/>"#,
+            r#"<Override PartName="/customXml/itemProps1.xml" ContentType="application/vnd.openxmlformats-officedocument.customXmlProperties+xml"/>"#,
+            r#"<Override PartName="/word/numbering.xml" ContentType="{ct}.numbering+xml"/>"#,
+            r#"<Override PartName="/word/styles.xml" ContentType="{ct}.styles+xml"/>"#,
+            r#"<Override PartName="/word/settings.xml" ContentType="{ct}.settings+xml"/>"#,
+            r#"<Override PartName="/word/comments.xml" ContentType="{ct}.comments+xml"/>"#,
+            r#"<Override PartName="/word/header1.xml" ContentType="{ct}.header+xml"/>"#,
+            r#"<Override PartName="/word/footer1.xml" ContentType="{ct}.footer+xml"/>"#,
+            r#"<Override PartName="/word/fontTable.xml" ContentType="{ct}.fontTable+xml"/>"#,
+            r#"<Override PartName="/word/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>"#,
+            r#"<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>"#,
+            r#"<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>"#,
+            "</Types>",
+        ),
+        decl = decl,
+        ct = PKG_CT_WML,
+    );
+    let dot_rels = format!(
+        concat!(
+            "{decl}",
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId3" Type="{rel}/extended-properties" Target="docProps/app.xml"/>"#,
+            r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>"#,
+            r#"<Relationship Id="rId1" Type="{rel}/officeDocument" Target="word/document.xml"/>"#,
+            "</Relationships>",
+        ),
+        decl = decl,
+        rel = PKG_REL,
+    );
+    let doc_rels = format!(
+        concat!(
+            "{decl}",
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId8" Type="{rel}/comments" Target="comments.xml"/>"#,
+            r#"<Relationship Id="rId3" Type="{rel}/settings" Target="settings.xml"/>"#,
+            r#"<Relationship Id="rId7" Type="{rel}/footer" Target="footer1.xml"/>"#,
+            r#"<Relationship Id="rId2" Type="{rel}/styles" Target="styles.xml"/>"#,
+            r#"<Relationship Id="rId1" Type="{rel}/customXml" Target="../customXml/item1.xml"/>"#,
+            r#"<Relationship Id="rId6" Type="{rel}/header" Target="header1.xml"/>"#,
+            r#"<Relationship Id="rId11" Type="{rel}/theme" Target="theme/theme1.xml"/>"#,
+            r#"<Relationship Id="rId5" Type="{rel}/numbering" Target="numbering.xml"/>"#,
+            r#"<Relationship Id="rId10" Type="{rel}/image" Target="media/image2.png"/>"#,
+            r#"<Relationship Id="rId4" Type="{rel}/fontTable" Target="fontTable.xml"/>"#,
+            r#"<Relationship Id="rId9" Type="{rel}/image" Target="media/image1.png"/>"#,
+            "</Relationships>",
+        ),
+        decl = decl,
+        rel = PKG_REL,
+    );
+    let header_rels = format!(
+        concat!(
+            "{decl}",
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId1" Type="{rel}/hyperlink" Target="https://example.com/header" TargetMode="External"/>"#,
+            "</Relationships>",
+        ),
+        decl = decl,
+        rel = PKG_REL,
+    );
+    let item_rels = format!(
+        concat!(
+            "{decl}",
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId1" Type="{rel}/customXmlProps" Target="itemProps1.xml"/>"#,
+            "</Relationships>",
+        ),
+        decl = decl,
+        rel = PKG_REL,
+    );
+    let styles = format!(
+        concat!(
+            "{decl}",
+            r#"<w:styles xmlns:w="{w}"><w:docDefaults><w:rPrDefault><w:rPr>"#,
+            r#"<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault>"#,
+            r#"<w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="259" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>"#,
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>"#,
+            r#"<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="240"/><w:outlineLvl w:val="0"/></w:pPr>"#,
+            r#"<w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/>"#,
+            r#"<w:pPr><w:ind w:left="720"/></w:pPr></w:style>"#,
+            r#"<w:style w:type="character" w:styleId="CommentReference"><w:name w:val="annotation reference"/><w:rPr><w:sz w:val="16"/></w:rPr></w:style>"#,
+            "</w:styles>",
+        ),
+        decl = decl,
+        w = PKG_W_NS,
+    );
+    let numbering = format!(
+        concat!(
+            "{decl}",
+            r#"<w:numbering xmlns:w="{w}"><w:abstractNum w:abstractNumId="0">"#,
+            r#"<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#,
+            r#"<w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum>"#,
+            r#"<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        ),
+        decl = decl,
+        w = PKG_W_NS,
+    );
+    let settings = format!(
+        concat!(
+            "{decl}",
+            r#"<w:settings xmlns:w="{w}"><w:zoom w:percent="100"/><w:proofState w:spelling="clean" w:grammar="clean"/>"#,
+            r#"<w:defaultTabStop w:val="720"/><w:characterSpacingControl w:val="doNotCompress"/>"#,
+            r#"<w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat>"#,
+            "</w:settings>",
+        ),
+        decl = decl,
+        w = PKG_W_NS,
+    );
+    let font_table = format!(
+        concat!(
+            "{decl}",
+            r#"<w:fonts xmlns:w="{w}"><w:font w:name="Calibri"><w:panose1 w:val="020F0502020204030204"/>"#,
+            r#"<w:charset w:val="00"/><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font></w:fonts>"#,
+        ),
+        decl = decl,
+        w = PKG_W_NS,
+    );
+    let theme = format!(
+        concat!(
+            "{decl}",
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">"#,
+            r#"<a:themeElements><a:clrScheme name="Office"><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>"#,
+            r#"<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1></a:clrScheme>"#,
+            r#"<a:fontScheme name="Office"><a:majorFont><a:latin typeface="Calibri Light"/></a:majorFont>"#,
+            r#"<a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#,
+        ),
+        decl = decl,
+    );
+    let comments = format!(
+        concat!(
+            "{decl}",
+            r#"<w:comments xmlns:w="{w}"><w:comment w:id="0" w:author="Reviewer" w:date="2026-01-02T03:04:05Z" w:initials="R">"#,
+            r#"<w:p><w:r><w:t>Please check this.</w:t></w:r></w:p></w:comment></w:comments>"#,
+        ),
+        decl = decl,
+        w = PKG_W_NS,
+    );
+    let header = format!(
+        concat!(
+            "{decl}",
+            r#"<w:hdr xmlns:w="{w}" xmlns:r="{r}"><w:p><w:pPr><w:pStyle w:val="Header"/></w:pPr>"#,
+            r#"<w:r><w:t>Header text</w:t></w:r></w:p></w:hdr>"#,
+        ),
+        decl = decl,
+        w = PKG_W_NS,
+        r = PKG_R_NS,
+    );
+    let footer = format!(
+        concat!(
+            "{decl}",
+            r#"<w:ftr xmlns:w="{w}"><w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>"#,
+            r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+            "</w:p></w:ftr>",
+        ),
+        decl = decl,
+        w = PKG_W_NS,
+    );
+    let core = format!(
+        concat!(
+            "{decl}",
+            r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" "#,
+            r#"xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" "#,
+            r#"xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+            r#"<dc:creator>Package Author</dc:creator><cp:revision>3</cp:revision>"#,
+            r#"<dcterms:created xsi:type="dcterms:W3CDTF">2026-01-01T00:00:00Z</dcterms:created></cp:coreProperties>"#,
+        ),
+        decl = decl,
+    );
+    let app = format!(
+        concat!(
+            "{decl}",
+            r#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">"#,
+            r#"<Application>Microsoft Office Word</Application><Pages>1</Pages></Properties>"#,
+        ),
+        decl = decl,
+    );
+    let item = r#"<?xml version="1.0" encoding="UTF-8" standalone="no"?><b:Sources xmlns:b="http://schemas.openxmlformats.org/officeDocument/2006/bibliography" SelectedStyle="\APA.XSL"/>"#.to_string();
+    let item_props = format!(
+        concat!(
+            "{decl}",
+            r#"<ds:datastoreItem ds:itemID="{{11111111-2222-3333-4444-555555555555}}" "#,
+            r#"xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml">"#,
+            r#"<ds:schemaRefs><ds:schemaRef ds:uri="http://schemas.openxmlformats.org/officeDocument/2006/bibliography"/></ds:schemaRefs>"#,
+            "</ds:datastoreItem>",
+        ),
+        decl = decl,
+    );
+    /* Two distinct (tiny) "PNG" blobs — the signature plus a tag byte. */
+    let png = |tag: u8| -> Vec<u8> { vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, tag] };
+    vec![
+        ("[Content_Types].xml", xml(content_types)),
+        ("_rels/.rels", xml(dot_rels)),
+        ("word/_rels/document.xml.rels", xml(doc_rels)),
+        ("word/footer1.xml", xml(footer)),
+        ("word/header1.xml", xml(header)),
+        ("word/_rels/header1.xml.rels", xml(header_rels)),
+        ("word/comments.xml", xml(comments)),
+        ("word/media/image1.png", png(1)),
+        ("word/media/image2.png", png(2)),
+        ("word/theme/theme1.xml", xml(theme)),
+        ("word/settings.xml", xml(settings)),
+        ("customXml/item1.xml", xml(item)),
+        ("customXml/_rels/item1.xml.rels", xml(item_rels)),
+        ("customXml/itemProps1.xml", xml(item_props)),
+        ("word/numbering.xml", xml(numbering)),
+        ("word/styles.xml", xml(styles)),
+        ("word/fontTable.xml", xml(font_table)),
+        ("docProps/core.xml", xml(core)),
+        ("docProps/app.xml", xml(app)),
+    ]
+}
+
+/// Issues #134 / #135 fixture: `word/document.xml` sits where Word puts it
+/// (after the rels, before the parts it references).
+fn build_word_package_parts_docx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+    let parts = word_package_parts();
+    let document_xml = word_package_document_xml();
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (i, (name, body)) in parts.iter().enumerate() {
+            if i == 3 {
+                zip.start_file("word/document.xml", opts).unwrap();
+                zip.write_all(document_xml.as_bytes()).unwrap();
+            }
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// Every `(entry name, bytes)` of a saved package, in archive order.
+fn zip_entries(docx: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    use std::io::Read;
+    let mut a = zip::ZipArchive::new(std::io::Cursor::new(docx)).context("open zip")?;
+    let mut out = Vec::with_capacity(a.len());
+    for i in 0..a.len() {
+        let mut f = a.by_index(i).context("zip entry")?;
+        let mut b = Vec::new();
+        f.read_to_end(&mut b).context("read entry")?;
+        out.push((f.name().to_owned(), b));
+    }
+    Ok(out)
+}
+
+/// Issue #135 — step 21: open the Word-shaped package (two pictures),
+/// insert a third picture through the model, `write_docx`: three media
+/// parts (the originals byte-identical), a new image relationship whose id
+/// collides with no rels part, a `<Default>` for the new extension, every
+/// other sibling byte-identical, and the re-read resolves all three.
+fn run_package_media_insert() -> Result<()> {
+    use engine::{BlockPath, ImageBlob, InlineKind, LogicalPos};
+    let fixture = build_word_package_parts_docx();
+    let archive = read_docx(&fixture).context("read word_package_parts")?;
+    let para = archive
+        .document
+        .nth_paragraph(3)
+        .context("picture paragraph")?;
+    let gif: &[u8] = b"GIF89a\x01\x00\x01\x00";
+    let edited = archive.document.insert_inline_image_at(
+        LogicalPos {
+            path: BlockPath::top(3),
+            offset: para.text.len() as u32,
+        },
+        ImageBlob {
+            content_type: "image/gif".into(),
+            data: gif.to_vec(),
+        },
+        914_400,
+        914_400,
+    );
+    let saved = write_docx(&archive, &edited).context("write")?;
+    format_docx::check_document_xml_well_formed(&saved).context("well-formed document.xml")?;
+    let source = zip_entries(&fixture)?;
+    let out = zip_entries(&saved)?;
+    let get = |all: &[(String, Vec<u8>)], name: &str| -> Option<Vec<u8>> {
+        all.iter().find(|(n, _)| n == name).map(|(_, b)| b.clone())
+    };
+    let media: Vec<&str> = out
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| n.starts_with("word/media/"))
+        .collect();
+    if media
+        != [
+            "word/media/image1.png",
+            "word/media/image2.png",
+            "word/media/image3.gif",
+        ]
+    {
+        bail!("step 21: media parts {media:?}");
+    }
+    if get(&out, "word/media/image3.gif").as_deref() != Some(gif) {
+        bail!("step 21: new media bytes differ");
+    }
+    for (name, bytes) in &source {
+        if matches!(
+            name.as_str(),
+            "word/document.xml" | "word/_rels/document.xml.rels" | "[Content_Types].xml"
+        ) {
+            continue;
+        }
+        if get(&out, name).as_ref() != Some(bytes) {
+            bail!("step 21: sibling {name} not byte-identical");
+        }
+    }
+    let rels_bytes = get(&out, "word/_rels/document.xml.rels").context("rels")?;
+    let rels =
+        format_docx::opc::relationships::parse_relationships(&rels_bytes).context("rels parse")?;
+    let new = rels
+        .by_id("rId12")
+        .context("step 21: new relationship rId12 missing")?;
+    if new.target != "media/image3.gif" || !new.rel_type.ends_with("/image") {
+        bail!("step 21: new relationship {new:?}");
+    }
+    let mut ids: Vec<&str> = rels.items.iter().map(|r| r.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() != rels.items.len() {
+        bail!("step 21: duplicate relationship ids");
+    }
+    let ct = String::from_utf8(get(&out, "[Content_Types].xml").context("content types")?)?;
+    if ct.matches(r#"<Default Extension="gif""#).count() != 1 {
+        bail!("step 21: gif content-type default missing or duplicated");
+    }
+    let reread = read_docx(&saved).context("re-read")?;
+    let ids: Vec<String> = reread
+        .document
+        .nth_paragraph(3)
+        .context("re-read paragraph")?
+        .inline_objects
+        .iter()
+        .filter_map(|io| match &io.kind {
+            InlineKind::Image { rel_id, .. } => Some(rel_id.clone()),
+            _ => None,
+        })
+        .collect();
+    if ids != ["rId9", "rId10", "rId12"]
+        || ids.iter().any(|id| !reread.document.media.contains_key(id))
+    {
+        bail!("step 21: re-read picture ids {ids:?}");
+    }
+    println!(
+        "[roundtrip] step 21 OK — an inserted picture adds media + rels + content type, originals byte-identical"
+    );
+    Ok(())
+}
+
 /* ========================================================= --fixtures ==== */
 
 fn run_fixtures(dir: &Path) -> Result<()> {
@@ -3206,6 +3657,32 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_texts: vec![
                         "a \u{FFFC}\u{FFFC}\u{FFFC} z".into(),
                         "pic \u{FFFC} end".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issues #134 / #135 — a Word-shaped package: styles, numbering,
+        settings, fontTable, theme, header + footer (+ header rels),
+        comments, core / app props, custom XML and two body pictures.
+        Zero-edit drift 0; the default harness's step 21 inserts a third
+        picture through the model (#135). */
+        PrebuiltFixture {
+            name: "word_package_parts.docx",
+            bytes: build_word_package_parts_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 5,
+                    paragraph_texts: vec![
+                        "Package title".into(),
+                        "first item".into(),
+                        "commented text".into(),
+                        "pictures \u{FFFC}\u{FFFC}".into(),
+                        "last paragraph".into(),
                     ],
                 },
                 roundtrip: RoundtripBounds {

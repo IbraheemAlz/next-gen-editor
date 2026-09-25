@@ -28,7 +28,7 @@ use engine::{
     UnderlineStyle, VMergeRole,
 };
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Write};
 use zip::write::{SimpleFileOptions, ZipWriter};
 
@@ -2114,6 +2114,17 @@ fn geometry_is_stock_a4(g: &engine::PageGeometry) -> bool {
 /// Repack `archive`'s sibling entries verbatim + a freshly serialized
 /// `word/document.xml` from `doc`. Returns the assembled `.docx` bytes.
 pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    /* Issue #135 — images inserted after open: plan their media parts,
+    package relationship ids and content-type defaults, and write from a
+    copy of the tree whose image references carry the package ids. */
+    let media_plan = crate::media_plan::plan_new_media(&archive.other_entries, doc);
+    let renamed_doc;
+    let doc: &DocumentTree = if media_plan.renames.is_empty() {
+        doc
+    } else {
+        renamed_doc = crate::media_plan::rename_image_rel_ids(doc, &media_plan.renames);
+        &renamed_doc
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     {
         let mut zip = ZipWriter::new(Cursor::new(&mut buf));
@@ -2286,6 +2297,10 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             .and_then(|xml| crate::opc::relationships::parse_relationships(xml.as_bytes()).ok())
             .unwrap_or_default();
         let mut hyperlink_next = existing_rels_str.map(next_rel_id).unwrap_or(1);
+        /* Issue #135 — new media ids sit above every rels part's `rIdN`. */
+        if !media_plan.is_empty() {
+            hyperlink_next = hyperlink_next.max(media_plan.next_free_rid);
+        }
         if synth_comments {
             hyperlink_next += 1;
         }
@@ -2463,6 +2478,45 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         }
         let synth_hf = !hf_new_parts.is_empty();
 
+        /* Issue #135 — one image `<Relationship>` row per (new picture,
+        referencing part), keyed by the part's rels entry name, plus one
+        `<Default Extension>` per extension the package does not type. */
+        let mut media_rels_rows: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
+        for m in &media_plan.new_media {
+            for part in &m.parts {
+                use crate::media_plan::StoryPart;
+                let rels_name = match part {
+                    StoryPart::Body => Some(RELS_XML.to_string()),
+                    StoryPart::Header(rid) | StoryPart::Footer(rid) => hf_new_parts
+                        .iter()
+                        .find(|(r, ..)| r == rid)
+                        .map(|(_, part_name, ..)| part_name.clone())
+                        .or_else(|| {
+                            existing_rels
+                                .by_id(rid)
+                                .map(|rel| crate::parts::rels::resolve_target(&rel.target))
+                        })
+                        .map(|part_name| hf_part_rels_name(&part_name)),
+                    StoryPart::Footnotes => Some(hf_part_rels_name(FOOTNOTES_XML)),
+                    StoryPart::Endnotes => Some(hf_part_rels_name(ENDNOTES_XML)),
+                };
+                if let Some(rels_name) = rels_name {
+                    media_rels_rows
+                        .entry(rels_name)
+                        .or_default()
+                        .push((m.rel_id.as_str(), m.target.as_str()));
+                }
+            }
+        }
+        let mut media_ct_defaults: Vec<(&str, &str)> = Vec::new();
+        for m in &media_plan.new_media {
+            if !media_ct_defaults.iter().any(|(e, _)| *e == m.extension) {
+                media_ct_defaults.push((m.extension, m.default_content_type));
+            }
+        }
+        let body_media_rows = media_rels_rows.get(RELS_XML).cloned().unwrap_or_default();
+        let mut media_rels_written: Vec<String> = Vec::new();
+
         /* Write sibling entries verbatim, in original order — except
         for parts we have a regenerated copy for (replace in-place).
         `[Content_Types].xml` and `word/_rels/document.xml.rels` may
@@ -2502,6 +2556,18 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             } else if let Some(new_bytes) = hf_replacements.get(name.as_str()) {
                 /* Phase 3 (#39) — an edited imported header/footer part. */
                 zip.write_all(new_bytes)?;
+            } else if name != RELS_XML
+                && let Some(rows) = media_rels_rows.get(name.as_str())
+            {
+                /* Issue #135 — a header / footer / note part's rels gains
+                the rows of the new pictures it references (on top of a
+                hyperlink splice when the part was regenerated). */
+                let base = hf_rels_replacements
+                    .get(name.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(bytes.as_slice());
+                zip.write_all(splice_image_rels(std::str::from_utf8(base)?, rows).as_bytes())?;
+                media_rels_written.push(name.clone());
             } else if let Some(new_bytes) = hf_rels_replacements.get(name.as_str()) {
                 /* Issue #72 — a regenerated part's rels file (additive
                 splice; foreign rows survive). */
@@ -2517,10 +2583,19 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                     || synth_hf
                     || synth_settings
                     || synth_footnotes
-                    || synth_endnotes)
+                    || synth_endnotes
+                    || !media_ct_defaults.is_empty())
             {
                 let raw = std::str::from_utf8(bytes)?;
                 let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
+                /* Issue #135 — `<Default>` rows for new media extensions. */
+                for (ext, content_type) in &media_ct_defaults {
+                    if let Some(s) =
+                        crate::media_plan::inject_content_type_default(&patched, ext, content_type)
+                    {
+                        patched = Cow::Owned(s);
+                    }
+                }
                 if synth_comments {
                     patched = match inject_content_type_override(
                         &patched,
@@ -2587,10 +2662,17 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
                     || synth_hf
                     || synth_settings
                     || synth_footnotes
-                    || synth_endnotes)
+                    || synth_endnotes
+                    || !body_media_rows.is_empty())
             {
                 let raw = std::str::from_utf8(bytes)?;
-                let mut patched: Cow<'_, str> = Cow::Borrowed(raw);
+                /* Issue #135 — body picture rows first, so the sequential
+                synth ids below start above them. */
+                let mut patched: Cow<'_, str> = if body_media_rows.is_empty() {
+                    Cow::Borrowed(raw)
+                } else {
+                    Cow::Owned(splice_image_rels(raw, &body_media_rows))
+                };
                 let mut next = next_rel_id(&patched);
                 if synth_comments {
                     let rid = format!("rId{next}");
@@ -2719,12 +2801,24 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         Override is needed for a `.rels` part itself (it rides the
         `Default Extension="rels"` catch-all every archive already
         carries). */
-        if !rels_already_present && (needs_hyperlink_rels_splice || synth_hf || synth_settings) {
+        if !rels_already_present
+            && (needs_hyperlink_rels_splice
+                || synth_hf
+                || synth_settings
+                || !body_media_rows.is_empty())
+        {
             let mut fresh = String::with_capacity(256);
             fresh.push_str(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
                  <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n",
             );
+            /* Issue #135 — new body pictures. */
+            for (rid, target) in &body_media_rows {
+                fresh.push_str(&format!(
+                    "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{target}\"/>\n",
+                    crate::media_plan::IMAGE_REL_TYPE
+                ));
+            }
             for (rid, target) in &new_hyperlink_rel_entries {
                 fresh.push_str(&format!(
                     "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL_TYPE}\" Target=\"{target}\" TargetMode=\"External\"/>\n"
@@ -2759,7 +2853,27 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
         `Default Extension="rels"` rule — no Content_Types Override). */
         for (name, bytes) in &hf_rels_new {
             zip.start_file(name, opts)?;
-            zip.write_all(bytes)?;
+            match media_rels_rows.get(name.as_str()) {
+                Some(rows) => {
+                    zip.write_all(splice_image_rels(std::str::from_utf8(bytes)?, rows).as_bytes())?;
+                    media_rels_written.push(name.clone());
+                }
+                None => zip.write_all(bytes)?,
+            }
+        }
+        /* Issue #135 — a part referencing a new picture that had no rels
+        file at all gets a fresh one. */
+        for (name, rows) in &media_rels_rows {
+            if name == RELS_XML || media_rels_written.contains(name) {
+                continue;
+            }
+            zip.start_file(name, opts)?;
+            zip.write_all(splice_image_rels(EMPTY_RELS_XML, rows).as_bytes())?;
+        }
+        /* Issue #135 — the new media parts themselves. */
+        for m in &media_plan.new_media {
+            zip.start_file(&m.entry_name, opts)?;
+            zip.write_all(&m.data)?;
         }
         /* Issue #74 — synthesized settings.xml on a document that never
         had one. */
@@ -3274,6 +3388,31 @@ fn inject_content_type_override<'a>(
     ));
     out.push_str(&xml[close_idx..]);
     Cow::Owned(out)
+}
+
+/// Issue #135 — an empty relationships part, the base a fresh part-local
+/// rels file grows from.
+const EMPTY_RELS_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+     <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n\
+     </Relationships>";
+
+/// Issue #135 — splice one image `<Relationship>` per `(id, target)` row
+/// into `rels_xml` (additive: existing rows stay byte-identical; a row
+/// whose target is already declared is skipped).
+fn splice_image_rels(rels_xml: &str, rows: &[(&str, &str)]) -> String {
+    let mut patched: Cow<'_, str> = Cow::Borrowed(rels_xml);
+    for (rid, target) in rows {
+        if let Cow::Owned(s) = inject_doc_rel(
+            &patched,
+            rid,
+            crate::media_plan::IMAGE_REL_TYPE,
+            target,
+            None,
+        ) {
+            patched = Cow::Owned(s);
+        }
+    }
+    patched.into_owned()
 }
 
 /// L1.2 (#18) — pick a fresh `rId` that does not collide with any
