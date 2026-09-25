@@ -767,6 +767,7 @@ fn resolve_hyperlinks_block(
                         start: h.start,
                         end: h.end,
                         target: url.clone(),
+                        attrs: h.attrs,
                     })
                 })
                 .collect();

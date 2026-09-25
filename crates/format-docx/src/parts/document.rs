@@ -839,7 +839,7 @@ pub fn parse_document_xml_with_warnings(
     when the element opens; mark the byte range covered when it
     closes. `target` is the rId at this stage — the archive resolver
     swaps it to a URL via the rels map in a second pass. */
-    let mut hyperlink_stack: Vec<(String, u32)> = Vec::new();
+    let mut hyperlink_stack: Vec<(String, u32, Vec<engine::SourceAttr>)> = Vec::new();
 
     /* Phase 6 — `<w:sectPr>` accumulators. A sectPr can live in two places:
     inside a paragraph's `<w:pPr>` (ends a section *at* that paragraph,
@@ -1183,7 +1183,10 @@ pub fn parse_document_xml_with_warnings(
                         let target = attr_val(&e, b"r:id")
                             .or_else(|| attr_val(&e, b"w:anchor").map(|a| format!("#{a}")))
                             .unwrap_or_default();
-                        hyperlink_stack.push((target, start));
+                        /* Issue #242 — the source attributes (`r:id`, `w:history`,
+                        `w:tooltip`, …) ride the link for regeneration. */
+                        let attrs = crate::schema::source_markup::raw_attrs(&e, &ns);
+                        hyperlink_stack.push((target, start, attrs));
                     }
                     b"w:t" => {
                         in_text_elt = true;
@@ -1824,10 +1827,15 @@ pub fn parse_document_xml_with_warnings(
                         }
                     }
                     b"w:hyperlink" => {
-                        if let Some((target, start)) = hyperlink_stack.pop() {
+                        if let Some((target, start, attrs)) = hyperlink_stack.pop() {
                             let end = (para_text.len() + run_text.len()) as u32;
                             if end > start && !target.is_empty() {
-                                para_hyperlinks.push(engine::Hyperlink { start, end, target });
+                                para_hyperlinks.push(engine::Hyperlink {
+                                    start,
+                                    end,
+                                    target,
+                                    attrs,
+                                });
                             }
                         }
                     }

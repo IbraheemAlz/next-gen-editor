@@ -1294,17 +1294,8 @@ fn emit_styled_runs_with_objects(
                 && !hyperlink_stack
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *h as *const _))
-                && (h.target.starts_with('#') || hyperlink_rel_map.contains_key(&h.target))
+                && open_hyperlink(h, hyperlink_rel_map, out)
             {
-                /* Issue #81 — `#name` is an internal bookmark anchor (a
-                TOC entry); everything else resolves to a relationship. */
-                if let Some(anchor) = h.target.strip_prefix('#') {
-                    out.push_str("<w:hyperlink w:anchor=\"");
-                    push_escaped_attr(anchor, out);
-                    out.push_str("\" w:history=\"1\">");
-                } else if let Some(rid) = hyperlink_rel_map.get(&h.target) {
-                    out.push_str(&format!("<w:hyperlink r:id=\"{rid}\">"));
-                }
                 hyperlink_stack.push(h);
             }
         }
@@ -2757,18 +2748,21 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                 need a part-local r:id. Clean paragraphs passthrough
                 their original markup, whose ids stay valid because
                 the rels splice below is strictly additive. */
-                let mut link_targets: Vec<String> = Vec::new();
+                let mut links: Vec<Hyperlink> = Vec::new();
                 for_each_hf_paragraph(blocks, &mut |para| {
                     if para.dirty {
-                        for h in &para.hyperlinks {
-                            if !link_targets.contains(&h.target) {
-                                link_targets.push(h.target.clone());
-                            }
-                        }
+                        /* Issue #81 — an internal `#name` anchor needs no
+                        relationship. */
+                        links.extend(
+                            para.hyperlinks
+                                .iter()
+                                .filter(|h| !h.target.starts_with('#'))
+                                .cloned(),
+                        );
                     }
                 });
                 let mut link_map: HashMap<String, String> = HashMap::new();
-                if !link_targets.is_empty() {
+                if !links.is_empty() {
                     let rels_name = hf_part_rels_name(&part_name);
                     let existing_bytes = archive
                         .other_entries
@@ -2788,7 +2782,14 @@ fn write_docx_inner(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>
                                 .to_string()
                         });
                     let mut minted = 0u32;
-                    for target in &link_targets {
+                    for h in &links {
+                        /* Issue #242 — a still-valid source `r:id` stays. */
+                        if note_verified_source_rid(h, &parsed, &mut link_map)
+                            || link_map.contains_key(&h.target)
+                        {
+                            continue;
+                        }
+                        let target = &h.target;
                         if let Some(existing) = parsed.items.iter().find(|r| &r.target == target) {
                             link_map.insert(target.clone(), existing.id.clone());
                             continue;
@@ -3955,30 +3956,137 @@ fn inject_doc_rel<'a>(
     Cow::Owned(out)
 }
 
-/// Issue #60 — every hyperlink target belonging to a paragraph the
+/// Issue #242 — the lookup key under which [`hyperlink_rel_map`] records a
+/// *verified* source `r:id` (the rels part still maps it to the link's
+/// target). A NUL prefix can never collide with a target URL key.
+fn verified_rid_key(rid: &str) -> String {
+    format!("\u{0}{rid}")
+}
+
+/// Issue #242 — the `r:id` a regenerated `<w:hyperlink>` carried in the
+/// source, if any.
+fn source_rid(h: &Hyperlink) -> Option<&str> {
+    h.attrs
+        .iter()
+        .find(|a| a.name == "r:id")
+        .map(|a| a.value.as_str())
+}
+
+/// Issue #242 — the relationship id an external link is written with: its
+/// own source `r:id` while verified (so links sharing a URL keep their own
+/// rows), else the per-target id the pre-pass resolved.
+fn resolve_hyperlink_rid<'m>(
+    h: &Hyperlink,
+    hyperlink_rel_map: &'m HashMap<String, String>,
+) -> Option<&'m str> {
+    if let Some(rid) = source_rid(h)
+        && let Some((key, target)) = hyperlink_rel_map.get_key_value(&verified_rid_key(rid))
+        && *target == h.target
+    {
+        return Some(&key[1..]);
+    }
+    hyperlink_rel_map.get(&h.target).map(String::as_str)
+}
+
+/// Open one `<w:hyperlink>`. Returns `false` (nothing written) for an
+/// external link with no resolvable relationship — the runs then emit as
+/// plain text rather than a dangling `r:id`.
+///
+/// Issue #81 — `#name` is an internal bookmark anchor (a TOC entry);
+/// everything else resolves to a relationship. Issue #242 — a link read
+/// from `.docx` re-emits its source attributes in source order with the
+/// `r:id` / `w:anchor` value re-derived from the live target (verbatim
+/// when unchanged); an engine-authored link keeps the stock spelling.
+fn open_hyperlink(
+    h: &Hyperlink,
+    hyperlink_rel_map: &HashMap<String, String>,
+    out: &mut String,
+) -> bool {
+    let anchor = h.target.strip_prefix('#');
+    let rid = match anchor {
+        Some(_) => None,
+        None => match resolve_hyperlink_rid(h, hyperlink_rel_map) {
+            Some(rid) => Some(rid),
+            None => return false,
+        },
+    };
+    if h.attrs.is_empty() {
+        match (anchor, rid) {
+            (Some(anchor), _) => {
+                out.push_str("<w:hyperlink w:anchor=\"");
+                push_escaped_attr(anchor, out);
+                out.push_str("\" w:history=\"1\">");
+            }
+            (None, Some(rid)) => out.push_str(&format!("<w:hyperlink r:id=\"{rid}\">")),
+            (None, None) => return false,
+        }
+        return true;
+    }
+    let mut escaped_anchor = String::new();
+    if let Some(a) = anchor {
+        push_escaped_attr(a, &mut escaped_anchor);
+    }
+    out.push_str("<w:hyperlink");
+    let mut wrote_rid = false;
+    let mut wrote_anchor = false;
+    for a in &h.attrs {
+        let value = match a.name.as_str() {
+            /* An internal link has no relationship. */
+            "r:id" => match rid {
+                Some(rid) => {
+                    wrote_rid = true;
+                    rid
+                }
+                None => continue,
+            },
+            /* External links may carry a location inside the target —
+            kept verbatim; an internal link's anchor IS the target. */
+            "w:anchor" if anchor.is_some() => {
+                wrote_anchor = true;
+                escaped_anchor.as_str()
+            }
+            _ => a.value.as_str(),
+        };
+        out.push(' ');
+        out.push_str(&a.name);
+        out.push_str("=\"");
+        out.push_str(value);
+        out.push('"');
+    }
+    if let Some(rid) = rid
+        && !wrote_rid
+    {
+        out.push_str(&format!(" r:id=\"{rid}\""));
+    }
+    if anchor.is_some() && !wrote_anchor {
+        out.push_str(" w:anchor=\"");
+        out.push_str(&escaped_anchor);
+        out.push('"');
+    }
+    out.push('>');
+    true
+}
+
+/// Issue #60 — every external hyperlink belonging to a paragraph the
 /// writer is about to REGENERATE (`dirty`, walked recursively through
 /// table cells). A clean/passthrough paragraph keeps its original
 /// `<w:hyperlink r:id>` untouched inside its verbatim `source_xml`, so it
 /// never needs an entry here — only what THIS save actually re-derives
 /// from the `Paragraph.hyperlinks` overlay (which carries the resolved
-/// target URL, not the original rId) needs a fresh-or-reused id resolved.
-fn collect_dirty_hyperlink_targets(doc: &DocumentTree) -> Vec<String> {
-    fn walk_cell_blocks(blocks: &[Block], out: &mut Vec<String>) {
+/// target URL; the source `r:id` rides `Hyperlink::attrs`, issue #242)
+/// needs a verified, reused or fresh id resolved.
+fn collect_dirty_hyperlinks(doc: &DocumentTree) -> Vec<&Hyperlink> {
+    fn walk<'a>(blocks: impl IntoIterator<Item = &'a Block>, out: &mut Vec<&'a Hyperlink>) {
         for b in blocks {
             match b {
                 Block::Paragraph(p) if p.dirty => {
-                    out.extend(
-                        p.hyperlinks
-                            .iter()
-                            .filter(|h| !h.target.starts_with('#'))
-                            .map(|h| h.target.clone()),
-                    );
+                    out.extend(p.hyperlinks.iter().filter(|h| !h.target.starts_with('#')));
                 }
                 Block::Paragraph(_) => {}
                 Block::Table(t) => {
                     for row in &t.rows {
                         for cell in &row.cells {
-                            walk_cell_blocks(&cell.blocks, out);
+                            walk(&cell.blocks, out);
                         }
                     }
                 }
@@ -3986,33 +4094,36 @@ fn collect_dirty_hyperlink_targets(doc: &DocumentTree) -> Vec<String> {
         }
     }
     let mut out = Vec::new();
-    for b in &doc.blocks {
-        match b {
-            Block::Paragraph(p) if p.dirty => {
-                out.extend(
-                    p.hyperlinks
-                        .iter()
-                        .filter(|h| !h.target.starts_with('#'))
-                        .map(|h| h.target.clone()),
-                );
-            }
-            Block::Paragraph(_) => {}
-            Block::Table(t) => {
-                for row in &t.rows {
-                    for cell in &row.cells {
-                        walk_cell_blocks(&cell.blocks, &mut out);
-                    }
-                }
-            }
-        }
-    }
+    walk(&doc.blocks, &mut out);
     out
 }
 
-/// Issue #60 — resolve every dirty-paragraph hyperlink target to an
-/// `r:id`: reuse an existing rels entry whose `Target` already matches
-/// (mirrors `inject_doc_rel`'s own dedup-by-target), else mint the next
-/// unused sequential id starting from `next` (the caller has already
+/// Issue #242 — record `h`'s source `r:id` in `map` when the rels part
+/// still maps that id to the link's target (the link then keeps its own
+/// row, even when several rows share one URL). Returns whether it did.
+fn note_verified_source_rid(
+    h: &Hyperlink,
+    existing: &crate::opc::relationships::Relationships,
+    map: &mut HashMap<String, String>,
+) -> bool {
+    let Some(rid) = source_rid(h) else {
+        return false;
+    };
+    let verified = existing
+        .by_id(rid)
+        .is_some_and(|r| r.target == h.target && r.rel_type.ends_with("/hyperlink"));
+    if verified {
+        map.insert(verified_rid_key(rid), h.target.clone());
+    }
+    verified
+}
+
+/// Issue #60 — resolve every dirty-paragraph hyperlink to an `r:id`. A
+/// link whose source `r:id` is still valid keeps it (issue #242 — before
+/// that, links sharing one URL all collapsed onto the first matching
+/// row). Otherwise reuse an existing rels entry whose `Target` already
+/// matches (mirrors `inject_doc_rel`'s own dedup-by-target), else mint the
+/// next unused sequential id starting from `next` (the caller has already
 /// reserved whatever ids `synth_comments`/`synth_extended` are about to
 /// consume from the same rels part, so minting here can never collide
 /// with theirs). Returns the full lookup map (fed to `build_document_xml`
@@ -4025,10 +4136,11 @@ fn hyperlink_rel_map(
 ) -> (HashMap<String, String>, Vec<(String, String)>) {
     let mut map: HashMap<String, String> = HashMap::new();
     let mut new_entries: Vec<(String, String)> = Vec::new();
-    for target in collect_dirty_hyperlink_targets(doc) {
-        if map.contains_key(&target) {
+    for h in collect_dirty_hyperlinks(doc) {
+        if note_verified_source_rid(h, existing, &mut map) || map.contains_key(&h.target) {
             continue;
         }
+        let target = h.target.clone();
         if let Some(rid) = existing
             .items
             .iter()
@@ -5105,6 +5217,7 @@ mod tests {
             start: 10,
             end: 17,
             target: "https://fresh-example.com".to_string(),
+            ..Default::default()
         });
         para.dirty = true;
         let doc = DocumentTree::from_rich_paragraphs([para]);
@@ -5156,6 +5269,7 @@ mod tests {
             start: 10,
             end: 17,
             target: "https://fresh-example.com".to_string(),
+            ..Default::default()
         });
         para.dirty = true;
         let doc = DocumentTree::from_rich_paragraphs([para]);
@@ -8047,6 +8161,7 @@ mod tests {
                 start: 0,
                 end: 8,
                 target: "https://example.com/".into(),
+                ..Default::default()
             }],
             dirty: true,
             ..Default::default()
@@ -9112,5 +9227,117 @@ mod tests {
         assert!(out.contains("<w:spacing"), "{out}");
         /* The attributes still ride (no styles involved). */
         assert!(out.contains(r#"w:rsidR="00A1B2C3""#), "{out}");
+    }
+
+    /// Issue #242 — three external links (two sharing one URL, as Word
+    /// writes a re-pasted link) plus an internal anchor, every one with
+    /// source attributes the model does not read.
+    const LINK_RELS: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://b.example/" TargetMode="External"/>"#,
+        r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://a.example/" TargetMode="External"/>"#,
+        r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://a.example/" TargetMode="External"/>"#,
+        r#"</Relationships>"#,
+    );
+    const LINK_P: &str = concat!(
+        r#"<w:p w:rsidR="00A1B2C3"><w:r><w:t xml:space="preserve">See </w:t></w:r>"#,
+        r#"<w:hyperlink r:id="rId4" w:tooltip="First &amp; best" w:history="1"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>one</w:t></w:r></w:hyperlink>"#,
+        r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+        r#"<w:hyperlink r:id="rId5" w:history="1"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>two</w:t></w:r></w:hyperlink>"#,
+        r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+        r#"<w:hyperlink r:id="rId6" w:anchor="part2" w:tgtFrame="_blank" w:history="1"><w:r><w:t>three</w:t></w:r></w:hyperlink>"#,
+        r#"<w:r><w:t xml:space="preserve"> and </w:t></w:r>"#,
+        r#"<w:hyperlink w:anchor="_Toc1" w:docLocation="x" w:history="1"><w:r><w:t>four</w:t></w:r></w:hyperlink>"#,
+        r#"</w:p>"#,
+    );
+
+    fn link_archive() -> (String, DocxArchive) {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{LINK_P}<w:sectPr/></w:body></w:document>"#
+        );
+        let archive = read_docx(&zip_minimal_docx(&xml, Some(LINK_RELS))).expect("read links");
+        (xml, archive)
+    }
+
+    fn rels_of(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut f = z.by_name(RELS_XML).unwrap();
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+        s
+    }
+
+    /// Issue #242 — editing a paragraph with several links keeps every
+    /// link's own `r:id` (two links to one URL no longer collapse onto one
+    /// row) and every source attribute: the regenerated part is the source
+    /// plus the inserted bytes, the rels part is untouched.
+    #[test]
+    fn edited_paragraph_keeps_each_hyperlink_rid_and_attributes() {
+        let (xml, archive) = link_archive();
+        let p = archive.document.nth_paragraph(0).unwrap();
+        assert_eq!(p.hyperlinks.len(), 4, "{:?}", p.hyperlinks);
+        assert_eq!(p.hyperlinks[0].target, "http://a.example/");
+        assert_eq!(p.hyperlinks[1].target, "http://a.example/");
+        assert_eq!(p.hyperlinks[2].target, "http://b.example/");
+        assert_eq!(p.hyperlinks[3].target, "#_Toc1");
+        let zero = write_docx(&archive, &archive.document).expect("zero-edit");
+        assert_eq!(document_xml_of(&zero), xml);
+
+        let edited = archive.document.insert_text(at(0, 2), "X");
+        let bytes = write_docx(&archive, &edited).expect("write");
+        assert_eq!(document_xml_of(&bytes), xml.replacen("See ", "SeXe ", 1));
+        assert_eq!(rels_of(&bytes), LINK_RELS, "no rel minted or rewritten");
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+
+        let back = read_docx(&bytes).expect("re-read");
+        let targets: Vec<&str> = back
+            .document
+            .nth_paragraph(0)
+            .unwrap()
+            .hyperlinks
+            .iter()
+            .map(|h| h.target.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "http://a.example/",
+                "http://a.example/",
+                "http://b.example/",
+                "#_Toc1"
+            ]
+        );
+    }
+
+    /// Issue #242 — a link whose target changed no longer matches its
+    /// source row: it gets a fresh relationship but keeps its other
+    /// attributes; an internal link re-derives `w:anchor` in place.
+    #[test]
+    fn retargeted_hyperlink_mints_a_row_and_keeps_its_attributes() {
+        let (_, archive) = link_archive();
+        let mut doc = archive.document.clone();
+        if let Some(Block::Paragraph(p)) = doc.blocks.get_mut(0) {
+            p.hyperlinks[1].target = "http://c.example/".into();
+            p.hyperlinks[3].target = "#_Toc2".into();
+            p.dirty = true;
+        }
+        let bytes = write_docx(&archive, &doc).expect("write");
+        let out = document_xml_of(&bytes);
+        assert!(
+            out.contains(r#"<w:hyperlink r:id="rId7" w:history="1">"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<w:hyperlink w:anchor="_Toc2" w:docLocation="x" w:history="1">"#),
+            "{out}"
+        );
+        let rels = rels_of(&bytes);
+        assert!(rels.contains(r#"Id="rId7""#), "{rels}");
+        assert!(rels.contains(r#"Target="http://c.example/""#), "{rels}");
+        /* The untouched links keep their own rows. */
+        assert!(out.contains(r#"r:id="rId4" w:tooltip="First &amp; best""#));
+        assert!(out.contains(r#"r:id="rId6" w:anchor="part2" w:tgtFrame="_blank""#));
     }
 }

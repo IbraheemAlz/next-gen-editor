@@ -166,6 +166,13 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   (remapped) text offset between runs. Comment anchors are deliberately
   NOT markers (tree-level `comment_ranges`; a verbatim copy could
   resurrect a deleted comment).
+- `<w:hyperlink>` attributes ride the link itself (`Hyperlink::attrs`,
+  issue #242) and re-emit in source order. The source `r:id` is kept only
+  while the rels part still maps it to the link's target (*verified* —
+  several rows may share one URL, and each link keeps its own); otherwise
+  the writer re-resolves by target / mints a row. An internal `#name`
+  target re-derives `w:anchor`. Typing at either end of a link stays
+  outside it.
 - Offsets are remapped by `insert_text`, `delete_text`, `split_at`,
   `concat`, inline-object splices and the revision accept/reject helper;
   `SourceMarkup::text_len` makes any other text edit go *stale* (runs /

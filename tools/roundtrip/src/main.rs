@@ -294,6 +294,7 @@ fn run_default() -> Result<()> {
     run_style_bidi_roundtrip()?;
     run_part_scoped_media_roundtrip()?;
     run_source_markup_roundtrip()?;
+    run_hyperlink_identity_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -2802,6 +2803,140 @@ fn run_source_markup_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/* ============================================ hyperlink identity (#242) ==== */
+
+/// Issue #242 — the rels part of the hyperlink fixture: two rows share one
+/// URL (Word writes one row per inserted link, `58618.docx`).
+const HYPERLINK_RELS: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    r#"<Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://b.example/" TargetMode="External"/>"#,
+    r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://a.example/" TargetMode="External"/>"#,
+    r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://a.example/" TargetMode="External"/>"#,
+    r#"</Relationships>"#,
+);
+
+/// Issue #242 — three external links (two to one URL) and an internal
+/// anchor, carrying `w:history` / `w:tooltip` / `w:anchor` /
+/// `w:tgtFrame` / `w:docLocation`.
+const HYPERLINK_BODY: &str = concat!(
+    r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r>"#,
+    r#"<w:hyperlink r:id="rId4" w:tooltip="First &amp; best" w:history="1"><w:r><w:t>one</w:t></w:r></w:hyperlink>"#,
+    r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+    r#"<w:hyperlink r:id="rId5" w:history="1"><w:r><w:t>two</w:t></w:r></w:hyperlink>"#,
+    r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+    r#"<w:hyperlink r:id="rId6" w:anchor="part2" w:tgtFrame="_blank" w:history="1"><w:r><w:t>three</w:t></w:r></w:hyperlink>"#,
+    r#"<w:r><w:t xml:space="preserve"> and </w:t></w:r>"#,
+    r#"<w:hyperlink w:anchor="_Toc1" w:docLocation="x" w:history="1"><w:r><w:t>four</w:t></w:r></w:hyperlink>"#,
+    r#"</w:p>"#,
+);
+
+fn build_hyperlink_identity_docx() -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{HYPERLINK_BODY}{BARE_SECT_PR}</w:body></w:document>"#
+    );
+    package_document_xml_with_rels(&document_xml, HYPERLINK_RELS)
+}
+
+/// Issue #242 — step 27: typing before, between and after the links of a
+/// regenerated paragraph keeps every link's own `r:id` (two links to one
+/// URL no longer collapse onto one row), every source attribute and the
+/// rels part byte-identical: the saved `document.xml` is exactly source +
+/// the inserted bytes, on both save paths; the re-read resolves the same
+/// four targets.
+fn run_hyperlink_identity_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+
+    let at = |offset: usize| LogicalPos {
+        path: BlockPath::top(0),
+        offset: offset as u32,
+    };
+    let fixture_bytes = build_hyperlink_identity_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read hyperlink fixture")?;
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
+        bail!("untouched hyperlink document drifted");
+    }
+    println!("[roundtrip] step 27a OK — untouched save byte-identical");
+
+    /* Before the first link, right after a middle link, after the last
+    one. Typing at a link's end stays outside the link (the engine's
+    travel rule); it continues the link's source run, which the link
+    boundary then cuts into a run of its own. */
+    let edited = archive_a
+        .document
+        .insert_text(at("See one two three and four".len()), INSERT_TEXT)
+        .insert_text(at("See one two".len()), INSERT_TEXT)
+        .insert_text(at("Se".len()), INSERT_TEXT);
+    let expected_xml = doc_a
+        .replacen("See ", &format!("Se{INSERT_TEXT}e "), 1)
+        .replacen(
+            "two</w:t></w:r></w:hyperlink>",
+            &format!(
+                r#"two</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve">{INSERT_TEXT}</w:t></w:r>"#
+            ),
+            1,
+        )
+        .replacen(
+            "four</w:t></w:r></w:hyperlink>",
+            &format!(
+                r#"four</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve">{INSERT_TEXT}</w:t></w:r>"#
+            ),
+            1,
+        );
+    for (path, bytes) in [
+        (
+            "write_docx",
+            write_docx(&archive_a, &edited).context("write edited")?,
+        ),
+        (
+            "save_docx",
+            format_docx::save_docx(&edited).context("ui save edited")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&bytes).context("edited hyperlink .docx")?;
+        let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+        if xml != expected_xml {
+            bail!(
+                "{path}: edited hyperlink paragraph is not source + edit\n--- expected ---\n{expected_xml}\n--- got ---\n{xml}"
+            );
+        }
+        let rels = zip_entries(&bytes)?
+            .into_iter()
+            .find(|(n, _)| n == "word/_rels/document.xml.rels")
+            .context("rels part")?
+            .1;
+        if rels != HYPERLINK_RELS.as_bytes() {
+            bail!("{path}: rels part rewritten");
+        }
+        let back = read_docx(&bytes).context("re-read edited")?;
+        let targets: Vec<String> = back
+            .document
+            .nth_paragraph(0)
+            .context("p0")?
+            .hyperlinks
+            .iter()
+            .map(|h| h.target.clone())
+            .collect();
+        if targets
+            != [
+                "http://a.example/",
+                "http://a.example/",
+                "http://b.example/",
+                "#_Toc1",
+            ]
+        {
+            bail!("{path}: re-read targets {targets:?}");
+        }
+    }
+    println!(
+        "[roundtrip] step 27b OK — edited link paragraph keeps each r:id + attribute; rels untouched on both save paths"
+    );
+    Ok(())
+}
+
 /* ================================================ table placement (#173) ==== */
 
 /// Issue #173 — step 18: the `<w:jc>` / `<w:tblInd>` round-trip contract
@@ -4823,6 +4958,15 @@ fn build_table_fixture(body_intro_text: &str, inner_tbl_xml: &str) -> Vec<u8> {
 /// Wrap one complete `word/document.xml` part (declaration included) in
 /// the minimal OPC skeleton the Phase 5+ handcrafted fixtures share.
 fn package_document_xml(document_xml: &str) -> Vec<u8> {
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>"#;
+    package_document_xml_with_rels(document_xml, doc_rels)
+}
+
+/// [`package_document_xml`] with a caller-supplied
+/// `word/_rels/document.xml.rels` (hyperlink rows, issue #242).
+fn package_document_xml_with_rels(document_xml: &str, doc_rels: &str) -> Vec<u8> {
     use std::io::Write;
     use zip::write::{SimpleFileOptions, ZipWriter};
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4834,9 +4978,6 @@ fn package_document_xml(document_xml: &str) -> Vec<u8> {
     let dot_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>"#;
-    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 </Relationships>"#;
     let mut buf: Vec<u8> = Vec::new();
     {

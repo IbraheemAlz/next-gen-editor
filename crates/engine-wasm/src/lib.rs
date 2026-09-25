@@ -18072,6 +18072,7 @@ mod tests {
             start: 10,
             end: 17,
             target: "https://example.com".to_string(),
+            ..Default::default()
         });
 
         let base_spans = build_style_spans(&para, empty_sctx(), 24.0, [0, 0, 0, 255], 1.0);
@@ -25668,11 +25669,13 @@ mod wire_validation_tests {
                     start: 0,
                     end: 6,
                     target: "x".into(),
+                    ..Default::default()
                 },
                 engine::Hyperlink {
                     start: 2,
                     end: 8,
                     target: "y".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()

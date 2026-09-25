@@ -2565,14 +2565,23 @@ impl Default for FloatAnchor {
 /// A hyperlink overlay on a contiguous byte range of a paragraph. Display
 /// styling (blue + underline if no explicit `<w:rPr>`) is applied at layout
 /// time; clicks are out of scope for Phase 7 (the model is read-only).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hyperlink {
     pub start: u32,
     pub end: u32,
-    /// External URL (`Target` from the `r:id`'s rel entry). Internal
-    /// document anchors (`<w:hyperlink w:anchor>`) are not modelled in
-    /// this initial cut.
+    /// External URL (`Target` from the `r:id`'s rel entry), or `#name`
+    /// for an internal bookmark anchor (`<w:hyperlink w:anchor>`, issue
+    /// #81).
     pub target: String,
+    /// Issue #242 — the source `<w:hyperlink>` attributes, source order
+    /// (`r:id`, `w:history`, `w:tooltip`, `w:anchor`, `w:tgtFrame`, …),
+    /// re-emitted when the paragraph regenerates. The writer keeps the
+    /// source `r:id` only while the package's rels part still maps it to
+    /// `target` (a *verified* id — two links to one URL keep their own
+    /// rows) and re-resolves it otherwise; an internal `target` re-derives
+    /// `w:anchor`. Empty for an engine-authored link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attrs: Vec<SourceAttr>,
 }
 
 /// Phase 2 audit (gap D.1) — complex field overlay on a paragraph byte
@@ -3734,7 +3743,7 @@ impl Paragraph {
                 (ns < ne).then(|| Hyperlink {
                     start: ns,
                     end: ne,
-                    target: h.target.clone(),
+                    ..h.clone()
                 })
             })
             .collect();
@@ -5969,14 +5978,26 @@ impl DocumentTree {
             a stale range would repaint the wrong bytes). Typing at a
             field's start boundary stays outside (shift); strictly inside
             grows the field (the cached result was hand-edited — the next
-            resolution overwrites it wholesale). Hyperlinks/revisions
-            keep their pre-existing #56 limitation. */
+            resolution overwrites it wholesale). Revisions keep their
+            pre-existing #56 limitation. */
             for f in &mut para.fields {
                 if f.start >= off {
                     f.start += len;
                     f.end += len;
                 } else if f.end > off {
                     f.end += len;
+                }
+            }
+            /* Issue #242 — hyperlinks follow their text the same way
+            (typing at either boundary stays outside the link); a stale
+            range re-anchored every link of an edited paragraph onto the
+            wrong bytes on save. */
+            for h in &mut para.hyperlinks {
+                if h.start >= off {
+                    h.start += len;
+                    h.end += len;
+                } else if h.end > off {
+                    h.end += len;
                 }
             }
             /* Issue #69 / #80 — inline-object anchors (images, note
@@ -11909,6 +11930,7 @@ mod tests {
             start: 0,
             end: 5,
             target: "https://example.com".to_string(),
+            ..Default::default()
         });
         para.revisions.push(Revision {
             start: 6,

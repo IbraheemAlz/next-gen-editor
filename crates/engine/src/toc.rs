@@ -499,6 +499,7 @@ impl DocumentTree {
                 start: 0,
                 end: text.len() as u32,
                 target: format!("#{anchor}"),
+                ..Default::default()
             });
             if let Some((s, t)) = page_range {
                 fields.push(Field {
@@ -620,7 +621,7 @@ fn prefix_paragraph(p: &Paragraph, prefix: &str) -> Paragraph {
         .map(|h| Hyperlink {
             start: h.start + shift,
             end: h.end + shift,
-            target: h.target.clone(),
+            ..h.clone()
         })
         .collect();
     out
