@@ -989,7 +989,9 @@ impl Engine {
     }
 
     /// Phase 7 — list every inline-image media blob the document carries,
-    /// keyed by archive relationship id (`r:id`). The TS shell consumes
+    /// keyed by media key (issue #188: the resolved target path for an
+    /// imported picture, the minted id for an inserted one — the same key
+    /// the display list's `DrawImage.rel_id` names). The TS shell consumes
     /// this list once after `OpenDocx`, decodes each blob into an
     /// `ImageBitmap` via the browser, and installs the result via
     /// [`Engine::register_image`]. Returns an array of
@@ -2025,10 +2027,16 @@ fn build_inline_object_infos(
     para.inline_objects
         .iter()
         .map(|obj| match &obj.kind {
-            engine::InlineKind::Image {
-                rel_id,
+            /* Issue #188 — layout, the display list, the canvas image
+            cache and the PDF all key pictures by the part-resolved MEDIA
+            key (`word/media/image2.png`), never by the part-scoped
+            `rel_id`: a header's `rId5` and the body's `rId5` may name
+            different targets. The layout fields keep their `rel_id`
+            names for wire stability. */
+            kind @ engine::InlineKind::Image {
                 width_emu,
                 height_emu,
+                ..
             } => layout::paragraph::InlineObjectInfo {
                 at: obj.at,
                 width_px: engine::emu_to_pt(*width_emu) * scale,
@@ -2039,12 +2047,12 @@ fn build_inline_object_infos(
                 layout px. `<wp:inline>` keeps the Phase 7 in-line box. */
                 kind: match obj.anchor.as_deref() {
                     Some(anchor) => layout::paragraph::InlineObjectInfoKind::FloatingImage {
-                        rel_id: rel_id.clone(),
+                        rel_id: kind.image_media_key().unwrap_or_default().to_string(),
                         spec: float_spec_from_anchor(anchor, scale),
                         wrap: float_wrap_from_anchor(anchor, scale),
                     },
                     None => layout::paragraph::InlineObjectInfoKind::Image {
-                        rel_id: rel_id.clone(),
+                        rel_id: kind.image_media_key().unwrap_or_default().to_string(),
                     },
                 },
             },
@@ -2834,9 +2842,12 @@ fn paragraph_layout_key(
                 rel_id,
                 width_emu,
                 height_emu,
+                media_key,
             } => {
                 1u8.hash(&mut h);
                 rel_id.hash(&mut h);
+                /* Issue #188 — the laid-out glyph carries the media key. */
+                media_key.hash(&mut h);
                 width_emu.hash(&mut h);
                 height_emu.hash(&mut h);
             }
@@ -3604,6 +3615,18 @@ fn build_header_footer_box(
                     );
                     (para.text.clone(), spans)
                 };
+                /* Issue #78 / #188 — band pictures (and every other inline
+                object) ride the body's inline-object path; their media
+                keys were resolved against the part's own rels at read
+                time. A composition preview shifts the anchors after it. */
+                let mut inline_infos = build_inline_object_infos(para, cfg, scale, sctx);
+                if let Some(c) = comp {
+                    for info in &mut inline_infos {
+                        if info.at >= c.at.offset {
+                            info.at += c.text.len() as u32;
+                        }
+                    }
+                }
                 let mut p = layout_paragraph(ParagraphConfig {
                     text: &text,
                     fonts,
@@ -3619,7 +3642,7 @@ fn build_header_footer_box(
                     hanging_indent_px: ind_h,
                     marker_text: para.resolved_marker.clone(),
                     px_size_for_marker: cfg.px_size * scale,
-                    inline_objects: &[],
+                    inline_objects: &inline_infos,
                     tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
                 });
                 /* Phase 2 audit (gap D.1) — propagate field overlays so
@@ -11333,21 +11356,33 @@ impl Engine {
 
     /// Sprint 10 — project the innermost cell's shading + borders into
     /// the wire shape; `None` outside any table.
+    ///
+    /// Issue #174 — both the cell lookup AND the owning top-level table's
+    /// `bidi_visual` flag must resolve against the story adapter
+    /// (`with_selection_doc`), the same pattern `table_bidi_visual` (issue
+    /// #79) already used here. Previously only the `bidi_visual` half went
+    /// through the adapter; `innermost_cell_props_at` still read
+    /// unconditionally from the BODY document, so a caret inside a
+    /// header/footer (or note / text-box) table's cell reported the body
+    /// document's cell at that same path — wrong shading/borders, or
+    /// `None` when the body has no table there at all.
     fn cell_properties_for_caret(&self, path: &BridgeBlockPath) -> Option<BridgeCellProperties> {
         let engine_path = bridge_path_to_engine(path);
-        let cell = self.undo.current().innermost_cell_props_at(&engine_path)?;
-        /* Issue #79 — the owning TOP-LEVEL table's flag: the table the
-        context menu and `SetTableProperties` address. Read from the
-        selection's tree so a header/footer table reports its own. */
-        let table_bidi_visual = self.with_selection_doc(|d| {
+        self.with_selection_doc(|d| {
+            let cell = d.innermost_cell_props_at(&engine_path)?;
+            /* The owning TOP-LEVEL table's flag: the table the context
+            menu and `SetTableProperties` address. */
             let top = engine_path.steps.first().cloned()?;
             let top_path = engine::BlockPath { steps: vec![top] };
-            d.table_at_path(&top_path).map(|t| t.props.bidi_visual)
-        });
-        Some(BridgeCellProperties {
-            shading: cell.shading.map(rgba_to_bridge_color),
-            borders: engine_borders_to_bridge(cell.borders.as_ref()),
-            table_bidi_visual: table_bidi_visual.unwrap_or(false),
+            let table_bidi_visual = d
+                .table_at_path(&top_path)
+                .map(|t| t.props.bidi_visual)
+                .unwrap_or(false);
+            Some(BridgeCellProperties {
+                shading: cell.shading.map(rgba_to_bridge_color),
+                borders: engine_borders_to_bridge(cell.borders.as_ref()),
+                table_bidi_visual,
+            })
         })
     }
 
@@ -18823,7 +18858,8 @@ mod tests {
                 kind: engine::InlineKind::Image {
                     rel_id: "nge_img_1".to_string(),
                     width_emu: 914_400,  // 1 inch
-                    height_emu: 457_200, // 0.5 inch
+                    height_emu: 457_200, // 0.5 inch,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -18871,6 +18907,7 @@ mod tests {
                     rel_id: "nge_img_1".to_string(),
                     width_emu: 457_200,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -18901,6 +18938,7 @@ mod tests {
                     rel_id: "nge_float_1".to_string(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: Some(Box::new(anchor)),
                 source_xml: None,
@@ -18918,6 +18956,7 @@ mod tests {
                     rel_id: "nge_img_1".to_string(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -18944,6 +18983,7 @@ mod tests {
                     rel_id: rel.to_string(),
                     width_emu: 457_200,
                     height_emu: 228_600,
+                    media_key: None,
                 },
                 anchor,
                 source_xml: None,
@@ -19094,6 +19134,7 @@ mod tests {
                     rel_id: "nge_float_1".to_string(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: Some(Box::new(engine::FloatAnchor {
                     position_h: engine::HPosition {
@@ -19533,6 +19574,7 @@ mod tests {
                 rel_id: rel.to_string(),
                 width_emu: 685_800,
                 height_emu: 457_200,
+                media_key: None,
             },
             anchor: Some(Box::new(engine::FloatAnchor {
                 dist_right_emu: 57_150,
@@ -20016,6 +20058,7 @@ mod tests {
                         rel_id: "rIdInlinePic".to_string(),
                         width_emu: 228_600,
                         height_emu: 228_600,
+                        media_key: None,
                     },
                     anchor: None,
                     source_xml: None,
@@ -20535,6 +20578,7 @@ mod tests {
                     rel_id: "nge_img_1".to_string(),
                     width_emu: 914_400,
                     height_emu: 457_200,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -20861,7 +20905,7 @@ mod tests {
 
     /// Shared scaffold: a native Engine over `doc` with a real Latin font
     /// and a cached layout config, mirroring the interactive boot state.
-    fn test_engine_with_doc(doc: DocumentTree) -> Engine {
+    pub(crate) fn test_engine_with_doc(doc: DocumentTree) -> Engine {
         let bytes_font = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
         let font =
             LoadedFont::parse("test-latin".to_string(), bytes_font).expect("parse test font");
@@ -22335,6 +22379,61 @@ mod tests {
                 .bidi_visual
         );
         assert_eq!(x0(&e), before);
+    }
+
+    /// Issue #174 — `cell_properties_for_caret` must resolve through the
+    /// story adapter (`with_selection_doc`), the same pattern
+    /// `table_bidi_visual` (issue #79) already followed for the OWNING
+    /// table's flag. Body block 0 is a plain paragraph — not a table — at
+    /// the same top-level index the header story's table occupies, so
+    /// before the fix (`self.undo.current().innermost_cell_props_at(...)`,
+    /// unconditionally the BODY doc) the readback resolved against the
+    /// body's paragraph instead of the header's real, shaded cell and
+    /// reported `None` for a caret sitting inside a header table.
+    #[test]
+    fn cell_properties_for_caret_reads_the_active_story_not_the_body() {
+        let mut body = DocumentTree::from_text("body paragraph, not a table");
+        let mut header_cell = cell_with_text("header cell");
+        header_cell.props.shading = Some([0xff, 0x00, 0x00, 0xff]); // red
+        let mut header_table = one_row_table(vec![header_cell]);
+        header_table.props.bidi_visual = true;
+        body.headers.insert(
+            "rIdHeader".to_string(),
+            vec![engine::Block::Table(header_table)],
+        );
+
+        let mut e = test_engine_with_doc(body);
+        let path = BridgeBlockPath {
+            steps: vec![
+                BridgePathStep::Block { idx: 0 },
+                BridgePathStep::Cell { row: 0, col: 0 },
+                BridgePathStep::Block { idx: 0 },
+            ],
+        };
+
+        /* Body mode: the same path addresses the body's plain paragraph at
+        block 0 — no table there, so the honest answer is `None`, never a
+        leaked header cell. */
+        assert!(e.cell_properties_for_caret(&path).is_none());
+
+        e.active_story = StoryTarget::Header {
+            rid: "rIdHeader".to_string(),
+            page: 0,
+            section_block: 0,
+            role: engine::HeaderFooterRole::Default,
+        };
+        let props = e
+            .cell_properties_for_caret(&path)
+            .expect("header table cell reports its own properties");
+        let shading = props.shading.expect("header cell's own shading");
+        assert_eq!(
+            (shading.r, shading.g, shading.b, shading.a),
+            (0xff, 0, 0, 0xff)
+        );
+        assert!(
+            props.table_bidi_visual,
+            "header table's own bidiVisual flag, not the body's"
+        );
     }
 
     fn table_doc() -> DocumentTree {
@@ -24309,6 +24408,9 @@ mod a11y_direction_tests;
 
 #[cfg(test)]
 mod a11y_note_tests;
+
+#[cfg(test)]
+mod part_media_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {

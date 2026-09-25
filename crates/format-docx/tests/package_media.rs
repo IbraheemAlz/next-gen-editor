@@ -136,10 +136,20 @@ fn inserted_picture_gets_a_media_part_relationship_and_content_type() {
     let reread = read_docx(&saved).expect("re-read");
     let ids = image_rel_ids(&reread.document, 3);
     assert_eq!(ids, vec!["rId9", "rId10", "rId12"]);
-    for id in &ids {
-        assert!(reread.document.media.contains_key(id), "{id} resolves");
+    /* Issue #188 — blobs are keyed by the part-resolved target path. */
+    let keys: Vec<&str> = reread
+        .document
+        .nth_paragraph(3)
+        .expect("paragraph 3")
+        .inline_objects
+        .iter()
+        .filter_map(|io| io.kind.image_media_key())
+        .collect();
+    assert_eq!(keys.len(), 3);
+    for key in &keys {
+        assert!(reread.document.media.contains_key(*key), "{key} resolves");
     }
-    assert_eq!(reread.document.media["rId12"].data, JPEG);
+    assert_eq!(reread.document.media[keys[2]].data, JPEG);
 
     /* The live tree keeps its engine id — only the written copy renames. */
     assert!(

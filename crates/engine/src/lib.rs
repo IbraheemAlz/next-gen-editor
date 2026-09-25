@@ -182,10 +182,13 @@ pub struct DocumentTree {
     /// blocks produce.
     #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub footers: std::collections::HashMap<String, Vec<Block>>,
-    /// Phase 7 — image blobs keyed by their relationship id (`r:id`). The
-    /// archive reader fills this from `word/media/*` for every image rel
-    /// the document references. Inline images look up by the `rel_id`
-    /// their [`InlineKind::Image`] carries.
+    /// Phase 7 — image blobs keyed by MEDIA KEY. Issue #188 — the archive
+    /// reader keys them by the resolved target entry name
+    /// (`word/media/image2.png`), registering the picture rels of every
+    /// part it parses (body, headers, footers, notes) — never by the bare
+    /// relationship id, which is scoped per part. Engine-inserted blobs
+    /// (and pre-#188 snapshots) are keyed by their `rel_id`. Pictures
+    /// look up through [`InlineKind::image_media_key`].
     #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub media: std::collections::HashMap<String, ImageBlob>,
     /// Issue #80 — `word/footnotes.xml` note stories keyed by the OOXML
@@ -1679,10 +1682,23 @@ pub enum InlineKind {
     /// `rel_id` is the OOXML relationship id from the `<a:blip r:embed=...>`
     /// pointing to the `word/media/*` archive entry. `width_emu` /
     /// `height_emu` come from `<wp:extent cx="..." cy="..."/>`.
+    ///
+    /// Issue #188 — `rel_id` is scoped to the OPC part the picture lives
+    /// in (`word/_rels/header1.xml.rels` and `document.xml.rels` may both
+    /// declare `rId5` for different targets), so it is kept only as the
+    /// part-local serialization id the writer re-emits as `r:embed`.
+    /// `media_key` is the [`DocumentTree::media`] key the picture paints
+    /// from: the reader resolves the rel against its own part's rels and
+    /// stores the target part name (`word/media/image2.png`), so equal
+    /// targets share one blob. `None` ⇒ `rel_id` doubles as the media key
+    /// (engine-inserted pictures, pre-#188 snapshots). Read it through
+    /// [`InlineKind::image_media_key`].
     Image {
         rel_id: String,
         width_emu: i64,
         height_emu: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_key: Option<String>,
     },
     /// `<w:footnoteReference w:id="N"/>` — Phase 8a / issue #80. `id` is
     /// the OOXML footnote id (a key into
@@ -1722,6 +1738,47 @@ pub enum InlineKind {
         height_emu: i64,
         story: Box<TextBoxStory>,
     },
+}
+
+impl InlineKind {
+    /// Issue #188 — the [`DocumentTree::media`] key a picture paints
+    /// from: its resolved `media_key`, else its `rel_id`. `None` for every
+    /// non-picture kind.
+    pub fn image_media_key(&self) -> Option<&str> {
+        match self {
+            InlineKind::Image {
+                rel_id, media_key, ..
+            } => Some(media_key.as_deref().unwrap_or(rel_id)),
+            _ => None,
+        }
+    }
+}
+
+/// Issue #188 — visit every picture ([`InlineKind::Image`]) in `blocks`,
+/// recursing into table cells (any depth) and text-box stories. The
+/// callback gets the whole kind so it can read or rewrite `rel_id` /
+/// `media_key` together.
+pub fn for_each_image_mut(blocks: &mut [Block], f: &mut dyn FnMut(&mut InlineKind)) {
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) => {
+                for io in &mut p.inline_objects {
+                    match &mut io.kind {
+                        k @ InlineKind::Image { .. } => f(k),
+                        InlineKind::TextBox { story, .. } => for_each_image_mut(&mut story.body, f),
+                        _ => {}
+                    }
+                }
+            }
+            Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        for_each_image_mut(&mut cell.blocks, f);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Issue #83 — vertical anchoring of a text box story inside the shape's
@@ -7299,6 +7356,7 @@ impl DocumentTree {
                     rel_id: rel_id_for_inline.clone(),
                     width_emu,
                     height_emu,
+                    media_key: None,
                 },
             );
         });
@@ -10046,6 +10104,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 0,
                     height_emu: 0,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -10066,6 +10125,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 914_400,
                     height_emu: 914_400,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -10095,6 +10155,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 100,
                     height_emu: 100,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -10131,6 +10192,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 914_400,
                     height_emu: 914_400,
+                    media_key: None,
                 },
                 anchor: Some(Box::new(anchor)),
                 source_xml: None,
@@ -10214,6 +10276,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 100,
                     height_emu: 100,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -10320,6 +10383,7 @@ mod tests {
                 rel_id: "r".into(),
                 width_emu: 1,
                 height_emu: 2,
+                media_key: None,
             },
             anchor: Some(Box::new(FloatAnchor {
                 wrap: WrapKind::Square,
@@ -10347,6 +10411,7 @@ mod tests {
                         rel_id: "a".into(),
                         width_emu: 1,
                         height_emu: 1,
+                        media_key: None,
                     },
                     anchor: None,
                     source_xml: None,
@@ -10357,6 +10422,7 @@ mod tests {
                         rel_id: "b".into(),
                         width_emu: 1,
                         height_emu: 1,
+                        media_key: None,
                     },
                     anchor: None,
                     source_xml: None,
@@ -10382,6 +10448,7 @@ mod tests {
                     rel_id: "c".into(),
                     width_emu: 1,
                     height_emu: 1,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
