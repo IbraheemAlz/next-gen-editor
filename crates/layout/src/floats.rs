@@ -389,6 +389,7 @@ mod tests {
             inline_note_anchor: None,
             inline_object_height: 0.0,
             float: float.map(Box::new),
+            leader: None,
         }
     }
 

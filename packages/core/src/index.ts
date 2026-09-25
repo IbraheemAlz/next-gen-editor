@@ -16,7 +16,12 @@ export type { EditorSurfaceProps, EditorSurfaceHandle } from './EditorSurface';
 export { EngineProvider, useEngine } from './EngineProvider';
 export type { EngineProviderProps, EngineHandle } from './EngineProvider';
 
-export { createEditorCommands, STYLE_PRESETS, emptyPatch } from './createEditorCommands';
+export {
+    createEditorCommands,
+    DEFAULT_TOC_SWITCHES,
+    STYLE_PRESETS,
+    emptyPatch,
+} from './createEditorCommands';
 export type { EditorCommands, ParagraphStyleId } from './createEditorCommands';
 
 export { createEditorState } from './createEditorState';
@@ -75,6 +80,7 @@ export type {
     BridgeFieldRef,
     BridgeHfRole,
     FieldKind,
+    TocSwitches,
     ListKind,
     LogicalPos,
     LogicalRange,

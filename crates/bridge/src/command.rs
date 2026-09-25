@@ -614,6 +614,18 @@ pub enum Command {
         at: LogicalPos,
         instruction: String,
     },
+    /// Issue #81 — insert a Table of Contents at `at` (a top-level body
+    /// paragraph outside tables and other TOCs): before the paragraph
+    /// when the caret is at its start, after it at its end, else the
+    /// paragraph splits. The result is generated immediately from the
+    /// document's headings with live page numbers; `UpdateFields` (F9)
+    /// regenerates it. Rejected with `Event::Error` inside a table, a
+    /// header/footer/note story, or an existing TOC.
+    InsertToc {
+        at: LogicalPos,
+        #[serde(default)]
+        switches: TocSwitches,
+    },
     /// Sprint 2 (UI Edition) — set `<w:pPr><w:pBdr>` on every
     /// paragraph the range spans. Mirrors `SetCellBorders` over the
     /// paragraph-border model that shipped in Sprint 5. Pass an
@@ -873,6 +885,39 @@ pub enum FieldKind {
     Time,
     FileName,
     Author,
+}
+
+/// Issue #81 — the `TOC` field switches [`Command::InsertToc`] authors.
+/// Defaults are Word's Insert › Table of Contents: `TOC \o "1-3" \h \z \u`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[serde(default)]
+pub struct TocSwitches {
+    /// `\o "min-max"` — heading outline levels collected (1-based,
+    /// clamped to 1..=9). `outline_max == 0` omits `\o`.
+    pub outline_min: u8,
+    pub outline_max: u8,
+    /// `\h` — entries hyperlink to their headings.
+    pub hyperlinks: bool,
+    /// `\z` — hide tab leaders / numbers in Web layout.
+    pub hide_in_web: bool,
+    /// `\u` — also collect paragraphs by their direct outline level.
+    pub use_outline_levels: bool,
+    /// `false` emits `\n` (no page numbers).
+    pub page_numbers: bool,
+}
+
+impl Default for TocSwitches {
+    fn default() -> Self {
+        Self {
+            outline_min: 1,
+            outline_max: 3,
+            hyperlinks: true,
+            hide_in_web: true,
+            use_outline_levels: true,
+            page_numbers: true,
+        }
+    }
 }
 
 /// Sprint 11 (#13) — wire shape for one `<w:pPr><w:tabs><w:tab>`

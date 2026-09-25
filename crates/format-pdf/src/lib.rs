@@ -2006,6 +2006,7 @@ mod tests {
                 inline_note_anchor: None,
                 inline_object_height: 0.0,
                 float: None,
+                leader: None,
             }],
             font: "liberation".to_string(),
             direction: ShapingDirection::Ltr,

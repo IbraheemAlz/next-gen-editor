@@ -35,6 +35,7 @@ export type {
     BridgeFieldRef,
     BridgeHfRole,
     FieldKind,
+    TocSwitches,
     ListKind,
     LogicalPos,
     LogicalRange,
