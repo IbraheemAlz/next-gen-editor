@@ -4395,6 +4395,7 @@ mod tests {
                 header,
                 cant_split: false,
                 source_row: out_rows.len() as u32,
+                exact_height: false,
             });
             y += h;
         }
@@ -5653,6 +5654,7 @@ mod tests {
             header,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 
@@ -5986,6 +5988,7 @@ mod tests {
             header: false,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 
@@ -6175,6 +6178,7 @@ mod tests {
             header: false,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 

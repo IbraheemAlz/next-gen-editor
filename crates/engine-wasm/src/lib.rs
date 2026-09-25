@@ -4045,13 +4045,22 @@ fn layout_table_box(
             x += cell_width;
             col_cursor += span;
         }
-        /* Apply row min-height from `<w:trHeight>` if present. */
+        /* `<w:trHeight>`: `atLeast` is a floor under the measured
+        content height; `exact` (issue #169) IS the row height — the
+        content is clipped to it at paint time (`exact_height`). A
+        non-positive exact value has no height to honour and keeps the
+        content height (nothing clipped away to zero). */
+        let mut exact_height = false;
         if let Some(rh) = row.props.height {
             match rh {
-                engine::RowHeight::AtLeast { twips } | engine::RowHeight::Exact { twips } => {
+                engine::RowHeight::AtLeast { twips } => {
                     row_height = row_height.max(twips_to_layout_px(twips, scale));
                 }
-                engine::RowHeight::Auto => {}
+                engine::RowHeight::Exact { twips } if twips > 0 => {
+                    row_height = twips_to_layout_px(twips, scale);
+                    exact_height = true;
+                }
+                engine::RowHeight::Exact { .. } | engine::RowHeight::Auto => {}
             }
         }
         /* Stamp final row height onto every cell. */
@@ -4101,6 +4110,7 @@ fn layout_table_box(
             cant_split: row.props.cant_split
                 || matches!(row.props.height, Some(engine::RowHeight::Exact { .. })),
             source_row: rows_out.len() as u32,
+            exact_height,
         });
         y += row_height;
     }
@@ -22501,6 +22511,110 @@ mod tests {
         d
     }
 
+    /// Issue #169 — "intro", a 2-cell table whose first row is
+    /// `<w:trHeight w:val="800">` under `rule` (40 px at scale 1) with a
+    /// long cell A that wraps far past it, a plain second row, "outro".
+    fn exact_row_doc(exact: bool) -> DocumentTree {
+        let mut t = one_row_table(vec![
+            cell_with_text(&"overflowing exact row content ".repeat(12)),
+            cell_with_text("short"),
+        ]);
+        t.rows[0].props.height = Some(if exact {
+            engine::RowHeight::Exact { twips: 800 }
+        } else {
+            engine::RowHeight::AtLeast { twips: 800 }
+        });
+        t.rows.push(engine::TableRow {
+            props: engine::RowProperties::default(),
+            cells: vec![cell_with_text("next A"), cell_with_text("next B")],
+        });
+        let mut d = DocumentTree::from_text("intro");
+        d.blocks.push_back(engine::Block::Table(t));
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "outro".into(),
+                ..Default::default()
+            }));
+        d
+    }
+
+    fn glyph_runs(pages: &[PageBox]) -> usize {
+        render::scene::build_document_scene(pages, 0.0)
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::DrawGlyphRun(_)))
+            .count()
+    }
+
+    /// Issue #169 acceptance — an exact row keeps its declared height
+    /// (the content does not grow it), is flagged for clipping, and the
+    /// scene clips both its cells and drops the lines below the row;
+    /// the same content under `atLeast` grows the row and paints every
+    /// line unclipped.
+    #[test]
+    fn exact_height_row_is_fixed_and_clipped() {
+        let engine = test_engine_with_doc(exact_row_doc(true));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("exact");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let t = first_table(&pages);
+        let declared = twips_to_layout_px(800, 1.0);
+        assert_eq!(t.rows[0].size.height, declared);
+        assert!(t.rows[0].exact_height && t.rows[0].cant_split);
+        assert!(!t.rows[1].exact_height);
+        let content: f32 = t.rows[0].cells[0]
+            .content
+            .iter()
+            .map(|b| b.size().height)
+            .sum();
+        assert!(content > 2.0 * declared, "the cell content overflows");
+        for c in &t.rows[0].cells {
+            assert_eq!(c.size.height, declared);
+        }
+        assert_eq!(
+            t.rows[1].origin.y, declared,
+            "the next row follows the fixed row"
+        );
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let clips = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 2, "one clip per cell of the exact row");
+
+        let grown = test_engine_with_doc(exact_row_doc(false));
+        let (grown_pages, _, _, _) = grown.build_pages(1.0, false, None).expect("atLeast");
+        let g = first_table(&grown_pages);
+        assert!(
+            g.rows[0].size.height > 2.0 * declared,
+            "atLeast grows to fit"
+        );
+        assert!(!g.rows[0].exact_height);
+        assert!(
+            glyph_runs(&pages) < glyph_runs(&grown_pages),
+            "lines past the exact row are not painted"
+        );
+        let clips = render::scene::build_document_scene(&grown_pages, 0.0)
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 0, "a growing row needs no clip");
+
+        /* PDF: the clipped export is valid and smaller (dropped lines). */
+        let fonts = test_font_stack();
+        let mut exact_pdf = Vec::new();
+        format_pdf::export_pdf(
+            &pages,
+            &fonts,
+            &[],
+            format_pdf::PdfProfile::Plain,
+            &mut exact_pdf,
+        )
+        .expect("pdf");
+        assert!(exact_pdf.starts_with(b"%PDF"));
+    }
+
     /// Issue #95 — stamp `<w:widowControl>` onto every top-level
     /// paragraph (`None` = unspecified, Word's default ON).
     fn with_widow_control(mut doc: DocumentTree, widow: Option<bool>) -> DocumentTree {
@@ -22567,6 +22681,11 @@ mod tests {
         let engine = test_engine_with_doc(with_widow_control(table_doc(), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
         out.push(("autofit_table", pages, info.degradations));
+
+        /* Issue #169 — an overflowing `<w:trHeight w:hRule="exact">` row. */
+        let engine = test_engine_with_doc(with_widow_control(exact_row_doc(true), widow));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("exact row");
+        out.push(("exact_row_overflow_table", pages, info.degradations));
 
         let engine = test_engine_with_doc(with_widow_control(prose_doc(300), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
@@ -22727,6 +22846,9 @@ mod tests {
         on the #75 adapter; every other value is unchanged by it). */
         ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
+        /* Issue #169 — an overflowing exact-height row, recorded on the
+        #169 adapter (new fixture; every other value is unchanged). */
+        ("exact_row_overflow_table", 0x33d0f55718ea079f),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),
         /* Issue #79 — recorded with the `<w:bidiVisual>` mirror in place
@@ -22751,6 +22873,7 @@ mod tests {
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
         ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
+        ("exact_row_overflow_table", 0x33d0f55718ea079f),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),
     ];

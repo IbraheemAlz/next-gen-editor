@@ -471,6 +471,20 @@ fn build_table_box(
             col_idx += span;
         }
 
+        /* Mirrors engine-wasm's `<w:trHeight>`: `atLeast` floors the
+        content height; `exact` (issue #169) IS the row height and the
+        overflow is clipped at paint time. */
+        let mut exact_height = false;
+        match row.props.height {
+            Some(engine::RowHeight::AtLeast { twips }) => {
+                row_height = row_height.max(twips_to_pt(twips));
+            }
+            Some(engine::RowHeight::Exact { twips }) if twips > 0 => {
+                row_height = twips_to_pt(twips);
+                exact_height = true;
+            }
+            _ => {}
+        }
         for cell_out in cells_out.iter_mut() {
             cell_out.size.height = row_height;
         }
@@ -488,6 +502,7 @@ fn build_table_box(
             cant_split: row.props.cant_split
                 || matches!(row.props.height, Some(engine::RowHeight::Exact { .. })),
             source_row: rows_out.len() as u32,
+            exact_height,
         });
         y += row_height;
     }

@@ -406,6 +406,56 @@ fn build_table_placement() -> Vec<u8> {
     build_plain(&body)
 }
 
+/// Issue #169 — `<w:trHeight w:hRule>` oracle. One fixed-width 2-column
+/// bordered table: a one-line row; an `exact` 840-twip (42pt) row whose
+/// cell A holds 6 exact 14pt lines (84pt of content — overflows; cell B
+/// one line); the same content under `atLeast` 840 twips (grows to 84pt);
+/// a one-line row. Zero cell top/bottom margins (Word's stock), so the
+/// exact row shows lines 1-3 of cell A and clips lines 4-6.
+fn build_exact_row_table() -> Vec<u8> {
+    let edge =
+        |e: &str| format!(r#"<w:{e} w:val="single" w:sz="4" w:space="0" w:color="000000"/>"#);
+    let borders = format!(
+        "<w:tblBorders>{}{}{}{}{}{}</w:tblBorders>",
+        edge("top"),
+        edge("left"),
+        edge("bottom"),
+        edge("right"),
+        edge("insideH"),
+        edge("insideV")
+    );
+    let cell = |inner: String| {
+        format!(r#"<w:tc><w:tcPr><w:tcW w:w="4500" w:type="dxa"/></w:tcPr>{inner}</w:tc>"#)
+    };
+    let tall = |tag: &str| -> String {
+        (1..=6u32)
+            .map(|i| exact_line(&format!("{tag} line {i}")))
+            .collect()
+    };
+    let row =
+        |tr_pr: &str, a: String, b: String| format!("<w:tr>{tr_pr}{}{}</w:tr>", cell(a), cell(b));
+    let table = format!(
+        r#"<w:tbl><w:tblPr><w:tblW w:w="9000" w:type="dxa"/>{borders}<w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid><w:gridCol w:w="4500"/><w:gridCol w:w="4500"/></w:tblGrid>{}{}{}{}</w:tbl>"#,
+        row("", exact_line("First row A"), exact_line("First row B")),
+        row(
+            r#"<w:trPr><w:trHeight w:val="840" w:hRule="exact"/></w:trPr>"#,
+            tall("Exact"),
+            exact_line("Exact row B"),
+        ),
+        row(
+            r#"<w:trPr><w:trHeight w:val="840" w:hRule="atLeast"/></w:trPr>"#,
+            tall("AtLeast"),
+            exact_line("AtLeast row B"),
+        ),
+        row("", exact_line("Last row A"), exact_line("Last row B")),
+    );
+    let mut body = String::new();
+    body.push_str(&exact_line("Exact-height row table"));
+    body.push_str(&table);
+    body.push_str(&exact_line("End of document"));
+    build_plain(&body)
+}
+
 fn table_fixtures() -> Vec<Fixture> {
     vec![
         Fixture {
@@ -417,6 +467,11 @@ fn table_fixtures() -> Vec<Fixture> {
             name: "table_placement.docx",
             description: "Issue #173 horizontal-placement oracle: four fixed-width 200pt bordered tables on A4 (1in margins, ~451.3pt column) — jc=center (left edge ~125.6pt into the column), jc=right (~251.3pt, flush right), tblInd=720 twips (36pt), and a bidiVisual table with no jc (default start = right margin, ~251.3pt; cell A rightmost). Explicit A4 pgSz. Expected 1 page.",
             bytes: build_table_placement(),
+        },
+        Fixture {
+            name: "exact_row_table.docx",
+            description: "Issue #169 <w:trHeight w:hRule> oracle: a 2-column bordered table (exact 14pt line pitch, zero cell top/bottom margins) whose second row is hRule=exact 840 twips (42pt) holding 6 lines in cell A — the row stays 42pt and lines 4-6 are clipped (not painted; our PDF drops them from the content stream too); the third row carries the same 6 lines under hRule=atLeast 840 and grows to 84pt. Explicit A4 pgSz. Expected 1 page, rows 14/42/84/14pt.",
+            bytes: build_exact_row_table(),
         },
     ]
 }
@@ -604,6 +659,39 @@ mod tests {
                 assert_eq!(p.origin.x, 0.0);
             }
         }
+    }
+
+    /// Issue #169 — our side of the `exact_row_table.docx` oracle: the
+    /// exact row keeps its declared 42pt (content clipped at paint time),
+    /// the atLeast row grows to its 84pt of content.
+    #[test]
+    fn exact_row_table_fixes_the_exact_row_height() {
+        use layout::LayoutBlock;
+        let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let face =
+            text_pipeline::LoadedFont::parse("liberation".into(), bytes).expect("parse font");
+        let mut faces = std::collections::HashMap::new();
+        faces.insert("liberation".to_string(), std::sync::Arc::new(face));
+        let fonts = text_pipeline::FontStack::from_faces(faces, "liberation");
+        let mut doc = read_docx(&build_exact_row_table()).expect("parse").document;
+        let built = crate::pipeline::build_pages(&mut doc, &fonts);
+        assert_eq!(built.pages.len(), 1);
+        let tables: Vec<&layout::TableBox> = built.pages[0]
+            .blocks
+            .iter()
+            .filter_map(LayoutBlock::as_table)
+            .collect();
+        assert_eq!(tables.len(), 1);
+        let heights: Vec<f32> = tables[0].rows.iter().map(|r| r.size.height).collect();
+        let near = |got: f32, want: f32| assert!((got - want).abs() < 0.01, "{got} vs {want}");
+        near(heights[1], 42.0);
+        near(heights[2], 84.0);
+        let exact: Vec<bool> = tables[0].rows.iter().map(|r| r.exact_height).collect();
+        assert_eq!(exact, vec![false, true, false, false]);
+        assert!(
+            tables[0].rows[1].cant_split,
+            "exact rows never split (#155)"
+        );
     }
 
     /// Issue #155 — our side of the `long_cell_table.docx` oracle: the

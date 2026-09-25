@@ -32,9 +32,49 @@ pub fn paint_alpha_glyph(
     color: [u8; 3],
     bg: Option<[u8; 4]>,
 ) -> Result<(), JsValue> {
+    paint_alpha_glyph_cropped(ctx, glyph, origin_x, origin_y, color, bg, None)
+}
+
+/// [`paint_alpha_glyph`] cropped to `crop` (canvas pixels). Issue #169 —
+/// `put_image_data` ignores the canvas clip path, so a glyph straddling a
+/// [`DisplayCmd::PushClip`] rect (an exact-height table row, a text box)
+/// would overflow it; the dirty-rect form of `putImageData` writes only
+/// the part inside the clip. `None` is the historical uncropped blit,
+/// byte-identical to [`paint_alpha_glyph`].
+fn paint_alpha_glyph_cropped(
+    ctx: &web_sys::OffscreenCanvasRenderingContext2d,
+    glyph: &RasterizedGlyph,
+    origin_x: f64,
+    origin_y: f64,
+    color: [u8; 3],
+    bg: Option<[u8; 4]>,
+    crop: Option<Rect>,
+) -> Result<(), JsValue> {
     if glyph.width == 0 || glyph.height == 0 {
         return Ok(());
     }
+    let dx = origin_x + glyph.left as f64;
+    let dy = origin_y - glyph.top as f64;
+    let dirty = match crop {
+        None => None,
+        Some(c) => {
+            let hit = c.intersect(Rect::new(
+                dx,
+                dy,
+                dx + f64::from(glyph.width),
+                dy + f64::from(glyph.height),
+            ));
+            if hit.width() <= 0.0 || hit.height() <= 0.0 {
+                return Ok(());
+            }
+            Some(Rect::new(
+                hit.x0 - dx,
+                hit.y0 - dy,
+                hit.x1 - dx,
+                hit.y1 - dy,
+            ))
+        }
+    };
     let pixel_count = (glyph.width as usize) * (glyph.height as usize);
     let mut rgba = Vec::with_capacity(pixel_count * 4);
     match bg {
@@ -63,9 +103,18 @@ pub fn paint_alpha_glyph(
         glyph.width,
         glyph.height,
     )?;
-    let dx = origin_x + glyph.left as f64;
-    let dy = origin_y - glyph.top as f64;
-    ctx.put_image_data(&image_data, dx, dy)?;
+    match dirty {
+        None => ctx.put_image_data(&image_data, dx, dy)?,
+        Some(d) => ctx.put_image_data_with_dirty_x_and_dirty_y_and_dirty_width_and_dirty_height(
+            &image_data,
+            dx,
+            dy,
+            d.x0,
+            d.y0,
+            d.width(),
+            d.height(),
+        )?,
+    }
     Ok(())
 }
 
@@ -106,6 +155,14 @@ pub fn render_canvas2d(
     ctx.rect(clip.x0, clip.y0, clip.width(), clip.height());
     ctx.clip();
 
+    /* Issue #169 — the active `PushClip` rects, intersected, so glyph
+    blits (which ignore the canvas clip) can be cropped to them. Under a
+    `PushTransform` the clip lives in transformed space the untransformed
+    blit cannot follow, so cropping is skipped there (no emitter nests
+    them today). */
+    let mut push_clips: Vec<Rect> = Vec::new();
+    let mut transform_depth: u32 = 0;
+
     for cmd in &list.cmds {
         match cmd {
             DisplayCmd::FillRect { rect, paint } => {
@@ -129,6 +186,11 @@ pub fn render_canvas2d(
                     continue;
                 };
                 let rgb = paint_rgb(&run.paint);
+                let crop = if transform_depth == 0 {
+                    push_clips.last().copied()
+                } else {
+                    None
+                };
                 for g in &run.glyphs {
                     let key = GlyphKey::new(
                         run.font.clone(),
@@ -138,7 +200,7 @@ pub fn render_canvas2d(
                         run.faux_italic,
                     );
                     if let Some(raster) = atlas.get_or_rasterize(&key, &font, run.px_size) {
-                        paint_alpha_glyph(ctx, raster, g.x, g.y, rgb, run.bg_color)?;
+                        paint_alpha_glyph_cropped(ctx, raster, g.x, g.y, rgb, run.bg_color, crop)?;
                     }
                 }
             }
@@ -182,14 +244,23 @@ pub fn render_canvas2d(
                 ctx.begin_path();
                 ctx.rect(rect.x0, rect.y0, rect.width(), rect.height());
                 ctx.clip();
+                let top = push_clips.last().map_or(*rect, |c| c.intersect(*rect));
+                push_clips.push(top);
             }
-            DisplayCmd::PopClip => ctx.restore(),
+            DisplayCmd::PopClip => {
+                push_clips.pop();
+                ctx.restore();
+            }
             DisplayCmd::PushTransform(affine) => {
                 ctx.save();
+                transform_depth += 1;
                 let [a, b, c, d, e, f] = affine.as_coeffs();
                 ctx.transform(a, b, c, d, e, f)?;
             }
-            DisplayCmd::PopTransform => ctx.restore(),
+            DisplayCmd::PopTransform => {
+                transform_depth = transform_depth.saturating_sub(1);
+                ctx.restore();
+            }
         }
     }
 

@@ -135,6 +135,7 @@ mod tests {
             header: false,
             cant_split: false,
             source_row: 0,
+            exact_height: false,
         }
     }
 

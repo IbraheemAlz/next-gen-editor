@@ -621,6 +621,29 @@ pub enum LayoutBlock {
 }
 
 impl LayoutBlock {
+    /// Issues #83 / #169 — overflow clipping for a container that does
+    /// not grow (a text box, an exact-height table row): this block with
+    /// every line starting at or past `limit` (container-content-relative
+    /// y) removed. `None` when nothing needs cutting — or the block is a
+    /// table, which the caller keeps or drops whole by its origin. Shared
+    /// by the renderer and the PDF exporter so both drop the same lines.
+    pub fn clip_lines_at(&self, limit: f32) -> Option<LayoutBlock> {
+        let LayoutBlock::Paragraph(p) = self else {
+            return None;
+        };
+        let keep = p
+            .lines
+            .iter()
+            .take_while(|l| p.origin.y + l.origin.y < limit)
+            .count();
+        if keep == p.lines.len() {
+            return None;
+        }
+        let mut cut = p.clone();
+        cut.lines.truncate(keep);
+        Some(LayoutBlock::Paragraph(cut))
+    }
+
     pub fn origin(&self) -> Point {
         match self {
             LayoutBlock::Paragraph(p) => p.origin,
@@ -714,6 +737,13 @@ pub struct TableRowBox {
     /// clone keeps its source header's index, so hit-testing maps every
     /// fragment row back to the right model row.
     pub source_row: u32,
+    /// Issue #169 — `<w:trHeight w:hRule="exact">`: `size.height` IS the
+    /// declared height (the row neither grows to fit its content nor
+    /// shrinks below it), and content that overflows it is clipped to
+    /// each cell's rect by the renderer and the PDF exporter. `false`
+    /// for `atLeast` / `auto` rows, which grow to fit (nothing to clip).
+    /// Exact rows are also `cant_split` (issue #155).
+    pub exact_height: bool,
 }
 
 #[derive(Debug, Clone)]
