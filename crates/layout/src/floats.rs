@@ -315,6 +315,14 @@ fn place_float(
         hidden: f.spec.hidden,
         frame_origin,
         wrap: f.wrap.clone(),
+        /* Issue #83 — the story is laid out after pagination (engine-
+        wasm), once the box's page and width are final. */
+        text_box: f.text_box.as_ref().map(|tb| {
+            Box::new(crate::boxes::TextBoxFrame {
+                source: (**tb).clone(),
+                blocks: Vec::new(),
+            })
+        }),
     }
 }
 
@@ -415,6 +423,7 @@ mod tests {
             height: 50.0,
             spec,
             wrap: crate::boxes::FloatWrap::default(),
+            text_box: None,
         };
         let line = LineBox {
             origin: Point { x: 0.0, y: 0.0 },

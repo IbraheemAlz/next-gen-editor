@@ -1037,7 +1037,7 @@ fn emit_styled_runs_with_objects(
         }
 
         if let Some(obj) = obj_at.get(&lo) {
-            emit_inline_object(obj, out);
+            emit_inline_object(obj, out, hyperlink_rel_map);
             /* Skip to the byte after the anchor's UTF-8 length — the
             object consumes the full anchor character. The cut set
             already placed a boundary at `lo + OBJECT_REPLACE_UTF8.len()`,
@@ -1140,8 +1140,36 @@ fn emit_tab_run(style: &SpanStyle, _delete_kind: bool, out: &mut String) {
 /// anchor for `InlineObject` in a paragraph's `text`).
 const OBJECT_REPLACE_UTF8: &str = "\u{FFFC}";
 
-fn emit_inline_object(obj: &InlineObject, out: &mut String) {
+fn emit_inline_object(
+    obj: &InlineObject,
+    out: &mut String,
+    hyperlink_rel_map: &HashMap<String, String>,
+) {
     match &obj.kind {
+        /* Issue #83 — a text box re-emits its container: verbatim when
+        clean, story-regenerated when dirty, synthesized when engine-
+        authored (`parts::textbox::container_xml`). The story's blocks go
+        through the body's own block emitter (passthrough included). */
+        InlineKind::TextBox {
+            width_emu,
+            height_emu,
+            story,
+        } => {
+            let emit_blocks = |blocks: &[Block], o: &mut String| {
+                for b in blocks {
+                    emit_block(b, o, hyperlink_rel_map);
+                }
+            };
+            out.push_str("<w:r>");
+            out.push_str(&crate::parts::textbox::container_xml(
+                *width_emu,
+                *height_emu,
+                obj.anchor.as_deref(),
+                story,
+                &emit_blocks,
+            ));
+            out.push_str("</w:r>");
+        }
         InlineKind::Image {
             rel_id,
             width_emu,
@@ -1276,6 +1304,20 @@ fn emit_paragraph(para: &Paragraph, out: &mut String, hyperlink_rel_map: &HashMa
         `quick_xml`'s decoder. Defensively fall back on regenerate if the
         bytes aren't UTF-8. */
         match std::str::from_utf8(raw) {
+            /* Issue #83 — a text-box story edit leaves the host clean:
+            splice the regenerated container(s) into the passthrough
+            bytes; regenerate the paragraph if a splice is refused. */
+            Ok(s) if crate::parts::textbox::has_dirty_text_box(para) => {
+                let emit_blocks = |blocks: &[Block], o: &mut String| {
+                    for b in blocks {
+                        emit_block(b, o, hyperlink_rel_map);
+                    }
+                };
+                match crate::parts::textbox::splice_host(s, para, &emit_blocks) {
+                    Some(spliced) => out.push_str(&spliced),
+                    None => serialize_paragraph(para, out, hyperlink_rel_map),
+                }
+            }
             Ok(s) => out.push_str(s),
             Err(_) => serialize_paragraph(para, out, hyperlink_rel_map),
         }
@@ -1623,7 +1665,20 @@ fn build_document_xml_with_root(
     root_attrs: &[(String, String)],
 ) -> String {
     let mut out = String::with_capacity(2048);
-    let header = if doc_has_inline_images(doc) {
+    let top: Vec<Block> = doc.blocks.iter().cloned().collect();
+    /* Issue #83 — a text box is DrawingML too: its container (verbatim or
+    synthesized) uses the `wp` / `a` / `r` prefixes the drawing header
+    binds, and an engine-authored one also needs `wps`. */
+    let has_text_box = crate::parts::textbox::blocks_have_text_box(&top);
+    let mut root_attrs: Vec<(String, String)> = root_attrs.to_vec();
+    if crate::parts::textbox::blocks_need_wps(&top) {
+        root_attrs.push((
+            "xmlns:wps".to_string(),
+            crate::parts::textbox::NS_WPS.to_string(),
+        ));
+    }
+    let root_attrs = root_attrs.as_slice();
+    let header = if doc_has_inline_images(doc) || has_text_box {
         DOC_XML_HEADER_WITH_DRAWING
     } else if doc_has_hyperlinks(doc) || doc_has_section_hf_refs(doc) {
         /* Phase 3 (#40) — `<w:headerReference r:id>` (freshly emitted OR
@@ -7030,6 +7085,160 @@ mod tests {
             hp.resolved_marker.is_some(),
             "the reader's part-marker pass resolved the bullet glyph"
         );
+    }
+
+    /* ---------------- Issue #83 — text boxes ---------------- */
+
+    const TB_DOC: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+        r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+        r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+        r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+        r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" "#,
+        r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" "#,
+        r#"xmlns:v="urn:schemas-microsoft-com:vml" "#,
+        r#"xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" mc:Ignorable="w14"><w:body>"#,
+        r#"<w:p w14:paraId="0A0A0A0A"><w:r><w:t xml:space="preserve">before </w:t></w:r>"#,
+        r#"<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>"#,
+        r#"<wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="3" "#,
+        r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>"#,
+        r#"<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+        r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+        r#"<wp:extent cx="1270000" cy="635000"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+        r#"<wp:wrapSquare wrapText="bothSides"/><wp:docPr id="7" name="Text Box 7"/>"#,
+        r#"<wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+        r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>"#,
+        r#"<wps:txbx><w:txbxContent><w:p w14:paraId="0B0B0B0B"><w:r><w:t>boxed</w:t></w:r></w:p>"#,
+        r#"<w:p w14:paraId="0C0C0C0C"><w:r><w:t>kept</w:t></w:r></w:p></w:txbxContent></wps:txbx>"#,
+        r#"<wps:bodyPr rot="0" vert="horz"/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice>"#,
+        r#"<mc:Fallback><w:pict><v:shape style="width:100pt;height:50pt"><v:textbox>"#,
+        r#"<w:txbxContent><w:p><w:r><w:t>boxed</w:t></w:r></w:p><w:p><w:r><w:t>kept</w:t></w:r></w:p></w:txbxContent>"#,
+        r#"</v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>"#,
+        r#"<w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>tail</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#,
+    );
+
+    fn document_xml_of(bytes: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut f = z.by_name("word/document.xml").unwrap();
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+        s
+    }
+
+    fn body_of(xml: &str) -> &str {
+        let s = xml.find("<w:body>").expect("body") + "<w:body>".len();
+        let e = xml.rfind("</w:body>").expect("body end");
+        &xml[s..e]
+    }
+
+    fn source_body() -> &'static str {
+        body_of(TB_DOC)
+    }
+
+    #[test]
+    fn untouched_text_box_rides_the_passthrough_byte_identical() {
+        let parsed = read_docx_from_parts(&[("word/document.xml", TB_DOC)]);
+        let bytes = write_docx(&parsed, &parsed.document).expect("write");
+        let xml = document_xml_of(&bytes);
+        assert_eq!(body_of(&xml), source_body());
+        crate::opc::archive::check_document_xml_well_formed(&bytes).expect("well-formed");
+    }
+
+    #[test]
+    fn edited_text_box_story_splices_choice_and_fallback_only() {
+        let parsed = read_docx_from_parts(&[("word/document.xml", TB_DOC)]);
+        let doc = &parsed.document;
+        let host = engine::BlockPath::top(0);
+        let at = doc
+            .paragraph_at_path(&host)
+            .and_then(|p| p.inline_objects.first())
+            .map(|o| o.at)
+            .expect("text box anchor");
+        let story = doc.text_box_at(&host, at).expect("story");
+        let mut body = story.body.clone();
+        if let Some(Block::Paragraph(p)) = body.first_mut() {
+            p.text = "boxed!".into();
+            p.dirty = true;
+            p.source_xml = None;
+        }
+        let edited = doc.with_updated_text_box(&host, at, body);
+        let bytes = write_docx(&parsed, &edited).expect("write");
+        crate::opc::archive::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let xml = document_xml_of(&bytes);
+        let out = body_of(&xml);
+        /* The host paragraph stays on its passthrough bytes around the
+        container (paraId, the surrounding runs) … */
+        assert!(out.starts_with(
+            r#"<w:p w14:paraId="0A0A0A0A"><w:r><w:t xml:space="preserve">before </w:t></w:r>"#
+        ));
+        assert!(out.contains(r#"<w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p><w:p><w:r><w:t>tail</w:t></w:r></w:p>"#));
+        /* … the unedited story paragraph keeps ITS bytes, in both the
+        choice and the VML fallback … */
+        assert_eq!(
+            out.matches(r#"<w:p w14:paraId="0C0C0C0C"><w:r><w:t>kept</w:t></w:r></w:p>"#)
+                .count(),
+            2
+        );
+        /* … and the edit lands in both copies. */
+        assert_eq!(out.matches("boxed!").count(), 2, "{out}");
+        /* Bounded drift: the delta is the regenerated edited paragraph
+        (twice), nothing else. */
+        let delta = out.len() as i64 - source_body().len() as i64;
+        assert!(delta.abs() < 400, "delta {delta}: {out}");
+        /* Re-read: the edit is in the model. */
+        let back = read_docx_from_parts(&[("word/document.xml", xml.as_str())]);
+        let story = back
+            .document
+            .text_box_at(&host, at)
+            .expect("story after round-trip");
+        let first = story.body[0].as_paragraph().expect("p");
+        assert_eq!(first.text, "boxed!");
+    }
+
+    #[test]
+    fn engine_authored_text_box_round_trips_through_build_minimal_docx() {
+        let doc = DocumentTree::from_text("seed text");
+        let (doc, host, at) = doc.insert_text_box_at(
+            engine::LogicalPos {
+                path: engine::BlockPath::top(0),
+                offset: 4,
+            },
+            1_828_800,
+            914_400,
+        );
+        let mut body = doc.text_box_at(&host, at).expect("story").body.clone();
+        if let Some(Block::Paragraph(p)) = body.first_mut() {
+            p.text = "fresh box".into();
+            p.dirty = true;
+        }
+        let doc = doc.with_updated_text_box(&host, at, body);
+        let bytes = build_minimal_docx(&doc).expect("build");
+        crate::opc::archive::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let xml = document_xml_of(&bytes);
+        assert!(xml.contains("xmlns:wps="), "wps bound on the root: {xml}");
+        let parsed = read_docx(&bytes).expect("read");
+        let p = parsed.document.nth_paragraph(0).expect("paragraph");
+        assert_eq!(p.text, "seed\u{FFFC} text");
+        let obj = &p.inline_objects[0];
+        let a = obj.anchor.as_deref().expect("floating");
+        assert_eq!(a.wrap, engine::WrapKind::Square);
+        let InlineKind::TextBox {
+            width_emu,
+            height_emu,
+            story,
+        } = &obj.kind
+        else {
+            panic!("expected a text box");
+        };
+        assert_eq!((*width_emu, *height_emu), (1_828_800, 914_400));
+        assert_eq!(
+            story.body[0].as_paragraph().map(|p| p.text.as_str()),
+            Some("fresh box")
+        );
+        assert_eq!(story.fill, Some([255, 255, 255, 255]));
+        assert_eq!(story.outline.map(|o| o.width_emu), Some(9_525));
     }
 
     /// Issue #81 — the `document.xml` part of a written package.

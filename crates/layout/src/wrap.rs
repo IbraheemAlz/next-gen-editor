@@ -703,6 +703,7 @@ mod tests {
             hidden: false,
             frame_origin: Point::default(),
             wrap,
+            text_box: None,
         }
     }
 

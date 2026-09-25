@@ -261,6 +261,12 @@ pub fn export_pdf(
         }
         page.footnotes.for_each_paragraph(&mut collect);
         page.endnotes.for_each_paragraph(&mut collect);
+        /* Issue #83 — text-box stories embed their fonts too. */
+        for f in &page.floats {
+            if let Some(tb) = f.text_box.as_deref() {
+                for_each_paragraph(&tb.blocks, &mut collect);
+            }
+        }
     }
 
     let mut pdf = Pdf::new();
@@ -455,6 +461,9 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
     let content_y = page.margins.top;
     let mut content = Content::new();
 
+    /* Issue #83 — behind-text text boxes paint first (scene.rs order). */
+    emit_text_boxes(&mut content, page, true, font_objs);
+
     /* Issue #71 — header band BEFORE body (mirrors
     `render/scene.rs::build_document_scene` ordering: header, body,
     footnotes, footer). Band origin comes from the SAME shared
@@ -553,7 +562,86 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
         );
     }
 
+    /* Issue #83 — in-front text boxes close the page. */
+    emit_text_boxes(&mut content, page, false, font_objs);
+
     content.finish().to_vec()
+}
+
+/// Issue #83 — one z-order group of the page's text boxes (the scene's
+/// `paint_floats` twin: `behind` selects the `behindDoc` group, sorted by
+/// z-order): shape fill, the story clipped to the shape rect, outline.
+fn emit_text_boxes(
+    content: &mut Content,
+    page: &PageBox,
+    behind: bool,
+    font_objs: &[(String, FontObj)],
+) {
+    let page_h = page.size.height;
+    let mut group: Vec<&layout::FloatBox> = page
+        .floats
+        .iter()
+        .filter(|f| f.text_box.is_some() && f.behind_doc == behind && !f.hidden)
+        .collect();
+    group.sort_by_key(|f| f.z_order);
+    for f in group {
+        let Some(tb) = f.text_box.as_deref() else {
+            continue;
+        };
+        if f.size.width <= 0.0 || f.size.height <= 0.0 {
+            continue;
+        }
+        let (x, w, h) = (f.origin.x, f.size.width, f.size.height);
+        let pdf_y = page_h - (f.origin.y + h);
+        if let Some([r, g, b, _]) = tb.source.fill {
+            content.save_state();
+            content.set_fill_rgb(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+            );
+            content.rect(x, pdf_y, w, h);
+            content.fill_nonzero();
+            content.restore_state();
+        }
+        if let Some((origin, _)) = f.text_box_content_rect() {
+            content.save_state();
+            content.rect(x, pdf_y, w, h);
+            content.clip_nonzero();
+            content.end_path();
+            for block in &tb.blocks {
+                emit_block_shading(content, page_h, origin.x, origin.y, block);
+            }
+            for block in &tb.blocks {
+                match block {
+                    LayoutBlock::Paragraph(p) => {
+                        emit_paragraph_text(content, page_h, origin.x, origin.y, p, font_objs);
+                    }
+                    LayoutBlock::Table(t) => {
+                        emit_table_text(content, page_h, origin.x, origin.y, t, font_objs);
+                    }
+                }
+            }
+            for block in &tb.blocks {
+                emit_block_borders(content, page_h, origin.x, origin.y, block);
+            }
+            content.restore_state();
+        }
+        if let Some(([r, g, b, _], lw)) = tb.source.outline
+            && lw > 0.0
+        {
+            content.save_state();
+            content.set_stroke_rgb(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+            );
+            content.set_line_width(lw);
+            content.rect(x, pdf_y, w, h);
+            content.stroke();
+            content.restore_state();
+        }
+    }
 }
 
 /// Issue #71 — one header/footer band: the same shading → text →
@@ -1245,6 +1333,11 @@ fn collect_to_unicode_pages(
         }
         page.footnotes.for_each_paragraph(&mut collect);
         page.endnotes.for_each_paragraph(&mut collect);
+        for f in &page.floats {
+            if let Some(tb) = f.text_box.as_deref() {
+                for_each_paragraph(&tb.blocks, &mut collect);
+            }
+        }
     }
     out
 }
@@ -2436,5 +2529,121 @@ mod tests {
             );
         }
         assert_eq!(painted_body_rows, n_rows - 1);
+    }
+
+    /// Issue #155 — a row that does not fit the rest of the page breaks
+    /// at a line boundary: both parts of the row paint their own lines
+    /// (none lost, none doubled) on their own page.
+    #[test]
+    fn row_split_at_a_line_boundary_paints_both_parts() {
+        let stack = liberation_stack();
+        let para = layout_paragraph(ParagraphConfig {
+            text: "hi",
+            fonts: &stack,
+            spans: &[plain_span("hi".len() as u32)],
+            base_direction: ShapingDirection::Ltr,
+            max_width: 200.0,
+            line_height: 22.0,
+            line_height_exact: false,
+            alignment: Alignment::Start,
+            indent_start_px: 0.0,
+            indent_end_px: 0.0,
+            first_line_indent_px: 0.0,
+            hanging_indent_px: 0.0,
+            marker_text: None,
+            px_size_for_marker: 22.0,
+            inline_objects: &[],
+            tab_stops_px: &[],
+        });
+        let glyphs: usize = para
+            .lines
+            .iter()
+            .flat_map(|l| l.runs.iter())
+            .map(|r| r.glyphs.len())
+            .sum();
+        assert!(glyphs > 0);
+        let line_h = para.size.height;
+        let row = |i: u32, n_paras: usize, h: f32| {
+            let content: Vec<LayoutBlock> = (0..n_paras)
+                .map(|k| {
+                    let mut p = para.clone();
+                    p.origin.y = k as f32 * line_h;
+                    LayoutBlock::Paragraph(p)
+                })
+                .collect();
+            layout::TableRowBox {
+                origin: layout::Point::default(),
+                size: layout::Size {
+                    width: 200.0,
+                    height: h,
+                },
+                cells: vec![layout::TableCellBox {
+                    origin: layout::Point::default(),
+                    size: layout::Size {
+                        width: 200.0,
+                        height: h,
+                    },
+                    grid_span: 1,
+                    v_merge: engine::VMergeRole::None,
+                    borders: engine::default_word_borders(),
+                    shading: None,
+                    content,
+                    padding_left: 0.0,
+                    padding_top: 0.0,
+                    padding_right: 0.0,
+                    padding_bottom: 0.0,
+                    content_offset: 0,
+                }],
+                header: false,
+                cant_split: false,
+                source_row: i,
+            }
+        };
+        /* 698 pt body: a 650 pt first row leaves 48 pt — two of the
+        second row's five lines stay, three continue. */
+        let mut rows = vec![row(0, 1, 650.0), row(1, 5, 5.0 * line_h)];
+        rows[1].origin.y = 650.0;
+        let table = TableBox {
+            origin: layout::Point::default(),
+            size: layout::Size {
+                width: 200.0,
+                height: 650.0 + 5.0 * line_h,
+            },
+            columns: vec![200.0],
+            rows,
+            outer_borders: engine::default_word_borders(),
+        };
+        let geom = layout::PaginatePageGeometry {
+            width: 595.0,
+            height: 842.0,
+            margins: Margins::uniform(72.0),
+            header_offset: 36.0,
+            footer_offset: 36.0,
+        };
+        let mut pag = layout::Paginator::with_default_bands(geom, None, None);
+        pag.push_block(LayoutBlock::Table(table), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        let fo = test_font_objs(&["liberation"]);
+        let per_page: Vec<usize> = pages
+            .iter()
+            .map(|page| {
+                let content = build_content(page, &fo);
+                let text = String::from_utf8_lossy(&content).into_owned();
+                text.split_whitespace().filter(|t| *t == "Tm").count()
+            })
+            .collect();
+        let lines_on = |p: &layout::PageBox| -> usize {
+            p.blocks
+                .iter()
+                .filter_map(LayoutBlock::as_table)
+                .flat_map(|t| t.rows.iter())
+                .map(|r| r.cells[0].content.len())
+                .sum()
+        };
+        assert_eq!(lines_on(&pages[0]), 3, "row 0 + two lines of row 1");
+        assert_eq!(lines_on(&pages[1]), 3, "the other three lines");
+        assert_eq!(per_page, vec![3 * glyphs, 3 * glyphs]);
     }
 }

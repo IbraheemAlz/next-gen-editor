@@ -131,9 +131,23 @@ fn main() -> ExitCode {
         };
     }
 
+    if args.first().map(String::as_str) == Some("--gen-table-fixtures") {
+        let dir = args
+            .get(1)
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new(fixtures::TABLE_FIXTURES_DIR));
+        return match fixtures::generate_tables(dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("FAIL: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let (Some(input), Some(output)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "usage: differential-native <input.docx> <output.pdf>\n       differential-native --gen-fixtures [dir]"
+            "usage: differential-native <input.docx> <output.pdf>\n       differential-native --gen-fixtures [dir]\n       differential-native --gen-table-fixtures [dir]"
         );
         return ExitCode::FAILURE;
     };

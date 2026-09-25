@@ -571,6 +571,21 @@ pub enum Command {
     InsertEndnote {
         at: LogicalPos,
     },
+    /// Issue #83 — insert a floating text box anchored at `at` (a body
+    /// paragraph; rejected with `Event::Error` inside table cells and
+    /// while a story is being edited). `width_emu` × `height_emu` is the
+    /// shape extent (914400 EMU per inch). The box gets Word's "Draw Text
+    /// Box" defaults — white fill, 0.75 pt black outline, square wrap,
+    /// column / paragraph-relative at zero offset — and the engine ENTERS
+    /// its story so typing lands in it: `SelectionChanged.editing_story`
+    /// reports `area: TextBox`. A click outside the box (or
+    /// `ExitHeaderFooter`) returns to the body; a click inside any text
+    /// box enters its story.
+    InsertTextBox {
+        at: LogicalPos,
+        width_emu: i64,
+        height_emu: i64,
+    },
     /// Issue #43 — install the render-time date DATE fields resolve
     /// against. The worker injects today's date right after INIT (the
     /// engine core never reads a wall clock — determinism for tests
@@ -856,7 +871,9 @@ pub enum SectionBreakKind {
 /// clicking into a note band or by `InsertFootnote` / `InsertEndnote`;
 /// left with `ExitHeaderFooter`). `EnterHeaderFooter` rejects the two
 /// note areas with `Event::Error` — notes are entered by content, not
-/// by page zone.
+/// by page zone. Issue #83 — `TextBox` names a text-box story (entered
+/// by clicking into the box or by `InsertTextBox`); `EnterHeaderFooter`
+/// rejects it the same way.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum HeaderFooterArea {
@@ -865,6 +882,7 @@ pub enum HeaderFooterArea {
     Footer,
     Footnote,
     Endnote,
+    TextBox,
 }
 
 /// Issue #43 — the field kinds [`Command::InsertField`] authors.

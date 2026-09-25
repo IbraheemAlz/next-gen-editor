@@ -1,0 +1,11 @@
+{
+  "_comment": "Issue #155 table pagination differential-oracle fixture corpus. word_pdf is PENDING for every entry: no Word 365 available in this environment (see tools/differential/README.md).",
+  "fixtures": {
+    "long_cell_table.docx": {
+      "description": "Issue #155 row-split oracle: a 20-line cell row at a page bottom breaks at a line boundary (4 lines stay on page 1); the same row with <w:cantSplit/> later moves whole. Exact 14pt line pitch, explicit A4 pgSz. Expected 3 pages.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
+    }
+  }
+}

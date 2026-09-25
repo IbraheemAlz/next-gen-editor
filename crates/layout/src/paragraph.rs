@@ -65,6 +65,16 @@ pub enum InlineObjectInfoKind {
         /// [`crate::boxes::FloatGlyph`] so the wrap plan can cut text.
         wrap: crate::boxes::FloatWrap,
     },
+    /// Issue #83 — a text box. Floating (`text_box.inline == false`) it
+    /// behaves exactly like [`Self::FloatingImage`]; in-line it reserves
+    /// its extent in the line like an inline image AND rides a
+    /// [`crate::boxes::FloatGlyph`] (character / line frame) so the
+    /// paginator positions the box at the glyph.
+    TextBox {
+        spec: crate::boxes::FloatSpec,
+        wrap: crate::boxes::FloatWrap,
+        text_box: Box<crate::boxes::TextBoxGlyph>,
+    },
 }
 
 /// Issue #80 — note markers shape at this fraction of the span size…
@@ -1548,6 +1558,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                                 info.kind,
                                 InlineObjectInfoKind::Image { .. }
                                     | InlineObjectInfoKind::FloatingImage { .. }
+                                    | InlineObjectInfoKind::TextBox { .. }
                             )
                     });
                     let (image_rel, float) = match info.map(|i| &i.kind) {
@@ -1566,11 +1577,33 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                                 height: info.map_or(0.0, |i| i.height_px),
                                 spec: *spec,
                                 wrap: wrap.clone(),
+                                text_box: None,
+                            })),
+                        ),
+                        /* Issue #83 — a text box rides the float path;
+                        an in-line one also reserves its extent below. */
+                        Some(InlineObjectInfoKind::TextBox {
+                            spec,
+                            wrap,
+                            text_box,
+                        }) => (
+                            None,
+                            Some(Box::new(crate::boxes::FloatGlyph {
+                                rel_id: String::new(),
+                                width: info.map_or(0.0, |i| i.width_px),
+                                height: info.map_or(0.0, |i| i.height_px),
+                                spec: *spec,
+                                wrap: wrap.clone(),
+                                text_box: Some(text_box.clone()),
                             })),
                         ),
                         _ => (None, None),
                     };
-                    let is_float = float.is_some();
+                    /* `is_float` ⇒ the glyph reserves nothing; an in-line
+                    text box is a float that still reserves its box. */
+                    let is_float = float
+                        .as_deref()
+                        .is_some_and(|f| !f.text_box.as_deref().is_some_and(|t| t.inline));
                     PositionedGlyph {
                         id: g.glyph_id as u16,
                         cluster: cluster_src,

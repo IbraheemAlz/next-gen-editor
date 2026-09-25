@@ -61,7 +61,8 @@ const INSERT_TEXT: &str = " تم التعديل";
 /// with a `run_default()` exact-byte-equality assertion that compares a
 /// resave against the pinned SOURCE text (`grab_bag_exotic.docx`,
 /// `floating_image_anchor.docx`, `footnotes_endnotes.docx`,
-/// `table_cell_runs.docx`, `image_wrap_modes.docx`, `toc_word_shape.docx`)
+/// `table_cell_runs.docx`, `image_wrap_modes.docx`, `toc_word_shape.docx`,
+/// `text_boxes_wrap.docx`)
 /// — the writer's
 /// trailing-sectPr compaction (`sect_pr_compaction_delta`) would desync
 /// those comparisons. `w14_paraid_word.docx` is the one exception THAT
@@ -282,6 +283,7 @@ fn run_default() -> Result<()> {
     run_table_cell_runs_survival()?;
     run_wrap_modes_roundtrip()?;
     run_toc_roundtrip()?;
+    run_text_boxes_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -1062,6 +1064,235 @@ fn run_wrap_modes_roundtrip() -> Result<()> {
     println!(
         "[roundtrip] step 14c OK — a wrap-mode change regenerates one element, distances kept"
     );
+    Ok(())
+}
+
+/* ============================================== text boxes (#83) ==== */
+
+const TB_PROSE: &str = "Body text wraps around the framed story on the left while the paragraph keeps going for several more lines of ordinary prose that fill the column.";
+const TB_ARABIC: &str =
+    "هذا نص عربي يلتف حول صندوق النص على اليمين ويستمر لعدة أسطر أخرى من النثر العادي.";
+const TB_STORY_A: &str = "Box one frames a short story.";
+const TB_STORY_B: &str = "صندوق نص من اليمين";
+
+/// Issue #83 fixture: two floating text boxes with square wrap. Box A
+/// (LTR) is Word's `mc:AlternateContent` shape — the DrawingML choice
+/// plus its VML `<v:textbox>` fallback — anchored at the left of the
+/// first paragraph's column; box B (RTL story, `<w:bidi/>`) is a bare
+/// `<w:drawing>` aligned right in the second, RTL paragraph. Every
+/// paragraph is in the writer's canonical shape so an edited story
+/// regenerates byte-identical modulo the edit.
+fn text_boxes_document_xml() -> String {
+    let anchor = |align_h: &str, id: u32| {
+        format!(
+            concat!(
+                r#"<wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="{id}" "#,
+                r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>"#,
+                r#"<wp:positionH relativeFrom="column">{align_h}</wp:positionH>"#,
+                r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+                r#"<wp:extent cx="1371600" cy="685800"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+                r#"<wp:wrapSquare wrapText="bothSides"/><wp:docPr id="{id}" name="Text Box {id}"/>"#,
+                r#"<wp:cNvGraphicFramePr/>"#,
+            ),
+            align_h = align_h,
+            id = id
+        )
+    };
+    let wsp = |story: &str| {
+        format!(
+            concat!(
+                r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+                r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1371600" cy="685800"/></a:xfrm>"#,
+                r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#,
+                r#"<a:ln w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></wps:spPr>"#,
+                r#"<wps:txbx><w:txbxContent>{story}</w:txbxContent></wps:txbx>"#,
+                r#"<wps:bodyPr rot="0" vert="horz" wrap="square" lIns="91440" tIns="45720" rIns="91440" bIns="45720" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>"#,
+                r#"</wps:wsp></a:graphicData></a:graphic>"#,
+            ),
+            story = story
+        )
+    };
+    let story_a = format!(r#"<w:p><w:r><w:t xml:space="preserve">{TB_STORY_A}</w:t></w:r></w:p>"#);
+    let story_b = format!(
+        r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:t xml:space="preserve">{TB_STORY_B}</w:t></w:r></w:p>"#
+    );
+    let box_a = format!(
+        concat!(
+            r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>{anchor}{wsp}</wp:anchor></w:drawing></mc:Choice>"#,
+            r##"<mc:Fallback><w:pict><v:shape id="Text Box 1" o:spid="_x0000_s1026" type="#_x0000_t202" "##,
+            r#"style="position:absolute;margin-left:0;margin-top:0;width:108pt;height:54pt;z-index:1" strokeweight=".5pt">"#,
+            r#"<v:textbox><w:txbxContent>{story}</w:txbxContent></v:textbox>"#,
+            r#"<w10:wrap type="square"/></v:shape></w:pict></mc:Fallback></mc:AlternateContent>"#,
+        ),
+        anchor = anchor("<wp:posOffset>0</wp:posOffset>", 1),
+        wsp = wsp(&story_a),
+        story = story_a
+    );
+    let box_b = format!(
+        "<w:drawing>{}{}</wp:anchor></w:drawing>",
+        anchor("<wp:align>right</wp:align>", 2),
+        wsp(&story_b)
+    );
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+            r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+            r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+            r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+            r#"xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" "#,
+            r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" "#,
+            r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" "#,
+            r#"xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" "#,
+            r#"xmlns:w10="urn:schemas-microsoft-com:office:word" mc:Ignorable="wp14">"#,
+            "<w:body>",
+            r#"<w:p><w:r><w:t xml:space="preserve">Intro </w:t></w:r><w:r>{box_a}</w:r>"#,
+            r#"<w:r><w:t xml:space="preserve">{prose}</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:bidi/></w:pPr><w:r>{box_b}</w:r>"#,
+            r#"<w:r><w:t xml:space="preserve">{arabic}</w:t></w:r></w:p>"#,
+            "<w:sectPr/></w:body></w:document>",
+        ),
+        box_a = box_a,
+        box_b = box_b,
+        prose = TB_PROSE,
+        arabic = TB_ARABIC
+    )
+}
+
+/// Issue #83 fixture builder. Rides the `--fixtures` passthrough at
+/// drift 0 and the default harness's text-box step.
+fn build_text_boxes_docx() -> Vec<u8> {
+    package_document_xml(&text_boxes_document_xml())
+}
+
+/// Issue #83 — the text-box round-trip contract:
+/// (a) both shapes parse into text boxes (story text, the RTL story's
+/// direction, square wrap, right alignment); (b) a zero-edit save is
+/// byte-identical; (c) editing box A's story regenerates ONLY the edited
+/// story paragraph — in the DrawingML choice AND the VML fallback — and
+/// leaves the host paragraphs and box B verbatim (the whole part equals
+/// the source plus the inserted text, twice); (d) the edit re-reads;
+/// (e) an engine-authored box synthesizes a well-formed `<wps:wsp>` on
+/// both save paths and re-reads as a third box.
+fn run_text_boxes_roundtrip() -> Result<()> {
+    use engine::{BlockPath, InlineKind, LogicalPos};
+
+    let fixture = build_text_boxes_docx();
+    let archive = read_docx(&fixture).context("read text-box fixture")?;
+    let doc = &archive.document;
+    let boxes = doc.text_box_addresses();
+    if boxes.len() != 2 {
+        bail!("text-box fixture: expected 2 boxes, got {}", boxes.len());
+    }
+    let story_text = |d: &DocumentTree, i: usize| -> Option<String> {
+        let (h, a) = d.text_box_addresses().get(i)?.clone();
+        let st = d.text_box_at(&h, a)?;
+        st.body
+            .first()
+            .and_then(engine::Block::as_paragraph)
+            .map(|p| p.text.clone())
+    };
+    if story_text(doc, 0).as_deref() != Some(TB_STORY_A)
+        || story_text(doc, 1).as_deref() != Some(TB_STORY_B)
+    {
+        bail!("text-box fixture: stories parsed wrongly");
+    }
+    let (h1, a1) = boxes[1].clone();
+    let rtl = doc
+        .text_box_at(&h1, a1)
+        .and_then(|s| s.body.first())
+        .and_then(engine::Block::as_paragraph)
+        .and_then(|p| p.props.direction);
+    if rtl != Some(engine::TextDirection::Rtl) {
+        bail!("text-box fixture: box B's story is not RTL ({rtl:?})");
+    }
+    for (h, a) in &boxes {
+        let io = doc
+            .paragraph_at_path(h)
+            .and_then(|p| p.inline_objects.iter().find(|o| o.at == *a))
+            .context("box object")?;
+        let anchor = io.anchor.as_deref().context("box floats")?;
+        if anchor.wrap != engine::WrapKind::Square || !matches!(io.kind, InlineKind::TextBox { .. })
+        {
+            bail!("text-box fixture: box at {h:?}/{a} lowered wrongly: {anchor:?}");
+        }
+    }
+    println!("[roundtrip] step 16a OK — two text boxes (one RTL) parse with square wrap");
+
+    let src = String::from_utf8(extract_doc_xml(&fixture)?).context("utf8 source")?;
+    let zero = write_docx(&archive, doc).context("zero-edit write")?;
+    if String::from_utf8(extract_doc_xml(&zero)?).context("utf8 zero")? != src {
+        bail!("text-box fixture: zero-edit save drifted");
+    }
+    println!("[roundtrip] step 16b OK — zero-edit save is byte-identical");
+
+    /* (c) Type into box A's story through a story tree, exactly like the
+    engine's story adapter does. */
+    let (h0, a0) = boxes[0].clone();
+    let story = doc.text_box_at(&h0, a0).context("box A")?;
+    let story_tree = DocumentTree::from_blocks(story.body.clone());
+    let typed = story_tree.insert_text(
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        },
+        INSERT_TEXT,
+    );
+    let edited = doc.with_updated_text_box(&h0, a0, typed.blocks.iter().cloned().collect());
+    let bytes = write_docx(&archive, &edited).context("write edited text box")?;
+    assert_document_xml_well_formed(&bytes).context("edited text-box .docx")?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+    let needle = format!(r#"<w:t xml:space="preserve">{TB_STORY_A}</w:t>"#);
+    let want = src.replace(
+        &needle,
+        &format!(r#"<w:t xml:space="preserve">{INSERT_TEXT}{TB_STORY_A}</w:t>"#),
+    );
+    if src.matches(&needle).count() != 2 || out != want {
+        bail!(
+            "text-box fixture: edited save is not source + edit in both copies\n--- expected ---\n{want}\n--- got ---\n{out}"
+        );
+    }
+    let drift = out.len() - src.len();
+    if drift > 2 * 2 * INSERT_TEXT.len() {
+        bail!("text-box fixture: drift {drift} B exceeds the bound");
+    }
+    println!("[roundtrip] step 16c OK — story edit splices choice + fallback only (Δ {drift} B)");
+
+    let reread = read_docx(&bytes).context("re-read edited text box")?;
+    if story_text(&reread.document, 0) != Some(format!("{INSERT_TEXT}{TB_STORY_A}"))
+        || story_text(&reread.document, 1).as_deref() != Some(TB_STORY_B)
+    {
+        bail!("text-box fixture: edit did not re-read");
+    }
+    println!("[roundtrip] step 16d OK — the edited story re-reads, box B untouched");
+
+    let (with_new, _, _) = edited.insert_text_box_at(
+        LogicalPos {
+            path: BlockPath::top(1),
+            offset: 0,
+        },
+        1_828_800,
+        914_400,
+    );
+    for (label, bytes) in [
+        (
+            "write_docx",
+            write_docx(&archive, &with_new).context("write new box")?,
+        ),
+        (
+            "build_minimal_docx",
+            build_minimal_docx(&with_new).context("ui save")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&bytes).with_context(|| format!("{label} new box"))?;
+        let back = read_docx(&bytes).with_context(|| format!("{label} re-read"))?;
+        if back.document.text_box_addresses().len() != 3 {
+            bail!("{label}: the engine-authored box did not re-read");
+        }
+    }
+    println!("[roundtrip] step 16e OK — an engine-authored box synthesizes and re-reads");
     Ok(())
 }
 
@@ -2625,6 +2856,25 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 asserts: FixtureAsserts {
                     paragraph_count: 2,
                     paragraph_texts: vec!["intro".into(), "after".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        /* Issue #83 — two floating text boxes (one RTL, one with a VML
+        fallback) with square wrap. Passthrough at drift 0; the default
+        harness's step 16 edits a story. */
+        PrebuiltFixture {
+            name: "text_boxes_wrap.docx",
+            bytes: build_text_boxes_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec![
+                        format!("Intro \u{FFFC}{TB_PROSE}"),
+                        format!("\u{FFFC}{TB_ARABIC}"),
+                    ],
                 },
                 roundtrip: RoundtripBounds::default(),
             },

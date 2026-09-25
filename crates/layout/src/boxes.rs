@@ -224,6 +224,56 @@ pub enum TabLeaderKind {
 /// Issue #69 — the floating-object payload a sentinel glyph carries into
 /// pagination. Sizes are layout px (already scaled); the positioning
 /// spec is frame-relative and resolved once the anchor's page is known.
+/// Issue #83 — the text box a float sentinel carries: the story (shared,
+/// laid out after pagination into [`TextBoxFrame::blocks`] at the box's
+/// inner width), the shape's paint + inset geometry in layout px, and a
+/// content `key` (a hash of the story + shape) that stands in for the
+/// story in equality — two glyphs with equal keys paint the same box.
+#[derive(Debug, Clone)]
+pub struct TextBoxGlyph {
+    pub story: std::sync::Arc<engine::TextBoxStory>,
+    pub key: u64,
+    /// `[left, top, right, bottom]` insets in layout px.
+    pub insets: [f32; 4],
+    pub v_align: engine::TextBoxVAlign,
+    pub fill: Option<[u8; 4]>,
+    /// Outline colour + stroke width (layout px).
+    pub outline: Option<([u8; 4], f32)>,
+    /// `true` for a `<wp:inline>` text box: the sentinel reserves the
+    /// box's width and grows the line, and the box paints at the glyph.
+    pub inline: bool,
+}
+
+impl PartialEq for TextBoxGlyph {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.insets == other.insets
+            && self.v_align == other.v_align
+            && self.fill == other.fill
+            && self.outline == other.outline
+            && self.inline == other.inline
+    }
+}
+
+/// Issue #83 — a positioned text box: its [`TextBoxGlyph`] plus the laid
+/// out story. `blocks` origins are relative to the box's CONTENT rect
+/// (the float rect inset by `source.insets`), with the vertical-anchor
+/// offset already folded into each block's `origin.y` — the renderer is
+/// a pure traversal. Lines past the content rect are clipped at paint.
+#[derive(Debug, Clone)]
+pub struct TextBoxFrame {
+    pub source: TextBoxGlyph,
+    pub blocks: Vec<LayoutBlock>,
+}
+
+impl PartialEq for TextBoxFrame {
+    /// The laid-out blocks are a pure function of `source` and the box
+    /// width, so the source decides equality.
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FloatGlyph {
     /// Archive relationship id of the image blob to paint.
@@ -235,6 +285,8 @@ pub struct FloatGlyph {
     /// Issue #82 — the wrap contract (kind, side, distances, polygon)
     /// the page assembler turns into line cutouts.
     pub wrap: FloatWrap,
+    /// Issue #83 — `Some` when the floating object is a text box.
+    pub text_box: Option<Box<TextBoxGlyph>>,
 }
 
 /// Issue #69 — one positioning axis of a float in layout units. Mirrors
@@ -316,6 +368,28 @@ pub struct FloatBox {
     /// the wrap plan (`crate::wrap::derive_plan`) can register this
     /// object's cutouts against every paragraph it overlaps.
     pub wrap: FloatWrap,
+    /// Issue #83 — the text box this float is (`None` for a picture).
+    pub text_box: Option<Box<TextBoxFrame>>,
+}
+
+impl FloatBox {
+    /// Issue #83 — page-relative top-left and size of a text box's
+    /// content rect (the float rect inset by the shape's insets). `None`
+    /// for a picture.
+    pub fn text_box_content_rect(&self) -> Option<(Point, Size)> {
+        let tb = self.text_box.as_deref()?;
+        let [l, t, r, b] = tb.source.insets;
+        Some((
+            Point {
+                x: self.origin.x + l,
+                y: self.origin.y + t,
+            },
+            Size {
+                width: (self.size.width - l - r).max(0.0),
+                height: (self.size.height - t - b).max(0.0),
+            },
+        ))
+    }
 }
 
 /// A maximal run of glyphs sharing one font, direction, and style — the unit
@@ -574,12 +648,14 @@ pub struct TableRowBox {
     /// continues onto after a split. Header rows still pay their own
     /// budget on the original page.
     pub header: bool,
-    /// Audit gap C.M2 — `<w:trPr><w:cantSplit/>` toggle. Issue #91: the
-    /// paginator moves every row that fits a page whole to the next page
-    /// (no mid-row split below the page height); a row taller than a
-    /// whole page continues cell-by-cell on the next page — unless this
-    /// flag is set, in which case it is placed atomically and clips
-    /// (`DegradeReason::OversizeLine`), Word's reading of the flag.
+    /// Audit gap C.M2 — `<w:trPr><w:cantSplit/>` toggle. Issue #155: a
+    /// row that does not fit the rest of the page is cut at a line
+    /// boundary (Word's default "allow row to break across pages") unless
+    /// this flag is set — then it moves whole to the next page; a flagged
+    /// row taller than a whole page is placed atomically and clips
+    /// (`DegradeReason::OversizeLine`, issue #91), Word's reading of the
+    /// flag. The layout pass also sets it for `<w:trHeight
+    /// w:hRule="exact">` rows: an exact-height row never breaks.
     pub cant_split: bool,
     /// Issue #91 — index of the model row (`engine::Table::rows`) this
     /// box renders. Equal to the row's position in an unsplit table; a
