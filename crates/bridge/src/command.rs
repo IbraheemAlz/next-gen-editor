@@ -304,13 +304,17 @@ pub enum Command {
     SetViewport {
         rect: Rect,
     },
+    /// Issue #239 — sent before the engine's first `RenderPage`, this is
+    /// queued (`Event::ZoomPending`) rather than dropped; `RenderPage`
+    /// composes it into the fresh layout config it builds.
     SetZoom {
         scale: f32,
     },
     /// Post-boot devicePixelRatio change (monitor move / browser zoom).
     /// Replaces the boot device scale (`devicePixelRatio × 4/3`) and
     /// recomposes the effective scale with the user zoom untouched —
-    /// unlike `SetZoom`, which owns the user-zoom factor.
+    /// unlike `SetZoom`, which owns the user-zoom factor. Issue #239 —
+    /// same pre-`RenderPage` queuing as `SetZoom`.
     SetDeviceScale {
         scale: f32,
     },
