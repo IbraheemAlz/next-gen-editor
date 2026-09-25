@@ -66,9 +66,16 @@ The `tools/roundtrip/` harness asserts:
   content. A fragment relying on a prefix bound only on an intermediate
   ancestor is dropped at capture (`grab_bag::bound_by_root`) rather than
   written unbound.
-- **Two save paths (issue #100).** The live editor saves through
-  `build_minimal_docx(&DocumentTree)` (engine-wasm `SaveDocx` /
-  `SaveDocument`) — it has no `DocxArchive`. So the reader ALSO records the
+- **Two save paths (issues #100 / #134).** The live editor (engine-wasm
+  `SaveDocx` / `SaveDocument`) has no `DocxArchive`; it calls
+  `format_docx::save_docx(&DocumentTree)`. A tree read from `.docx`
+  carries its source package (`DocumentTree::source_package`, every
+  non-`document.xml` entry, shared by every undo state via `Arc`, persisted
+  once per crash-recovery snapshot with media parts by reference to
+  `DocumentTree::media`), so `save_docx` rebuilds the archive and goes
+  through `write_docx` — siblings byte-identical, new pictures get media
+  parts + rels + content-type defaults (#135, `media_plan.rs`). Only an
+  engine-authored tree (no package) falls back to `build_minimal_docx`. So the reader ALSO records the
   roots on the tree: `DocumentTree::document_root_attrs` (document + header/
   footer roots) and `DocumentTree::part_root_attrs` (per-entry, e.g. note
   parts whose root binds prefixes the document root does not). Any part a

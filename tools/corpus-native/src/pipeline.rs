@@ -113,6 +113,17 @@ pub struct DocResult {
     pub pdf_pages: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_check: Option<EditCheck>,
+    /// Issue #134 — the live editor's save path (`format_docx::save_docx`,
+    /// what engine-wasm `SaveDocx` / `SaveDocument` call with the tree
+    /// alone, using its retained `source_package`): every source sibling
+    /// entry re-emitted byte-identical, none dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_save_siblings_identical: Option<bool>,
+    /// Issue #134 — the UI-path save is byte-identical to the harness
+    /// path (`write_docx` against the source archive), for the zero-edit
+    /// save and — with the scripted edit — the edited one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_save_matches_write_docx: Option<bool>,
 }
 
 impl DocResult {
@@ -142,6 +153,8 @@ impl DocResult {
             pdf_bytes_len: None,
             pdf_pages: None,
             edit_check: None,
+            ui_save_siblings_identical: None,
+            ui_save_matches_write_docx: None,
         }
     }
 
@@ -382,6 +395,21 @@ pub fn run_one(
     rec.page_count_after = Some(pages_b.len());
     rec.page_count_stable = Some(pages_b.len() == pages_a.len());
 
+    /* 6e. Issue #134 — the UI save path. The live editor holds only the
+    tree; `save_docx` must find the retained source package on it and
+    write through `write_docx`, not synthesize a minimal package. */
+    let ui_bytes: Vec<u8> = stage!(
+        "ui_save_noedit",
+        format_docx::save_docx(&archive_a.document)
+    );
+    stage!(
+        "ui_save_wellformed",
+        format_docx::check_document_xml_well_formed(&ui_bytes)
+    );
+    rec.ui_save_matches_write_docx = Some(ui_bytes == resaved_bytes);
+    let archive_ui: DocxArchive = stage!("ui_save_reread", format_docx::read_docx(&ui_bytes));
+    rec.ui_save_siblings_identical = Some(compare_siblings(&archive_a, &archive_ui).0);
+
     /* 7. Optional scripted edit + the round-trip harness's ≤2×N bound
     (`.claude/rules/docx.md`). Mirrors `tools/roundtrip`'s default-mode
     check: edit the FIRST parse, save, compare `document.xml` against the
@@ -396,6 +424,11 @@ pub fn run_one(
             "edit_write_docx",
             format_docx::write_docx(&archive_a, &edited_doc)
         );
+        /* Issue #134 — the UI path writes the same edited file. */
+        let ui_edited: Vec<u8> = stage!("ui_save_edit", format_docx::save_docx(&edited_doc));
+        if ui_edited != edited_bytes {
+            rec.ui_save_matches_write_docx = Some(false);
+        }
         /* Issue #110 — same strict guard on the edited save. */
         stage!(
             "wellformed_edit",

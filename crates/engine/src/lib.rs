@@ -69,7 +69,7 @@ pub use fields::{
     FieldEnv, FieldInstruction, FieldSite, FieldStory, FieldSwitch, PageContext, TocSwitches,
     TypedField, render_date_time_picture,
 };
-pub use package::{PackageEntry, SourcePackage};
+pub use package::{MediaRef, PackageEntry, SourcePackage};
 pub use toc::{TocEntry, TocHeading};
 
 /// Top-level document block (Phase 5 PR 1). Tables sit alongside
@@ -301,10 +301,7 @@ pub struct DocumentTree {
     /// save byte-identical. `None` for an engine-authored document (saved
     /// through the minimal-package writer). Shared by every undo state via
     /// the `Arc`; never mutated after open.
-    #[serde(
-        with = "package::arc_option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(with = "package::arc_option", skip_serializing_if = "Option::is_none")]
     pub source_package: Option<std::sync::Arc<SourcePackage>>,
 }
 

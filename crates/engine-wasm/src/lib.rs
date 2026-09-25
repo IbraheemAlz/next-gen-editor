@@ -7266,17 +7266,21 @@ impl Engine {
 
     /// Issue #85 — assemble the session state the snapshot persists.
     fn capture_snapshot(&self) -> EngineSnapshotV1 {
-        let (mut doc_history, undo_cursor) =
-            self.undo.history_window(self.snapshot_undo_entries());
+        let (mut doc_history, undo_cursor) = self.undo.history_window(self.snapshot_undo_entries());
         /* Issue #134 — the package rides the envelope once, not once per
         undo entry (the entries share one `Arc`). */
-        let source_package = doc_history
-            .get(undo_cursor)
-            .and_then(|d| d.source_package.clone());
+        let current = doc_history.get(undo_cursor);
+        let source_package = current.and_then(|d| d.source_package.clone());
+        /* Media parts ride by reference to the current entry's `media`
+        (the same bytes) — see `engine::package`'s snapshot-size notes. */
+        let persisted_package = current.and_then(|d| {
+            d.source_package
+                .as_ref()
+                .map(|p| Arc::new(p.deduplicated_against(&d.media)))
+        });
         if let Some(pkg) = &source_package {
             for d in &mut doc_history {
-                if d
-                    .source_package
+                if d.source_package
                     .as_ref()
                     .is_some_and(|p| Arc::ptr_eq(p, pkg) || **p == **pkg)
                 {
@@ -7285,7 +7289,7 @@ impl Engine {
             }
         }
         EngineSnapshotV1 {
-            source_package,
+            source_package: persisted_package,
             doc_history,
             undo_cursor: undo_cursor as u32,
             selection: self.selection.clone(),
@@ -7322,7 +7326,14 @@ impl Engine {
     fn restore_snapshot(&mut self, mut s: EngineSnapshotV1) {
         /* Issue #134 — re-attach the once-persisted source package to every
         history entry (see `EngineSnapshotV1::source_package`). */
-        if let Some(pkg) = &s.source_package {
+        /* Media entries were persisted by reference to the current
+        entry's `media`; an unresolvable reference drops the package (the
+        session then saves through the minimal-package writer). */
+        let package = s.source_package.take().and_then(|p| {
+            let media = &s.doc_history.get(s.undo_cursor as usize)?.media;
+            p.rehydrated_from(media).map(Arc::new)
+        });
+        if let Some(pkg) = &package {
             for d in &mut s.doc_history {
                 if d.source_package.is_none() {
                     d.source_package = Some(pkg.clone());
@@ -23143,7 +23154,11 @@ mod snapshot_tests {
         session writes the identical file. */
         let mut b = engine();
         b.restore_from_bytes(&e.snapshot_bytes().unwrap()).unwrap();
-        assert_eq!(ui_save(&mut b), bytes, "recovered session saves the same file");
+        assert_eq!(
+            ui_save(&mut b),
+            bytes,
+            "recovered session saves the same file"
+        );
     }
 
     /// Issues #134 / #135 — a picture inserted through the UI command into
@@ -23183,7 +23198,11 @@ mod snapshot_tests {
                 "word/media/image3.gif"
             ]
         );
-        for name in ["word/media/image1.png", "word/media/image2.png", "word/styles.xml"] {
+        for name in [
+            "word/media/image1.png",
+            "word/media/image2.png",
+            "word/styles.xml",
+        ] {
             let a = source.iter().find(|(n, _)| n == name).unwrap();
             let b = out.iter().find(|(n, _)| n == name).unwrap();
             assert_eq!(a.1, b.1, "{name}");
@@ -23216,7 +23235,11 @@ mod snapshot_tests {
 
         let mut b = engine();
         b.restore_from_bytes(&bytes).unwrap();
-        assert_eq!(b.snapshot_bytes().unwrap(), bytes, "byte-stable re-snapshot");
+        assert_eq!(
+            b.snapshot_bytes().unwrap(),
+            bytes,
+            "byte-stable re-snapshot"
+        );
         apply(&mut b, Command::Undo);
         let doc = b.undo.current();
         let pkg = doc.source_package.as_ref().expect("package re-attached");
@@ -23230,23 +23253,25 @@ mod snapshot_tests {
     /// fixture (the corpus numbers are in the PR report).
     #[test]
     fn snapshot_cost_with_the_source_package_reference() {
-        for (label, fixture) in [
+        let mut fixtures: Vec<(String, Vec<u8>)> = vec![
             (
-                "50p.docx",
-                include_bytes!("../../../tests/perf/50p.docx").as_slice(),
+                "50p.docx".into(),
+                include_bytes!("../../../tests/perf/50p.docx").to_vec(),
             ),
-            ("word_package_parts.docx", PACKAGE_FIXTURE),
-            ("saut", Box::leak(std::fs::read("/data/corpus/files/apache-poi-test-data-document/saut_page.docx").unwrap().into_boxed_slice())),
-            ("fontemb", Box::leak(std::fs::read("/data/corpus/files/docx4j-sample-docs/FontEmbedded.docx").unwrap().into_boxed_slice())),
-            ("tables", Box::leak(std::fs::read("/data/corpus/files/docx4j-sample-docs/tables.docx").unwrap().into_boxed_slice())),
-        ] {
+            ("word_package_parts.docx".into(), PACKAGE_FIXTURE.to_vec()),
+        ];
+        /* Optional: `NGE_SNAPSHOT_COST_DOCX=a.docx:b.docx` adds real
+        documents (media-heavy corpus files) to the report. */
+        if let Ok(list) = std::env::var("NGE_SNAPSHOT_COST_DOCX") {
+            for path in list.split(':').filter(|p| !p.is_empty()) {
+                if let Ok(bytes) = std::fs::read(path) {
+                    fixtures.push((path.to_string(), bytes));
+                }
+            }
+        }
+        for (label, fixture) in fixtures {
             let mut e = engine();
-            let evt = apply(
-                &mut e,
-                Command::LoadDocx {
-                    bytes: fixture.to_vec(),
-                },
-            );
+            let evt = apply(&mut e, Command::LoadDocx { bytes: fixture });
             assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
             let t0 = std::time::Instant::now();
             let with = e.snapshot_bytes().unwrap();

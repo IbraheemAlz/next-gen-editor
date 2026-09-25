@@ -289,6 +289,7 @@ fn run_default() -> Result<()> {
     run_table_jc_tblind_roundtrip()?;
     run_body_passthrough_roundtrip()?;
     run_package_media_insert()?;
+    run_package_ui_save()?;
 
     println!("\nPASS");
     Ok(())
@@ -2971,6 +2972,121 @@ fn zip_entries(docx: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 /// parts (the originals byte-identical), a new image relationship whose id
 /// collides with no rels part, a `<Default>` for the new extension, every
 /// other sibling byte-identical, and the re-read resolves all three.
+/// Issue #134 — step 22: the live editor's save path. engine-wasm
+/// `SaveDocx` / `SaveDocument` hold only the tree and call
+/// `format_docx::save_docx`; the tree must carry its source package (and
+/// keep it through the crash-recovery snapshot codec), so a UI save of an
+/// opened Word package re-emits every sibling part byte-identical, every
+/// `headerReference` / `footerReference` resolves, and the file is the
+/// same one the harness path (`write_docx` with the archive) writes. An
+/// engine-authored document still saves through `build_minimal_docx`.
+fn run_package_ui_save() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+    let fixture = build_word_package_parts_docx();
+    let archive = read_docx(&fixture).context("read word_package_parts")?;
+    if archive.document.source_package.is_none() {
+        bail!("step 22: the opened tree does not retain its source package");
+    }
+    /* The crash-recovery snapshot envelope round-trips the package. */
+    let snap = engine::snapshot::encode(&archive.document).context("snapshot encode")?;
+    let restored: DocumentTree = engine::snapshot::decode(&snap)
+        .context("snapshot decode")?
+        .payload;
+    if restored.source_package != archive.document.source_package {
+        bail!("step 22: snapshot lost the source package");
+    }
+    let para = restored.nth_paragraph(4).context("paragraph 4")?;
+    let edited = restored.insert_text(
+        LogicalPos {
+            path: BlockPath::top(4),
+            offset: para.text.len() as u32,
+        },
+        INSERT_TEXT,
+    );
+    let ui = format_docx::save_docx(&edited).context("UI-path save")?;
+    if ui != write_docx(&archive, &edited).context("harness save")? {
+        bail!("step 22: UI-path save differs from write_docx with the archive");
+    }
+    format_docx::check_document_xml_well_formed(&ui).context("well-formed document.xml")?;
+    let source = zip_entries(&fixture)?;
+    let out = zip_entries(&ui)?;
+    for (name, bytes) in &source {
+        if name == "word/document.xml" {
+            continue;
+        }
+        match out.iter().find(|(n, _)| n == name) {
+            Some((_, b)) if b == bytes => {}
+            Some(_) => bail!("step 22: sibling {name} not byte-identical"),
+            None => bail!("step 22: UI save dropped {name}"),
+        }
+        if name.ends_with(".xml") {
+            format_docx::check_part_xml_well_formed(&ui, name)
+                .with_context(|| format!("step 22: {name} well-formed"))?;
+        }
+    }
+    if out.len() != source.len() {
+        bail!(
+            "step 22: {} entries saved, {} in the source",
+            out.len(),
+            source.len()
+        );
+    }
+    let reread = read_docx(&ui).context("re-read")?;
+    let rels = format_docx::parts::rels::parse_rels_xml(
+        reread
+            .part_by_name("word/_rels/document.xml.rels")
+            .context("rels")?,
+    )
+    .context("rels parse")?;
+    let mut refs = 0;
+    for s in reread.document.effective_sections() {
+        for rid in [
+            &s.header_refs.default,
+            &s.header_refs.first,
+            &s.header_refs.even,
+            &s.footer_refs.default,
+            &s.footer_refs.first,
+            &s.footer_refs.even,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let target = rels
+                .get(rid)
+                .with_context(|| format!("step 22: {rid} unresolved"))?;
+            let entry = format_docx::parts::rels::resolve_target(target);
+            if reread.part_by_name(&entry).is_none() {
+                bail!("step 22: {rid} points at missing part {entry}");
+            }
+            refs += 1;
+        }
+    }
+    if refs != 2 {
+        bail!("step 22: expected a header + a footer reference, found {refs}");
+    }
+    let delta = extract_doc_xml(&ui)?
+        .len()
+        .abs_diff(extract_doc_xml(&fixture)?.len());
+    if delta > 2 * INSERT_TEXT.len() {
+        bail!(
+            "step 22: document.xml delta {delta} B > 2 x {}",
+            INSERT_TEXT.len()
+        );
+    }
+    /* From scratch: no package, the minimal-package writer. */
+    let fresh = DocumentTree::from_paragraphs(["fresh".to_string()]);
+    if format_docx::save_docx(&fresh).context("fresh save")?
+        != build_minimal_docx(&fresh).context("minimal")?
+    {
+        bail!("step 22: an engine-authored document must save through build_minimal_docx");
+    }
+    println!(
+        "[roundtrip] step 22 OK — UI-path save keeps {} sibling parts byte-identical, {refs} header/footer refs resolve, Δ {delta} B",
+        source.len() - 1
+    );
+    Ok(())
+}
+
 fn run_package_media_insert() -> Result<()> {
     use engine::{BlockPath, ImageBlob, InlineKind, LogicalPos};
     let fixture = build_word_package_parts_docx();
