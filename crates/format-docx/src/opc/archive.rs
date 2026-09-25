@@ -210,7 +210,26 @@ impl DocxArchive {
 }
 
 /// Read a `.docx` byte blob → parsed document + stashed sibling entries.
+/// Fallback page geometry for a `<w:sectPr>` missing `<w:pgSz>` is A4 —
+/// see [`read_docx_with_settings`] to override it.
 pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
+    read_docx_with_settings(bytes, engine::DefaultPageSize::default())
+}
+
+/// [`read_docx`], with a host-chosen [`engine::DefaultPageSize`] fallback
+/// for any `<w:sectPr>` that omits `<w:pgSz>` (issue #109 — ECMA-376
+/// requires `pgSz`, but the Apache POI / docx4j "wild document" corpus
+/// ships files that skip it; `read_docx` itself always resolves those to
+/// A4, unchanged, so every pinned `layout::geometry_fingerprint` fixture
+/// keeps its geometry). An embedding host that defaults new/underspecified
+/// documents to US Letter calls this directly with
+/// `engine::DefaultPageSize::Letter`. The choice is stamped onto
+/// `DocumentTree.settings.default_page_size` for inspection — it is never
+/// read FROM the archive, since OOXML has no such element.
+pub fn read_docx_with_settings(
+    bytes: &[u8],
+    default_page_size: engine::DefaultPageSize,
+) -> Result<DocxArchive, DocxError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
     let mut other_entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut document_xml: Option<Vec<u8>> = None;
@@ -242,7 +261,13 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     };
     let resolver = StyleResolver::new(&style_table);
     let mut warnings: Vec<DocxWarning> = Vec::new();
-    let mut document = parse_document_xml_with_warnings(&xml, &resolver, &mut warnings)?;
+    let mut document = parse_document_xml_with_warnings(
+        &xml,
+        &resolver,
+        &mut warnings,
+        default_page_size.geometry(),
+    )?;
+    document.settings.default_page_size = default_page_size;
 
     /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
     numbering resolver. Second pass over the parsed paragraphs fills each
