@@ -1054,12 +1054,19 @@ mod tests {
         let mut alpha = vec![255u8; 8];
         alpha.extend([0u8; 8]);
         assert_eq!(soft.alpha, Some(alpha));
-        assert!(near(&soft.data[0..3], [40, 40, 200]), "{:?}", &soft.data[0..3]);
+        assert!(
+            near(&soft.data[0..3], [40, 40, 200]),
+            "{:?}",
+            &soft.data[0..3]
+        );
 
         let flat = prepare_image(&data, "", AlphaMode::FlattenOnWhite, false).unwrap();
         assert!(flat.alpha.is_none());
         assert!(near(&flat.data[0..3], [40, 40, 200]));
-        assert!(flat.data[24..].iter().all(|&v| v == 255), "clear rows → white");
+        assert!(
+            flat.data[24..].iter().all(|&v| v == 255),
+            "clear rows → white"
+        );
     }
 
     /// Fuzz-style robustness: every truncation, plus deterministic byte
@@ -1079,7 +1086,17 @@ mod tests {
         #[cfg(feature = "gif")]
         {
             fixtures.push(gif_3x2_transparent());
-            fixtures.push(test_images::gif(4, 3, &GIF_PALETTE, 1, 1, 2, 1, &[0, 1], None));
+            fixtures.push(test_images::gif(
+                4,
+                3,
+                &GIF_PALETTE,
+                1,
+                1,
+                2,
+                1,
+                &[0, 1],
+                None,
+            ));
         }
         #[cfg(feature = "webp")]
         fixtures.push(test_images::webp_lossless_rgba(3, 2, &WEBP_PX));
@@ -1132,7 +1149,12 @@ mod tests {
     #[test]
     fn webp_without_the_feature_is_an_unsupported_format() {
         assert_eq!(
-            prepare_image(&test_images::WEBP_LOSSY_4X4_RED, "", AlphaMode::SoftMask, false),
+            prepare_image(
+                &test_images::WEBP_LOSSY_4X4_RED,
+                "",
+                AlphaMode::SoftMask,
+                false
+            ),
             Err(ImageSkipReason::UnsupportedFormat { format: "WebP" })
         );
     }
