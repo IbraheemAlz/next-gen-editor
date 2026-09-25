@@ -284,6 +284,7 @@ fn run_default() -> Result<()> {
     run_wrap_modes_roundtrip()?;
     run_toc_roundtrip()?;
     run_text_boxes_roundtrip()?;
+    run_nested_text_boxes_roundtrip()?;
     run_rtl_table_roundtrip()?;
     run_table_jc_tblind_roundtrip()?;
     run_body_passthrough_roundtrip()?;
@@ -1162,6 +1163,191 @@ fn text_boxes_document_xml() -> String {
         prose = TB_PROSE,
         arabic = TB_ARABIC
     )
+}
+
+/* ============================================ nested text boxes (#196) ==== */
+
+const TBN_OUTER: &str = "Outer story text.";
+const TBN_INNER: &str = "Inner story text.";
+
+/// Issue #196 fixture: a page-anchored 3" × 2" text box (at 1", 3" on
+/// the page) whose story hosts a second, nested 1.5" × 0.6" box placed
+/// 1" right / 0.5" down inside the outer box's content rect. Both are
+/// bare `<w:drawing>` shapes; every paragraph is in the writer's
+/// canonical shape so an edited nested story regenerates byte-identical
+/// modulo the edit. The e2e spec `ts/e2e/nested-text-box.spec.ts`
+/// clicks into the nested box by this geometry.
+fn nested_text_boxes_document_xml() -> String {
+    let drawing = |x: i64, y: i64, cx: i64, cy: i64, id: u32, story: &str| {
+        format!(
+            concat!(
+                r#"<w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="{id}" "#,
+                r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>"#,
+                r#"<wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH>"#,
+                r#"<wp:positionV relativeFrom="page"><wp:posOffset>{y}</wp:posOffset></wp:positionV>"#,
+                r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+                r#"<wp:wrapSquare wrapText="bothSides"/><wp:docPr id="{id}" name="Text Box {id}"/>"#,
+                r#"<wp:cNvGraphicFramePr/>"#,
+                r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+                r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>"#,
+                r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#,
+                r#"<a:ln w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></wps:spPr>"#,
+                r#"<wps:txbx><w:txbxContent>{story}</w:txbxContent></wps:txbx>"#,
+                r#"<wps:bodyPr rot="0" vert="horz" wrap="square" lIns="91440" tIns="45720" rIns="91440" bIns="45720" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>"#,
+                r#"</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>"#,
+            ),
+            x = x,
+            y = y,
+            cx = cx,
+            cy = cy,
+            id = id,
+            story = story
+        )
+    };
+    let inner_story =
+        format!(r#"<w:p><w:r><w:t xml:space="preserve">{TBN_INNER}</w:t></w:r></w:p>"#);
+    let inner = drawing(914_400, 457_200, 1_371_600, 548_640, 2, &inner_story);
+    let outer_story = format!(
+        concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">{outer}</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r>{inner}</w:r><w:r><w:t xml:space="preserve">Nested host.</w:t></w:r></w:p>"#,
+        ),
+        outer = TBN_OUTER,
+        inner = inner
+    );
+    let outer = drawing(914_400, 2_743_200, 2_743_200, 1_828_800, 1, &outer_story);
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+            r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+            r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+            r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            "<w:body>",
+            r#"<w:p><w:r><w:t xml:space="preserve">Intro paragraph.</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r>{outer}</w:r><w:r><w:t xml:space="preserve">Host paragraph.</w:t></w:r></w:p>"#,
+            "<w:sectPr/></w:body></w:document>",
+        ),
+        outer = outer
+    )
+}
+
+/// Issue #196 fixture builder. Rides the `--fixtures` passthrough at
+/// drift 0, the default harness's nested step and the e2e spec.
+fn build_nested_text_boxes_docx() -> Vec<u8> {
+    package_document_xml(&nested_text_boxes_document_xml())
+}
+
+/// Issue #196 — the nested text-box round-trip contract: (a) the outer
+/// box and the box nested in its story both parse (two levels); (b) a
+/// zero-edit save is byte-identical; (c) typing into the NESTED story
+/// through the engine's nested write path (outer story tree →
+/// `with_updated_text_box(inner)` → `with_updated_text_box(outer)`)
+/// regenerates ONLY the nested story paragraph — the whole part equals
+/// the source plus the inserted text; (d) the edit re-reads.
+fn run_nested_text_boxes_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos};
+
+    let fixture = build_nested_text_boxes_docx();
+    let archive = read_docx(&fixture).context("read nested text-box fixture")?;
+    let doc = &archive.document;
+    let outer_addr = (BlockPath::top(1), 0u32);
+    let inner_addr = (BlockPath::top(1), 0u32);
+    let nested_text = |d: &DocumentTree| -> Option<String> {
+        let outer = d.text_box_at(&outer_addr.0, outer_addr.1)?;
+        let tree = DocumentTree::from_blocks(outer.body.clone());
+        let inner = tree.text_box_at(&inner_addr.0, inner_addr.1)?;
+        inner
+            .body
+            .first()
+            .and_then(engine::Block::as_paragraph)
+            .map(|p| p.text.clone())
+    };
+    if doc.text_box_addresses() != vec![outer_addr.clone()] {
+        bail!(
+            "nested text-box fixture: expected one body box at {outer_addr:?}, got {:?}",
+            doc.text_box_addresses()
+        );
+    }
+    if nested_text(doc).as_deref() != Some(TBN_INNER) {
+        bail!("nested text-box fixture: the nested story parsed wrongly");
+    }
+    println!("[roundtrip] step 20a OK — a box nested in a box's story parses (two levels)");
+
+    let src = String::from_utf8(extract_doc_xml(&fixture)?).context("utf8 source")?;
+    let zero = write_docx(&archive, doc).context("zero-edit write")?;
+    if String::from_utf8(extract_doc_xml(&zero)?).context("utf8 zero")? != src {
+        bail!("nested text-box fixture: zero-edit save drifted");
+    }
+    println!("[roundtrip] step 20b OK — zero-edit save is byte-identical");
+
+    /* (c) Type into the nested story exactly like the engine's nested
+    story adapter (`write_text_box_story`) does. */
+    let outer = doc
+        .text_box_at(&outer_addr.0, outer_addr.1)
+        .context("outer box")?;
+    let outer_tree = DocumentTree::from_blocks(outer.body.clone());
+    let inner = outer_tree
+        .text_box_at(&inner_addr.0, inner_addr.1)
+        .context("nested box")?;
+    let typed = DocumentTree::from_blocks(inner.body.clone()).insert_text(
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: 0,
+        },
+        INSERT_TEXT,
+    );
+    let outer_edited = outer_tree.with_updated_text_box(
+        &inner_addr.0,
+        inner_addr.1,
+        typed.blocks.iter().cloned().collect(),
+    );
+    let edited = doc.with_updated_text_box(
+        &outer_addr.0,
+        outer_addr.1,
+        outer_edited.blocks.iter().cloned().collect(),
+    );
+    let bytes = write_docx(&archive, &edited).context("write edited nested text box")?;
+    assert_document_xml_well_formed(&bytes).context("edited nested text-box .docx")?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+    let needle = format!(r#"<w:t xml:space="preserve">{TBN_INNER}</w:t>"#);
+    let want = src.replace(
+        &needle,
+        &format!(r#"<w:t xml:space="preserve">{INSERT_TEXT}{TBN_INNER}</w:t>"#),
+    );
+    if src.matches(&needle).count() != 1 || out != want {
+        bail!(
+            "nested text-box fixture: edited save is not source + edit\n--- expected ---\n{want}\n--- got ---\n{out}"
+        );
+    }
+    let drift = out.len() - src.len();
+    if drift > 2 * INSERT_TEXT.len() {
+        bail!("nested text-box fixture: drift {drift} B exceeds the bound");
+    }
+    println!(
+        "[roundtrip] step 20c OK — a nested story edit splices only the nested story (Δ {drift} B)"
+    );
+
+    let reread = read_docx(&bytes).context("re-read edited nested text box")?;
+    if nested_text(&reread.document) != Some(format!("{INSERT_TEXT}{TBN_INNER}")) {
+        bail!("nested text-box fixture: the nested edit did not re-read");
+    }
+    let outer_text = reread
+        .document
+        .text_box_at(&outer_addr.0, outer_addr.1)
+        .and_then(|s| {
+            s.body
+                .first()
+                .and_then(engine::Block::as_paragraph)
+                .map(|p| p.text.clone())
+        });
+    if outer_text.as_deref() != Some(TBN_OUTER) {
+        bail!("nested text-box fixture: the outer story changed ({outer_text:?})");
+    }
+    println!("[roundtrip] step 20d OK — the nested edit re-reads, the outer story untouched");
+    Ok(())
 }
 
 /// Issue #83 fixture builder. Rides the `--fixtures` passthrough at
@@ -3118,6 +3304,25 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_texts: vec![
                         format!("Intro \u{FFFC}{TB_PROSE}"),
                         format!("\u{FFFC}{TB_ARABIC}"),
+                    ],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
+        /* Issue #196 — a text box nested in a text box's story.
+        Passthrough at drift 0; the default harness's step 20 edits the
+        nested story; the e2e spec clicks into it. */
+        PrebuiltFixture {
+            name: "text_boxes_nested.docx",
+            bytes: build_nested_text_boxes_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec![
+                        "Intro paragraph.".into(),
+                        "\u{FFFC}Host paragraph.".into(),
                     ],
                 },
                 roundtrip: RoundtripBounds::default(),
