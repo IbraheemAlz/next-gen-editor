@@ -15010,11 +15010,19 @@ impl Engine {
     }
 
     /// Sprint 9 — serialize the current document to a standalone HTML5
-    /// blob via `format_html::to_html`. `String::into_bytes()` consumes
-    /// the buffer in place — no extra copy crossing the wasm bridge;
-    /// the resulting `Vec<u8>` flows back to TS as a single `Uint8Array`.
+    /// blob via `format_html::to_html_with_note_markers`. `String::
+    /// into_bytes()` consumes the buffer in place — no extra copy
+    /// crossing the wasm bridge; the resulting `Vec<u8>` flows back to TS
+    /// as a single `Uint8Array`. Issue #226 — footnote/endnote labels use
+    /// the PAINTED per-page markers when a live layout snapshot exists
+    /// (`painted_note_markers`, the same source `build_a11y_nodes` reads),
+    /// so an each-page-restart numbering scheme exports the number the
+    /// page actually shows; without a snapshot this falls back to the
+    /// plain document-order labels, exactly `format_html::to_html`.
     fn save_html_bytes(&self) -> Event {
-        let html = format_html::to_html(self.undo.current());
+        let doc = self.undo.current();
+        let markers = self.painted_note_markers(doc);
+        let html = format_html::to_html_with_note_markers(doc, &markers);
         let bytes = html.into_bytes();
         let size = bytes.len() as u32;
         Event::DocumentSaved { bytes, size }
