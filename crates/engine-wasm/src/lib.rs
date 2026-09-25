@@ -347,6 +347,16 @@ struct LazyLayoutInfo {
     /// raised below `build_pages` (paragraph-cache verifier, autofit
     /// solver, verified fast path). Forwarded on `Event::Painted`.
     degradations: Vec<LayoutDegraded>,
+    /// Issue #93 — index of the first PROVISIONAL page of a culled band:
+    /// the page that was in progress when the cull stopped inside a
+    /// multi-column section whose next section starts continuously. That
+    /// section's columns are balanced only when the paginator reaches the
+    /// next section (L2.3, #8), so the page is laid out unbalanced here
+    /// and balanced in any band that gets further; pages from this index
+    /// on are excluded from the verified prefix (`layout::
+    /// verify_prefix_open`). `None` — every page is final (up to the
+    /// usual partial last page).
+    open_from_page: Option<usize>,
 }
 
 thread_local! {
@@ -6772,12 +6782,15 @@ impl Engine {
             snap.as_ref()
                 .filter(|s| same_layout_inputs(s) && !s.info.is_full_layout)
                 .and_then(|prev| {
-                    let (shorter, longer) = if prev.pages.len() <= pages.len() {
-                        (&prev.pages[..], &pages[..])
+                    /* Issue #93 — the shorter band's provisional pages
+                    (a pending column balance) are not part of the
+                    prediction. */
+                    let (shorter, longer, open_from) = if prev.pages.len() <= pages.len() {
+                        (&prev.pages[..], &pages[..], prev.info.open_from_page)
                     } else {
-                        (&pages[..], &prev.pages[..])
+                        (&pages[..], &prev.pages[..], info.open_from_page)
                     };
-                    layout::verify_prefix(shorter, longer).err()
+                    layout::verify_prefix_open(shorter, longer, open_from).err()
                 })
         };
         if let Some(m) = mismatch {
@@ -7172,6 +7185,8 @@ impl Engine {
             target_y.map(|y| y + runway)
         };
         let mut culled = false;
+        /* Issue #93 — see `LazyLayoutInfo::open_from_page`. */
+        let mut open_from_page: Option<usize> = None;
         /* Issue #95 — the last body block pushed was a keep-with-next
         paragraph (see the cull stop below). */
         let mut after_keep_next = false;
@@ -7413,6 +7428,20 @@ impl Engine {
                     });
                     if height_so_far(&emitted_pages, pag_h) >= budget {
                         culled = true;
+                        /* Issue #93 — stopping inside a multi-column
+                        section that a continuous section follows leaves
+                        its balance pass pending: the in-progress page is
+                        provisional. */
+                        let balance_pending = section.columns.is_multi()
+                            && sections.get(sect_idx + 1).is_some_and(|next| {
+                                matches!(next.section_type, engine::SectionType::Continuous)
+                            });
+                        if balance_pending {
+                            open_from_page = Some(
+                                emitted_pages.len()
+                                    + paginator.as_ref().map_or(0, |p| p.page_count_emitted()),
+                            );
+                        }
                         break 'outer;
                     }
                 }
@@ -7716,6 +7745,7 @@ impl Engine {
             is_full_layout: !culled,
             remaining_blocks: total_blocks.saturating_sub(processed_blocks),
             degradations,
+            open_from_page,
         };
         Ok((emitted_pages, font_stack, emitted_paths, info))
     }
@@ -19338,6 +19368,124 @@ mod tests {
         assert!(s.info.degradations.is_empty(), "{:?}", s.info.degradations);
         assert!(!s.info.is_full_layout, "still a culled band");
         assert_eq!(layout::verify_prefix(&s.pages, &full), Ok(()));
+    }
+
+    /* ================================================================
+    Issue #93 — a culled band that ends inside a multi-column section a
+    continuous section follows (its column balance still pending).
+    ================================================================ */
+
+    /// `n` prose paragraphs in a 2-column section, then a continuous
+    /// single-column section of `tail` paragraphs.
+    fn two_column_then_continuous(n: usize, tail: usize) -> DocumentTree {
+        let mut d = prose_doc(n);
+        let mut sect = d.body_section.clone();
+        sect.columns = engine::ColumnSpec {
+            count: 2,
+            gutter_pt: 36.0,
+        };
+        if let Some(engine::Block::Paragraph(p)) = d.blocks.get_mut(n - 1) {
+            p.section_end = Some(Box::new(sect));
+        }
+        d.body_section.section_type = engine::SectionType::Continuous;
+        for i in 0..tail {
+            d.blocks.push_back(para_of(
+                &format!("Single-column paragraph {i} after the continuous break."),
+                engine::ParaProperties::default(),
+            ));
+        }
+        d
+    }
+
+    /// Acceptance: a band culled on the last page of a continuous
+    /// multi-column section (unbalanced there, balanced once the next
+    /// section is reached) flags that page provisional, expands without
+    /// a `FastPathMismatch`, and the final geometry equals a full layout.
+    #[test]
+    fn expanding_through_a_continuous_section_never_demotes() {
+        let gap = render::scene::PAGE_GAP_PT;
+        /* Find a section length whose last page holds more than one
+        column's worth but less than two — the case balancing reshuffles. */
+        let (n, page, full) = (60..160)
+            .step_by(3)
+            .find_map(|n| {
+                let engine = test_engine_with_doc(two_column_then_continuous(n, 120));
+                let (pages, _, paths, _) = engine.build_pages(1.0, false, None).expect("pages");
+                let last = EngineBlockPath::top(n as u32 - 1);
+                let page = paths.iter().position(|pp| pp.contains(&last))?;
+                let content_h =
+                    pages[page].size.height - pages[page].margins.top - pages[page].margins.bottom;
+                let in_section = |p: &EngineBlockPath| {
+                    matches!(p.steps.first(), Some(engine::PathStep::Block(i)) if (*i as usize) < n)
+                };
+                let section_h: f32 = pages[page]
+                    .blocks
+                    .iter()
+                    .zip(&paths[page])
+                    .filter(|(_, p)| in_section(p))
+                    .map(|(b, _)| b.size().height)
+                    .sum();
+                (page >= 2 && section_h > 1.1 * content_h && section_h < 1.7 * content_h)
+                    .then_some((n, page, pages))
+            })
+            .expect("a section whose last page balances");
+        let engine = test_engine_with_doc(two_column_then_continuous(n, 120));
+        let above: f32 = full[..page].iter().map(|p| p.size.height + gap).sum();
+        let content_h = full[page].size.height - full[page].margins.top - full[page].margins.bottom;
+        let runway = lazy_runway(engine.lazy_layout.viewport_h, 1.0);
+        /* Aim the cull at that page, deep enough into column 0 that the
+        band holds blocks the balance pass moves (swept: the cull only
+        stops at block boundaries). */
+        let target = (40..100)
+            .map(|pct| above + content_h * pct as f32 / 100.0 - runway)
+            .find(|&target| {
+                engine.invalidate_layout_snapshot();
+                engine
+                    .ensure_layout_snapshot(1.0, false, Some(target))
+                    .expect("band 1");
+                let snap = engine.layout_snapshot.borrow();
+                let s = snap.as_ref().expect("snapshot");
+                !s.info.is_full_layout
+                    && s.info.open_from_page == Some(page)
+                    && layout::verify_prefix(&s.pages, &full).is_err()
+            })
+            .expect("a band whose unbalanced page differs from the balanced one");
+        {
+            /* Everything before the provisional page is final. */
+            let snap = engine.layout_snapshot.borrow();
+            let s = snap.as_ref().expect("snapshot");
+            assert_eq!(
+                layout::verify_prefix_open(&s.pages, &full, Some(page)),
+                Ok(())
+            );
+        }
+        engine
+            .ensure_layout_snapshot(1.0, false, Some(target + 1500.0))
+            .expect("band 2");
+        {
+            let snap = engine.layout_snapshot.borrow();
+            let s = snap.as_ref().expect("snapshot");
+            assert!(
+                s.info.degradations.is_empty(),
+                "no FastPathMismatch on expand: {:?}",
+                s.info.degradations
+            );
+            assert!(!s.info.is_full_layout, "still a culled band");
+            assert_eq!(s.info.open_from_page, None, "band 2 left the section");
+            assert_eq!(layout::verify_prefix(&s.pages, &full), Ok(()));
+        }
+        engine
+            .ensure_layout_snapshot(1.0, false, None)
+            .expect("full");
+        let snap = engine.layout_snapshot.borrow();
+        let s = snap.as_ref().expect("snapshot");
+        assert!(s.info.is_full_layout);
+        assert!(s.info.degradations.is_empty(), "{:?}", s.info.degradations);
+        assert_eq!(
+            layout::geometry_fingerprint(&s.pages),
+            layout::geometry_fingerprint(&full),
+            "final geometry equals a full layout"
+        );
     }
 
     /// A deeper `ExpandLayout` band verifies as a prefix of the previous

@@ -440,6 +440,49 @@ pub fn verify_prefix(shorter: &[PageBox], longer: &[PageBox]) -> Result<(), Fast
     Ok(())
 }
 
+/// Issue #93 — [`verify_prefix`] for a band whose pages from `open_from`
+/// on are PROVISIONAL: laid out before a pass that only runs once more
+/// content arrives (a continuous section's column balance). Pages before
+/// `open_from` must match exactly — all of them complete, block counts
+/// included; provisional pages only have to exist in `longer` with the
+/// same page geometry. `None` (or an index past the band) is
+/// [`verify_prefix`].
+pub fn verify_prefix_open(
+    shorter: &[PageBox],
+    longer: &[PageBox],
+    open_from: Option<usize>,
+) -> Result<(), FastPathMismatch> {
+    let Some(open) = open_from.filter(|&o| o < shorter.len()) else {
+        return verify_prefix(shorter, longer);
+    };
+    if shorter.len() > longer.len() {
+        return Err(FastPathMismatch::PageCount {
+            shorter: shorter.len(),
+            longer: longer.len(),
+        });
+    }
+    /* Every stable page is complete: verify it against `longer` with the
+    provisional tail cut off, then demand equal block counts on the last
+    stable page too (`verify_prefix` treats its last page as partial). */
+    verify_prefix(&shorter[..open], longer)?;
+    if let Some(last) = open.checked_sub(1)
+        && shorter[last].blocks.len() != longer[last].blocks.len()
+    {
+        return Err(FastPathMismatch::BlockCount {
+            page: last,
+            shorter: shorter[last].blocks.len(),
+            longer: longer[last].blocks.len(),
+        });
+    }
+    for page in open..shorter.len() {
+        let (s, l) = (&shorter[page], &longer[page]);
+        if s.size != l.size || !margins_eq(&s.margins, &l.margins) {
+            return Err(FastPathMismatch::PageGeometry { page });
+        }
+    }
+    Ok(())
+}
+
 fn margins_eq(a: &crate::page::Margins, b: &crate::page::Margins) -> bool {
     a.top == b.top && a.right == b.right && a.bottom == b.bottom && a.left == b.left
 }
@@ -841,6 +884,51 @@ mod tests {
             page_number: 1,
             floats: Vec::new(),
         }
+    }
+
+    /// Issue #93 — a band whose last page waits on a pending column
+    /// balance: the provisional page may differ (its blocks move between
+    /// columns once balanced) but must exist with the same geometry; the
+    /// stable pages before it are checked complete.
+    #[test]
+    fn provisional_pages_are_excluded_from_the_verified_prefix() {
+        let mut moved = para(0.0, 40.0, 4);
+        moved.set_origin(Point { x: 220.0, y: 0.0 });
+        let shallow = vec![
+            page(vec![para(0.0, 30.0, 3)]),
+            page(vec![para(0.0, 20.0, 2), para(20.0, 40.0, 4)]),
+        ];
+        let balanced = vec![
+            page(vec![para(0.0, 30.0, 3)]),
+            page(vec![para(0.0, 20.0, 2), moved]),
+            page(vec![para(0.0, 10.0, 1)]),
+        ];
+        assert_eq!(
+            verify_prefix(&shallow, &balanced),
+            Err(FastPathMismatch::BlockGeometry { page: 1, block: 1 }),
+            "without the exclusion the balance reads as a mismatch"
+        );
+        assert_eq!(verify_prefix_open(&shallow, &balanced, Some(1)), Ok(()));
+        assert!(verify_prefix_open(&shallow, &balanced, None).is_err());
+        /* A stable page must still match, and match COMPLETELY. */
+        let mut grew = balanced.clone();
+        grew[0].blocks.push(para(30.0, 10.0, 1));
+        assert_eq!(
+            verify_prefix_open(&shallow, &grew, Some(1)),
+            Err(FastPathMismatch::BlockCount {
+                page: 0,
+                shorter: 1,
+                longer: 2
+            })
+        );
+        /* A provisional page still has to exist with the same geometry. */
+        let mut other = balanced.clone();
+        other[1].size.width = 400.0;
+        assert_eq!(
+            verify_prefix_open(&shallow, &other, Some(1)),
+            Err(FastPathMismatch::PageGeometry { page: 1 })
+        );
+        assert!(verify_prefix_open(&shallow, &balanced[..1], Some(1)).is_err());
     }
 
     #[test]

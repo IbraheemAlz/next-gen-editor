@@ -34,6 +34,7 @@ pub use paragraph::{
 pub use watchdog::{
     BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation,
     PageRefConvergence, Watchdog, converge_page_refs, geometry_fingerprint, verify_prefix,
+    verify_prefix_open,
 };
 pub use wrap::{
     FloatKey, WrapConvergence, WrapCutout, WrapPlan, WrapVerdict, cutouts_for_float, derive_plan,
