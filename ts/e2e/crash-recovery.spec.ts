@@ -454,3 +454,176 @@ test('embedded-font document: snapshots stay small, the package is stored once, 
     expect(r.info.restored).toBe(true);
     expect(r.postHash, 'recovered session saves the identical file').toBe(r.preHash);
 });
+
+/* Issue #268 — a failed `packages` write leaves later snapshots naming a
+   package the store does not hold. They still restore, but save through
+   the minimal writer — silently dropping the `.docx`'s sibling parts.
+   Recovery must prefer an OLDER snapshot whose package is present.
+   Document A is opened and snapshotted (package hA stored), then document
+   B (a different package, hB) is opened and snapshotted twice; the hB row
+   is deleted, then a real trap. The newest snapshots restore only without
+   their package; the snapshot of A still has hA, and its tail replays the
+   logged `OPEN_DOCUMENT` of B — so the recovered session is B WITH its
+   package and saves the identical file. */
+test('a missing package row: recovery prefers an older snapshot that still has its package', async ({
+    page,
+}) => {
+    test.setTimeout(120_000);
+    const docA = readFileSync(PACKAGE_FIXTURE);
+    const docB = appendStoredEntry(
+        readFileSync(PACKAGE_FIXTURE),
+        'word/fonts/font1.odttf',
+        pseudoRandomBytes(64 * 1024),
+    );
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+
+    const result = await page.evaluate(
+        async ([a64, b64]: [string, string]) => {
+            const w = window as any;
+            const dispatch = w.__dispatch as (cmd: unknown) => Promise<any>;
+            const client = w.__engineClient;
+            const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+            const sha256 = async (bytes: Uint8Array): Promise<string> => {
+                const digest = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
+                return Array.from(new Uint8Array(digest))
+                    .map((b) => b.toString(16).padStart(2, '0'))
+                    .join('');
+            };
+            const withDb = <T,>(fn: (db: IDBDatabase) => Promise<T>): Promise<T> =>
+                new Promise((resolve, reject) => {
+                    const open = indexedDB.open('engine-log');
+                    open.onsuccess = () => {
+                        const db = open.result;
+                        fn(db).then(
+                            (v) => {
+                                db.close();
+                                resolve(v);
+                            },
+                            (e) => {
+                                db.close();
+                                reject(e);
+                            },
+                        );
+                    };
+                    open.onerror = () => reject(open.error);
+                });
+            type Log = { snaps: { seq: number; packageHash?: string }[]; packages: string[] };
+            const readLog = () =>
+                withDb(
+                    (db) =>
+                        new Promise<Log>((resolve, reject) => {
+                            const tx = db.transaction(['snapshots', 'packages'], 'readonly');
+                            const snaps = tx.objectStore('snapshots').getAll();
+                            const packages = tx.objectStore('packages').getAllKeys();
+                            tx.oncomplete = () =>
+                                resolve({
+                                    snaps: snaps.result.map((r: any) => ({
+                                        seq: r.seq,
+                                        packageHash: r.packageHash,
+                                    })),
+                                    packages: packages.result as string[],
+                                });
+                            tx.onerror = () => reject(tx.error);
+                        }),
+                );
+            /* Wait for `n` snapshots naming a package other than `not`. */
+            const awaitSnapshots = async (n: number, not?: string): Promise<Log> => {
+                for (let i = 0; i < 200; i++) {
+                    const log = await readLog();
+                    const named = log.snaps.filter(
+                        (s) => s.packageHash !== undefined && s.packageHash !== not,
+                    );
+                    if (named.length >= n) return log;
+                    await sleep(50);
+                }
+                throw new Error(`no ${n} snapshot(s) naming a package other than ${not}`);
+            };
+            const open = async (b64: string, name: string) => {
+                const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+                const evt = await dispatch({ type: 'OPEN_DOCUMENT', bytes, format: 'docx', name });
+                if (evt.type === 'ERROR') throw new Error(`open ${name}: ${evt.message}`);
+            };
+            const save = async (): Promise<Uint8Array> => {
+                const evt = await dispatch({ type: 'SAVE_DOCUMENT', format: 'docx' });
+                if (evt.type !== 'DOCUMENT_SAVED') throw new Error(`save: ${evt.type}`);
+                return evt.bytes;
+            };
+
+            await open(a64, 'a.docx');
+            const logA = await awaitSnapshots(1);
+            const hashA = logA.snaps.find((s) => s.packageHash)!.packageHash!;
+            await open(b64, 'b.docx');
+            await awaitSnapshots(1, hashA);
+            await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'B' });
+            const logB = await awaitSnapshots(2, hashA);
+            const hashB = logB.snaps.find((s) => s.packageHash && s.packageHash !== hashA)!
+                .packageHash!;
+            const preSave = await save();
+
+            /* The failed package write: the store never got hB. */
+            await withDb(
+                (db) =>
+                    new Promise<void>((resolve, reject) => {
+                        const tx = db.transaction('packages', 'readwrite');
+                        tx.objectStore('packages').delete(hashB);
+                        tx.oncomplete = () => resolve();
+                        tx.onerror = () => reject(tx.error);
+                    }),
+            );
+            const before = await readLog();
+
+            await client.armTrap(1);
+            await dispatch({ type: 'PING' }).catch(() => undefined);
+            for (let i = 0; i < 600 && w.__recovered !== true; i++) await sleep(50);
+            if (w.__recovered !== true) return { failed: 'recovery did not complete' };
+            const postSave = await save();
+            const name = new TextEncoder().encode('word/fonts/font1.odttf');
+            const hasEntry = (b: Uint8Array) => {
+                outer: for (let i = 0; i + name.length <= b.length; i++) {
+                    for (let j = 0; j < name.length; j++) {
+                        if (b[i + j] !== name[j]) continue outer;
+                    }
+                    return true;
+                }
+                return false;
+            };
+            return {
+                hashA,
+                hashB,
+                before,
+                info: client.lastRecovery,
+                preHash: await sha256(preSave),
+                postHash: await sha256(postSave),
+                postHasSibling: hasEntry(postSave),
+            };
+        },
+        [Buffer.from(docA).toString('base64'), Buffer.from(docB).toString('base64')] as [
+            string,
+            string,
+        ],
+    );
+
+    expect((result as any).failed, 'in-page failure').toBeUndefined();
+    const r = result as any;
+    console.log(
+        `[recovery #268] snaps=${r.before.snaps
+            .map((s: any) => `${s.seq}:${(s.packageHash ?? '-').slice(0, 14)}`)
+            .join(',')} packages=${r.before.packages.length} ` +
+            `packageFallbacks=${r.info.packageFallbacks} packageLost=${r.info.packageLost}`,
+    );
+    expect(r.hashA).not.toBe(r.hashB);
+    expect(r.hashA.startsWith('sha256-'), 'issue #269 key').toBe(true);
+    /* Set-up: A's package is stored, B's is not, and snapshots name both. */
+    expect(r.before.packages).toEqual([r.hashA]);
+    expect(r.before.snaps.some((s: any) => s.packageHash === r.hashB)).toBe(true);
+
+    expect(r.info.restored).toBe(true);
+    expect(r.info.packageFallbacks, 'newer package-less snapshot passed over').toBeGreaterThanOrEqual(1);
+    expect(r.info.packageLost, 'no silent sibling loss').toBe(false);
+    expect(r.info.snapshotFallbacks).toBe(0);
+    expect(r.postHasSibling, 'the recovered save keeps the sibling part').toBe(true);
+    expect(r.postHash, 'recovered session saves the identical file').toBe(r.preHash);
+});
