@@ -66,6 +66,13 @@ export default defineConfig({
     timeout: 30_000,
     /* Serial: the throughput + boot tests are timing-sensitive. */
     workers: 1,
+    /* Issue #230 — CI is now a blocking gate on this suite. One retry
+     * absorbs the rare cold-cache flake (observed once locally: Vite's
+     * dependency-optimizer full-reload racing a mid-test `page.evaluate`,
+     * "Execution context was destroyed") without masking a real, repeatable
+     * failure — a genuine regression fails the retry too. Local runs stay
+     * retry-free so a flaky spec is loud, not silently green on attempt 2. */
+    retries: process.env.CI ? 1 : 0,
     reporter: 'list',
     use: {
         baseURL: BASE_URL,
