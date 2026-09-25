@@ -285,11 +285,13 @@ fn run_default() -> Result<()> {
     run_toc_roundtrip()?;
     run_text_boxes_roundtrip()?;
     run_nested_text_boxes_roundtrip()?;
+    run_text_box_pictures_roundtrip()?;
     run_rtl_table_roundtrip()?;
     run_table_jc_tblind_roundtrip()?;
     run_body_passthrough_roundtrip()?;
     run_package_media_insert()?;
     run_package_ui_save()?;
+    run_style_bidi_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -650,6 +652,14 @@ fn build_floating_image_anchor_docx() -> Vec<u8> {
 /// A minimal OPC package around `document_xml` with one image part
 /// (`rId5` → `word/media/image1.png`, the 8-byte PNG signature).
 fn pack_docx_with_png(document_xml: &str) -> Vec<u8> {
+    pack_docx_with_png_bytes(
+        document_xml,
+        &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+    )
+}
+
+/// [`pack_docx_with_png`] with the image part's bytes supplied.
+fn pack_docx_with_png_bytes(document_xml: &str, png: &[u8]) -> Vec<u8> {
     use std::io::Write;
     use zip::write::{SimpleFileOptions, ZipWriter};
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -667,7 +677,6 @@ fn pack_docx_with_png(document_xml: &str) -> Vec<u8> {
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
 </Relationships>"#;
-    let png_signature: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut zip = ZipWriter::new(std::io::Cursor::new(&mut buf));
@@ -679,7 +688,7 @@ fn pack_docx_with_png(document_xml: &str) -> Vec<u8> {
             ("_rels/.rels", dot_rels.as_bytes()),
             ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
             ("word/document.xml", document_xml.as_bytes()),
-            ("word/media/image1.png", png_signature),
+            ("word/media/image1.png", png),
         ] {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body).unwrap();
@@ -1349,6 +1358,235 @@ fn run_nested_text_boxes_roundtrip() -> Result<()> {
         bail!("nested text-box fixture: the outer story changed ({outer_text:?})");
     }
     println!("[roundtrip] step 20d OK — the nested edit re-reads, the outer story untouched");
+    Ok(())
+}
+
+/* ======================================= pictures in text boxes (#206) ==== */
+
+/// Issue #206 — an 8 × 8 solid-blue PNG (a real image, so the picture
+/// paints in a browser; the reader stores bytes, decoding is the shell's).
+const TBP_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4b, 0x6d, 0x29,
+    0xdc, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x90, 0x8b, 0x3a, 0x81,
+    0x15, 0x31, 0x0c, 0x2d, 0x09, 0x00, 0x18, 0x19, 0x50, 0x01, 0x47, 0xb6, 0x9a, 0xb3, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+const TBP_OUTER: &str = "Outer story text flows beside the picture.";
+const TBP_INNER: &str = "Inner text.";
+
+/// Issue #206 — a floating `<wp:anchor>` picture (`rId5`) at fixed EMU
+/// offsets from the column / paragraph frames, square wrap, in the
+/// writer's canonical `CT_Anchor` child order.
+fn tbp_picture(x: i64, y: i64, cx: i64, cy: i64, id: u32) -> String {
+    format!(
+        concat!(
+            r#"<w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="{id}" "#,
+            r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="column"><wp:posOffset>{x}</wp:posOffset></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>{y}</wp:posOffset></wp:positionV>"#,
+            r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+            r#"<wp:wrapSquare wrapText="bothSides"/><wp:docPr id="{id}" name="Picture {id}"/>"#,
+            r#"<wp:cNvGraphicFramePr/><a:graphic>"#,
+            r#"<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>"#,
+            r#"<pic:nvPicPr><pic:cNvPr id="0" name="Image"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+            r#"<pic:blipFill><a:blip r:embed="rId5"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+            r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>"#,
+            r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>"#,
+            r#"</pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing>"#,
+        ),
+        x = x,
+        y = y,
+        cx = cx,
+        cy = cy,
+        id = id
+    )
+}
+
+/// Issue #206 fixture: the #196 geometry — a page-anchored 3" × 2" box at
+/// (1", 3") — whose story opens with a 0.75" × 0.5" floating picture at
+/// the column / paragraph corner, then hosts a nested 1.5" × 0.8" box
+/// (1.2" right / 0.9" down in the outer content rect) whose own story
+/// opens with a 0.5" × 0.3" floating picture. The e2e spec
+/// `ts/e2e/text-box-pictures.spec.ts` targets both pictures by this
+/// geometry.
+fn text_box_pictures_document_xml() -> String {
+    let text_box = |x: i64, y: i64, cx: i64, cy: i64, id: u32, story: &str| {
+        format!(
+            concat!(
+                r#"<w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="{id}" "#,
+                r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>"#,
+                r#"<wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH>"#,
+                r#"<wp:positionV relativeFrom="page"><wp:posOffset>{y}</wp:posOffset></wp:positionV>"#,
+                r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+                r#"<wp:wrapSquare wrapText="bothSides"/><wp:docPr id="{id}" name="Text Box {id}"/>"#,
+                r#"<wp:cNvGraphicFramePr/>"#,
+                r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+                r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>"#,
+                r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#,
+                r#"<a:ln w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></wps:spPr>"#,
+                r#"<wps:txbx><w:txbxContent>{story}</w:txbxContent></wps:txbx>"#,
+                r#"<wps:bodyPr rot="0" vert="horz" wrap="square" lIns="91440" tIns="45720" rIns="91440" bIns="45720" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>"#,
+                r#"</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>"#,
+            ),
+            x = x,
+            y = y,
+            cx = cx,
+            cy = cy,
+            id = id,
+            story = story
+        )
+    };
+    let inner_story = format!(
+        r#"<w:p><w:r>{pic}</w:r><w:r><w:t xml:space="preserve">{TBP_INNER}</w:t></w:r></w:p>"#,
+        pic = tbp_picture(0, 0, 457_200, 274_320, 4)
+    );
+    let inner = text_box(1_097_280, 822_960, 1_371_600, 731_520, 2, &inner_story);
+    let outer_story = format!(
+        concat!(
+            r#"<w:p><w:r>{pic}</w:r><w:r><w:t xml:space="preserve">{outer}</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r>{inner}</w:r><w:r><w:t xml:space="preserve">Nested host.</w:t></w:r></w:p>"#,
+        ),
+        pic = tbp_picture(0, 0, 685_800, 457_200, 3),
+        outer = TBP_OUTER,
+        inner = inner
+    );
+    let outer = text_box(914_400, 2_743_200, 2_743_200, 1_828_800, 1, &outer_story);
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+            r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+            r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+            r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+            r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            "<w:body>",
+            r#"<w:p><w:r><w:t xml:space="preserve">Intro paragraph.</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r>{outer}</w:r><w:r><w:t xml:space="preserve">Host paragraph.</w:t></w:r></w:p>"#,
+            "<w:sectPr/></w:body></w:document>",
+        ),
+        outer = outer
+    )
+}
+
+/// Issue #206 fixture builder. Rides the `--fixtures` passthrough at
+/// drift 0, the default harness's step 24 and the e2e spec.
+fn build_text_box_pictures_docx() -> Vec<u8> {
+    pack_docx_with_png_bytes(&text_box_pictures_document_xml(), TBP_PNG)
+}
+
+/// Issue #206 — pictures inside text-box stories round-trip their edits:
+/// (a) both pictures parse as floating pictures of their stories (the
+/// outer box's, and the nested box's); (b) a zero-edit save is
+/// byte-identical; (c) moving the outer-story picture and re-wrapping +
+/// resizing the nested-story picture through the engine's story-chain
+/// edit path (`with_text_box_story_edit`, what `MoveImage` / `ResizeImage`
+/// / `SetImageWrap` run with a `story`) regenerates exactly those two
+/// drawings — the verified passthrough (#112/#119) refuses their stale
+/// bytes — while every untouched paragraph keeps its bytes; (d) the
+/// edits re-read.
+fn run_text_box_pictures_roundtrip() -> Result<()> {
+    use engine::{BlockPath, FloatOffset, WrapKind};
+
+    let fixture = build_text_box_pictures_docx();
+    let archive = read_docx(&fixture).context("read text-box pictures fixture")?;
+    let doc = &archive.document;
+    let outer_chain = vec![(BlockPath::top(1), 0u32)];
+    let inner_chain = vec![(BlockPath::top(1), 0u32), (BlockPath::top(1), 0u32)];
+    let picture = |d: &DocumentTree, chain: &[(BlockPath, u32)]| -> Option<engine::InlineObject> {
+        d.text_box_story_tree(chain)?
+            .paragraph_at_path(&BlockPath::top(0))?
+            .inline_objects
+            .iter()
+            .find(|io| io.at == 0 && matches!(io.kind, engine::InlineKind::Image { .. }))
+            .cloned()
+    };
+    let (Some(op), Some(ip)) = (picture(doc, &outer_chain), picture(doc, &inner_chain)) else {
+        bail!("text-box pictures fixture: a story picture did not parse");
+    };
+    if !op.is_floating() || !ip.is_floating() || op.source_xml.is_none() {
+        bail!("text-box pictures fixture: the story pictures must be floating with bytes");
+    }
+    println!("[roundtrip] step 24a OK — pictures parse inside a box story and a nested box story");
+
+    let src = String::from_utf8(extract_doc_xml(&fixture)?).context("utf8 source")?;
+    let zero = write_docx(&archive, doc).context("zero-edit write")?;
+    if String::from_utf8(extract_doc_xml(&zero)?).context("utf8 zero")? != src {
+        bail!("text-box pictures fixture: zero-edit save drifted");
+    }
+    println!("[roundtrip] step 24b OK — zero-edit save is byte-identical");
+
+    let at0 = BlockPath::top(0);
+    let edited = doc
+        .with_text_box_story_edit(&outer_chain, |t| {
+            t.move_floating_image_at(&at0, 0, 228_600, 91_440)
+        })
+        .context("move the outer-story picture")?;
+    let edited = edited
+        .with_text_box_story_edit(&inner_chain, |t| {
+            t.set_floating_image_wrap_at(&at0, 0, WrapKind::TopAndBottom, false)
+                .resize_inline_image_at(&at0, 0, 548_640, 329_184)
+        })
+        .context("re-wrap + resize the nested-story picture")?;
+    let bytes = write_docx(&archive, &edited).context("write edited pictures")?;
+    assert_document_xml_well_formed(&bytes).context("edited text-box pictures .docx")?;
+    let out = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+    let unchanged = [
+        r#"<w:p><w:r><w:t xml:space="preserve">Intro paragraph.</w:t></w:r></w:p>"#.to_string(),
+        format!(r#"<w:t xml:space="preserve">{TBP_OUTER}</w:t>"#),
+        format!(r#"<w:t xml:space="preserve">{TBP_INNER}</w:t>"#),
+        r#"<w:t xml:space="preserve">Nested host.</w:t>"#.to_string(),
+        r#"<w:t xml:space="preserve">Host paragraph.</w:t>"#.to_string(),
+    ];
+    for needle in &unchanged {
+        if !out.contains(needle.as_str()) {
+            bail!("text-box pictures fixture: lost `{needle}`\n{out}");
+        }
+    }
+    for needle in [
+        "<wp:posOffset>228600</wp:posOffset>",
+        "<wp:posOffset>91440</wp:posOffset>",
+        "<wp:wrapTopAndBottom/>",
+        r#"cx="548640" cy="329184""#,
+    ] {
+        if !out.contains(needle) {
+            bail!("text-box pictures fixture: the edit `{needle}` was not written\n{out}");
+        }
+    }
+    if out.contains("<wp:wrapSquare wrapText=\"bothSides\"/><wp:docPr id=\"4\"") {
+        bail!("text-box pictures fixture: the nested picture kept its stale wrap bytes");
+    }
+    println!("[roundtrip] step 24c OK — box-story picture edits regenerate their drawings only");
+
+    let reread = read_docx(&bytes).context("re-read edited pictures")?;
+    let (Some(op), Some(ip)) = (
+        picture(&reread.document, &outer_chain),
+        picture(&reread.document, &inner_chain),
+    ) else {
+        bail!("text-box pictures fixture: an edited picture did not re-read");
+    };
+    let oa = op.anchor.as_deref().context("outer still floating")?;
+    let ia = ip.anchor.as_deref().context("nested still floating")?;
+    if oa.position_h.offset != FloatOffset::Emu(228_600)
+        || oa.position_v.offset != FloatOffset::Emu(91_440)
+        || ia.wrap != WrapKind::TopAndBottom
+        || !matches!(
+            ip.kind,
+            engine::InlineKind::Image {
+                width_emu: 548_640,
+                height_emu: 329_184,
+                ..
+            }
+        )
+    {
+        bail!(
+            "text-box pictures fixture: the re-read edits differ: {oa:?} / {ia:?} / {:?}",
+            ip.kind
+        );
+    }
+    println!("[roundtrip] step 24d OK — the moved / re-wrapped / resized pictures re-read");
     Ok(())
 }
 
@@ -2339,6 +2577,106 @@ fn run_rtl_table_roundtrip() -> Result<()> {
     }
     println!(
         "[roundtrip] step 17c OK — toggling bidiVisual adds / removes exactly <w:bidiVisual/>"
+    );
+    Ok(())
+}
+
+/* ================================== style-inherited direction (#202) ==== */
+
+/// Issue #202 — `RtlBase` sets `<w:bidi/>`; `RtlBody` inherits it via
+/// `basedOn` (the Arabic-template "RTL Body" shape).
+const STYLE_BIDI_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:styleId="RtlBase"><w:name w:val="RTL Base"/><w:pPr><w:bidi/></w:pPr></w:style>
+<w:style w:type="paragraph" w:styleId="RtlBody"><w:name w:val="RTL Body"/><w:basedOn w:val="RtlBase"/></w:style>
+</w:styles>"#;
+
+/// The three paragraphs of `pPr_bidi_style.docx`, byte-for-byte: (0) a
+/// style-RTL paragraph that starts with a Latin word, (1) the same style
+/// under a direct `<w:bidi w:val="false"/>`, (2) an unstyled paragraph.
+/// Written in the writer's own regeneration shape, so an edited
+/// paragraph regenerates to exactly source + insert.
+const STYLE_BIDI_PARAGRAPHS: [&str; 3] = [
+    r#"<w:p><w:pPr><w:pStyle w:val="RtlBody"/></w:pPr><w:r><w:t xml:space="preserve">Word مرحبا</w:t></w:r></w:p>"#,
+    r#"<w:p><w:pPr><w:pStyle w:val="RtlBody"/><w:bidi w:val="false"/></w:pPr><w:r><w:t xml:space="preserve">Word مرحبا</w:t></w:r></w:p>"#,
+    r#"<w:p><w:r><w:t xml:space="preserve">plain</w:t></w:r></w:p>"#,
+];
+
+fn build_style_bidi_docx() -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{}{BARE_SECT_PR}</w:body></w:document>"#,
+        STYLE_BIDI_PARAGRAPHS.concat()
+    );
+    build_styled_docx(STYLE_BIDI_STYLES_XML, &document_xml)
+}
+
+/// Issue #202 — step 23: paragraph direction inherited from a style.
+///
+/// a. `bidi` resolves through the `basedOn` chain on read (RTL although
+///    the text starts with a Latin word) without becoming a direct
+///    override; a direct `w:val="false"` beats the style.
+/// b. An untouched save is byte-identical.
+/// c. Editing the style-RTL paragraph regenerates exactly source +
+///    insert — it does NOT gain a direct `<w:bidi/>` — the other two
+///    paragraphs pass through byte-identical, and the re-read still
+///    resolves RTL from styles.xml.
+fn run_style_bidi_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos, TextDirection};
+
+    type Dirs = Vec<(Option<TextDirection>, Option<TextDirection>)>;
+    let dirs = |doc: &DocumentTree| -> Dirs {
+        (0..3)
+            .filter_map(|i| doc.nth_paragraph(i))
+            .map(|p| (p.props.direction, p.direct_overrides.direction))
+            .collect()
+    };
+    let expected: Dirs = vec![
+        (Some(TextDirection::Rtl), None),
+        (Some(TextDirection::Ltr), Some(TextDirection::Ltr)),
+        (None, None),
+    ];
+
+    let fixture_bytes = build_style_bidi_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read style-bidi fixture")?;
+    if dirs(&archive_a.document) != expected {
+        bail!(
+            "style bidi not resolved on read: {:?}",
+            dirs(&archive_a.document)
+        );
+    }
+    println!("[roundtrip] step 23a OK — bidi resolves through basedOn, direct off wins");
+
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
+        bail!("untouched style-bidi document drifted");
+    }
+    println!("[roundtrip] step 23b OK — untouched save byte-identical");
+
+    let edited = archive_a.document.insert_text(
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: "Word".len() as u32,
+        },
+        INSERT_TEXT,
+    );
+    let expected_xml = doc_a.replacen("Word مرحبا", &format!("Word{INSERT_TEXT} مرحبا"), 1);
+    let bytes = write_docx(&archive_a, &edited).context("write edited style-bidi")?;
+    assert_document_xml_well_formed(&bytes).context("edited style-bidi .docx")?;
+    let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+    if xml != expected_xml {
+        bail!(
+            "edited style-RTL paragraph is not source + edit (inherited <w:bidi/> leaked?)\n--- expected ---\n{expected_xml}\n--- got ---\n{xml}"
+        );
+    }
+    let back = read_docx(&bytes).context("re-read edited style-bidi")?;
+    if dirs(&back.document) != expected {
+        bail!("direction lost on re-read: {:?}", dirs(&back.document));
+    }
+    let drift = expected_xml.len() - doc_a.len();
+    println!(
+        "[roundtrip] step 23c OK — edited style-RTL paragraph gains no direct <w:bidi/>, re-reads RTL (Δ {drift} B)"
     );
     Ok(())
 }
@@ -3597,6 +3935,22 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 roundtrip: RoundtripBounds::default(),
             },
         },
+        /* Issue #202 — style-inherited paragraph direction. Passthrough
+        at drift 0; the default harness's step 23 edits the style-RTL
+        paragraph. */
+        PrebuiltFixture {
+            name: "pPr_bidi_style.docx",
+            bytes: build_style_bidi_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 3,
+                    paragraph_texts: vec!["Word مرحبا".into(), "Word مرحبا".into(), "plain".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
         PrebuiltFixture {
             name: "style_cascade.docx",
             bytes: build_style_cascade_docx(),
@@ -3879,6 +4233,26 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         /* Issue #196 — a text box nested in a text box's story.
         Passthrough at drift 0; the default harness's step 20 edits the
         nested story; the e2e spec clicks into it. */
+        /* Issue #206 — floating pictures inside a text box's story and
+        inside the box nested in it. Passthrough at drift 0; the default
+        harness's step 24 moves / re-wraps them; the e2e spec selects,
+        drags, resizes and re-wraps them. */
+        PrebuiltFixture {
+            name: "text_box_pictures.docx",
+            bytes: build_text_box_pictures_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec![
+                        "Intro paragraph.".into(),
+                        "\u{FFFC}Host paragraph.".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
         PrebuiltFixture {
             name: "text_boxes_nested.docx",
             bytes: build_nested_text_boxes_docx(),
@@ -4068,9 +4442,6 @@ fn build_table_jc_tblind_docx() -> Vec<u8> {
 /// (italic, basedOn BaseStyle); the single `<w:p>` references ChildStyle
 /// and must round-trip with the cascade resolved to bold + italic.
 fn build_style_cascade_docx() -> Vec<u8> {
-    use std::io::Write;
-    use zip::write::{SimpleFileOptions, ZipWriter};
-
     let styles_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:style w:type="paragraph" w:styleId="BaseStyle"><w:name w:val="Base"/><w:rPr><w:b/></w:rPr></w:style>
@@ -4078,6 +4449,15 @@ fn build_style_cascade_docx() -> Vec<u8> {
 </w:styles>"#;
     let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="ChildStyle"/></w:pPr><w:r><w:t xml:space="preserve">hello cascade</w:t></w:r></w:p>"#.to_owned() + A4_SECT_PR_EXPLICIT + "</w:body></w:document>";
+    build_styled_docx(styles_xml, &document_xml)
+}
+
+/// Package a `word/styles.xml` + `word/document.xml` pair in the minimal
+/// OPC skeleton (styles relationship included).
+fn build_styled_docx(styles_xml: &str, document_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -4105,7 +4485,7 @@ fn build_style_cascade_docx() -> Vec<u8> {
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
             ("word/styles.xml", styles_xml),
-            ("word/document.xml", document_xml.as_str()),
+            ("word/document.xml", document_xml),
         ] {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();

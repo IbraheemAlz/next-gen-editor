@@ -17,6 +17,7 @@ import type {
     Direction,
     Event,
     ImageWrapMode,
+    TextBoxHop,
     LogicalPos,
     LogicalRange,
     Rect,
@@ -166,10 +167,18 @@ export interface ImageRectCss {
     /** Issue #82 — the floating image's text-wrap mode (`undefined` for
      *  an inline image); drives the image toolbar's wrap picker. */
     wrap: ImageWrapMode | undefined;
+    /** Issue #206 — the text-box story chain the picture lives in (empty
+     *  for a body picture); `path` is rooted in that story. Handed back as
+     *  the `story` of RESIZE_IMAGE / MOVE_IMAGE / SET_IMAGE_WRAP. */
+    story: TextBoxHop[];
+    /** Issue #206 — the owning story's `outer/inner` id (`''` for body). */
+    storyRid: string;
 }
 export interface ImageAddr {
     path: BlockPath;
     at: number;
+    /** Issue #206 — the picture's text-box story chain (empty = body). */
+    story: TextBoxHop[];
 }
 const [imageRectsSig, setImageRectsSig] = createSignal<ImageRectCss[]>([]);
 const [selectedImageSig, setSelectedImageSig] = createSignal<ImageAddr | null>(null);
@@ -179,11 +188,10 @@ export function imageRectsForPointer(): ImageRectCss[] {
     return imageRectsSig();
 }
 
-const sameAddr = (a: ImageAddr, b: ImageAddr): boolean =>
-    a.at === b.at &&
-    a.path.steps.length === b.path.steps.length &&
-    a.path.steps.every((s, i) => {
-        const o = b.path.steps[i]!;
+const samePath = (a: BlockPath, b: BlockPath): boolean =>
+    a.steps.length === b.steps.length &&
+    a.steps.every((s, i) => {
+        const o = b.steps[i]!;
         if (s.kind !== o.kind) return false;
         if (s.kind === 'BLOCK' && o.kind === 'BLOCK') return s.idx === o.idx;
         if (s.kind === 'CELL' && o.kind === 'CELL')
@@ -191,19 +199,40 @@ const sameAddr = (a: ImageAddr, b: ImageAddr): boolean =>
         return false;
     });
 
+/** `true` when two image addresses name the same picture — same story
+ *  chain (issue #206: a box picture's path is story-rooted, so `(path,
+ *  at)` alone can collide with a body picture), path and anchor byte. */
+export const sameImageAddr = (a: ImageAddr, b: ImageAddr): boolean =>
+    a.at === b.at &&
+    samePath(a.path, b.path) &&
+    a.story.length === b.story.length &&
+    a.story.every((h, i) => {
+        const o = b.story[i]!;
+        return h.at === o.at && samePath(h.path, o.path);
+    });
+
 /** Select the image under a document-absolute CSS point, if any. Returns
  *  true when an image was hit (and selected); false clears the selection.
- *  Called synchronously by the pointer path before it places a caret. */
-export function selectImageByPoint(cssX: number, cssY: number): boolean {
-    const hit = imageRectsSig().find(
+ *  Called synchronously by the pointer path before it places a caret.
+ *  Issue #206 — `textBoxOnly` limits the hit to pictures inside text-box
+ *  stories (the pointer path while a text box is being edited). Nested
+ *  pictures are listed after their box's, so the innermost hit wins. */
+export function selectImageByPoint(
+    cssX: number,
+    cssY: number,
+    textBoxOnly = false,
+): boolean {
+    const hits = imageRectsSig().filter(
         (im) =>
+            (!textBoxOnly || im.story.length > 0) &&
             cssX >= im.rect.x &&
             cssX <= im.rect.x + im.rect.w &&
             cssY >= im.rect.y &&
             cssY <= im.rect.y + im.rect.h,
     );
+    const hit = hits[hits.length - 1];
     if (hit) {
-        setSelectedImageSig({ path: hit.path, at: hit.at });
+        setSelectedImageSig({ path: hit.path, at: hit.at, story: hit.story });
         return true;
     }
     setSelectedImageSig(null);
@@ -361,10 +390,12 @@ export function createEngineStore(client: EngineClient) {
                 frameX: im.frame_x / dpr,
                 frameY: im.frame_y / dpr,
                 wrap: im.wrap,
+                story: im.story ?? [],
+                storyRid: im.story_rid ?? '',
             }));
             setImageRectsSig(rects);
             const sel = selectedImageSig();
-            if (sel && !rects.some((r) => sameAddr({ path: r.path, at: r.at }, sel))) {
+            if (sel && !rects.some((r) => sameImageAddr(r, sel))) {
                 setSelectedImageSig(null);
             }
         } catch (e) {

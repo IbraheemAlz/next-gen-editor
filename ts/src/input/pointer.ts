@@ -201,12 +201,17 @@ export function attachPointer(
            consume the event. `selectImageByPoint` also CLEARS a prior
            image selection when the click misses every image, so a normal
            text click deselects. Coordinates are document-absolute CSS
-           px, matching the stored image rects. Skipped in story mode —
-           body images are unreachable behind the dim. */
-        if (!editingStoryForPointer()) {
+           px, matching the stored image rects. Skipped in header / footer
+           / note story mode — body images are unreachable behind the dim.
+           Issue #206 — while a text box is being edited, a press on a
+           picture INSIDE a text box still selects it (the engine accepts
+           picture edits in text-box mode); a press elsewhere falls
+           through to the story's own routing. */
+        const imageStory = editingStoryForPointer();
+        if (!imageStory || imageStory.area === 'TextBox') {
             const dpr = window.devicePixelRatio || 1;
             const gCss = toGlobal(e);
-            if (selectImageByPoint(gCss.x / dpr, gCss.y / dpr)) {
+            if (selectImageByPoint(gCss.x / dpr, gCss.y / dpr, imageStory !== undefined)) {
                 gesture += 1;
                 return;
             }

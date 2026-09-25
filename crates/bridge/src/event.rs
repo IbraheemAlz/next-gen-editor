@@ -670,8 +670,8 @@ pub struct A11yTree {
 }
 
 /// A top-level (or nested) accessibility node — a paragraph, a table,
-/// (issue #73) a header/footer story container, or (issue #165) a text
-/// box story region.
+/// (issue #73) a header/footer story container, (issue #165) a text
+/// box story region, or (issue #203) a footnote / endnote story region.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum A11yNode {
@@ -679,6 +679,53 @@ pub enum A11yNode {
     Table(A11yTable),
     Story(A11yStory),
     TextBox(A11yTextBox),
+    Note(A11yNote),
+}
+
+/// Issue #203 — which note family an [`A11yNote`] region or an
+/// [`A11yNoteRef`] reference mark belongs to.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum A11yNoteKind {
+    #[default]
+    Footnote,
+    Endnote,
+}
+
+/// Issue #203 — one footnote / endnote story mirrored into the
+/// screen-reader DOM. A FOOTNOTE (`role="doc-footnote"`) sits right after
+/// the paragraph holding its first reference (after that paragraph's
+/// text-box regions), in the same node list — top level for a body
+/// paragraph, the cell's `nodes` for a cell paragraph. ENDNOTES are
+/// appended at the very end of the top-level list, in first-reference
+/// order; the mirror wraps that contiguous suffix in one
+/// `role="doc-endnotes"` section. A note is its own node, so an edit
+/// inside it patches only that region (`A11yPatch::Update`).
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct A11yNote {
+    /// Footnote or endnote. (Not `kind`: that is the node's tag.)
+    pub note_kind: A11yNoteKind,
+    /// Stable region id — `"footnote-<w:id>"` / `"endnote-<w:id>"`. The
+    /// reference marks' [`A11yNoteRef::id`] names it; the shell derives
+    /// the DOM `id` from it and matches it against the active note story
+    /// (`editing_story` area `Footnote` / `Endnote`, `rid` = the w:id).
+    pub id: String,
+    /// The note's `w:id` (what `editing_story.rid` carries).
+    pub note_id: u32,
+    /// Display marker in document order (`"1"`, `"iv"`, …); empty for a
+    /// custom-marked reference (the author's own mark follows in text).
+    pub marker: String,
+    pub nodes: Vec<A11yNode>,
+}
+
+/// Issue #203 — the note a reference-mark run points at: the mirror
+/// renders the run as `role="doc-noteref"` linking to the region whose
+/// [`A11yNote::id`] equals `id`.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct A11yNoteRef {
+    pub kind: A11yNoteKind,
+    pub id: String,
 }
 
 /// Issue #165 — one text box story mirrored into the screen-reader DOM as
@@ -745,6 +792,13 @@ pub struct A11yRun {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// Issue #203 — set on a footnote / endnote REFERENCE mark (whose
+    /// `text` is then the note's display marker): the note region it
+    /// links to. Absent on every other run — and off the wire, so a
+    /// document without notes serializes exactly as before. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tsify(optional)]
+    pub note_ref: Option<A11yNoteRef>,
 }
 
 /// Table node — mirrored as `<table role="table">` in the DOM. PR 3b
@@ -798,4 +852,59 @@ pub enum A11yPatch {
     Insert { index: u32, node: A11yNode },
     /// Remove the node at `index`, shifting later nodes up.
     Remove { index: u32 },
+}
+
+#[cfg(test)]
+mod a11y_note_wire_tests {
+    use super::*;
+
+    fn run(text: &str, note_ref: Option<A11yNoteRef>) -> A11yRun {
+        A11yRun {
+            text: text.into(),
+            bold: false,
+            italic: false,
+            underline: false,
+            note_ref,
+        }
+    }
+
+    /// Issue #203 — a run without a reference mark serializes exactly as
+    /// before (no `note_ref` key), and an old payload deserializes.
+    #[test]
+    fn plain_runs_keep_their_wire_shape() {
+        let json = serde_json::to_string(&run("a", None)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"text":"a","bold":false,"italic":false,"underline":false}"#
+        );
+        let back: A11yRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, run("a", None));
+    }
+
+    #[test]
+    fn note_nodes_round_trip() {
+        let node = A11yNode::Note(A11yNote {
+            note_kind: A11yNoteKind::Endnote,
+            id: "endnote-2".into(),
+            note_id: 2,
+            marker: "i".into(),
+            nodes: vec![],
+        });
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.starts_with(r#"{"kind":"NOTE""#), "{json}");
+        assert_eq!(serde_json::from_str::<A11yNode>(&json).unwrap(), node);
+        let r = run(
+            "1",
+            Some(A11yNoteRef {
+                kind: A11yNoteKind::Footnote,
+                id: "footnote-1".into(),
+            }),
+        );
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(r#""note_ref":{"kind":"Footnote","id":"footnote-1"}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<A11yRun>(&json).unwrap(), r);
+    }
 }

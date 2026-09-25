@@ -29,11 +29,16 @@
  * widthEmu / rect.w`, the same zoom / DPR-free ratio the resize path
  * uses, so the shell never reconstructs the layout scale chain. Inline
  * images have no body layer (their sentinel flows with the text; a press
- * on the body still reaches the canvas and keeps the image selected). */
+ * on the body still reaches the canvas and keeps the image selected).
+ *
+ * Issue #206 — pictures inside text-box stories (and inside a box nested
+ * in one) are listed by the same query with their `story` chain; every
+ * command below hands that chain back, so selection, drag, resize and
+ * the wrap picker work on them exactly as on body pictures. */
 import { For, Show, createSignal } from 'solid-js';
 import { ImageWrapPicker } from '@nge/ui';
 import type { EngineClient } from '../engine/engine-client';
-import type { EngineStore, ImageRectCss } from '../state/engine-store';
+import { sameImageAddr, type EngineStore, type ImageRectCss } from '../state/engine-store';
 
 interface HandleDef {
     id: string;
@@ -80,16 +85,7 @@ export function ImageHandlesOverlay(props: {
             .imageRects()
             .find(
                 (im) =>
-                    im.at === sel.at &&
-                    im.path.steps.length === sel.path.steps.length &&
-                    im.path.steps.every((s, i) => {
-                        const o = sel.path.steps[i]!;
-                        if (s.kind !== o.kind) return false;
-                        if (s.kind === 'BLOCK' && o.kind === 'BLOCK') return s.idx === o.idx;
-                        if (s.kind === 'CELL' && o.kind === 'CELL')
-                            return s.row === o.row && s.col === o.col;
-                        return false;
-                    }) &&
+                    sameImageAddr(im, sel) &&
                     im.rect.y + im.rect.h > top &&
                     im.rect.y < bottom,
             );
@@ -118,7 +114,7 @@ export function ImageHandlesOverlay(props: {
         if (!im || !im.floating) return;
         e.preventDefault();
         e.stopPropagation();
-        const addr = { path: im.path, at: im.at };
+        const addr = { path: im.path, at: im.at, story: im.story };
         const startX = e.clientX;
         const startY = e.clientY;
         /* px → EMU: the image's own extent gives the exact ratio. */
@@ -156,6 +152,7 @@ export function ImageHandlesOverlay(props: {
                     at: addr.at,
                     offset_h_emu: Math.round(offXPx * emuPerPx),
                     offset_v_emu: Math.round(offYPx * emuPerPx),
+                    story: addr.story,
                 })
                 .catch((err: unknown) => console.error('moveImage failed', err));
         };
@@ -170,7 +167,7 @@ export function ImageHandlesOverlay(props: {
         if (!im) return;
         /* Capture the resize address up front — a mid-drag refresh must
            not repoint the commit at a different image. */
-        const addr = { path: im.path, at: im.at };
+        const addr = { path: im.path, at: im.at, story: im.story };
         const startX = e.clientX;
         const startY = e.clientY;
         const startW = im.rect.w;
@@ -233,6 +230,7 @@ export function ImageHandlesOverlay(props: {
                         at: addr.at,
                         width_emu: targetEmuW,
                         height_emu: targetEmuH,
+                        story: addr.story,
                     })
                     .catch((err: unknown) => console.error('resizeImage failed', err));
             }
@@ -267,6 +265,7 @@ export function ImageHandlesOverlay(props: {
                                         at: im.at,
                                         floating: im.floating,
                                         wrap: im.wrap,
+                                        story: im.story,
                                     };
                                 }}
                             />

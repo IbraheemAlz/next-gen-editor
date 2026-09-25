@@ -693,6 +693,11 @@ impl StoryPart {
 /// that box's story, the nested box's story-rooted `(host, at)`.
 type TextBoxAddr = (EngineBlockPath, u32, Option<(EngineBlockPath, u32)>);
 
+/// Issue #206 — an image command's resolved story chain (engine hops,
+/// outermost first; empty = the body) plus a copy of the picture's inline
+/// object at the addressed `(path, at)` in that story, if any.
+type StoryImage = (Vec<(EngineBlockPath, u32)>, Option<engine::InlineObject>);
+
 /// One laid-out line flattened for pointer hit-testing and caret/selection
 /// geometry. All coordinates are absolute page points (= canvas device px).
 struct LineGeom {
@@ -4992,11 +4997,105 @@ fn collect_paragraph_image_rects(
                         frame_x: 0.0,
                         frame_y: 0.0,
                         wrap: None,
+                        /* Stamped by `collect_text_box_image_rects` for
+                        a picture inside a text-box story. */
+                        story: Vec::new(),
+                        story_rid: String::new(),
                     });
                 }
                 pen += g.x_advance;
             }
         }
+    }
+}
+
+/// Issue #206 — emit a rect for every picture inside the story of the
+/// text-box float `f` (inline pictures through the story's paragraph
+/// boxes, floating ones from the frame's `floats`), then recurse into the
+/// boxes nested in that story. `base` is the absolute device-px origin of
+/// the space `f.origin` is relative to (the page top-left for a page
+/// float, the parent's content rect for a nested box); `chain` is the
+/// `(host, at)` hop list down to and including `f`, host paths rooted in
+/// the enclosing story. Every rect it emits carries the chain as its
+/// `story` + the `outer/inner` rid and a path rooted in its story.
+/// Bounded by the layout's nesting cap: a frame past it has no floats.
+fn collect_text_box_image_rects(
+    f: &layout::FloatBox,
+    base: (f32, f32),
+    chain: &[(EngineBlockPath, u32)],
+    out: &mut Vec<bridge::ImageRect>,
+) {
+    let (Some(tb), Some((origin, _))) = (f.text_box.as_deref(), f.text_box_content_rect()) else {
+        return;
+    };
+    let (cx, cy) = (base.0 + origin.x, base.1 + origin.y);
+    let start = out.len();
+    for (i, block) in tb.blocks.iter().enumerate() {
+        match block {
+            LayoutBlock::Paragraph(p) => {
+                collect_paragraph_image_rects(p, cx, cy, &BridgeBlockPath::top(i as u32), out);
+            }
+            LayoutBlock::Table(t) => {
+                collect_table_image_rects(t, i as u32, cx + t.origin.x, cy + t.origin.y, out);
+            }
+        }
+    }
+    /* The frame's floats resolved against the story's pseudo page, whose
+    block `i` is story block `i`. */
+    let story_paths: Vec<EngineBlockPath> = (0..tb.blocks.len() as u32)
+        .map(EngineBlockPath::top)
+        .collect();
+    for nf in tb.floats.iter().filter(|nf| nf.text_box.is_none()) {
+        let Some(host) = float_host_path(&story_paths, nf) else {
+            continue;
+        };
+        out.push(bridge::ImageRect {
+            path: engine_to_bridge_path(host),
+            at: nf.at,
+            rel_id: nf.rel_id.clone(),
+            rect: BridgeRect {
+                x: cx + nf.origin.x,
+                y: cy + nf.origin.y,
+                w: nf.size.width,
+                h: nf.size.height,
+            },
+            width_emu: 0,
+            height_emu: 0,
+            floating: true,
+            frame_x: cx + nf.frame_origin.x,
+            frame_y: cy + nf.frame_origin.y,
+            wrap: None,
+            story: Vec::new(),
+            story_rid: String::new(),
+        });
+    }
+    let story: Vec<bridge::TextBoxHop> = chain
+        .iter()
+        .map(|(h, a)| bridge::TextBoxHop {
+            path: engine_to_bridge_path(h.clone()),
+            at: *a,
+        })
+        .collect();
+    let rid = chain
+        .iter()
+        .map(|(h, a)| text_box_rid(h, *a))
+        .collect::<Vec<_>>()
+        .join("/");
+    for im in &mut out[start..] {
+        im.story = story.clone();
+        im.story_rid = rid.clone();
+    }
+    for nf in tb
+        .floats
+        .iter()
+        .filter(|nf| nf.text_box.is_some() && !nf.hidden)
+    {
+        let Some(host) = float_host_path(&story_paths, nf) else {
+            continue;
+        };
+        let mut next = chain.to_vec();
+        next.push((host, nf.at));
+        collect_text_box_image_rects(nf, (cx, cy), &next, out);
     }
 }
 
@@ -5818,28 +5917,171 @@ fn push_run(runs: &mut Vec<A11yRun>, text: &str, s: u32, e: u32, style: SpanStyl
                 .underline
                 .unwrap_or(engine::UnderlineStyle::None)
                 .is_visible(),
+            note_ref: None,
         });
     }
 }
 
 /// Split a paragraph into gap-free accessibility runs by its style spans.
-fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
+///
+/// Issue #203 — `subs` are the paragraph's note marks (each a U+FFFC
+/// placeholder byte offset, the display text, the optional note link):
+/// each placeholder is replaced by its own run carrying the marker text
+/// (and `note_ref` for a reference), styled like the span it sits in.
+/// Without `subs` the output is exactly the pre-#203 run list.
+fn a11y_runs(para: &engine::Paragraph, subs: &[A11yNoteMark]) -> Vec<A11yRun> {
     let len = para.text.len() as u32;
     let mut runs: Vec<A11yRun> = Vec::new();
+    let push = |runs: &mut Vec<A11yRun>, s: u32, e: u32, style: SpanStyle| {
+        let mut cursor = s;
+        for m in subs.iter().filter(|m| m.at >= s && m.at < e) {
+            push_run(runs, &para.text, cursor, m.at, style.clone());
+            runs.push(A11yRun {
+                text: m.text.clone(),
+                bold: style.bold.unwrap_or(false),
+                italic: style.italic.unwrap_or(false),
+                underline: style
+                    .underline
+                    .unwrap_or(engine::UnderlineStyle::None)
+                    .is_visible(),
+                note_ref: m.note_ref.clone(),
+            });
+            cursor = (m.at + A11Y_PLACEHOLDER_LEN).min(e);
+        }
+        push_run(runs, &para.text, cursor, e, style);
+    };
     let mut cursor = 0_u32;
     for sr in &para.spans {
-        push_run(
-            &mut runs,
-            &para.text,
-            cursor,
-            sr.start,
-            SpanStyle::default(),
-        );
-        push_run(&mut runs, &para.text, sr.start, sr.end, sr.style.clone());
+        push(&mut runs, cursor, sr.start, SpanStyle::default());
+        push(&mut runs, sr.start, sr.end, sr.style.clone());
         cursor = sr.end;
     }
-    push_run(&mut runs, &para.text, cursor, len, SpanStyle::default());
+    push(&mut runs, cursor, len, SpanStyle::default());
     runs
+}
+
+/// UTF-8 length of the U+FFFC object placeholder a note mark occupies.
+const A11Y_PLACEHOLDER_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
+
+/// Issue #203 — one note mark inside a paragraph, for [`a11y_runs`].
+struct A11yNoteMark {
+    at: u32,
+    text: String,
+    note_ref: Option<bridge::A11yNoteRef>,
+}
+
+/// Issue #203 — the note context of a body walk: the document (for the
+/// note stories), the document-order display markers, and the footnotes
+/// already emitted (a note referenced twice gets ONE region, after its
+/// first reference).
+struct A11yNotes<'d> {
+    doc: &'d DocumentTree,
+    markers: HashMap<engine::NoteAnchor, String>,
+    emitted: RefCell<std::collections::HashSet<engine::NoteAnchor>>,
+}
+
+/// Issue #203 — the region id of a note: `"footnote-<w:id>"` /
+/// `"endnote-<w:id>"`.
+fn a11y_note_id(anchor: engine::NoteAnchor) -> String {
+    match anchor.kind {
+        engine::NoteKind::Footnote => format!("footnote-{}", anchor.id),
+        engine::NoteKind::Endnote => format!("endnote-{}", anchor.id),
+    }
+}
+
+fn a11y_note_kind(kind: engine::NoteKind) -> bridge::A11yNoteKind {
+    match kind {
+        engine::NoteKind::Footnote => bridge::A11yNoteKind::Footnote,
+        engine::NoteKind::Endnote => bridge::A11yNoteKind::Endnote,
+    }
+}
+
+/// Issue #203 — the note anchor a reference inline object names.
+fn note_ref_anchor(kind: &engine::InlineKind) -> Option<engine::NoteAnchor> {
+    match kind {
+        engine::InlineKind::FootnoteRef { id, .. } => Some(engine::NoteAnchor {
+            kind: engine::NoteKind::Footnote,
+            id: *id,
+        }),
+        engine::InlineKind::EndnoteRef { id, .. } => Some(engine::NoteAnchor {
+            kind: engine::NoteKind::Endnote,
+            id: *id,
+        }),
+        _ => None,
+    }
+}
+
+/// Issue #203 — the note marks of `p` in `scope`: reference marks when
+/// the walk carries a note context (the body), the self-mark when the
+/// walk is a note story's body. Only real U+FFFC placeholders qualify.
+fn a11y_note_marks(p: &engine::Paragraph, scope: A11yScope<'_>) -> Vec<A11yNoteMark> {
+    let mut marks: Vec<A11yNoteMark> = Vec::new();
+    if scope.notes.is_none() && scope.self_marker.is_none() {
+        return marks;
+    }
+    for io in &p.inline_objects {
+        if !p
+            .text
+            .get(io.at as usize..)
+            .is_some_and(|t| t.starts_with('\u{FFFC}'))
+        {
+            continue;
+        }
+        if let Some(notes) = scope.notes
+            && let Some(anchor) = note_ref_anchor(&io.kind)
+        {
+            let note_ref = notes.doc.note_story(anchor).map(|_| bridge::A11yNoteRef {
+                kind: a11y_note_kind(anchor.kind),
+                id: a11y_note_id(anchor),
+            });
+            marks.push(A11yNoteMark {
+                at: io.at,
+                text: notes.markers.get(&anchor).cloned().unwrap_or_default(),
+                note_ref,
+            });
+        } else if let Some(marker) = scope.self_marker
+            && matches!(io.kind, engine::InlineKind::NoteSelfRef { .. })
+        {
+            marks.push(A11yNoteMark {
+                at: io.at,
+                text: marker.to_string(),
+                note_ref: None,
+            });
+        }
+    }
+    marks.sort_by_key(|m| m.at);
+    marks.dedup_by_key(|m| m.at);
+    marks
+}
+
+/// Issue #203 — the region of note `anchor`: its story body built with
+/// this module's own block walk (self-mark read as `marker`; text boxes
+/// in it scoped under the note id). `None` for a dangling reference.
+fn build_a11y_note(
+    doc: &DocumentTree,
+    anchor: engine::NoteAnchor,
+    marker: &str,
+    direction: Direction,
+) -> Option<A11yNode> {
+    let story = doc.note_story(anchor)?;
+    let id = a11y_note_id(anchor);
+    let id_prefix = format!("{id}:");
+    let nodes = build_a11y_nodes_of(
+        &story.body,
+        direction,
+        A11yScope {
+            id_prefix: &id_prefix,
+            self_marker: Some(marker),
+            ..A11yScope::BODY
+        },
+    );
+    Some(A11yNode::Note(bridge::A11yNote {
+        note_kind: a11y_note_kind(anchor.kind),
+        id,
+        note_id: anchor.id,
+        marker: marker.to_string(),
+        nodes,
+    }))
 }
 
 /// Issue #165 — where a block list sits, for the text-box region ids its
@@ -5847,12 +6089,17 @@ fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
 /// `"<parent box id>/"` inside a story, `"<rid>:"` inside a header /
 /// footer part), `path_prefix` is the list's own path (`"3.1x0."` for a
 /// cell of top-level table 3), `depth` the text-box nesting level of the
-/// list (0 = not inside a box).
+/// list (0 = not inside a box). Issue #203 — `notes` is the note context
+/// of the BODY walk (reference marks + footnote regions; `None`
+/// everywhere else), `self_marker` the display marker of the note whose
+/// story is being walked (its self-mark reads as that text).
 #[derive(Clone, Copy)]
 struct A11yScope<'a> {
     id_prefix: &'a str,
     path_prefix: &'a str,
     depth: u32,
+    notes: Option<&'a A11yNotes<'a>>,
+    self_marker: Option<&'a str>,
 }
 
 impl A11yScope<'static> {
@@ -5860,6 +6107,8 @@ impl A11yScope<'static> {
         id_prefix: "",
         path_prefix: "",
         depth: 0,
+        notes: None,
+        self_marker: None,
     };
 }
 
@@ -5990,8 +6239,41 @@ fn push_a11y_paragraph(
     out.push(A11yNode::Paragraph(A11yParagraph {
         direction,
         resolved_direction,
-        runs: a11y_runs(p),
+        runs: a11y_runs(p, &a11y_note_marks(p, scope)),
     }));
+    push_a11y_text_boxes(out, p, direction, scope, path);
+    /* Issue #203 — the footnotes FIRST referenced in this paragraph
+    follow it (after its text boxes), in reference order. Endnotes
+    collect at the end of the tree instead (`build_a11y_nodes`). */
+    if let Some(notes) = scope.notes {
+        let mut refs: Vec<(u32, engine::NoteAnchor)> = p
+            .inline_objects
+            .iter()
+            .filter_map(|io| note_ref_anchor(&io.kind).map(|a| (io.at, a)))
+            .filter(|(_, a)| a.kind == engine::NoteKind::Footnote)
+            .collect();
+        refs.sort_by_key(|(at, _)| *at);
+        for (_, anchor) in refs {
+            if notes.doc.note_story(anchor).is_none() || !notes.emitted.borrow_mut().insert(anchor)
+            {
+                continue;
+            }
+            let marker = notes.markers.get(&anchor).cloned().unwrap_or_default();
+            if let Some(node) = build_a11y_note(notes.doc, anchor, &marker, direction) {
+                out.push(node);
+            }
+        }
+    }
+}
+
+/// Issue #165 — the text-box regions anchored in paragraph `p`.
+fn push_a11y_text_boxes(
+    out: &mut Vec<A11yNode>,
+    p: &engine::Paragraph,
+    direction: Direction,
+    scope: A11yScope<'_>,
+    path: &str,
+) {
     if scope.depth >= MAX_TEXT_BOX_LAYOUT_DEPTH {
         return;
     }
@@ -6015,6 +6297,8 @@ fn push_a11y_paragraph(
                 id_prefix: &inner_prefix,
                 path_prefix: "",
                 depth: scope.depth + 1,
+                notes: None,
+                self_marker: None,
             },
         );
         out.push(A11yNode::TextBox(bridge::A11yTextBox {
@@ -6317,7 +6601,19 @@ impl Engine {
             /* Issue #85 — a snapshot is a read of the whole session (the
             active story included) and recovery rebuilds it wholesale. */
             | Command::Snapshot { .. }
-            | Command::Recover { .. } => None,
+            | Command::Recover { .. }
+            /* Issue #206 — the image-geometry query is a pure read of the
+            whole layout (text-box pictures included). */
+            | Command::GetImageRects => None,
+            /* Issue #206 — picture edits carry an explicit, body-rooted
+            address (`story` chain + path) and never move a text byte, so
+            the open box's `(host, at)` and its selection stay valid:
+            a picture in a box is edited while that box is open. */
+            Command::ResizeImage { .. } | Command::MoveImage { .. } | Command::SetImageWrap { .. }
+                if matches!(self.active_story, StoryTarget::TextBox { .. }) =>
+            {
+                None
+            }
             /* Loading a document tears the story's ground away —
             exit first, then handle normally. */
             Command::LoadDocx { .. } | Command::OpenDocument { .. } => {
@@ -6522,14 +6818,21 @@ impl Engine {
                 at,
                 width_emu,
                 height_emu,
-            } => self.do_resize_image(path, at, width_emu, height_emu),
+                story,
+            } => self.do_resize_image(path, at, width_emu, height_emu, story),
             Command::MoveImage {
                 path,
                 at,
                 offset_h_emu,
                 offset_v_emu,
-            } => self.do_move_image(path, at, offset_h_emu, offset_v_emu),
-            Command::SetImageWrap { path, at, wrap } => self.do_set_image_wrap(path, at, wrap),
+                story,
+            } => self.do_move_image(path, at, offset_h_emu, offset_v_emu, story),
+            Command::SetImageWrap {
+                path,
+                at,
+                wrap,
+                story,
+            } => self.do_set_image_wrap(path, at, wrap, story),
             Command::SetSelection { range, caret } => self.do_set_selection(range, caret),
             Command::ExtendSelection { to, .. } => self.do_extend_selection(to),
             Command::SelectAll => self.do_select_all(),
@@ -9941,7 +10244,22 @@ impl Engine {
                     frame_y: page_top + f.frame_origin.y,
                     /* Filled from the document model below. */
                     wrap: None,
+                    story: Vec::new(),
+                    story_rid: String::new(),
                 });
+            }
+            /* Issue #206 — pictures inside text-box stories (and inside a
+            box nested in one): the box frames were laid out with the
+            page, so walk them. Header / footer boxes are not addressable
+            (no body path), like their pictures. */
+            for f in &page.floats {
+                if f.text_box.is_none() || f.hidden {
+                    continue;
+                }
+                let Some(host) = float_host_path(paths, f) else {
+                    continue;
+                };
+                collect_text_box_image_rects(f, (0.0, page_top), &[(host, f.at)], &mut out);
             }
             page_top += page.size.height + gap;
         }
@@ -9950,10 +10268,28 @@ impl Engine {
         resizes by `new_emu = emu × new_px / old_px`, so it needs the
         current EMU alongside the current px rect. */
         let doc = self.undo.current();
+        /* Issue #206 — a box picture's path is rooted in its story: resolve
+        each story tree once (keyed by its rid). */
+        let mut story_trees: HashMap<String, Option<DocumentTree>> = HashMap::new();
         for im in &mut out {
             let epath = bridge_path_to_engine(&im.path);
-            let io = doc
-                .paragraph_at_path(&epath)
+            let tree = if im.story.is_empty() {
+                Some(doc)
+            } else {
+                story_trees
+                    .entry(im.story_rid.clone())
+                    .or_insert_with(|| {
+                        let hops: Vec<(EngineBlockPath, u32)> = im
+                            .story
+                            .iter()
+                            .map(|h| (bridge_path_to_engine(&h.path), h.at))
+                            .collect();
+                        doc.text_box_story_tree(&hops)
+                    })
+                    .as_ref()
+            };
+            let io = tree
+                .and_then(|t| t.paragraph_at_path(&epath))
                 .and_then(|p| p.inline_objects.iter().find(|io| io.at == im.at));
             if let Some(io) = io
                 && let engine::InlineKind::Image {
@@ -13332,7 +13668,26 @@ impl Engine {
             _ => Direction::Ltr,
         };
         let doc = self.undo.current();
-        let mut nodes = build_a11y_nodes_of(doc.blocks.iter(), direction, A11yScope::BODY);
+        /* Issue #203 — the body walk carries the note context: reference
+        marks read as their document-order markers, and each footnote's
+        region follows the paragraph of its first reference. */
+        let notes = A11yNotes {
+            doc,
+            markers: if doc.footnote_stories.is_empty() && doc.endnote_stories.is_empty() {
+                HashMap::new()
+            } else {
+                doc.note_markers()
+            },
+            emitted: RefCell::new(std::collections::HashSet::new()),
+        };
+        let mut nodes = build_a11y_nodes_of(
+            doc.blocks.iter(),
+            direction,
+            A11yScope {
+                notes: Some(&notes),
+                ..A11yScope::BODY
+            },
+        );
         /* Issue #73 — mirror every REFERENCED header/footer part so
         screen readers can reach band text (deduped by rid, stable
         body → headers → footers order; the delta differ handles the
@@ -13352,6 +13707,21 @@ impl Engine {
                 ),
             }));
         });
+        /* Issue #203 — endnotes: one region each, in first-reference
+        order, as the contiguous tail of the tree (the mirror wraps it in
+        a `role="doc-endnotes"` section). */
+        if !doc.endnote_stories.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for r in doc.note_references() {
+                if r.anchor.kind != engine::NoteKind::Endnote || !seen.insert(r.anchor) {
+                    continue;
+                }
+                let marker = notes.markers.get(&r.anchor).cloned().unwrap_or_default();
+                if let Some(node) = build_a11y_note(doc, r.anchor, &marker, direction) {
+                    nodes.push(node);
+                }
+            }
+        }
         nodes
     }
 
@@ -14471,22 +14841,65 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::ResizeImage` (Issue #44) — overwrite the inline image's
-    /// `<wp:extent>` at `(path, at)` with new EMU dimensions. Clears the
-    /// layout cache (the reserved image box changed size) and repaints.
-    fn do_resize_image(
-        &mut self,
-        path: BridgeBlockPath,
+    /// Issue #206 — resolve an image command's `story` chain against the
+    /// current tree: the engine hops plus a copy of the picture's inline
+    /// object at `(path, at)` in that story (body when the chain is
+    /// empty). `Err` is the honest reply for a chain past the nesting cap,
+    /// a hop that names no text box, or an address holding no picture.
+    fn resolve_story_image(
+        &self,
+        origin: &str,
+        story: &[bridge::TextBoxHop],
+        path: &EngineBlockPath,
         at: u32,
-        width_emu: i64,
-        height_emu: i64,
+    ) -> Result<StoryImage, Box<Event>> {
+        if story.len() > MAX_TEXT_BOX_LAYOUT_DEPTH as usize {
+            return Err(Box::new(Event::Error {
+                message: format!(
+                    "{origin}: text boxes nest at most {MAX_TEXT_BOX_LAYOUT_DEPTH} deep"
+                ),
+            }));
+        }
+        let hops: Vec<(EngineBlockPath, u32)> = story
+            .iter()
+            .map(|h| (bridge_path_to_engine(&h.path), h.at))
+            .collect();
+        let doc = self.undo.current();
+        let find = |d: &DocumentTree| {
+            d.paragraph_at_path(path).and_then(|p| {
+                p.inline_objects
+                    .iter()
+                    .find(|io| io.at == at && matches!(io.kind, engine::InlineKind::Image { .. }))
+                    .cloned()
+            })
+        };
+        let io = if hops.is_empty() {
+            find(doc)
+        } else {
+            let Some(tree) = doc.text_box_story_tree(&hops) else {
+                return Err(Box::new(Event::Error {
+                    message: format!("{origin}: the story chain addresses no text box"),
+                }));
+            };
+            find(&tree)
+        };
+        Ok((hops, io))
+    }
+
+    /// Issue #206 — push `edit` (run inside the story the hops address,
+    /// the body for none) as ONE undo step and re-lay-out: the paragraph
+    /// layout LRU is cleared (the image spec rides the sentinel glyph; a
+    /// story edit re-keys its box) and the pages re-paginate + repaint.
+    fn commit_image_edit(
+        &mut self,
+        hops: &[(EngineBlockPath, u32)],
+        edit: impl FnOnce(&DocumentTree) -> DocumentTree,
     ) -> Event {
-        let new_doc = self.undo.current().resize_inline_image_at(
-            &bridge_to_engine_path(path),
-            at,
-            width_emu,
-            height_emu,
-        );
+        let Some(new_doc) = self.undo.current().with_text_box_story_edit(hops, edit) else {
+            return Event::Error {
+                message: "Image edit: the story chain addresses no text box".into(),
+            };
+        };
         self.undo.push(new_doc);
         self.layout_cache.get_mut().clear();
         self.invalidate_layout_snapshot();
@@ -14495,6 +14908,36 @@ impl Engine {
             return *e;
         }
         self.selection_changed()
+    }
+
+    /// `Command::ResizeImage` (Issue #44) — overwrite the inline image's
+    /// `<wp:extent>` at `(path, at)` with new EMU dimensions. Clears the
+    /// layout cache (the reserved image box changed size) and repaints.
+    /// Issue #206 — `story` addresses a picture inside a text-box story;
+    /// there an address holding no picture is an honest `Event::Error`.
+    fn do_resize_image(
+        &mut self,
+        path: BridgeBlockPath,
+        at: u32,
+        width_emu: i64,
+        height_emu: i64,
+        story: Vec<bridge::TextBoxHop>,
+    ) -> Event {
+        let epath = bridge_to_engine_path(path);
+        let hops = match self.resolve_story_image("ResizeImage", &story, &epath, at) {
+            Ok((hops, io)) => {
+                if !hops.is_empty() && io.is_none() {
+                    return Event::Error {
+                        message: "ResizeImage: no picture at that address in the text box".into(),
+                    };
+                }
+                hops
+            }
+            Err(e) => return *e,
+        };
+        self.commit_image_edit(&hops, |d| {
+            d.resize_inline_image_at(&epath, at, width_emu, height_emu)
+        })
     }
 
     /// `Command::MoveImage` (issue #69) — reposition the floating image
@@ -14505,44 +14948,30 @@ impl Engine {
     /// at page flush) and repainted. An address that holds no floating
     /// image is an honest `Event::Error`, never a silent no-op — the
     /// shell only offers the body-drag on `ImageRect.floating` rects.
+    /// Issue #206 — `story` addresses a picture inside a text-box story.
     fn do_move_image(
         &mut self,
         path: BridgeBlockPath,
         at: u32,
         offset_h_emu: i64,
         offset_v_emu: i64,
+        story: Vec<bridge::TextBoxHop>,
     ) -> Event {
         let epath = bridge_to_engine_path(path);
-        let is_floating_image = self
-            .undo
-            .current()
-            .paragraph_at_path(&epath)
-            .is_some_and(|p| {
-                p.inline_objects.iter().any(|io| {
-                    io.at == at
-                        && io.is_floating()
-                        && matches!(io.kind, engine::InlineKind::Image { .. })
-                })
-            });
-        if !is_floating_image {
-            return Event::Error {
-                message: "MoveImage: no floating image at that address — inline images \
-                          flow with the text and have no free position (issue #69)"
-                    .into(),
-            };
-        }
-        let new_doc =
-            self.undo
-                .current()
-                .move_floating_image_at(&epath, at, offset_h_emu, offset_v_emu);
-        self.undo.push(new_doc);
-        self.layout_cache.get_mut().clear();
-        self.invalidate_layout_snapshot();
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
-        }
-        self.selection_changed()
+        let hops = match self.resolve_story_image("MoveImage", &story, &epath, at) {
+            Ok((hops, Some(io))) if io.is_floating() => hops,
+            Ok(_) => {
+                return Event::Error {
+                    message: "MoveImage: no floating image at that address — inline images \
+                              flow with the text and have no free position (issue #69)"
+                        .into(),
+                };
+            }
+            Err(e) => return *e,
+        };
+        self.commit_image_edit(&hops, |d| {
+            d.move_floating_image_at(&epath, at, offset_h_emu, offset_v_emu)
+        })
     }
 
     /// `Command::SetImageWrap` (issue #82) — set the text-wrap mode of
@@ -14551,32 +14980,28 @@ impl Engine {
     /// contract rides the sentinel glyph, so the paragraph layout LRU is
     /// cleared before the re-pagination (which runs the wrap loop). An
     /// address that holds no floating image is an honest `Event::Error`.
+    /// Issue #206 — `story` addresses a picture inside a text-box story
+    /// (the box story's own wrap loop re-runs on the next layout).
     fn do_set_image_wrap(
         &mut self,
         path: BridgeBlockPath,
         at: u32,
         wrap: bridge::ImageWrapMode,
+        story: Vec<bridge::TextBoxHop>,
     ) -> Event {
         use bridge::ImageWrapMode as M;
         let epath = bridge_to_engine_path(path);
-        let is_floating_image = self
-            .undo
-            .current()
-            .paragraph_at_path(&epath)
-            .is_some_and(|p| {
-                p.inline_objects.iter().any(|io| {
-                    io.at == at
-                        && io.is_floating()
-                        && matches!(io.kind, engine::InlineKind::Image { .. })
-                })
-            });
-        if !is_floating_image {
-            return Event::Error {
-                message: "SetImageWrap: no floating image at that address — an inline image \
-                          flows with the text and has no wrap mode (issue #82)"
-                    .into(),
-            };
-        }
+        let hops = match self.resolve_story_image("SetImageWrap", &story, &epath, at) {
+            Ok((hops, Some(io))) if io.is_floating() => hops,
+            Ok(_) => {
+                return Event::Error {
+                    message: "SetImageWrap: no floating image at that address — an inline image \
+                              flows with the text and has no wrap mode (issue #82)"
+                        .into(),
+                };
+            }
+            Err(e) => return *e,
+        };
         let (kind, behind) = match wrap {
             M::Square => (engine::WrapKind::Square, false),
             M::Tight => (engine::WrapKind::Tight, false),
@@ -14585,18 +15010,9 @@ impl Engine {
             M::BehindText => (engine::WrapKind::None, true),
             M::InFrontOfText => (engine::WrapKind::None, false),
         };
-        let new_doc = self
-            .undo
-            .current()
-            .set_floating_image_wrap_at(&epath, at, kind, behind);
-        self.undo.push(new_doc);
-        self.layout_cache.get_mut().clear();
-        self.invalidate_layout_snapshot();
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
-        }
-        self.selection_changed()
+        self.commit_image_edit(&hops, |d| {
+            d.set_floating_image_wrap_at(&epath, at, kind, behind)
+        })
     }
 
     /// `Command::SetColumns` (Sprint 2 UI Edition) — set the multi-
@@ -16035,6 +16451,7 @@ mod tests {
                 bold: false,
                 italic: false,
                 underline: false,
+                note_ref: None,
             }],
         })
     }
@@ -18339,7 +18756,8 @@ mod tests {
         }
         let mut engine = test_engine_with_doc(doc);
         let before = engine.image_geometry().expect("geom")[0].rect.w;
-        let evt = engine.do_resize_image(BridgeBlockPath::top(0), 0, 1_828_800, 1_828_800);
+        let evt =
+            engine.do_resize_image(BridgeBlockPath::top(0), 0, 1_828_800, 1_828_800, Vec::new());
         assert!(matches!(evt, Event::SelectionChanged { .. }));
         let after = engine.image_geometry().expect("geom")[0].rect.w;
         assert!(
@@ -18510,7 +18928,7 @@ mod tests {
     fn move_image_dispatch_shifts_the_float_and_rejects_inline() {
         let mut engine = test_engine_with_doc(floating_image_doc(engine::FloatAnchor::default()));
         let before = engine.image_geometry().expect("geom")[0].clone();
-        let evt = engine.do_move_image(BridgeBlockPath::top(0), 1, 914_400, 457_200);
+        let evt = engine.do_move_image(BridgeBlockPath::top(0), 1, 914_400, 457_200, Vec::new());
         assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
         let after = engine.image_geometry().expect("geom")[0].clone();
         let inch = engine::emu_to_pt(914_400) * 2.0;
@@ -18529,7 +18947,7 @@ mod tests {
         assert!((undone.rect.x - before.rect.x).abs() < 0.01);
 
         let mut inline = test_engine_with_doc(inline_image_doc());
-        let evt = inline.do_move_image(BridgeBlockPath::top(0), 0, 1, 1);
+        let evt = inline.do_move_image(BridgeBlockPath::top(0), 0, 1, 1, Vec::new());
         assert!(
             matches!(evt, Event::Error { .. }),
             "an inline image has no free position: {evt:?}"
@@ -19431,6 +19849,281 @@ mod tests {
         )));
     }
 
+    /* ---------------------------------------------------------------
+    Issue #206 — pictures inside text-box stories are addressable.
+    --------------------------------------------------------------- */
+
+    fn hop(idx: u32, at: u32) -> bridge::TextBoxHop {
+        bridge::TextBoxHop {
+            path: BridgeBlockPath::top(idx),
+            at,
+        }
+    }
+
+    /// Drive one command through the production dispatcher (`apply` has
+    /// no internal await point, so one poll completes it).
+    fn apply_now(e: &mut Engine, cmd: Command) -> Event {
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut fut = Box::pin(e.apply(cmd));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("Engine::apply suspended in a native test"),
+        }
+    }
+
+    /// The single picture rect of `rel` in `rects`.
+    fn rect_of<'r>(rects: &'r [bridge::ImageRect], rel: &str) -> &'r bridge::ImageRect {
+        let hits: Vec<_> = rects.iter().filter(|r| r.rel_id == rel).collect();
+        assert_eq!(hits.len(), 1, "one rect for {rel}: {rects:?}");
+        hits[0]
+    }
+
+    /// `boxed_float_image_doc` + a nested box (with its own floating
+    /// picture) in a second story paragraph, and an INLINE picture in
+    /// the nested story.
+    fn boxed_pictures_doc() -> DocumentTree {
+        let doc = boxed_float_image_doc();
+        doc.with_text_box_story_edit(&[(EngineBlockPath::top(0), 0)], |story| {
+            let mut level2 = DocumentTree::from_text("\u{FFFC}inner \u{FFFC}pic");
+            if let Some(ip) = level2.blocks[0].as_paragraph_mut() {
+                ip.inline_objects.push(story_float_image("rIdInnerPic"));
+                ip.inline_objects.push(engine::InlineObject {
+                    at: "\u{FFFC}inner ".len() as u32,
+                    kind: engine::InlineKind::Image {
+                        rel_id: "rIdInlinePic".to_string(),
+                        width_emu: 228_600,
+                        height_emu: 228_600,
+                    },
+                    anchor: None,
+                    source_xml: None,
+                });
+            }
+            let mut blocks: Vec<engine::Block> = story.blocks.iter().cloned().collect();
+            blocks.push(plain_para("Nested host."));
+            let story = DocumentTree::from_blocks(blocks);
+            let (story, h, a) = story.insert_text_box_at(
+                EnginePos {
+                    path: EngineBlockPath::top(1),
+                    offset: 0,
+                },
+                1_371_600,
+                731_520,
+            );
+            story.with_updated_text_box(&h, a, level2.blocks.iter().cloned().collect())
+        })
+        .expect("outer box")
+    }
+
+    /// Issue #206 — `image_geometry` walks text-box stories (and the box
+    /// nested in one): every picture reports its story chain + rid, its
+    /// story-rooted path, the EMU extent and wrap from the story model,
+    /// and a page-space rect inside the box's content rect.
+    #[test]
+    fn image_geometry_reports_pictures_inside_text_box_stories() {
+        let engine = test_engine_with_doc(boxed_pictures_doc());
+        let rects = engine.image_geometry().expect("image geometry");
+        assert_eq!(rects.len(), 3, "{rects:?}");
+
+        let outer = rect_of(&rects, "rIdBoxPic");
+        assert_eq!(outer.story, vec![hop(0, 0)]);
+        assert_eq!(outer.story_rid, "0@0");
+        assert_eq!(outer.path, BridgeBlockPath::top(0));
+        assert_eq!(outer.at, 0);
+        assert!(outer.floating);
+        assert_eq!((outer.width_emu, outer.height_emu), (685_800, 457_200));
+        assert_eq!(outer.wrap, Some(bridge::ImageWrapMode::Square));
+
+        let nested = rect_of(&rects, "rIdInnerPic");
+        assert_eq!(nested.story, vec![hop(0, 0), hop(1, 0)]);
+        assert_eq!(nested.story_rid, "0@0/1@0");
+        assert!(nested.floating);
+        assert_eq!((nested.width_emu, nested.height_emu), (685_800, 457_200));
+
+        let inline = rect_of(&rects, "rIdInlinePic");
+        assert_eq!(inline.story, vec![hop(0, 0), hop(1, 0)]);
+        assert!(!inline.floating);
+        assert_eq!(inline.at, "\u{FFFC}inner ".len() as u32);
+        assert_eq!((inline.width_emu, inline.height_emu), (228_600, 228_600));
+
+        /* Page space: the outer picture sits at the box's content origin
+        + its content-relative offset, inside the box. */
+        let (pages, _, _, _) = engine.build_pages(engine.scale(), false, None).unwrap();
+        let bx = pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("box");
+        let (origin, content) = bx.text_box_content_rect().expect("content");
+        let tb = bx.text_box.as_deref().unwrap();
+        let pic = tb.floats.iter().find(|f| f.text_box.is_none()).unwrap();
+        assert!((outer.rect.x - (origin.x + pic.origin.x)).abs() < 0.01);
+        assert!((outer.rect.y - (origin.y + pic.origin.y)).abs() < 0.01);
+        assert!((outer.frame_x - (origin.x + pic.frame_origin.x)).abs() < 0.01);
+        for r in [outer, nested, inline] {
+            assert!(
+                r.rect.x >= origin.x - 0.01
+                    && r.rect.x + r.rect.w <= origin.x + content.width + 0.5
+                    && r.rect.y >= origin.y - 0.01,
+                "{r:?} inside the box content {origin:?} {content:?}"
+            );
+        }
+        /* The nested box's own pictures sit inside the nested box. */
+        let nbox = tb.floats.iter().find(|f| f.text_box.is_some()).unwrap();
+        let (norigin, _) = nbox.text_box_content_rect().unwrap();
+        for r in [nested, inline] {
+            assert!(r.rect.x >= origin.x + norigin.x - 0.01, "{r:?}");
+            assert!(r.rect.y >= origin.y + norigin.y - 0.01, "{r:?}");
+        }
+    }
+
+    /// Issue #206 — `MoveImage` / `ResizeImage` / `SetImageWrap` address a
+    /// box picture through `story`: each is one undo step, the rect
+    /// follows, a wrong chain is an honest error, and the commands work
+    /// while that box's story is being edited (the gate lets them
+    /// through). A save round-trips the moved / resized / re-wrapped
+    /// picture — the verified passthrough regenerates it.
+    #[test]
+    fn image_commands_address_pictures_inside_text_box_stories() {
+        let mut engine = test_engine_with_doc(boxed_pictures_doc());
+        let before = rect_of(&engine.image_geometry().unwrap(), "rIdInnerPic").clone();
+        let story = before.story.clone();
+
+        /* Move the nested picture 0.25" right, 0.125" down. */
+        let evt = engine.do_move_image(
+            before.path.clone(),
+            before.at,
+            228_600,
+            114_300,
+            story.clone(),
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let moved = rect_of(&engine.image_geometry().unwrap(), "rIdInnerPic").clone();
+        let quarter = engine::emu_to_pt(228_600) * engine.scale();
+        assert!(
+            (moved.rect.x - moved.frame_x - quarter).abs() < 0.05,
+            "{moved:?}"
+        );
+        assert!((moved.rect.y - moved.frame_y - quarter / 2.0).abs() < 0.05);
+
+        /* Wrong chains: the body paragraph holds no floating picture; a
+        hop that names no box addresses nothing. */
+        let evt = engine.do_move_image(before.path.clone(), before.at, 1, 1, Vec::new());
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        let evt = engine.do_move_image(before.path.clone(), before.at, 1, 1, vec![hop(0, 9)]);
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        let evt = engine.do_resize_image(before.path.clone(), before.at, 5, 5, vec![hop(1, 0)]);
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+
+        /* Enter the NESTED box's story: the image commands still apply. */
+        engine.enter_text_box_story(
+            EngineBlockPath::top(0),
+            0,
+            Some((EngineBlockPath::top(1), 0)),
+            0,
+            0,
+        );
+        let evt = apply_now(
+            &mut engine,
+            Command::ResizeImage {
+                path: before.path.clone(),
+                at: before.at,
+                width_emu: 914_400,
+                height_emu: 609_600,
+                story: story.clone(),
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let evt = apply_now(
+            &mut engine,
+            Command::SetImageWrap {
+                path: before.path.clone(),
+                at: before.at,
+                wrap: bridge::ImageWrapMode::TopAndBottom,
+                story: story.clone(),
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let evt = apply_now(&mut engine, Command::GetImageRects);
+        let Event::ImageRects { images } = evt else {
+            panic!("image rects in story mode: {evt:?}");
+        };
+        let now = rect_of(&images, "rIdInnerPic");
+        assert_eq!((now.width_emu, now.height_emu), (914_400, 609_600));
+        assert_eq!(now.wrap, Some(bridge::ImageWrapMode::TopAndBottom));
+        assert!(matches!(
+            &engine.active_story,
+            StoryTarget::TextBox { inner: Some(_), .. }
+        ));
+
+        /* Save → re-read: the nested picture carries the new geometry. */
+        let Event::DocumentSaved { bytes, .. } = engine.save_docx_bytes("test") else {
+            panic!("save");
+        };
+        let reread = format_docx::read_docx(&bytes).expect("re-read").document;
+        let tree = reread
+            .text_box_story_tree(&[(EngineBlockPath::top(0), 0), (EngineBlockPath::top(1), 0)])
+            .expect("nested story");
+        let io = tree
+            .paragraph_at_path(&EngineBlockPath::top(0))
+            .and_then(|p| p.inline_objects.iter().find(|io| io.at == 0))
+            .expect("nested picture");
+        assert!(matches!(
+            io.kind,
+            engine::InlineKind::Image {
+                width_emu: 914_400,
+                height_emu: 609_600,
+                ..
+            }
+        ));
+        let a = io.anchor.as_deref().expect("still floating");
+        assert_eq!(a.position_h.offset, engine::FloatOffset::Emu(228_600));
+        assert_eq!(a.position_v.offset, engine::FloatOffset::Emu(114_300));
+        assert_eq!(a.wrap, engine::WrapKind::TopAndBottom);
+
+        /* Undo walks the three edits back one step each. */
+        for _ in 0..3 {
+            let evt = apply_now(&mut engine, Command::Undo);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        }
+        let undone = rect_of(&engine.image_geometry().unwrap(), "rIdInnerPic").clone();
+        assert!((undone.rect.x - before.rect.x).abs() < 0.01);
+        assert!((undone.rect.y - before.rect.y).abs() < 0.01);
+        assert_eq!(undone.width_emu, before.width_emu);
+        assert_eq!(undone.wrap, before.wrap);
+    }
+
+    /// Issue #206 — the committed `text_box_pictures.docx` (outer box at
+    /// 1", 3" with 0.1" / 0.05" insets; its story's picture at the content
+    /// corner, 0.75" × 0.5"; the nested box 1.2" / 0.9" into the content
+    /// rect, whose picture sits at ITS content corner, 0.5" × 0.3"): pins
+    /// the page-inch geometry the e2e spec clicks and drags by.
+    #[test]
+    fn text_box_pictures_fixture_reports_page_geometry() {
+        let bytes = include_bytes!("../../format-docx/tests/fixtures/text_box_pictures.docx");
+        let archive = format_docx::read_docx(bytes).expect("fixture");
+        let engine = test_engine_with_doc(archive.document);
+        let px = |inches: f32| inches * 72.0 * engine.scale();
+        let rects = engine.image_geometry().expect("geometry");
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        let near = |a: f32, b: f32| (a - b).abs() < 0.5;
+        let outer = rects.iter().find(|r| r.story.len() == 1).expect("outer");
+        assert_eq!(outer.story_rid, "1@0");
+        assert!(outer.floating);
+        assert!(
+            near(outer.rect.x, px(1.1)) && near(outer.rect.y, px(3.05)),
+            "{outer:?}"
+        );
+        assert!(near(outer.rect.w, px(0.75)) && near(outer.rect.h, px(0.5)));
+        let nested = rects.iter().find(|r| r.story.len() == 2).expect("nested");
+        assert_eq!(nested.story_rid, "1@0/1@0");
+        assert!(
+            near(nested.rect.x, px(2.4)) && near(nested.rect.y, px(4.0)),
+            "{nested:?}"
+        );
+        assert!(near(nested.rect.w, px(0.5)) && near(nested.rect.h, px(0.3)));
+    }
+
     /// A box nested past the layout cap (only a hand-built tree can carry
     /// one) keeps its place in its parent story but is not resolved —
     /// the recursion is bounded and nothing degrades.
@@ -19473,6 +20166,7 @@ mod tests {
                 A11yNode::TextBox(b) => format!("[box {}]", b.id),
                 A11yNode::Table(_) => "[table]".to_string(),
                 A11yNode::Story(_) => "[story]".to_string(),
+                A11yNode::Note(n) => format!("[note {}]", n.id),
             })
             .collect()
     }
@@ -19602,7 +20296,7 @@ mod tests {
             (bridge::ImageWrapMode::BehindText, false),
             (bridge::ImageWrapMode::InFrontOfText, false),
         ] {
-            let evt = engine.do_set_image_wrap(BridgeBlockPath::top(0), 0, mode);
+            let evt = engine.do_set_image_wrap(BridgeBlockPath::top(0), 0, mode, Vec::new());
             assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
             assert_eq!(engine.image_geometry().expect("g")[0].wrap, Some(mode));
             /* Top-and-bottom skips whole bands: no segments, but the text
@@ -19621,8 +20315,12 @@ mod tests {
             "undo is one step"
         );
         let mut inline = test_engine_with_doc(inline_image_doc());
-        let evt =
-            inline.do_set_image_wrap(BridgeBlockPath::top(0), 0, bridge::ImageWrapMode::Square);
+        let evt = inline.do_set_image_wrap(
+            BridgeBlockPath::top(0),
+            0,
+            bridge::ImageWrapMode::Square,
+            Vec::new(),
+        );
         assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
     }
 
@@ -23338,6 +24036,9 @@ mod mutation_signal_tests;
 
 #[cfg(test)]
 mod a11y_direction_tests;
+
+#[cfg(test)]
+mod a11y_note_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {
