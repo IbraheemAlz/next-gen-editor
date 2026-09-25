@@ -6641,17 +6641,7 @@ impl Engine {
                 day,
                 hour,
                 minute,
-            } => {
-                self.render_date = Some((year, month, day));
-                /* Issue #77 — the clock half is optional; both parts
-                or nothing (a half-clock keeps TIME cached). */
-                self.render_clock = match (hour, minute) {
-                    (Some(h), Some(m)) => Some((h.min(23), m.min(59))),
-                    _ => None,
-                };
-                self.invalidate_layout_snapshot();
-                Event::Pong
-            }
+            } => self.do_set_render_date(year, month, day, hour, minute),
             Command::UpdateFields => self.do_update_fields(),
             Command::SetFieldCodeView { enabled } => self.do_set_field_code_view(enabled),
             Command::SetFieldInstruction { at, instruction } => {
@@ -14218,7 +14208,17 @@ impl Engine {
     /// first (a fresh engine before any render has no scale to
     /// mutate — return a no-op `selection_changed` so the caller
     /// still sees a reply).
+    ///
+    /// Issue #186 — a NaN/±∞ `zoom` is rejected with a typed
+    /// `Event::Error` before `.clamp()` ever sees it (`f32::clamp`
+    /// leaves NaN untouched). A finite value outside `[0.25, 4.0]` is
+    /// still silently clamped, same as before.
     fn do_set_zoom(&mut self, zoom: f32) -> Event {
+        if let Err(e) = engine::validate_finite_scale(zoom) {
+            return Event::Error {
+                message: format!("SetZoom: {e}"),
+            };
+        }
         let zoom = zoom.clamp(0.25, 4.0);
         if let Some(cfg) = self.layout_cfg.as_mut() {
             cfg.zoom = zoom;
@@ -14239,7 +14239,14 @@ impl Engine {
     /// `scale = base_scale × zoom`, leaving the user zoom untouched —
     /// the mirror image of `do_set_zoom`. The wider clamp admits real
     /// device ratios (dpr up to ~6 × the 4/3 CSS-pt factor).
+    ///
+    /// Issue #186 — same NaN/±∞ rejection as `do_set_zoom`.
     fn do_set_device_scale(&mut self, scale: f32) -> Event {
+        if let Err(e) = engine::validate_finite_scale(scale) {
+            return Event::Error {
+                message: format!("SetDeviceScale: {e}"),
+            };
+        }
         let base = scale.clamp(0.5, 8.0);
         if let Some(cfg) = self.layout_cfg.as_mut() {
             cfg.base_scale = base;
@@ -14253,6 +14260,39 @@ impl Engine {
             return *e;
         }
         self.selection_changed()
+    }
+
+    /// `SetRenderDate` — install the shell-injected render date/clock
+    /// DATE/TIME fields resolve against (issue #43 / #77). Issue #187 —
+    /// every field is range-checked (`engine::validate_render_date`)
+    /// BEFORE it's cached: the fuzzer's `month: 960_639_140` repro used
+    /// to sail straight into `self.render_date` and only surface as
+    /// garbage field text on the next F9/save. `hour` / `minute` no
+    /// longer need the old `.min(23)` / `.min(59)` silent clamp — an
+    /// out-of-range clock half is now a rejected command, not a
+    /// silently-corrected one.
+    fn do_set_render_date(
+        &mut self,
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: Option<u32>,
+        minute: Option<u32>,
+    ) -> Event {
+        if let Err(e) = engine::validate_render_date(year, month, day, hour, minute) {
+            return Event::Error {
+                message: format!("SetRenderDate: {e}"),
+            };
+        }
+        self.render_date = Some((year, month, day));
+        /* Issue #77 — the clock half is optional; both parts or nothing
+        (a half-clock keeps TIME cached). */
+        self.render_clock = match (hour, minute) {
+            (Some(h), Some(m)) => Some((h, m)),
+            _ => None,
+        };
+        self.invalidate_layout_snapshot();
+        Event::Pong
     }
 
     /// Sprint 3 (UI Edition) — insert an inline image at `at` (or at
@@ -20428,6 +20468,94 @@ mod tests {
             "D: 7/5/2026 end".chars().count(),
             "body DATE field re-laid with the resolved text"
         );
+    }
+
+    // ---- issue #186 — SetZoom / SetDeviceScale finite-scale guard ----------
+
+    #[test]
+    fn set_zoom_rejects_non_finite_scale_and_leaves_geometry_unchanged() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
+        let (zoom_before, scale_before) = {
+            let cfg = engine.layout_cfg.as_ref().unwrap();
+            (cfg.zoom, cfg.scale)
+        };
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let evt = engine.do_set_zoom(bad);
+            assert!(
+                matches!(evt, Event::Error { .. }),
+                "{bad} must be a typed Event::Error, not silently clamped"
+            );
+            let cfg = engine.layout_cfg.as_ref().unwrap();
+            assert_eq!(
+                cfg.zoom, zoom_before,
+                "zoom untouched after rejecting {bad}"
+            );
+            assert_eq!(
+                cfg.scale, scale_before,
+                "scale untouched after rejecting {bad}"
+            );
+        }
+        // A finite out-of-range value is still silently clamped, unchanged
+        // from the pre-#186 behavior.
+        let evt = engine.do_set_zoom(100.0);
+        assert!(!matches!(evt, Event::Error { .. }));
+        assert_eq!(engine.layout_cfg.as_ref().unwrap().zoom, 4.0);
+    }
+
+    #[test]
+    fn set_device_scale_rejects_non_finite_scale_and_leaves_geometry_unchanged() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
+        let base_before = engine.layout_cfg.as_ref().unwrap().base_scale;
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let evt = engine.do_set_device_scale(bad);
+            assert!(
+                matches!(evt, Event::Error { .. }),
+                "{bad} must be a typed Event::Error, not silently clamped"
+            );
+            assert_eq!(
+                engine.layout_cfg.as_ref().unwrap().base_scale,
+                base_before,
+                "base_scale untouched after rejecting {bad}"
+            );
+        }
+        let evt = engine.do_set_device_scale(0.01);
+        assert!(!matches!(evt, Event::Error { .. }));
+        assert_eq!(engine.layout_cfg.as_ref().unwrap().base_scale, 0.5);
+    }
+
+    // ---- issue #187 — SetRenderDate calendar validation --------------------
+
+    #[test]
+    fn set_render_date_rejects_out_of_range_calendar_fields() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
+        // The #187 repro itself: a fuzzer-sent `month: 960_639_140`.
+        let evt = engine.do_set_render_date(2026, 960_639_140, 5, None, None);
+        assert!(matches!(evt, Event::Error { .. }));
+        assert_eq!(engine.render_date, None, "rejected date never cached");
+
+        for (y, m, d, h, min) in [
+            (0, 1, 1, None, None),
+            (2026, 0, 1, None, None),
+            (2026, 13, 1, None, None),
+            (2026, 4, 31, None, None), // April has 30 days
+            (2026, 2, 29, None, None), // 2026 is not a leap year
+            (2026, 7, 5, Some(24), Some(0)),
+            (2026, 7, 5, Some(0), Some(60)),
+        ] {
+            let evt = engine.do_set_render_date(y, m, d, h, min);
+            assert!(
+                matches!(evt, Event::Error { .. }),
+                "{y}-{m}-{d} {h:?}:{min:?} should be rejected"
+            );
+            assert_eq!(engine.render_date, None, "rejection never mutates state");
+            assert_eq!(engine.render_clock, None, "rejection never mutates state");
+        }
+
+        // A valid date (leap-year Feb 29 included) is accepted and cached.
+        let evt = engine.do_set_render_date(2024, 2, 29, Some(23), Some(59));
+        assert!(matches!(evt, Event::Pong));
+        assert_eq!(engine.render_date, Some((2024, 2, 29)));
+        assert_eq!(engine.render_clock, Some((23, 59)));
     }
 
     /* ================================================================
