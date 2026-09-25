@@ -26782,6 +26782,7 @@ mod snapshot_tests {
                 bytes: PACKAGE_FIXTURE.to_vec(),
                 format: bridge::DocFormat::Docx,
                 name: None,
+                defaults: None,
             }],
         );
         assert!(!lost(&evt), "a replayed open supersedes the base");
