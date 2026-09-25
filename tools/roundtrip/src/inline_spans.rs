@@ -307,14 +307,9 @@ pub(crate) fn run_field_source_form_roundtrip() -> Result<()> {
         "[roundtrip] step 29b OK — fldSimple stays simple, FORMTEXT keeps its ffData (source + insert)"
     );
 
-    let mut doc = archive.document.clone();
-    let Some(engine::Block::Paragraph(p)) = doc.blocks.get(0).cloned() else {
-        bail!("step 29c: no paragraph");
-    };
-    let mut p = p.with_spliced_range(0, "FldSimple.docx".len() as u32, "Renamed.docx");
-    p.dirty = true;
-    p.source_xml = None;
-    doc.blocks.set(0, engine::Block::Paragraph(p));
+    let doc = archive.document.restamp_fields(&mut |site| {
+        (site.field.instruction.starts_with("FILENAME")).then(|| "Renamed.docx".to_string())
+    });
     let expected = xml.replacen(">FldSimple.docx<", ">Renamed.docx<", 1);
     for bytes in [
         write_docx(&archive, &doc).context("write restamped")?,

@@ -443,27 +443,25 @@ fn simple_field_keeps_its_form_through_edits() {
     );
 }
 
-/// The #246 drop: a field restamp (`with_spliced_range`, what the live
-/// editor's FILENAME / PAGE resolution calls) used to leave the source
-/// markup stale, so every positioned marker — the `_GoBack` bookmark
-/// after the field — was dropped. The markup now follows the splice.
+/// The #246 drop: a field restamp (the live editor's FILENAME / PAGE
+/// resolution on F9 / save) used to leave the source markup stale, so
+/// every positioned marker — the `_GoBack` bookmark after the field — was
+/// dropped. The restamp now remaps the markup (issues #250 / #252), and
+/// the restamped field keeps its simple form.
 #[test]
 fn restamped_simple_field_keeps_its_form_and_the_bookmark_after_it() {
     let (xml, archive) = open(FLD_SIMPLE_P);
-    let mut doc = archive.document.clone();
-    let Some(engine::Block::Paragraph(p)) = doc.blocks.get(0).cloned() else {
-        panic!("paragraph");
-    };
-    let mut p = p.with_spliced_range(0, "FldSimple.docx".len() as u32, "Renamed.docx");
-    p.dirty = true;
-    p.source_xml = None;
+    let doc = archive
+        .document
+        .restamp_fields(&mut |_| Some("Renamed.docx".to_string()));
+    let p = doc.nth_paragraph(0).unwrap();
+    assert_eq!(p.text, "Renamed.docx");
     assert!(
         p.source_markup
             .as_deref()
             .unwrap()
             .offsets_valid(p.text.len())
     );
-    doc.blocks.set(0, engine::Block::Paragraph(p));
     assert_eq!(
         save(&archive, &doc),
         xml.replacen(">FldSimple.docx<", ">Renamed.docx<", 1)

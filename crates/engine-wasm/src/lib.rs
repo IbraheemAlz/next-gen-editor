@@ -25480,6 +25480,9 @@ mod part_media_tests;
 mod block_remap_tests;
 
 #[cfg(test)]
+mod text_remap_tests;
+
+#[cfg(test)]
 mod story_tab_tests;
 
 #[cfg(test)]

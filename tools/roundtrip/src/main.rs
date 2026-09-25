@@ -232,13 +232,40 @@ fn run_default() -> Result<()> {
         doc_diff,
         insert_len_utf8
     );
-    let bound = insert_len_utf8 * 2;
-    if doc_diff > bound {
+    /* Issue #251 — the PRIMARY bound: the edited save must not rewrite any
+    ORIGINAL byte. The old size-only `≤ 2×N` check (kept below as an
+    informational bound) cannot tell a faithful insertion that needed its
+    own new `<w:r>` from a lossy regeneration that happens to balance out
+    to the same size — see issue #199's 82 -> 92 false regression. */
+    let (rewrite_start, source_bytes_rewritten, _edited_region_bytes) =
+        rewritten_region(doc_a.as_slice(), doc_b.as_slice());
+    if source_bytes_rewritten > 0 {
         bail!(
-            "document.xml diff {doc_diff} B exceeds bound {bound} B (insert {insert_len_utf8} B × 2)"
+            "document.xml rewrote {source_bytes_rewritten} B of the ORIGINAL part at offset \
+             {rewrite_start} — a faithful edit must not touch source bytes (issue #251)"
         );
     }
-    println!("[roundtrip] step 6b OK — document.xml diff within bound");
+    println!("[roundtrip] step 6b OK — no original document.xml bytes rewritten (issue #251)");
+
+    /* Secondary, informational-turned-advisory size bound: 2×N plus an
+    allowance for any run(s) the faithful insertion had to create (see
+    `tools/corpus-native/src/pipeline.rs`'s `NEW_RUN_ALLOWANCE_BYTES` for
+    why 48 B/run). The bare `2×N` number is still asserted here since this
+    fixture's insert always lands in a plain single-run paragraph — a
+    violation here would mean the writer grew the save for no run-creation
+    reason, which is exactly the size-based smell the old bound was meant
+    to catch. */
+    let new_runs =
+        count_run_open_tags(doc_b.as_slice()).saturating_sub(count_run_open_tags(doc_a.as_slice()));
+    let new_run_allowance = new_runs * NEW_RUN_ALLOWANCE_BYTES;
+    let bound = insert_len_utf8 * 2 + new_run_allowance;
+    if doc_diff > bound {
+        bail!(
+            "document.xml diff {doc_diff} B exceeds secondary bound {bound} B (insert \
+             {insert_len_utf8} B × 2 + {new_runs} new run(s) × {NEW_RUN_ALLOWANCE_BYTES} B)"
+        );
+    }
+    println!("[roundtrip] step 6c OK — document.xml diff within the secondary size bound");
 
     /* Sprint 9 — exercise the non-OOXML emitters too. The `DocumentTree`
     that came back from the edited round-trip is the freshest view of
@@ -5213,6 +5240,56 @@ fn extract_doc_xml(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     f.read_to_end(&mut out)?;
     Ok(out)
+}
+
+/* ============================================================ issue #251 ==== */
+
+/// Issue #251 — per-new-`<w:r>` size allowance for the secondary
+/// (informational-turned-advisory) size bound. Deliberately duplicated
+/// from `tools/corpus-native/src/pipeline.rs::NEW_RUN_ALLOWANCE_BYTES`
+/// rather than shared through a library crate — these are two independent
+/// CLI binaries and this is a ~5-line pure function, not worth a new
+/// workspace member. See that module's doc comment for how the 48 B figure
+/// was picked (the exact 43 B markup cost of an empty
+/// `<w:r><w:t xml:space="preserve"></w:t></w:r>` wrapper, rounded up).
+const NEW_RUN_ALLOWANCE_BYTES: usize = 48;
+
+/// Issue #251 — count `<w:r>` / `<w:r ...>` / `<w:r/>` run-element open
+/// tags in a `document.xml` byte slice. A cheap heuristic (a literal-byte
+/// scan, not a real XML walk): see the corpus-native twin of this function
+/// for the full rationale.
+fn count_run_open_tags(xml: &[u8]) -> usize {
+    xml.windows(4)
+        .enumerate()
+        .filter(|(i, w)| {
+            *w == *b"<w:r" && matches!(xml.get(i + 4), Some(b' ') | Some(b'>') | Some(b'/'))
+        })
+        .count()
+}
+
+/// Issue #251 (originally #199) — `(prefix_len, original_span,
+/// edited_span)`: the byte offset the ORIGINAL and edited parts start to
+/// differ at, and the lengths of the region between the longest common
+/// prefix and the longest common suffix of the two parts. 0 for
+/// `original_span` means the edited save is a pure insertion — nothing of
+/// the source was lost or respelled. Deliberately duplicated from
+/// `tools/corpus-native/src/pipeline.rs::rewritten_region` — see the note
+/// on [`NEW_RUN_ALLOWANCE_BYTES`].
+fn rewritten_region(orig: &[u8], edited: &[u8]) -> (usize, u64, u64) {
+    let prefix = orig.iter().zip(edited).take_while(|(a, b)| a == b).count();
+    let max_suffix = orig.len().min(edited.len()) - prefix;
+    let suffix = orig
+        .iter()
+        .rev()
+        .zip(edited.iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    (
+        prefix,
+        (orig.len() - prefix - suffix) as u64,
+        (edited.len() - prefix - suffix) as u64,
+    )
 }
 
 /* ================================================================= main ==== */
