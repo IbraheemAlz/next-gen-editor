@@ -18,3 +18,10 @@ packages:
 # (so `@nge/core` becomes "not found" on install).
 allowBuilds:
   esbuild: true
+
+# Non-interactive runners (merge gates, worktree agents, CI without CI=true)
+# hit ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY whenever the workspace
+# membership changes (e.g. #211 dropping tools/corpus): pnpm wants to purge
+# node_modules and asks for a TTY confirmation. Purging is exactly what we
+# want in that case — the lockfile is the source of truth.
+confirmModulesPurge: false
