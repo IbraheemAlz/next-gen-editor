@@ -312,8 +312,14 @@ test('drag-selection traffic prefetches at most at the debounce rate', async ({ 
             await new Promise((r) => setTimeout(r, 5));
         }
     });
-    /* Let the trailing debounce fire and settle. */
-    await page.waitForTimeout(600);
+    /* Let the trailing debounce fire and the prefetch reply land. A fixed
+       wait was too short on a loaded machine (the round-trip can exceed
+       600 ms while other builds run), so poll for the warm entry like the
+       warm-copy specs above do; no further prefetch can run without a new
+       selection change, so polling longer cannot inflate `during`. */
+    await expect
+        .poll(async () => (await prefetchStats(page)).warm, { timeout: 10_000 })
+        .toBe(true);
 
     const stats = await prefetchStats(page);
     const during = (stats.prefetches as number) - before;
