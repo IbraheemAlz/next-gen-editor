@@ -137,6 +137,21 @@
         "document_xml_drift_bytes": 0
       }
     },
+    "pPr_bidi_style.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 11,
+      "asserts": {
+        "paragraph_count": 3,
+        "paragraph_texts": [
+          "Word مرحبا",
+          "Word مرحبا",
+          "plain"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "pPr_ind_firstline.docx": {
       "generator": "handcrafted",
       "phase_introduced": 2,

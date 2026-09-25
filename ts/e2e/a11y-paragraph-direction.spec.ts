@@ -1,4 +1,6 @@
 import { test, expect } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 /* Issue #195 — the screen-reader mirror sets `dir` on every `<p>` from
  * that paragraph's OWN resolved base direction (explicit bidi →
@@ -114,4 +116,44 @@ test('text-box region paragraphs resolve on their own; regions carry no dir', as
     await expect(mirror.locator(':scope > p').first()).toHaveAttribute('dir', 'rtl');
     await expect(region.locator('p')).toHaveAttribute('dir', 'ltr');
     expect(await region.getAttribute('dir')).toBeNull();
+});
+
+/* Issue #202 — a paragraph whose direction comes from its STYLE
+ * (`RtlBody` basedOn `RtlBase`, which sets `<w:bidi/>`) mirrors as RTL
+ * even though its text starts with a Latin word; a direct
+ * `<w:bidi w:val="false"/>` over the same style mirrors LTR. Fixture:
+ * tools/roundtrip `build_style_bidi_docx`. */
+const STYLE_BIDI_FIXTURE = fileURLToPath(
+    new URL('../../crates/format-docx/tests/fixtures/pPr_bidi_style.docx', import.meta.url),
+);
+
+test('a style-inherited paragraph direction drives the mirrored dir', async ({ page }) => {
+    test.setTimeout(60_000);
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 20_000,
+    });
+
+    const bytes = Array.from(readFileSync(STYLE_BIDI_FIXTURE));
+    await page.evaluate(async (arr: number[]) => {
+        const dispatch = (cmd: unknown): Promise<any> => (window as any).__dispatch(cmd);
+        const loaded = await dispatch({
+            type: 'OPEN_DOCUMENT',
+            bytes: new Uint8Array(arr),
+            format: 'docx',
+            name: undefined,
+        });
+        if (loaded.type === 'ERROR') throw new Error(loaded.message);
+        await dispatch({ type: 'PING' });
+    }, bytes);
+
+    const paragraphs = page.locator('.a11y-mirror > p');
+    await expect(paragraphs).toHaveCount(3);
+    await expect(paragraphs.nth(2)).toHaveText('plain');
+    const dirs = await paragraphs.evaluateAll((els) => els.map((el) => el.getAttribute('dir')));
+    expect(dirs).toEqual([
+        'rtl', // style bidi beats the Latin first-strong character
+        'ltr', // direct w:val="false" beats the style
+        'ltr', // unstyled Latin → first strong
+    ]);
 });
