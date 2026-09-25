@@ -436,7 +436,7 @@ fn build_table_box(
                 for b in &cell.blocks {
                     let mut lb = build_layout_block(b, doc, fonts, content_w, para_texts, next_id);
                     let mut origin = lb.origin();
-                    origin.x = pad_l;
+                    origin.x = pad_l + lb.placement_dx();
                     origin.y = cy + pad_t;
                     lb.set_origin(origin);
                     cy += lb.size().height;
@@ -499,12 +499,23 @@ fn build_table_box(
         columns: col_widths,
         rows: rows_out,
         outer_borders: t.props.borders.clone().unwrap_or_default(),
+        placement_dx: 0.0,
     };
     /* Issue #79 — `<w:bidiVisual>` RTL tables: the same visual mirror
     the production layout applies. */
     if t.props.bidi_visual {
         layout::mirror_bidi_visual(&mut table_box);
     }
+    /* Issue #173 — `<w:jc>` + `<w:tblInd>`: the same placement the
+    production layout resolves (the paginator adds it to the column x,
+    the cell-content stacking above keeps it). */
+    layout::place_table(
+        &mut table_box,
+        t.props.alignment,
+        twips_to_pt(t.props.indent_twips),
+        t.props.bidi_visual,
+        avail_width,
+    );
     table_box
 }
 

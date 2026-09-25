@@ -10,6 +10,7 @@ pub mod page;
 pub mod paginate;
 pub mod paragraph;
 pub mod table_bidi;
+pub mod table_place;
 mod table_split;
 pub mod watchdog;
 pub mod wrap;
@@ -33,6 +34,7 @@ pub use paragraph::{
     InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
 };
 pub use table_bidi::mirror_bidi_visual;
+pub use table_place::{place_table, resolve_table_placement};
 pub use watchdog::{
     BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation,
     PageRefConvergence, Watchdog, converge_page_refs, geometry_fingerprint, verify_prefix,

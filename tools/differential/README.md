@@ -43,6 +43,10 @@ tools/differential/
                                   expected distribution is in its manifest
                                   description and pinned on our side by a
                                   `differential-native` unit test.
+                                  `table_placement.docx` (issue #173):
+                                  fixed-width tables placed by `<w:jc>` /
+                                  `<w:tblInd>` / a `<w:bidiVisual>` default
+                                  start at the right margin.
 ```
 
 ## Running it

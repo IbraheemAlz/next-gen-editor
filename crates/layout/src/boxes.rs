@@ -605,6 +605,15 @@ impl LayoutBlock {
             LayoutBlock::Table(t) => t.size,
         }
     }
+    /// Issue #173 — the block's horizontal offset within its band:
+    /// [`TableBox::placement_dx`] for a table, `0.0` for a paragraph
+    /// (whose indents and alignment live inside its own box).
+    pub fn placement_dx(&self) -> f32 {
+        match self {
+            LayoutBlock::Paragraph(_) => 0.0,
+            LayoutBlock::Table(t) => t.placement_dx,
+        }
+    }
     pub fn as_paragraph(&self) -> Option<&ParagraphBox> {
         match self {
             LayoutBlock::Paragraph(p) => Some(p),
@@ -635,6 +644,14 @@ pub struct TableBox {
     /// entire table rectangle. `None` per-edge ⇒ no stroke (Word's default
     /// table has no borders unless `<w:tblBorders>` says so).
     pub outer_borders: engine::CellBorders,
+    /// Issue #173 — signed offset of the table's left edge from the left
+    /// edge of the band it was laid out for (the column, a cell's content
+    /// box, a header/footer band), resolved from `<w:jc>`, `<w:tblInd>`
+    /// and `<w:bidiVisual>` by [`crate::place_table`]. Every placement site
+    /// sets `origin.x = band x + placement_dx`, so each page part of a
+    /// split table keeps the same x. `0.0` = flush with the band's left
+    /// edge (the pre-#173 placement of every table).
+    pub placement_dx: f32,
 }
 
 #[derive(Debug, Clone)]

@@ -263,6 +263,22 @@
         "document_xml_drift_bytes": 141
       }
     },
+    "table_jc_tblind.docx": {
+      "generator": "handcrafted",
+      "phase_introduced": 10,
+      "asserts": {
+        "paragraph_count": 4,
+        "paragraph_texts": [
+          "intro",
+          "mid one",
+          "mid two",
+          "after"
+        ]
+      },
+      "roundtrip": {
+        "document_xml_drift_bytes": 0
+      }
+    },
     "table_nested_200_deep.docx": {
       "generator": "handcrafted",
       "phase_introduced": 10,

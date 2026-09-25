@@ -6,6 +6,12 @@
       "generator": "differential-native --gen-fixtures (hand-written OOXML)",
       "word_pdf": null,
       "word_pdf_status": "PENDING"
+    },
+    "table_placement.docx": {
+      "description": "Issue #173 horizontal-placement oracle: four fixed-width 200pt bordered tables on A4 (1in margins, ~451.3pt column) — jc=center (left edge ~125.6pt into the column), jc=right (~251.3pt, flush right), tblInd=720 twips (36pt), and a bidiVisual table with no jc (default start = right margin, ~251.3pt; cell A rightmost). Explicit A4 pgSz. Expected 1 page.",
+      "generator": "differential-native --gen-fixtures (hand-written OOXML)",
+      "word_pdf": null,
+      "word_pdf_status": "PENDING"
     }
   }
 }

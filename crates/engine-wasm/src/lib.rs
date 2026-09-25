@@ -2735,7 +2735,8 @@ fn layout_note_blocks(
         };
         y += before;
         let mut o = lb.origin();
-        o.x = 0.0;
+        /* Issue #173 — a table keeps its jc / tblInd offset. */
+        o.x = lb.placement_dx();
         o.y = y;
         lb.set_origin(o);
         y += lb.size().height + after;
@@ -3668,6 +3669,7 @@ fn layout_table_box(
         columns,
         rows: rows_out,
         outer_borders: table.props.borders.clone().unwrap_or_default(),
+        placement_dx: 0.0,
     };
     /* Issue #79 — `<w:bidiVisual>`: everything above is the LTR layout
     (grid, spans, vMerge, content); the RTL presentation is one visual
@@ -3676,6 +3678,17 @@ fn layout_table_box(
     if table.props.bidi_visual {
         layout::mirror_bidi_visual(&mut table_box);
     }
+    /* Issue #173 — `<w:jc>` + `<w:tblInd>` (direction-aware through
+    `bidiVisual`): the table's offset inside the band it was laid out
+    for. Every placement site (paginator page parts, cell content,
+    header/footer bands, note bodies) adds it to the band's x. */
+    layout::place_table(
+        &mut table_box,
+        table.props.alignment,
+        twips_to_layout_px(table.props.indent_twips, scale),
+        table.props.bidi_visual,
+        available_width_px,
+    );
     table_box
 }
 
@@ -19080,6 +19093,154 @@ mod tests {
         d
     }
 
+    /// Issue #173 — a fixed-layout 2 × 2 table, 200 pt wide
+    /// (`<w:tblGrid>` 2000 + 2000 twips), narrower than the A4 column,
+    /// with `<w:jc>` / `<w:tblInd>` / `<w:bidiVisual>` as given. The
+    /// surrounding paragraphs are RTL when `bidi_visual` is set.
+    fn placed_table_doc(
+        alignment: Option<engine::Alignment>,
+        indent_twips: i32,
+        bidi_visual: bool,
+    ) -> DocumentTree {
+        let para = |text: &str| engine::Paragraph {
+            text: text.into(),
+            props: engine::ParaProperties {
+                direction: bidi_visual.then_some(engine::TextDirection::Rtl),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut d = DocumentTree::from_text("");
+        d.blocks.set(0, engine::Block::Paragraph(para("intro")));
+        let rows = (1..=2)
+            .map(|r| engine::TableRow {
+                props: engine::RowProperties::default(),
+                cells: (1..=2)
+                    .map(|c| engine::TableCell {
+                        props: engine::CellProperties::default(),
+                        blocks: vec![engine::Block::Paragraph(para(&format!("r{r}c{c}")))],
+                    })
+                    .collect(),
+            })
+            .collect();
+        d.blocks.push_back(engine::Block::Table(engine::Table {
+            grid: vec![2000, 2000],
+            props: engine::TableProperties {
+                alignment,
+                indent_twips,
+                bidi_visual,
+                layout: engine::TableLayout::Fixed,
+                borders: Some(engine::default_word_borders()),
+                ..Default::default()
+            },
+            rows,
+            dirty: true,
+            source_xml: None,
+        }));
+        d.blocks.push_back(engine::Block::Paragraph(para("outro")));
+        d
+    }
+
+    /// Issue #173 — `(table origin.x, column width, table width)` of the
+    /// first table at scale 1.0.
+    fn table_x(doc: DocumentTree) -> (f32, f32, f32) {
+        let e = test_engine_with_doc(doc);
+        let (pages, _, _, info) = e.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let page = &pages[0];
+        let cw = page.size.width - page.margins.left - page.margins.right;
+        let t = first_table(&pages);
+        (t.origin.x, cw, t.size.width)
+    }
+
+    /// Issue #173 — `<w:jc>` places a narrower-than-column table at the
+    /// left / centre / right of the column, `<w:tblInd>` shifts a
+    /// start-aligned table from its leading edge, and a `bidiVisual`
+    /// table's default `start` is the RIGHT margin.
+    #[test]
+    fn table_jc_and_tbl_ind_resolve_the_table_x_origin() {
+        use engine::Alignment as A;
+        let (x, cw, w) = table_x(placed_table_doc(None, 0, false));
+        assert_eq!(w, 200.0);
+        assert!(cw > w + 100.0, "column {cw} vs table {w}");
+        assert_eq!(x, 0.0, "LTR default start = left edge");
+        let at = |a, ind, rtl| table_x(placed_table_doc(a, ind, rtl)).0;
+        let near = |got: f32, want: f32| assert!((got - want).abs() < 1e-3, "{got} vs {want}");
+        near(at(Some(A::Start), 0, false), 0.0);
+        near(at(Some(A::Center), 0, false), (cw - w) / 2.0);
+        near(at(Some(A::End), 0, false), cw - w);
+        near(at(None, 720, false), 36.0);
+        near(at(Some(A::Center), 720, false), (cw - w) / 2.0);
+        near(at(None, -108, false), -5.4);
+        /* RTL (`bidiVisual`): start = right margin, indent from it. */
+        near(at(None, 0, true), cw - w);
+        near(at(Some(A::Start), 720, true), cw - w - 36.0);
+        near(at(Some(A::End), 0, true), 0.0);
+        near(at(Some(A::Center), 0, true), (cw - w) / 2.0);
+    }
+
+    /// Issue #173 — caret geometry and hit-testing follow the placed
+    /// table: every cell line shifts by exactly the table offset, and a
+    /// click inside the moved cell resolves to it.
+    #[test]
+    fn placed_table_geometry_and_hit_testing_follow_the_origin() {
+        let left = test_engine_with_doc(placed_table_doc(None, 0, false));
+        let right = test_engine_with_doc(placed_table_doc(Some(engine::Alignment::End), 0, false));
+        /* `table_x` lays out at scale 1.0; geometry is in the engine's
+        device scale. */
+        let (x, ..) = table_x(placed_table_doc(Some(engine::Alignment::End), 0, false));
+        assert!(x > 100.0);
+        let x = x * right.scale();
+        fn cell_line(geom: &[LineGeom], row: u32, col: u32) -> &LineGeom {
+            geom.iter()
+                .find(|g| {
+                    matches!(
+                        g.path.steps.get(1),
+                        Some(BridgePathStep::Cell { row: r, col: c }) if *r == row && *c == col
+                    )
+                })
+                .unwrap_or_else(|| panic!("line for cell ({row},{col})"))
+        }
+        let (gl, gr) = (
+            left.document_geometry().expect("geom"),
+            right.document_geometry().expect("geom"),
+        );
+        for (row, col) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let (a, b) = (cell_line(&gl, row, col), cell_line(&gr, row, col));
+            assert!(
+                (b.hit_left - a.hit_left - x).abs() < 1e-3,
+                "cell ({row},{col}) moved {} not {x}",
+                b.hit_left - a.hit_left
+            );
+            assert_eq!(a.y_top, b.y_top);
+            let hit = hit_test_geom(&gr, b.hit_left + 2.0, b.y_top + b.height / 2.0);
+            assert_eq!(
+                hit.path.steps.get(1),
+                Some(&BridgePathStep::Cell { row, col })
+            );
+        }
+    }
+
+    /// Issue #173 — an autofit table fills the column, so `<w:jc>` (and a
+    /// `bidiVisual` default start) has no slack to act on: geometry is
+    /// bit-identical to the unaligned table.
+    #[test]
+    fn full_width_autofit_table_is_unmoved_by_jc() {
+        let fp = |d: DocumentTree| {
+            let e = test_engine_with_doc(d);
+            let (pages, ..) = e.build_pages(1.0, false, None).expect("layout");
+            layout::geometry_fingerprint(&pages)
+        };
+        let plain = fp(table_doc());
+        for a in [engine::Alignment::Center, engine::Alignment::End] {
+            let mut d = table_doc();
+            if let Some(engine::Block::Table(t)) = d.blocks.get_mut(1) {
+                t.props.alignment = Some(a);
+            }
+            assert_eq!(fp(d), plain, "{a:?}");
+        }
+    }
+
     fn first_table(pages: &[PageBox]) -> &TableBox {
         pages
             .iter()
@@ -19337,6 +19498,30 @@ mod tests {
         let engine = test_engine_with_doc(rtl_table_doc(true));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("rtl table");
         out.push(("rtl_bidi_visual_table", pages, info.degradations));
+
+        /* Issue #173 — fixed-width (200 pt) tables placed by `<w:jc>` /
+        `<w:tblInd>`, and a narrow `<w:bidiVisual>` table at its default
+        `start` = the right margin. */
+        for (name, alignment, indent, rtl) in [
+            (
+                "ltr_center_fixed_table",
+                Some(engine::Alignment::Center),
+                0,
+                false,
+            ),
+            (
+                "ltr_right_fixed_table",
+                Some(engine::Alignment::End),
+                0,
+                false,
+            ),
+            ("ltr_indented_fixed_table", None, 720, false),
+            ("rtl_narrow_bidi_visual_table", None, 0, true),
+        ] {
+            let engine = test_engine_with_doc(placed_table_doc(alignment, indent, rtl));
+            let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect(name);
+            out.push((name, pages, info.degradations));
+        }
         out
     }
 
@@ -19398,6 +19583,13 @@ mod tests {
         /* Issue #79 — recorded with the `<w:bidiVisual>` mirror in place
         (column 1 rightmost); every value above is unchanged by it. */
         ("rtl_bidi_visual_table", 0xa105472832896e3f),
+        /* Issue #173 — recorded with `<w:jc>` / `<w:tblInd>` placement in
+        place (new fixtures; every value above is unchanged by it —
+        autofit tables fill the column, so they have no slack to move). */
+        ("ltr_center_fixed_table", 0x392d9b82e26033b8),
+        ("ltr_right_fixed_table", 0x93457cced5c21beb),
+        ("ltr_indented_fixed_table", 0x327125e1450360f6),
+        ("rtl_narrow_bidi_visual_table", 0x840944f9156e942e),
     ];
 
     /// Issue #95 — the same fixtures with widow / orphan control at its

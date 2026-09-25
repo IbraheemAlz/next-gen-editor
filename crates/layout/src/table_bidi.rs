@@ -158,6 +158,7 @@ mod tests {
                 left: Some(stroke()),
                 ..Default::default()
             },
+            placement_dx: 0.0,
         }
     }
 

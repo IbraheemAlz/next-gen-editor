@@ -1640,6 +1640,7 @@ mod tests {
             columns: vec![200.0],
             rows: vec![row],
             outer_borders: cell_borders,
+            placement_dx: 0.0,
         };
         let page = PageBox {
             size: Size {
@@ -1748,6 +1749,7 @@ mod tests {
                 columns: vec![200.0],
                 rows: vec![row],
                 outer_borders: engine::default_word_borders(),
+                placement_dx: 0.0,
             };
             PageBox {
                 size: Size {
@@ -1856,6 +1858,7 @@ mod tests {
                 columns: vec![100.0; 3],
                 rows: vec![row],
                 outer_borders: engine::default_word_borders(),
+                placement_dx: 0.0,
             };
             if mirrored {
                 layout::mirror_bidi_visual(&mut table);
@@ -2602,6 +2605,7 @@ mod tests {
             columns: vec![200.0],
             rows,
             outer_borders: engine::default_word_borders(),
+            placement_dx: 0.0,
         };
         let geom = layout::PaginatePageGeometry {
             width: 595.0,
@@ -2723,6 +2727,7 @@ mod tests {
             columns: vec![200.0],
             rows,
             outer_borders: engine::default_word_borders(),
+            placement_dx: 0.0,
         };
         let geom = layout::PaginatePageGeometry {
             width: 595.0,

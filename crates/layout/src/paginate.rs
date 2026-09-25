@@ -509,8 +509,11 @@ impl Paginator {
                 col += 1;
                 y_in_col = 0.0;
             }
+            /* Issue #173 — a table keeps its jc / tblInd offset in
+            whichever column it lands. */
+            let dx = block.placement_dx();
             block.set_origin(Point {
-                x: col_x[col],
+                x: col_x[col] + dx,
                 y: section_top_y + y_in_col,
             });
             y_in_col += h;
@@ -1343,7 +1346,10 @@ impl Paginator {
     fn place_atomic(&mut self, mut block: LayoutBlock, after: f32) {
         let h = block.size().height;
         let mut origin = block.origin();
-        origin.x = self.current_column_origin_x();
+        /* Issue #173 — a table sits at its resolved jc / tblInd offset
+        within the column (zero for paragraphs and start-aligned
+        tables). */
+        origin.x = self.current_column_origin_x() + block.placement_dx();
         origin.y = self.cur_y;
         block.set_origin(origin);
         self.cur_y += h + after;
@@ -2030,9 +2036,12 @@ impl Paginator {
             recompute_vmerge_spans(&mut head_rows);
         }
         let head_h = restack_rows(&mut head_rows);
+        /* Issue #173 — every page part keeps the table's resolved
+        horizontal placement (the tail re-enters `push_block_inner`, whose
+        placement adds the same offset). */
         let head = TableBox {
             origin: Point {
-                x: self.current_column_origin_x(),
+                x: self.current_column_origin_x() + table.placement_dx,
                 y: self.cur_y,
             },
             size: Size {
@@ -2042,6 +2051,7 @@ impl Paginator {
             columns: table.columns.clone(),
             rows: head_rows,
             outer_borders: table.outer_borders.clone(),
+            placement_dx: table.placement_dx,
         };
         self.cur_y += head_h;
         self.cur_blocks.push(LayoutBlock::Table(head));
@@ -2064,6 +2074,7 @@ impl Paginator {
             columns: table.columns.clone(),
             rows: tail_rows,
             outer_borders: table.outer_borders.clone(),
+            placement_dx: table.placement_dx,
         };
         /* Audit gap A.H2 — snake into the next column before forcing a
         page; matches the paragraph split policy. */
@@ -2424,11 +2435,13 @@ fn blocks_height(blocks: &[LayoutBlock]) -> f32 {
         .fold(0.0_f32, f32::max)
 }
 
-/// Re-stack `blocks` from `y = 0` at `x = 0`; returns the total height.
+/// Re-stack `blocks` from `y = 0` at `x = 0` (plus a table's placement
+/// offset, issue #173); returns the total height.
 fn restack_blocks(blocks: &mut [LayoutBlock]) -> f32 {
     let mut y = 0.0_f32;
     for b in blocks.iter_mut() {
-        b.set_origin(Point { x: 0.0, y });
+        let x = b.placement_dx();
+        b.set_origin(Point { x, y });
         y += b.size().height;
     }
     y
@@ -2439,7 +2452,8 @@ fn append_stacked(head: &mut Vec<LayoutBlock>, extra: &[LayoutBlock]) {
     let mut y = blocks_height(head);
     for b in extra {
         let mut c = b.clone();
-        c.set_origin(Point { x: 0.0, y });
+        let x = c.placement_dx();
+        c.set_origin(Point { x, y });
         y += c.size().height;
         head.push(c);
     }
@@ -2466,7 +2480,8 @@ fn split_note_blocks(
         tail_first = idx as u32;
         if y + h <= budget {
             let mut c = b.clone();
-            c.set_origin(Point { x: 0.0, y });
+            let x = c.placement_dx();
+            c.set_origin(Point { x, y });
             head.push(c);
             y += h;
             tail_first = idx as u32 + 1;
@@ -2486,7 +2501,10 @@ fn split_note_blocks(
             LayoutBlock::Table(t) => {
                 let (hd, tl) = split_table_rows(t, budget - y);
                 if let Some(mut hd) = hd {
-                    hd.origin = Point { x: 0.0, y };
+                    hd.origin = Point {
+                        x: hd.placement_dx,
+                        y,
+                    };
                     head.push(LayoutBlock::Table(hd));
                 }
                 if let Some(tl) = tl {
@@ -2572,7 +2590,10 @@ fn split_table_rows_at(t: &TableBox, n: usize) -> (Option<TableBox>, Option<Tabl
             })
             .collect();
         TableBox {
-            origin: Point { x: 0.0, y: 0.0 },
+            origin: Point {
+                x: t.placement_dx,
+                y: 0.0,
+            },
             size: Size {
                 width: t.size.width,
                 height: y,
@@ -2580,6 +2601,7 @@ fn split_table_rows_at(t: &TableBox, n: usize) -> (Option<TableBox>, Option<Tabl
             columns: t.columns.clone(),
             rows,
             outer_borders: t.outer_borders.clone(),
+            placement_dx: t.placement_dx,
         }
     };
     (Some(build(&t.rows[..n])), Some(build(&t.rows[n..])))
@@ -4268,6 +4290,7 @@ mod tests {
             columns: vec![200.0],
             rows: out_rows,
             outer_borders: engine::CellBorders::default(),
+            placement_dx: 0.0,
         }
     }
 
@@ -5546,6 +5569,7 @@ mod tests {
             columns: vec![100.0, 100.0],
             rows,
             outer_borders: engine::CellBorders::default(),
+            placement_dx: 0.0,
         }
     }
 

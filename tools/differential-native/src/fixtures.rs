@@ -349,12 +349,76 @@ fn build_long_cell_table() -> Vec<u8> {
     build_plain(&body)
 }
 
+/// Issue #173 — one fixed-width (2 × 2000 twips = 200pt) bordered 2 × 1
+/// table. `placement` is the `<w:tblPr>` children between `<w:tblW>` and
+/// `<w:tblBorders>` (`<w:bidiVisual/>` goes before `<w:tblW>` per
+/// CT_TblPrBase, so it is a separate flag, which also makes the cell
+/// paragraphs bidi).
+fn placed_table(tag: &str, placement: &str, bidi_visual: bool) -> String {
+    let edge =
+        |e: &str| format!(r#"<w:{e} w:val="single" w:sz="4" w:space="0" w:color="000000"/>"#);
+    let borders = format!(
+        "<w:tblBorders>{}{}{}{}</w:tblBorders>",
+        edge("top"),
+        edge("left"),
+        edge("bottom"),
+        edge("right")
+    );
+    let bidi = if bidi_visual { "<w:bidiVisual/>" } else { "" };
+    let ppr = if bidi_visual {
+        r#"<w:pPr><w:bidi/><w:spacing w:before="0" w:after="0" w:line="280" w:lineRule="exact"/></w:pPr>"#
+    } else {
+        r#"<w:pPr><w:spacing w:before="0" w:after="0" w:line="280" w:lineRule="exact"/></w:pPr>"#
+    };
+    let cell = |text: String| {
+        format!(
+            r#"<w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p>{ppr}<w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p></w:tc>"#
+        )
+    };
+    format!(
+        r#"<w:tbl><w:tblPr>{bidi}<w:tblW w:w="4000" w:type="dxa"/>{placement}{borders}<w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid><w:tr>{}{}</w:tr></w:tbl>"#,
+        cell(format!("{tag} A")),
+        cell(format!("{tag} B")),
+    )
+}
+
+/// Issue #173 — table horizontal placement oracle. Four 200pt tables on
+/// an A4 page (1in margins → a ~451.3pt column): `<w:jc w:val="center">`
+/// (left edge ~125.6pt into the column), `<w:jc w:val="right">` (flush
+/// right, ~251.3pt), `<w:tblInd w:w="720">` (36pt), and a `<w:bidiVisual>`
+/// table with no `<w:jc>` — its default start edge is the RIGHT margin
+/// (~251.3pt), cell A rightmost. Separated by exact-pitch paragraphs.
+fn build_table_placement() -> Vec<u8> {
+    let mut body = String::new();
+    body.push_str(&exact_line("Centered table"));
+    body.push_str(&placed_table("Center", r#"<w:jc w:val="center"/>"#, false));
+    body.push_str(&exact_line("Right-aligned table"));
+    body.push_str(&placed_table("Right", r#"<w:jc w:val="right"/>"#, false));
+    body.push_str(&exact_line("Indented table"));
+    body.push_str(&placed_table(
+        "Indent",
+        r#"<w:tblInd w:w="720" w:type="dxa"/>"#,
+        false,
+    ));
+    body.push_str(&exact_line("RTL table"));
+    body.push_str(&placed_table("RTL", "", true));
+    body.push_str(&exact_line("End of document"));
+    build_plain(&body)
+}
+
 fn table_fixtures() -> Vec<Fixture> {
-    vec![Fixture {
-        name: "long_cell_table.docx",
-        description: "Issue #155 row-split oracle: a 20-line cell row at a page bottom breaks at a line boundary (4 lines stay on page 1); the same row with <w:cantSplit/> later moves whole. Exact 14pt line pitch, explicit A4 pgSz. Expected 3 pages.",
-        bytes: build_long_cell_table(),
-    }]
+    vec![
+        Fixture {
+            name: "long_cell_table.docx",
+            description: "Issue #155 row-split oracle: a 20-line cell row at a page bottom breaks at a line boundary (4 lines stay on page 1); the same row with <w:cantSplit/> later moves whole. Exact 14pt line pitch, explicit A4 pgSz. Expected 3 pages.",
+            bytes: build_long_cell_table(),
+        },
+        Fixture {
+            name: "table_placement.docx",
+            description: "Issue #173 horizontal-placement oracle: four fixed-width 200pt bordered tables on A4 (1in margins, ~451.3pt column) — jc=center (left edge ~125.6pt into the column), jc=right (~251.3pt, flush right), tblInd=720 twips (36pt), and a bidiVisual table with no jc (default start = right margin, ~251.3pt; cell A rightmost). Explicit A4 pgSz. Expected 1 page.",
+            bytes: build_table_placement(),
+        },
+    ]
 }
 
 /// `--gen-table-fixtures [dir]` — the table pagination corpus.
@@ -499,6 +563,47 @@ mod tests {
         }
         assert!(dir.join("_manifest.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #173 — our side of the `table_placement.docx` oracle: each
+    /// table's x-origin in the column (the manifest's promised edges),
+    /// and the bidiVisual table's cell A rightmost.
+    #[test]
+    fn table_placement_fixture_positions_every_table() {
+        use layout::LayoutBlock;
+        let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let face =
+            text_pipeline::LoadedFont::parse("liberation".into(), bytes).expect("parse font");
+        let mut faces = std::collections::HashMap::new();
+        faces.insert("liberation".to_string(), std::sync::Arc::new(face));
+        let fonts = text_pipeline::FontStack::from_faces(faces, "liberation");
+        let mut doc = read_docx(&build_table_placement()).expect("parse").document;
+        let built = crate::pipeline::build_pages(&mut doc, &fonts);
+        assert_eq!(built.pages.len(), 1);
+        let page = &built.pages[0];
+        let cw = page.size.width - page.margins.left - page.margins.right;
+        let tables: Vec<&layout::TableBox> = page
+            .blocks
+            .iter()
+            .filter_map(LayoutBlock::as_table)
+            .collect();
+        assert_eq!(tables.len(), 4);
+        let near = |got: f32, want: f32| assert!((got - want).abs() < 0.01, "{got} vs {want}");
+        for t in &tables {
+            near(t.size.width, 200.0);
+        }
+        near(tables[0].origin.x, (cw - 200.0) / 2.0);
+        near(tables[1].origin.x, cw - 200.0);
+        near(tables[2].origin.x, 36.0);
+        near(tables[3].origin.x, cw - 200.0);
+        let rtl = &tables[3].rows[0].cells;
+        assert!(rtl[0].origin.x > rtl[1].origin.x, "cell A rightmost");
+        /* The paragraphs between them stay at the column edge. */
+        for b in &page.blocks {
+            if let LayoutBlock::Paragraph(p) = b {
+                assert_eq!(p.origin.x, 0.0);
+            }
+        }
     }
 
     /// Issue #155 — our side of the `long_cell_table.docx` oracle: the

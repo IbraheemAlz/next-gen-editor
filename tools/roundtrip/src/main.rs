@@ -285,6 +285,7 @@ fn run_default() -> Result<()> {
     run_toc_roundtrip()?;
     run_text_boxes_roundtrip()?;
     run_rtl_table_roundtrip()?;
+    run_table_jc_tblind_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -2153,6 +2154,120 @@ fn run_rtl_table_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/* ================================================ table placement (#173) ==== */
+
+/// Issue #173 — step 18: the `<w:jc>` / `<w:tblInd>` round-trip contract
+/// on `table_jc_tblind.docx` (centred, end-aligned and indented tables).
+///
+/// a. Both are MODELED on read (`TableProperties::alignment` /
+///    `indent_twips`), never carried in the tblPr grab bag.
+/// b. An untouched save is byte-identical (passthrough, drift 0).
+/// c. Typing into each table dirties it: every regenerated table is
+///    exactly its source plus the insert — `<w:jc>` and `<w:tblInd>`
+///    emitted once each, in schema order — on both save paths, and the
+///    re-read model carries the same placement.
+fn run_table_jc_tblind_roundtrip() -> Result<()> {
+    use engine::{Alignment, BlockPath, LogicalPos, PathStep};
+
+    let fixture_bytes = build_table_jc_tblind_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read jc/tblInd fixture")?;
+    /* Block indices of the three tables and their expected placement. */
+    let tables: [(u32, Option<Alignment>, i32, &str, &str); 3] = [
+        (1, Some(Alignment::Center), 0, JC_TBLIND_CENTER, "centre a"),
+        (3, Some(Alignment::End), 0, JC_TBLIND_END, "end a"),
+        (5, Some(Alignment::Start), 720, JC_TBLIND_INDENT, "indent a"),
+    ];
+    for (idx, alignment, indent, _, _) in tables {
+        let t = archive_a.document.blocks[idx as usize]
+            .as_table()
+            .with_context(|| format!("block {idx} is a table"))?;
+        if t.props.alignment != alignment || t.props.indent_twips != indent {
+            bail!(
+                "table {idx}: jc/tblInd not modeled: {:?} / {}",
+                t.props.alignment,
+                t.props.indent_twips
+            );
+        }
+        if t.props.grab_bag.is_some() {
+            bail!(
+                "table {idx}: jc/tblInd must not ride the tblPr grab bag: {:?}",
+                t.props.grab_bag
+            );
+        }
+    }
+    let src = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+
+    /* b. untouched save — byte-identical. */
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    assert_document_xml_well_formed(&untouched).context("untouched jc/tblInd .docx")?;
+    if extract_doc_xml(&untouched)? != src.as_bytes() {
+        bail!("untouched jc/tblInd document.xml drifted");
+    }
+    println!(
+        "[roundtrip] step 18a OK — jc / tblInd modeled on read, untouched save byte-identical"
+    );
+
+    /* c. edit the first cell of every table. */
+    let mut edited = archive_a.document.clone();
+    let mut expected = src.clone();
+    for (idx, _, _, tbl_pr, first) in tables {
+        let path = BlockPath::top(idx)
+            .push(PathStep::Cell { row: 0, col: 0 })
+            .push(PathStep::Block(0));
+        edited = edited.insert_text(
+            LogicalPos {
+                path,
+                offset: first.len() as u32,
+            },
+            INSERT_TEXT,
+        );
+        let src_tbl = jc_tblind_table(tbl_pr, first, &first.replace(" a", " b"));
+        let want_tbl = src_tbl.replacen(first, &format!("{first}{INSERT_TEXT}"), 1);
+        if !expected.contains(&src_tbl) {
+            bail!("fixture does not contain table {idx} verbatim");
+        }
+        expected = expected.replacen(&src_tbl, &want_tbl, 1);
+    }
+    for (label, bytes) in [
+        (
+            "write_docx",
+            write_docx(&archive_a, &edited).context("write edited jc/tblInd tables")?,
+        ),
+        (
+            "build_minimal_docx",
+            build_minimal_docx(&edited).context("UI-path save of jc/tblInd tables")?,
+        ),
+    ] {
+        assert_document_xml_well_formed(&bytes)
+            .with_context(|| format!("{label} jc/tblInd tables"))?;
+        let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+        let body = |s: &str| -> Result<String> {
+            let a = s.find("<w:body>").context("no <w:body>")?;
+            let b = s.rfind("</w:body>").context("no </w:body>")?;
+            Ok(s[a..b].to_string())
+        };
+        if body(&xml)? != body(&expected)? {
+            bail!(
+                "{label}: regenerated tables are not source + edit\n--- expected ---\n{expected}\n--- got ---\n{xml}"
+            );
+        }
+        let back = read_docx(&bytes).with_context(|| format!("{label}: re-read"))?;
+        for (idx, alignment, indent, _, _) in tables {
+            let t = back.document.blocks[idx as usize]
+                .as_table()
+                .context("table")?;
+            if t.props.alignment != alignment || t.props.indent_twips != indent {
+                bail!("{label}: table {idx} placement lost on re-read");
+            }
+        }
+    }
+    let drift = expected.len() - src.len();
+    println!(
+        "[roundtrip] step 18b OK — dirty tables regenerate source + edit, jc / tblInd emitted once in schema order (Δ {drift} B)"
+    );
+    Ok(())
+}
+
 /* ========================================================== manifest ==== */
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3019,7 +3134,78 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 },
             },
         },
+        /* Issue #173 — `<w:jc>` + `<w:tblInd>` on fixed-width tables.
+        Untouched it rides the passthrough at drift 0; the default
+        harness's step 18 is the dirty-regeneration check. */
+        PrebuiltFixture {
+            name: "table_jc_tblind.docx",
+            bytes: build_table_jc_tblind_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 10,
+                asserts: FixtureAsserts {
+                    paragraph_count: 4,
+                    paragraph_texts: vec![
+                        "intro".into(),
+                        "mid one".into(),
+                        "mid two".into(),
+                        "after".into(),
+                    ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
     ]
+}
+
+/// Issue #173 — one fixed-width (2 × 2000 twips) 1 × 2 table: `tbl_pr`
+/// is the whole `<w:tblPr>…</w:tblPr>` (writer-canonical child order).
+fn jc_tblind_table(tbl_pr: &str, a: &str, b: &str) -> String {
+    format!(
+        concat!(
+            "<w:tbl>{tbl_pr}",
+            r#"<w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>"#,
+            r#"<w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">{a}</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t xml:space="preserve">{b}</w:t></w:r></w:p></w:tc></w:tr>"#,
+            "</w:tbl>",
+        ),
+        tbl_pr = tbl_pr,
+        a = a,
+        b = b,
+    )
+}
+
+/// Issue #173 — the three `<w:tblPr>`s of `table_jc_tblind.docx`, in
+/// the writer's canonical shape (CT_TblPrBase order: tblW, jc, tblInd,
+/// tblLayout) so a regenerated table is byte-identical to its source.
+const JC_TBLIND_CENTER: &str = r#"<w:tblPr><w:tblW w:w="4000" w:type="dxa"/><w:jc w:val="center"/><w:tblLayout w:type="fixed"/></w:tblPr>"#;
+const JC_TBLIND_END: &str = r#"<w:tblPr><w:tblW w:w="4000" w:type="dxa"/><w:jc w:val="end"/><w:tblLayout w:type="fixed"/></w:tblPr>"#;
+const JC_TBLIND_INDENT: &str = r#"<w:tblPr><w:tblW w:w="4000" w:type="dxa"/><w:jc w:val="start"/><w:tblInd w:w="720" w:type="dxa"/><w:tblLayout w:type="fixed"/></w:tblPr>"#;
+
+/// Issue #173 fixture: a centred, an end-aligned and a start-aligned +
+/// 720-twip-indented fixed-width table, separated by paragraphs (Word
+/// merges adjacent tables).
+fn build_table_jc_tblind_docx() -> Vec<u8> {
+    let p = |t: &str| format!(r#"<w:p><w:r><w:t xml:space="preserve">{t}</w:t></w:r></w:p>"#);
+    let document_xml = format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            "<w:body>{intro}{t1}{mid1}{t2}{mid2}{t3}{after}{sect}</w:body></w:document>",
+        ),
+        intro = p("intro"),
+        t1 = jc_tblind_table(JC_TBLIND_CENTER, "centre a", "centre b"),
+        mid1 = p("mid one"),
+        t2 = jc_tblind_table(JC_TBLIND_END, "end a", "end b"),
+        mid2 = p("mid two"),
+        t3 = jc_tblind_table(JC_TBLIND_INDENT, "indent a", "indent b"),
+        after = p("after"),
+        sect = BARE_SECT_PR,
+    );
+    package_document_xml(&document_xml)
 }
 
 /// Replicates `crates/format-docx/src/writer.rs`
