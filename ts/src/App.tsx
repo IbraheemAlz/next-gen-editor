@@ -34,7 +34,9 @@ import './styles/a11y.css';
  *  the engine then already holds the document, selection, undo window and
  *  layout config, and re-seeding via `RENDER_PAGE` would wipe exactly what
  *  was just recovered. That path only re-asserts the live device scale
- *  (which repaints and re-broadcasts the selection). */
+ *  (which repaints and re-broadcasts the selection). Issue #97 — the same
+ *  holds when no snapshot existed but the replayed tail re-seeded the
+ *  session itself (`RecoveryInfo.layoutRestored`). */
 async function setupEngine(
     client: EngineClient,
     fonts: FontRegistry,
@@ -251,7 +253,11 @@ export function App() {
         await setupEngine(
             client,
             fontRegistry,
-            generation > 0 && client.lastRecovery?.restored === true,
+            /* Issue #97 — "the engine already holds the session" also
+               covers a snapshot-less recovery whose replayed tail carried
+               the boot RENDER_PAGE: re-seeding would wipe the replayed
+               document and snap the zoom back to 100 %. */
+            generation > 0 && client.lastRecovery?.layoutRestored === true,
         );
         setBooting(false);
         /* Issue #54 — the boot paint presents while the opaque

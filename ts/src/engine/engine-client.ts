@@ -70,6 +70,19 @@ export interface RecoveryInfo {
     appliedCommands: number;
     /** The renderer the recovered engine actually paints with (#66). */
     renderer: string;
+    /** Issue #97 — the user zoom the recovered engine renders at. */
+    zoom: number;
+    /** Issue #97 — the recovered boot device scale; `undefined` when the
+     *  engine came back without a layout config. */
+    deviceScale: number | undefined;
+    /**
+     * Issue #97 — the recovered engine holds a live session (document +
+     * layout config): either a base snapshot was restored, or the replayed
+     * tail itself re-seeded it (it carried the boot `RENDER_PAGE`). The
+     * shell must then NOT re-seed via `RENDER_PAGE`, which would wipe the
+     * replayed document and reset the zoom to 100 %.
+     */
+    layoutRestored: boolean;
 }
 
 type Resolver = (v: WorkerReply) => void;
@@ -166,10 +179,15 @@ export class EngineClient {
         ]);
         if (!r.ok) throw new Error(r.error);
         this.activeRenderer = r.renderer ?? 'canvas2d';
+        const recovered = r.evt?.type === 'RECOVERED' ? r.evt : undefined;
+        const deviceScale = recovered?.device_scale;
         this.lastRecoveryInfo = {
             restored: r.restored === true,
             appliedCommands: r.appliedCommands ?? 0,
             renderer: this.activeRenderer,
+            zoom: recovered?.zoom ?? 1,
+            deviceScale,
+            layoutRestored: r.restored === true || deviceScale !== undefined,
         };
     }
 

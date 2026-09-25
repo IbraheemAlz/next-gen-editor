@@ -166,6 +166,13 @@ export interface EditorState {
      * starts from the live value instead of 100 %.
      */
     zoom: Accessor<number>;
+    /**
+     * Issue #97 — the boot device scale (`devicePixelRatio × 4/3`) the
+     * engine reported on its last `RECOVERED`; `undefined` before any
+     * recovery, or when the engine came back cold (no layout config — the
+     * shell re-seeds it). Shared like `zoom`.
+     */
+    deviceScale: Accessor<number | undefined>;
 }
 
 /**
@@ -179,6 +186,7 @@ export interface EditorState {
  */
 interface ViewState {
     zoom: Accessor<number>;
+    deviceScale: Accessor<number | undefined>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -194,12 +202,20 @@ function viewStateFor(engine: EngineHandle): ViewState {
     if (existing) return existing;
     const state = createRoot(() => {
         const [zoom, setZoom] = createSignal(1);
+        const [deviceScale, setDeviceScale] = createSignal<number | undefined>(undefined);
         engine.subscribe((evt: Event) => {
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
+            } else if (evt.type === 'RECOVERED') {
+                /* Issue #97 — the respawned engine folded the replayed
+                   SET_ZOOM / SET_DEVICE_SCALE into its restored config (or
+                   came back cold at 100 %); the controls follow IT, not
+                   whatever they showed before the trap. */
+                setZoom(roundZoom(evt.zoom ?? 1));
+                setDeviceScale(evt.device_scale);
             }
         });
-        return { zoom };
+        return { zoom, deviceScale };
     });
     viewStates.set(engine, state);
     return state;
@@ -340,5 +356,6 @@ export function createEditorState(): EditorState {
         fieldCodeView,
         fieldAtCaret,
         zoom: view.zoom,
+        deviceScale: view.deviceScale,
     };
 }

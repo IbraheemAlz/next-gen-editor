@@ -7475,6 +7475,9 @@ impl Engine {
     /// The shell repaints once fonts are back (`SetDeviceScale` +
     /// `RequestPaint`), and reads the actual renderer off the reply so
     /// `__renderer` cannot lie after a respawn (issue #66).
+    ///
+    /// Issue #97 — the reply carries the recovered `zoom` / `device_scale`
+    /// so the shell's zoom controls re-sync from the engine.
     async fn do_recover(&mut self, snapshot: Vec<u8>, log_tail: Vec<Command>) -> Event {
         self.reset_session_state();
         let snapshot_restored = if snapshot.is_empty() {
@@ -7535,6 +7538,8 @@ impl Engine {
             applied_commands,
             snapshot_restored,
             renderer: self.renderer_name().to_string(),
+            zoom: self.user_zoom(),
+            device_scale: self.layout_cfg.as_ref().map(|c| c.base_scale),
         }
     }
 
@@ -23683,10 +23688,17 @@ mod snapshot_tests {
                 applied_commands,
                 snapshot_restored,
                 renderer,
+                zoom,
+                device_scale,
             } => {
                 assert_eq!(applied_commands, 2);
                 assert!(snapshot_restored);
                 assert_eq!(renderer, "canvas2d");
+                /* Issue #97 — the reply reports the REPLAYED zoom (the
+                snapshot said 1.25, the tail's SetZoom said 2.0) and the
+                restored boot device scale, so the shell re-syncs. */
+                assert_eq!(zoom, 2.0);
+                assert_eq!(device_scale, Some(1.5));
             }
             other => panic!("expected Recovered, got {other:?}"),
         }
@@ -23760,6 +23772,16 @@ mod snapshot_tests {
                 ..
             }
         ));
+        /* Issue #97 — a cold recovery reports the cold defaults: 100 %
+        zoom and no device scale (the shell re-seeds both). */
+        let Event::Recovered {
+            zoom, device_scale, ..
+        } = evt
+        else {
+            unreachable!()
+        };
+        assert_eq!(zoom, 1.0);
+        assert_eq!(device_scale, None);
         assert_eq!(text(&b), "");
         assert!(b.selection.is_none());
         assert!(b.layout_cfg.is_none());

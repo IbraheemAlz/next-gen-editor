@@ -108,6 +108,18 @@ pub enum Event {
         /// so the shell's `__renderer` never drifts from the truth after a
         /// post-trap respawn.
         renderer: String,
+        /// Issue #97 — the user zoom fraction the recovered engine renders
+        /// at (restored config + any replayed `SetZoom`; `1.0` when the
+        /// engine came back cold). The shell re-syncs its zoom controls
+        /// from this instead of trusting its pre-trap UI state.
+        #[serde(default = "default_zoom")]
+        zoom: f32,
+        /// Issue #97 — the recovered boot device scale
+        /// (`devicePixelRatio × 4/3`, before zoom); `None` when the engine
+        /// came back cold with no layout config (the shell re-seeds it).
+        #[serde(default)]
+        #[tsify(optional)]
+        device_scale: Option<f32>,
     },
     /// Reply to `Command::Snapshot` (issue #85): the versioned snapshot
     /// envelope (`engine::snapshot`, magic + format version + payload).

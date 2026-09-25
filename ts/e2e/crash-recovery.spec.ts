@@ -147,3 +147,73 @@ test('document, caret and undo survive a real wasm trap; renderer reported truth
     expect(r.clientRenderer).toBe(r.recoveredEvt.renderer);
     expect(r.lastRecovery?.renderer).toBe(r.recoveredEvt.renderer);
 });
+
+/* Issue #97 — zoom / device scale after a real trap. Set 150 % through the
+   zoom control, trap, and prove the control, the engine's own report
+   (`Event::Recovered.zoom` / `.device_scale`) and the painted page scale
+   all agree on the recovered generation. */
+test('zoom and device scale re-sync from Event::Recovered after a real trap', async ({
+    page,
+}) => {
+    test.setTimeout(60_000);
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+    const pageHeight = (): Promise<number> =>
+        page.evaluate(async () => {
+            const evt = await (window as any).__dispatch({
+                type: 'REQUEST_PAINT',
+                viewport: { x: 0, y: 0, w: 0, h: 0 },
+                dirty: undefined,
+            });
+            return evt.type === 'PAINTED' ? (evt.page_heights[0] ?? -1) : -1;
+        });
+    const zoomValues = (): Promise<string[]> =>
+        page.$$eval('.nge-zoom__select', (els) =>
+            els.map((el) => (el as HTMLSelectElement).value),
+        );
+
+    /* An edit before the trap: the recovery below usually has no base
+       snapshot yet (the idle snapshot needs 1.5 s of quiet), so this also
+       proves the shell keeps a session the replayed tail re-seeded instead
+       of re-seeding a blank page over it. */
+    await page.evaluate(() =>
+        (window as any).__dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'Z' }),
+    );
+    const h100 = await pageHeight();
+    expect(h100).toBeGreaterThan(0);
+    await page.locator('.nge-zoom__select').first().selectOption('1.5');
+    await expect.poll(zoomValues).toEqual(['1.5', '1.5']);
+    const h150 = await pageHeight();
+    expect(h150 / h100).toBeCloseTo(1.5, 3);
+
+    const recovered = await page.evaluate(async () => {
+        const client = (window as any).__engineClient;
+        let evt: any = null;
+        client.subscribe((e: any) => {
+            if (e.type === 'RECOVERED') evt = e;
+        });
+        await client.armTrap(1);
+        await (window as any).__dispatch({ type: 'PING' }).catch(() => undefined);
+        for (let i = 0; i < 600 && (window as any).__recovered !== true; i++) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        return { evt, dpr: window.devicePixelRatio };
+    });
+    expect(recovered.evt, 'Event::Recovered broadcast').not.toBeNull();
+    expect(recovered.evt.zoom).toBeCloseTo(1.5, 5);
+    expect(recovered.evt.device_scale).toBeCloseTo((recovered.dpr * 4) / 3, 4);
+
+    /* The controls show the engine's zoom, and the recovered engine paints
+       at exactly the pre-trap 150 % scale. */
+    await expect.poll(zoomValues).toEqual(['1.5', '1.5']);
+    expect(await pageHeight()).toBeCloseTo(h150, 3);
+    const text = await page.evaluate(async () => {
+        const dispatch = (window as any).__dispatch;
+        await dispatch({ type: 'SELECT_ALL' });
+        const p = await dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' });
+        return p.type === 'CLIPBOARD_PAYLOAD' ? p.plain : `<${p.type}>`;
+    });
+    expect(text).toBe(`Z${SEED}`);
+});

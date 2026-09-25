@@ -861,9 +861,15 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
         const recovered = evt.type === 'RECOVERED' ? evt : undefined;
         const renderer = recovered?.renderer ?? probed;
         const restored = recovered?.snapshot_restored === true;
+        /* Issue #97 — the engine holds a live session when a snapshot was
+           restored OR the replayed tail re-seeded one (it carried the boot
+           RENDER_PAGE → a layout config, reported as `device_scale`). The
+           shell then keeps it instead of re-seeding, so it needs the same
+           media re-decode + a11y rebuild as a snapshot restore. */
+        const sessionRestored = restored || recovered?.device_scale !== undefined;
         /* Phase 7 — a restored document may carry inline images whose
            bitmaps died with the old worker; decode them again. */
-        if (restored) {
+        if (sessionRestored) {
             await decodeAndRegisterMedia();
         }
         self.postMessage({
@@ -877,7 +883,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
         /* §10 — the recovered engine has no a11y cache, so this delta is a
            full `Replace`: the mirror DOM rebuilds from the restored tree
            instead of narrating 200 replayed edits. */
-        if (restored) {
+        if (sessionRestored) {
             const delta = await dispatch({ type: 'REQUEST_ACCESSIBILITY_DELTA' });
             if (delta.type === 'ACCESSIBILITY_TREE_DELTA') {
                 self.postMessage({ evt: delta });
