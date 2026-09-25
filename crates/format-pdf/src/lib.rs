@@ -259,9 +259,8 @@ pub fn export_pdf(
         if let Some(hf) = &page.footer {
             for_each_paragraph(&hf.blocks, &mut collect);
         }
-        for entry in &page.footnotes {
-            collect(&entry.paragraph);
-        }
+        page.footnotes.for_each_paragraph(&mut collect);
+        page.endnotes.for_each_paragraph(&mut collect);
     }
 
     let mut pdf = Pdf::new();
@@ -494,13 +493,20 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
         emit_block_borders(&mut content, page_h, content_x, content_y, block);
     }
 
-    /* Issue #71 — footnote band: stacked entries bottom-anchored at
-    the margin, with the 30%-width separator rule scene.rs draws. */
-    if !page.footnotes.is_empty() {
-        let band_height: f32 = page.footnotes.iter().map(|e| e.paragraph.size.height).sum();
-        let band_bottom = page.size.height - page.margins.bottom;
-        let band_top = band_bottom - band_height;
-        let rule_w = (page.size.width - page.margins.left - page.margins.right) * 0.3;
+    /* Issue #80 — note bands at the paginator's `NoteBand::y` (the
+    SAME placement scene.rs paints): separator rule (30 % of the content
+    width, full width for a continuation) + every entry's blocks. */
+    for band in [&page.endnotes, &page.footnotes] {
+        if band.is_empty() {
+            continue;
+        }
+        let band_top = band.y;
+        let content_w = page.size.width - page.margins.left - page.margins.right;
+        let rule_w = if band.continuation {
+            content_w
+        } else {
+            content_w * 0.3
+        };
         let rule_y = band_top - 6.0;
         content.save_state();
         content.set_fill_rgb(
@@ -511,15 +517,25 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
         content.rect(content_x, page_h - (rule_y + 0.75), rule_w, 0.75);
         content.fill_nonzero();
         content.restore_state();
-        for entry in &page.footnotes {
-            emit_paragraph_text(
-                &mut content,
-                page_h,
-                content_x,
-                band_top,
-                &entry.paragraph,
-                font_objs,
-            );
+        for entry in &band.entries {
+            let entry_x = content_x + entry.origin.x;
+            let entry_top = band_top + entry.origin.y;
+            for block in &entry.blocks {
+                emit_block_shading(&mut content, page_h, entry_x, entry_top, block);
+            }
+            for block in &entry.blocks {
+                match block {
+                    LayoutBlock::Paragraph(p) => {
+                        emit_paragraph_text(&mut content, page_h, entry_x, entry_top, p, font_objs);
+                    }
+                    LayoutBlock::Table(t) => {
+                        emit_table_text(&mut content, page_h, entry_x, entry_top, t, font_objs);
+                    }
+                }
+            }
+            for block in &entry.blocks {
+                emit_block_borders(&mut content, page_h, entry_x, entry_top, block);
+            }
         }
     }
 
@@ -1227,9 +1243,8 @@ fn collect_to_unicode_pages(
         if let Some(hf) = &page.footer {
             for_each_paragraph(&hf.blocks, &mut collect);
         }
-        for entry in &page.footnotes {
-            collect(&entry.paragraph);
-        }
+        page.footnotes.for_each_paragraph(&mut collect);
+        page.endnotes.for_each_paragraph(&mut collect);
     }
     out
 }
@@ -1385,7 +1400,8 @@ mod tests {
             footer: None,
             header_offset: 36.0,
             footer_offset: 36.0,
-            footnotes: Vec::new(),
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
@@ -1541,7 +1557,8 @@ mod tests {
             footer: None,
             header_offset: 36.0,
             footer_offset: 36.0,
-            footnotes: Vec::new(),
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
@@ -1646,7 +1663,8 @@ mod tests {
                 footer: None,
                 header_offset: 36.0,
                 footer_offset: 36.0,
-                footnotes: Vec::new(),
+                footnotes: layout::NoteBand::default(),
+                endnotes: layout::NoteBand::default(),
                 hf_role: layout::HeaderRole::Default,
                 page_number: 1,
                 floats: Vec::new(),
@@ -1680,7 +1698,8 @@ mod tests {
             footer: None,
             header_offset: 36.0,
             footer_offset: 36.0,
-            footnotes: Vec::new(),
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
@@ -1980,6 +1999,7 @@ mod tests {
                 synthetic: false,
                 inline_image_rel_id: None,
                 inline_footnote_marker: None,
+                inline_note_anchor: None,
                 inline_object_height: 0.0,
                 float: None,
             }],
@@ -2029,7 +2049,8 @@ mod tests {
             footer: None,
             header_offset: 36.0,
             footer_offset: 36.0,
-            footnotes: Vec::new(),
+            footnotes: layout::NoteBand::default(),
+            endnotes: layout::NoteBand::default(),
             hf_role: layout::HeaderRole::Default,
             page_number: 1,
             floats: Vec::new(),
@@ -2256,11 +2277,20 @@ mod tests {
             LayoutBlock::Paragraph(p) => p.clone(),
             LayoutBlock::Table(_) => unreachable!(),
         };
-        page.footnotes = vec![layout::boxes::FootnoteEntry {
-            id: 1,
-            marker: "1".into(),
-            paragraph: note_para,
-        }];
+        page.footnotes = layout::NoteBand {
+            entries: vec![layout::boxes::FootnoteEntry {
+                id: 1,
+                kind: engine::NoteKind::Footnote,
+                marker: "1".into(),
+                origin: layout::Point { x: 0.0, y: 0.0 },
+                blocks: vec![LayoutBlock::Paragraph(note_para)],
+                first_block_index: 0,
+                continued_from_previous: false,
+                continues_on_next: false,
+            }],
+            y: page.size.height - page.margins.bottom - 20.0,
+            continuation: false,
+        };
         let mut with_notes = Vec::new();
         export_pdf(
             std::slice::from_ref(&page),
@@ -2271,7 +2301,7 @@ mod tests {
         )
         .expect("export");
         let mut without = page.clone();
-        without.footnotes = Vec::new();
+        without.footnotes = layout::NoteBand::default();
         let mut plain = Vec::new();
         export_pdf(
             std::slice::from_ref(&without),

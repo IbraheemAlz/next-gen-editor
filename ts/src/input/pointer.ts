@@ -18,6 +18,12 @@ import {
     selectionViewForPointer,
 } from '../state/engine-store';
 
+/** Issue #80 — footnote / endnote stories ride the header/footer story
+ *  protocol (`editing_story`) but live in the body's page flow. */
+function isNoteArea(area: string): boolean {
+    return area === 'Footnote' || area === 'Endnote';
+}
+
 /**
  * Wire pointer listeners on `canvas` for one page in the multi-canvas DOM
  * architecture (Phase 6c). Returns a teardown that removes them. Pointer
@@ -151,12 +157,23 @@ export function attachPointer(
              band on click, so dispatch EnterHeaderFooter for the
              pressed page/area instead);
            - story mode + press on the dimmed body → swallow (dblclick
-             exits — Word semantics). */
+             exits — Word semantics);
+           - issue #80 NOTE story mode (footnote / endnote) → a press in
+             a margin band is swallowed like in body mode (dblclick
+             enters the band); any other press falls through to
+             PLACE_CARET_AT_POINT, which the engine routes itself
+             (inside a note band → that note, elsewhere → back to the
+             body at the point). */
         {
             const local = toLocal(e);
             const zone = headerFooterZoneAt(pageIdx, local.y);
             const story = editingStoryForPointer();
-            if (story) {
+            if (story && isNoteArea(story.area)) {
+                if (zone !== null) {
+                    gesture += 1;
+                    return;
+                }
+            } else if (story) {
                 const inOwnBand =
                     zone === story.area && pageIdx === story.page;
                 if (!inOwnBand) {
@@ -240,7 +257,10 @@ export function attachPointer(
                 });
             return;
         }
-        if (story && zone === null) {
+        /* Issue #80 — inside a note story a body double-click selects a
+           word like anywhere else (the note lives in the page flow; a
+           single click already routes story ↔ body engine-side). */
+        if (story && zone === null && !isNoteArea(story.area)) {
             void client.dispatch({ type: 'EXIT_HEADER_FOOTER' }).catch((err: unknown) => {
                 console.error('exitHeaderFooter failed', err);
             });

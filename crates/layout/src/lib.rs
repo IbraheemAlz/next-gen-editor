@@ -14,15 +14,15 @@ pub mod wrap;
 
 pub use boxes::{
     CellAnchorRef, FloatAnchorRef, FloatBox, FloatGlyph, FloatOffsetPx, FloatSpec, FloatWrap,
-    FontId, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, LineSegment, MarkerBox, PageBox,
-    ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TableBox, TableCellBox, TableRowBox,
-    TextAttrs, VisualRun, WrapSide,
+    FontId, FootnoteEntry, HeaderFooterBox, LayoutBlock, LayoutField, LineBox, LineSegment,
+    MarkerBox, NoteBand, PageBox, ParagraphBox, Point, PositionedGlyph, Size, StyleSpan, TableBox,
+    TableCellBox, TableRowBox, TextAttrs, VisualRun, WrapSide,
 };
 pub use floats::{ColumnLayout, resolve_page_floats};
 pub use page::{A4Page, Margins};
 pub use paginate::{
-    HeaderBands, HeaderRole, PageGeometry as PaginatePageGeometry, Paginator,
-    split_paragraph_at_line,
+    FOOTNOTE_SEPARATOR_HEIGHT_PT, HeaderBands, HeaderRole, NoteBody,
+    PageGeometry as PaginatePageGeometry, Paginator, collect_note_anchors, split_paragraph_at_line,
 };
 pub use paragraph::{InlineObjectInfo, ParagraphConfig, layout_paragraph};
 pub use watchdog::{

@@ -316,14 +316,26 @@ fn emit_inline_object(obj: &InlineObject, out: &mut String) {
                 "\" data-width-emu=\"{width_emu}\" data-height-emu=\"{height_emu}\" width=\"{w_px}\" height=\"{h_px}\"/>"
             ));
         }
-        InlineKind::FootnoteRef {
-            id: _,
-            display_number,
-        } => {
-            /* Footnote references render as a superscript marker in the
-            HTML payload. Not yet a paste target — Phase 8a's footnote
-            insertion uses a separate command path. */
-            out.push_str(&format!("<sup>{display_number}</sup>"));
+        InlineKind::FootnoteRef { id, .. } | InlineKind::EndnoteRef { id, .. } => {
+            /* Note references render as a superscript marker in the
+            HTML payload. The displayed number is a document-order
+            derivation (`DocumentTree::note_markers`) the clipboard
+            slice cannot see, so the OOXML id stands in — Word's ids run
+            1, 2, 3… in reference order, so the two usually agree. Not
+            yet a paste target (issue #80 keeps note authoring on the
+            `InsertFootnote` / `InsertEndnote` command path). */
+            let kind = if matches!(obj.kind, InlineKind::FootnoteRef { .. }) {
+                "footnote"
+            } else {
+                "endnote"
+            };
+            out.push_str(&format!(
+                "<sup data-nge-note=\"{kind}\" data-nge-note-id=\"{id}\">{id}</sup>"
+            ));
+        }
+        InlineKind::NoteSelfRef { .. } => {
+            /* The self-mark inside a note body carries no number of its
+            own on the clipboard. */
         }
     }
 }

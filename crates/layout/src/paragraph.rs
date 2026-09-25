@@ -37,16 +37,19 @@ pub struct InlineObjectInfo {
     pub kind: InlineObjectInfoKind,
 }
 
-/// Phase 8a — discriminator for `InlineObjectInfo`. Image anchors carry a
-/// rel id; footnote refs carry the marker text the renderer paints as a
-/// superscript.
+/// Phase 8a / issue #80 — discriminator for `InlineObjectInfo`. Image
+/// anchors carry a rel id; note markers carry the displayed number
+/// (`"1"`, `"iv"`, …, empty for an author-supplied custom mark) plus —
+/// for a body-side REFERENCE — the anchor the paginator reserves band
+/// space for. The self-mark heading a note body has no anchor.
 #[derive(Debug, Clone)]
 pub enum InlineObjectInfoKind {
     Image {
         rel_id: String,
     },
-    FootnoteMarker {
+    NoteMarker {
         text: String,
+        anchor: Option<engine::NoteAnchor>,
     },
     /// Issue #69 — a FLOATING image (`<wp:anchor>`). The sentinel glyph
     /// reserves no width; `width_px` / `height_px` on the owning
@@ -57,6 +60,35 @@ pub enum InlineObjectInfoKind {
         rel_id: String,
         spec: crate::boxes::FloatSpec,
     },
+}
+
+/// Issue #80 — note markers shape at this fraction of the span size…
+pub const NOTE_MARK_SCALE: f32 = 0.65;
+/// …raised by this fraction of the span size above the baseline (the
+/// same superscript geometry `<w:vertAlign w:val="superscript"/>` uses).
+pub const NOTE_MARK_RAISE: f32 = 0.33;
+/// UTF-8 length of the U+FFFC anchor sentinel.
+const SENTINEL_LEN: u32 = 3;
+
+/// The note marker anchored exactly at paragraph byte `at`.
+fn note_marker_at(objects: &[InlineObjectInfo], at: u32) -> Option<&InlineObjectInfo> {
+    objects
+        .iter()
+        .find(|o| o.at == at && matches!(o.kind, InlineObjectInfoKind::NoteMarker { .. }))
+}
+
+/// Byte offset of the first note-marker anchor strictly inside
+/// `(from, before)`, so a text piece can be cut in front of it.
+fn next_note_marker_start(objects: &[InlineObjectInfo], from: u32, before: u32) -> Option<u32> {
+    objects
+        .iter()
+        .filter(|o| {
+            matches!(o.kind, InlineObjectInfoKind::NoteMarker { .. })
+                && o.at > from
+                && o.at < before
+        })
+        .map(|o| o.at)
+        .min()
 }
 
 pub struct ParagraphConfig<'a> {
@@ -367,6 +399,7 @@ fn build_marker(
             synthetic: false,
             inline_image_rel_id: None,
             inline_footnote_marker: None,
+            inline_note_anchor: None,
             inline_object_height: 0.0,
             float: None,
         })
@@ -919,6 +952,7 @@ fn compose_width_lines(
             seg_from as u32,
             cfg.spans,
             cfg.base_direction,
+            cfg.inline_objects,
         );
 
         if line_width + seg_width <= cfg.max_width {
@@ -961,6 +995,7 @@ fn compose_width_lines(
                 start as u32,
                 cfg.spans,
                 cfg.base_direction,
+                cfg.inline_objects,
             );
             if w <= cfg.max_width {
                 lines.push((build_line(cfg, start, end), false));
@@ -995,6 +1030,7 @@ fn char_break_fit(cfg: &ParagraphConfig<'_>, start: usize, hard_end: usize) -> u
             start as u32,
             cfg.spans,
             cfg.base_direction,
+            cfg.inline_objects,
         );
         if w <= cfg.max_width {
             accept = Some(abs);
@@ -1037,12 +1073,26 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                 let Some(span) = style_at(cfg.spans, cursor) else {
                     break;
                 };
-                let piece_end = span.end.min(seg_end);
+                let mut piece_end = span.end.min(seg_end);
+                /* Issue #80 — a note marker is its own piece: the U+FFFC
+                sentinel shapes as the marker's digits at superscript
+                size, never together with the surrounding text. Cut in
+                front of the next marker, or clamp this piece to the
+                sentinel when one starts right here. */
+                let marker = note_marker_at(cfg.inline_objects, cursor);
+                if marker.is_some() {
+                    piece_end = piece_end.min(cursor + SENTINEL_LEN);
+                } else if let Some(next) =
+                    next_note_marker_start(cfg.inline_objects, cursor, piece_end)
+                {
+                    piece_end = next;
+                }
                 subs.push((
                     (cursor - brun_abs) as usize,
                     (piece_end - brun_abs) as usize,
                     script,
                     span,
+                    marker,
                 ));
                 cursor = piece_end;
             }
@@ -1051,13 +1101,29 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
             subs.reverse();
         }
 
-        for (rel_start, rel_end, script, span) in subs {
+        for (rel_start, rel_end, script, span, marker) in subs {
             let Some((font_id, face, synth)) =
                 cfg.fonts
                     .resolve(script, span.font_family.as_deref(), span.bold, span.italic)
             else {
                 continue;
             };
+            if let Some(info) = marker
+                && let InlineObjectInfoKind::NoteMarker { text, anchor } = &info.kind
+            {
+                runs.push(shape_note_marker(
+                    face,
+                    font_id.clone(),
+                    text,
+                    *anchor,
+                    brun.direction,
+                    &span,
+                    synth.faux_bold,
+                    synth.faux_italic,
+                    brun_abs + rel_start as u32..brun_abs + rel_end as u32,
+                ));
+                continue;
+            }
             let sub_text_raw = &brun_text[rel_start..rel_end];
             /* L1.3 (#4) — two shape-time substitutions:
             * `caps_transform` upper-cases the slice. Byte-length
@@ -1097,26 +1163,26 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                         None => g.cluster,
                     };
                     let abs_cluster = brun_abs_start + cluster_src;
-                    let info = cfg
-                        .inline_objects
-                        .iter()
-                        .find(|info| info.at == abs_cluster);
-                    let (image_rel, footnote_marker, float) = match info.map(|i| &i.kind) {
-                        Some(crate::paragraph::InlineObjectInfoKind::Image { rel_id }) => {
-                            (Some(rel_id.clone()), None, None)
-                        }
-                        Some(crate::paragraph::InlineObjectInfoKind::FootnoteMarker { text }) => {
-                            (None, Some(text.clone()), None)
+                    /* Note markers never reach this path (they are
+                    their own piece above), so only image anchors
+                    (inline or floating) override the glyph. */
+                    let info = cfg.inline_objects.iter().find(|info| {
+                        info.at == abs_cluster
+                            && matches!(
+                                info.kind,
+                                InlineObjectInfoKind::Image { .. }
+                                    | InlineObjectInfoKind::FloatingImage { .. }
+                            )
+                    });
+                    let (image_rel, float) = match info.map(|i| &i.kind) {
+                        Some(InlineObjectInfoKind::Image { rel_id }) => {
+                            (Some(rel_id.clone()), None)
                         }
                         /* Issue #69 — a floating object's sentinel: the
                         glyph reserves NO width and grows NO line; the
                         payload rides to the paginator, which positions
                         the object against its reference frame. */
-                        Some(crate::paragraph::InlineObjectInfoKind::FloatingImage {
-                            rel_id,
-                            spec,
-                        }) => (
-                            None,
+                        Some(InlineObjectInfoKind::FloatingImage { rel_id, spec }) => (
                             None,
                             Some(Box::new(crate::boxes::FloatGlyph {
                                 rel_id: rel_id.clone(),
@@ -1125,7 +1191,7 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                                 spec: *spec,
                             })),
                         ),
-                        None => (None, None, None),
+                        _ => (None, None),
                     };
                     let is_float = float.is_some();
                     PositionedGlyph {
@@ -1141,7 +1207,8 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
                         y_offset: g.y_offset,
                         synthetic: false,
                         inline_image_rel_id: image_rel,
-                        inline_footnote_marker: footnote_marker,
+                        inline_footnote_marker: None,
+                        inline_note_anchor: None,
                         inline_object_height: if is_float {
                             0.0
                         } else {
@@ -1183,6 +1250,97 @@ fn build_line(cfg: &ParagraphConfig<'_>, start: usize, end: usize) -> LineBox {
         segments: Vec::new(),
         segment: 0,
     }
+}
+
+/// Issue #80 — shape a note marker (`"1"`, `"iv"`, …) into one superscript
+/// [`VisualRun`] standing in for its U+FFFC anchor. Every glyph maps to
+/// cluster 0 (the sentinel's byte); the first carries the marker metadata
+/// and the rest are `synthetic` so caret / hit-test slot emission sees
+/// ONE stop for the whole mark (exactly the Kashida rule). An empty
+/// marker (custom mark follows) still yields one zero-advance carrier
+/// glyph so the paginator can find the anchor.
+#[allow(clippy::too_many_arguments)]
+fn shape_note_marker(
+    face: &text_pipeline::LoadedFont,
+    font_id: String,
+    text: &str,
+    anchor: Option<engine::NoteAnchor>,
+    direction: ShapingDirection,
+    span: &StyleSpan,
+    faux_bold: bool,
+    faux_italic: bool,
+    source_range: std::ops::Range<u32>,
+) -> VisualRun {
+    let px_size = (span.px_size * NOTE_MARK_SCALE).max(1.0);
+    let raise = span.px_size * NOTE_MARK_RAISE;
+    let mut glyphs: Vec<PositionedGlyph> = Vec::new();
+    if !text.is_empty() {
+        /* Digits and letters are direction-neutral; shape them LTR so
+        "12" never comes out as "21" inside an RTL run. */
+        let shaped = shape_text(face, text, ShapingDirection::Ltr, px_size);
+        for g in &shaped.glyphs {
+            glyphs.push(PositionedGlyph {
+                id: g.glyph_id as u16,
+                cluster: 0,
+                x_advance: g.x_advance,
+                y_advance: g.y_advance,
+                x_offset: g.x_offset,
+                y_offset: g.y_offset,
+                synthetic: !glyphs.is_empty(),
+                inline_image_rel_id: None,
+                inline_footnote_marker: None,
+                inline_note_anchor: None,
+                inline_object_height: 0.0,
+                float: None,
+            });
+        }
+    }
+    if glyphs.is_empty() {
+        glyphs.push(PositionedGlyph {
+            id: 0,
+            cluster: 0,
+            x_advance: 0.0,
+            y_advance: 0.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            synthetic: false,
+            inline_image_rel_id: None,
+            inline_footnote_marker: None,
+            inline_note_anchor: None,
+            inline_object_height: 0.0,
+            float: None,
+        });
+    }
+    if let Some(first) = glyphs.first_mut() {
+        first.inline_footnote_marker = Some(text.to_string());
+        first.inline_note_anchor = anchor;
+    }
+    VisualRun {
+        glyphs,
+        font: font_id,
+        direction,
+        source_range,
+        attrs: TextAttrs {
+            px_size,
+            color: span.color,
+            faux_bold,
+            faux_italic,
+            underline: span.underline,
+            strike: span.strike,
+            bg_color: span.bg_color,
+            baseline_shift_px: span.baseline_shift_px + raise,
+        },
+    }
+}
+
+/// Issue #80 — advance a note marker contributes to a line, measured the
+/// way [`shape_note_marker`] will shape it.
+fn measure_note_marker(face: &text_pipeline::LoadedFont, text: &str, px_size: f32) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let px = (px_size * NOTE_MARK_SCALE).max(1.0);
+    shape_text(face, text, ShapingDirection::Ltr, px).total_advance
 }
 
 /// Sum of every glyph advance across a line's runs.
@@ -1256,6 +1414,7 @@ fn measure_text(
     abs_start: u32,
     spans: &[StyleSpan],
     direction: ShapingDirection,
+    inline_objects: &[InlineObjectInfo],
 ) -> f32 {
     let mut total = 0.0_f32;
     for (srange, script) in segment_by_script(text) {
@@ -1265,7 +1424,7 @@ fn measure_text(
             let Some(span) = style_at(spans, cursor) else {
                 break;
             };
-            let piece_end = span.end.min(seg_end);
+            let mut piece_end = span.end.min(seg_end);
             /* Resolve per span: an explicit font family changes shaping (and
             width); faux bold/italic do not, so weight/slant stay `false`. */
             let Some((_, face, _)) =
@@ -1273,6 +1432,18 @@ fn measure_text(
             else {
                 break;
             };
+            /* Issue #80 — mirror `build_line`'s marker pieces so the
+            greedy probe measures what the line will shape. */
+            if let Some(info) = note_marker_at(inline_objects, cursor)
+                && let InlineObjectInfoKind::NoteMarker { text: mark, .. } = &info.kind
+            {
+                total += measure_note_marker(face, mark, span.px_size);
+                cursor += SENTINEL_LEN;
+                continue;
+            }
+            if let Some(next) = next_note_marker_start(inline_objects, cursor, piece_end) {
+                piece_end = next;
+            }
             let sub_raw = &text[(cursor - abs_start) as usize..(piece_end - abs_start) as usize];
             /* L1.3 (#4) — keep the greedy width probe in sync with
             `build_line`'s shape input via the shared
@@ -1519,6 +1690,7 @@ fn inject_kashida(run: &mut VisualRun, glyph_idx: usize, extra: f32, fonts: &Fon
         synthetic: true,
         inline_image_rel_id: None,
         inline_footnote_marker: None,
+        inline_note_anchor: None,
         inline_object_height: 0.0,
         float: None,
     };
@@ -1660,6 +1832,7 @@ mod tests {
             synthetic: false,
             inline_image_rel_id: None,
             inline_footnote_marker: None,
+            inline_note_anchor: None,
             inline_object_height: 0.0,
             float: None,
         }

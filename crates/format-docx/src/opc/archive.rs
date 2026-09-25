@@ -12,6 +12,7 @@ use crate::error::{DocxError, DocxWarning};
 use crate::numbering_resolver::resolve_markers_blocks;
 use crate::parts::comments::{parse_comments_extended_xml, parse_comments_xml};
 use crate::parts::document::parse_document_xml_with_warnings;
+use crate::parts::endnotes::parse_endnotes_xml;
 use crate::parts::footer::parse_footer_xml;
 use crate::parts::footnotes::parse_footnotes_xml;
 use crate::parts::header::parse_header_xml;
@@ -29,6 +30,7 @@ pub const STYLES_XML: &str = "word/styles.xml";
 pub const NUMBERING_XML: &str = "word/numbering.xml";
 pub const RELS_XML: &str = "word/_rels/document.xml.rels";
 pub const FOOTNOTES_XML: &str = "word/footnotes.xml";
+pub const ENDNOTES_XML: &str = "word/endnotes.xml";
 pub const COMMENTS_XML: &str = "word/comments.xml";
 pub const COMMENTS_EXTENDED_XML: &str = "word/commentsExtended.xml";
 pub const SETTINGS_XML: &str = "word/settings.xml";
@@ -395,17 +397,57 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
     stays `false` — read-only ingest never bloats the on-disk part. */
     document.numbering = engine_numbering_from(&numbering);
 
-    // Phase 8a — parse footnotes.xml + comments.xml if present, attach
-    // to the document. Both XML parts still ride other_entries verbatim
-    // so the passthrough writer round-trips them byte-identical.
-    if let Some(bytes) = other_entries
-        .iter()
-        .find(|(n, _)| n == FOOTNOTES_XML)
-        .map(|(_, b)| b.as_slice())
-        && let Ok(table) = parse_footnotes_xml(bytes)
-    {
-        document.footnotes = table.footnotes;
+    /* Issue #80 — note stories. `word/footnotes.xml` / `word/endnotes.xml`
+    parse through the body pipeline (style spans, lists, hyperlinks,
+    grab bags); both parts still ride `other_entries` verbatim so the
+    writer passes them through byte-identical until a story is edited.
+    Post-processing mirrors the header/footer parts: list markers
+    resolve against `numbering.xml`; hyperlink rel ids resolve against
+    the PART's own rels file (`word/_rels/footnotes.xml.rels`). */
+    for (entry, kind) in [
+        (FOOTNOTES_XML, engine::NoteKind::Footnote),
+        (ENDNOTES_XML, engine::NoteKind::Endnote),
+    ] {
+        let Some(bytes) = other_entries
+            .iter()
+            .find(|(n, _)| n == entry)
+            .map(|(_, b)| b.as_slice())
+        else {
+            continue;
+        };
+        let parsed = match kind {
+            engine::NoteKind::Footnote => parse_footnotes_xml(bytes, &resolver),
+            engine::NoteKind::Endnote => parse_endnotes_xml(bytes, &resolver),
+        };
+        let Ok(part) = parsed else {
+            continue;
+        };
+        let rels_name = part_rels_entry_name(entry);
+        let part_rels = other_entries
+            .iter()
+            .find(|(n, _)| n == &rels_name)
+            .and_then(|(_, b)| parse_rels_xml(b).ok())
+            .unwrap_or_default();
+        let mut stories: HashMap<i32, engine::NoteStory> = HashMap::with_capacity(part.notes.len());
+        for mut story in part.notes {
+            if !numbering.num_instances.is_empty() {
+                resolve_markers_blocks(&mut story.body, &numbering);
+            }
+            story.body = story
+                .body
+                .into_iter()
+                .map(|b| resolve_hyperlinks_block(b, &part_rels))
+                .collect();
+            stories.insert(story.id, story);
+        }
+        match kind {
+            engine::NoteKind::Footnote => document.footnote_stories = stories,
+            engine::NoteKind::Endnote => document.endnote_stories = stories,
+        }
     }
+    // Phase 8a — parse comments.xml if present, attach to the document.
+    // The XML part still rides other_entries verbatim so the passthrough
+    // writer round-trips it byte-identical.
     if let Some(bytes) = other_entries
         .iter()
         .find(|(n, _)| n == COMMENTS_XML)
@@ -460,6 +502,9 @@ pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
         && let Ok(settings) = crate::parts::settings::parse_settings_xml(bytes)
     {
         document.settings.even_and_odd_headers = settings.even_and_odd_headers;
+        /* Issue #80 — document-level note properties. */
+        document.footnote_props = settings.footnote_props;
+        document.endnote_props = settings.endnote_props;
     }
 
     /* Issue #77 — `docProps/core.xml` rides `other_entries` verbatim;
