@@ -2896,6 +2896,33 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
     Ok(buf)
 }
 
+/// Issue #134 — the live editor's save path (engine-wasm `SaveDocx` /
+/// `SaveDocument`), which holds only the tree. A document opened from
+/// `.docx` carries its source package (`DocumentTree::source_package`):
+/// it saves through [`write_docx`] against that package, so every sibling
+/// part (headers/footers, styles, numbering, settings, theme, fontTable,
+/// comments, custom XML, media) is re-emitted byte-identical and only the
+/// additive OPC splices `write_docx` owns (new media, new parts) touch
+/// `[Content_Types].xml` / rels. An engine-authored document (no package)
+/// saves through [`build_minimal_docx`], unchanged.
+pub fn save_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    let Some(package) = doc.source_package.as_deref() else {
+        return build_minimal_docx(doc);
+    };
+    let archive = DocxArchive {
+        other_entries: package
+            .entries
+            .iter()
+            .map(|e| (e.name.clone(), e.data.clone()))
+            .collect(),
+        /* `write_docx` writes `doc`, never `archive.document`. */
+        document: DocumentTree::default(),
+        document_root_attrs: doc.document_root_attrs.clone(),
+        warnings: Vec::new(),
+    };
+    write_docx(&archive, doc)
+}
+
 /// Build a minimal valid `.docx` from a freshly created document — no
 /// existing archive to base on. When the document references media
 /// (`doc.media`), the writer pulls the blobs into `word/media/*` and
