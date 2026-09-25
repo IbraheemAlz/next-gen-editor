@@ -42,7 +42,16 @@ paths:
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:
 1. **Sibling entries byte-identical** — zero drift on non-`document.xml` entries.
-2. **`document.xml` delta ≤ 2 × UTF-8 byte size of the inserted text.** Tighter is suspicious (probably overwrote unrelated regions). Looser means whitespace creep.
+2. **Primary (issue #251): `source_bytes_rewritten == 0`.** An edited save
+   must not respell or drop a single ORIGINAL byte; the whole delta must be
+   insertion. Superseded the old size-only check, which couldn't tell a
+   faithful insertion (which may legitimately mint a new `<w:r>`) from a
+   lossy regeneration landing in bounds by coincidence.
+3. **Secondary, informational: `document.xml` delta ≤ 2 × UTF-8 byte size
+   of the inserted text + a per-new-run allowance** (48 B/run — see
+   `tools/corpus-native/src/pipeline.rs::NEW_RUN_ALLOWANCE_BYTES`). The
+   bare `≤ 2×N` number (no allowance) is kept as an informational column
+   only (`EditCheck::bound_bytes` / `within_bound`).
 
 ## In-part grab bags (issue #84)
 - A dirty paragraph / table regenerates from the typed model. Every
@@ -166,13 +175,65 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   (remapped) text offset between runs. Comment anchors are deliberately
   NOT markers (tree-level `comment_ranges`; a verbatim copy could
   resurrect a deleted comment).
-- Offsets are remapped by `insert_text`, `delete_text`, `split_at`,
-  `concat`, inline-object splices and the revision accept/reject helper;
-  `SourceMarkup::text_len` makes any other text edit go *stale* (runs /
-  markers ignored, never misplaced).
+- **Content spans (issue #244).** A complex field with no result that
+  the model does not represent (legacy form fields: `FORMCHECKBOX`,
+  `FORMDROPDOWN`, an empty `FORMTEXT`, `<w:ffData>` in the begin
+  `fldChar`) is ONE marker with `MarkerRole::Content`: the whole `begin …
+  end` run range (balanced, root-bound), replacing the markers captured
+  inside it (name bookmark, text-less runs). Kept out of the field model.
+  A field nested in another field's *instruction* is never a span of its
+  own (only the enclosing field's span may keep it). Content markers are
+  Tier 3: when the offsets go stale they are still written, at the offset
+  clamped to the text, and `write_docx_with_notes` reports
+  `WriteNote::StaleMarkupClamped` (verbatim markers stay dropped).
+- **Run-level wrappers (issue #245).** An in-paragraph `<w:sdt>` keeps
+  its runs as paragraph content; its wrapper rides as a marker pair —
+  `MarkerRole::Open { id, close_xml }` (`<w:sdt>…<w:sdtContent>`, the
+  `sdtPr` subtree skipped whole by the parser) and `MarkerRole::Close
+  { id }` (`</w:sdtContent>…</w:sdt>`), `id` = the source byte offset. An
+  insertion at the closer's offset lands inside the control. The writer
+  (`positioned_markers`) pairs them with a stack (an orphaned closer is
+  dropped, an opener that lost its closer — a split — closes with
+  `close_xml` at the paragraph end) and checks every pair against the
+  wrappers it regenerates (hyperlinks, `ins` / `del`, local fields,
+  `nests_with`): a pair that would cross one is widened to a fixpoint and
+  the markers are emitted in a constructed order, noted as
+  `WriteNote::InlineWrapperWidened`. Row / cell-level `sdt` inside a
+  regenerated table are NOT covered (table markup, #248).
+- **Run padding (issue #245).** Pretty-print whitespace inside a source
+  `<w:r>` rides `SourceRun::pad` (`open` / `after_rpr` / `close`) and is
+  re-emitted on every regenerated piece of the run; a source bare `<w:t>`
+  whose text already had edge whitespace (`SourceRun::bare_edge_ws`) keeps
+  its bare spelling.
+- **Field source form (issue #246).** A field read from `.docx` carries
+  `Field::source` (`engine::FieldSource`): a `<w:fldSimple>`'s start tag
+  + `</w:fldSimple>`, or a complex field's source prologue (begin run —
+  `<w:ffData>` included — through the separate run; the markers captured
+  inside it are dropped, the bytes carry them) + its end run. The writer
+  (`open_field` / `close_field`) re-emits them while the live instruction
+  equals `FieldSource::instruction` and outside a `<w:del>`; a
+  `<w:fldSimple>` only while its element nests with every regenerated
+  wrapper (`simple_field_nests`), else the complex form.
+- Offsets are remapped by `delete_text`, `split_at`, `concat` and — for
+  every in-place text change — `Paragraph::splice_text` (`engine::
+  text_remap`, issues #250 / #252), which returns the `TextEdit` the
+  caller also feeds to `DocumentTree::remap_text_edit`, so the source
+  markup and the tree-level `comment_ranges` see ONE edit record
+  (insert / tracked insert + own-insertion delete / inline objects /
+  accept-reject / rich paste / field restamp all route through it — a
+  restamp that left the markup stale used to drop the `_GoBack` bookmark
+  after a FILENAME field, issue #246).
+  `SourceMarkup::text_len` still makes an unaware edit go *stale* in a
+  release build (runs / markers ignored, never misplaced); test builds
+  (`engine` feature `markup-assert`, on in `cfg(test)` and engine-wasm's
+  dev-deps) assert on every `UndoStack::push` that nothing went stale.
 - `tools/corpus-native` reports `edit_check.source_bytes_rewritten` (bytes
-  of the original the edited save rewrote; 0 = pure insertion) next to the
-  size-delta bound.
+  of the original the edited save rewrote; 0 = pure insertion) — the
+  primary bound since issue #251, see "Round-trip diff bounds" above — next
+  to the informational size-delta bound, and (when `> 0`) a cheap
+  `rewrite_cause` tag (`hyperlink` / `comment anchor` / `form field` /
+  `sdt` / `fldSimple` / `move` / `table` / `rPr` / `other`) tracking the
+  corpus against issues #242–#249.
 
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.

@@ -105,9 +105,9 @@ fuzz/             cargo-fuzz crate, own workspace (D5.5)
 - **`EngineClient`** (`ts/src/engine-client.ts`) is the typed main-thread RPC layer: spawns the worker, matches replies by `id`, exposes `dispatch` / `subscribe` / `recover`, and `loadFont` / `openDocument` (which pass byte buffers as `Transferable`s — zero-copy).
 - **Worker dual-protocol** (`ts/src/engine/engine.worker.ts`): the `EngineClient` `id`-routed path and the Phase-1 `?test=` visual-diff harness path coexist; a worker instance only ever sees one. The interactive editor uses `EngineClient`; `harness/visual-diff.ts` keeps the harness path alive for the `?test=` goldens.
 - **Bridge schema** is split across `crates/bridge/src/{common,command,event}.rs`. Every layer landed **additively**: §4–§5 on the Phase-1 PoC subset, then Phase 4's pointer / IME / clipboard / a11y commands on §4–§5 (see the Phase 4 section). The discipline is permanent — extend, never break a consumer.
-- **IndexedDB event log** (`ts/src/event-log.ts`): one `engine-log` DB; stores `commands` / `snapshots` / `meta`; snapshots pruned to the newest 3. The worker logs **off the critical path** — `handleClientCommand` posts the RPC reply *before* `logCommand()` runs (D2.8 backpressure; sustains 1000+ cmds/s).
-- **Crash recovery**: a WASM trap (`/RuntimeError|unreachable/`) → worker posts `{ trap: true }` + `self.close()` → `EngineClient.onTrap` rejects pending + fires the UI `onCrash` callback → `App` bumps the `canvasGen` signal, remounting `EditorCanvas` with a fresh `<canvas>`, and calls `recover()` → respawn + `Command::Recover`. `loadLatestEventLog` returns `snapshotSeq` / `lastSeq` so the recovered worker resumes `logSequence` (never restarts at 0).
-- **Recovery = base snapshot + replayed tail (issue #85).** `Command::Snapshot` → `Event::Snapshot { bytes }` is the versioned `engine::snapshot` envelope (`NGES` magic + format-version byte + named-field MessagePack; every model struct is `#[serde(default)]`, maps serialize sorted so equal states are byte-identical). It carries the document tree (styles, numbering, header/footer stories, media, comments), a size-bounded undo window, the selection, the active story, sticky formatting, review flags and the layout config. The worker snapshots every `SNAPSHOT_EVERY` logged commands *inside* the command task after the reply (so the seq is exact) and on a 1.5 s idle timer; the IndexedDB write stays off the critical path. `Command::Recover { snapshot, log_tail }` restores, then replays the tail through `apply` with the layout config stashed (no fonts yet → nothing may paint), and answers `Recovered { applied_commands, snapshot_restored, renderer }` — the renderer is re-probed on the fresh canvas and reported by the engine itself (#66). `setupEngine(restored = true)` re-loads fonts and re-asserts the device scale instead of re-seeding. `ARM_TRAP` (`EngineClient.armTrap`) is the fault-injection hook: a real `Engine.debug_force_trap` after K logged commands, log flushed first.
+- **IndexedDB event log** (`ts/src/event-log.ts`): one `engine-log` DB; stores `commands` / `snapshots` / `meta` / `packages`; snapshots pruned to the newest 3. Snapshots are persisted **detached** (issue #212, `Command::Snapshot.detach_package`): an opened `.docx`'s retained source package (#134) is stored once per document in `packages` under its content key (`Event::Snapshot.package_hash`), handed back on `Command::Recover.package`, and garbage-collected when no retained snapshot names it — a missing/mismatched package falls back to the minimal-package writer. The worker logs **off the critical path** — `handleClientCommand` posts the RPC reply *before* `logCommand()` runs (D2.8 backpressure; sustains 1000+ cmds/s).
+- **Crash recovery**: a WASM trap (`/RuntimeError|unreachable/`) → worker posts `{ trap: true }` + `self.close()` → `EngineClient.onTrap` rejects pending + fires the UI `onCrash` callback → `App` bumps the `canvasGen` signal, remounting `EditorCanvas` with a fresh `<canvas>`, and calls `recover()` → respawn + `Command::Recover`. `loadRecoveryLog` returns every retained snapshot (newest first, then the snapshot-less base) + the command rows + `lastSeq`, so the recovered worker resumes `logSequence` (never restarts at 0) and falls back to an older snapshot when the newest will not restore (issue #241). Pruning only ever drops commands at or before a *pruned* snapshot, in the same transaction — never without a retained snapshot — so every retained snapshot keeps its full tail.
+- **Recovery = base snapshot + replayed tail (issue #85).** `Command::Snapshot` → `Event::Snapshot { bytes }` is the versioned `engine::snapshot` envelope (`NGES` magic + format-version byte + named-field MessagePack; every model struct is `#[serde(default)]`, maps serialize sorted so equal states are byte-identical). It carries the document tree (styles, numbering, header/footer stories, media, comments), a size-bounded undo window, the selection, the active story, sticky formatting, review flags and the layout config. The worker snapshots every `SNAPSHOT_EVERY` logged commands *inside* the command task after the reply (so the seq is exact) and on a 1.5 s idle timer; the IndexedDB write stays off the critical path. `Command::Recover { snapshot, log_tail }` restores, then replays the tail through `apply` with the layout config stashed (no fonts yet → nothing may paint), and answers `Recovered { applied_commands, snapshot_restored, renderer }` — the renderer is re-probed on the fresh canvas and reported by the engine itself (#66). `setupEngine(restored = true)` re-loads fonts and re-asserts the device scale instead of re-seeding. `ARM_TRAP` (`EngineClient.armTrap`) is the fault-injection hook: a real `Engine.debug_force_trap` after K logged commands, log flushed first. The #99 Vello crash-loop streak is **persisted** (issue #240, `meta` row `renderer-streak`: count + timestamp + renderer + a `live` token; a clean `pagehide` leaves the token in `localStorage`, so only a generation that died with its tab counts): a boot within 24 h of reaching `VELLO_TRAP_LIMIT` starts on Canvas2D without probing (`INIT.forceRenderer`), and the Dev HUD shows the sticky fallback with a "Retry vello (reload)" action (`EngineClient.retryGpuRenderer`).
 - **e2e suite**: `ts/e2e/*.spec.ts` + `ts/playwright.config.ts` — `@playwright/test` with `channel: 'chrome'` (system Chrome, no download); `webServer` auto-boots Vite. Run: `pnpm exec playwright test` from `ts/`.
 
 ## Phase 3 — rendering, RTL, box model
@@ -331,7 +331,30 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 
 - The reader stashes every non-`word/document.xml` archive entry verbatim in `DocxArchive.other_entries`.
 - The writer emits those entries **byte-identical** + a freshly serialized `word/document.xml`. Don't re-serialize content types or rels.
-- Round-trip diff bound: `word/document.xml` byte delta ≤ 2 × UTF-8 byte size of the inserted text. Tighter than that is suspicious (probably overwrote unrelated regions). Looser means whitespace creep.
+- **Edit-drift bound (issue #251) — fidelity first, size second.** The
+  primary bound is `edit_check.source_bytes_rewritten == 0`: an edited save
+  must not respell or drop a single byte of the ORIGINAL `word/document.xml`
+  — everything the edit changes must be a pure insertion. The secondary
+  bound is size: `document.xml` byte delta ≤ `2 × inserted UTF-8 bytes` +
+  a per-new-run allowance (48 B/run — the measured ≈43 B markup cost of an
+  empty `<w:r><w:t xml:space="preserve"></w:t></w:r>` wrapper, rounded up;
+  `new_run_count` comes from a cheap tag-count heuristic, not a real diff),
+  since a faithful insertion may legitimately need to mint a new `<w:r>`
+  (e.g. appending after a differently-styled run, or opening a self-closing
+  `<w:p/>`). Both bounds live on `EditCheck` in `tools/corpus-native/src/
+  pipeline.rs` and are asserted the same way in `tools/roundtrip`'s default
+  step 6b/6c. The old size-only `≤ 2×N` bound is kept as an informational
+  column (`bound_bytes` / `within_bound`) — it cannot distinguish a
+  faithful insertion from a lossy regeneration that happens to land in
+  bounds (issue #199: a fix that drove `source_bytes_rewritten` down from
+  134 to a small residual simultaneously drove the old bound's violation
+  count *up*, 82 → 92, because faithful new runs cost bytes a silent
+  regeneration didn't).
+- Every document that still rewrites source bytes gets a cheap root-cause
+  tag (`hyperlink` / `comment anchor` / `form field` / `sdt` / `fldSimple`
+  / `move` / `table` / `rPr` / `other`) so the corpus can be tracked
+  against the filed issues (#242–#249) — see `tools/corpus-native`'s
+  `classify_rewrite` and `report.mjs`'s root-cause histogram.
 - XML escapes: `&` `<` `>` only. `xml:space="preserve"` on every `<w:t>` to keep trailing whitespace.
 
 ## Bash / agent ergonomics
@@ -339,7 +362,7 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 - **Working dir drifts** between Bash tool calls. Use absolute paths or `cd /home/ibrahim/Desktop/code/next-gen-editor &&` at the top of every multi-step command.
 - Long-running processes (vite dev, wasm-pack build) run in `run_in_background: true`.
 - Don't `git add .` blindly. Stage by explicit path.
-- Commit messages: heredoc + `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
+- Commit messages: heredoc + a `Co-Authored-By:` trailer naming the model that wrote the change (e.g. `Claude Fable 5.1`, `Claude Opus 5.5`, `Claude Sonnet 5`, each `<noreply@anthropic.com>`); the session that merges adds its `Claude-Session:` link.
 - **Parallel agents in git worktrees.** A shared `CARGO_TARGET_DIR` across
   worktrees is *unsound*: cargo fingerprints workspace-relative paths, so a
   sibling worktree's stale rlib (built from different sources) satisfies your

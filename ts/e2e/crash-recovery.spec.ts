@@ -1,4 +1,6 @@
 import { test, expect } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { appendStoredEntry, pseudoRandomBytes } from './zip-append';
 
 /* D2.7 exit gate: crash recovery. Force a worker trap, then verify the UI
    shell handles the crash callback — swaps in a fresh <canvas>, respawns the
@@ -305,4 +307,150 @@ test('zoom and device scale re-sync from Event::Recovered after a real trap', as
         return p.type === 'CLIPBOARD_PAYLOAD' ? p.plain : `<${p.type}>`;
     });
     expect(text).toBe(`Z${SEED}`);
+});
+
+/* Issue #212 — a `.docx` whose retained source package (#134) is large:
+   the package-parts fixture plus a 2 MiB incompressible
+   `word/fonts/font1.odttf`, the shape of a Word document with an
+   embedded font. Snapshots are persisted DETACHED — the package lands
+   once in the event log's `packages` store and every snapshot row stays
+   small — and a recovery re-attaches it, so the recovered session saves
+   the byte-identical file. */
+const PACKAGE_FIXTURE = new URL(
+    '../../crates/format-docx/tests/fixtures/word_package_parts.docx',
+    import.meta.url,
+);
+const FONT_BYTES = 2 * 1024 * 1024;
+
+test('embedded-font document: snapshots stay small, the package is stored once, recovery saves the identical file', async ({
+    page,
+}) => {
+    test.setTimeout(120_000);
+    const docx = appendStoredEntry(
+        readFileSync(PACKAGE_FIXTURE),
+        'word/fonts/font1.odttf',
+        pseudoRandomBytes(FONT_BYTES),
+    );
+    await page.goto('/');
+    await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+        timeout: 15_000,
+    });
+
+    const result = await page.evaluate(async (b64: string) => {
+        const w = window as any;
+        const dispatch = w.__dispatch as (cmd: unknown) => Promise<any>;
+        const client = w.__engineClient;
+        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        const sha256 = async (bytes: Uint8Array): Promise<string> => {
+            const digest = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
+            return Array.from(new Uint8Array(digest))
+                .map((b) => b.toString(16).padStart(2, '0'))
+                .join('');
+        };
+        type Log = {
+            snaps: { seq: number; size: number; packageHash?: string }[];
+            packages: { hash: string; size: number }[];
+        };
+        const readLog = (): Promise<Log> =>
+            new Promise((resolve, reject) => {
+                const open = indexedDB.open('engine-log');
+                open.onsuccess = () => {
+                    const db = open.result;
+                    const tx = db.transaction(['snapshots', 'packages'], 'readonly');
+                    const snaps = tx.objectStore('snapshots').getAll();
+                    const packages = tx.objectStore('packages').getAll();
+                    tx.oncomplete = () => {
+                        db.close();
+                        resolve({
+                            snaps: snaps.result.map((r: any) => ({
+                                seq: r.seq,
+                                size: r.bytes.length,
+                                packageHash: r.packageHash,
+                            })),
+                            packages: packages.result.map((r: any) => ({
+                                hash: r.hash,
+                                size: r.bytes.length,
+                            })),
+                        });
+                    };
+                    tx.onerror = () => reject(tx.error);
+                };
+                open.onerror = () => reject(open.error);
+            });
+        /* The idle snapshot fires 1.5 s after the last logged command. */
+        const awaitSnapshotCount = async (n: number): Promise<Log> => {
+            for (let i = 0; i < 200; i++) {
+                const log = await readLog();
+                if (log.snaps.filter((s) => s.packageHash).length >= n) return log;
+                await sleep(50);
+            }
+            throw new Error(`no ${n} package-bearing snapshot(s)`);
+        };
+        const save = async (): Promise<Uint8Array> => {
+            const evt = await dispatch({ type: 'SAVE_DOCUMENT', format: 'docx' });
+            if (evt.type !== 'DOCUMENT_SAVED') throw new Error(`save: ${evt.type}`);
+            return evt.bytes;
+        };
+
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const opened = await dispatch({
+            type: 'OPEN_DOCUMENT',
+            bytes,
+            format: 'docx',
+            name: 'embedded-font.docx',
+        });
+        if (opened.type === 'ERROR') return { failed: `open: ${opened.message}` };
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'A' });
+        /* The self-contained (#134) snapshot, for the size comparison. */
+        const inline = (await client.snapshot()) as Uint8Array;
+        const first = await awaitSnapshotCount(1);
+
+        /* A second idle snapshot of the same document: small again, and
+           the package is not written a second time. */
+        await dispatch({ type: 'INSERT_TEXT', at: undefined, text: 'B' });
+        const second = await awaitSnapshotCount(2);
+        const preSave = await save();
+        const preHash = await sha256(preSave);
+
+        let recoveredEvt: any = null;
+        client.subscribe((e: any) => {
+            if (e.type === 'RECOVERED') recoveredEvt = e;
+        });
+        await client.armTrap(1);
+        await dispatch({ type: 'PING' }).catch(() => undefined);
+        for (let i = 0; i < 600 && w.__recovered !== true; i++) await sleep(50);
+        if (w.__recovered !== true) return { failed: 'recovery did not complete' };
+        const postSave = await save();
+        return {
+            inlineSize: inline.length,
+            first,
+            second,
+            preSize: preSave.length,
+            preHash,
+            postHash: await sha256(postSave),
+            recoveredEvt,
+            info: client.lastRecovery,
+        };
+    }, Buffer.from(docx).toString('base64'));
+
+    expect((result as any).failed, 'in-page failure').toBeUndefined();
+    const r = result as any;
+    const snaps = r.second.snaps.filter((s: any) => s.packageHash);
+    console.log(
+        `[recovery #212] inline snapshot ${r.inlineSize} B · persisted snapshots ` +
+            `${snaps.map((s: any) => `${s.size} B`).join(', ')} · package ` +
+            `${r.second.packages.map((p: any) => `${p.size} B`).join(', ')} · saved ${r.preSize} B`,
+    );
+    /* Before #212 every snapshot carried the font: > 2 MiB each. */
+    expect(r.inlineSize).toBeGreaterThan(FONT_BYTES);
+    for (const s of snaps) expect(s.size).toBeLessThan(256 * 1024);
+    /* Stored once, named by every snapshot of the document. */
+    expect(r.first.packages).toHaveLength(1);
+    expect(r.second.packages).toHaveLength(1);
+    expect(r.second.packages[0].size).toBeGreaterThan(FONT_BYTES);
+    for (const s of snaps) expect(s.packageHash).toBe(r.second.packages[0].hash);
+
+    expect(r.recoveredEvt?.snapshot_restored, 'base snapshot restored').toBe(true);
+    expect(r.info.restored).toBe(true);
+    expect(r.postHash, 'recovered session saves the identical file').toBe(r.preHash);
 });

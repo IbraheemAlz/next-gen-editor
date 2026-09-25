@@ -96,6 +96,12 @@ export function emptyPatch(): TextAttrsPatch {
 export interface EditorCommands {
     /* Lifecycle */
     requestStats(): Promise<Event>;
+    /** Issue #240 — whether the engine offers `retryGpuRenderer`. */
+    readonly canRetryGpuRenderer: boolean;
+    /** Issue #240 — forget a persisted GPU crash-loop downgrade and reload
+     *  so the next boot probes the GPU renderer again. A no-op when
+     *  `canRetryGpuRenderer` is false. */
+    retryGpuRenderer(): Promise<void>;
     requestPaint(viewport: Rect, dirty?: Rect): Promise<Event>;
 
     /* Viewport */
@@ -485,6 +491,8 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
 
     return {
         requestStats: () => dispatch({ type: 'REQUEST_STATS' }),
+        canRetryGpuRenderer: typeof engine.retryGpuRenderer === 'function',
+        retryGpuRenderer: () => engine.retryGpuRenderer?.() ?? Promise.resolve(),
         requestPaint: (viewport, dirty) =>
             dispatch({ type: 'REQUEST_PAINT', viewport, dirty }),
 

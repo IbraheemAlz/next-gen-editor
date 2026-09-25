@@ -4,6 +4,7 @@
 //! `word/document.xml` is regenerated.
 
 use crate::error::DocxError;
+use crate::error::WriteNote;
 use crate::opc::archive::{
     COMMENTS_EXTENDED_XML, COMMENTS_XML, DOC_XML, DocxArchive, ENDNOTES_XML, FOOTNOTES_XML,
     NUMBERING_XML, RELS_XML, STYLES_XML, root_attributes,
@@ -413,12 +414,19 @@ fn open_source_run(style: &SpanStyle, src: Option<RunSource<'_>>, out: &mut Stri
     out.push_str("<w:r");
     attrs_xml(&run.attrs, out);
     out.push('>');
+    /* Issue #245 — a pretty-printed source run keeps its whitespace. */
+    let pad = run.pad.as_deref();
+    push_utf8(pad.map_or(&[], |p| p.open.as_slice()), out);
+    let before_rpr = out.len();
     if run.style == *style && source_bytes_trusted() {
         if let Some(rpr) = &run.rpr {
             push_utf8(rpr, out);
         }
     } else {
         emit_rpr_adopting(style, run.rpr.as_deref(), out);
+    }
+    if out.len() > before_rpr {
+        push_utf8(pad.map_or(&[], |p| p.after_rpr.as_slice()), out);
     }
     if first {
         push_utf8(&run.lead, out);
@@ -436,7 +444,11 @@ fn push_text_element(text: &str, delete_kind: bool, src: Option<&SourceRun>, out
     out.push_str(tag);
     match src.and_then(|r| r.t_attrs.as_deref()) {
         Some(attrs) => {
-            if text_needs_preserve(text) && !attrs.iter().any(|a| a.name == "xml:space") {
+            let bare_source = src.is_some_and(|r| r.bare_edge_ws);
+            if text_needs_preserve(text)
+                && !bare_source
+                && !attrs.iter().any(|a| a.name == "xml:space")
+            {
                 out.push_str(" xml:space=\"preserve\"");
             }
             attrs_xml(attrs, out);
@@ -848,7 +860,11 @@ fn serialize_paragraph(
         .chars()
         .any(|c| c == '\u{2028}' || c == '\u{000C}');
     let has_source_runs = markup.is_some_and(|m| {
-        m.offsets_valid(para.text.len()) && !(m.runs.is_empty() && m.markers.is_empty())
+        if m.offsets_valid(para.text.len()) {
+            !(m.runs.is_empty() && m.markers.is_empty())
+        } else {
+            m.markers.iter().any(|mk| mk.role.must_survive())
+        }
     });
     if para.spans.is_empty()
         && para.inline_objects.is_empty()
@@ -1079,13 +1095,7 @@ fn emit_styled_runs_with_objects(
         .as_deref()
         .filter(|m| m.offsets_valid(len));
     let source_runs: &[SourceRun] = markup.map_or(&[], |m| m.runs.as_slice());
-    let mut markers: Vec<(usize, &[u8])> = markup.map_or_else(Vec::new, |m| {
-        m.markers
-            .iter()
-            .map(|mk| ((mk.at as usize).min(len), mk.xml.as_slice()))
-            .collect()
-    });
-    markers.sort_by_key(|(at, _)| *at);
+    let markers = positioned_markers(para, &wrapper_ranges(para));
     let mut marker_cursor = 0usize;
     for r in source_runs {
         for b in [r.start as usize, r.end as usize] {
@@ -1206,6 +1216,9 @@ fn emit_styled_runs_with_objects(
 
     let mut rev_stack: Vec<&Revision> = Vec::new();
     let mut field_stack: Vec<&Field> = Vec::new();
+    /* Issue #246 — per open field, the source closing bytes chosen when
+    it opened (`None`: the standard end run). */
+    let mut field_close: Vec<Option<&[u8]>> = Vec::new();
     let mut hyperlink_stack: Vec<&Hyperlink> = Vec::new();
     let mut next_fallback_id: u32 = 1;
     /* Issues #199 / #106 — the `<w:r>` still open in `sink`: consecutive
@@ -1215,9 +1228,13 @@ fn emit_styled_runs_with_objects(
     collects its wrapper / marker markup in its own buffer first; any
     markup, and any leaf outside a source run, closes the open run. */
     let mut open_run: Option<(*const SourceRun, SpanStyle, bool)> = None;
+    /* Issue #245 — the open source run's trailing pretty-print whitespace. */
+    let mut open_run_pad: &[u8] = &[];
     let close_open_run = |open_run: &mut Option<(*const SourceRun, SpanStyle, bool)>,
+                          pad: &[u8],
                           sink: &mut String| {
         if open_run.take().is_some() {
+            push_utf8(pad, sink);
             sink.push_str("</w:r>");
         }
     };
@@ -1235,7 +1252,7 @@ fn emit_styled_runs_with_objects(
         fldChar run emits before the surrounding `</w:ins>` close. */
         while let Some(top) = field_stack.last() {
             if (top.end as usize) <= lo {
-                emit_field_epilogue(out);
+                close_field(field_close.pop().flatten(), out);
                 field_stack.pop();
             } else {
                 break;
@@ -1337,7 +1354,7 @@ fn emit_styled_runs_with_objects(
                     .iter()
                     .any(|x| std::ptr::eq(*x as *const _, *f as *const _))
             {
-                emit_field_prologue(&f.instruction, in_del, out);
+                field_close.push(open_field(f, para, in_del, out));
                 field_stack.push(f);
             }
         }
@@ -1357,10 +1374,11 @@ fn emit_styled_runs_with_objects(
             let key = (src.run as *const SourceRun, style, in_del);
             let continues = window.is_empty() && open_run.as_ref() == Some(&key);
             if !continues {
-                close_open_run(&mut open_run, sink);
+                close_open_run(&mut open_run, open_run_pad, sink);
                 sink.push_str(&window);
                 open_source_run(&key.1, Some(src), sink);
                 open_run = Some(key);
+                open_run_pad = src.run.pad.as_ref().map_or(&[], |p| p.close.as_slice());
             }
             if let Some(&kind) = break_at.get(&lo) {
                 sink.push_str(match kind {
@@ -1386,17 +1404,17 @@ fn emit_styled_runs_with_objects(
         } else {
             serialize_run_kind(&para.text[lo..hi], &style_at(lo), in_del, out);
         }
-        close_open_run(&mut open_run, sink);
+        close_open_run(&mut open_run, open_run_pad, sink);
         sink.push_str(&window);
     }
-    close_open_run(&mut open_run, sink);
+    close_open_run(&mut open_run, open_run_pad, sink);
     let out = sink;
 
     /* Drain whatever is still open. Field epilogues fire before
     revision closes (field wrappers nest inside revision wrappers), and
     hyperlinks — the outermost wrapper — drain last. */
-    while let Some(_top) = field_stack.pop() {
-        emit_field_epilogue(out);
+    while field_stack.pop().is_some() {
+        close_field(field_close.pop().flatten(), out);
     }
     while let Some(top) = rev_stack.pop() {
         emit_revision_close(top.kind, out);
@@ -1412,6 +1430,324 @@ fn emit_styled_runs_with_objects(
     for (_, xml) in markers.iter().skip(marker_cursor) {
         push_utf8(xml, out);
     }
+}
+
+/// Issue #245 — the byte ranges of every wrapper the writer regenerates
+/// around runs (hyperlinks, `<w:ins>` / `<w:del>`, local fields): a
+/// source content control must nest with each of them.
+fn wrapper_ranges(para: &Paragraph) -> Vec<(usize, usize)> {
+    let len = para.text.len();
+    let clamp = |a: u32, b: u32| ((a as usize).min(len), (b as usize).min(len));
+    para.hyperlinks
+        .iter()
+        .map(|h| clamp(h.start, h.end))
+        .chain(
+            para.revisions
+                .iter()
+                .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+                .map(|r| clamp(r.start, r.end)),
+        )
+        .chain(
+            para.fields
+                .iter()
+                .filter(|f| f.is_local())
+                .map(|f| clamp(f.start, f.end)),
+        )
+        .filter(|(s, e)| s < e)
+        .collect()
+}
+
+/// One source marker on its way out of [`positioned_markers`].
+#[derive(Clone, Copy)]
+struct PlacedMarker<'a> {
+    at: usize,
+    xml: &'a [u8],
+    kind: PlacedKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlacedKind {
+    Plain,
+    /// Opener of pair `i` (index into the pair list).
+    Open(usize),
+    /// Closer of pair `i` (its own bytes, or the opener's `close_xml`).
+    Close(usize),
+}
+
+/// `true` when the wrapper range `w` and the content control `[s, e)`
+/// nest as the writer emits them at shared offsets (markers between the
+/// closes and the opens of the regenerated wrappers): disjoint, the
+/// wrapper inside the control, or the wrapper strictly around it.
+fn nests_with(s: usize, e: usize, (ws, we): (usize, usize)) -> bool {
+    we <= s || ws >= e || (s <= ws && we <= e) || (ws < s && we > e)
+}
+
+/// Issues #199 / #244 / #245 — the paragraph's source markers to re-emit,
+/// as `(text offset, bytes)` in emission order.
+///
+/// - In sync with the text: every marker at its offset. Stale (an edit
+///   path that does not remap the markup): only the markup that must never
+///   be lost ([`engine::MarkerRole::must_survive`] — a legacy form field, a
+///   content control's ends) at its offset clamped to the text and floored
+///   to a char boundary, noted as [`WriteNote::StaleMarkupClamped`].
+/// - Content-control ends pair up through a stack in source order: a
+///   closer without an opener is dropped, an opener that lost its closer
+///   (a split) closes with its `close_xml` at the paragraph end (and an
+///   inner opener still open when an outer closer arrives closes right
+///   before it) — the output is balanced whatever an edit did.
+/// - A pair whose range would cross a regenerated wrapper
+///   ([`wrapper_ranges`], see [`nests_with`]) is widened until every pair
+///   nests with every wrapper and with each other, and then emitted in a
+///   constructed order (closes innermost first, plain markers, opens
+///   outermost first) — the control keeps its content, at a slightly wider
+///   range, noted as [`WriteNote::InlineWrapperWidened`].
+fn positioned_markers<'a>(
+    para: &'a Paragraph,
+    wrappers: &[(usize, usize)],
+) -> Vec<(usize, &'a [u8])> {
+    let len = para.text.len();
+    let Some(m) = para.source_markup.as_deref() else {
+        return Vec::new();
+    };
+    let valid = m.offsets_valid(len);
+    let floor = |at: u32| {
+        let mut at = (at as usize).min(len);
+        while !para.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    };
+    let kept: Vec<&engine::SourceMarker> = m
+        .markers
+        .iter()
+        .filter(|mk| valid || mk.role.must_survive())
+        .collect();
+    if !valid && !kept.is_empty() {
+        note(WriteNote::StaleMarkupClamped {
+            markers: kept.len() as u32,
+        });
+    }
+    /* Pair openers and closers in source order. */
+    let mut placed: Vec<PlacedMarker<'a>> = Vec::with_capacity(kept.len());
+    /* (opener id, close_xml, pair index) */
+    let mut stack: Vec<(u32, &'a [u8], usize)> = Vec::new();
+    /* Per pair: (id, [start, end)). */
+    let mut pairs: Vec<(u32, usize, usize)> = Vec::new();
+    for mk in kept {
+        let at = floor(mk.at);
+        match &mk.role {
+            engine::MarkerRole::Open { id, close_xml } => {
+                stack.push((*id, close_xml.as_slice(), pairs.len()));
+                pairs.push((*id, at, len));
+                placed.push(PlacedMarker {
+                    at,
+                    xml: &mk.xml,
+                    kind: PlacedKind::Open(pairs.len() - 1),
+                });
+            }
+            engine::MarkerRole::Close { id } => {
+                if !stack.iter().any(|(sid, _, _)| sid == id) {
+                    continue;
+                }
+                while let Some((sid, close_xml, pi)) = stack.pop() {
+                    pairs[pi].2 = at;
+                    let own = sid == *id;
+                    placed.push(PlacedMarker {
+                        at,
+                        xml: if own { &mk.xml } else { close_xml },
+                        kind: PlacedKind::Close(pi),
+                    });
+                    if own {
+                        break;
+                    }
+                }
+            }
+            _ => placed.push(PlacedMarker {
+                at,
+                xml: &mk.xml,
+                kind: PlacedKind::Plain,
+            }),
+        }
+    }
+    while let Some((_, close_xml, pi)) = stack.pop() {
+        placed.push(PlacedMarker {
+            at: len,
+            xml: close_xml,
+            kind: PlacedKind::Close(pi),
+        });
+    }
+    let conflict = |pairs: &[(u32, usize, usize)]| {
+        pairs
+            .iter()
+            .any(|&(_, s, e)| s < e && wrappers.iter().any(|&w| !nests_with(s, e, w)))
+    };
+    if !conflict(&pairs) {
+        /* Natural source order: stack-balanced, and monotone in offset. */
+        placed.sort_by_key(|p| p.at);
+        return placed.into_iter().map(|p| (p.at, p.xml)).collect();
+    }
+    /* Widen to a fixpoint (ranges only grow, bounded by [0, len]; the
+    round cap is a backstop — at worst every pair spans the paragraph,
+    which nests with anything). */
+    let original = pairs.clone();
+    let mut settled = false;
+    for _ in 0..64 {
+        let mut changed = false;
+        for i in 0..pairs.len() {
+            let (_, mut s, mut e) = pairs[i];
+            if s >= e {
+                continue;
+            }
+            for &(ws, we) in wrappers {
+                if !nests_with(s, e, (ws, we)) {
+                    s = s.min(ws);
+                    e = e.max(we);
+                }
+            }
+            for (j, &(_, qs, qe)) in pairs.iter().enumerate() {
+                let partial = j != i
+                    && qs < qe
+                    && ((s < qs && qs < e && e < qe) || (qs < s && s < qe && qe < e));
+                if partial {
+                    s = s.min(qs);
+                    e = e.max(qe);
+                }
+            }
+            if (s, e) != (pairs[i].1, pairs[i].2) {
+                pairs[i].1 = s;
+                pairs[i].2 = e;
+                changed = true;
+            }
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        for p in pairs.iter_mut().filter(|p| p.1 < p.2) {
+            p.1 = 0;
+            p.2 = len;
+        }
+    }
+    for (p, o) in pairs.iter().zip(&original) {
+        if (p.1, p.2) != (o.1, o.2) {
+            note(WriteNote::InlineWrapperWidened { id: p.0 });
+        }
+    }
+    /* Constructed order. Key: (offset, class, tie-break). An empty pair
+    is emitted as a unit among the plain markers (opener, then closer). */
+    let mut open_seq = vec![0i64; pairs.len()];
+    for (seq, p) in placed.iter().enumerate() {
+        if let PlacedKind::Open(i) = p.kind {
+            open_seq[i] = seq as i64;
+        }
+    }
+    let mut keyed: Vec<((usize, u8, i64, i64), PlacedMarker<'a>)> = placed
+        .into_iter()
+        .enumerate()
+        .map(|(seq, p)| {
+            let key = match p.kind {
+                PlacedKind::Plain => (p.at, 1, seq as i64, 0),
+                PlacedKind::Open(i) | PlacedKind::Close(i) if pairs[i].1 >= pairs[i].2 => {
+                    let second = matches!(p.kind, PlacedKind::Close(_)) as i64;
+                    (pairs[i].1, 1, open_seq[i], second)
+                }
+                PlacedKind::Close(i) => (pairs[i].2, 0, -(pairs[i].1 as i64), -(i as i64)),
+                PlacedKind::Open(i) => (pairs[i].1, 2, -(pairs[i].2 as i64), i as i64),
+            };
+            let at = key.0;
+            (key, PlacedMarker { at, ..p })
+        })
+        .collect();
+    keyed.sort_by_key(|(k, _)| *k);
+    keyed.into_iter().map(|(_, p)| (p.at, p.xml)).collect()
+}
+
+thread_local! {
+    /// Issues #244 / #245 — the best-effort decisions of the running
+    /// [`write_docx_with_notes`].
+    /// `None` outside it (nothing collects, nothing accumulates).
+    static WRITE_NOTES: std::cell::RefCell<Option<Vec<WriteNote>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn note(n: WriteNote) {
+    WRITE_NOTES.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut() {
+            v.push(n);
+        }
+    });
+}
+
+/// Issue #246 — open a local field in its source form when the source
+/// bytes still spell its instruction ([`engine::FieldSource`]): a
+/// `<w:fldSimple>` start tag (only when the element nests with every
+/// wrapper the writer emits around it, see [`simple_field_nests`]) or
+/// the complex field's source prologue. Otherwise, and inside a
+/// `<w:del>` (the prologue would need `w:delInstrText`), the standard
+/// complex prologue. Returns the closing bytes to pair with it.
+fn open_field<'a>(
+    f: &'a Field,
+    para: &Paragraph,
+    in_del: bool,
+    out: &mut String,
+) -> Option<&'a [u8]> {
+    let src = f
+        .source
+        .as_deref()
+        .filter(|s| !in_del && s.is_current(&f.instruction) && !s.open.is_empty());
+    let simple = |s: &engine::FieldSource| s.open.starts_with(b"<w:fldSimple");
+    match src {
+        Some(s) if simple(s) && simple_field_nests(f, para) => {
+            push_utf8(&s.open, out);
+            Some(s.close.as_slice())
+        }
+        Some(s) if !simple(s) => {
+            push_utf8(&s.open, out);
+            (!s.close.is_empty()).then_some(s.close.as_slice())
+        }
+        /* No source form, a changed instruction, or a simple field that
+        would cross a wrapper: the standard complex form. */
+        _ => {
+            emit_field_prologue(&f.instruction, in_del, out);
+            None
+        }
+    }
+}
+
+/// Issue #246 — close a field opened by [`open_field`].
+fn close_field(close: Option<&[u8]>, out: &mut String) {
+    match close {
+        Some(bytes) => push_utf8(bytes, out),
+        None => emit_field_epilogue(out),
+    }
+}
+
+/// Issue #246 — `true` when a `<w:fldSimple>` element around `f` stays
+/// well-formed among the wrappers the writer emits at shared offsets
+/// (hyperlinks and revisions open before fields and close after them;
+/// other fields nest by range): each is disjoint from `f`, contains it,
+/// strictly lies inside it, or is another field it nests with. A complex
+/// field has no element, so it never needs this.
+fn simple_field_nests(f: &Field, para: &Paragraph) -> bool {
+    let (fs, fe) = (f.start, f.end);
+    let outer_ok = |ws: u32, we: u32| {
+        ws >= we || we <= fs || ws >= fe || (ws <= fs && fe <= we) || (fs < ws && we < fe)
+    };
+    para.hyperlinks.iter().all(|h| outer_ok(h.start, h.end))
+        && para
+            .revisions
+            .iter()
+            .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+            .all(|r| outer_ok(r.start, r.end))
+        && para.fields.iter().filter(|g| g.is_local()).all(|g| {
+            std::ptr::eq(g, f)
+                || g.end <= fs
+                || g.start >= fe
+                || (g.start <= fs && fe <= g.end)
+                || (fs <= g.start && g.end <= fe)
+        })
 }
 
 /// Issue #81 — one end of a multi-paragraph field.
@@ -2472,8 +2808,23 @@ fn geometry_is_stock_a4(g: &engine::PageGeometry) -> bool {
 /// Repack `archive`'s sibling entries verbatim + a freshly serialized
 /// `word/document.xml` from `doc`. Returns the assembled `.docx` bytes.
 pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
+    write_docx_with_notes(archive, doc).map(|(bytes, _)| bytes)
+}
+
+/// [`write_docx`], also returning the writer's best-effort decisions
+/// ([`WriteNote`]): unmodeled content kept at a clamped position because
+/// the paragraph's source offsets went stale, a content control widened to
+/// stay well-formed around a regenerated wrapper. Never an error — the
+/// content was written.
+pub fn write_docx_with_notes(
+    archive: &DocxArchive,
+    doc: &DocumentTree,
+) -> Result<(Vec<u8>, Vec<WriteNote>), DocxError> {
     let _source_scope = AgainstSourceScope::enter(true);
-    write_docx_inner(archive, doc)
+    let outer = WRITE_NOTES.with(|c| c.borrow_mut().replace(Vec::new()));
+    let res = write_docx_inner(archive, doc);
+    let notes = WRITE_NOTES.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
+    res.map(|bytes| (bytes, notes.unwrap_or_default()))
 }
 
 /// [`write_docx`] without choosing whether recorded source markup is
@@ -6174,11 +6525,15 @@ mod tests {
         assert_eq!(f.keyword(), "PAGE");
 
         /* Force regeneration through the writer and verify the
-        wrappers re-emit as the canonical run sequence. */
+        wrappers re-emit as the canonical run sequence. Issue #246 — a
+        field read from `.docx` keeps its source prologue while its
+        instruction is unchanged; drop it to exercise the canonical form. */
+        assert!(f.source.is_some(), "source form captured");
         let mut owned_doc = parsed.document.clone();
         if let Some(engine::Block::Paragraph(p)) = owned_doc.blocks.iter_mut().next() {
             p.dirty = true;
             p.source_xml = None;
+            p.fields[0].source = None;
         }
         let xml = build_document_xml(&owned_doc, &HashMap::new());
         assert!(
@@ -6553,7 +6908,7 @@ mod tests {
     }
 
     /// A minimal `.docx` from a `styles.xml` + `document.xml` pair.
-    fn build_docx_with_styles(styles_xml: &str, document_xml: &str) -> Vec<u8> {
+    pub(super) fn build_docx_with_styles(styles_xml: &str, document_xml: &str) -> Vec<u8> {
         let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -8202,7 +8557,7 @@ mod tests {
         r#"<w:p><w:r><w:t>tail</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#,
     );
 
-    fn document_xml_of(bytes: &[u8]) -> String {
+    pub(super) fn document_xml_of(bytes: &[u8]) -> String {
         let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut f = z.by_name("word/document.xml").unwrap();
         let mut s = String::new();
@@ -9114,3 +9469,8 @@ mod tests {
         assert!(out.contains(r#"w:rsidR="00A1B2C3""#), "{out}");
     }
 }
+
+/// Issues #244 / #245 / #246 — positioned verbatim spans.
+#[cfg(test)]
+#[path = "writer_inline_span_tests.rs"]
+mod inline_span_tests;

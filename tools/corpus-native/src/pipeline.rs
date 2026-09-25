@@ -5,8 +5,12 @@
 //! sibling byte-identity, `document.xml` stability with no edits, plain-text
 //! equality, and stable page count. Optionally (`--with-edit`, on by
 //! default) applies one scripted edit and re-checks the round-trip
-//! harness's `document.xml` delta bound (`.claude/rules/docx.md`: delta ≤
-//! 2 × inserted UTF-8 bytes).
+//! harness's edit-drift bound (`.claude/rules/docx.md`, issue #251):
+//! primarily `source_bytes_rewritten == 0` (no original byte respelled),
+//! plus a secondary size bound of `2 × inserted UTF-8 bytes` + an
+//! allowance for any run(s) the edit had to create. The old size-only
+//! `≤ 2×N` number is kept as an informational column (`bound_bytes` /
+//! `within_bound`).
 //!
 //! Every stage runs through [`crate::panics::catch`] so a panic on one
 //! document degrades to a single JSONL record instead of aborting the
@@ -53,26 +57,192 @@ pub enum Outcome {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct EditCheck {
     pub inserted_bytes: usize,
+    /// Informational only since issue #251 — the raw `document.xml` size
+    /// delta. Kept for the historical record; it cannot distinguish a
+    /// faithful insertion (which may legitimately need a new `<w:r>`) from
+    /// a lossy regeneration, so it is no longer a pass/fail bound on its
+    /// own. See `fidelity_ok` / `within_secondary_bound`.
     pub document_xml_delta_bytes: u64,
+    /// Informational only since issue #251 — the old `2 × inserted_bytes`
+    /// number, kept as a column. Superseded by `secondary_bound_bytes`.
     pub bound_bytes: u64,
+    /// Informational only since issue #251 — `document_xml_delta_bytes <=
+    /// bound_bytes`. Superseded by `within_secondary_bound`.
     pub within_bound: bool,
-    /// Issue #199 — bytes of the ORIGINAL `document.xml` the edited save
-    /// rewrote: the span between the longest common prefix and suffix of
-    /// the two parts. 0 means the save is a pure insertion (nothing of the
-    /// source was lost or respelled); `document_xml_delta_bytes` alone
+    /// Issue #199 / #251 — bytes of the ORIGINAL `document.xml` the edited
+    /// save rewrote: the span between the longest common prefix and suffix
+    /// of the two parts. 0 means the save is a pure insertion (nothing of
+    /// the source was lost or respelled); `document_xml_delta_bytes` alone
     /// cannot tell (a regeneration that DROPS bytes can hide inside the
-    /// bound).
+    /// old bound). **This is the primary edit-drift bound (issue #251):
+    /// a faithful save must have `source_bytes_rewritten == 0`.**
     #[serde(default)]
     pub source_bytes_rewritten: u64,
     /// Issue #199 — bytes of the edited part inside that span (the
     /// inserted text plus whatever markup carries it).
     #[serde(default)]
     pub edited_region_bytes: u64,
+    /// Issue #250 — [`Self::source_bytes_rewritten`] for the SAME net edit
+    /// made in track-changes mode (tracked insertion of the marker plus a
+    /// few extra bytes, then a tracked delete of those extra bytes — the
+    /// "backspace over my own insertion" path that removes text). A
+    /// regenerated paragraph whose source markup went stale loses its
+    /// source runs, so this count tracks the plain one only while every
+    /// tracked edit path keeps `Paragraph::source_markup` in step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked_source_bytes_rewritten: Option<u64>,
+    /// Issue #250 — the edited paragraph's source markup is still in step
+    /// with its text after the plain / tracked edit (`None`: the paragraph
+    /// carries no source markup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markup_in_step: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked_markup_in_step: Option<bool>,
+    /// Issue #251 — `source_bytes_rewritten == 0`, spelled out as its own
+    /// bool so a JSONL/report consumer doesn't have to re-derive the
+    /// primary bound from the raw counter.
+    #[serde(default)]
+    pub fidelity_ok: bool,
+    /// Issue #251 — the secondary (informational-turned-advisory) size
+    /// bound: `2 × inserted_bytes` plus an allowance for any run(s) a
+    /// faithful insertion had to create. See [`NEW_RUN_ALLOWANCE_BYTES`]
+    /// for how the allowance is sized.
+    #[serde(default)]
+    pub new_run_allowance_bytes: u64,
+    /// Issue #251 — `bound_bytes + new_run_allowance_bytes`.
+    #[serde(default)]
+    pub secondary_bound_bytes: u64,
+    /// Issue #251 — `document_xml_delta_bytes <= secondary_bound_bytes`.
+    #[serde(default)]
+    pub within_secondary_bound: bool,
+    /// Issue #251 — set only when `source_bytes_rewritten > 0`: a cheap
+    /// substring-heuristic guess at which construct forced the rewrite
+    /// (`hyperlink` / `comment anchor` / `form field` / `sdt` /
+    /// `fldSimple` / `move` / `table` / `rPr` / `other`), cross-referenced
+    /// against the filed root-cause issues #242-#249. Not a substitute for
+    /// a real diff — see [`classify_rewrite`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_cause: Option<String>,
 }
 
-/// Issue #199 — `(original, edited)` lengths of the region between the
-/// longest common prefix and the longest common suffix.
-fn rewritten_region(orig: &[u8], edited: &[u8]) -> (u64, u64) {
+/// Issue #250 — `Some(in step)` for the paragraph at `pos`, `None` when it
+/// carries no source markup.
+fn markup_in_step(doc: &engine::DocumentTree, pos: &engine::LogicalPos) -> Option<bool> {
+    let p = doc.paragraph_at_path(&pos.path)?;
+    let m = p.source_markup.as_deref()?;
+    Some(m.offsets_valid(p.text.len()))
+}
+
+/// Issue #250 — the scripted edit made in track-changes mode: a tracked
+/// insertion of the marker plus a few extra bytes, then a tracked delete
+/// of the extra bytes (inside the reviewer's own pending insertion, so the
+/// text is removed rather than marked). The net text equals the plain
+/// edit's. `None` when the tracked pipeline panicked or failed to write.
+fn tracked_edit(
+    archive: &DocxArchive,
+    end: engine::LogicalPos,
+) -> Option<(engine::DocumentTree, Vec<u8>)> {
+    const TRACKED_EXTRA: &str = "xyz";
+    let author = String::from("corpus-native");
+    let date = String::from("2026-01-01T00:00:00Z");
+    panics::catch(|| {
+        let doc = archive.document.tracked_insert_text(
+            end.clone(),
+            &format!("{EDIT_MARKER}{TRACKED_EXTRA}"),
+            author.clone(),
+            date.clone(),
+        );
+        let from = end.offset + EDIT_MARKER.len() as u32;
+        let doc = doc.tracked_delete_range(
+            engine::LogicalPos::new(end.path.clone(), from),
+            engine::LogicalPos::new(end.path.clone(), from + TRACKED_EXTRA.len() as u32),
+            author,
+            date,
+        );
+        let bytes = format_docx::write_docx(archive, &doc).ok()?;
+        Some((doc, bytes))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Issue #251 — per-new-`<w:r>` size allowance for the secondary bound.
+///
+/// The choice, documented per issue #251's ask: rather than one flat
+/// allowance, count the actual number of new run-open tags the edit
+/// needed (a cheap heuristic, [`count_run_open_tags`]) and multiply by a
+/// fixed per-run cost. The minimal markup an empty run adds is exactly 43
+/// bytes (`<w:r><w:t xml:space="preserve"></w:t></w:r>`, the shape issue
+/// #251 measured); 48 rounds that up with a few bytes of slack for the
+/// rare case a carried-over `<w:rPr>` needs to ride along too.
+const NEW_RUN_ALLOWANCE_BYTES: u64 = 48;
+
+/// Issue #251 — count `<w:r>` / `<w:r ...>` / `<w:r/>` run-element open
+/// tags in a `document.xml` byte slice. A cheap heuristic (a literal-byte
+/// scan, not a real XML walk): it only counts a `<w:r` match whose next
+/// byte closes the element name (space, `>`, or `/`), so `<w:rPr>`,
+/// `<w:rFonts>`, `<w:rsid...>` etc. never match. Good enough to size the
+/// new-run allowance and to spot a construct that gained/lost runs; not a
+/// substitute for `format_docx`'s real parser.
+fn count_run_open_tags(xml: &[u8]) -> usize {
+    xml.windows(4)
+        .enumerate()
+        .filter(|(i, w)| {
+            *w == *b"<w:r" && matches!(xml.get(i + 4), Some(b' ') | Some(b'>') | Some(b'/'))
+        })
+        .count()
+}
+
+/// Issue #251 — priority-ordered substring markers used to guess which
+/// construct forced an edited save to rewrite original bytes, cross-
+/// referenced against the filed root-cause issues. Checked in order;
+/// first match wins.
+const REWRITE_CAUSE_MARKERS: &[(&str, &str)] = &[
+    ("w:hyperlink", "hyperlink"),              // #242
+    ("w:commentRangeStart", "comment anchor"), // #243
+    ("w:commentRangeEnd", "comment anchor"),   // #243
+    ("w:commentReference", "comment anchor"),  // #243
+    ("w:ffData", "form field"),                // #244
+    ("w:sdt", "sdt"),                          // #245
+    ("w:fldSimple", "fldSimple"),              // #246
+    ("_GoBack", "fldSimple"),                  // #246
+    ("moveFrom", "move"),                      // #247
+    ("moveTo", "move"),                        // #247
+    ("w:tbl", "table"),                        // #248
+    ("<w:tc", "table"),                        // #248
+    ("<w:tr", "table"),                        // #248
+    ("w:rPr", "rPr"),                          // #249
+];
+
+/// Bytes of context inspected on each side of the rewritten span when
+/// classifying it — enough to see an immediately-enclosing element
+/// (`<w:hyperlink>`, `<w:sdt>`) without walking the full tree. The
+/// scripted edit always lands at `end_of_document()`, so the enclosing
+/// construct is always close by.
+const REWRITE_CAUSE_WINDOW: usize = 400;
+
+/// Issue #251 — classify why an edited save rewrote original bytes, by a
+/// cheap substring scan of the ORIGINAL xml around the rewritten span
+/// (see [`REWRITE_CAUSE_MARKERS`] / [`REWRITE_CAUSE_WINDOW`]). Not a real
+/// diff — good enough to bucket the corpus against issues #242-#249.
+fn classify_rewrite(orig: &[u8], region_start: usize, region_len: u64) -> &'static str {
+    let win_start = region_start.saturating_sub(REWRITE_CAUSE_WINDOW);
+    let win_end = (region_start + region_len as usize + REWRITE_CAUSE_WINDOW).min(orig.len());
+    let window = orig.get(win_start..win_end.max(win_start)).unwrap_or(&[]);
+    let text = String::from_utf8_lossy(window);
+    for (needle, label) in REWRITE_CAUSE_MARKERS {
+        if text.contains(needle) {
+            return label;
+        }
+    }
+    "other"
+}
+
+/// Issue #199 / #251 — `(prefix_len, original_span, edited_span)`: the
+/// byte offset the ORIGINAL and edited parts start to differ at, and the
+/// lengths of the region between the longest common prefix and the
+/// longest common suffix of the two parts.
+fn rewritten_region(orig: &[u8], edited: &[u8]) -> (usize, u64, u64) {
     let prefix = orig.iter().zip(edited).take_while(|(a, b)| a == b).count();
     let max_suffix = orig.len().min(edited.len()) - prefix;
     let suffix = orig
@@ -83,6 +253,7 @@ fn rewritten_region(orig: &[u8], edited: &[u8]) -> (u64, u64) {
         .take_while(|(a, b)| a == b)
         .count();
     (
+        prefix,
         (orig.len() - prefix - suffix) as u64,
         (edited.len() - prefix - suffix) as u64,
     )
@@ -440,7 +611,7 @@ pub fn run_one(
     let archive_ui: DocxArchive = stage!("ui_save_reread", format_docx::read_docx(&ui_bytes));
     rec.ui_save_siblings_identical = Some(compare_siblings(&archive_a, &archive_ui).0);
 
-    /* 7. Optional scripted edit + the round-trip harness's ≤2×N bound
+    /* 7. Optional scripted edit + the issue #251 fidelity bound
     (`.claude/rules/docx.md`). Mirrors `tools/roundtrip`'s default-mode
     check: edit the FIRST parse, save, compare `document.xml` against the
     ORIGINAL file's bytes. */
@@ -448,7 +619,7 @@ pub fn run_one(
         let end = stage_infallible!("edit_end_of_document", archive_a.document.end_of_document());
         let edited_doc = stage_infallible!(
             "edit_insert_text",
-            archive_a.document.insert_text(end, EDIT_MARKER)
+            archive_a.document.insert_text(end.clone(), EDIT_MARKER)
         );
         let edited_bytes: Vec<u8> = stage!(
             "edit_write_docx",
@@ -469,15 +640,36 @@ pub fn run_one(
         {
             let delta = (doc_xml_edited.len() as i64 - doc_xml_orig.len() as i64).unsigned_abs();
             let bound = (EDIT_MARKER.len() as u64) * 2;
-            let (source_bytes_rewritten, edited_region_bytes) =
+            let (rewrite_start, source_bytes_rewritten, edited_region_bytes) =
                 rewritten_region(&doc_xml_orig, &doc_xml_edited);
-            /* Issue #199 — `--dump-drift DIR` also dumps an edited save
-            that breaks the ≤2×N bound or rewrote source bytes, so the
+            let fidelity_ok = source_bytes_rewritten == 0;
+            let new_runs = count_run_open_tags(&doc_xml_edited)
+                .saturating_sub(count_run_open_tags(&doc_xml_orig))
+                as u64;
+            let new_run_allowance_bytes = new_runs * NEW_RUN_ALLOWANCE_BYTES;
+            let secondary_bound_bytes = bound + new_run_allowance_bytes;
+            let within_secondary_bound = delta <= secondary_bound_bytes;
+            let rewrite_cause = (!fidelity_ok).then(|| {
+                classify_rewrite(&doc_xml_orig, rewrite_start, source_bytes_rewritten).to_string()
+            });
+            /* Issue #199 / #251 — `--dump-drift DIR` also dumps an edited
+            save that breaks the fidelity or secondary bound, so the
             regeneration drift can be diffed against the original. */
-            if delta > bound || source_bytes_rewritten > 0 {
+            if !fidelity_ok || !within_secondary_bound {
                 dump("edit-orig", &doc_xml_orig);
                 dump("edited", &doc_xml_edited);
             }
+            /* Issue #250 — the same net edit in track-changes mode. */
+            let (tracked_source_bytes_rewritten, tracked_markup_in_step) =
+                match tracked_edit(&archive_a, end.clone()) {
+                    Some((doc, bytes)) => (
+                        extract_doc_xml(&bytes)
+                            .ok()
+                            .map(|x| rewritten_region(&doc_xml_orig, &x).1),
+                        markup_in_step(&doc, &end),
+                    ),
+                    None => (None, None),
+                };
             rec.edit_check = Some(EditCheck {
                 inserted_bytes: EDIT_MARKER.len(),
                 document_xml_delta_bytes: delta,
@@ -485,10 +677,101 @@ pub fn run_one(
                 within_bound: delta <= bound,
                 source_bytes_rewritten,
                 edited_region_bytes,
+                tracked_source_bytes_rewritten,
+                markup_in_step: markup_in_step(&edited_doc, &end),
+                tracked_markup_in_step,
+                fidelity_ok,
+                new_run_allowance_bytes,
+                secondary_bound_bytes,
+                within_secondary_bound,
+                rewrite_cause,
             });
         }
     }
 
     rec.elapsed_ms = overall_start.elapsed().as_millis();
     rec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewritten_region_reports_prefix_and_spans() {
+        // Pure append: no rewrite, everything after the shared prefix is new.
+        let (start, orig_span, edited_span) = rewritten_region(b"abc", b"abcXYZ");
+        assert_eq!(start, 3);
+        assert_eq!(orig_span, 0);
+        assert_eq!(edited_span, 3);
+
+        // A respelled middle byte: both sides report a 1-byte span at the
+        // same offset.
+        let (start, orig_span, edited_span) = rewritten_region(b"abcdef", b"abcXef");
+        assert_eq!(start, 3);
+        assert_eq!(orig_span, 1);
+        assert_eq!(edited_span, 1);
+
+        // Byte-identical: no span at all.
+        let (_, orig_span, edited_span) = rewritten_region(b"same", b"same");
+        assert_eq!(orig_span, 0);
+        assert_eq!(edited_span, 0);
+    }
+
+    #[test]
+    fn count_run_open_tags_ignores_lookalike_elements() {
+        let xml = br#"<w:r><w:rPr><w:rFonts w:ascii="Arial"/></w:rPr><w:t>a</w:t></w:r><w:r/><w:r w:rsidR="1"><w:t>b</w:t></w:r>"#;
+        // Three real `<w:r...>` opens: `<w:r>`, `<w:r/>`, `<w:r w:rsidR=...>`.
+        // `<w:rPr>` / `<w:rFonts>` must not count.
+        assert_eq!(count_run_open_tags(xml), 3);
+    }
+
+    #[test]
+    fn count_run_open_tags_handles_short_input() {
+        assert_eq!(count_run_open_tags(b""), 0);
+        assert_eq!(count_run_open_tags(b"<w:"), 0);
+    }
+
+    #[test]
+    fn classify_rewrite_prioritizes_markers_in_issue_order() {
+        let hyperlink =
+            br#"<w:p><w:hyperlink r:id="rId1"><w:r><w:t>x</w:t></w:r></w:hyperlink></w:p>"#;
+        let region_start = hyperlink
+            .windows(5)
+            .position(|w| w == b"<w:t>")
+            .expect("needle");
+        assert_eq!(classify_rewrite(hyperlink, region_start, 3), "hyperlink");
+
+        let comment = br#"<w:p><w:commentRangeStart w:id="0"/><w:r><w:t>x</w:t></w:r><w:commentRangeEnd w:id="0"/></w:p>"#;
+        let region_start = comment
+            .windows(5)
+            .position(|w| w == b"<w:t>")
+            .expect("needle");
+        assert_eq!(classify_rewrite(comment, region_start, 3), "comment anchor");
+
+        let table =
+            br#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let region_start = table
+            .windows(5)
+            .position(|w| w == b"<w:t>")
+            .expect("needle");
+        assert_eq!(classify_rewrite(table, region_start, 3), "table");
+
+        let plain = br#"<w:p><w:r><w:t>x</w:t></w:r></w:p>"#;
+        let region_start = plain
+            .windows(5)
+            .position(|w| w == b"<w:t>")
+            .expect("needle");
+        assert_eq!(classify_rewrite(plain, region_start, 3), "other");
+    }
+
+    #[test]
+    fn classify_rewrite_clamps_window_at_document_edges() {
+        // A rewrite near byte 0 (window start would underflow) and one at
+        // the very end (window end would overflow) must not panic.
+        let xml = br#"<w:t>x</w:t>"#;
+        let _ = classify_rewrite(xml, 0, 1);
+        let _ = classify_rewrite(xml, xml.len(), 1);
+        let _ = classify_rewrite(xml, xml.len() + 1000, 1);
+    }
 }

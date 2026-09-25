@@ -120,6 +120,16 @@ pub enum Command {
         #[serde(default)]
         #[tsify(optional)]
         renderer_downgrade: Option<RendererDowngrade>,
+        /// Issue #212 — the detached source package for a `snapshot`
+        /// taken with `Command::Snapshot.detach_package`: the
+        /// `Event::Snapshot.package` bytes whose `package_hash` the
+        /// snapshot records. Re-attached when its hash matches; absent or
+        /// mismatched, the recovered session saves through the minimal-
+        /// package writer (the pre-#134 fallback). Ignored for a snapshot
+        /// that carries its package inline.
+        #[serde(default, with = "serde_bytes")]
+        #[tsify(type = "Uint8Array", optional)]
+        package: Option<Vec<u8>>,
     },
     /// Issue #85 — serialize the whole engine session (document tree +
     /// styles + stories + undo window + selection + layout config) into a
@@ -130,6 +140,22 @@ pub enum Command {
     /// sequence).
     Snapshot {
         seq: Option<u64>,
+        /// Issue #212 — leave the opened `.docx`'s retained source package
+        /// (`DocumentTree::source_package`, #134) OUT of `bytes`: the
+        /// snapshot records only its content hash
+        /// (`Event::Snapshot.package_hash`) and the caller stores the
+        /// package once per document, handing it back on
+        /// `Command::Recover.package`. `false`/absent keeps the package
+        /// inline — a self-contained snapshot, as before.
+        #[serde(default)]
+        #[tsify(optional)]
+        detach_package: Option<bool>,
+        /// Issue #212 — with `detach_package`: the package hash the caller
+        /// already stores. When it matches, `Event::Snapshot.package` is
+        /// omitted (the bytes are only shipped when the package changed).
+        #[serde(default)]
+        #[tsify(optional)]
+        known_package_hash: Option<String>,
     },
     /// Tear down the engine and release resources.
     Dispose,

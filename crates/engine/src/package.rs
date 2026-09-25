@@ -80,6 +80,15 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Issue #212 — content key of a detached, encoded package (the
+/// `Event::Snapshot.package_hash` the crash-recovery event log stores the
+/// package under, once per document). Length + FNV-1a 64 of the encoded
+/// bytes: a cache key within one session's own log, verified on restore
+/// against the snapshot's record — not a security hash.
+pub fn package_key(encoded: &[u8]) -> String {
+    format!("pkg-{:x}-{:016x}", encoded.len(), fnv1a64(encoded))
+}
+
 impl SourcePackage {
     /// Build from `(entry name, bytes)` pairs in archive order.
     pub fn from_entries<I: IntoIterator<Item = (String, Vec<u8>)>>(entries: I) -> Self {
