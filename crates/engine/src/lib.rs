@@ -5835,49 +5835,35 @@ impl DocumentTree {
         let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
             /* Range entirely inside a same-author Insert? If so, undo
             the Insert (remove text + shrink the Insert overlay). */
-            let owning_insert = para.revisions.iter().position(|r| {
+            let owning_insert = para.revisions.iter().any(|r| {
                 r.kind == RevisionKind::Insert
                     && r.author == author
                     && r.start <= s_off
                     && e_off <= r.end
             });
-            if let Some(idx) = owning_insert {
+            if owning_insert {
                 let s = s_off.min(para.text.len() as u32);
                 let e = e_off.min(para.text.len() as u32);
                 let removed_len = e.saturating_sub(s);
                 if e > s {
                     /* Issues #250 / #252 — one splice drives the source
-                    markup and (below) the comment anchors. */
-                    removed_edit = Some(para.splice_text(s, removed_len, ""));
-                }
-                /* Shrink the owning Insert by removed_len; shift
-                trailing revisions left by removed_len. */
-                let owning = &mut para.revisions[idx];
-                owning.end -= removed_len;
-                let owning_empty = owning.end <= owning.start;
-                /* Now shift everything else after e_off. */
-                for (i, r) in para.revisions.iter_mut().enumerate() {
-                    if i == idx {
-                        continue;
-                    }
-                    if r.start >= e_off {
-                        r.start = r.start.saturating_sub(removed_len);
-                    }
-                    if r.end > e_off {
-                        r.end = r.end.saturating_sub(removed_len);
-                    }
-                }
-                if owning_empty {
-                    para.revisions.remove(idx);
-                }
-                /* Shift spans + their byte-offset relatives. */
-                for s in &mut para.spans {
-                    if s.start >= e_off {
-                        s.start = s.start.saturating_sub(removed_len);
-                    }
-                    if s.end > e_off {
-                        s.end = s.end.saturating_sub(removed_len);
-                    }
+                    markup and (below) the comment anchors. Issue #265 —
+                    the SAME (at, removed) window then drives every other
+                    byte-offset table through `shift_paragraph_offsets_after`
+                    (spans, hyperlinks, fields, inline objects, and the
+                    revisions themselves): the owning Insert satisfies
+                    `start <= s && e <= end`, so the shared gap-shift rule
+                    shrinks its `end` by `removed_len` and leaves `start`
+                    alone — exactly the old bespoke shrink — and drops it
+                    outright if that shrinks it to empty, via the same
+                    `retain` every other overlay gets. This is the
+                    `apply_revision_decision` (accept/reject) bookkeeping,
+                    reused so a field, hyperlink or picture inside a
+                    reviewer's own removed insertion leaves no stale
+                    offsets. */
+                    let edit = para.splice_text(s, removed_len, "");
+                    shift_paragraph_offsets_after(para, edit.at, edit.removed);
+                    removed_edit = Some(edit);
                 }
                 para.dirty = true;
                 return;
@@ -10210,11 +10196,13 @@ fn walk_paragraphs<F: FnMut(&Paragraph)>(blocks: &Vector<Block>, f: &mut F) {
 /// field on `para` LEFT by `removed_len`, for every value at or
 /// after `from`. Mirrors the rightward shift performed by
 /// `insert_inline_image_at` in reverse. Used when a tracked-change
-/// revision is rejected (Insert) or accepted (Delete) and the
-/// covered text range is sliced out.
+/// revision is rejected (Insert) or accepted (Delete) — and (issue
+/// #265) when the reviewer's own pending insertion is removed by
+/// `tracked_delete_range` — and the covered text range is sliced out.
 fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u32) {
+    let to = from + removed_len;
     let shift = |v: &mut u32| {
-        if *v >= from + removed_len {
+        if *v >= to {
             *v -= removed_len;
         } else if *v > from {
             *v = from;
@@ -10225,9 +10213,19 @@ fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u
         shift(&mut s.end);
     }
     para.spans.retain(|s| s.start < s.end);
-    for io in &mut para.inline_objects {
-        shift(&mut io.at);
-    }
+    /* Issue #265 — an inline object is a single sentinel byte, not a
+    range: one whose sentinel lies inside the removed gap has nothing
+    left to clamp onto (unlike a span/field/hyperlink, which can be
+    clipped to the gap's edge) and is dropped, exactly like
+    `Paragraph::delete_text`'s rule for the same case. */
+    para.inline_objects.retain_mut(|io| {
+        if io.at >= to {
+            io.at -= removed_len;
+            true
+        } else {
+            io.at < from
+        }
+    });
     for h in &mut para.hyperlinks {
         shift(&mut h.start);
         shift(&mut h.end);
@@ -11797,6 +11795,87 @@ mod tests {
         assert_eq!(p.revisions[0].kind, RevisionKind::Insert);
         assert_eq!(p.revisions[0].start, 5);
         assert_eq!(p.revisions[0].end, 7);
+    }
+
+    /// Issue #265 — deleting the reviewer's own pending insertion must
+    /// remap EVERY byte-offset table, not just style spans and the
+    /// comment anchors (#252): a field, a hyperlink and a picture inside
+    /// the removed insertion must leave no stale offsets, and undo must
+    /// restore them.
+    #[test]
+    fn tracked_delete_own_insert_remaps_fields_hyperlinks_and_inline_objects() {
+        let base = tracked_doc();
+        let mut undo = UndoStack::new(base.clone(), 100);
+        let inserted =
+            base.tracked_insert_text(pos0(5), "PPPPLL\u{FFFC}", "Alice".into(), "t1".into());
+        undo.push(inserted.clone());
+        assert_eq!(
+            inserted.nth_paragraph(0).unwrap().text,
+            "helloPPPPLL\u{FFFC}"
+        );
+        /* Attach a field over "PPPP" [5, 9), a hyperlink over "LL"
+        [9, 11), and a picture at the sentinel [11, 14) — all inside the
+        pending Insert revision [5, 14) `tracked_insert_text` just
+        recorded. */
+        let mut blocks = inserted.blocks.clone();
+        if let Block::Paragraph(p) = &mut blocks[0] {
+            p.fields.push(Field {
+                start: 5,
+                end: 9,
+                instruction: "PAGE".into(),
+                span: None,
+                source: None,
+            });
+            p.hyperlinks.push(Hyperlink {
+                start: 9,
+                end: 11,
+                target: "https://example.com".into(),
+            });
+            p.inline_objects.push(InlineObject {
+                at: 11,
+                kind: InlineKind::Image {
+                    rel_id: "rId9".into(),
+                    width_emu: 100,
+                    height_emu: 100,
+                    media_key: None,
+                },
+                anchor: None,
+                source_xml: None,
+            });
+        }
+        let mut with_overlays = inserted;
+        with_overlays.blocks = blocks;
+        undo.push(with_overlays.clone());
+        /* Delete the WHOLE pending insertion — the own-insertion
+        (owning_insert) path. */
+        let deleted =
+            with_overlays.tracked_delete_range(pos0(5), pos0(14), "Alice".into(), "t2".into());
+        undo.push(deleted.clone());
+        let p = deleted.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "hello");
+        assert!(p.fields.is_empty(), "stale field: {:?}", p.fields);
+        assert!(
+            p.hyperlinks.is_empty(),
+            "stale hyperlink: {:?}",
+            p.hyperlinks
+        );
+        assert!(
+            p.inline_objects.is_empty(),
+            "stale inline object: {:?}",
+            p.inline_objects
+        );
+        assert!(
+            p.revisions.iter().all(|r| r.kind != RevisionKind::Insert),
+            "the fully-removed Insert must not survive: {:?}",
+            p.revisions
+        );
+        /* Undo restores the overlays and their text. */
+        assert!(undo.undo());
+        let restored = undo.current().nth_paragraph(0).unwrap();
+        assert_eq!(restored.text, "helloPPPPLL\u{FFFC}");
+        assert_eq!(restored.fields.len(), 1);
+        assert_eq!(restored.hyperlinks.len(), 1);
+        assert_eq!(restored.inline_objects.len(), 1);
     }
 
     #[test]
