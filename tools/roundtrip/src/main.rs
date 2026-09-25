@@ -30,6 +30,7 @@
 //! Exit 0 on PASS, non-zero on FAIL.
 
 mod inline_spans;
+mod table_markup;
 
 use anyhow::{Context, Result, bail};
 use engine::{Alignment, DocumentTree, Indent, ParaProperties, Paragraph, Spacing, TextDirection};
@@ -326,6 +327,7 @@ fn run_default() -> Result<()> {
     inline_spans::run_form_fields_roundtrip()?;
     inline_spans::run_content_controls_roundtrip()?;
     inline_spans::run_field_source_form_roundtrip()?;
+    table_markup::run_table_markup_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -4563,6 +4565,26 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         String::new(),
                         "after".into(),
                     ],
+                },
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: 0,
+                },
+            },
+        },
+        /* Issue #248 — a pretty-printed Word table carrying every piece of
+        table source markup (row / cell attributes, tblPrEx, tblGridChange,
+        verified tblPr / trPr / tcPr spellings, row- and cell-level
+        content controls, bookmarks between rows). Zero-edit drift 0; the
+        default harness's step 30 edits and restructures it. */
+        PrebuiltFixture {
+            name: "table_source_markup.docx",
+            bytes: table_markup::build_table_source_markup_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 12,
+                asserts: FixtureAsserts {
+                    paragraph_count: 2,
+                    paragraph_texts: vec!["intro".into(), "after".into()],
                 },
                 roundtrip: RoundtripBounds {
                     document_xml_drift_bytes: 0,

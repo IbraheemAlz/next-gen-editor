@@ -14,16 +14,18 @@
 
 use crate::error::{DocxError, DocxWarning};
 use crate::parts::document::is_block_level_marker;
-use crate::schema::block_envelope::BlockEnvelopes;
+use crate::schema::block_envelope::{BlockEnvelopes, PassthroughSlot};
 use crate::schema::ct_ppr::parse_jc;
 use crate::schema::ct_rpr::{attr_val, parse_hex_color, toggle_on};
 use crate::schema::ct_tbl;
 use crate::schema::grab_bag::{
-    NamespaceScope, capture_subtree, slice_element, slice_fragment, stash,
+    NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
+use crate::schema::source_markup::raw_attrs;
 use engine::{
-    Block, BorderStroke, BorderStyle, CellBorders, CellMargins, CellWidth, GrabBag, RowHeight,
-    Table, TableCell, TableProperties, TableRow, VMergeRole, VerticalAlign,
+    Block, BorderStroke, BorderStyle, CellBorders, CellMargins, CellSourceMarkup, CellWidth,
+    GrabBag, RowHeight, RowSourceMarkup, SourceElement, Table, TableCell, TableProperties,
+    TableRow, TableSourceMarkup, VMergeRole, VerticalAlign,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -74,31 +76,106 @@ pub fn parse_table_bytes(
     ns: &NamespaceScope,
 ) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
     let mut warnings = Vec::new();
-    parse_table_bytes_at(xml, resolver, ns, 0, &mut warnings)
+    let t = parse_table_bytes_at(xml, resolver, ns, 0, &mut warnings)?;
+    Ok((t.grid, t.props, t.rows))
 }
 
-/// [`parse_table_bytes`], appending every non-fatal reader diagnostic to
-/// `warnings`.
+/// One parsed `<w:tbl>`: the typed model plus (issue #248) the source
+/// markup a regenerated table re-emits.
+#[derive(Debug, Default)]
+pub struct ParsedTable {
+    pub grid: Vec<i32>,
+    pub props: TableProperties,
+    pub rows: Vec<TableRow>,
+    pub source_markup: Option<Box<TableSourceMarkup>>,
+}
+
+impl ParsedTable {
+    /// The clean `Block::Table` for these parsed parts and their source
+    /// bytes.
+    pub fn into_table(
+        self,
+        source_xml: Option<Vec<u8>>,
+        body_xml: Option<Box<engine::BodyPassthrough>>,
+    ) -> Table {
+        Table {
+            grid: self.grid,
+            props: self.props,
+            rows: self.rows,
+            dirty: false,
+            source_xml,
+            body_xml,
+            source_markup: self.source_markup,
+        }
+    }
+}
+
+/// [`parse_table_bytes`] with the table's source markup (issue #248),
+/// appending every non-fatal reader diagnostic to `warnings`.
 pub fn parse_table_bytes_with_warnings(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
     ns: &NamespaceScope,
     warnings: &mut Vec<DocxWarning>,
-) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
+) -> Result<ParsedTable, DocxError> {
     parse_table_bytes_at(xml, resolver, ns, 0, warnings)
+}
+
+/// Issue #248 — a table property element (`<w:tblPr>`, `<w:tblGrid>`,
+/// `<w:trPr>`, `<w:tcPr>`) the walk is inside: where it started and what
+/// the source wrote before it.
+struct OpenElement {
+    start: usize,
+    lead: Vec<u8>,
+}
+
+impl OpenElement {
+    fn new(xml: &[u8], lead_from: usize, start: usize) -> Self {
+        Self {
+            start,
+            lead: xml.get(lead_from..start).unwrap_or_default().to_vec(),
+        }
+    }
+
+    /// The element ended at `end`: its captured bytes, when the slice is
+    /// the element (shape-checked) and root-bound — else `None` (the
+    /// element then always regenerates).
+    fn finish<T: Default>(
+        self,
+        xml: &[u8],
+        end: usize,
+        qname: &[u8],
+        ns: &NamespaceScope,
+    ) -> Option<SourceElement<T>> {
+        let bytes = slice_element(xml, self.start, end, qname)?;
+        (bound_by_root(&bytes, ns) && bound_by_root(&self.lead, ns)).then(|| SourceElement {
+            lead: self.lead,
+            xml: bytes,
+            model: T::default(),
+        })
+    }
 }
 
 /// The recursive worker behind [`parse_table_bytes`]. `depth` is this
 /// table's nesting level (outermost = 0); nested tables recurse at
 /// `depth + 1` until [`MAX_TABLE_NESTING_DEPTH`], where the walk stops
 /// and preserves the subtree opaquely.
+///
+/// Issue #248 — besides the typed rows the walk records the source markup
+/// a regenerated table re-emits: the `<w:tbl>` / `<w:tr>` / `<w:tc>`
+/// attributes, the `<w:tblPr>` / `<w:tblGrid>` / `<w:tblPrEx>` /
+/// `<w:trPr>` / `<w:tcPr>` bytes with the whitespace before each, and —
+/// through one [`BlockEnvelopes`] tracker per level (rows of the table,
+/// cells of the current row, blocks of the current cell) — everything
+/// between rows and between cells: whitespace, range markers and the
+/// `<w:sdt>` / `<w:customXml>` wrappers around rows or cells.
 fn parse_table_bytes_at(
     xml: &[u8],
     resolver: &crate::style_resolver::StyleResolver<'_>,
     ns: &NamespaceScope,
     depth: u32,
     warnings: &mut Vec<DocxWarning>,
-) -> Result<(Vec<i32>, TableProperties, Vec<TableRow>), DocxError> {
+) -> Result<ParsedTable, DocxError> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -106,6 +183,7 @@ fn parse_table_bytes_at(
     let mut grid: Vec<i32> = Vec::new();
     let mut props = TableProperties::default();
     let mut rows: Vec<TableRow> = Vec::new();
+    let mut markup = TableSourceMarkup::default();
 
     /* Element stack — `Vec<Vec<u8>>` keyed by element name. We push
     on Start, pop on End. Lets us decide context without juggling
@@ -133,16 +211,37 @@ fn parse_table_bytes_at(
     `<w:sdt>` around cell paragraphs, bookmarks / whitespace between
     them); one tracker per `<w:tc>`, drained into the cell's blocks. */
     let mut cell_env = BlockEnvelopes::new();
+    /* Issue #248 — the same tracker one level up (between the cells of
+    the current row) and two levels up (between the rows of the table). */
+    let mut row_env = BlockEnvelopes::new();
+    let mut tc_env = BlockEnvelopes::new();
+    /* Issue #248 — end of the last property child of the table / current
+    row (the start of the next one's `lead`), end of the `<w:tc>` start
+    tag, and the property element currently open at each level. */
+    let mut tbl_child_end: usize = 0;
+    let mut row_child_end: usize = 0;
+    let mut cell_open_end: usize = 0;
+    let mut open_tbl_pr: Option<OpenElement> = None;
+    let mut open_grid: Option<OpenElement> = None;
+    let mut open_tr_pr: Option<OpenElement> = None;
+    let mut open_tc_pr: Option<OpenElement> = None;
 
     loop {
-        match reader.read_event_into(&mut buf)? {
+        let event = reader.read_event_into(&mut buf)?;
+        let end_pos = reader.buffer_position() as usize;
+        /* Structural levels of the walk (issue #248). */
+        let table_level = in_table && nested_tbl_depth == 0 && cur_row.is_none();
+        let row_level = nested_tbl_depth == 0 && cur_row.is_some() && cur_cell.is_none();
+        let at_cell_level = nested_tbl_depth == 0 && cur_cell.is_some() && p_start_byte.is_none();
+        let parent: &[u8] = stack.last().map(Vec::as_slice).unwrap_or(b"");
+        match event {
             Event::Start(e) => {
                 let name = e.name().as_ref().to_owned();
-                let at_cell_level =
-                    nested_tbl_depth == 0 && cur_cell.is_some() && p_start_byte.is_none();
                 match name.as_slice() {
                     b"w:tbl" if !in_table => {
                         in_table = true;
+                        markup.attrs = raw_attrs(&e, ns);
+                        tbl_child_end = end_pos;
                     }
                     b"w:tbl" if cur_cell.is_some() => {
                         /* Nested table inside a cell. */
@@ -152,11 +251,70 @@ fn parse_table_bytes_at(
                         }
                         nested_tbl_depth += 1;
                     }
+                    /* Issue #248 — the table's own property elements: the
+                    whitespace before each is its `lead` (so it is no row
+                    passthrough). */
+                    b"w:tblPr" if table_level && parent == b"w:tbl" => {
+                        open_tbl_pr = Some(OpenElement::new(xml, tbl_child_end, prev_pos));
+                        row_env = BlockEnvelopes::new();
+                    }
+                    b"w:tblGrid" if table_level && parent == b"w:tbl" => {
+                        open_grid = Some(OpenElement::new(xml, tbl_child_end, prev_pos));
+                        row_env = BlockEnvelopes::new();
+                    }
+                    /* The grid's revision history is no live grid: its
+                    `<w:gridCol>`s must not append columns (the bytes ride
+                    the verified `<w:tblGrid>` capture). */
+                    b"w:tblGridChange" if nested_tbl_depth == 0 && parent == b"w:tblGrid" => {
+                        let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
                     b"w:tr" if nested_tbl_depth == 0 => {
-                        cur_row = Some(TableRow::default());
+                        row_env.note_block_start(prev_pos);
+                        cur_row = Some(TableRow {
+                            source_markup: Some(Box::new(RowSourceMarkup {
+                                attrs: raw_attrs(&e, ns),
+                                ..Default::default()
+                            })),
+                            ..TableRow::default()
+                        });
+                        row_child_end = end_pos;
+                        tc_env = BlockEnvelopes::new();
+                    }
+                    /* Issue #103 — row-level table property exceptions:
+                    unmodeled, captured whole (nothing inside is a live
+                    table property) and re-emitted verbatim. */
+                    b"w:tblPrEx" if row_level && parent == b"w:tr" => {
+                        let lead_from = row_child_end;
+                        let frag = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        let end = reader.buffer_position() as usize;
+                        record_tbl_pr_ex(xml, lead_from, prev_pos, frag, ns, &mut cur_row);
+                        row_child_end = end;
+                        tc_env = BlockEnvelopes::new();
+                        prev_pos = end;
+                        buf.clear();
+                        continue;
+                    }
+                    b"w:trPr" if row_level && parent == b"w:tr" => {
+                        open_tr_pr = Some(OpenElement::new(xml, row_child_end, prev_pos));
+                        tc_env = BlockEnvelopes::new();
                     }
                     b"w:tc" if nested_tbl_depth == 0 => {
-                        cur_cell = Some(TableCell::default());
+                        tc_env.note_block_start(prev_pos);
+                        cur_cell = Some(TableCell {
+                            source_markup: Some(Box::new(CellSourceMarkup {
+                                attrs: raw_attrs(&e, ns),
+                                ..Default::default()
+                            })),
+                            ..TableCell::default()
+                        });
+                        cell_open_end = end_pos;
+                        cell_env = BlockEnvelopes::new();
+                    }
+                    b"w:tcPr" if at_cell_level && parent == b"w:tc" => {
+                        open_tc_pr = Some(OpenElement::new(xml, cell_open_end, prev_pos));
                         cell_env = BlockEnvelopes::new();
                     }
                     b"w:p" if nested_tbl_depth == 0 && cur_cell.is_some() => {
@@ -169,11 +327,25 @@ fn parse_table_bytes_at(
                             cell_env.set_blocks_at_open(cell.blocks.len());
                         }
                     }
+                    /* Issue #248 — a content control / custom-XML element
+                    wrapping cells of a row, or rows of the table. */
+                    b"w:sdt" | b"w:customXml" if row_level => {
+                        tc_env.open_container(prev_pos);
+                        if let Some(row) = cur_row.as_ref() {
+                            tc_env.set_blocks_at_open(row.cells.len());
+                        }
+                    }
+                    b"w:sdt" | b"w:customXml" if table_level => {
+                        row_env.open_container(prev_pos);
+                        row_env.set_blocks_at_open(rows.len());
+                    }
                     b"w:sdtPr" | b"w:sdtEndPr" | b"w:customXmlPr"
-                        if at_cell_level && cell_env.in_container() =>
+                        if (at_cell_level && cell_env.in_container())
+                            || (row_level && tc_env.in_container())
+                            || (table_level && row_env.in_container()) =>
                     {
-                        /* Property children of a cell-level container: never
-                        live properties, always inside the envelope bytes. */
+                        /* Property children of a container: never live
+                        properties, always inside the envelope bytes. */
                         let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
                         prev_pos = reader.buffer_position() as usize;
                         buf.clear();
@@ -213,34 +385,77 @@ fn parse_table_bytes_at(
             }
             Event::Empty(e) => {
                 let name = e.name().as_ref().to_owned();
-                let at_cell_level =
-                    nested_tbl_depth == 0 && cur_cell.is_some() && p_start_byte.is_none();
                 if at_cell_level && name.as_slice() == b"w:p" {
                     /* Issue #120 — a self-closing `<w:p …/>` cell paragraph
                     (Word writes one for every empty cell): one `Empty`
                     event, so the Start / End arms never see it. Same
                     block as `<w:p></w:p>`, through the body parser. */
-                    let end = reader.buffer_position() as usize;
                     cell_env.note_block_start(prev_pos);
-                    if let Some(raw) = slice_element(xml, prev_pos, end, b"w:p")
+                    if let Some(raw) = slice_element(xml, prev_pos, end_pos, b"w:p")
                         && let Some(cell) = cur_cell.as_mut()
                     {
                         let mut p = parse_cell_paragraph(&raw, resolver, ns);
                         p.body_xml = cell_env.take_before();
                         cell.blocks.push(Block::Paragraph(p));
-                        cell_env.note_block_end(end);
+                        cell_env.note_block_end(end_pos);
                     }
-                    prev_pos = end;
+                    prev_pos = end_pos;
                     buf.clear();
                     continue;
                 }
-                if at_cell_level && is_block_level_marker(&name) {
-                    /* Issue #120 — a marker between two cell blocks. */
-                    let end = reader.buffer_position() as usize;
-                    if let Some(frag) = slice_fragment(xml, prev_pos, end) {
-                        cell_env.push_verbatim(frag);
+                /* Issue #248 — self-closing property elements of the
+                table / row / cell (`<w:tblPr/>`, `<w:tcPr/>`, …). */
+                match name.as_slice() {
+                    b"w:tblPr" if table_level && parent == b"w:tbl" => {
+                        markup.tbl_pr = OpenElement::new(xml, tbl_child_end, prev_pos)
+                            .finish(xml, end_pos, &name, ns);
+                        tbl_child_end = end_pos;
+                        row_env = BlockEnvelopes::new();
                     }
-                    prev_pos = end;
+                    b"w:tblGrid" if table_level && parent == b"w:tbl" => {
+                        markup.grid = OpenElement::new(xml, tbl_child_end, prev_pos)
+                            .finish(xml, end_pos, &name, ns);
+                        tbl_child_end = end_pos;
+                        row_env = BlockEnvelopes::new();
+                    }
+                    b"w:tblPrEx" if row_level && parent == b"w:tr" => {
+                        let frag = slice_fragment(xml, prev_pos, end_pos);
+                        record_tbl_pr_ex(xml, row_child_end, prev_pos, frag, ns, &mut cur_row);
+                        row_child_end = end_pos;
+                        tc_env = BlockEnvelopes::new();
+                    }
+                    b"w:trPr" if row_level && parent == b"w:tr" => {
+                        let el = OpenElement::new(xml, row_child_end, prev_pos)
+                            .finish(xml, end_pos, &name, ns);
+                        if let Some(m) = cur_row.as_mut().and_then(|r| r.source_markup.as_mut()) {
+                            m.tr_pr = el;
+                        }
+                        row_child_end = end_pos;
+                        tc_env = BlockEnvelopes::new();
+                    }
+                    b"w:tcPr" if at_cell_level && parent == b"w:tc" => {
+                        let el = OpenElement::new(xml, cell_open_end, prev_pos)
+                            .finish(xml, end_pos, &name, ns);
+                        if let Some(m) = cur_cell.as_mut().and_then(|c| c.source_markup.as_mut()) {
+                            m.tc_pr = el;
+                        }
+                        cell_env = BlockEnvelopes::new();
+                    }
+                    _ => {}
+                }
+                if (at_cell_level || row_level || table_level) && is_block_level_marker(&name) {
+                    /* Issue #120 — a marker between two cell blocks; issue
+                    #248 — between two cells of a row, or two rows. */
+                    if let Some(frag) = slice_fragment(xml, prev_pos, end_pos) {
+                        if at_cell_level {
+                            cell_env.push_verbatim(frag);
+                        } else if row_level {
+                            tc_env.push_verbatim(frag);
+                        } else {
+                            row_env.push_verbatim(frag);
+                        }
+                    }
+                    prev_pos = end_pos;
                     buf.clear();
                     continue;
                 }
@@ -251,8 +466,7 @@ fn parse_table_bytes_at(
                     /* Issue #84 — unmodeled leaf child (`<w:tblLook>`,
                     `<w:bidiVisual>`, `<w:cnfStyle>`, `<w:noWrap>`, …) →
                     the owning grab bag, verbatim. */
-                    let end = reader.buffer_position() as usize;
-                    if let Some(frag) = slice_fragment(xml, prev_pos, end)
+                    if let Some(frag) = slice_fragment(xml, prev_pos, end_pos)
                         && let Some(slot) = bag_for(parent, &mut props, &mut cur_row, &mut cur_cell)
                     {
                         stash(slot, frag, ns);
@@ -278,8 +492,7 @@ fn parse_table_bytes_at(
                             && let Some(start) = nested_tbl_start.take()
                             && let Some(cell) = cur_cell.as_mut()
                         {
-                            let end = reader.buffer_position() as usize;
-                            if let Some(raw) = slice_element(xml, start, end, b"w:tbl") {
+                            if let Some(raw) = slice_element(xml, start, end_pos, b"w:tbl") {
                                 if depth + 1 >= MAX_TABLE_NESTING_DEPTH {
                                     /* Issue #111 — Tier-3 opaque preservation.
                                     The subtree's bytes ride the passthrough
@@ -290,57 +503,110 @@ fn parse_table_bytes_at(
                                     warnings.push(DocxWarning::TableNestingTooDeep {
                                         limit: MAX_TABLE_NESTING_DEPTH,
                                     });
-                                    cell.blocks.push(Block::Table(Table {
-                                        grid: Vec::new(),
-                                        props: TableProperties::default(),
-                                        rows: Vec::new(),
-                                        dirty: false,
-                                        source_xml: Some(raw),
-                                        body_xml: cell_env.take_before(),
-                                    }));
-                                    cell_env.note_block_end(end);
-                                } else if let Ok((g, p, r)) =
+                                    cell.blocks.push(Block::Table(
+                                        ParsedTable::default()
+                                            .into_table(Some(raw), cell_env.take_before()),
+                                    ));
+                                    cell_env.note_block_end(end_pos);
+                                } else if let Ok(parsed) =
                                     parse_table_bytes_at(&raw, resolver, ns, depth + 1, warnings)
                                 {
-                                    cell.blocks.push(Block::Table(Table {
-                                        grid: g,
-                                        props: p,
-                                        rows: r,
-                                        dirty: false,
-                                        source_xml: Some(raw),
-                                        body_xml: cell_env.take_before(),
-                                    }));
-                                    cell_env.note_block_end(end);
+                                    cell.blocks.push(Block::Table(
+                                        parsed.into_table(Some(raw), cell_env.take_before()),
+                                    ));
+                                    cell_env.note_block_end(end_pos);
                                 }
                             }
                         }
                     }
                     b"w:tbl" if in_table => {
                         in_table = false;
+                        /* Issue #248 — whatever follows the last row
+                        (whitespace, a `<w:bookmarkEnd/>`) rides it. */
+                        row_env.finish(&mut rows);
+                    }
+                    b"w:tblPr" if nested_tbl_depth == 0 && open_tbl_pr.is_some() => {
+                        markup.tbl_pr = open_tbl_pr
+                            .take()
+                            .and_then(|o| o.finish(xml, end_pos, &name, ns));
+                        tbl_child_end = end_pos;
+                        row_env = BlockEnvelopes::new();
+                    }
+                    b"w:tblGrid" if nested_tbl_depth == 0 && open_grid.is_some() => {
+                        markup.grid = open_grid
+                            .take()
+                            .and_then(|o| o.finish(xml, end_pos, &name, ns));
+                        tbl_child_end = end_pos;
+                        row_env = BlockEnvelopes::new();
+                    }
+                    b"w:trPr"
+                        if nested_tbl_depth == 0 && cur_cell.is_none() && open_tr_pr.is_some() =>
+                    {
+                        let el = open_tr_pr
+                            .take()
+                            .and_then(|o| o.finish(xml, end_pos, &name, ns));
+                        if let Some(m) = cur_row.as_mut().and_then(|r| r.source_markup.as_mut()) {
+                            m.tr_pr = el;
+                        }
+                        row_child_end = end_pos;
+                        tc_env = BlockEnvelopes::new();
+                    }
+                    b"w:tcPr"
+                        if nested_tbl_depth == 0
+                            && p_start_byte.is_none()
+                            && open_tc_pr.is_some() =>
+                    {
+                        let el = open_tc_pr
+                            .take()
+                            .and_then(|o| o.finish(xml, end_pos, &name, ns));
+                        if let Some(m) = cur_cell.as_mut().and_then(|c| c.source_markup.as_mut()) {
+                            m.tc_pr = el;
+                        }
+                        cell_env = BlockEnvelopes::new();
                     }
                     b"w:tr" if nested_tbl_depth == 0 => {
-                        if let Some(row) = cur_row.take() {
+                        if let Some(mut row) = cur_row.take() {
+                            /* Whatever follows the last cell (whitespace
+                            before `</w:tr>`) rides it. */
+                            tc_env.finish(&mut row.cells);
+                            if let Some(m) = row.source_markup.as_mut()
+                                && let Some(tr_pr) = m.tr_pr.as_mut()
+                            {
+                                tr_pr.model = row.props.clone();
+                            }
+                            *row.passthrough_slot() = row_env.take_before();
                             rows.push(row);
+                            row_env.note_block_end(end_pos);
                         }
                     }
                     /* Issue #120 — a cell-level container closes. */
-                    b"w:sdt" | b"w:customXml"
-                        if nested_tbl_depth == 0
-                            && cur_cell.is_some()
-                            && p_start_byte.is_none()
-                            && cell_env.in_container() =>
-                    {
-                        let end = reader.buffer_position() as usize;
+                    b"w:sdt" | b"w:customXml" if at_cell_level && cell_env.in_container() => {
                         if let Some(cell) = cur_cell.as_mut() {
-                            cell_env.close_container(xml, end, &mut cell.blocks);
+                            cell_env.close_container(xml, end_pos, &mut cell.blocks);
                         }
+                    }
+                    /* Issue #248 — a container around cells / rows closes. */
+                    b"w:sdt" | b"w:customXml" if row_level && tc_env.in_container() => {
+                        if let Some(row) = cur_row.as_mut() {
+                            tc_env.close_container(xml, end_pos, &mut row.cells);
+                        }
+                    }
+                    b"w:sdt" | b"w:customXml" if table_level && row_env.in_container() => {
+                        row_env.close_container(xml, end_pos, &mut rows);
                     }
                     b"w:tc" if nested_tbl_depth == 0 => {
                         if let Some(mut cell) = cur_cell.take()
                             && let Some(row) = cur_row.as_mut()
                         {
                             cell_env.finish(&mut cell.blocks);
+                            if let Some(m) = cell.source_markup.as_mut()
+                                && let Some(tc_pr) = m.tc_pr.as_mut()
+                            {
+                                tc_pr.model = cell.props.clone();
+                            }
+                            *cell.passthrough_slot() = tc_env.take_before();
                             row.cells.push(cell);
+                            tc_env.note_block_end(end_pos);
                         }
                     }
                     b"w:p"
@@ -348,9 +614,8 @@ fn parse_table_bytes_at(
                             && cur_cell.is_some()
                             && p_start_byte.is_some() =>
                     {
-                        let p_end = reader.buffer_position() as usize;
                         let start = p_start_byte.take().unwrap();
-                        if let Some(raw) = slice_element(xml, start, p_end, b"w:p") {
+                        if let Some(raw) = slice_element(xml, start, end_pos, b"w:p") {
                             if let Some(cell) = cur_cell.as_mut() {
                                 /* Issue #101 — cell paragraphs parse
                                 through the body run parser (runs, rPr
@@ -358,7 +623,7 @@ fn parse_table_bytes_at(
                                 let mut p = parse_cell_paragraph(&raw, resolver, ns);
                                 p.body_xml = cell_env.take_before();
                                 cell.blocks.push(Block::Paragraph(p));
-                                cell_env.note_block_end(p_end);
+                                cell_env.note_block_end(end_pos);
                             }
                         }
                     }
@@ -368,21 +633,19 @@ fn parse_table_bytes_at(
                     stack.pop();
                 }
             }
-            Event::Text(t)
-                if nested_tbl_depth == 0
-                    && cur_cell.is_some()
-                    && p_start_byte.is_none()
-                    && matches!(
-                        stack.last().map(Vec::as_slice),
-                        Some(b"w:tc" | b"w:sdtContent" | b"w:customXml")
-                    )
-                    && t.iter().all(u8::is_ascii_whitespace) =>
-            {
+            Event::Text(t) if t.iter().all(u8::is_ascii_whitespace) => {
                 /* Issue #120 — whitespace between two cell blocks (a
-                pretty-printed part) rides the following block. */
-                let end = reader.buffer_position() as usize;
-                if let Some(frag) = slice_fragment(xml, prev_pos, end) {
-                    cell_env.push_verbatim(frag);
+                pretty-printed part) rides the following block; issue
+                #248 — the same between cells and between rows. */
+                let container = matches!(parent, b"w:sdtContent" | b"w:customXml");
+                if let Some(frag) = slice_fragment(xml, prev_pos, end_pos) {
+                    if at_cell_level && (container || parent == b"w:tc") {
+                        cell_env.push_verbatim(frag);
+                    } else if row_level && (container || parent == b"w:tr") {
+                        tc_env.push_verbatim(frag);
+                    } else if table_level && (container || parent == b"w:tbl") {
+                        row_env.push_verbatim(frag);
+                    }
                 }
             }
             Event::Eof => break,
@@ -392,7 +655,41 @@ fn parse_table_bytes_at(
         buf.clear();
     }
 
-    Ok((grid, props, rows))
+    /* Issue #248 — the model the table-level bytes produced. */
+    if let Some(el) = markup.tbl_pr.as_mut() {
+        el.model = props.clone();
+    }
+    if let Some(el) = markup.grid.as_mut() {
+        el.model = grid.clone();
+    }
+    Ok(ParsedTable {
+        grid,
+        props,
+        rows,
+        source_markup: Some(Box::new(markup)),
+    })
+}
+
+/// Issue #103 — record a `<w:tr>`'s `<w:tblPrEx>` bytes (`frag`, which
+/// started at `start`) with the whitespace since `lead_from`.
+fn record_tbl_pr_ex(
+    xml: &[u8],
+    lead_from: usize,
+    start: usize,
+    frag: Option<Vec<u8>>,
+    ns: &NamespaceScope,
+    cur_row: &mut Option<TableRow>,
+) {
+    let Some(frag) = frag.filter(|f| bound_by_root(f, ns)) else {
+        return;
+    };
+    if let Some(m) = cur_row.as_mut().and_then(|r| r.source_markup.as_mut()) {
+        m.tbl_pr_ex = Some(SourceElement {
+            lead: xml.get(lead_from..start).unwrap_or_default().to_vec(),
+            xml: frag,
+            model: (),
+        });
+    }
 }
 
 /// Cell paragraph parser (issue #101). A cell `<w:p>` is parsed by the
@@ -947,7 +1244,7 @@ mod tests {
     fn deep_nesting_does_not_overflow_the_stack() {
         let xml = nested_table_xml(5000);
         let mut warnings = Vec::new();
-        let (_, _, rows) = parse_table_bytes_with_warnings(
+        let ParsedTable { rows, .. } = parse_table_bytes_with_warnings(
             &xml,
             &StyleResolver::new(&empty_resolver()),
             &NamespaceScope::default(),
@@ -986,7 +1283,7 @@ mod tests {
         let depth = MAX_TABLE_NESTING_DEPTH as usize;
         let xml = nested_table_xml(depth);
         let mut warnings = Vec::new();
-        let (_, _, rows) = parse_table_bytes_with_warnings(
+        let ParsedTable { rows, .. } = parse_table_bytes_with_warnings(
             &xml,
             &StyleResolver::new(&empty_resolver()),
             &NamespaceScope::default(),

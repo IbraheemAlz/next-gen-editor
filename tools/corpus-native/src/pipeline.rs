@@ -226,6 +226,9 @@ const REWRITE_CAUSE_WINDOW: usize = 400;
 /// (see [`REWRITE_CAUSE_MARKERS`] / [`REWRITE_CAUSE_WINDOW`]). Not a real
 /// diff — good enough to bucket the corpus against issues #242-#249.
 fn classify_rewrite(orig: &[u8], region_start: usize, region_len: u64) -> &'static str {
+    if let Some(shape) = classify_one_byte_rewrite(orig, region_start, region_len) {
+        return shape;
+    }
     let win_start = region_start.saturating_sub(REWRITE_CAUSE_WINDOW);
     let win_end = (region_start + region_len as usize + REWRITE_CAUSE_WINDOW).min(orig.len());
     let window = orig.get(win_start..win_end.max(win_start)).unwrap_or(&[]);
@@ -236,6 +239,38 @@ fn classify_rewrite(orig: &[u8], region_start: usize, region_len: u64) -> &'stat
         }
     }
     "other"
+}
+
+/// Issue #248 — two one-byte "rewrites" that are really an insertion the
+/// single-region metric cannot express, tagged by shape BEFORE the
+/// substring markers (which would otherwise blame whatever construct is
+/// nearby, typically a table):
+///
+/// - `"empty <w:p/>"` (#267): text typed into a self-closing `<w:p …/>`
+///   opens it — the `/` of `/>` is the one rewritten byte;
+/// - `"t preserve"` (#199 rule): a bare source `<w:t>` gains
+///   `xml:space="preserve"` because the inserted text put whitespace at
+///   its edge — two insertions (attribute + text) around the source `>`.
+fn classify_one_byte_rewrite(
+    orig: &[u8],
+    region_start: usize,
+    region_len: u64,
+) -> Option<&'static str> {
+    if region_len != 1 {
+        return None;
+    }
+    let before = orig.get(..region_start)?;
+    match orig.get(region_start)? {
+        b'/' if orig.get(region_start + 1) == Some(&b'>') => {
+            let tag_start = before.iter().rposition(|&b| b == b'<')?;
+            let tag = &before[tag_start..];
+            let is_p = tag.starts_with(b"<w:p")
+                && matches!(tag.get(4), Some(b' ' | b'\t' | b'\r' | b'\n') | None);
+            is_p.then_some("empty <w:p/>")
+        }
+        b'>' if before.ends_with(b"<w:t") => Some("t preserve"),
+        _ => None,
+    }
 }
 
 /// Issue #199 / #251 — `(prefix_len, original_span, edited_span)`: the
@@ -763,6 +798,23 @@ mod tests {
             .position(|w| w == b"<w:t>")
             .expect("needle");
         assert_eq!(classify_rewrite(plain, region_start, 3), "other");
+    }
+
+    /// Issue #248 — the two one-byte insertion shapes are tagged by shape,
+    /// not by the table they happen to sit next to.
+    #[test]
+    fn classify_rewrite_tags_one_byte_insertion_shapes() {
+        let empty_p = br#"<w:tbl><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl><w:p w:rsidR="1"/>"#;
+        let slash = empty_p.len() - 2;
+        assert_eq!(classify_rewrite(empty_p, slash, 1), "empty <w:p/>");
+        let bare_t =
+            br#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let gt = bare_t.windows(5).position(|w| w == b"<w:t>").unwrap() + 4;
+        assert_eq!(classify_rewrite(bare_t, gt, 1), "t preserve");
+        /* A self-closing non-paragraph element stays with the markers. */
+        let pr = br#"<w:tbl><w:tblPr/></w:tbl>"#;
+        let slash = pr.windows(2).position(|w| w == b"/>").unwrap();
+        assert_eq!(classify_rewrite(pr, slash, 1), "table");
     }
 
     #[test]
