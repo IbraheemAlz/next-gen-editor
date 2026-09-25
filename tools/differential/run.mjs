@@ -146,12 +146,24 @@ if (havePdftoppm) {
 /* Conversion                                                         */
 /* ---------------------------------------------------------------- */
 
+/** Issue #109 — `differential-native` prints `pgsz-explicit=true|false` on
+ * its success line (it already has the raw `.docx` bytes open via
+ * `read_docx`, so it can answer "did the source declare `<w:pgSz>`" without
+ * this script re-parsing the archive). `null` means the flag wasn't found
+ * (an older binary, or output was swallowed) — the caller then treats a
+ * page-size mismatch as a real disagreement rather than assuming either
+ * way. */
+function parsePgSzExplicit(stdout) {
+    const m = /pgsz-explicit=(true|false)/.exec(stdout || '');
+    return m ? m[1] === 'true' : null;
+}
+
 function convertOurEngine(docxPath, outPdf) {
     const r = spawnSync(NATIVE_BIN, [docxPath, outPdf], { encoding: 'utf8' });
     if (r.status !== 0 || !existsSync(outPdf)) {
         return { ok: false, error: (r.stderr || r.stdout || 'unknown error').trim() };
     }
-    return { ok: true };
+    return { ok: true, pgSzExplicit: parsePgSzExplicit(r.stdout) };
 }
 
 /** Per-process `-env:UserInstallation` profile so parallel/back-to-back
@@ -197,7 +209,10 @@ function pdfPageCount(info) {
  * true page-size differences with DPI rounding) — the right signal for
  * "did the two renderers agree on the sheet size", found to matter during
  * development: without an explicit `<w:pgSz>`, our engine defaults to A4
- * while this harness's LibreOffice defaults to US Letter (its locale). */
+ * while this harness's LibreOffice defaults to US Letter (its locale).
+ * Issue #109 — that specific case (source omits `<w:pgSz>`) is reported as
+ * an INFORMATIONAL mismatch, not a scored disagreement; see
+ * `pageSizeMismatchInformational` / `parsePgSzExplicit`. */
 function pdfPageSizePt(info) {
     const m = /Page size:\s+([\d.]+) x ([\d.]+) pts/.exec(info);
     return m ? { width: parseFloat(m[1]), height: parseFloat(m[2]) } : null;
@@ -387,6 +402,15 @@ for (const docxPath of corpus) {
         loPageSizePt != null &&
         (Math.abs(ourPageSizePt.width - loPageSizePt.width) > 1 ||
             Math.abs(ourPageSizePt.height - loPageSizePt.height) > 1);
+    /* Issue #109 — when the SOURCE `.docx` never declared `<w:pgSz>`, our
+     * reader falls back to A4 while this harness's LibreOffice falls back
+     * to its own locale default (US Letter here) — two independently
+     * reasonable defaults disagreeing on an underspecified document, not a
+     * real rendering bug. Downgrade that specific case from a scored
+     * disagreement to an informational note; `pgSzExplicit === null` (an
+     * older `differential-native` that doesn't print the flag) keeps the
+     * mismatch scored as before rather than silently hiding it. */
+    const pageSizeMismatchInformational = pageSizeMismatch && rOurs.pgSzExplicit === false;
 
     const ourText = pdfPagesText(ourPdf, ourPages);
     const loText = pdfPagesText(loPdf, loPages);
@@ -433,6 +457,8 @@ for (const docxPath of corpus) {
         ourPageSizePt,
         loPageSizePt,
         pageSizeMismatch,
+        pageSizeMismatchInformational,
+        sourcePgSzExplicit: rOurs.pgSzExplicit,
         avgTextSimilarity,
         ourLineCount: ourLines.length,
         loLineCount: loLines.length,
@@ -446,8 +472,11 @@ for (const docxPath of corpus) {
 
     console.log(`  pages: ours=${ourPages} lo=${loPages} (delta ${record.pageCountDelta})`);
     if (pageSizeMismatch) {
+        const label = pageSizeMismatchInformational
+            ? 'page size mismatch (informational — source omits <w:pgSz>)'
+            : 'PAGE SIZE MISMATCH';
         console.log(
-            `  PAGE SIZE MISMATCH: ours=${ourPageSizePt.width}x${ourPageSizePt.height}pt lo=${loPageSizePt.width}x${loPageSizePt.height}pt`,
+            `  ${label}: ours=${ourPageSizePt.width}x${ourPageSizePt.height}pt lo=${loPageSizePt.width}x${loPageSizePt.height}pt`,
         );
     }
     console.log(
@@ -470,7 +499,13 @@ for (const docxPath of corpus) {
 function severity(r) {
     if (r.error) return 1000;
     let s = 0;
-    if (r.pageSizeMismatch) s += 500;
+    /* Issue #109 — an informational page-size mismatch (source omits
+     * <w:pgSz>, so ours-vs-LibreOffice is two independent defaults, not a
+     * real disagreement) still nudges severity up a little — it is real
+     * signal that a fixture is underspecified and worth fixing (see
+     * tools/roundtrip's pgSz-pinning work) — just nowhere near the weight
+     * of a genuine same-input page-size disagreement. */
+    if (r.pageSizeMismatch) s += r.pageSizeMismatchInformational ? 15 : 500;
     s += Math.abs(r.pageCountDelta || 0) * 100;
     s += Math.abs(r.paragraphCountDelta || 0) * 20;
     s += (r.paragraphLineBreakDiffs || []).length * 10;
@@ -489,8 +524,11 @@ for (const r of ranked) {
     }
     const textSim = r.avgTextSimilarity == null ? 'n/a' : r.avgTextSimilarity.toFixed(3);
     const rasterPct = r.raster?.avgDiffPct != null ? `${r.raster.avgDiffPct.toFixed(1)}%` : 'n/a';
+    const pageSizeTag = r.pageSizeMismatchInformational
+        ? 'PAGE-SIZE-MISMATCH-INFO'
+        : 'PAGE-SIZE-MISMATCH';
     const pageSize = r.pageSizeMismatch
-        ? ` PAGE-SIZE-MISMATCH(${r.ourPageSizePt?.width}x${r.ourPageSizePt?.height} vs ${r.loPageSizePt?.width}x${r.loPageSizePt?.height}pt)`
+        ? ` ${pageSizeTag}(${r.ourPageSizePt?.width}x${r.ourPageSizePt?.height} vs ${r.loPageSizePt?.width}x${r.loPageSizePt?.height}pt)`
         : '';
     console.log(
         `  ${r.name}: pageDelta=${r.pageCountDelta} paraDelta=${r.paragraphCountDelta} ` +
