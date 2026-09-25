@@ -28,5 +28,6 @@ pub mod writer;
 pub use error::{DocxError, DocxWarning};
 pub use opc::archive::{
     DOC_XML, DocxArchive, check_document_xml_well_formed, check_part_xml_well_formed, read_docx,
+    read_docx_with_settings,
 };
 pub use writer::{build_minimal_docx, write_docx};

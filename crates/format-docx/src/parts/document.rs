@@ -429,10 +429,14 @@ impl SectPrAccum {
     }
 
     /// Bake into the engine-facing `PageGeometry`. Missing fields fall back
-    /// to the A4 defaults so a `<w:sectPr/>` with only a header reference
-    /// still produces a usable section.
-    fn into_geometry(self) -> PageGeometry {
-        let d = PageGeometry::a4();
+    /// to `default_geometry` (issue #109 — a `<w:sectPr/>` with only a
+    /// header reference, or one that omits `<w:pgSz>` altogether, still
+    /// produces a usable section). `default_geometry` is
+    /// `engine::PageGeometry::a4()` for the stock `read_docx` entry point;
+    /// `read_docx_with_settings` threads a host-chosen
+    /// `engine::DefaultPageSize::geometry()` down instead.
+    fn into_geometry(self, default_geometry: PageGeometry) -> PageGeometry {
+        let d = default_geometry;
         PageGeometry {
             width: self.width.unwrap_or(d.width),
             height: self.height.unwrap_or(d.height),
@@ -457,7 +461,7 @@ pub fn parse_document_xml(
     resolver: &StyleResolver<'_>,
 ) -> Result<DocumentTree, DocxError> {
     let mut warnings = Vec::new();
-    parse_document_xml_with_warnings(xml, resolver, &mut warnings)
+    parse_document_xml_with_warnings(xml, resolver, &mut warnings, PageGeometry::default())
 }
 
 /// Strip a leading UTF-8 byte-order mark (`EF BB BF`).
@@ -476,10 +480,18 @@ pub(crate) fn strip_utf8_bom(xml: &[u8]) -> &[u8] {
 
 /// [`parse_document_xml`], appending every non-fatal reader diagnostic to
 /// `warnings` (see [`DocxWarning`]).
+///
+/// `default_page_geometry` — issue #109 — is the fallback baked into any
+/// `Section` whose `<w:sectPr>` omits `<w:pgSz>` (or has no `<w:sectPr>` at
+/// all). `parse_document_xml` passes `PageGeometry::a4()`, matching the
+/// pre-#109 hard-coded behavior byte-for-byte; `read_docx_with_settings`
+/// (`opc::archive`) is the host-facing entry point that threads a
+/// `DefaultPageSize::Letter` geometry down to this parameter instead.
 pub fn parse_document_xml_with_warnings(
     xml: &[u8],
     resolver: &StyleResolver<'_>,
     warnings: &mut Vec<DocxWarning>,
+    default_page_geometry: PageGeometry,
 ) -> Result<DocumentTree, DocxError> {
     /* Issue #110 — see `strip_utf8_bom`: `reader.buffer_position()` and
     every `xml[..]` slice below must share one byte space. */
@@ -1584,7 +1596,7 @@ pub fn parse_document_xml_with_warnings(
                                 let footnote_props = taken.footnote_props;
                                 let endnote_props = taken.endnote_props;
                                 out_sections.push(Section {
-                                    geometry: taken.into_geometry(),
+                                    geometry: taken.into_geometry(default_page_geometry),
                                     start_block: sect_start_block,
                                     end_block: end,
                                     header_refs,
@@ -1726,7 +1738,7 @@ pub fn parse_document_xml_with_warnings(
                                 let footnote_props = sect.footnote_props;
                                 let endnote_props = sect.endnote_props;
                                 out_sections.push(Section {
-                                    geometry: sect.into_geometry(),
+                                    geometry: sect.into_geometry(default_page_geometry),
                                     start_block: sect_start_block,
                                     end_block: end,
                                     header_refs,
@@ -1762,7 +1774,7 @@ pub fn parse_document_xml_with_warnings(
     let total = out_blocks.len() as u32;
     if total > sect_start_block {
         out_sections.push(Section {
-            geometry: PageGeometry::a4(),
+            geometry: default_page_geometry,
             start_block: sect_start_block,
             end_block: total,
             header_refs: HeaderFooterRefs::default(),

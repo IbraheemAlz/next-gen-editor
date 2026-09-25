@@ -44,6 +44,101 @@ const MANIFEST_NAME: &str = "_manifest.json";
 const SEED_TEXT: &str = "السلام عليكم ورحمة الله وبركاته";
 const INSERT_TEXT: &str = " تم التعديل";
 
+/* ==================================================== pgSz pinning (#109) ==== */
+
+/// Issue #109 — `Word.exe` always stamps `<w:pgSz>`/`<w:pgMar>` explicitly
+/// on every `<w:sectPr>` it writes. Every handcrafted / seed fixture here
+/// used to rely on the bare `<w:sectPr/>` short-hand instead, which meant
+/// `--fixtures` could never prove the reader's `<w:sectPr>`-omits-`<w:pgSz>`
+/// fallback (`format_docx::parts::document::SectPrAccum::into_geometry`)
+/// wasn't silently carrying every single committed fixture. Every fixture
+/// this module can safely touch now pins this exact A4 sectPr into its
+/// SOURCE bytes — byte-for-byte what `format_docx::writer::emit_sect_pr`
+/// itself would write for stock A4 geometry, so it is not a semantic
+/// change. See `ppr_fixtures` for the one exception (`pPr_bidi_rtl.docx`)
+/// and `run_gen_seed` / `prebuilt_fixtures` for the fixtures this module
+/// deliberately leaves alone because their generator functions are SHARED
+/// with a `run_default()` exact-byte-equality assertion that compares a
+/// resave against the pinned SOURCE text (`grab_bag_exotic.docx`,
+/// `floating_image_anchor.docx`, `footnotes_endnotes.docx`,
+/// `table_cell_runs.docx`, `image_wrap_modes.docx`, `toc_word_shape.docx`)
+/// — the writer's
+/// trailing-sectPr compaction (`sect_pr_compaction_delta`) would desync
+/// those comparisons. `w14_paraid_word.docx` is the one exception THAT
+/// IS pinned despite sharing a generator with a `run_default()` step:
+/// its assertion compares two fresh resaves of the same edited tree
+/// against EACH OTHER, not against the pinned source, so both sides
+/// compact identically and the comparison still holds.
+const A4_SECT_PR_EXPLICIT: &str = concat!(
+    "<w:sectPr>",
+    r#"<w:pgSz w:w="11906" w:h="16838"/>"#,
+    r#"<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720"/>"#,
+    "</w:sectPr>",
+);
+const BARE_SECT_PR: &str = "<w:sectPr/>";
+
+/// `write_docx`'s trailing-sectPr emission (`geometry_is_stock_a4`) is a
+/// deliberate byte-stability optimisation: ANY untouched stock-A4 document
+/// re-saves with the bare `<w:sectPr/>` footer, regardless of what its
+/// SOURCE bytes said. So a no-op `--fixtures` resave of a pinned fixture
+/// compacts `A4_SECT_PR_EXPLICIT` straight back to `BARE_SECT_PR` — this is
+/// that known, bounded, one-time delta, not corruption. Every pinned
+/// fixture's manifest entry carries this as `document_xml_drift_bytes`
+/// (plus any other fixture-specific drift already accounted for, e.g.
+/// `bom_utf8_passthrough.docx`'s BOM-removal bytes).
+fn sect_pr_compaction_delta() -> usize {
+    A4_SECT_PR_EXPLICIT.len() - BARE_SECT_PR.len()
+}
+
+/// Splice [`A4_SECT_PR_EXPLICIT`] into a `build_minimal_docx` zip's
+/// `word/document.xml`, in place of the bare `<w:sectPr/>` footer the
+/// writer emits for a freshly-built stock-A4 `DocumentTree`. Re-zips the
+/// archive with the same entries, in the same order, at the same
+/// compression — only `word/document.xml`'s bytes change.
+fn pin_explicit_a4_sect_pr(bytes: &[u8]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("read seed zip");
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).expect("zip entry");
+        let name = file.name().to_owned();
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).expect("read entry");
+        entries.push((name, buf));
+    }
+    let mut patched = false;
+    for (name, buf) in &mut entries {
+        if name == "word/document.xml" {
+            let xml = std::str::from_utf8(buf).expect("utf8 document.xml");
+            assert!(
+                xml.contains(BARE_SECT_PR),
+                "expected build_minimal_docx to emit the bare <w:sectPr/> footer, got:\n{xml}"
+            );
+            *buf = xml
+                .replacen(BARE_SECT_PR, A4_SECT_PR_EXPLICIT, 1)
+                .into_bytes();
+            patched = true;
+        }
+    }
+    assert!(patched, "seed zip has no word/document.xml to patch");
+
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut out));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, buf) in &entries {
+            zip.start_file(name.as_str(), opts).expect("start entry");
+            zip.write_all(buf).expect("write entry");
+        }
+        zip.finish().expect("finish zip");
+    }
+    out
+}
+
 /* ============================================================ default ==== */
 
 fn run_default() -> Result<()> {
@@ -1629,9 +1724,10 @@ fn w14_paraid_document_xml() -> String {
             r#"<w:tc><w:p w14:paraId="4D5E6F70" w14:textId="3B4C5D6E"><w:r><w:t xml:space="preserve">cell b</w:t></w:r></w:p></w:tc>"#,
             "</w:tr></w:tbl>",
             r#"<w:p w14:paraId="5E6F7081" w14:textId="4C5D6E7F"><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p>"#,
-            "<w:sectPr/></w:body></w:document>",
+            "{sect_pr}</w:body></w:document>",
         ),
         root = WORD_ROOT_OPEN,
+        sect_pr = A4_SECT_PR_EXPLICIT,
     )
 }
 
@@ -2263,6 +2359,17 @@ fn run_gen_seed(dir: &Path) -> Result<()> {
     };
     for fx in seed_fixtures() {
         let bytes = build_minimal_docx(&fx.doc).context("build seed")?;
+        /* Issue #109 — pin an explicit A4 `<w:pgSz>` into every seed
+        fixture EXCEPT `pPr_bidi_rtl.docx`: `build_minimal_docx` already
+        regenerates that one file with different bytes than what's
+        committed today (a pre-existing gap, unrelated to #109 — see
+        `ppr_fixtures`), so it is left exactly as-is rather than pinned
+        on top of an already-drifting base. */
+        let (bytes, drift_bound) = if fx.name == "pPr_bidi_rtl.docx" {
+            (bytes, 0)
+        } else {
+            (pin_explicit_a4_sect_pr(&bytes), sect_pr_compaction_delta())
+        };
         let path = dir.join(fx.name);
         std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
 
@@ -2282,7 +2389,9 @@ fn run_gen_seed(dir: &Path) -> Result<()> {
                     paragraph_count: texts.len() as u32,
                     paragraph_texts: texts,
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: drift_bound,
+                },
             },
         );
         println!("[gen-seed] wrote {} ({} B)", path.display(), bytes.len());
@@ -2339,7 +2448,19 @@ fn seed_fixtures() -> Vec<SeedFixture> {
 Each one isolates one `<w:pPr>` child element. The Word-authored
 ground-truth `.docx` files were not in the tree at Phase 2 kickoff;
 these are `handcrafted` via our own writer so the harness exercises the
-pPr reader + writer end-to-end. Phase 3 / 5 swap in true Word fixtures. */
+pPr reader + writer end-to-end. Phase 3 / 5 swap in true Word fixtures.
+
+Issue #109 — `run_gen_seed` pins an explicit A4 `<w:pgSz>` into every one
+of these EXCEPT `pPr_bidi_rtl.docx`: regenerating that one fixture via
+`build_minimal_docx` already produces different bytes than what's
+committed today (a pre-existing gap this PR did not introduce and does
+not fix — the RTL/`Alignment::End` combination the writer emits for it
+has drifted from the committed file at some point since it was last
+regenerated). Pinning pgSz on top of an already-drifting base would
+just be a second, unrelated change riding the same commit, so it is
+left untouched; its committed bytes still lack an explicit `<w:pgSz>`,
+which incidentally keeps at least one fixture exercising the
+`<w:sectPr>`-omits-`<w:pgSz>` reader fallback this issue is about. */
 fn ppr_fixtures() -> Vec<SeedFixture> {
     let mk = |name, props: ParaProperties, text: &str| SeedFixture {
         name,
@@ -2441,7 +2562,12 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             },
         },
         /* Issue #82 — one floating picture per wrap mode; passthrough
-        drift 0 on a zero-edit resave, exact regeneration in step 14. */
+        drift 0 on a zero-edit resave, exact regeneration in step 14
+        (`run_wrap_modes_roundtrip` compares a resave against the pinned
+        source by exact string equality). Issue #109's pgSz pin is
+        deliberately NOT applied here for the same reason as
+        `grab_bag_exotic.docx` / `table_cell_runs.docx` above — the
+        writer's trailing-sectPr compaction would desync that comparison. */
         PrebuiltFixture {
             name: "image_wrap_modes.docx",
             bytes: build_image_wrap_modes_docx(),
@@ -2485,7 +2611,11 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 1,
                     paragraph_texts: vec!["hello cascade".into()],
                 },
-                roundtrip: RoundtripBounds::default(),
+                /* Issue #109 — pinned A4 pgSz compacts back to the bare
+                `<w:sectPr/>` footer on a no-op resave (`sect_pr_compaction_delta`). */
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         PrebuiltFixture {
@@ -2504,7 +2634,9 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         "second ordered item".into(),
                     ],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         PrebuiltFixture {
@@ -2515,17 +2647,23 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 phase_introduced: 5,
                 /* Two surrounding paragraphs; the table sits between them.
                 Phase 5 PR 2 now fully parses rows + cells; the source
-                bytes still ride the passthrough writer so drift = 0. */
+                bytes still ride the passthrough writer, so the only drift
+                on a no-op resave is the pinned A4 pgSz (issue #109)
+                compacting back to the bare sectPr footer. */
                 asserts: FixtureAsserts {
                     paragraph_count: 2,
                     paragraph_texts: vec!["before".into(), "after".into()],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         /* Phase 5 PR 2 — full row/cell/tcPr feature coverage. Every
-        fixture round-trips via Phase 3 passthrough (drift = 0): the
-        captured `<w:tbl>` source bytes are emitted verbatim. */
+        fixture round-trips via Phase 3 passthrough: the captured
+        `<w:tbl>` source bytes are emitted verbatim, so a no-op resave's
+        only drift is the pinned A4 pgSz (issue #109) compacting back to
+        the bare trailing sectPr footer. */
         PrebuiltFixture {
             name: "table_grid_span.docx",
             bytes: build_table_grid_span_docx(),
@@ -2536,7 +2674,9 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 1,
                     paragraph_texts: vec!["intro".into()],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         PrebuiltFixture {
@@ -2549,7 +2689,9 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 1,
                     paragraph_texts: vec!["intro".into()],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         PrebuiltFixture {
@@ -2562,7 +2704,9 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 1,
                     paragraph_texts: vec!["intro".into()],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         PrebuiltFixture {
@@ -2575,7 +2719,9 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 1,
                     paragraph_texts: vec!["intro".into()],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         PrebuiltFixture {
@@ -2588,7 +2734,9 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 1,
                     paragraph_texts: vec!["مقدمة".into()],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         /* Issue #84 — exotic (unmodeled) rPr / pPr / tblPr / trPr / tcPr
@@ -2611,9 +2759,11 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         way docx4j and Apache POI write it (`toc.docx`, `55733.docx`, …).
         quick-xml strips the BOM without counting it in
         `buffer_position()`, which used to shift every passthrough capture
-        three bytes early and resave `</w<w:sectPr/>`. Drift bound 3: the
-        writer synthesizes its own declaration and never re-emits the BOM;
-        every paragraph must otherwise splice byte-exact. */
+        three bytes early and resave `</w<w:sectPr/>`. Base drift bound 3:
+        the writer synthesizes its own declaration and never re-emits the
+        BOM; every paragraph must otherwise splice byte-exact. Issue #109
+        adds `sect_pr_compaction_delta()` on top — the pinned A4 pgSz
+        compacts back to the bare sectPr footer on the same resave. */
         PrebuiltFixture {
             name: "bom_utf8_passthrough.docx",
             bytes: build_bom_utf8_passthrough_docx(),
@@ -2625,7 +2775,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_texts: vec!["first".into(), "second".into()],
                 },
                 roundtrip: RoundtripBounds {
-                    document_xml_drift_bytes: 3,
+                    document_xml_drift_bytes: 3 + sect_pr_compaction_delta(),
                 },
             },
         },
@@ -2634,8 +2784,12 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         under a second and the outer table rides the passthrough at drift 0
         whatever depth the typed model stops at. */
         /* Issue #100 — Word-shaped `w14:paraId` on every paragraph, bound
-        only on the root. Passthrough at drift 0; step 12 saves it through
-        the UI path. */
+        only on the root. Passthrough writer, but step 12 compares two
+        FRESH saves of the same edited tree (the UI path vs the archive
+        path) rather than the pinned source, so pinning A4 pgSz (issue
+        #109) here only adds the usual `sect_pr_compaction_delta()` —
+        both save paths compact it identically, so `doc_ui == doc_archive`
+        still holds. */
         PrebuiltFixture {
             name: "w14_paraid_word.docx",
             bytes: build_w14_paraid_docx(),
@@ -2650,12 +2804,20 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                         "after".into(),
                     ],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
         /* Issue #81 — Word's multi-paragraph TOC shape (hyperlinked
         entries, nested PAGEREFs, dot leaders, `_Toc*` bookmarks).
-        Passthrough at drift 0; step 15 edits + regenerates it. */
+        Passthrough at drift 0; step 15 edits + regenerates it. Issue
+        #109's pgSz pin is deliberately NOT applied here — same reasoning
+        as `grab_bag_exotic.docx` et al above: step 15a's untouched-save
+        check (`run_toc_roundtrip`) is `extract_doc_xml(&bytes)? !=
+        extract_doc_xml(&fixture)?`, an exact comparison against the
+        pinned source with no edit to account for the writer's
+        trailing-sectPr compaction. */
         PrebuiltFixture {
             name: "toc_word_shape.docx",
             bytes: build_toc_word_shape_docx(),
@@ -2676,7 +2838,14 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
             },
         },
         /* Issue #101 — mixed run formatting + a picture inside table
-        cells. Passthrough at drift 0; step 13 edits both cells. */
+        cells. Passthrough at drift 0; step 13 edits both cells and
+        requires the regenerated document.xml equal SOURCE + edits
+        exactly (`run_table_cell_runs_survival`'s `expected =
+        doc_a.replacen(...)`). Issue #109's pgSz pin is deliberately
+        NOT applied here — same reasoning as `grab_bag_exotic.docx` /
+        `floating_image_anchor.docx` / `footnotes_endnotes.docx` above:
+        the writer's trailing-sectPr compaction would desync that exact
+        comparison, and fixing it is out of this change's scope. */
         PrebuiltFixture {
             name: "table_cell_runs.docx",
             bytes: build_table_cell_runs_docx(),
@@ -2719,7 +2888,9 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                     paragraph_count: 1,
                     paragraph_texts: vec!["intro".into()],
                 },
-                roundtrip: RoundtripBounds::default(),
+                roundtrip: RoundtripBounds {
+                    document_xml_drift_bytes: sect_pr_compaction_delta(),
+                },
             },
         },
     ]
@@ -2740,7 +2911,7 @@ fn build_style_cascade_docx() -> Vec<u8> {
 <w:style w:type="paragraph" w:styleId="ChildStyle"><w:name w:val="Child"/><w:basedOn w:val="BaseStyle"/><w:rPr><w:i/></w:rPr></w:style>
 </w:styles>"#;
     let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="ChildStyle"/></w:pPr><w:r><w:t xml:space="preserve">hello cascade</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="ChildStyle"/></w:pPr><w:r><w:t xml:space="preserve">hello cascade</w:t></w:r></w:p>"#.to_owned() + A4_SECT_PR_EXPLICIT + "</w:body></w:document>";
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -2768,7 +2939,7 @@ fn build_style_cascade_docx() -> Vec<u8> {
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
             ("word/styles.xml", styles_xml),
-            ("word/document.xml", document_xml),
+            ("word/document.xml", document_xml.as_str()),
         ] {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
@@ -2805,7 +2976,7 @@ fn build_list_bullet_numbered_docx() -> Vec<u8> {
 <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
 </w:numbering>"#;
     let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">bullet alpha</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">bullet beta</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">first ordered item</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">first nested item</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">second ordered item</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">bullet alpha</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">bullet beta</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">first ordered item</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">first nested item</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t xml:space="preserve">second ordered item</w:t></w:r></w:p>"#.to_owned() + A4_SECT_PR_EXPLICIT + "</w:body></w:document>";
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -2833,7 +3004,7 @@ fn build_list_bullet_numbered_docx() -> Vec<u8> {
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
             ("word/numbering.xml", numbering_xml),
-            ("word/document.xml", document_xml),
+            ("word/document.xml", document_xml.as_str()),
         ] {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
@@ -2852,7 +3023,7 @@ fn build_table_2x2_opaque_docx() -> Vec<u8> {
     use zip::write::{SimpleFileOptions, ZipWriter};
 
     let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">before</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">B1</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">A2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">B2</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">before</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">B1</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">A2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">B2</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t xml:space="preserve">after</w:t></w:r></w:p>"#.to_owned() + A4_SECT_PR_EXPLICIT + "</w:body></w:document>";
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -2877,7 +3048,7 @@ fn build_table_2x2_opaque_docx() -> Vec<u8> {
             ("[Content_Types].xml", content_types),
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
-            ("word/document.xml", document_xml),
+            ("word/document.xml", document_xml.as_str()),
         ] {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
@@ -2890,12 +3061,14 @@ fn build_table_2x2_opaque_docx() -> Vec<u8> {
 /// Build a minimal Phase 5 PR 2 table fixture. `inner_tbl_xml` is the
 /// `<w:tbl>` element (without any wrapping) plus optional surrounding
 /// content. `body_intro_text` is the leading paragraph; the whole body
-/// becomes `<w:p>intro</w:p>` + inner_tbl_xml + `<w:sectPr/>`. Drift
-/// bound = 0 — every fixture rides the passthrough.
+/// becomes `<w:p>intro</w:p>` + inner_tbl_xml + the pinned A4
+/// `<w:sectPr>` (issue #109 — see `A4_SECT_PR_EXPLICIT`). The table rides
+/// the passthrough; a no-op resave's ONLY drift is the trailing sectPr
+/// compacting back to `<w:sectPr/>` (`sect_pr_compaction_delta`).
 fn build_table_fixture(body_intro_text: &str, inner_tbl_xml: &str) -> Vec<u8> {
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">{body_intro_text}</w:t></w:r></w:p>{inner_tbl_xml}<w:sectPr/></w:body></w:document>"#,
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">{body_intro_text}</w:t></w:r></w:p>{inner_tbl_xml}{A4_SECT_PR_EXPLICIT}</w:body></w:document>"#,
     );
     package_document_xml(&document_xml)
 }
@@ -2968,16 +3141,19 @@ fn build_table_in_rtl_doc_docx() -> Vec<u8> {
 /// paragraphs + a trailing body `<w:sectPr/>` cover both splice
 /// adjacencies the corruption showed up in.
 fn build_bom_utf8_passthrough_docx() -> Vec<u8> {
-    let document_xml = concat!(
-        "\u{FEFF}",
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-        "\n",
-        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
-        r#"<w:body><w:p><w:r><w:t xml:space="preserve">first</w:t></w:r></w:p>"#,
-        r#"<w:p><w:r><w:t xml:space="preserve">second</w:t></w:r></w:p>"#,
-        r#"<w:sectPr/></w:body></w:document>"#,
+    let document_xml = format!(
+        concat!(
+            "\u{FEFF}",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            "\n",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:p><w:r><w:t xml:space="preserve">first</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t xml:space="preserve">second</w:t></w:r></w:p>"#,
+            "{sect_pr}</w:body></w:document>",
+        ),
+        sect_pr = A4_SECT_PR_EXPLICIT,
     );
-    package_document_xml(document_xml)
+    package_document_xml(&document_xml)
 }
 
 /// Issue #111 — `depth` tables nested one inside the other (one row, one
