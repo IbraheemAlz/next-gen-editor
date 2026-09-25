@@ -12,6 +12,7 @@ export type {
     A11yRow,
     A11yRun,
     A11yTable,
+    A11yTextBox,
     A11yTree,
     Alignment,
     AttrsMixed,

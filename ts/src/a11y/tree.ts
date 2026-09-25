@@ -6,6 +6,12 @@
  * keystroke patches exactly one node, and the browser only re-derives a11y
  * for that node.
  *
+ * Issue #165: text-box stories are `TEXT_BOX` nodes — `role="group"` regions
+ * right after their anchor paragraph (nested boxes inside their parent's
+ * region), named from the box's `docPr`, holding the body's exact `<p dir>` /
+ * `<span>` structure. The region of the story being edited carries
+ * `aria-current="true"` (`setActiveStory`, fed by `editing_story.rid`).
+ *
  * Phase 5 PR 3b: nodes are now `A11yNode` (`Paragraph | Table`), not flat
  * paragraphs. Tables render as `<table role="table">` with `<tr role="row">`
  * and `<td role="gridcell" aria-rowspan aria-colspan>`. Continue-rows of a
@@ -84,10 +90,25 @@ function buildStory(node: Extract<A11yNode, { kind: 'STORY' }>): HTMLElement {
     return el;
 }
 
+/** Issue #165 — one text box story mirrored as a `role="group"` region,
+ *  named from the box's `docPr` name (description → `aria-description`).
+ *  `data-story-id` is the box address the engine also reports as
+ *  `editing_story.rid`, so the active region can be marked. */
+function buildTextBox(node: Extract<A11yNode, { kind: 'TEXT_BOX' }>): HTMLElement {
+    const el = document.createElement('div');
+    el.setAttribute('role', 'group');
+    el.setAttribute('aria-label', node.name ?? 'Text box');
+    if (node.description !== undefined) el.setAttribute('aria-description', node.description);
+    el.dataset.storyId = node.id;
+    for (const child of node.nodes) el.appendChild(buildNode(child));
+    return el;
+}
+
 /** Dispatch on `A11yNode.kind` — single entry point for builders + recursion. */
 function buildNode(node: A11yNode): HTMLElement {
     if (node.kind === 'TABLE') return buildTable(node);
     if (node.kind === 'STORY') return buildStory(node);
+    if (node.kind === 'TEXT_BOX') return buildTextBox(node);
     return buildParagraph(node);
 }
 
@@ -108,12 +129,34 @@ function stampPid(node: HTMLElement, index: number): HTMLElement {
 export interface A11yReconciler {
     /** Apply one delta's patches to the mirror, in order. */
     apply(patches: A11yPatch[]): void;
+    /** Issue #165 — mark the text-box region whose `data-story-id` is `id`
+     *  as the active story (`aria-current="true"`); `null` clears it.
+     *  Survives later patches (a rebuilt region is re-marked). */
+    setActiveStory(id: string | null): void;
 }
 
 /**
  * Create a reconciler bound to `root` — the `.a11y-mirror` container.
  */
 export function createA11yReconciler(root: HTMLElement): A11yReconciler {
+    let activeStory: string | null = null;
+
+    const markActive = (): void => {
+        for (const el of root.querySelectorAll<HTMLElement>('[aria-current]')) {
+            if (el.dataset.storyId !== activeStory) el.removeAttribute('aria-current');
+        }
+        if (activeStory === null) return;
+        for (const el of root.querySelectorAll<HTMLElement>('[data-story-id]')) {
+            if (el.dataset.storyId === activeStory) el.setAttribute('aria-current', 'true');
+        }
+    };
+
+    const setActiveStory = (id: string | null): void => {
+        if (id === activeStory) return;
+        activeStory = id;
+        markActive();
+    };
+
     const apply = (patches: A11yPatch[]): void => {
         let shifted = false;
         for (const patch of patches) {
@@ -145,7 +188,8 @@ export function createA11yReconciler(root: HTMLElement): A11yReconciler {
             }
         }
         if (shifted) reindex(root);
+        if (activeStory !== null) markActive();
     };
 
-    return { apply };
+    return { apply, setActiveStory };
 }

@@ -2108,6 +2108,209 @@ fn text_box_key(story: &engine::TextBoxStory, width_emu: i64, height_emu: i64) -
     h.finish()
 }
 
+/// Issue #165 — how deep text boxes lay out: a box in the body (level 1)
+/// and one box nested in its story (level 2). Mirrors the `.docx`
+/// reader's `MAX_TEXT_BOX_NESTING`, so every box the reader models
+/// paints; a deeper box (only a hand-built tree can carry one — the
+/// reader and `InsertTextBox` both refuse to nest further) keeps its
+/// place in the parent story but is not resolved.
+const MAX_TEXT_BOX_LAYOUT_DEPTH: u32 = 2;
+
+/// Issue #165 — the per-page inputs a text-box story layout shares down
+/// the nesting recursion.
+struct TextBoxLayoutCtx<'a> {
+    fonts: &'a FontStack,
+    cfg: &'a RenderConfig,
+    scale: f32,
+    sctx: StyleContext<'a>,
+    page_number: u32,
+}
+
+/// `true` when `blocks` (table cells included) carry a text box — the
+/// cheap model-side gate that keeps a box without nested boxes on the
+/// exact pre-#165 single pass.
+fn story_has_text_box(blocks: &[engine::Block]) -> bool {
+    blocks.iter().any(|b| match b {
+        engine::Block::Paragraph(p) => p
+            .inline_objects
+            .iter()
+            .any(|io| matches!(io.kind, engine::InlineKind::TextBox { .. })),
+        engine::Block::Table(t) => t
+            .rows
+            .iter()
+            .any(|r| r.cells.iter().any(|c| story_has_text_box(&c.blocks))),
+    })
+}
+
+/// Issue #83 / #165 — lay the story of the text-box float `f` into its
+/// [`layout::TextBoxFrame`] at `depth` (1 = a page float).
+///
+/// The story's blocks stack at the content-rect width through the
+/// cached paragraph / table pipeline. When the story carries a nested
+/// box (and `depth` is under [`MAX_TEXT_BOX_LAYOUT_DEPTH`]) the content
+/// rect becomes a margin-less pseudo page (`layout::story_frame_page`):
+/// `resolve_page_floats` places the nested box against the parent (a
+/// nested box IS a float of its parent's story), and the body's own
+/// `WrapConvergence` loop — bounded by its pass cap, forward-move cap
+/// and churn watchdog — re-lays the story around it; its notes land in
+/// `notes`. Each nested box then recurses. Finally the vertical anchor
+/// shifts the story AND its nested boxes together (`Center` / `Bottom`
+/// split the spare height; an overflowing story stays top-anchored and
+/// clips at paint).
+fn lay_text_box_frame(
+    f: &mut layout::FloatBox,
+    ctx: &TextBoxLayoutCtx<'_>,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    comp: Option<&CompositionState>,
+    depth: u32,
+    notes: &mut Vec<layout::LayoutDegradation>,
+) {
+    let (width, height) = (f.size.width, f.size.height);
+    let Some(tb) = f.text_box.as_deref_mut() else {
+        return;
+    };
+    let [l, t, r, b] = tb.source.insets;
+    let inner_w = (width - l - r).max(1.0);
+    let inner_h = (height - t - b).max(0.0);
+    let story = Arc::clone(&tb.source.story);
+    let lay = |plan: &layout::WrapPlan, cache: &mut LruCache<u64, ParagraphBox>| {
+        layout_story_blocks_cut(
+            &story.body,
+            inner_w,
+            ctx.fonts,
+            ctx.cfg,
+            ctx.scale,
+            ctx.sctx,
+            cache,
+            comp,
+            plan,
+        )
+    };
+    let mut plan = layout::WrapPlan::new();
+    let mut blocks = lay(&plan, cache);
+    let mut nested: Vec<layout::FloatBox> = Vec::new();
+    if depth < MAX_TEXT_BOX_LAYOUT_DEPTH && story_has_text_box(&story.body) {
+        let size = layout::Size {
+            width: inner_w,
+            height: inner_h,
+        };
+        /* The pseudo page keys its wrap plan by top-level block index;
+        the story's own `source_paragraph_id`s are put back after. */
+        let saved: Vec<Option<u32>> = blocks
+            .iter()
+            .map(|bk| bk.as_paragraph().map(|p| p.source_paragraph_id))
+            .collect();
+        let build = |mut blocks: Vec<LayoutBlock>| {
+            for (i, bk) in blocks.iter_mut().enumerate() {
+                if let LayoutBlock::Paragraph(p) = bk {
+                    p.source_paragraph_id = i as u32;
+                }
+            }
+            let mut page = layout::story_frame_page(blocks, size, ctx.page_number);
+            let mut floats = layout::resolve_page_floats(&page, layout::ColumnLayout::default());
+            /* Only nested TEXT BOXES are in scope: a floating picture in
+            a story is neither painted nor wrapped (pre-#165 behaviour). */
+            floats.retain(|nf| nf.text_box.is_some());
+            page.floats = floats;
+            page
+        };
+        let mut page = build(blocks);
+        if page
+            .floats
+            .iter()
+            .any(|nf| nf.wrap.cuts_text() && !nf.hidden)
+        {
+            let mut conv = layout::WrapConvergence::new(ctx.cfg.line_height * ctx.scale);
+            loop {
+                match conv.observe(std::slice::from_ref(&page), &plan) {
+                    layout::WrapVerdict::Converged | layout::WrapVerdict::Capped => break,
+                    layout::WrapVerdict::Continue(next) => {
+                        plan = next;
+                        page = build(lay(&plan, cache));
+                    }
+                }
+            }
+            notes.extend(conv.take_notes());
+        }
+        blocks = page.blocks;
+        nested = page.floats;
+        for (bk, id) in blocks.iter_mut().zip(saved) {
+            if let (LayoutBlock::Paragraph(p), Some(id)) = (bk, id) {
+                p.source_paragraph_id = id;
+            }
+        }
+        for nf in nested.iter_mut() {
+            lay_text_box_frame(nf, ctx, cache, None, depth + 1, notes);
+        }
+    }
+    let used = blocks
+        .iter()
+        .map(|bk| bk.origin().y + bk.size().height)
+        .fold(0.0_f32, f32::max);
+    let spare = (inner_h - used).max(0.0);
+    let shift = match tb.source.v_align {
+        engine::TextBoxVAlign::Top => 0.0,
+        engine::TextBoxVAlign::Center => spare / 2.0,
+        engine::TextBoxVAlign::Bottom => spare,
+    };
+    if shift > 0.0 {
+        for bk in &mut blocks {
+            let mut o = bk.origin();
+            o.y += shift;
+            bk.set_origin(o);
+        }
+        for nf in &mut nested {
+            nf.origin.y += shift;
+            nf.frame_origin.y += shift;
+        }
+    }
+    tb.blocks = blocks;
+    tb.floats = nested;
+}
+
+/// Issue #83 / #165 — join one text box's story to the PDF `/ToUnicode`
+/// text table: append the story's paragraph texts to `texts` and stamp
+/// the frame's laid-out paragraphs (cells included) with their indices
+/// (`base` = the table's length before `texts`), in the same walk order;
+/// then every nested box, depth-first.
+fn stamp_text_box_texts(tb: &mut layout::TextBoxFrame, base: usize, texts: &mut Vec<String>) {
+    let mut next = (base + texts.len()) as u32;
+    let mut story_texts: Vec<&str> = Vec::new();
+    for b in &tb.source.story.body {
+        walk_block_texts(b, &mut story_texts);
+    }
+    texts.extend(story_texts.into_iter().map(str::to_string));
+    for lb in tb.blocks.iter_mut() {
+        match lb {
+            LayoutBlock::Paragraph(p) => {
+                p.source_paragraph_id = next;
+                next += 1;
+            }
+            LayoutBlock::Table(t) => {
+                for row in t.rows.iter_mut() {
+                    for cell in row.cells.iter_mut() {
+                        if matches!(cell.v_merge, engine::VMergeRole::Continue) {
+                            continue;
+                        }
+                        layout::boxes::for_each_paragraph_in_blocks_mut(
+                            &mut cell.content,
+                            &mut |p| {
+                                p.source_paragraph_id = next;
+                                next += 1;
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for f in tb.floats.iter_mut() {
+        if let Some(inner) = f.text_box.as_deref_mut() {
+            stamp_text_box_texts(inner, base, texts);
+        }
+    }
+}
+
 /// Issue #83 — lower a text box's shape into the layout glyph payload
 /// (insets / outline width in layout px at `scale`).
 fn text_box_glyph(
@@ -2750,6 +2953,36 @@ fn layout_note_blocks(
     cache: &mut LruCache<u64, ParagraphBox>,
     composition: Option<&CompositionState>,
 ) -> Vec<LayoutBlock> {
+    layout_story_blocks_cut(
+        blocks,
+        content_width,
+        fonts,
+        cfg,
+        scale,
+        sctx,
+        cache,
+        composition,
+        &layout::WrapPlan::new(),
+    )
+}
+
+/// [`layout_note_blocks`] cut by an issue #82 wrap `plan` keyed by the
+/// story's TOP-LEVEL block index (issue #165: a text-box story wrapping
+/// around the boxes nested in it). A paragraph with cutouts lays out
+/// uncached (the cache key knows nothing of cuts); an empty plan is the
+/// plain cached pipeline, byte for byte.
+#[allow(clippy::too_many_arguments)]
+fn layout_story_blocks_cut(
+    blocks: &[engine::Block],
+    content_width: f32,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    sctx: StyleContext,
+    cache: &mut LruCache<u64, ParagraphBox>,
+    composition: Option<&CompositionState>,
+    plan: &layout::WrapPlan,
+) -> Vec<LayoutBlock> {
     let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
     for (block_idx, block) in blocks.iter().enumerate() {
@@ -2766,8 +2999,12 @@ fn layout_note_blocks(
                         && (c.at.offset as usize) <= para.text.len()
                         && para.text.is_char_boundary(c.at.offset as usize)
                 });
-                let mut p = match comp {
-                    Some(c) => layout_note_paragraph_with_composition(
+                let cuts = plan
+                    .get(&(block_idx as u32))
+                    .map(Vec::as_slice)
+                    .filter(|c| !c.is_empty());
+                let mut p = match (comp, cuts) {
+                    (Some(c), _) => layout_note_paragraph_with_composition(
                         para,
                         c,
                         fonts,
@@ -2776,7 +3013,16 @@ fn layout_note_blocks(
                         content_width,
                         sctx,
                     ),
-                    None => {
+                    (None, Some(cuts)) => layout_paragraph_wrapped_uncached(
+                        para,
+                        fonts,
+                        cfg,
+                        scale,
+                        content_width,
+                        sctx,
+                        cuts,
+                    ),
+                    (None, None) => {
                         layout_paragraph_cached(para, fonts, cfg, scale, content_width, sctx, cache)
                     }
                 };
@@ -5478,21 +5724,129 @@ fn a11y_runs(para: &engine::Paragraph) -> Vec<A11yRun> {
     runs
 }
 
-/// Build the accessibility node for one top-level block.
-/// Paragraphs map to `A11yNode::Paragraph`; tables walk rows and cells,
+/// Issue #165 — where a block list sits, for the text-box region ids its
+/// paragraphs' boxes get: `id_prefix` scopes the list (`""` for the body,
+/// `"<parent box id>/"` inside a story, `"<rid>:"` inside a header /
+/// footer part), `path_prefix` is the list's own path (`"3.1x0."` for a
+/// cell of top-level table 3), `depth` the text-box nesting level of the
+/// list (0 = not inside a box).
+#[derive(Clone, Copy)]
+struct A11yScope<'a> {
+    id_prefix: &'a str,
+    path_prefix: &'a str,
+    depth: u32,
+}
+
+impl A11yScope<'static> {
+    const BODY: Self = Self {
+        id_prefix: "",
+        path_prefix: "",
+        depth: 0,
+    };
+}
+
+/// Issue #83 / #165 — the stable address string of a text box: its host
+/// paragraph path (`Block(i)` → `i`, `Cell { row, col }` → `RxC`, joined
+/// by `.`) `@` the anchor byte. `BridgeStoryRef.rid` and the a11y region
+/// id share it, so the shell can match the active story to its region.
+fn text_box_rid(host: &EngineBlockPath, at: u32) -> String {
+    let path = host
+        .steps
+        .iter()
+        .map(|st| match st {
+            EnginePathStep::Block(i) => i.to_string(),
+            EnginePathStep::Cell { row, col } => format!("{row}x{col}"),
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("{path}@{at}")
+}
+
+/// Build the accessibility nodes for a block list: one node per block
+/// (paragraphs → `A11yNode::Paragraph`; tables walk rows and cells,
 /// resolving `<w:gridSpan>` → `col_span` and counting consecutive
-/// `VMergeRole::Continue` rows below a `Restart` cell → `row_span`.
-fn build_a11y_block(block: &engine::Block, block_index: u32, direction: Direction) -> A11yNode {
-    match block {
-        engine::Block::Paragraph(p) => A11yNode::Paragraph(A11yParagraph {
+/// `VMergeRole::Continue` rows below a `Restart` cell → `row_span`).
+///
+/// Issue #165 — every paragraph is followed by one `A11yNode::TextBox`
+/// region per text box anchored in it (anchor order), whose `nodes` are
+/// the box story built by this same function — so a box's paragraphs
+/// have the body's exact shape, and a box nested in a box lands in its
+/// parent's region after ITS anchor paragraph. Recursion is bounded by
+/// [`MAX_TEXT_BOX_LAYOUT_DEPTH`] (the layout / reader nesting cap).
+fn build_a11y_nodes_of<'b>(
+    blocks: impl IntoIterator<Item = &'b engine::Block>,
+    direction: Direction,
+    scope: A11yScope<'_>,
+) -> Vec<A11yNode> {
+    let mut out = Vec::new();
+    for (i, b) in blocks.into_iter().enumerate() {
+        let path = format!("{}{i}", scope.path_prefix);
+        match b {
+            engine::Block::Paragraph(p) => {
+                push_a11y_paragraph(&mut out, p, direction, scope, &path);
+            }
+            engine::Block::Table(t) => out.push(A11yNode::Table(build_a11y_table(
+                t, i as u32, direction, scope, &path,
+            ))),
+        }
+    }
+    out
+}
+
+/// One paragraph node, then its text-box regions (issue #165). `path` is
+/// the paragraph's path string inside `scope`.
+fn push_a11y_paragraph(
+    out: &mut Vec<A11yNode>,
+    p: &engine::Paragraph,
+    direction: Direction,
+    scope: A11yScope<'_>,
+    path: &str,
+) {
+    out.push(A11yNode::Paragraph(A11yParagraph {
+        direction,
+        runs: a11y_runs(p),
+    }));
+    if scope.depth >= MAX_TEXT_BOX_LAYOUT_DEPTH {
+        return;
+    }
+    let mut boxes: Vec<&engine::InlineObject> = p
+        .inline_objects
+        .iter()
+        .filter(|io| matches!(io.kind, engine::InlineKind::TextBox { .. }))
+        .collect();
+    boxes.sort_by_key(|io| io.at);
+    for io in boxes {
+        let engine::InlineKind::TextBox { story, .. } = &io.kind else {
+            continue;
+        };
+        let (name, description) = io.text_box_label().unwrap_or((None, None));
+        let id = format!("{}{path}@{}", scope.id_prefix, io.at);
+        let inner_prefix = format!("{id}/");
+        let nodes = build_a11y_nodes_of(
+            &story.body,
             direction,
-            runs: a11y_runs(p),
-        }),
-        engine::Block::Table(t) => A11yNode::Table(build_a11y_table(t, block_index, direction)),
+            A11yScope {
+                id_prefix: &inner_prefix,
+                path_prefix: "",
+                depth: scope.depth + 1,
+            },
+        );
+        out.push(A11yNode::TextBox(bridge::A11yTextBox {
+            id,
+            name,
+            description,
+            nodes,
+        }));
     }
 }
 
-fn build_a11y_table(t: &engine::Table, block_index: u32, direction: Direction) -> A11yTable {
+fn build_a11y_table(
+    t: &engine::Table,
+    block_index: u32,
+    direction: Direction,
+    scope: A11yScope<'_>,
+    path: &str,
+) -> A11yTable {
     /* Pre-compute vMerge row spans: for every (r, c) that is a Restart,
     count the run of Continue rows directly below at the same column.
     Continue cells are skipped from the DOM — the Restart cell carries
@@ -5531,18 +5885,15 @@ fn build_a11y_table(t: &engine::Table, block_index: u32, direction: Direction) -
                 1
             };
             /* PR 3b: cell paragraphs become paragraphs; nested tables
-            stay flat (recursive descent is PR 4). */
-            let nodes: Vec<A11yNode> = cell
-                .blocks
-                .iter()
-                .filter_map(|b| match b {
-                    engine::Block::Paragraph(p) => Some(A11yNode::Paragraph(A11yParagraph {
-                        direction,
-                        runs: a11y_runs(p),
-                    })),
-                    engine::Block::Table(_) => None,
-                })
-                .collect();
+            stay flat (recursive descent is PR 4). Issue #165 — a cell
+            paragraph's text boxes follow it inside the cell. */
+            let mut nodes: Vec<A11yNode> = Vec::with_capacity(cell.blocks.len());
+            for (j, b) in cell.blocks.iter().enumerate() {
+                if let engine::Block::Paragraph(p) = b {
+                    let cell_path = format!("{path}.{r}x{c}.{j}");
+                    push_a11y_paragraph(&mut nodes, p, direction, scope, &cell_path);
+                }
+            }
             out_cells.push(A11yCell {
                 row: r as u32,
                 col: c as u32,
@@ -7065,7 +7416,7 @@ impl Engine {
             .extend(conv.take_notes().into_iter().map(bridge_degradation));
         /* Issue #83 — the boxes are final: lay every text box's story
         into its content rect. */
-        self.attach_text_box_frames(
+        let nested_notes = self.attach_text_box_frames(
             &mut built.0,
             &built.1,
             &built.2,
@@ -7073,6 +7424,10 @@ impl Engine {
             scale,
             with_composition,
         );
+        built
+            .3
+            .degradations
+            .extend(nested_notes.into_iter().map(bridge_degradation));
         Ok(built)
     }
 
@@ -7094,6 +7449,14 @@ impl Engine {
     /// clipped at paint). The ACTIVE text-box story previews the live IME
     /// composition. Floats are resolved already, so nothing here can
     /// move a box or re-trigger wrap — a single pass by construction.
+    ///
+    /// Issue #165 — a story that itself carries a text box lays out
+    /// against its CONTENT rect as a pseudo page ([`lay_text_box_frame`]):
+    /// the nested box resolves through `resolve_page_floats`, the story
+    /// wraps around it through the body's bounded `WrapConvergence`
+    /// loop, and the nested story is laid out recursively (bounded by
+    /// [`MAX_TEXT_BOX_LAYOUT_DEPTH`]). Returns the nested wrap loops'
+    /// degradation notes (empty on the nominal path).
     fn attach_text_box_frames(
         &self,
         pages: &mut [PageBox],
@@ -7102,69 +7465,61 @@ impl Engine {
         doc: &DocumentTree,
         scale: f32,
         with_composition: bool,
-    ) {
+    ) -> Vec<layout::LayoutDegradation> {
         let Some(cfg) = self.layout_cfg.clone() else {
-            return;
+            return Vec::new();
         };
         if !pages
             .iter()
             .any(|p| p.floats.iter().any(|f| f.text_box.is_some()))
         {
-            return;
+            return Vec::new();
         }
         let sctx = StyleContext::of(doc);
         let mut cache = self.layout_cache.borrow_mut();
         let active = self.active_text_box();
+        let mut notes: Vec<layout::LayoutDegradation> = Vec::new();
         for (pi, page) in pages.iter_mut().enumerate() {
             let page_paths = paths.get(pi).map(Vec::as_slice).unwrap_or(&[]);
+            let page_number = page.page_number;
             for f in page.floats.iter_mut() {
-                let host = float_host_path(page_paths, f);
-                let (fat, width) = (f.at, f.size.width);
-                let Some(tb) = f.text_box.as_deref_mut() else {
+                if f.text_box.is_none() {
                     continue;
-                };
-                let [l, t, r, b] = tb.source.insets;
-                let inner_w = (width - l - r).max(1.0);
-                let inner_h = (f.size.height - t - b).max(0.0);
+                }
+                let host = float_host_path(page_paths, f);
                 let comp = if with_composition
                     && active
                         .as_ref()
-                        .is_some_and(|(h, a)| Some(h) == host.as_ref() && *a == fat)
+                        .is_some_and(|(h, a)| Some(h) == host.as_ref() && *a == f.at)
                 {
                     self.composition.as_ref()
                 } else {
                     None
                 };
-                let mut blocks = layout_note_blocks(
-                    &tb.source.story.body,
-                    inner_w,
-                    fonts,
-                    &cfg,
-                    scale,
-                    sctx,
+                let mut frame_notes = Vec::new();
+                lay_text_box_frame(
+                    f,
+                    &TextBoxLayoutCtx {
+                        fonts,
+                        cfg: &cfg,
+                        scale,
+                        sctx,
+                        page_number,
+                    },
                     &mut cache,
                     comp,
+                    1,
+                    &mut frame_notes,
                 );
-                let used = blocks
-                    .iter()
-                    .map(|bk| bk.origin().y + bk.size().height)
-                    .fold(0.0_f32, f32::max);
-                let spare = (inner_h - used).max(0.0);
-                let shift = match tb.source.v_align {
-                    engine::TextBoxVAlign::Top => 0.0,
-                    engine::TextBoxVAlign::Center => spare / 2.0,
-                    engine::TextBoxVAlign::Bottom => spare,
-                };
-                if shift > 0.0 {
-                    for bk in &mut blocks {
-                        let mut o = bk.origin();
-                        o.y += shift;
-                        bk.set_origin(o);
-                    }
-                }
-                tb.blocks = blocks;
+                /* The nested wrap loop reports against its pseudo page;
+                re-home the notes onto the real one. */
+                notes.extend(frame_notes.into_iter().map(|mut n| {
+                    n.page = pi as u32;
+                    n
+                }));
             }
         }
+        notes
     }
 
     /// One layout pass of [`Self::build_pages_of`] against the wrap
@@ -8317,38 +8672,8 @@ impl Engine {
         let mut tb_texts: Vec<String> = Vec::new();
         for page in pages.iter_mut() {
             for f in page.floats.iter_mut() {
-                let Some(tb) = f.text_box.as_deref_mut() else {
-                    continue;
-                };
-                let mut next = (para_texts.len() + tb_texts.len()) as u32;
-                let mut texts: Vec<&str> = Vec::new();
-                for b in &tb.source.story.body {
-                    walk_block_texts(b, &mut texts);
-                }
-                tb_texts.extend(texts.into_iter().map(str::to_string));
-                for lb in tb.blocks.iter_mut() {
-                    match lb {
-                        LayoutBlock::Paragraph(p) => {
-                            p.source_paragraph_id = next;
-                            next += 1;
-                        }
-                        LayoutBlock::Table(t) => {
-                            for row in t.rows.iter_mut() {
-                                for cell in row.cells.iter_mut() {
-                                    if matches!(cell.v_merge, engine::VMergeRole::Continue) {
-                                        continue;
-                                    }
-                                    layout::boxes::for_each_paragraph_in_blocks_mut(
-                                        &mut cell.content,
-                                        &mut |p| {
-                                            p.source_paragraph_id = next;
-                                            next += 1;
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
+                if let Some(tb) = f.text_box.as_deref_mut() {
+                    stamp_text_box_texts(tb, para_texts.len(), &mut tb_texts);
                 }
             }
         }
@@ -8968,18 +9293,9 @@ impl Engine {
                 page,
                 section_block,
             } => {
-                let path = host
-                    .steps
-                    .iter()
-                    .map(|st| match st {
-                        EnginePathStep::Block(i) => i.to_string(),
-                        EnginePathStep::Cell { row, col } => format!("{row}x{col}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(".");
                 return Some(bridge::BridgeStoryRef {
                     area: bridge::HeaderFooterArea::TextBox,
-                    rid: format!("{path}@{at}"),
+                    rid: text_box_rid(host, *at),
                     page: *page,
                     role: bridge::BridgeHfRole::Default,
                     linked: false,
@@ -11402,6 +11718,7 @@ impl Engine {
         if !self.story_active() {
             self.stashed_body_selection = self.selection.clone();
         }
+        let (host_for_label, at_for_label) = (host.clone(), at);
         self.active_story = StoryTarget::TextBox {
             host,
             at,
@@ -11425,7 +11742,25 @@ impl Engine {
         });
         self.caret_affinity = CaretAffinity::default();
         self.pending_format = None;
-        self.announce(AnnouncementPriority::Polite, "Editing text box");
+        /* Issue #165 — the live announcement names the region the a11y
+        mirror gives the box (its `docPr` name), so a screen-reader user
+        hears which group the caret entered. */
+        let label = self
+            .undo
+            .current()
+            .paragraph_at_path(&host_for_label)
+            .and_then(|p| {
+                p.inline_objects
+                    .iter()
+                    .find(|io| io.at == at_for_label)
+                    .and_then(engine::InlineObject::text_box_label)
+                    .and_then(|(name, _)| name)
+            });
+        let message = match label {
+            Some(name) => format!("Editing text box: {name}"),
+            None => "Editing text box".to_string(),
+        };
+        self.announce(AnnouncementPriority::Polite, message);
     }
 
     /// `Command::InsertTextBox` (issue #83) — splice a floating text box
@@ -12661,25 +12996,24 @@ impl Engine {
             _ => Direction::Ltr,
         };
         let doc = self.undo.current();
-        let mut nodes: Vec<A11yNode> = doc
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(block_index, b)| build_a11y_block(b, block_index as u32, direction))
-            .collect();
+        let mut nodes = build_a11y_nodes_of(doc.blocks.iter(), direction, A11yScope::BODY);
         /* Issue #73 — mirror every REFERENCED header/footer part so
         screen readers can reach band text (deduped by rid, stable
         body → headers → footers order; the delta differ handles the
         rest). */
         doc.for_each_referenced_story(&mut |is_header, rid, blocks| {
+            let id_prefix = format!("{rid}:");
             nodes.push(A11yNode::Story(bridge::A11yStory {
                 header: is_header,
                 rid: rid.to_string(),
-                nodes: blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| build_a11y_block(b, i as u32, direction))
-                    .collect(),
+                nodes: build_a11y_nodes_of(
+                    blocks,
+                    direction,
+                    A11yScope {
+                        id_prefix: &id_prefix,
+                        ..A11yScope::BODY
+                    },
+                ),
             }));
         });
         nodes
@@ -18010,6 +18344,296 @@ mod tests {
         let spare = inner.height - b.size().height;
         assert!(spare > 1.0);
         assert!((b.origin().y - spare / 2.0).abs() < 0.01);
+    }
+
+    /* ------------------ Issue #165 — nested text boxes + a11y ------------------ */
+
+    fn plain_para(text: &str) -> engine::Block {
+        engine::Block::Paragraph(engine::Paragraph {
+            text: text.to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Give the text box anchored at `(host, at)` a `<wp:docPr>`.
+    fn name_text_box(doc: &mut DocumentTree, host: usize, doc_pr: &str) {
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(host)
+            && let Some(a) = p.inline_objects[0].anchor.as_mut()
+        {
+            a.doc_pr_xml = Some(doc_pr.to_string());
+        }
+    }
+
+    /// A body paragraph hosting a 3" × 2" floating box ("Sidebar") whose
+    /// story hosts a 0.75" × 0.5" floating box ("Inner", square wrap) at
+    /// the head of a long outer-story paragraph — the two-level nesting
+    /// the `.docx` reader models.
+    fn nested_text_box_doc() -> DocumentTree {
+        let outer_text = "Outer story text wraps beside the nested box. ".repeat(2);
+        let mut story = DocumentTree::from_blocks(vec![plain_para(&outer_text)]);
+        let (s2, h, a) = story.insert_text_box_at(
+            EnginePos {
+                path: EngineBlockPath::top(0),
+                offset: 0,
+            },
+            1_371_600,
+            548_640,
+        );
+        story = s2.with_updated_text_box(&h, a, vec![plain_para("Inner story")]);
+        name_text_box(&mut story, 0, r#"<wp:docPr id="7" name="Inner"/>"#);
+        let outer_body: Vec<engine::Block> = story.blocks.iter().cloned().collect();
+
+        let prose = "Body text wraps around the sidebar box and keeps going. ".repeat(6);
+        let doc = DocumentTree::from_blocks(vec![plain_para(&prose), plain_para("Tail")]);
+        let (doc, h0, a0) = doc.insert_text_box_at(
+            EnginePos {
+                path: EngineBlockPath::top(0),
+                offset: 0,
+            },
+            2_743_200,
+            2_743_200,
+        );
+        let mut doc = doc.with_updated_text_box(&h0, a0, outer_body);
+        name_text_box(
+            &mut doc,
+            0,
+            r#"<wp:docPr id="5" name="Sidebar" descr="Pull quote &amp; notes"/>"#,
+        );
+        doc
+    }
+
+    /// The nested box resolves as a float of its parent's story: laid
+    /// out inside the parent's content rect with its own story, the
+    /// parent story wraps around it, the scene paints (and clips) both
+    /// boxes, the PDF exporter walks both stories. Geometry pinned.
+    #[test]
+    fn nested_text_boxes_lay_out_wrap_and_paint() {
+        let engine = test_engine_with_doc(nested_text_box_doc());
+        let (pages, fonts, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let outer = pages[0]
+            .floats
+            .iter()
+            .find(|f| f.text_box.is_some())
+            .expect("outer box");
+        let otb = outer.text_box.as_deref().expect("outer frame");
+        assert_eq!(otb.floats.len(), 1, "one nested box resolved");
+        let inner = &otb.floats[0];
+        let itb = inner.text_box.as_deref().expect("nested frame");
+        assert!(itb.floats.is_empty());
+        let ip = itb.blocks[0]
+            .as_paragraph()
+            .expect("nested story paragraph");
+        assert!(!ip.lines.is_empty() && !ip.lines[0].runs.is_empty());
+        /* Inside the parent's content rect (content-relative origin). */
+        let (_, inner_rect) = outer.text_box_content_rect().expect("content rect");
+        assert!(inner.origin.x >= -0.01 && inner.origin.y >= -0.01);
+        assert!(inner.origin.x + inner.size.width <= inner_rect.width + 0.5);
+        /* Square wrap: the outer story's lines beside the nested box
+        start right of it. */
+        let op = otb.blocks[0].as_paragraph().expect("outer story paragraph");
+        assert!(
+            op.lines
+                .iter()
+                .any(|l| l.segments.first().is_some_and(|s| s.x0 >= inner.size.width)),
+            "some outer-story band starts right of the nested box"
+        );
+        /* Scene: both boxes clip + stroke; the nested story paints. */
+        let scene = render::scene::build_document_scene(&pages, 0.0);
+        let clips = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::PushClip { .. }))
+            .count();
+        assert_eq!(clips, 2, "outer + nested clip");
+        let strokes = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::StrokeRect { .. }))
+            .count();
+        assert!(strokes >= 2);
+        let runs_in = |blocks: &[LayoutBlock]| -> usize {
+            blocks
+                .iter()
+                .filter_map(LayoutBlock::as_paragraph)
+                .map(|p| p.lines.iter().map(|l| l.runs.len()).sum::<usize>())
+                .sum()
+        };
+        let painted_runs = scene
+            .cmds
+            .iter()
+            .filter(|c| matches!(c, render::scene::DisplayCmd::DrawGlyphRun(_)))
+            .count();
+        /* The fixture's stories fit their boxes (nothing is culled). */
+        let bottom = |blocks: &[LayoutBlock]| {
+            blocks
+                .iter()
+                .map(|b| b.origin().y + b.size().height)
+                .fold(0.0_f32, f32::max)
+        };
+        assert!(bottom(&otb.blocks) <= inner_rect.height);
+        let (_, nested_rect) = inner.text_box_content_rect().expect("nested rect");
+        assert!(bottom(&itb.blocks) <= nested_rect.height + 0.5);
+        assert!(
+            painted_runs >= runs_in(&pages[0].blocks) + runs_in(&otb.blocks) + runs_in(&itb.blocks),
+            "body, outer and nested story runs all paint"
+        );
+        let mut pdf = Vec::new();
+        format_pdf::export_pdf(&pages, &fonts, &[], format_pdf::PdfProfile::Plain, &mut pdf)
+            .expect("pdf");
+        assert!(pdf.starts_with(b"%PDF"));
+        let Event::PdfExported { bytes, .. } = engine.do_export_pdf(PdfConformance::A2u) else {
+            panic!("engine pdf export");
+        };
+        assert!(bytes.starts_with(b"%PDF"));
+        /* Pinned: a change here moves the nested-box geometry. */
+        let fp = layout::geometry_fingerprint(&pages);
+        if std::env::var_os("NGE_PRINT_WRAP_FINGERPRINTS").is_some() {
+            eprintln!("ENGINE NESTED TEXT BOX FINGERPRINT = {fp:#x}");
+        }
+        assert_eq!(fp, PINNED_NESTED_TEXT_BOXES);
+    }
+
+    const PINNED_NESTED_TEXT_BOXES: u64 = 0x0effc1fd111fcc44;
+
+    /// A box nested past the layout cap (only a hand-built tree can carry
+    /// one) keeps its place in its parent story but is not resolved —
+    /// the recursion is bounded and nothing degrades.
+    #[test]
+    fn text_box_nesting_past_the_cap_is_not_laid_out() {
+        let mut doc = nested_text_box_doc();
+        /* Nest a third level inside "Inner". */
+        if let Some(engine::Block::Paragraph(p)) = doc.blocks.get_mut(0)
+            && let engine::InlineKind::TextBox { story, .. } = &mut p.inline_objects[0].kind
+            && let Some(engine::Block::Paragraph(sp)) = story.body.get_mut(0)
+            && let engine::InlineKind::TextBox { story: inner, .. } = &mut sp.inline_objects[0].kind
+        {
+            let third = DocumentTree::from_blocks(vec![plain_para("level two")]);
+            let (third, _, _) = third.insert_text_box_at(
+                EnginePos {
+                    path: EngineBlockPath::top(0),
+                    offset: 0,
+                },
+                300_000,
+                200_000,
+            );
+            inner.body = third.blocks.iter().cloned().collect();
+        } else {
+            panic!("fixture shape");
+        }
+        let engine = test_engine_with_doc(doc);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty());
+        let otb = pages[0].floats[0].text_box.as_deref().expect("outer");
+        let itb = otb.floats[0].text_box.as_deref().expect("nested");
+        assert!(itb.floats.is_empty(), "level three is past the cap");
+        assert!(!itb.blocks.is_empty(), "level two still lays out its story");
+    }
+
+    fn a11y_text(nodes: &[A11yNode]) -> Vec<String> {
+        nodes
+            .iter()
+            .map(|n| match n {
+                A11yNode::Paragraph(p) => p.runs.iter().map(|r| r.text.as_str()).collect(),
+                A11yNode::TextBox(b) => format!("[box {}]", b.id),
+                A11yNode::Table(_) => "[table]".to_string(),
+                A11yNode::Story(_) => "[story]".to_string(),
+            })
+            .collect()
+    }
+
+    /// The a11y tree mirrors every text box as a `TextBox` region right
+    /// after its anchor paragraph — named from `docPr`, holding the
+    /// body's exact paragraph shape — and a nested box inside its
+    /// parent's region after ITS anchor paragraph.
+    #[test]
+    fn a11y_tree_emits_text_box_regions_after_their_anchor_paragraphs() {
+        let engine = test_engine_with_doc(nested_text_box_doc());
+        let nodes = engine.build_a11y_nodes();
+        assert_eq!(nodes.len(), 3, "{:?}", a11y_text(&nodes));
+        assert!(matches!(nodes[0], A11yNode::Paragraph(_)));
+        assert!(matches!(nodes[2], A11yNode::Paragraph(_)));
+        let A11yNode::TextBox(outer) = &nodes[1] else {
+            panic!("region after the anchor paragraph: {:?}", nodes[1]);
+        };
+        assert_eq!(outer.id, "0@0");
+        assert_eq!(outer.name.as_deref(), Some("Sidebar"));
+        assert_eq!(outer.description.as_deref(), Some("Pull quote & notes"));
+        assert_eq!(outer.nodes.len(), 2);
+        let A11yNode::Paragraph(op) = &outer.nodes[0] else {
+            panic!("outer story paragraph");
+        };
+        assert!(op.runs.iter().any(|r| r.text.contains("Outer story text")));
+        let A11yNode::TextBox(inner) = &outer.nodes[1] else {
+            panic!("nested region after its anchor paragraph");
+        };
+        assert_eq!(inner.id, "0@0/0@0");
+        assert_eq!(inner.name.as_deref(), Some("Inner"));
+        assert_eq!(inner.description, None);
+        assert_eq!(a11y_text(&inner.nodes), ["Inner story"]);
+
+        /* Two sibling boxes in the #83 fixture: one region per anchor
+        paragraph, ids matching the story rid scheme, RTL text intact. */
+        let engine = test_engine_with_doc(text_box_doc());
+        let nodes = engine.build_a11y_nodes();
+        let got = a11y_text(&nodes);
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(got[1], "[box 0@0]");
+        assert_eq!(got[3], "[box 1@0]");
+        let A11yNode::TextBox(rtl) = &nodes[3] else {
+            panic!("rtl region");
+        };
+        assert_eq!(a11y_text(&rtl.nodes), ["صندوق نص من اليمين"]);
+    }
+
+    /// Documents without text boxes keep their pre-#165 a11y shape: one
+    /// node per top-level block, cells unchanged.
+    #[test]
+    fn a11y_tree_without_text_boxes_is_unchanged() {
+        let engine = test_engine_with_doc(DocumentTree::from_blocks(vec![
+            plain_para("one"),
+            plain_para("two"),
+        ]));
+        let nodes = engine.build_a11y_nodes();
+        assert_eq!(a11y_text(&nodes), ["one", "two"]);
+    }
+
+    /// Typing inside a text box patches ONLY that box's region — one
+    /// `Update` at the region's index — never a full-tree `Replace`; the
+    /// enter announcement names the region.
+    #[test]
+    fn a11y_delta_for_a_text_box_edit_patches_only_its_region() {
+        let mut engine = test_engine_with_doc(nested_text_box_doc());
+        let first = engine.build_a11y_delta();
+        assert!(matches!(first.as_slice(), [A11yPatch::Replace { .. }]));
+        engine.pending_announcements.clear();
+        engine.enter_text_box_story(EngineBlockPath::top(0), 0, 0, 0);
+        assert!(
+            engine
+                .pending_announcements
+                .iter()
+                .any(|(_, m)| m == "Editing text box: Sidebar"),
+            "{:?}",
+            engine.pending_announcements
+        );
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        let typed = engine.do_insert_text_interactive(caret, "Hello ".to_string());
+        assert!(matches!(typed, Event::SelectionChanged { .. }), "{typed:?}");
+        let delta = engine.build_a11y_delta();
+        assert_eq!(delta.len(), 1, "{delta:?}");
+        let A11yPatch::Update {
+            index,
+            node: A11yNode::TextBox(region),
+        } = &delta[0]
+        else {
+            panic!("expected a region Update, got {delta:?}");
+        };
+        assert_eq!(*index, 1);
+        assert_eq!(region.id, "0@0");
+        let A11yNode::Paragraph(p) = &region.nodes[0] else {
+            panic!("story paragraph");
+        };
+        assert!(p.runs[0].text.starts_with("Hello "));
     }
 
     /// `Command::SetImageWrap` switches the mode (one undo step), the

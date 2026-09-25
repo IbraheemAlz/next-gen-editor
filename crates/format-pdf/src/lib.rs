@@ -264,7 +264,8 @@ pub fn export_pdf(
         /* Issue #83 — text-box stories embed their fonts too. */
         for f in &page.floats {
             if let Some(tb) = f.text_box.as_deref() {
-                for_each_paragraph(&tb.blocks, &mut collect);
+                /* Issue #165 — nested stories too. */
+                tb.for_each_story_blocks(&mut |blocks| for_each_paragraph(blocks, &mut collect));
             }
         }
     }
@@ -577,70 +578,107 @@ fn emit_text_boxes(
     behind: bool,
     font_objs: &[(String, FontObj)],
 ) {
-    let page_h = page.size.height;
-    let mut group: Vec<&layout::FloatBox> = page
-        .floats
+    emit_text_box_group(
+        content,
+        page.size.height,
+        &page.floats,
+        0.0,
+        0.0,
+        behind,
+        font_objs,
+    );
+}
+
+/// One z-order group of `floats` (text boxes only) whose origins are
+/// relative to `(base_x, base_y)` in layout space — the page for page
+/// floats, the parent's content rect for nested boxes (issue #165).
+fn emit_text_box_group(
+    content: &mut Content,
+    page_h: f32,
+    floats: &[layout::FloatBox],
+    base_x: f32,
+    base_y: f32,
+    behind: bool,
+    font_objs: &[(String, FontObj)],
+) {
+    let mut group: Vec<&layout::FloatBox> = floats
         .iter()
         .filter(|f| f.text_box.is_some() && f.behind_doc == behind && !f.hidden)
         .collect();
     group.sort_by_key(|f| f.z_order);
     for f in group {
-        let Some(tb) = f.text_box.as_deref() else {
-            continue;
-        };
-        if f.size.width <= 0.0 || f.size.height <= 0.0 {
-            continue;
+        emit_text_box(content, page_h, f, base_x, base_y, font_objs);
+    }
+}
+
+/// One text box: fill, the clipped story (with its nested boxes — the
+/// `behindDoc` group under the story text, the rest over it), outline.
+fn emit_text_box(
+    content: &mut Content,
+    page_h: f32,
+    f: &layout::FloatBox,
+    base_x: f32,
+    base_y: f32,
+    font_objs: &[(String, FontObj)],
+) {
+    let Some(tb) = f.text_box.as_deref() else {
+        return;
+    };
+    if f.size.width <= 0.0 || f.size.height <= 0.0 {
+        return;
+    }
+    let (x, w, h) = (base_x + f.origin.x, f.size.width, f.size.height);
+    let pdf_y = page_h - (base_y + f.origin.y + h);
+    if let Some([r, g, b, _]) = tb.source.fill {
+        content.save_state();
+        content.set_fill_rgb(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        );
+        content.rect(x, pdf_y, w, h);
+        content.fill_nonzero();
+        content.restore_state();
+    }
+    if let Some((origin, _)) = f.text_box_content_rect() {
+        let (cx, cy) = (base_x + origin.x, base_y + origin.y);
+        content.save_state();
+        content.rect(x, pdf_y, w, h);
+        content.clip_nonzero();
+        content.end_path();
+        emit_text_box_group(content, page_h, &tb.floats, cx, cy, true, font_objs);
+        for block in &tb.blocks {
+            emit_block_shading(content, page_h, cx, cy, block);
         }
-        let (x, w, h) = (f.origin.x, f.size.width, f.size.height);
-        let pdf_y = page_h - (f.origin.y + h);
-        if let Some([r, g, b, _]) = tb.source.fill {
-            content.save_state();
-            content.set_fill_rgb(
-                f32::from(r) / 255.0,
-                f32::from(g) / 255.0,
-                f32::from(b) / 255.0,
-            );
-            content.rect(x, pdf_y, w, h);
-            content.fill_nonzero();
-            content.restore_state();
-        }
-        if let Some((origin, _)) = f.text_box_content_rect() {
-            content.save_state();
-            content.rect(x, pdf_y, w, h);
-            content.clip_nonzero();
-            content.end_path();
-            for block in &tb.blocks {
-                emit_block_shading(content, page_h, origin.x, origin.y, block);
-            }
-            for block in &tb.blocks {
-                match block {
-                    LayoutBlock::Paragraph(p) => {
-                        emit_paragraph_text(content, page_h, origin.x, origin.y, p, font_objs);
-                    }
-                    LayoutBlock::Table(t) => {
-                        emit_table_text(content, page_h, origin.x, origin.y, t, font_objs);
-                    }
+        for block in &tb.blocks {
+            match block {
+                LayoutBlock::Paragraph(p) => {
+                    emit_paragraph_text(content, page_h, cx, cy, p, font_objs);
+                }
+                LayoutBlock::Table(t) => {
+                    emit_table_text(content, page_h, cx, cy, t, font_objs);
                 }
             }
-            for block in &tb.blocks {
-                emit_block_borders(content, page_h, origin.x, origin.y, block);
-            }
-            content.restore_state();
         }
-        if let Some(([r, g, b, _], lw)) = tb.source.outline
-            && lw > 0.0
-        {
-            content.save_state();
-            content.set_stroke_rgb(
-                f32::from(r) / 255.0,
-                f32::from(g) / 255.0,
-                f32::from(b) / 255.0,
-            );
-            content.set_line_width(lw);
-            content.rect(x, pdf_y, w, h);
-            content.stroke();
-            content.restore_state();
+        for block in &tb.blocks {
+            emit_block_borders(content, page_h, cx, cy, block);
         }
+        emit_text_box_group(content, page_h, &tb.floats, cx, cy, false, font_objs);
+        content.restore_state();
+    }
+    if let Some(([r, g, b, _], lw)) = tb.source.outline
+        && lw > 0.0
+    {
+        content.save_state();
+        content.set_stroke_rgb(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        );
+        content.set_line_width(lw);
+        content.rect(x, pdf_y, w, h);
+        content.stroke();
+        content.restore_state();
     }
 }
 
@@ -1335,7 +1373,8 @@ fn collect_to_unicode_pages(
         page.endnotes.for_each_paragraph(&mut collect);
         for f in &page.floats {
             if let Some(tb) = f.text_box.as_deref() {
-                for_each_paragraph(&tb.blocks, &mut collect);
+                /* Issue #165 — nested stories too. */
+                tb.for_each_story_blocks(&mut |blocks| for_each_paragraph(blocks, &mut collect));
             }
         }
     }

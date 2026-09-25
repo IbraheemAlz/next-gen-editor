@@ -661,13 +661,38 @@ pub struct A11yTree {
 }
 
 /// A top-level (or nested) accessibility node — a paragraph, a table,
-/// or (issue #73) a header/footer story container.
+/// (issue #73) a header/footer story container, or (issue #165) a text
+/// box story region.
 #[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum A11yNode {
     Paragraph(A11yParagraph),
     Table(A11yTable),
     Story(A11yStory),
+    TextBox(A11yTextBox),
+}
+
+/// Issue #165 — one text box story mirrored into the screen-reader DOM as
+/// a `role="group"` region, placed right AFTER the paragraph its anchor
+/// lives in (in the same node list: top level for a body paragraph, the
+/// cell's `nodes` for a cell paragraph, the parent box's `nodes` for a
+/// box nested in a box). `nodes` use the exact body paragraph / table
+/// shapes. A box is its own node, so an edit inside it patches only
+/// that region (`A11yPatch::Update`), never the whole tree.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+pub struct A11yTextBox {
+    /// Stable address of the box — the same `host path @ anchor byte`
+    /// string `BridgeStoryRef.rid` carries while the box's story is
+    /// being edited (`"0@5"`, `"2.1x0.0@3"`); a nested box appends its
+    /// story-relative address after a `/` (`"0@5/0@12"`). The shell
+    /// matches it against `editing_story.rid` to mark the active region.
+    pub id: String,
+    /// `<wp:docPr name>` — the region's accessible name, when present.
+    pub name: Option<String>,
+    /// `<wp:docPr descr>` (alt text) — the region's accessible
+    /// description, when present.
+    pub description: Option<String>,
+    pub nodes: Vec<A11yNode>,
 }
 
 /// Issue #73 — one REFERENCED header/footer part mirrored into the

@@ -24,7 +24,7 @@ pub use boxes::{
     TabLeaderKind, TableBox, TableCellBox, TableRowBox, TextAttrs, TextBoxFrame, TextBoxGlyph,
     VisualRun, WrapSide,
 };
-pub use floats::{ColumnLayout, resolve_page_floats};
+pub use floats::{ColumnLayout, resolve_page_floats, story_frame_page};
 pub use page::{A4Page, Margins};
 pub use paginate::{
     FOOTNOTE_SEPARATOR_HEIGHT_PT, HeaderBands, HeaderRole, NoteBody,

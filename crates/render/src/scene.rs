@@ -290,7 +290,7 @@ fn paint_floats(page: &PageBox, top: f32, behind: bool, cmds: &mut Vec<DisplayCm
         let x0 = f.origin.x as f64;
         let y0 = (top + f.origin.y) as f64;
         if f.text_box.is_some() {
-            paint_text_box(f, top, cmds);
+            paint_text_box(f, 0.0, top, cmds);
             continue;
         }
         cmds.push(DisplayCmd::DrawImage {
@@ -305,12 +305,22 @@ fn paint_floats(page: &PageBox, top: f32, behind: bool, cmds: &mut Vec<DisplayCm
 /// Canvas2D blits glyphs with `put_image_data`, which ignores the clip,
 /// so lines starting at or past the shape's bottom edge are also culled
 /// here (line-granular overflow clip, exact on Vello / PDF).
-fn paint_text_box(f: &layout::FloatBox, top: f32, cmds: &mut Vec<DisplayCmd>) {
+///
+/// `(base_x, base_y)` is the absolute origin `f.origin` is relative to:
+/// the page's top-left for a page float, the parent box's content rect
+/// for a nested one (issue #165). Nested boxes paint inside the
+/// parent's clip — `behindDoc` ones under the parent story's text, the
+/// rest over it, each group in `z_order` — recursing through the same
+/// function (depth bounded by the layout's nesting cap).
+fn paint_text_box(f: &layout::FloatBox, base_x: f32, base_y: f32, cmds: &mut Vec<DisplayCmd>) {
     let Some(tb) = f.text_box.as_deref() else {
         return;
     };
-    let x0 = f.origin.x as f64;
-    let y0 = (top + f.origin.y) as f64;
+    if f.size.width <= 0.0 || f.size.height <= 0.0 {
+        return;
+    }
+    let x0 = (base_x + f.origin.x) as f64;
+    let y0 = (base_y + f.origin.y) as f64;
     let rect = Rect::new(x0, y0, x0 + f.size.width as f64, y0 + f.size.height as f64);
     if let Some([r, g, b, a]) = tb.source.fill {
         cmds.push(DisplayCmd::FillRect {
@@ -319,18 +329,20 @@ fn paint_text_box(f: &layout::FloatBox, top: f32, cmds: &mut Vec<DisplayCmd>) {
         });
     }
     if let Some((origin, _)) = f.text_box_content_rect() {
-        let base_x = origin.x;
-        let base_y = top + origin.y;
+        let content_x = base_x + origin.x;
+        let content_y = base_y + origin.y;
         /* Content-relative y past which nothing is visible. */
         let limit = f.origin.y + f.size.height - origin.y;
         cmds.push(DisplayCmd::PushClip { rect });
+        paint_nested_text_boxes(tb, content_x, content_y, true, cmds);
         for block in &tb.blocks {
             match clip_block_lines(block, limit) {
-                Some(clipped) => paint_block(&clipped, base_x, base_y, cmds),
-                None if block.origin().y < limit => paint_block(block, base_x, base_y, cmds),
+                Some(clipped) => paint_block(&clipped, content_x, content_y, cmds),
+                None if block.origin().y < limit => paint_block(block, content_x, content_y, cmds),
                 None => {}
             }
         }
+        paint_nested_text_boxes(tb, content_x, content_y, false, cmds);
         cmds.push(DisplayCmd::PopClip);
     }
     if let Some(([r, g, b, a], w)) = tb.source.outline
@@ -341,6 +353,29 @@ fn paint_text_box(f: &layout::FloatBox, top: f32, cmds: &mut Vec<DisplayCmd>) {
             paint: Paint::solid(Color::from_rgba8(r, g, b, a)),
             width: w as f64,
         });
+    }
+}
+
+/// Issue #165 — one z-order group (`behind` = the `behindDoc` group) of
+/// the boxes nested in `tb`'s story, at the parent's content origin.
+fn paint_nested_text_boxes(
+    tb: &layout::TextBoxFrame,
+    content_x: f32,
+    content_y: f32,
+    behind: bool,
+    cmds: &mut Vec<DisplayCmd>,
+) {
+    if tb.floats.is_empty() {
+        return;
+    }
+    let mut group: Vec<&layout::FloatBox> = tb
+        .floats
+        .iter()
+        .filter(|f| f.text_box.is_some() && f.behind_doc == behind && !f.hidden)
+        .collect();
+    group.sort_by_key(|f| f.z_order);
+    for f in group {
+        paint_text_box(f, content_x, content_y, cmds);
     }
 }
 
