@@ -2396,6 +2396,7 @@ fn resolve_line_height(
 /// number the story's `NoteSelfRef` paints (`StyleContext::with_self_mark`);
 /// `do_export_pdf` stamps `source_paragraph_id`s later so the PDF
 /// `/ToUnicode` table covers note glyphs.
+#[allow(clippy::too_many_arguments)]
 fn layout_note_blocks(
     blocks: &[engine::Block],
     content_width: f32,
@@ -2404,23 +2405,51 @@ fn layout_note_blocks(
     scale: f32,
     sctx: StyleContext,
     cache: &mut LruCache<u64, ParagraphBox>,
+    composition: Option<&CompositionState>,
 ) -> Vec<LayoutBlock> {
     let mut out: Vec<LayoutBlock> = Vec::with_capacity(blocks.len());
     let mut y = 0.0_f32;
-    for block in blocks {
+    for (block_idx, block) in blocks.iter().enumerate() {
         let mut lb = match block {
             engine::Block::Paragraph(para) => {
-                let mut p =
-                    layout_paragraph_cached(para, fonts, cfg, scale, content_width, sctx, cache);
-                p.fields = para
-                    .fields
-                    .iter()
-                    .map(|f| layout::LayoutField {
-                        byte_range: f.start..f.end,
-                        instruction: f.instruction.clone(),
-                        evaluated_text: None,
-                    })
-                    .collect();
+                /* Issue #80 — inline IME preview inside the note being
+                edited. The composition's `at` path is STORY-rooted
+                (`Block(i)` = the note body's i-th block); the caller
+                only passes it for the ACTIVE note. */
+                let comp = composition.filter(|c| {
+                    bridge_to_engine_path(c.at.path.clone())
+                        == EngineBlockPath::top(block_idx as u32)
+                        && !c.text.is_empty()
+                        && (c.at.offset as usize) <= para.text.len()
+                        && para.text.is_char_boundary(c.at.offset as usize)
+                });
+                let mut p = match comp {
+                    Some(c) => layout_note_paragraph_with_composition(
+                        para,
+                        c,
+                        fonts,
+                        cfg,
+                        scale,
+                        content_width,
+                        sctx,
+                    ),
+                    None => {
+                        layout_paragraph_cached(para, fonts, cfg, scale, content_width, sctx, cache)
+                    }
+                };
+                /* Field ranges would be stale against the preview text. */
+                p.fields = if comp.is_some() {
+                    Vec::new()
+                } else {
+                    para.fields
+                        .iter()
+                        .map(|f| layout::LayoutField {
+                            byte_range: f.start..f.end,
+                            instruction: f.instruction.clone(),
+                            evaluated_text: None,
+                        })
+                        .collect()
+                };
                 p.borders = para.props.borders.clone();
                 p.shading = para.props.shading;
                 LayoutBlock::Paragraph(p)
@@ -2454,11 +2483,70 @@ fn layout_note_blocks(
     out
 }
 
+/// Issue #80 — lay out one note paragraph with the live IME composition
+/// spliced in at `c.at.offset` (uncached: the preview is transient).
+/// Unlike the body / band preview paths, the paragraph's inline objects
+/// ride along (shifted past the preview text) so the note's self-mark
+/// keeps painting while the user composes behind it.
+fn layout_note_paragraph_with_composition(
+    para: &engine::Paragraph,
+    c: &CompositionState,
+    fonts: &FontStack,
+    cfg: &RenderConfig,
+    scale: f32,
+    max_width: f32,
+    sctx: StyleContext,
+) -> ParagraphBox {
+    let off = c.at.offset as usize;
+    let ins = c.text.len() as u32;
+    let mut text = String::with_capacity(para.text.len() + c.text.len());
+    text.push_str(&para.text[..off]);
+    text.push_str(&c.text);
+    text.push_str(&para.text[off..]);
+    let spans = apply_revision_overlay(
+        apply_hyperlink_overlay(
+            composition_layout_spans(para, sctx, off as u32, ins, cfg.px_size, scale),
+            &para.hyperlinks,
+            [0, 0, 0, 255],
+        ),
+        &para.revisions,
+        [0, 0, 0, 255],
+    );
+    let mut infos = build_inline_object_infos(para, cfg, scale, sctx);
+    for info in &mut infos {
+        if info.at as usize >= off {
+            info.at += ins;
+        }
+    }
+    let base_direction = resolve_base_direction(para, cfg);
+    let (ind_s, ind_e, ind_fl, ind_h) = effective_layout_indents(para, base_direction, scale);
+    let (lh_px, lh_exact) = resolve_line_height(para.props.line_height, cfg.line_height, scale);
+    layout_paragraph(ParagraphConfig {
+        text: &text,
+        fonts,
+        spans: &spans,
+        base_direction,
+        max_width,
+        line_height: lh_px,
+        line_height_exact: lh_exact,
+        alignment: para.props.alignment.map_or(cfg.alignment, layout_align),
+        indent_start_px: ind_s,
+        indent_end_px: ind_e,
+        first_line_indent_px: ind_fl,
+        hanging_indent_px: ind_h,
+        marker_text: para.resolved_marker.clone(),
+        px_size_for_marker: cfg.px_size * scale,
+        inline_objects: &infos,
+        tab_stops_px: &tab_stops_to_layout_px(&para.props.tab_stops, scale),
+    })
+}
+
 /// Issue #80 — the per-paint note tables the paginator consumes: every
 /// REFERENCED note story laid out at `content_width` keyed by its anchor,
 /// plus the document's `continuationNotice` story (if any). Special
 /// separator stories are never laid out — the paginator draws its own
 /// rules.
+#[allow(clippy::too_many_arguments)]
 fn build_note_bodies(
     doc: &DocumentTree,
     content_width: f32,
@@ -2467,6 +2555,7 @@ fn build_note_bodies(
     scale: f32,
     sctx: StyleContext,
     cache: &mut LruCache<u64, ParagraphBox>,
+    active_comp: Option<(engine::NoteAnchor, &CompositionState)>,
 ) -> (
     HashMap<engine::NoteAnchor, layout::NoteBody>,
     Option<layout::NoteBody>,
@@ -2483,6 +2572,9 @@ fn build_note_bodies(
             continue;
         }
         let mark = sctx.note_marker_text(r.anchor);
+        let comp = active_comp
+            .filter(|(anchor, _)| *anchor == r.anchor)
+            .map(|(_, c)| c);
         let blocks = layout_note_blocks(
             &story.body,
             content_width,
@@ -2491,6 +2583,7 @@ fn build_note_bodies(
             scale,
             sctx.with_self_mark(&mark),
             cache,
+            comp,
         );
         bodies.insert(r.anchor, blocks);
     }
@@ -2514,6 +2607,7 @@ fn build_note_bodies(
                 scale,
                 sctx.with_self_mark(""),
                 cache,
+                None,
             )
         });
     (bodies, notice)
@@ -6502,8 +6596,23 @@ impl Engine {
                 s.geometry.content_width()
             })
             * scale;
-        let (note_bodies, continuation_notice) =
-            build_note_bodies(&doc, note_width, &font_stack, &cfg, scale, sctx, &mut cache);
+        /* The active note previews the live IME composition. */
+        let note_comp = match (&self.active_story, composition) {
+            (StoryTarget::Note { kind, id, .. }, Some(c)) => u32::try_from(*id)
+                .ok()
+                .map(|id| (engine::NoteAnchor { kind: *kind, id }, c)),
+            _ => None,
+        };
+        let (note_bodies, continuation_notice) = build_note_bodies(
+            &doc,
+            note_width,
+            &font_stack,
+            &cfg,
+            scale,
+            sctx,
+            &mut cache,
+            note_comp,
+        );
         let mut endnotes_placed: std::collections::HashSet<engine::NoteAnchor> =
             std::collections::HashSet::new();
         /* Each top-level block is covered by at most one effective section. The
@@ -6591,8 +6700,7 @@ impl Engine {
         let story_comp: Option<(&str, bool)> = match &self.active_story {
             StoryTarget::Header { rid, .. } => Some((rid.as_str(), true)),
             StoryTarget::Footer { rid, .. } => Some((rid.as_str(), false)),
-            /* Issue #80 — no inline IME preview inside a note body yet
-            (the commit path is story-aware; the preview is a follow-up). */
+            /* Issue #80 — a note previews through `build_note_bodies`. */
             StoryTarget::Body | StoryTarget::Note { .. } => None,
         };
         'outer: for (sect_idx, section) in sections.iter().enumerate() {
@@ -6823,7 +6931,12 @@ impl Engine {
                         processed_blocks += 1;
                     }
                     engine::Block::Paragraph(para) => {
-                        let comp = composition.and_then(|c| {
+                        /* A story's composition path is STORY-rooted —
+                        it must never splice into the body block that
+                        happens to share its index (issue #80 review). */
+                        let body_comp =
+                            composition.filter(|_| matches!(self.active_story, StoryTarget::Body));
+                        let comp = body_comp.and_then(|c| {
                             if bridge_to_engine_path(c.at.path.clone()) != para_path
                                 || c.text.is_empty()
                             {
@@ -15494,6 +15607,59 @@ mod tests {
             "a press in the body leaves the note"
         );
         assert!(matches!(engine.active_story, StoryTarget::Body));
+    }
+
+    /// Issue #80 — the IME preview renders inside the ACTIVE note (its
+    /// band entry widens by the composed text) and never leaks into the
+    /// body block that shares the story-rooted path index.
+    #[test]
+    fn ime_preview_renders_inside_the_active_note_only() {
+        fn ink_width(p: &ParagraphBox) -> f32 {
+            p.lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .flat_map(|r| r.glyphs.iter())
+                .map(|g| g.x_advance)
+                .sum()
+        }
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("Alpha body text"));
+        let evt = engine.do_insert_note(bpos_top(0, 5), engine::NoteKind::Footnote);
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let widths = |engine: &Engine| {
+            let (pages, ..) = engine
+                .build_pages(engine.scale(), true, None)
+                .expect("layout");
+            let page = &pages[0];
+            let note = match page
+                .footnotes
+                .entries
+                .first()
+                .expect("note entry")
+                .blocks
+                .first()
+            {
+                Some(LayoutBlock::Paragraph(p)) => ink_width(p),
+                other => panic!("{other:?}"),
+            };
+            let body = match page.blocks.first() {
+                Some(LayoutBlock::Paragraph(p)) => ink_width(p),
+                other => panic!("{other:?}"),
+            };
+            (note, body)
+        };
+        let (note0, body0) = widths(&engine);
+        let caret = engine.selection.as_ref().unwrap().caret.clone();
+        engine.do_begin_composition(caret);
+        engine.do_update_composition("wide preview".to_string(), None);
+        let (note1, body1) = widths(&engine);
+        assert!(
+            note1 > note0 + 1.0,
+            "the note band previews the composition ({note0} -> {note1})"
+        );
+        assert!(
+            (body1 - body0).abs() < 0.01,
+            "the body block sharing the story path is untouched ({body0} -> {body1})"
+        );
     }
 
     /// Issue #44 — `image_geometry()` surfaces one rect per inline image,
