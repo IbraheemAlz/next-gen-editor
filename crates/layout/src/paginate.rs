@@ -157,11 +157,19 @@ pub struct Paginator {
     /// compute section-relative page numbers without needing to know
     /// about the global page accumulator.
     doc_page_offset: u32,
-    /// Issue #43 — the render-time date `(year, month, day)` DATE
-    /// fields resolve against. `None` (tests, headless) keeps the
-    /// cached text. Injected by the shell at boot (`SetRenderDate`) —
-    /// the engine core never reads a wall clock.
-    render_date: Option<(i32, u32, u32)>,
+    /// Issue #43 / #77 — the field-evaluation environment (render
+    /// date + clock, document name, author) every non-page field kind
+    /// resolves against; the page context is filled per flush. All
+    /// inputs are shell-injected — the engine core never reads a wall
+    /// clock — and an absent input keeps the cached text.
+    field_env: engine::FieldEnv,
+    /// Issue #77 — Alt+F9 field-code view. While `true` no field is
+    /// evaluated (neither the per-page PAGE / DATE / … pass nor the
+    /// NUMPAGES finish pass): the paragraphs being laid out display
+    /// `{ INSTRUCTION }` codes, and stamping a live value into a code
+    /// span would corrupt the display. Geometry of field-free
+    /// documents is unaffected either way (see the fingerprint pin).
+    fields_frozen: bool,
     /// Issue #87 — churn watchdog + degradation notes for this flow.
     watchdog: Watchdog,
     /// Issue #87 — stage (c): hard cap on emitted pages.
@@ -198,7 +206,8 @@ impl Paginator {
             cur_footnote_height: 0.0,
             page_num: engine::PageNumType::default(),
             doc_page_offset: 0,
-            render_date: None,
+            field_env: engine::FieldEnv::default(),
+            fields_frozen: false,
             watchdog: Watchdog::default(),
             page_cap: DEFAULT_PAGE_CAP,
             capped: false,
@@ -250,7 +259,23 @@ impl Paginator {
 
     /// Issue #43 — install the render-time date for DATE fields.
     pub fn with_render_date(mut self, date: Option<(i32, u32, u32)>) -> Self {
-        self.render_date = date;
+        self.field_env.date = date;
+        self
+    }
+
+    /// Issue #77 — install the full field-evaluation environment
+    /// (date, clock, document name, author). The page context is
+    /// ignored — the paginator fills it per flush.
+    pub fn with_field_env(mut self, env: engine::FieldEnv) -> Self {
+        self.field_env = engine::FieldEnv { page: None, ..env };
+        self
+    }
+
+    /// Issue #77 — freeze every field at its cached (display) text:
+    /// the field-code view lays out `{ INSTRUCTION }` spans that must
+    /// never be overwritten by a live value.
+    pub fn with_fields_frozen(mut self, frozen: bool) -> Self {
+        self.fields_frozen = frozen;
         self
     }
 
@@ -1101,54 +1126,43 @@ impl Paginator {
         }
     }
 
-    /// Phase 2 audit (gap D.1) — stamp every PAGE field in the
-    /// paragraph's [`ParagraphBox::fields`] with the 1-based page
-    /// number it is about to flush on. NUMPAGES is deferred: its
-    /// value is `pages.len()` at end-of-document, which is unknown
+    /// Phase 2 audit (gap D.1) / issue #77 — stamp every field in the
+    /// paragraph's [`ParagraphBox::fields`] with its live value for
+    /// the page it is about to flush on: PAGE from the page context,
+    /// DATE / TIME / FILENAME / AUTHOR from `env` (`engine::Field::
+    /// evaluate_in` is the single evaluator). NUMPAGES is deferred:
+    /// its value is `pages.len()` at end-of-document, which is unknown
     /// here; [`Paginator::finish`] walks every emitted page and
-    /// patches them in a second pass.
+    /// patches them in a second pass. An unresolvable kind keeps
+    /// `evaluated_text: None` (the cached text stands).
     fn evaluate_fields_on_paragraph(
         para: &mut ParagraphBox,
         doc_page: u32,
         page_num: engine::PageNumType,
         section_start_doc_page: u32,
-        render_date: Option<(i32, u32, u32)>,
+        env: &engine::FieldEnv,
     ) {
+        /* Audit gap A.M11 — section-relative page numbering.
+        `start: Some(n)` rebases: the section's first page is `n`,
+        every subsequent page is `n + (doc_page -
+        section_start_doc_page)`. `start: None` keeps the doc-wide
+        count. Format renders the integer. */
+        let section_page = match page_num.start {
+            Some(n) => n + doc_page.saturating_sub(section_start_doc_page),
+            None => doc_page,
+        };
+        let page_env = env.with_page(Some(page_num.format.render(section_page)), None);
         for f in para.fields.iter_mut() {
-            /* Keyword extraction lives on `engine::Field` so the
-            layout box doesn't need to reimplement the trim + split
-            + uppercase walk. Re-build a synthetic Field just to
-            call `keyword` — cheap, since instructions are short. */
+            /* Keyword dispatch lives on `engine::Field`; re-build a
+            synthetic Field just to evaluate — cheap, instructions are
+            short. */
             let synthetic = engine::Field {
                 start: f.byte_range.start,
                 end: f.byte_range.end,
                 instruction: f.instruction.clone(),
             };
-            match synthetic.keyword().as_str() {
-                "PAGE" => {
-                    /* Audit gap A.M11 — section-relative page numbering.
-                    `start: Some(n)` rebases: the section's first page is
-                    `n`, every subsequent page is `n + (doc_page -
-                    section_start_doc_page)`. `start: None` keeps the
-                    doc-wide count. Format renders the integer. */
-                    let section_page = match page_num.start {
-                        Some(n) => n + doc_page.saturating_sub(section_start_doc_page),
-                        None => doc_page,
-                    };
-                    f.evaluated_text = Some(page_num.format.render(section_page));
-                }
-                /* Issue #43 — DATE resolves against the shell-injected
-                render date (Word updates DATE on open/print). No date
-                installed → cached text stands. */
-                "DATE" => {
-                    if let Some((y, m, d)) = render_date {
-                        let pic = synthetic
-                            .date_picture()
-                            .unwrap_or_else(|| "M/d/yyyy".to_string());
-                        f.evaluated_text = Some(engine::render_date_picture(&pic, y, m, d));
-                    }
-                }
-                _ => {}
+            if let Some(v) = synthetic.evaluate_in(&page_env) {
+                f.evaluated_text = Some(v);
             }
         }
     }
@@ -1228,40 +1242,43 @@ impl Paginator {
         let doc_page = self.doc_page_offset + (self.pages.len() as u32) + 1;
         let section_start_doc_page = self.doc_page_offset + 1;
         let page_num = self.page_num;
-        let render_date = self.render_date;
+        let env = self.field_env.clone();
         let mut blocks = blocks;
-        for block in blocks.iter_mut() {
-            Self::for_each_paragraph_in_block(block, &mut |p| {
-                Self::evaluate_fields_on_paragraph(
-                    p,
-                    doc_page,
-                    page_num,
-                    section_start_doc_page,
-                    render_date,
-                );
-            });
-        }
-        if let Some(hf) = header.as_mut() {
-            hf.for_each_paragraph_mut(&mut |p| {
-                Self::evaluate_fields_on_paragraph(
-                    p,
-                    doc_page,
-                    page_num,
-                    section_start_doc_page,
-                    render_date,
-                );
-            });
-        }
-        if let Some(hf) = footer.as_mut() {
-            hf.for_each_paragraph_mut(&mut |p| {
-                Self::evaluate_fields_on_paragraph(
-                    p,
-                    doc_page,
-                    page_num,
-                    section_start_doc_page,
-                    render_date,
-                );
-            });
+        /* Issue #77 — the field-code view freezes every field. */
+        if !self.fields_frozen {
+            for block in blocks.iter_mut() {
+                Self::for_each_paragraph_in_block(block, &mut |p| {
+                    Self::evaluate_fields_on_paragraph(
+                        p,
+                        doc_page,
+                        page_num,
+                        section_start_doc_page,
+                        &env,
+                    );
+                });
+            }
+            if let Some(hf) = header.as_mut() {
+                hf.for_each_paragraph_mut(&mut |p| {
+                    Self::evaluate_fields_on_paragraph(
+                        p,
+                        doc_page,
+                        page_num,
+                        section_start_doc_page,
+                        &env,
+                    );
+                });
+            }
+            if let Some(hf) = footer.as_mut() {
+                hf.for_each_paragraph_mut(&mut |p| {
+                    Self::evaluate_fields_on_paragraph(
+                        p,
+                        doc_page,
+                        page_num,
+                        section_start_doc_page,
+                        &env,
+                    );
+                });
+            }
         }
 
         /* Even an empty page is emitted on an explicit `force_page_break`
@@ -1343,17 +1360,23 @@ impl Paginator {
         page and stamp NUMPAGES on any field that hadn't already been
         evaluated as PAGE. */
         let total_pages = self.pages.len() as u32;
-        for page in self.pages.iter_mut() {
+        let total_env = engine::FieldEnv::default().with_page(None, Some(total_pages));
+        /* Issue #77 — frozen fields (field-code view) skip the pass. */
+        let pages_to_stamp: &mut [PageBox] = if self.fields_frozen {
+            &mut []
+        } else {
+            &mut self.pages
+        };
+        for page in pages_to_stamp.iter_mut() {
             let mut stamp = |para: &mut ParagraphBox| {
                 for f in para.fields.iter_mut() {
-                    let kw = engine::Field {
+                    let synthetic = engine::Field {
                         start: f.byte_range.start,
                         end: f.byte_range.end,
                         instruction: f.instruction.clone(),
-                    }
-                    .keyword();
-                    if kw == "NUMPAGES" {
-                        f.evaluated_text = Some(total_pages.to_string());
+                    };
+                    if synthetic.typed() == engine::TypedField::NumPages {
+                        f.evaluated_text = synthetic.evaluate_in(&total_env);
                     }
                 }
             };
@@ -2759,6 +2782,135 @@ mod tests {
             LayoutBlock::Table(_) => None,
         };
         assert_eq!(ev, None, "DATE is inert without an injected date");
+    }
+
+    /// Issue #77 — the full environment resolves every non-page kind
+    /// through the single evaluator; PAGE still comes from the flush.
+    #[test]
+    fn field_env_resolves_time_filename_and_author_alongside_page() {
+        let geom = a4_geometry();
+        let env = engine::FieldEnv {
+            page: None,
+            date: Some((2026, 9, 3)),
+            clock: Some((14, 7)),
+            document_name: Some("report.docx".into()),
+            author: Some("Ibrahim".into()),
+        };
+        let mut pag = Paginator::new(
+            geom,
+            HeaderBands::default(),
+            HeaderBands::default(),
+            false,
+            false,
+        )
+        .with_field_env(env);
+        for instr in [
+            "PAGE",
+            "TIME",
+            "FILENAME \\p",
+            "AUTHOR",
+            "DATE",
+            "TOC \\o \"1-3\"",
+        ] {
+            pag.push_block(
+                LayoutBlock::Paragraph(fake_paragraph_with_field(instr, 16.0)),
+                0.0,
+                0.0,
+            );
+        }
+        let pages = pag.finish();
+        let evals: Vec<Option<String>> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                LayoutBlock::Paragraph(p) => {
+                    Some(p.fields.first().and_then(|f| f.evaluated_text.clone()))
+                }
+                LayoutBlock::Table(_) => None,
+            })
+            .collect();
+        assert_eq!(evals[0].as_deref(), Some("1"));
+        assert_eq!(evals[1].as_deref(), Some("2:07 pm"));
+        assert_eq!(evals[2].as_deref(), Some("report.docx"));
+        assert_eq!(evals[3].as_deref(), Some("Ibrahim"));
+        assert_eq!(evals[4].as_deref(), Some("9/3/2026"));
+        assert_eq!(evals[5], None, "unknown kinds keep the cached text");
+    }
+
+    /// Issue #77 — the field-code view freezes every field: neither the
+    /// per-page pass nor the NUMPAGES finish pass stamps a value.
+    #[test]
+    fn frozen_fields_are_never_evaluated() {
+        let geom = a4_geometry();
+        let env = engine::FieldEnv {
+            page: None,
+            date: Some((2026, 9, 3)),
+            clock: Some((14, 7)),
+            document_name: Some("report.docx".into()),
+            author: Some("Ibrahim".into()),
+        };
+        let mut pag = Paginator::new(
+            geom,
+            HeaderBands::default(),
+            HeaderBands::default(),
+            false,
+            false,
+        )
+        .with_field_env(env)
+        .with_fields_frozen(true);
+        for instr in ["PAGE", "NUMPAGES", "DATE", "AUTHOR"] {
+            pag.push_block(
+                LayoutBlock::Paragraph(fake_paragraph_with_field(instr, 16.0)),
+                0.0,
+                0.0,
+            );
+        }
+        let pages = pag.finish();
+        for b in &pages[0].blocks {
+            if let LayoutBlock::Paragraph(p) = b {
+                assert_eq!(
+                    p.fields[0].evaluated_text, None,
+                    "{}",
+                    p.fields[0].instruction
+                );
+            }
+        }
+    }
+
+    /// Issue #77 — a field-free document lays out bit-identically
+    /// whatever the field environment / freeze switch: the field
+    /// machinery is geometry-neutral for every document without fields.
+    #[test]
+    fn field_env_and_freeze_are_geometry_neutral_for_field_free_documents() {
+        let build = |env: Option<engine::FieldEnv>, frozen: bool| -> u64 {
+            let geom = a4_geometry();
+            let mut pag = Paginator::new(
+                geom,
+                HeaderBands::default(),
+                HeaderBands::default(),
+                false,
+                false,
+            )
+            .with_fields_frozen(frozen);
+            if let Some(env) = env {
+                pag = pag.with_field_env(env);
+            }
+            for _ in 0..80 {
+                pag.push_block(LayoutBlock::Paragraph(fake_paragraph(3, 16.0)), 4.0, 6.0);
+            }
+            geometry_fingerprint(&pag.finish())
+        };
+        let full_env = engine::FieldEnv {
+            page: None,
+            date: Some((2026, 9, 3)),
+            clock: Some((14, 7)),
+            document_name: Some("report.docx".into()),
+            author: Some("Ibrahim".into()),
+        };
+        let base = build(None, false);
+        assert_eq!(base, build(Some(full_env.clone()), false));
+        assert_eq!(base, build(None, true));
+        assert_eq!(base, build(Some(full_env), true));
     }
 
     /* ================================================================

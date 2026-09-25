@@ -181,6 +181,9 @@ struct EngineSnapshotV1 {
     review_author: String,
     review_date: String,
     layout_cfg: Option<LayoutCfgSnapshot>,
+    /// Issue #77 — the opened file's name (FILENAME fields). Absent in
+    /// pre-#77 snapshots → `None` → cached text stands.
+    document_name: Option<String>,
 }
 
 impl EngineSnapshotV1 {
@@ -425,9 +428,28 @@ struct LayoutSnapshot {
     /// input change.
     viewport_h_bits: u32,
     composition_active: bool,
+    /// Issue #77 — the Alt+F9 view lays out a DIFFERENT document (the
+    /// field-code derivation) at the same undo revision.
+    code_view: bool,
     pages: Vec<PageBox>,
     page_paths: Vec<Vec<EngineBlockPath>>,
     info: LazyLayoutInfo,
+}
+
+/// Issue #77 — how [`Engine::build_pages_of`] treats fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldMode {
+    /// Results: fields resolve per page and the #43 reshape pass splices
+    /// the live text into the painted boxes (screen, PDF).
+    Resolved,
+    /// Alt+F9: every field frozen at its `{ INSTRUCTION }` text; nothing
+    /// resolves, nothing is reshaped.
+    Codes,
+    /// F9 / save-time restamp: fields resolve per page but the boxes keep
+    /// the source text and carry the live values only in
+    /// `LayoutField::evaluated_text` (no reshape) — the restamp reads
+    /// them back per `(story, paragraph, field)`.
+    Probe,
 }
 
 /// Cached dimensions from the most recent `render_document`, replayed by
@@ -614,6 +636,24 @@ pub struct Engine {
     /// worker right after INIT). `None` keeps cached field text — the
     /// engine core never reads a wall clock.
     render_date: Option<(i32, u32, u32)>,
+    /// Issue #77 — the shell-injected `(hour 0–23, minute)` TIME fields
+    /// resolve against (the optional clock half of `SetRenderDate`).
+    /// `None` keeps cached TIME text.
+    render_clock: Option<(u32, u32)>,
+    /// Issue #77 — the document's file name as opened
+    /// (`OpenDocument.name`, directory components stripped); what a
+    /// FILENAME field resolves to. `None` (a document never opened from
+    /// a file) keeps cached FILENAME text. Persisted in the crash
+    /// snapshot alongside the document it names.
+    document_name: Option<String>,
+    /// Issue #77 — Alt+F9 field-code view. While `true` the LAYOUT
+    /// runs on `layout_doc()` (every field's result replaced by its
+    /// `{ INSTRUCTION }` code, overlays stripped so nothing
+    /// re-evaluates) and every geometry consumer maps between source
+    /// and display offsets at the boundary. `selection`, the undo
+    /// stack and every `LogicalPos` on the wire stay in SOURCE
+    /// coordinates. Pure display state: not snapshotted, not saved.
+    field_code_view: bool,
     /// Last accessibility tree broadcast to the UI (Backlog #10).
     /// `build_a11y_delta` diffs the freshly built tree against this so a
     /// keystroke emits only the changed paragraph. `None` until the first
@@ -731,6 +771,9 @@ fn assemble_engine(
         active_story: StoryTarget::Body,
         stashed_body_selection: None,
         render_date: None,
+        render_clock: None,
+        document_name: None,
+        field_code_view: false,
         a11y_cache: None,
         image_cache: HashMap::new(),
         last_paint_dims: LastPaintDims::default(),
@@ -4606,6 +4649,26 @@ fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, Bridg
 /// Clamp a position into `doc` — `path` resolved to a real paragraph
 /// (falling back to the document end), `offset` capped at the
 /// paragraph's UTF-8 length.
+/// Issue #77 — owned key for a `FieldStory` (body / header rid / footer
+/// rid) so page-field lookups can be collected before the restamp walk.
+fn story_key(story: &engine::FieldStory<'_>) -> (u8, String) {
+    match story {
+        engine::FieldStory::Body => (0, String::new()),
+        engine::FieldStory::Header(rid) => (1, (*rid).to_string()),
+        engine::FieldStory::Footer(rid) => (2, (*rid).to_string()),
+    }
+}
+
+/// Issue #77 — the base name of a shell-supplied document name
+/// (`OpenDocument.name`): directory components stripped, trimmed.
+fn file_base_name(name: &str) -> String {
+    name.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_string()
+}
+
 fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     /* Design review B6 — a TABLE-ONLY tree (a letterhead header whose
     sole block is a table) has paragraph_count() == 0 but real caret
@@ -4916,6 +4979,12 @@ impl Engine {
             | Command::SetEvenOddHeaders { .. }
             | Command::InsertField { .. }
             | Command::SetRenderDate { .. }
+            /* Issue #77 — F9 is document-wide (the active part
+            included), the code view is display state, and the
+            instruction edit routes through the story adapter. */
+            | Command::UpdateFields
+            | Command::SetFieldCodeView { .. }
+            | Command::SetFieldInstruction { .. }
             /* Issue #72 — paragraph-property family. Each handler below
             routes through `story_mutate` against the synthetic story
             tree when a story is active. */
@@ -5100,9 +5169,17 @@ impl Engine {
             Command::OpenDocument {
                 bytes,
                 format,
-                name: _,
+                name,
             } => match format {
-                DocFormat::Docx => self.load_docx_bytes(&bytes, "OpenDocument"),
+                DocFormat::Docx => {
+                    /* Issue #77 — FILENAME resolves to the opened file's
+                    base name (directory components stripped). */
+                    self.document_name = name
+                        .as_deref()
+                        .map(file_base_name)
+                        .filter(|n| !n.is_empty());
+                    self.load_docx_bytes(&bytes, "OpenDocument")
+                }
                 other => Event::Error {
                     message: format!(
                         "OpenDocument: format {other:?} not supported — only Docx ships today"
@@ -5247,10 +5324,27 @@ impl Engine {
             Command::SetTitlePage { enabled } => self.do_set_title_page(enabled),
             Command::SetEvenOddHeaders { enabled } => self.do_set_even_odd_headers(enabled),
             Command::InsertField { at, kind } => self.do_insert_field(at, kind),
-            Command::SetRenderDate { year, month, day } => {
+            Command::SetRenderDate {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+            } => {
                 self.render_date = Some((year, month, day));
+                /* Issue #77 — the clock half is optional; both parts
+                or nothing (a half-clock keeps TIME cached). */
+                self.render_clock = match (hour, minute) {
+                    (Some(h), Some(m)) => Some((h.min(23), m.min(59))),
+                    _ => None,
+                };
                 self.invalidate_layout_snapshot();
                 Event::Pong
+            }
+            Command::UpdateFields => self.do_update_fields(),
+            Command::SetFieldCodeView { enabled } => self.do_set_field_code_view(enabled),
+            Command::SetFieldInstruction { at, instruction } => {
+                self.do_set_field_instruction(at, instruction)
             }
             Command::SetParagraphBorders { range, borders } => {
                 self.do_set_paragraph_borders(range, borders)
@@ -5702,6 +5796,12 @@ impl Engine {
         /* Phase 3 (#39) — recovery lands in body mode. */
         self.active_story = StoryTarget::Body;
         self.stashed_body_selection = None;
+        /* Issue #77 — display state and shell-injected inputs are not
+        part of the session: the worker re-injects the clock, the
+        snapshot carries the document name, the view resets. */
+        self.field_code_view = false;
+        self.render_clock = None;
+        self.document_name = None;
     }
 
     /// Issue #85 — real crash recovery: base snapshot + replayed tail.
@@ -5831,6 +5931,7 @@ impl Engine {
             review_author: self.review_author.clone(),
             review_date: self.review_date.clone(),
             layout_cfg: self.layout_cfg.as_ref().map(LayoutCfgSnapshot::capture),
+            document_name: self.document_name.clone(),
         }
     }
 
@@ -5863,6 +5964,7 @@ impl Engine {
         self.tracking_changes = s.tracking_changes;
         self.review_author = s.review_author;
         self.review_date = s.review_date;
+        self.document_name = s.document_name;
         self.composition = None;
         /* The fresh stack restarts its revision counter at 0 — every
         revision-keyed memo must go. */
@@ -5971,10 +6073,12 @@ impl Engine {
         let viewport_h_bits = self.lazy_layout.viewport_h.to_bits();
         /* The inputs the LAYOUT depends on; the cull target and the
         viewport height only decide how deep the band goes. */
+        let code_view = self.field_code_view;
         let same_layout_inputs = |s: &LayoutSnapshot| {
             s.doc_revision == doc_revision
                 && s.scale_bits == scale_bits
                 && s.composition_active == composition_active
+                && s.code_view == code_view
         };
         {
             let snap = self.layout_snapshot.borrow();
@@ -6031,6 +6135,7 @@ impl Engine {
             target_bits,
             viewport_h_bits,
             composition_active,
+            code_view,
             pages,
             page_paths,
             info,
@@ -6079,6 +6184,40 @@ impl Engine {
         ),
         Box<Event>,
     > {
+        /* Issue #77 — the on-screen layout runs on `layout_doc()`: the
+        real tree, or its field-code derivation while Alt+F9 is on. */
+        let mode = if self.field_code_view {
+            FieldMode::Codes
+        } else {
+            FieldMode::Resolved
+        };
+        self.build_pages_of(self.layout_doc(), scale, with_composition, target_y, mode)
+    }
+
+    /// [`Self::build_pages`] over an explicit document and
+    /// [`FieldMode`]. `Codes` says `doc` is the field-code derivation:
+    /// every field is frozen at its displayed `{ INSTRUCTION }` text
+    /// (issue #77) and the IME preview anchor is mapped from source to
+    /// display offsets. PDF export passes the SOURCE tree as `Resolved`
+    /// so what leaves the engine is always the result view, whatever the
+    /// screen shows; the F9 / save-time restamp passes it as `Probe`.
+    #[allow(clippy::type_complexity)]
+    fn build_pages_of(
+        &self,
+        doc: DocumentTree,
+        scale: f32,
+        with_composition: bool,
+        target_y: Option<f32>,
+        mode: FieldMode,
+    ) -> Result<
+        (
+            Vec<PageBox>,
+            FontStack,
+            Vec<Vec<EngineBlockPath>>,
+            LazyLayoutInfo,
+        ),
+        Box<Event>,
+    > {
         let cfg = match self.layout_cfg.clone() {
             Some(c) => c,
             None => {
@@ -6095,7 +6234,6 @@ impl Engine {
 
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
-        let doc = self.undo.current().clone();
         let sctx = StyleContext::of(&doc);
         let mut cache = self.layout_cache.borrow_mut();
         let composition = if with_composition {
@@ -6352,9 +6490,11 @@ impl Engine {
                     doc.settings.even_and_odd_headers,
                 )
                 .with_footnote_bodies(footnote_bodies.clone())
-                /* Issue #43 — DATE fields resolve against the
-                shell-injected render date. */
-                .with_render_date(self.render_date);
+                /* Issue #43 / #77 — DATE / TIME / FILENAME / AUTHOR
+                resolve against the shell-injected environment; the
+                field-code view freezes every field at its code text. */
+                .with_field_env(self.field_env())
+                .with_fields_frozen(mode == FieldMode::Codes);
                 if section.columns.is_multi() {
                     pag.set_columns(section.columns.count, section.columns.gutter_pt * scale);
                 }
@@ -6421,14 +6561,30 @@ impl Engine {
                         processed_blocks += 1;
                     }
                     engine::Block::Paragraph(para) => {
-                        let comp = composition.filter(|c| {
-                            bridge_to_engine_path(c.at.path.clone()) == para_path
-                                && !c.text.is_empty()
-                                && (c.at.offset as usize) <= para.text.len()
-                                && para.text.is_char_boundary(c.at.offset as usize)
+                        let comp = composition.and_then(|c| {
+                            if bridge_to_engine_path(c.at.path.clone()) != para_path
+                                || c.text.is_empty()
+                            {
+                                return None;
+                            }
+                            /* Issue #77 — the composition anchor is a
+                            SOURCE offset; in the code view `para` is the
+                            derived code text, so map the anchor onto it. */
+                            let off = if mode == FieldMode::Codes {
+                                self.undo
+                                    .current()
+                                    .paragraph_at_path(&para_path)
+                                    .map_or(c.at.offset, |sp| {
+                                        sp.source_offset_to_code_view(c.at.offset)
+                                    })
+                            } else {
+                                c.at.offset
+                            };
+                            ((off as usize) <= para.text.len()
+                                && para.text.is_char_boundary(off as usize))
+                            .then_some((c, off as usize))
                         });
-                        let para_box = if let Some(c) = comp {
-                            let off = c.at.offset as usize;
+                        let para_box = if let Some((c, off)) = comp {
                             let mut text = String::with_capacity(para.text.len() + c.text.len());
                             text.push_str(&para.text[..off]);
                             text.push_str(&c.text);
@@ -6555,17 +6711,21 @@ impl Engine {
             StoryTarget::Footer { page, .. } => Some((*page, false)),
             StoryTarget::Body => None,
         };
-        reshape_resolved_fields(
-            &mut emitted_pages,
-            &emitted_paths,
-            &doc,
-            &font_stack,
-            &cfg,
-            scale,
-            sctx,
-            &mut cache,
-            story_skip,
-        );
+        /* Issue #77 — `Codes` has nothing resolved to splice; `Probe`
+        must keep the `evaluated_text` markers the restamp reads back. */
+        if mode == FieldMode::Resolved {
+            reshape_resolved_fields(
+                &mut emitted_pages,
+                &emitted_paths,
+                &doc,
+                &font_stack,
+                &cfg,
+                scale,
+                sctx,
+                &mut cache,
+                story_skip,
+            );
+        }
         drop(cache);
         /* Always at least one page so downstream consumers can index `[0]`. */
         if emitted_pages.is_empty() {
@@ -6864,7 +7024,14 @@ impl Engine {
         in-progress IME composition. */
         /* `target_y: None` — PDF export is a full-document materialization,
         not a viewport paint. The cull budget would corrupt page count. */
-        let (mut pages, font_stack, _box_paths, _info) = match self.build_pages(1.0, false, None) {
+        /* Issue #77 — a PDF is the result view whatever the screen shows. */
+        let (mut pages, font_stack, _box_paths, _info) = match self.build_pages_of(
+            self.undo.current().clone(),
+            1.0,
+            false,
+            None,
+            FieldMode::Resolved,
+        ) {
             Ok(v) => v,
             Err(e) => return *e,
         };
@@ -7117,6 +7284,383 @@ impl Engine {
         self.with_selection_doc(|d| d.clone())
     }
 
+    /* ===========================================================
+    Issue #77 — field authoring v2: the evaluation environment, the
+    Alt+F9 layout document, and the atomic-field invariant.
+    =========================================================== */
+
+    /// Everything a field evaluation can read: the shell-injected
+    /// render date + clock, the opened document's name, and the
+    /// document's own `docProps/core.xml` creator. The page context is
+    /// left empty — the paginator fills it per flush.
+    fn field_env(&self) -> engine::FieldEnv {
+        engine::FieldEnv {
+            page: None,
+            date: self.render_date,
+            clock: self.render_clock,
+            document_name: self.document_name.clone(),
+            author: self.undo.current().settings.author.clone(),
+        }
+    }
+
+    /// The document the on-screen layout runs on: the real tree, or —
+    /// while the field-code view is on — its derivation with every
+    /// field's result replaced by `{ INSTRUCTION }` (body, cells and
+    /// every part). Never stored, never saved.
+    fn layout_doc(&self) -> DocumentTree {
+        if self.field_code_view {
+            self.undo.current().to_code_view()
+        } else {
+            self.undo.current().clone()
+        }
+    }
+
+    /// The fields of the paragraph `path` addresses (story-aware).
+    fn fields_at_path(&self, path: &BridgeBlockPath) -> Vec<engine::Field> {
+        let epath = bridge_to_engine_path(path.clone());
+        self.with_selection_doc(|d| {
+            d.paragraph_at_path(&epath)
+                .map(|p| p.fields.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Push `pos` out of any field result it sits strictly inside — to
+    /// the field's end when `forward`, else its start. Positions at a
+    /// boundary or outside every field pass through.
+    fn snap_out_of_field(&self, pos: BridgeLogicalPos, forward: bool) -> BridgeLogicalPos {
+        let off = pos.offset;
+        let snapped = self
+            .fields_at_path(&pos.path)
+            .iter()
+            .find(|f| f.start < off && off < f.end)
+            .map(|f| if forward { f.end } else { f.start });
+        match snapped {
+            Some(offset) => BridgeLogicalPos {
+                path: pos.path,
+                offset,
+            },
+            None => pos,
+        }
+    }
+
+    /// Nearer-boundary variant (vertical walks, line home / end).
+    fn snap_nearest_field_boundary(&self, pos: BridgeLogicalPos) -> BridgeLogicalPos {
+        let off = pos.offset;
+        let snapped = self
+            .fields_at_path(&pos.path)
+            .iter()
+            .find(|f| f.start < off && off < f.end)
+            .map(|f| {
+                if off - f.start > f.end - off {
+                    f.end
+                } else {
+                    f.start
+                }
+            });
+        match snapped {
+            Some(offset) => BridgeLogicalPos {
+                path: pos.path,
+                offset,
+            },
+            None => pos,
+        }
+    }
+
+    /// Widen an ORDERED `[start, end)` so it never partially covers a
+    /// field: each end snaps outward against its own paragraph. A
+    /// collapsed position strictly inside a field yields the whole
+    /// field.
+    fn expand_over_fields(
+        &self,
+        start: BridgeLogicalPos,
+        end: BridgeLogicalPos,
+    ) -> (BridgeLogicalPos, BridgeLogicalPos) {
+        (
+            self.snap_out_of_field(start, false),
+            self.snap_out_of_field(end, true),
+        )
+    }
+
+    /// `SelectionChanged.field_at_caret` — the field the selection
+    /// addresses: the one it covers EXACTLY (`selected: true`), else,
+    /// for a collapsed caret, the field ending at the caret, else the
+    /// one starting there (see `Paragraph::field_index_at`).
+    fn field_ref_at_selection(&self, sel: &SelectionState) -> Option<bridge::BridgeFieldRef> {
+        let (start, end) = ordered(sel.anchor.clone(), sel.caret.clone());
+        let epath = bridge_to_engine_path(sel.caret.path.clone());
+        self.with_selection_doc(|d| {
+            let para = d.paragraph_at_path(&epath)?;
+            let (field, selected) = if start != end {
+                if start.path != end.path {
+                    return None;
+                }
+                (para.field_exactly(start.offset, end.offset)?, true)
+            } else {
+                (
+                    para.fields.get(para.field_index_at(sel.caret.offset)?)?,
+                    false,
+                )
+            };
+            Some(bridge::BridgeFieldRef {
+                instruction: field.instruction.clone(),
+                keyword: field.keyword(),
+                start: BridgeLogicalPos {
+                    path: sel.caret.path.clone(),
+                    offset: field.start,
+                },
+                end: BridgeLogicalPos {
+                    path: sel.caret.path.clone(),
+                    offset: field.end,
+                },
+                selected,
+            })
+        })
+    }
+
+    /// `Command::SetFieldCodeView` (issue #77, Alt+F9). Pure display
+    /// state: the layout swaps to `layout_doc()`, `document_geometry`
+    /// translates the result back to source offsets, and nothing about
+    /// the selection, the undo stack or the wire changes.
+    fn do_set_field_code_view(&mut self, enabled: bool) -> Event {
+        if self.field_code_view == enabled {
+            return self.selection_changed();
+        }
+        self.field_code_view = enabled;
+        /* The layout memo is keyed on the flag, but the paragraph LRU
+        is content-keyed and the code text differs — nothing stale can
+        be reused; the dirty tracker still needs the full page. */
+        self.invalidate_layout_snapshot();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(
+            AnnouncementPriority::Polite,
+            if enabled {
+                "Field codes shown"
+            } else {
+                "Field results shown"
+            },
+        );
+        self.selection_changed()
+    }
+
+    /// `Command::SetFieldInstruction` (issue #77) — replace the code of
+    /// the field the caret at `at` addresses. The cached result stays
+    /// (Word keeps the stale result until the next update); the
+    /// selection is preserved. Body or story.
+    fn do_set_field_instruction(&mut self, at: BridgeLogicalPos, instruction: String) -> Event {
+        let instruction = instruction.trim().to_string();
+        if instruction.is_empty() {
+            return Event::Error {
+                message: "SetFieldInstruction: the field code is empty".into(),
+            };
+        }
+        let epath = bridge_to_engine_path(at.path.clone());
+        let index = self.with_selection_doc(|d| {
+            d.paragraph_at_path(&epath)
+                .and_then(|p| p.field_index_at(at.offset))
+        });
+        let Some(index) = index else {
+            return Event::Error {
+                message: "SetFieldInstruction: no field at the caret".into(),
+            };
+        };
+        if self.story_active() {
+            let Some(temp) = self.story_doc() else {
+                return self.story_vanished();
+            };
+            let Some(mutated) = temp.set_field_instruction_at(&epath, index, &instruction) else {
+                return Event::Error {
+                    message: "SetFieldInstruction: no field at the caret".into(),
+                };
+            };
+            self.announce(AnnouncementPriority::Polite, "Field code updated");
+            return self.story_mutate(|_| mutated, at, true);
+        }
+        let Some(new_doc) =
+            self.undo
+                .current()
+                .set_field_instruction_at(&epath, index, &instruction)
+        else {
+            return Event::Error {
+                message: "SetFieldInstruction: no field at the caret".into(),
+            };
+        };
+        self.undo.push(new_doc);
+        if let Some(sel) = self.selection.clone() {
+            let doc = self.undo.current();
+            self.selection = Some(SelectionState {
+                anchor: clamp_pos(doc, sel.anchor),
+                caret: clamp_pos(doc, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+        }
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(AnnouncementPriority::Polite, "Field code updated");
+        self.selection_changed()
+    }
+
+    /// `Command::UpdateFields` (issue #77, F9) — stamp every field's
+    /// live value into the model (body + every part) as ONE undo step.
+    /// A document whose fields are all current is left untouched (no
+    /// undo entry, nothing dirtied).
+    fn do_update_fields(&mut self) -> Event {
+        let (new_doc, changed) = self.restamped_document();
+        if !changed {
+            self.announce(AnnouncementPriority::Polite, "Fields are up to date");
+            return self.selection_changed();
+        }
+        self.undo.push(new_doc);
+        if let Some(sel) = self.selection.clone() {
+            let clamped = self.with_selection_doc(|d| SelectionState {
+                anchor: clamp_pos(d, sel.anchor),
+                caret: clamp_pos(d, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+            self.selection = Some(clamped);
+        }
+        self.caret_affinity = CaretAffinity::default();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(AnnouncementPriority::Polite, "Fields updated");
+        self.selection_changed()
+    }
+
+    /// Issue #77 — the document with every field's cached result
+    /// replaced by its live value, plus whether anything changed. PAGE /
+    /// NUMPAGES read a full pagination of the SOURCE tree
+    /// (`page_field_values`); every other kind reads `field_env()`; a
+    /// kind the environment cannot resolve keeps its cached text. Shared
+    /// by F9 and the save-time restamp.
+    fn restamped_document(&self) -> (DocumentTree, bool) {
+        let doc = self.undo.current();
+        if !doc.has_any_fields() {
+            return (doc.clone(), false);
+        }
+        let env = self.field_env();
+        let page_values = self.page_field_values();
+        let mut changed = false;
+        let new_doc = doc.restamp_fields(&mut |site| {
+            let value = match site.field.typed() {
+                engine::TypedField::Page | engine::TypedField::NumPages => {
+                    let story = story_key(&site.story);
+                    page_values
+                        .iter()
+                        .find(|(s, p, i, _)| *s == story && p == site.path && *i == site.index)
+                        .map(|(.., v)| v.clone())
+                }
+                _ => site.field.evaluate_in(&env),
+            };
+            if let Some(v) = value.as_deref()
+                && site
+                    .paragraph
+                    .text
+                    .get(site.field.start as usize..site.field.end as usize)
+                    != Some(v)
+            {
+                changed = true;
+            }
+            value
+        });
+        (new_doc, changed)
+    }
+
+    /// Issue #77 — `(story, paragraph path, field index) → live value`
+    /// for every PAGE / NUMPAGES field, from a full pagination of the
+    /// SOURCE document. A body field takes the first page its paragraph
+    /// lands on; a band field takes the FIRST page that renders its part
+    /// (the model holds one cached value per field, and Word likewise
+    /// stamps the first rendering). Empty when no layout is possible yet
+    /// (no fonts / config) — page kinds then keep their cached text.
+    /// Fields inside table cells are not addressed (their cached text
+    /// stands; `InsertField` rejects cell carets today).
+    #[allow(clippy::type_complexity)]
+    fn page_field_values(&self) -> Vec<((u8, String), EngineBlockPath, usize, String)> {
+        let mut out: Vec<((u8, String), EngineBlockPath, usize, String)> = Vec::new();
+        let Ok((pages, _fonts, page_paths, _info)) = self.build_pages_of(
+            self.undo.current().clone(),
+            self.scale(),
+            false,
+            None,
+            FieldMode::Probe,
+        ) else {
+            return out;
+        };
+        let doc = self.undo.current();
+        let mut push = |story: (u8, String),
+                        path: &EngineBlockPath,
+                        sp: &engine::Paragraph,
+                        pb: &ParagraphBox| {
+            for lf in &pb.fields {
+                let Some(v) = lf.evaluated_text.as_deref() else {
+                    continue;
+                };
+                let Some(index) = sp
+                    .fields
+                    .iter()
+                    .position(|f| f.start == lf.byte_range.start)
+                else {
+                    continue;
+                };
+                let seen = out
+                    .iter()
+                    .any(|(s, p, i, _)| *s == story && p == path && *i == index);
+                if !seen {
+                    out.push((story.clone(), path.clone(), index, v.to_string()));
+                }
+            }
+        };
+        for (pi, page) in pages.iter().enumerate() {
+            let paths = page_paths.get(pi).map(|v| v.as_slice()).unwrap_or(&[]);
+            for (i, block) in page.blocks.iter().enumerate() {
+                let (Some(path), LayoutBlock::Paragraph(pb)) = (paths.get(i), block) else {
+                    continue;
+                };
+                if let Some(sp) = doc.paragraph_at_path(path) {
+                    push((0, String::new()), path, sp, pb);
+                }
+            }
+            for (is_header, band) in [(true, page.header.as_ref()), (false, page.footer.as_ref())] {
+                let Some(band) = band else { continue };
+                let Some(rid) = band.source_rid.as_deref() else {
+                    continue;
+                };
+                let table = if is_header {
+                    &doc.headers
+                } else {
+                    &doc.footers
+                };
+                let Some(source) = table.get(rid) else {
+                    continue;
+                };
+                for (j, bb) in band.blocks.iter().enumerate() {
+                    let (LayoutBlock::Paragraph(pb), Some(engine::Block::Paragraph(sp))) =
+                        (bb, source.get(j))
+                    else {
+                        continue;
+                    };
+                    let path = EngineBlockPath::top(j as u32);
+                    push(
+                        (if is_header { 1 } else { 2 }, rid.to_string()),
+                        &path,
+                        sp,
+                        pb,
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// Wire shape of the active story for `SelectionChanged`. `linked`
     /// and `section_index` are RE-DERIVED on every read (issue #70) —
     /// unlink/relink/undo all change them without touching the
@@ -7243,6 +7787,58 @@ impl Engine {
     /// `BlockPath` ending at the cell's paragraph (`[Block(t), Cell{r,c},
     /// Block(p)]`).
     fn document_geometry(&self) -> Result<Vec<LineGeom>, Box<Event>> {
+        let geom = self.document_geometry_display()?;
+        Ok(self.geometry_to_source_offsets(geom))
+    }
+
+    /// Issue #77 — while the field-code view is on, the layout (hence
+    /// every `LineGeom` the display walk produces) is expressed in the
+    /// derived code text, while the selection, every command and every
+    /// event stay in SOURCE offsets. Translate the geometry ONCE, here,
+    /// so no consumer knows about the view: slots strictly inside a
+    /// `{ … }` span are dropped (the atomic-field invariant makes those
+    /// positions unreachable), the two boundary slots land on the
+    /// field's result boundaries, and line / run byte ranges map through
+    /// the same function. Field-free paragraphs — and the whole result
+    /// view — pass through untouched.
+    fn geometry_to_source_offsets(&self, mut geom: Vec<LineGeom>) -> Vec<LineGeom> {
+        if !self.field_code_view {
+            return geom;
+        }
+        self.with_selection_doc(|doc| {
+            for line in geom.iter_mut() {
+                let epath = bridge_to_engine_path(line.path.clone());
+                let Some(sp) = doc.paragraph_at_path(&epath) else {
+                    continue;
+                };
+                if sp.fields.is_empty() {
+                    continue;
+                }
+                let dp = sp.with_field_codes();
+                let inside = |o: u32| dp.field_strictly_containing(o).is_some();
+                let map = |o: u32| sp.code_view_offset_to_source(o);
+                line.start_byte = map(line.start_byte);
+                line.end_byte = map(line.end_byte);
+                line.slots.retain(|s| !inside(s.byte));
+                for slot in line.slots.iter_mut() {
+                    slot.byte = map(slot.byte);
+                }
+                for run in line.runs.iter_mut() {
+                    run.src_start = map(run.src_start);
+                    run.src_end = map(run.src_end);
+                    run.slots.retain(|s| !inside(s.byte));
+                    for slot in run.slots.iter_mut() {
+                        slot.byte = map(slot.byte);
+                    }
+                }
+            }
+        });
+        geom
+    }
+
+    /// The display-offset geometry walk (see [`Self::document_geometry`]
+    /// for the source-offset view every consumer uses).
+    fn document_geometry_display(&self) -> Result<Vec<LineGeom>, Box<Event>> {
         /* Phase 3 (#39) — in story mode every geometry consumer
         (hit-test, caret rect, selection rects, arrow walks) sees the
         band's lines instead of the body's; combined with
@@ -7566,10 +8162,23 @@ impl Engine {
 
     /// `Command::SetSelection` — set the selection to `range`, caret at `caret`.
     fn do_set_selection(&mut self, range: BridgeLogicalRange, caret: BridgeLogicalPos) -> Event {
-        let anchor = if caret == range.start {
-            range.end
+        /* Issue #77 — atomic fields: a range never partially covers a
+        field, and a collapsed caret strictly inside a field's result
+        becomes the whole field (a click inside a field selects it —
+        Word parity). The caret keeps its side; field-free input takes
+        the historical path untouched. */
+        let (lo, hi) = ordered(range.start.clone(), range.end.clone());
+        let (lo2, hi2) = self.expand_over_fields(lo.clone(), hi.clone());
+        let (anchor, caret) = if lo2 == lo && hi2 == hi {
+            if caret == range.start {
+                (range.end, caret)
+            } else {
+                (range.start, caret)
+            }
+        } else if range.start != range.end && caret == range.start {
+            (hi2, lo2)
         } else {
-            range.start
+            (lo2, hi2)
         };
         /* A caret move discards any armed sticky style (Backlog #11). */
         self.pending_format = None;
@@ -7595,6 +8204,10 @@ impl Engine {
             .selection
             .as_ref()
             .map_or_else(|| to.clone(), |s| s.anchor.clone());
+        /* Issue #77 — atomic fields: the moving end snaps out of a
+        field AWAY from the anchor, so the field is covered whole. */
+        let forward = ordered(anchor.clone(), to.clone()).0 == anchor;
+        let to = self.snap_out_of_field(to, forward);
         self.pending_format = None;
         /* Audit gap B.M4 — shift+click is a non-arrow caret motion;
         reset affinity so the new caret position renders at the
@@ -7622,7 +8235,13 @@ impl Engine {
         let engine_path = bridge_to_engine_path(hit.path.clone());
         let (lo, hi) = self.with_selection_doc(|d| {
             d.paragraph_at_path(&engine_path)
-                .map_or((hit.offset, hit.offset), |p| p.word_bounds(hit.offset))
+                .map_or((hit.offset, hit.offset), |p| {
+                    /* Issue #77 — a word that reaches into a field takes
+                    the whole field (a double-click on "12" in "Page 12
+                    of 34" selects the PAGE field). */
+                    let (lo, hi) = p.word_bounds(hit.offset);
+                    p.expand_range_over_fields(lo, hi)
+                })
         });
         self.pending_format = None;
         self.selection = Some(SelectionState {
@@ -8003,7 +8622,26 @@ impl Engine {
                 (new_caret, Some(ideal))
             }
         };
-        let new_caret = clamp_pos(self.undo.current(), new_caret);
+        let new_caret = clamp_pos(&doc, new_caret);
+        /* Issue #77 — atomic fields: a horizontal step that lands
+        strictly inside a field's result continues to the boundary in
+        the direction of travel (one caret step per field); vertical
+        and line-edge landings snap to the nearer boundary. */
+        let new_caret = match direction {
+            MoveDirection::Left
+            | MoveDirection::Right
+            | MoveDirection::WordLeft
+            | MoveDirection::WordRight => {
+                let forward =
+                    new_caret.path != sel.caret.path || new_caret.offset > sel.caret.offset;
+                self.snap_out_of_field(new_caret, forward)
+            }
+            MoveDirection::Up
+            | MoveDirection::Down
+            | MoveDirection::LineHome
+            | MoveDirection::LineEnd => self.snap_nearest_field_boundary(new_caret),
+            _ => new_caret,
+        };
         /* Word parity — Tab/Shift+Tab don't just move the caret: they
         select the destination cell's ENTIRE content (which collapses
         naturally in a freshly-appended empty row). No-op steps
@@ -8128,6 +8766,8 @@ impl Engine {
             list_ilvl: self.list_ilvl_for_caret(&sel.caret.path),
             paragraph_borders: self.paragraph_borders_for_caret(&sel.caret.path),
             editing_story: self.bridge_story_ref(),
+            field_code_view: self.field_code_view,
+            field_at_caret: self.field_ref_at_selection(&sel),
         }
     }
 
@@ -8812,6 +9452,8 @@ impl Engine {
         } else {
             return self.selection_changed();
         };
+        /* Issue #77 — atomic fields: the step widens to the whole field. */
+        let (del_start, del_end) = self.expand_over_fields(del_start, del_end);
         let new_doc = temp.delete_range(to_engine_pos(del_start.clone()), to_engine_pos(del_end));
         self.commit_story_edit(&new_doc, del_start)
     }
@@ -9319,6 +9961,34 @@ impl Engine {
                     None => "1/1/2026".to_string(),
                 },
             ),
+            /* Issue #77 — the cached text is the value the environment
+            resolves to today, so a document saved before the next
+            update already reads right in a viewer that never
+            evaluates fields. */
+            bridge::FieldKind::Time => (
+                "TIME \\@ \"h:mm am/pm\"".to_string(),
+                match self.render_clock {
+                    Some(clock) => {
+                        engine::render_date_time_picture("h:mm am/pm", None, Some(clock))
+                    }
+                    None => "12:00 am".to_string(),
+                },
+            ),
+            bridge::FieldKind::FileName => (
+                "FILENAME".to_string(),
+                self.document_name
+                    .clone()
+                    .unwrap_or_else(|| "Document1".to_string()),
+            ),
+            bridge::FieldKind::Author => (
+                "AUTHOR".to_string(),
+                self.undo
+                    .current()
+                    .settings
+                    .author
+                    .clone()
+                    .unwrap_or_else(|| self.review_author.clone()),
+            ),
         };
         if self.story_active() {
             let Some(temp) = self.story_doc() else {
@@ -9624,8 +10294,20 @@ impl Engine {
 
     /// The range a collapsed-caret delete should remove. `None` at the matching
     /// document edge. A paragraph-boundary delete returns a cross-paragraph
-    /// range, which `delete_range` resolves as a merge.
+    /// range, which `delete_range` resolves as a merge. Issue #77 — a
+    /// range that reaches into a field's result widens to the whole
+    /// field: Backspace / Delete next to a field remove it as a unit.
     fn delete_target(
+        &self,
+        caret: BridgeLogicalPos,
+        forward: bool,
+        by_word: bool,
+    ) -> Option<(BridgeLogicalPos, BridgeLogicalPos)> {
+        let (start, end) = self.delete_target_raw(caret, forward, by_word)?;
+        Some(self.expand_over_fields(start, end))
+    }
+
+    fn delete_target_raw(
         &self,
         caret: BridgeLogicalPos,
         forward: bool,
@@ -10671,6 +11353,8 @@ impl Engine {
                 self.image_cache.clear();
                 self.last_paint_dims = LastPaintDims::default();
                 self.layout_cache.get_mut().clear();
+                /* Issue #77 — a document opens in the result view. */
+                self.field_code_view = false;
                 /* A fresh UndoStack restarts revision at 0, which the
                 memo key cannot distinguish from the old stack's 0. */
                 self.invalidate_layout_snapshot();
@@ -10696,7 +11380,13 @@ impl Engine {
     /// Sprint 3 (UI Edition) — shared body for the legacy `SaveDocx`
     /// and the new `SaveDocument { format: Docx }` commands.
     fn save_docx_bytes(&self, origin: &'static str) -> Event {
-        match build_minimal_docx(self.undo.current()) {
+        /* Issue #77 — restamp every field's cached result with its live
+        value before serializing (Word does the same at save), so a
+        reader that never evaluates fields still shows current text.
+        The in-memory document is untouched — F9 is the user's explicit
+        update; this is the file's. */
+        let (doc, _changed) = self.restamped_document();
+        match build_minimal_docx(&doc) {
             Ok(bytes) => {
                 let size = bytes.len() as u32;
                 Event::DocumentSaved { bytes, size }
@@ -11656,6 +12346,9 @@ mod tests {
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
             render_date: None,
+            render_clock: None,
+            document_name: None,
+            field_code_view: false,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -12465,6 +13158,9 @@ mod tests {
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
             render_date: None,
+            render_clock: None,
+            document_name: None,
+            field_code_view: false,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -12518,6 +13214,9 @@ mod tests {
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
             render_date: None,
+            render_clock: None,
+            document_name: None,
+            field_code_view: false,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -12562,6 +13261,9 @@ mod tests {
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
             render_date: None,
+            render_clock: None,
+            document_name: None,
+            field_code_view: false,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -12683,6 +13385,9 @@ mod tests {
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
             render_date: None,
+            render_clock: None,
+            document_name: None,
+            field_code_view: false,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -13221,6 +13926,9 @@ mod tests {
                 active_story: StoryTarget::Body,
                 stashed_body_selection: None,
                 render_date: None,
+                render_clock: None,
+                document_name: None,
+                field_code_view: false,
                 a11y_cache: None,
                 image_cache: HashMap::new(),
                 last_paint_dims: LastPaintDims::default(),
@@ -14459,6 +15167,9 @@ mod tests {
             active_story: StoryTarget::Body,
             stashed_body_selection: None,
             render_date: None,
+            render_clock: None,
+            document_name: None,
+            field_code_view: false,
             a11y_cache: None,
             image_cache: HashMap::new(),
             last_paint_dims: LastPaintDims::default(),
@@ -14924,6 +15635,464 @@ mod tests {
             "D: 7/5/2026 end".chars().count(),
             "body DATE field re-laid with the resolved text"
         );
+    }
+
+    /* ================================================================
+    Issue #77 — field authoring v2: atomic caret, F9, Alt+F9, new kinds.
+    ================================================================ */
+
+    /// `"Page 12 of 34"` with a PAGE field over `12` and a NUMPAGES field
+    /// over `34` — the canonical two-field paragraph.
+    fn two_field_paragraph() -> engine::Paragraph {
+        engine::Paragraph {
+            text: "Page 12 of 34".into(),
+            fields: vec![
+                engine::Field {
+                    start: 5,
+                    end: 7,
+                    instruction: "PAGE".into(),
+                },
+                engine::Field {
+                    start: 11,
+                    end: 13,
+                    instruction: "NUMPAGES".into(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn two_field_engine() -> Engine {
+        test_engine_with_doc(DocumentTree::from_blocks(vec![engine::Block::Paragraph(
+            two_field_paragraph(),
+        )]))
+    }
+
+    fn caret_offsets(engine: &Engine) -> (u32, u32) {
+        let sel = engine.selection.as_ref().expect("selection");
+        (sel.anchor.offset, sel.caret.offset)
+    }
+
+    #[test]
+    fn arrow_keys_step_over_a_field_in_one_move() {
+        let mut engine = two_field_engine();
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 4),
+                end: bpos_top(0, 4),
+            },
+            bpos_top(0, 4),
+        );
+        engine.do_move_caret(MoveDirection::Right, false);
+        assert_eq!(caret_offsets(&engine), (5, 5), "onto the field's start");
+        engine.do_move_caret(MoveDirection::Right, false);
+        assert_eq!(caret_offsets(&engine), (7, 7), "ONE step crosses the field");
+        engine.do_move_caret(MoveDirection::Left, false);
+        assert_eq!(caret_offsets(&engine), (5, 5), "and one step back");
+        /* Shift+Right from the start covers the field whole. */
+        engine.do_move_caret(MoveDirection::Right, true);
+        assert_eq!(caret_offsets(&engine), (5, 7));
+        /* Ctrl+Right (word step) never rests inside a result either. */
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 0),
+                end: bpos_top(0, 0),
+            },
+            bpos_top(0, 0),
+        );
+        for _ in 0..6 {
+            engine.do_move_caret(MoveDirection::WordRight, false);
+            let (_, c) = caret_offsets(&engine);
+            /* The only strictly-inside offsets of `12` / `34` are 6 and 12. */
+            assert!(c != 6 && c != 12, "word step landed inside at {c}");
+        }
+    }
+
+    #[test]
+    fn a_collapsed_selection_inside_a_field_selects_it_whole() {
+        let mut engine = two_field_engine();
+        let evt = engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 6),
+                end: bpos_top(0, 6),
+            },
+            bpos_top(0, 6),
+        );
+        assert_eq!(caret_offsets(&engine), (5, 7));
+        let Event::SelectionChanged {
+            field_at_caret,
+            field_code_view,
+            ..
+        } = evt
+        else {
+            panic!("SelectionChanged");
+        };
+        assert!(!field_code_view);
+        let f = field_at_caret.expect("field addressed");
+        assert!(f.selected);
+        assert_eq!(f.keyword, "PAGE");
+        assert_eq!((f.start.offset, f.end.offset), (5, 7));
+
+        /* A range that reaches into a field widens over it, keeping the
+        caret's side. */
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 2),
+                end: bpos_top(0, 12),
+            },
+            bpos_top(0, 2),
+        );
+        assert_eq!(caret_offsets(&engine), (13, 2));
+        /* Shift+click snaps the moving end away from the anchor. */
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 8),
+                end: bpos_top(0, 8),
+            },
+            bpos_top(0, 8),
+        );
+        engine.do_extend_selection(bpos_top(0, 12));
+        assert_eq!(caret_offsets(&engine), (8, 13));
+        engine.do_extend_selection(bpos_top(0, 6));
+        assert_eq!(caret_offsets(&engine), (8, 5));
+    }
+
+    #[test]
+    fn field_at_caret_reports_the_adjacent_field_for_a_collapsed_caret() {
+        let mut engine = two_field_engine();
+        let evt = engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 7),
+                end: bpos_top(0, 7),
+            },
+            bpos_top(0, 7),
+        );
+        let Event::SelectionChanged { field_at_caret, .. } = evt else {
+            panic!("SelectionChanged");
+        };
+        let f = field_at_caret.expect("field ending at the caret");
+        assert!(!f.selected);
+        assert_eq!(f.instruction, "PAGE");
+        assert_eq!((f.start.offset, f.end.offset), (5, 7));
+        let evt = engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 2),
+                end: bpos_top(0, 2),
+            },
+            bpos_top(0, 2),
+        );
+        let Event::SelectionChanged { field_at_caret, .. } = evt else {
+            panic!("SelectionChanged");
+        };
+        assert!(field_at_caret.is_none());
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_a_whole_field() {
+        let mut engine = two_field_engine();
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 7),
+                end: bpos_top(0, 7),
+            },
+            bpos_top(0, 7),
+        );
+        engine.do_delete_at_caret(false, false);
+        let p = engine.undo.current().nth_paragraph(0).unwrap().clone();
+        assert_eq!(p.text, "Page  of 34");
+        assert_eq!(p.fields.len(), 1, "the PAGE field is gone as a unit");
+        assert_eq!(p.fields[0].instruction, "NUMPAGES");
+        assert_eq!((p.fields[0].start, p.fields[0].end), (9, 11));
+        assert_eq!(caret_offsets(&engine), (5, 5));
+        /* Forward delete at a field's start removes it too. */
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 9),
+                end: bpos_top(0, 9),
+            },
+            bpos_top(0, 9),
+        );
+        engine.do_delete_at_caret(true, false);
+        let p = engine.undo.current().nth_paragraph(0).unwrap().clone();
+        assert_eq!(p.text, "Page  of ");
+        assert!(p.fields.is_empty());
+    }
+
+    #[test]
+    fn set_field_instruction_replaces_the_code_and_keeps_the_result() {
+        let mut engine = two_field_engine();
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 7),
+                end: bpos_top(0, 7),
+            },
+            bpos_top(0, 7),
+        );
+        let depth = engine.undo.depth();
+        let evt = engine.do_set_field_instruction(bpos_top(0, 7), " PAGE \\* roman ".into());
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        let p = engine.undo.current().nth_paragraph(0).unwrap().clone();
+        assert_eq!(p.fields[0].instruction, "PAGE \\* roman");
+        assert_eq!(
+            p.text, "Page 12 of 34",
+            "cached result stands until the next update"
+        );
+        assert!(p.dirty);
+        assert_eq!(engine.undo.depth(), depth + 1);
+        assert_eq!(caret_offsets(&engine), (7, 7), "selection preserved");
+        assert!(matches!(
+            engine.do_set_field_instruction(bpos_top(0, 7), "   ".into()),
+            Event::Error { .. }
+        ));
+        assert!(matches!(
+            engine.do_set_field_instruction(bpos_top(0, 2), "PAGE".into()),
+            Event::Error { .. }
+        ));
+    }
+
+    /// Body AUTHOR + FILENAME fields plus a shared footer `Page 99 of 1`
+    /// over a two-page document, with the environment fully populated.
+    fn update_fixture() -> Engine {
+        let mut doc = two_page_doc("first page", "second page").with_updated_footer_part(
+            "ngeHf1",
+            vec![engine::Block::Paragraph(engine::Paragraph {
+                text: "Page 99 of 1".into(),
+                fields: vec![
+                    engine::Field {
+                        start: 5,
+                        end: 7,
+                        instruction: "PAGE".into(),
+                    },
+                    engine::Field {
+                        start: 11,
+                        end: 12,
+                        instruction: "NUMPAGES".into(),
+                    },
+                ],
+                ..Default::default()
+            })],
+        );
+        doc = doc.set_section_hf_ref_at(
+            engine::LogicalPos::new(engine::BlockPath::top(0), 0),
+            false,
+            engine::HeaderFooterRole::Default,
+            Some("ngeHf1"),
+        );
+        doc.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: "by Y in Z".into(),
+                fields: vec![
+                    engine::Field {
+                        start: 3,
+                        end: 4,
+                        instruction: "AUTHOR".into(),
+                    },
+                    engine::Field {
+                        start: 8,
+                        end: 9,
+                        instruction: "FILENAME \\p".into(),
+                    },
+                ],
+                ..Default::default()
+            }));
+        doc.settings.author = Some("Ibrahim".into());
+        let mut engine = test_engine_with_doc(doc);
+        engine.document_name = Some("report.docx".into());
+        engine
+    }
+
+    #[test]
+    fn update_fields_restamps_body_and_footer_as_one_undo_step() {
+        let mut engine = update_fixture();
+        let depth = engine.undo.depth();
+        let evt = engine.do_update_fields();
+        assert!(matches!(evt, Event::SelectionChanged { .. }));
+        assert_eq!(engine.undo.depth(), depth + 1, "ONE undo step");
+        let doc = engine.undo.current();
+        assert_eq!(
+            doc.nth_paragraph(2).unwrap().text,
+            "by Ibrahim in report.docx"
+        );
+        let engine::Block::Paragraph(fp) = &doc.footers["ngeHf1"][0] else {
+            panic!("footer paragraph");
+        };
+        assert_eq!(
+            fp.text, "Page 1 of 2",
+            "footer PAGE takes its first page; NUMPAGES the total"
+        );
+        assert_eq!((fp.fields[0].start, fp.fields[0].end), (5, 6));
+        assert_eq!((fp.fields[1].start, fp.fields[1].end), (10, 11));
+        /* Already current → nothing happens, no undo entry. */
+        engine.do_update_fields();
+        assert_eq!(engine.undo.depth(), depth + 1);
+        /* Undo restores both stories at once. */
+        engine.do_undo();
+        let doc = engine.undo.current();
+        assert_eq!(doc.nth_paragraph(2).unwrap().text, "by Y in Z");
+        let engine::Block::Paragraph(fp) = &doc.footers["ngeHf1"][0] else {
+            panic!("footer paragraph");
+        };
+        assert_eq!(fp.text, "Page 99 of 1");
+    }
+
+    #[test]
+    fn save_restamps_cached_results_without_touching_the_model() {
+        let engine = update_fixture();
+        let Event::DocumentSaved { bytes, .. } = engine.save_docx_bytes("test") else {
+            panic!("saved");
+        };
+        let reread = format_docx::read_docx(&bytes).expect("re-read");
+        assert_eq!(
+            reread.document.nth_paragraph(2).unwrap().text,
+            "by Ibrahim in report.docx"
+        );
+        assert_eq!(
+            engine.undo.current().nth_paragraph(2).unwrap().text,
+            "by Y in Z",
+            "the in-memory document is untouched by a save"
+        );
+    }
+
+    #[test]
+    fn field_code_view_paints_codes_and_keeps_source_offsets() {
+        let mut engine = two_field_engine();
+        let glyphs_of = |engine: &Engine| -> usize {
+            engine
+                .ensure_layout_snapshot(engine.scale(), false, None)
+                .expect("layout");
+            let snap = engine.layout_snapshot.borrow();
+            let LayoutBlock::Paragraph(p) = &snap.as_ref().unwrap().pages[0].blocks[0] else {
+                panic!("paragraph");
+            };
+            p.lines
+                .iter()
+                .flat_map(|l| l.runs.iter())
+                .map(|r| r.glyphs.len())
+                .sum()
+        };
+        /* The result view already paints the LIVE values (#43 reshape):
+        one page → "Page 1 of 1". */
+        assert_eq!(glyphs_of(&engine), "Page 1 of 1".chars().count());
+        let evt = engine.do_set_field_code_view(true);
+        let Event::SelectionChanged {
+            field_code_view, ..
+        } = evt
+        else {
+            panic!("SelectionChanged");
+        };
+        assert!(field_code_view);
+        assert_eq!(
+            glyphs_of(&engine),
+            "Page { PAGE } of { NUMPAGES }".chars().count(),
+            "the layout shows the codes"
+        );
+        /* Geometry is translated back to SOURCE offsets: no slot rests
+        inside a field, the line still ends at the source length. */
+        let geom = engine.document_geometry().expect("geometry");
+        assert_eq!(geom.len(), 1);
+        assert_eq!((geom[0].start_byte, geom[0].end_byte), (0, 13));
+        let bytes: Vec<u32> = geom[0].slots.iter().map(|s| s.byte).collect();
+        assert!(bytes.iter().all(|&b| b <= 13));
+        /* The only strictly-inside offsets of `12` / `34` are 6 and 12. */
+        assert!(bytes.iter().all(|&b| b != 6 && b != 12), "{bytes:?}");
+        assert!(
+            bytes.contains(&5) && bytes.contains(&7) && bytes.contains(&11) && bytes.contains(&13)
+        );
+        /* The selection stays in source offsets and covers the field's
+        painted code span. */
+        let evt = engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 6),
+                end: bpos_top(0, 6),
+            },
+            bpos_top(0, 6),
+        );
+        let Event::SelectionChanged {
+            range,
+            rects,
+            field_at_caret,
+            ..
+        } = evt
+        else {
+            panic!("SelectionChanged");
+        };
+        assert_eq!((range.start.offset, range.end.offset), (5, 7));
+        assert!(!rects.is_empty(), "the code span is highlighted");
+        assert!(field_at_caret.is_some_and(|f| f.selected));
+        /* Undo history is untouched by the view; toggling back restores
+        the result glyphs. */
+        engine.do_set_field_code_view(false);
+        assert_eq!(glyphs_of(&engine), "Page 1 of 1".chars().count());
+        assert!(!engine.field_code_view);
+    }
+
+    #[test]
+    fn code_view_never_evaluates_and_pdf_export_ignores_it() {
+        let mut engine = update_fixture();
+        engine.do_set_field_code_view(true);
+        engine
+            .ensure_layout_snapshot(engine.scale(), false, None)
+            .expect("layout");
+        let snap = engine.layout_snapshot.borrow();
+        let pages = &snap.as_ref().unwrap().pages;
+        let f0 = pages[0].footer.as_ref().expect("footer");
+        assert_eq!(
+            band_glyph_count(f0),
+            "Page { PAGE } of { NUMPAGES }".chars().count(),
+            "band shows codes, nothing re-evaluated into them"
+        );
+        drop(snap);
+        /* The export path lays out the SOURCE tree with fields live. */
+        let (pages, ..) = engine
+            .build_pages_of(
+                engine.undo.current().clone(),
+                1.0,
+                false,
+                None,
+                FieldMode::Resolved,
+            )
+            .expect("export layout");
+        let f0 = pages[0].footer.as_ref().expect("footer");
+        assert_eq!(band_glyph_count(f0), "Page 1 of 2".chars().count());
+    }
+
+    #[test]
+    fn insert_field_new_kinds_and_environment() {
+        let mut engine = two_field_engine();
+        engine.render_clock = Some((14, 5));
+        engine.document_name = Some("notes.docx".into());
+        engine.do_set_selection(
+            BridgeLogicalRange {
+                start: bpos_top(0, 13),
+                end: bpos_top(0, 13),
+            },
+            bpos_top(0, 13),
+        );
+        engine.do_insert_field(bpos_top(0, 13), bridge::FieldKind::Time);
+        engine.do_insert_field(
+            engine.selection.clone().unwrap().caret,
+            bridge::FieldKind::FileName,
+        );
+        engine.do_insert_field(
+            engine.selection.clone().unwrap().caret,
+            bridge::FieldKind::Author,
+        );
+        let p = engine.undo.current().nth_paragraph(0).unwrap().clone();
+        assert_eq!(p.text, "Page 12 of 342:05 pmnotes.docxYou");
+        assert_eq!(p.fields.len(), 5);
+        assert_eq!(p.fields[2].instruction, "TIME \\@ \"h:mm am/pm\"");
+        assert_eq!(p.fields[3].instruction, "FILENAME");
+        assert_eq!(p.fields[4].instruction, "AUTHOR");
+        let env = engine.field_env();
+        assert_eq!(env.clock, Some((14, 5)));
+        assert_eq!(env.document_name.as_deref(), Some("notes.docx"));
+        assert_eq!(
+            env.author, None,
+            "no core.xml creator → AUTHOR keeps its cached text"
+        );
+        assert_eq!(file_base_name("C:\\docs\\a.docx"), "a.docx");
+        assert_eq!(file_base_name("/tmp/x/b.docx "), "b.docx");
+        assert_eq!(file_base_name("c.docx"), "c.docx");
     }
 
     /* ================================================================
