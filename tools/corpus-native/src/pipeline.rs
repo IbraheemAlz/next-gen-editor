@@ -231,9 +231,29 @@ fn compare_siblings(a: &DocxArchive, b: &DocxArchive) -> (bool, u64) {
 /// Run the full pipeline on one document's raw bytes. `path_label` is the
 /// path relative to the corpus root, used only for the JSONL record and
 /// panic-reproduction pointer — never touched as a filesystem path here.
-pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: bool) -> DocResult {
+pub fn run_one(
+    path_label: &str,
+    bytes: &[u8],
+    fonts: &FontStack,
+    with_edit: bool,
+    dump_drift: Option<&std::path::Path>,
+) -> DocResult {
     let mut rec = DocResult::new(path_label, bytes.len() as u64);
     let overall_start = Instant::now();
+    /* Issue #112 — `--dump-drift DIR`: write the original and the resaved
+    `document.xml` of every document that does not round-trip byte for
+    byte (or whose resave fails the well-formedness guard) so the drift
+    can be diffed by hand. */
+    let dump = |suffix: &str, xml: &[u8]| {
+        if let Some(dir) = dump_drift {
+            let stem = std::path::Path::new(path_label)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "document".into());
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(dir.join(format!("{stem}.{suffix}.xml")), xml);
+        }
+    };
 
     macro_rules! stage {
         ($stage:literal, $expr:expr) => {{
@@ -301,6 +321,15 @@ pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: boo
         "write_docx_noedit",
         format_docx::write_docx(&archive_a, &archive_a.document)
     );
+
+    /* Issue #112 — dump a drifting resave before any guard can end the
+    record, so a malformed resave is diffable too. */
+    if let (Ok(orig), Ok(resaved)) = (extract_doc_xml(bytes), extract_doc_xml(&resaved_bytes))
+        && orig != resaved
+    {
+        dump("orig", &orig);
+        dump("resaved", &resaved);
+    }
 
     /* 4b. Issue #110 — strict well-formedness of the saved part, BEFORE
     our own reader gets a say. A misaligned passthrough splice is

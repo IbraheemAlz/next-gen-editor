@@ -70,11 +70,7 @@ pub fn locate(original: &[u8], offset: usize) -> DriftPoint {
     let mut buf = Vec::new();
     let mut stack: Vec<String> = Vec::new();
     let mut prev: usize = 0;
-    loop {
-        let ev = match reader.read_event_into(&mut buf) {
-            Ok(ev) => ev,
-            Err(_) => break,
-        };
+    while let Ok(ev) = reader.read_event_into(&mut buf) {
         let pos = reader.buffer_position() as usize;
         let inside = prev <= target && target < pos;
         match ev {

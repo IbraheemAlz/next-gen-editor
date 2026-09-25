@@ -14,19 +14,17 @@
 use crate::error::{DocxError, DocxWarning};
 use crate::parts::table::parse_table_bytes_with_warnings;
 use crate::parts::textbox;
+use crate::schema::block_envelope::BlockEnvelopes;
 use crate::schema::ct_ppr::{apply_ppr, ppr_child_is_modeled};
 use crate::schema::ct_rpr::{apply_rpr, attr_val, fold_rpr_fragment, rpr_child_is_modeled};
+use crate::schema::drawing::scan_drawing;
 use crate::schema::grab_bag::{
-    NamespaceScope, capture_subtree, slice_element, slice_fragment, stash,
-};
-use crate::schema::wp_anchor::{
-    AnchorAxis, AnchorOffsetKind, anchor_from_start_tag, apply_wrap_fragment, h_relative_from,
-    is_wrap_element, parse_offset, v_relative_from, wrap_kind_of,
+    NamespaceScope, bound_by_root, capture_subtree, slice_element, slice_fragment, stash,
 };
 use crate::style_resolver::StyleResolver;
 use engine::{
-    Block, DocumentTree, HeaderFooterRefs, HeaderFooterRole, ListItem, PageGeometry,
-    ParaProperties, Paragraph, Section, SpanStyle, StyleRun, Table,
+    Block, DocumentEnvelope, DocumentTree, HeaderFooterRefs, HeaderFooterRole, ListItem,
+    PageGeometry, ParaProperties, Paragraph, Section, SpanStyle, StyleRun, Table,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -72,6 +70,9 @@ struct SectPrAccum {
     /// open, so its leaf children (`<w:pos>`, `<w:numFmt>`, …) route to
     /// the right props. Cleared on the container's end tag.
     note_pr_scope: Option<engine::NoteKind>,
+    /// Issue #112 — the raw `<w:sectPr>…</w:sectPr>` bytes, for the
+    /// writer's verified passthrough (`SectionProps::source_xml`).
+    source_xml: Option<Vec<u8>>,
 }
 
 /// Per-field accumulator on the [`field_stack`] in
@@ -204,6 +205,144 @@ fn handle_fld_char(
         }
         _ => { /* Unknown fldCharType — ignore. */ }
     }
+}
+
+/// Issue #120 — the self-contained elements a `<w:body>` / `<w:tc>` may
+/// hold between two blocks (ECMA-376 §17.2.2 `EG_RunLevelElements` at
+/// block level, plus `<w:altChunk>`) that the typed model does not
+/// represent. Each is preserved verbatim on the neighbouring block.
+/// `<w:commentRangeStart>` / `End` are deliberately absent: their own
+/// arms record the comment range AND preserve the marker.
+pub(crate) fn is_block_level_marker(qname: &[u8]) -> bool {
+    matches!(
+        qname,
+        b"w:bookmarkStart"
+            | b"w:bookmarkEnd"
+            | b"w:proofErr"
+            | b"w:permStart"
+            | b"w:permEnd"
+            | b"w:moveFromRangeStart"
+            | b"w:moveFromRangeEnd"
+            | b"w:moveToRangeStart"
+            | b"w:moveToRangeEnd"
+            | b"w:customXmlInsRangeStart"
+            | b"w:customXmlInsRangeEnd"
+            | b"w:customXmlDelRangeStart"
+            | b"w:customXmlDelRangeEnd"
+            | b"w:customXmlMoveFromRangeStart"
+            | b"w:customXmlMoveFromRangeEnd"
+            | b"w:customXmlMoveToRangeStart"
+            | b"w:customXmlMoveToRangeEnd"
+            | b"w:altChunk"
+            | b"w:sdt"
+            | b"w:customXml"
+    )
+}
+
+/// Issue #112 — `true` when `tail` is exactly what may follow the last
+/// body child of a `word/document.xml`: `</w:body>`, `</w:document>` and
+/// whitespace around them, to EOF. Anything else means the reader's
+/// picture of the part's end is off and the writer synthesizes the tail
+/// instead of splicing bytes it does not understand.
+pub(crate) fn valid_document_tail(tail: &[u8]) -> bool {
+    fn skip_ws(s: &[u8]) -> &[u8] {
+        let n = s.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        &s[n..]
+    }
+    fn expect<'a>(s: &'a [u8], lit: &[u8]) -> Option<&'a [u8]> {
+        s.strip_prefix(lit)
+    }
+    let s = skip_ws(tail);
+    let s = expect(s, b"</w:body").map(skip_ws);
+    let s = s.and_then(|s| expect(s, b">")).map(skip_ws);
+    let s = s.and_then(|s| expect(s, b"</w:document")).map(skip_ws);
+    let s = s.and_then(|s| expect(s, b">")).map(skip_ws);
+    matches!(s, Some(rest) if rest.is_empty())
+}
+
+/// Issue #83 / #119 — lower a captured DrawingML object element
+/// (`<w:drawing>` or `<mc:AlternateContent>`) into a text-box story when
+/// its FIRST `<wps:wsp>` carries a `<wps:txbx><w:txbxContent>`: the story
+/// blocks parse through the body pipeline (`textbox::parse_story`), the
+/// `<wps:bodyPr>` / `<wps:spPr>` / `<a:spAutoFit>` children fill the typed
+/// fields. The VML fallback of an AlternateContent is skipped (the choice
+/// defines the box; its `<w:txbxContent>` ranges are collected by the
+/// caller for the writer's splice). `None` for a picture, a shape without
+/// a story, or a box past the nesting cap — the caller keeps the element
+/// as an opaque object instead.
+fn lower_text_box(
+    fragment: &[u8],
+    resolver: &StyleResolver<'_>,
+    ns: &NamespaceScope,
+) -> Option<engine::TextBoxStory> {
+    let mut reader = Reader::from_reader(fragment);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut prev_pos: usize = 0;
+    let mut tb: Option<engine::TextBoxStory> = None;
+    let mut has_story = false;
+    let skip_subtree = |reader: &mut Reader<&[u8]>, e: &BytesStart| -> Option<usize> {
+        let end_tag = e.to_end().into_owned();
+        let mut skip = Vec::new();
+        reader.read_to_end_into(end_tag.name(), &mut skip).ok()?;
+        Some(reader.buffer_position() as usize)
+    };
+    while let Ok(ev) = reader.read_event_into(&mut buf) {
+        match ev {
+            Event::Start(e) => match e.name().as_ref() {
+                b"mc:Fallback" => {
+                    skip_subtree(&mut reader, &e)?;
+                }
+                b"wps:wsp" if tb.is_none() => tb = Some(engine::TextBoxStory::default()),
+                b"wps:bodyPr" if tb.is_some() => {
+                    if let Some(t) = tb.as_mut() {
+                        textbox::apply_body_pr(&e, t);
+                    }
+                }
+                b"wps:spPr" if tb.is_some() => {
+                    let end = skip_subtree(&mut reader, &e)?;
+                    if let (Some(sub), Some(t)) = (fragment.get(prev_pos..end), tb.as_mut()) {
+                        textbox::apply_sp_pr(sub, t);
+                    }
+                }
+                b"a:spAutoFit" if tb.is_some() => {
+                    if let Some(t) = tb.as_mut() {
+                        t.auto_fit = true;
+                    }
+                }
+                b"w:txbxContent" => {
+                    let end = skip_subtree(&mut reader, &e)?;
+                    if !has_story
+                        && let Some(sub) = fragment.get(prev_pos..end)
+                        && let Some(t) = tb.as_mut()
+                        && let Some(blocks) = textbox::parse_story(sub, resolver, ns)
+                    {
+                        t.body = blocks;
+                        has_story = true;
+                    }
+                }
+                _ => {}
+            },
+            Event::Empty(e) => match e.name().as_ref() {
+                b"wps:bodyPr" if tb.is_some() => {
+                    if let Some(t) = tb.as_mut() {
+                        textbox::apply_body_pr(&e, t);
+                    }
+                }
+                b"a:spAutoFit" if tb.is_some() => {
+                    if let Some(t) = tb.as_mut() {
+                        t.auto_fit = true;
+                    }
+                }
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+        prev_pos = reader.buffer_position() as usize;
+        buf.clear();
+    }
+    has_story.then_some(tb).flatten()
 }
 
 /// Map an OOXML `<w:headerReference w:type="…"/>` token to the engine's
@@ -448,6 +587,69 @@ impl SectPrAccum {
             footer_offset: self.footer_offset.unwrap_or(d.footer_offset),
         }
     }
+
+    /// Materialize the range-stamped [`Section`] `[start_block, end_block)`
+    /// the parser hands to `DocumentTree::from_blocks_with_sections`.
+    fn into_section(
+        self,
+        start_block: u32,
+        end_block: u32,
+        default_geometry: PageGeometry,
+    ) -> Section {
+        Section {
+            header_refs: self.header_refs.clone(),
+            footer_refs: self.footer_refs.clone(),
+            title_pg: self.title_pg,
+            columns: self.columns.unwrap_or_default(),
+            page_num: self.page_num.unwrap_or_default(),
+            section_type: self.section_type,
+            footnote_props: self.footnote_props,
+            endnote_props: self.endnote_props,
+            source_xml: self.source_xml.clone(),
+            start_block,
+            end_block,
+            geometry: self.into_geometry(default_geometry),
+        }
+    }
+}
+
+/// Issue #112 — the typed [`engine::SectionProps`] a standalone
+/// `<w:sectPr>…</w:sectPr>` fragment lowers to, exactly as the body parser
+/// would lower it in place. The writer runs this over a section's
+/// `source_xml` and compares the result to the live properties: equal ⇒
+/// the bytes still describe the section and are written verbatim (a
+/// *verified* passthrough); different ⇒ page setup, a header reference or
+/// the section type changed and the element regenerates. `source_xml` is
+/// left `None` on the result so the comparison is purely on properties.
+pub(crate) fn parse_sect_pr_fragment(
+    xml: &[u8],
+    default_geometry: PageGeometry,
+) -> engine::SectionProps {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut accum = SectPrAccum::default();
+    let mut seen_root = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if !seen_root {
+                    seen_root = true;
+                } else {
+                    accum.apply(e.name().as_ref(), &e);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if matches!(e.name().as_ref(), b"w:footnotePr" | b"w:endnotePr") {
+                    accum.note_pr_scope = None;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    engine::SectionProps::from(&accum.into_section(0, 1, default_geometry))
 }
 
 /// Parse `word/document.xml` into paragraphs.
@@ -495,7 +697,8 @@ pub fn parse_document_xml_with_warnings(
 ) -> Result<DocumentTree, DocxError> {
     /* Issue #110 — see `strip_utf8_bom`: `reader.buffer_position()` and
     every `xml[..]` slice below must share one byte space. */
-    let xml = strip_utf8_bom(xml);
+    let xml_raw = xml;
+    let xml = strip_utf8_bom(xml_raw);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
 
@@ -593,50 +796,39 @@ pub fn parse_document_xml_with_warnings(
     let mut in_pbdr = false;
     let mut in_tabs = false;
 
-    /* Phase 7 — `<w:drawing>` accumulators. A drawing element wraps an
-    inline image (`<wp:inline>`) or a floating image (`<wp:anchor>`,
-    deferred). Inside, `<wp:extent cx=".." cy=".."/>` carries EMU
-    dimensions and `<a:blip r:embed="rId.."/>` carries the image's
-    relationship id. When `</w:drawing>` closes, if we were inside a
-    `<wp:inline>` AND have both an rId and extents, push U+FFFC into
-    the current run text and queue an `InlineObject`. */
-    let mut in_drawing = false;
-    let mut in_wp_inline = false;
-    let mut cur_drawing_rel_id: Option<String> = None;
-    let mut cur_drawing_cx: Option<i64> = None;
-    let mut cur_drawing_cy: Option<i64> = None;
-    /* Issue #69 — `<wp:anchor>` (floating picture) accumulators. The
-    anchor's attributes seed `cur_anchor` on the start tag; `<wp:positionH>`
-    / `<wp:positionV>` open an axis (`anchor_axis`) whose `<wp:posOffset>` /
-    `<wp:align>` / `<wp14:pctPos*Offset>` child collects text into
-    `anchor_offset` until its end tag. The wrap element and `<wp:docPr>`
-    are captured VERBATIM (the writer cannot regenerate a wrap polygon or
-    a docPr's descr / hyperlink from typed fields). On `</w:drawing>` an
-    anchored picture with a blip + extents becomes an `InlineObject` whose
-    `anchor` is `Some` — same U+FFFC sentinel as an inline picture, so
-    every offset-shifting edit path already carries it. A text box or
-    shape anchor (no `<a:blip>`) is dropped exactly as before (#119). */
-    let mut in_wp_anchor = false;
-    let mut cur_anchor: Option<Box<engine::FloatAnchor>> = None;
-    let mut anchor_axis: Option<AnchorAxis> = None;
-    let mut anchor_offset: Option<(AnchorOffsetKind, String)> = None;
-    /* Issue #83 — text box accumulators. `<wps:wsp>` inside a drawing
-    opens `cur_tb`; `<wps:bodyPr>` / `<wps:spPr>` fill its insets,
-    vertical anchor, fill and outline; `<w:txbxContent>` parses into its
-    story (`textbox::parse_story`) and records the element's byte range.
-    On `</w:drawing>` a shape that carried a story becomes an
-    `InlineKind::TextBox` with the drawing's bytes as its verbatim
-    container — or, inside `<mc:AlternateContent>`, the whole
-    choice+fallback element (sealed on its end tag, with the VML
-    fallback's `<w:txbxContent>` ranges folded in so an edit rewrites
-    both). A bare VML `<w:pict>` text box parses through
-    `textbox::parse_vml`. */
-    let mut drawing_start: usize = 0;
-    let mut cur_tb: Option<Box<engine::TextBoxStory>> = None;
-    let mut cur_tb_has_story = false;
-    let mut cur_tb_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut alt_start: Option<usize> = None;
-    let mut alt_text_box: Option<(usize, Vec<(usize, usize)>)> = None;
+    /* Issue #119 — run-level drawing objects (`<w:drawing>`,
+    `<mc:AlternateContent>`, `<w:pict>`, `<w:object>`) are captured whole
+    at their start tag and lowered by `schema::drawing::scan_drawing`
+    (picture blip + extent + typed `<wp:anchor>`, exactly what the old
+    in-loop state machine collected); the verbatim bytes ride the
+    `InlineObject` so a regenerated paragraph re-emits the object — text
+    box, shape and OLE object included — instead of dropping it. */
+
+    /* Issue #120 / #112 — block-level passthrough + the part envelope.
+    `envelopes` tracks the markup between and around blocks (content-
+    control envelopes, bookmarks, inter-block whitespace) for the current
+    block container; `in_block_container` is true between the start and
+    end tags of `<w:body>` / `<w:hdr>` / `<w:ftr>` / `<w:footnote>` /
+    `<w:endnote>` / `<w:comment>`. "Block level" = inside that container
+    and outside any `<w:p>`, `<w:tbl>` or `<w:sectPr>`. `envelope`
+    collects the `word/document.xml` prolog, root start tag, `<w:body>`
+    tag and tail when the root is `<w:document>`, so a resave reproduces
+    the bytes the writer used to synthesize. */
+    let had_bom = xml_raw.len() != xml.len();
+    let mut envelopes = BlockEnvelopes::new();
+    let mut in_block_container = false;
+    let mut root_is_document = false;
+    let mut root_end: usize = 0;
+    let mut envelope = DocumentEnvelope::default();
+    /* A part with two `<w:body>` elements (Apache POI's `MultipleBodyBug`)
+    has no single envelope to reproduce; the writer synthesizes. */
+    let mut envelope_invalid = false;
+    let mut tail_start: Option<usize> = None;
+    let mut sect_pr_start: Option<usize> = None;
+    /* A body whose only child is the `<w:sectPr>` (no block at all) has
+    no section range to stamp; keep the accumulator so the trailing
+    section — and its bytes — still land on `body_section`. */
+    let mut trailing_sect_without_blocks: Option<SectPrAccum> = None;
 
     /* Phase 7 — `<w:hyperlink>` overlays. Word lays paragraph text out
     paragraph-flat with `<w:hyperlink>` spanning a contiguous slice of
@@ -696,7 +888,30 @@ pub fn parse_document_xml_with_warnings(
                 if !root_seen {
                     root_seen = true;
                     ns = NamespaceScope::from_root(&e);
+                    root_end = reader.buffer_position() as usize;
+                    match name.as_ref() {
+                        b"w:document" => {
+                            /* Issue #112 — everything before the root
+                            (BOM, declaration, the newline after it) and
+                            the root start tag itself, verbatim. */
+                            root_is_document = true;
+                            if had_bom {
+                                envelope.prolog.extend_from_slice(b"\xEF\xBB\xBF");
+                            }
+                            envelope.prolog.extend_from_slice(&xml[..prev_pos]);
+                            envelope.root_tag = xml[prev_pos..root_end].to_vec();
+                        }
+                        /* A header / footer part holds its blocks directly
+                        under the root. */
+                        b"w:hdr" | b"w:ftr" => in_block_container = true,
+                        _ => {}
+                    }
+                    prev_pos = root_end;
+                    buf.clear();
+                    continue;
                 }
+                let at_block_level =
+                    in_block_container && p_start_byte.is_none() && in_tbl == 0 && !in_sect_pr;
                 /* Phase 5 PR 1 — outermost `<w:tbl>` opens. Capture leading
                 byte offset for the source-byte passthrough; ignore every
                 child event (`<w:p>` / `<w:r>` etc. inside cells) until the
@@ -705,6 +920,7 @@ pub fn parse_document_xml_with_warnings(
                 if name.as_ref() == b"w:tbl" {
                     if in_tbl == 0 {
                         tbl_start_byte = Some(prev_pos);
+                        envelopes.note_block_start(prev_pos);
                     }
                     in_tbl += 1;
                     prev_pos = reader.buffer_position() as usize;
@@ -733,78 +949,139 @@ pub fn parse_document_xml_with_warnings(
                 — only its inner story is skipped. Modeling text boxes is
                 issue #83. */
                 match name.as_ref() {
-                    /* Issue #83 — the story of the text box being read. */
-                    b"w:txbxContent" if in_drawing && cur_tb.is_some() => {
+                    /* Issue #119 — a run-level object element: capture the
+                    whole subtree, lower the modeled facts out of it, and
+                    anchor ONE inline object carrying the bytes. A picture
+                    gets its blip + extent (+ typed anchor) exactly as
+                    before; a text box, shape, chart or OLE object gets its
+                    extent, an empty `rel_id` and the bytes — layout
+                    reserves the box, the writer re-emits the element. */
+                    b"w:drawing" | b"mc:AlternateContent" | b"w:pict" | b"w:object"
+                        if in_run && !in_rpr =>
+                    {
                         let start = prev_pos;
-                        let frag = capture_subtree(xml, start, &mut reader, &e)?;
-                        let end = reader.buffer_position() as usize;
-                        if !cur_tb_has_story
-                            && let Some(f) = frag.as_deref()
-                            && let Some(blocks) = textbox::parse_story(f, resolver, &ns)
-                            && let Some(tb) = cur_tb.as_mut()
-                        {
-                            tb.body = blocks;
-                            cur_tb_has_story = true;
-                        }
-                        cur_tb_ranges.push((start, end));
-                        prev_pos = end;
-                        buf.clear();
-                        continue;
-                    }
-                    /* Issue #83 — the VML duplicate of a text box read in
-                    this AlternateContent's choice: keep its story ranges
-                    so a regenerated container rewrites both. */
-                    b"mc:Fallback" if alt_text_box.is_some() => {
-                        let start = prev_pos;
-                        let frag = capture_subtree(xml, start, &mut reader, &e)?;
-                        if let (Some(f), Some((_, ranges))) =
-                            (frag.as_deref(), alt_text_box.as_mut())
-                        {
-                            for (s, e) in textbox::element_ranges(f, b"w:txbxContent") {
-                                ranges.push((start + s, start + e));
+                        if let Some(frag) = capture_subtree(xml, start, &mut reader, &e)? {
+                            let end = reader.buffer_position() as usize;
+                            let scan = scan_drawing(&frag);
+                            /* Issue #83 — a text box (a `<wps:wsp>` shape with
+                            a `<wps:txbx>` story, or a VML `<v:textbox>`) is
+                            modeled as a story: its blocks parse through the
+                            body pipeline, the whole element is its verbatim
+                            container and the `<w:txbxContent>` ranges are
+                            the writer's splice points. */
+                            let text_box = if scan.drawing_ml {
+                                lower_text_box(&frag, resolver, &ns).map(|tb| {
+                                    (
+                                        scan.cx.unwrap_or(0),
+                                        scan.cy.unwrap_or(0),
+                                        scan.anchor.clone(),
+                                        tb,
+                                    )
+                                })
+                            } else {
+                                textbox::parse_vml(&frag, resolver, &ns)
+                                    .map(|v| (v.width_emu, v.height_emu, v.anchor, v.story))
+                            };
+                            let at = (para_text.len() + run_text.len()) as u32;
+                            if let Some((width_emu, height_emu, anchor, mut story)) = text_box {
+                                story.story_ranges =
+                                    textbox::element_ranges(&frag, b"w:txbxContent")
+                                        .into_iter()
+                                        .map(|(s, e)| (s as u32, e as u32))
+                                        .collect();
+                                story.host_range = p_start_byte
+                                    .filter(|p| *p <= start)
+                                    .map(|p| ((start - p) as u32, (end - p) as u32));
+                                story.source_xml = String::from_utf8(frag).ok();
+                                run_text.push('\u{FFFC}');
+                                para_inline_objects.push(engine::InlineObject {
+                                    at,
+                                    kind: engine::InlineKind::TextBox {
+                                        width_emu,
+                                        height_emu,
+                                        story: Box::new(story),
+                                    },
+                                    anchor,
+                                    source_xml: None,
+                                });
+                            } else {
+                                let (rel_id, width_emu, height_emu) = scan.image_fields();
+                                /* A fragment whose prefixes the writer cannot
+                                re-bind (declared on an intermediate ancestor,
+                                not the part root) is not kept — the object
+                                then regenerates as a picture when it has one
+                                and is dropped otherwise, the pre-#119 outcome
+                                rather than an unbound-prefix save. */
+                                let keep_source = bound_by_root(&frag, &ns);
+                                if !rel_id.is_empty() || keep_source {
+                                    run_text.push('\u{FFFC}');
+                                    para_inline_objects.push(engine::InlineObject {
+                                        at,
+                                        kind: engine::InlineKind::Image {
+                                            rel_id,
+                                            width_emu,
+                                            height_emu,
+                                        },
+                                        anchor: scan.anchor,
+                                        source_xml: keep_source.then_some(frag),
+                                    });
+                                }
                             }
                         }
                         prev_pos = reader.buffer_position() as usize;
                         buf.clear();
                         continue;
                     }
-                    /* Issue #83 — a bare VML text box (`<w:pict>` with a
-                    `<v:textbox>`, no DrawingML choice). */
-                    b"w:pict" if in_run && alt_start.is_none() => {
-                        let start = prev_pos;
-                        let frag = capture_subtree(xml, start, &mut reader, &e)?;
-                        let end = reader.buffer_position() as usize;
-                        if let Some(f) = frag
-                            && let Some(vml) = textbox::parse_vml(&f, resolver, &ns)
-                            && let Ok(src) = String::from_utf8(f.clone())
-                        {
-                            let mut story = vml.story;
-                            story.story_ranges = textbox::element_ranges(&f, b"w:txbxContent")
-                                .into_iter()
-                                .map(|(s, e)| (s as u32, e as u32))
-                                .collect();
-                            story.source_xml = Some(src);
-                            story.host_range = p_start_byte
-                                .filter(|p| *p <= start)
-                                .map(|p| ((start - p) as u32, (end - p) as u32));
-                            let at = (para_text.len() + run_text.len()) as u32;
-                            run_text.push('\u{FFFC}');
-                            para_inline_objects.push(engine::InlineObject {
-                                at,
-                                kind: engine::InlineKind::TextBox {
-                                    width_emu: vml.width_emu,
-                                    height_emu: vml.height_emu,
-                                    story: Box::new(story),
-                                },
-                                anchor: vml.anchor,
-                            });
-                        }
-                        prev_pos = end;
+                    /* Issue #119 rider (shipped with #69) — a drawing
+                    sub-story outside a run (a text box's `<w:txbxContent>`,
+                    the VML `<w:pict>` / `<mc:Fallback>` duplicate) is never
+                    body content: skip it whole so its `<w:p>` cannot end
+                    the enclosing paragraph. Inside a run the arm above
+                    already captured it. */
+                    b"w:txbxContent" | b"w:pict" | b"mc:Fallback" => {
+                        let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
                         buf.clear();
                         continue;
                     }
-                    b"w:txbxContent" | b"w:pict" | b"mc:Fallback" => {
+                    /* Issue #120 — a block-level container (`<w:sdt>`
+                    content control, `<w:customXml>`): its inner blocks stay
+                    body blocks; the envelope around them is tracked. */
+                    b"w:sdt" | b"w:customXml" if at_block_level => {
+                        envelopes.open_container(prev_pos);
+                        envelopes.set_blocks_at_open(out_blocks.len());
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    /* The container's property children carry `<w:rPr>` /
+                    `<w:pPr>`-shaped content that must not leak into the
+                    live state; the bytes are inside the envelope's opener. */
+                    b"w:sdtPr" | b"w:sdtEndPr" | b"w:customXmlPr"
+                        if at_block_level && envelopes.in_container() =>
+                    {
                         let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
+                    }
+                    /* Issue #112 — the block container opens. */
+                    b"w:body" if root_is_document && !in_block_container && in_tbl == 0 => {
+                        let pos = reader.buffer_position() as usize;
+                        if !envelope.body_tag.is_empty() {
+                            envelope_invalid = true;
+                        }
+                        envelope.root_to_body = xml[root_end..prev_pos].to_vec();
+                        envelope.body_tag = xml[prev_pos..pos].to_vec();
+                        in_block_container = true;
+                        prev_pos = pos;
+                        buf.clear();
+                        continue;
+                    }
+                    b"w:footnote" | b"w:endnote" | b"w:comment"
+                        if !in_block_container && p_start_byte.is_none() && in_tbl == 0 =>
+                    {
+                        in_block_container = true;
                         prev_pos = reader.buffer_position() as usize;
                         buf.clear();
                         continue;
@@ -818,6 +1095,7 @@ pub fn parse_document_xml_with_warnings(
                         *before* this event was read (= where the `<` of
                         `<w:p>` lives in the source). */
                         p_start_byte = Some(prev_pos);
+                        envelopes.note_block_start(prev_pos);
                         p_style_id = None;
                         direct_ppr = ParaProperties::default();
                         pmark_rpr = SpanStyle::default();
@@ -859,93 +1137,18 @@ pub fn parse_document_xml_with_warnings(
                     b"w:tabs" if in_ppr => in_tabs = true,
                     b"w:sectPr" => {
                         /* Phase 6 — open a fresh accumulator. Inline (inside
-                        a `<w:pPr>`) and body-level both route here. */
+                        a `<w:pPr>`) and body-level both route here. Issue
+                        #112 — remember where the element starts so its
+                        bytes ride the section; at body level, whatever
+                        block-level markup is still pending (whitespace,
+                        a bookmark end) attaches after the last block, ahead
+                        of the sectPr. */
                         in_sect_pr = true;
                         cur_sect = SectPrAccum::default();
-                    }
-                    b"w:drawing" => {
-                        in_drawing = true;
-                        in_wp_inline = false;
-                        cur_drawing_rel_id = None;
-                        cur_drawing_cx = None;
-                        cur_drawing_cy = None;
-                        drawing_start = prev_pos;
-                        cur_tb = None;
-                        cur_tb_has_story = false;
-                        cur_tb_ranges.clear();
-                    }
-                    b"mc:AlternateContent" if alt_start.is_none() => {
-                        alt_start = Some(prev_pos);
-                        alt_text_box = None;
-                    }
-                    b"wps:wsp" if in_drawing => {
-                        cur_tb = Some(Box::default());
-                    }
-                    b"wps:bodyPr" if cur_tb.is_some() => {
-                        if let Some(tb) = cur_tb.as_mut() {
-                            textbox::apply_body_pr(&e, tb);
+                        sect_pr_start = Some(prev_pos);
+                        if at_block_level {
+                            envelopes.finish(&mut out_blocks);
                         }
-                    }
-                    b"wps:spPr" if cur_tb.is_some() => {
-                        let frag = capture_subtree(xml, prev_pos, &mut reader, &e)?;
-                        if let (Some(f), Some(tb)) = (frag.as_deref(), cur_tb.as_mut()) {
-                            textbox::apply_sp_pr(f, tb);
-                        }
-                    }
-                    b"wp:inline" if in_drawing => {
-                        in_wp_inline = true;
-                    }
-                    b"wp:anchor" if in_drawing => {
-                        in_wp_anchor = true;
-                        cur_anchor = Some(Box::new(anchor_from_start_tag(&e)));
-                    }
-                    b"wp:positionH" if in_wp_anchor => {
-                        anchor_axis = Some(AnchorAxis::H);
-                        if let Some(a) = cur_anchor.as_mut() {
-                            a.position_h.relative_from =
-                                h_relative_from(attr_val(&e, b"relativeFrom").as_deref());
-                        }
-                    }
-                    b"wp:positionV" if in_wp_anchor => {
-                        anchor_axis = Some(AnchorAxis::V);
-                        if let Some(a) = cur_anchor.as_mut() {
-                            a.position_v.relative_from =
-                                v_relative_from(attr_val(&e, b"relativeFrom").as_deref());
-                        }
-                    }
-                    b"wp:posOffset" if anchor_axis.is_some() => {
-                        anchor_offset = Some((AnchorOffsetKind::PosOffset, String::new()));
-                    }
-                    b"wp:align" if anchor_axis.is_some() => {
-                        anchor_offset = Some((AnchorOffsetKind::Align, String::new()));
-                    }
-                    b"wp14:pctPosHOffset" | b"wp14:pctPosVOffset" if anchor_axis.is_some() => {
-                        anchor_offset = Some((AnchorOffsetKind::Percent, String::new()));
-                    }
-                    n if in_wp_anchor && is_wrap_element(n) => {
-                        /* Wrap element with children (`<wp:wrapTight>` +
-                        `<wp:wrapPolygon>`, or `<wp:wrapSquare>` carrying
-                        an `<wp:effectExtent>`): consume the subtree and
-                        keep its bytes. */
-                        let frag = capture_subtree(xml, prev_pos, &mut reader, &e)?;
-                        if let Some(a) = cur_anchor.as_mut() {
-                            a.wrap = wrap_kind_of(n).unwrap_or_default();
-                            a.wrap_xml = frag.and_then(|f| String::from_utf8(f).ok());
-                            apply_wrap_fragment(a);
-                        }
-                    }
-                    b"wp:docPr" if in_wp_anchor => {
-                        let frag = capture_subtree(xml, prev_pos, &mut reader, &e)?;
-                        if let Some(a) = cur_anchor.as_mut() {
-                            a.doc_pr_xml = frag.and_then(|f| String::from_utf8(f).ok());
-                        }
-                    }
-                    b"wp:extent" if in_drawing => {
-                        cur_drawing_cx = attr_val(&e, b"cx").and_then(|v| v.parse().ok());
-                        cur_drawing_cy = attr_val(&e, b"cy").and_then(|v| v.parse().ok());
-                    }
-                    b"a:blip" if in_drawing => {
-                        cur_drawing_rel_id = attr_val(&e, b"r:embed");
                     }
                     b"w:hyperlink" => {
                         let start = (para_text.len() + run_text.len()) as u32;
@@ -1046,7 +1249,76 @@ pub fn parse_document_xml_with_warnings(
                     buf.clear();
                     continue;
                 }
+                let at_block_level =
+                    in_block_container && p_start_byte.is_none() && in_tbl == 0 && !in_sect_pr;
                 match name.as_ref() {
+                    b"w:p" if at_block_level => {
+                        /* Issue #120 — a self-closing `<w:p …/>` (an empty
+                        paragraph whose properties are attributes only:
+                        rsids, `w14:paraId`). quick-xml reports it as ONE
+                        `Empty` event, so the Start / End arms never see it
+                        and the paragraph used to vanish. Same block as an
+                        empty `<w:p></w:p>`: default cascade, its own bytes
+                        for the passthrough. */
+                        let end = reader.buffer_position() as usize;
+                        envelopes.note_block_start(prev_pos);
+                        let source_xml = slice_element(xml, prev_pos, end, b"w:p");
+                        let (props, _) = resolver.resolve_paragraph(
+                            None,
+                            ParaProperties::default(),
+                            SpanStyle::default(),
+                        );
+                        let list_item = props.list_item;
+                        out_blocks.push(Block::Paragraph(Paragraph {
+                            props,
+                            list_item,
+                            source_xml,
+                            body_xml: envelopes.take_before(),
+                            ..Paragraph::default()
+                        }));
+                        envelopes.note_block_end(end);
+                    }
+                    b"w:sectPr" => {
+                        /* An empty `<w:sectPr/>` — stock page setup. Issue
+                        #112: its bytes ride the section like a full one. */
+                        let end = reader.buffer_position() as usize;
+                        if at_block_level {
+                            envelopes.finish(&mut out_blocks);
+                        }
+                        let taken = SectPrAccum {
+                            source_xml: slice_element(xml, prev_pos, end, b"w:sectPr"),
+                            ..SectPrAccum::default()
+                        };
+                        if in_ppr {
+                            pending_paragraph_sect = Some(taken);
+                        } else {
+                            let block_end = out_blocks.len() as u32;
+                            if block_end > sect_start_block {
+                                out_sections.push(taken.into_section(
+                                    sect_start_block,
+                                    block_end,
+                                    default_page_geometry,
+                                ));
+                                sect_start_block = block_end;
+                            } else {
+                                trailing_sect_without_blocks = Some(taken);
+                            }
+                            if in_block_container {
+                                tail_start = Some(end);
+                            }
+                        }
+                    }
+                    /* Issue #120 — block-level range markers and other
+                    self-contained body children the model does not
+                    represent: verbatim, attached to the following block
+                    (or after the last one). Comment range markers are
+                    ALSO recorded as ranges in their own arms below. */
+                    n if at_block_level && is_block_level_marker(n) => {
+                        let end = reader.buffer_position() as usize;
+                        if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                            envelopes.push_verbatim(frag);
+                        }
+                    }
                     b"w:pStyle" if in_ppr => {
                         p_style_id = attr_val(&e, b"w:val");
                     }
@@ -1058,50 +1330,6 @@ pub fn parse_document_xml_with_warnings(
                     }
                     b"w:ilvl" if in_num_pr => {
                         list_ilvl = attr_val(&e, b"w:val").and_then(|v| v.parse().ok());
-                    }
-                    b"wp:extent" if in_drawing => {
-                        cur_drawing_cx = attr_val(&e, b"cx").and_then(|v| v.parse().ok());
-                        cur_drawing_cy = attr_val(&e, b"cy").and_then(|v| v.parse().ok());
-                    }
-                    b"a:blip" if in_drawing => {
-                        cur_drawing_rel_id = attr_val(&e, b"r:embed");
-                    }
-                    /* Issue #83 — `<wps:bodyPr …/>` / `<a:spAutoFit/>`. */
-                    b"wps:bodyPr" if cur_tb.is_some() => {
-                        if let Some(tb) = cur_tb.as_mut() {
-                            textbox::apply_body_pr(&e, tb);
-                        }
-                    }
-                    b"a:spAutoFit" if cur_tb.is_some() => {
-                        if let Some(tb) = cur_tb.as_mut() {
-                            tb.auto_fit = true;
-                        }
-                    }
-                    b"wp:simplePos" if in_wp_anchor => {
-                        if let Some(a) = cur_anchor.as_mut() {
-                            a.simple_pos_x_emu =
-                                attr_val(&e, b"x").and_then(|v| v.parse().ok()).unwrap_or(0);
-                            a.simple_pos_y_emu =
-                                attr_val(&e, b"y").and_then(|v| v.parse().ok()).unwrap_or(0);
-                        }
-                    }
-                    n if in_wp_anchor && is_wrap_element(n) => {
-                        /* Empty wrap element (`<wp:wrapNone/>`,
-                        `<wp:wrapSquare wrapText="bothSides"/>`, …). */
-                        let end = reader.buffer_position() as usize;
-                        if let Some(a) = cur_anchor.as_mut() {
-                            a.wrap = wrap_kind_of(n).unwrap_or_default();
-                            a.wrap_xml = slice_fragment(xml, prev_pos, end)
-                                .and_then(|f| String::from_utf8(f).ok());
-                            apply_wrap_fragment(a);
-                        }
-                    }
-                    b"wp:docPr" if in_wp_anchor => {
-                        let end = reader.buffer_position() as usize;
-                        if let Some(a) = cur_anchor.as_mut() {
-                            a.doc_pr_xml = slice_fragment(xml, prev_pos, end)
-                                .and_then(|f| String::from_utf8(f).ok());
-                        }
                     }
                     b"w:tab" if in_run => {
                         /* Audit gap A.M5 — `<w:tab/>` inside a `<w:r>`.
@@ -1167,6 +1395,7 @@ pub fn parse_document_xml_with_warnings(
                                 at,
                                 kind,
                                 anchor: None,
+                                source_xml: None,
                             });
                         }
                     }
@@ -1187,6 +1416,7 @@ pub fn parse_document_xml_with_warnings(
                             at,
                             kind: engine::InlineKind::NoteSelfRef { kind },
                             anchor: None,
+                            source_xml: None,
                         });
                     }
                     b"w:bookmarkStart" if in_tbl == 0 && p_start_byte.is_some() => {
@@ -1206,6 +1436,14 @@ pub fn parse_document_xml_with_warnings(
                             let off = (para_text.len() + run_text.len()) as u32;
                             open_comment_ranges.insert(id, (block_idx, off));
                         }
+                        /* Issue #120 — between two blocks the marker is
+                        body markup the writer never regenerates. */
+                        if at_block_level {
+                            let end = reader.buffer_position() as usize;
+                            if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                                envelopes.push_verbatim(frag);
+                            }
+                        }
                     }
                     b"w:commentRangeEnd" => {
                         if let Some(id) = attr_val(&e, b"w:id").and_then(|v| v.parse().ok())
@@ -1224,6 +1462,12 @@ pub fn parse_document_xml_with_warnings(
                                     offset: end_off,
                                 },
                             });
+                        }
+                        if at_block_level {
+                            let end = reader.buffer_position() as usize;
+                            if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                                envelopes.push_verbatim(frag);
+                            }
                         }
                     }
                     b"w:commentReference" => {
@@ -1302,11 +1546,34 @@ pub fn parse_document_xml_with_warnings(
             Event::Text(t) if (in_text_elt || in_del_text_elt) && in_tbl == 0 => {
                 run_text.push_str(&t.unescape()?);
             }
-            Event::Text(t) if anchor_offset.is_some() && in_tbl == 0 => {
-                /* Issue #69 — `<wp:posOffset>` / `<wp:align>` / wp14
-                percentage text of the open positioning axis. */
-                if let Some((_, buf_s)) = anchor_offset.as_mut() {
-                    buf_s.push_str(&t.unescape()?);
+            Event::Text(t)
+                if in_block_container
+                    && p_start_byte.is_none()
+                    && in_tbl == 0
+                    && !in_sect_pr
+                    && tail_start.is_none()
+                    && t.iter().all(u8::is_ascii_whitespace) =>
+            {
+                /* Issue #120 — character data between two blocks: the
+                whitespace of a pretty-printed part. Anything else there
+                is not schema-valid and is dropped as before. */
+                let end = reader.buffer_position() as usize;
+                if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                    envelopes.push_verbatim(frag);
+                }
+            }
+            Event::Comment(_) | Event::PI(_) | Event::CData(_)
+                if in_block_container
+                    && p_start_byte.is_none()
+                    && in_tbl == 0
+                    && !in_sect_pr
+                    && tail_start.is_none() =>
+            {
+                /* Issue #120 — an XML comment / processing instruction
+                between two blocks rides the following block verbatim. */
+                let end = reader.buffer_position() as usize;
+                if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                    envelopes.push_verbatim(frag);
                 }
             }
             Event::Text(t) if in_instr_text && in_tbl == 0 => {
@@ -1356,7 +1623,9 @@ pub fn parse_document_xml_with_warnings(
                                 rows,
                                 dirty: false,
                                 source_xml,
+                                body_xml: envelopes.take_before(),
                             }));
+                            envelopes.note_block_end(tbl_end_byte);
                         }
                     }
                     prev_pos = reader.buffer_position() as usize;
@@ -1393,156 +1662,36 @@ pub fn parse_document_xml_with_warnings(
                     b"w:numPr" => in_num_pr = false,
                     b"w:pBdr" => in_pbdr = false,
                     b"w:tabs" => in_tabs = false,
-                    b"wp:posOffset"
-                    | b"wp:align"
-                    | b"wp14:pctPosHOffset"
-                    | b"wp14:pctPosVOffset" => {
-                        /* Issue #69 — seal the offset onto the open axis. */
-                        if let (Some((kind, text)), Some(axis), Some(a)) =
-                            (anchor_offset.take(), anchor_axis, cur_anchor.as_mut())
-                            && let Some(offset) = parse_offset(kind, &text)
-                        {
-                            match axis {
-                                AnchorAxis::H => a.position_h.offset = offset,
-                                AnchorAxis::V => a.position_v.offset = offset,
+                    /* Issue #120 — a block-level container closes: its
+                    envelope lands on its first / last inner block (or, with
+                    no inner block, rides whole as one verbatim fragment). A
+                    run-level `</w:sdt>` (inside a paragraph) never gets
+                    here — `p_start_byte` is set. */
+                    b"w:sdt" | b"w:customXml"
+                        if in_block_container
+                            && p_start_byte.is_none()
+                            && !in_sect_pr
+                            && envelopes.in_container() =>
+                    {
+                        let end = reader.buffer_position() as usize;
+                        envelopes.close_container(xml, end, &mut out_blocks);
+                    }
+                    /* Issue #112 / #120 — the block container closes: pending
+                    markers attach after the last block; for `<w:body>` the
+                    tail (`</w:body>` … EOF, or from just after the trailing
+                    sectPr) completes the document envelope. */
+                    b"w:body" | b"w:hdr" | b"w:ftr" | b"w:footnote" | b"w:endnote"
+                    | b"w:comment"
+                        if in_block_container && p_start_byte.is_none() && !in_sect_pr =>
+                    {
+                        envelopes.finish(&mut out_blocks);
+                        if name.as_ref() == b"w:body" && root_is_document {
+                            let start = tail_start.take().unwrap_or(prev_pos);
+                            if start <= xml.len() && valid_document_tail(&xml[start..]) {
+                                envelope.tail = xml[start..].to_vec();
                             }
                         }
-                    }
-                    b"wp:positionH" | b"wp:positionV" => anchor_axis = None,
-                    b"wp:anchor" => {
-                        /* Like `</wp:inline>` below: the flag is read by
-                        the `</w:drawing>` handler, which does the reset. */
-                    }
-                    b"wp:inline" => {
-                        /* Don't clear `in_wp_inline` on the inline close —
-                        it's structurally a child of `<w:drawing>`, so the
-                        outer `</w:drawing>` handler is the one that needs
-                        to see "this drawing wrapped an inline picture"
-                        (vs anchor / floating) when it decides whether to
-                        push the inline object. Clearing here would race
-                        the two close handlers: `</wp:inline>` always
-                        fires before `</w:drawing>`, leaving the outer
-                        check with `in_wp_inline == false` and the image
-                        silently dropped. The drawing-close handler does
-                        the full reset for both flags. */
-                    }
-                    b"w:drawing" => {
-                        if in_drawing
-                            && (in_wp_inline || in_wp_anchor)
-                            && cur_tb_has_story
-                            && let Some(mut tb) = cur_tb.take()
-                            && let (Some(cx), Some(cy)) = (cur_drawing_cx, cur_drawing_cy)
-                        {
-                            /* Issue #83 — a shape with a story: a text box
-                            on the same U+FFFC anchor an image uses. */
-                            let end = reader.buffer_position() as usize;
-                            let at = (para_text.len() + run_text.len()) as u32;
-                            run_text.push('\u{FFFC}');
-                            if alt_start.is_some() {
-                                /* Sealed on `</mc:AlternateContent>`. */
-                                alt_text_box = Some((
-                                    para_inline_objects.len(),
-                                    std::mem::take(&mut cur_tb_ranges),
-                                ));
-                            } else {
-                                tb.source_xml = xml
-                                    .get(drawing_start..end)
-                                    .and_then(|b| std::str::from_utf8(b).ok())
-                                    .map(str::to_string);
-                                tb.story_ranges = cur_tb_ranges
-                                    .drain(..)
-                                    .map(|(s, e)| {
-                                        ((s - drawing_start) as u32, (e - drawing_start) as u32)
-                                    })
-                                    .collect();
-                                tb.host_range = p_start_byte
-                                    .filter(|p| *p <= drawing_start)
-                                    .map(|p| ((drawing_start - p) as u32, (end - p) as u32));
-                            }
-                            para_inline_objects.push(engine::InlineObject {
-                                at,
-                                kind: engine::InlineKind::TextBox {
-                                    width_emu: cx,
-                                    height_emu: cy,
-                                    story: tb,
-                                },
-                                anchor: if in_wp_anchor {
-                                    cur_anchor.take()
-                                } else {
-                                    None
-                                },
-                            });
-                            cur_drawing_rel_id = None;
-                            cur_drawing_cx = None;
-                            cur_drawing_cy = None;
-                        } else if in_drawing
-                            && (in_wp_inline || in_wp_anchor)
-                            && let Some(rid) = cur_drawing_rel_id.take()
-                            && let (Some(cx), Some(cy)) =
-                                (cur_drawing_cx.take(), cur_drawing_cy.take())
-                        {
-                            /* Inject U+FFFC as the inline object's anchor
-                            character. Position in the eventual `para_text` =
-                            `para_text.len()` (already flushed runs) +
-                            `run_text.len()` (this run's text so far).
-                            Issue #69 — a `<wp:anchor>` picture takes the
-                            same sentinel; its placement rides `anchor`. */
-                            let at = (para_text.len() + run_text.len()) as u32;
-                            run_text.push('\u{FFFC}');
-                            para_inline_objects.push(engine::InlineObject {
-                                at,
-                                kind: engine::InlineKind::Image {
-                                    rel_id: rid,
-                                    width_emu: cx,
-                                    height_emu: cy,
-                                },
-                                anchor: if in_wp_anchor {
-                                    cur_anchor.take()
-                                } else {
-                                    None
-                                },
-                            });
-                        } else {
-                            /* Shape / text box (no blip) or malformed — drop. */
-                            cur_drawing_rel_id = None;
-                            cur_drawing_cx = None;
-                            cur_drawing_cy = None;
-                        }
-                        in_drawing = false;
-                        in_wp_inline = false;
-                        in_wp_anchor = false;
-                        cur_anchor = None;
-                        anchor_axis = None;
-                        anchor_offset = None;
-                        cur_tb = None;
-                        cur_tb_has_story = false;
-                        cur_tb_ranges.clear();
-                    }
-                    b"mc:AlternateContent" => {
-                        /* Issue #83 — seal a text box read in this
-                        element's choice: the whole AlternateContent is
-                        its verbatim container. */
-                        if let Some(start) = alt_start.take() {
-                            let end = reader.buffer_position() as usize;
-                            if let Some((idx, mut ranges)) = alt_text_box.take()
-                                && let Some(io) = para_inline_objects.get_mut(idx)
-                                && let engine::InlineKind::TextBox { story, .. } = &mut io.kind
-                            {
-                                ranges.sort_unstable();
-                                story.source_xml = xml
-                                    .get(start..end)
-                                    .and_then(|b| std::str::from_utf8(b).ok())
-                                    .map(str::to_string);
-                                story.story_ranges = ranges
-                                    .into_iter()
-                                    .filter(|(s, e)| *s >= start && *e <= end)
-                                    .map(|(s, e)| ((s - start) as u32, (e - start) as u32))
-                                    .collect();
-                                story.host_range = p_start_byte
-                                    .filter(|p| *p <= start)
-                                    .map(|p| ((start - p) as u32, (end - p) as u32));
-                            }
-                        }
+                        in_block_container = false;
                     }
                     b"w:fldSimple" => {
                         /* Issue #43 — seal the compact field. A result-
@@ -1581,34 +1730,29 @@ pub fn parse_document_xml_with_warnings(
                         paragraph) → finalize a section covering everything
                         from `sect_start_block` to the current block count. */
                         in_sect_pr = false;
-                        let taken = std::mem::take(&mut cur_sect);
+                        let mut taken = std::mem::take(&mut cur_sect);
+                        /* Issue #112 — the element's own bytes ride the
+                        section for the writer's verified passthrough. */
+                        let end_byte = reader.buffer_position() as usize;
+                        taken.source_xml = sect_pr_start
+                            .take()
+                            .and_then(|s| slice_element(xml, s, end_byte, b"w:sectPr"));
                         if in_ppr {
                             pending_paragraph_sect = Some(taken);
                         } else {
                             let end = out_blocks.len() as u32;
                             if end > sect_start_block {
-                                let header_refs = taken.header_refs.clone();
-                                let footer_refs = taken.footer_refs.clone();
-                                let title_pg = taken.title_pg;
-                                let columns = taken.columns.unwrap_or_default();
-                                let page_num = taken.page_num.unwrap_or_default();
-                                let section_type = taken.section_type;
-                                let footnote_props = taken.footnote_props;
-                                let endnote_props = taken.endnote_props;
-                                out_sections.push(Section {
-                                    geometry: taken.into_geometry(default_page_geometry),
-                                    start_block: sect_start_block,
-                                    end_block: end,
-                                    header_refs,
-                                    footer_refs,
-                                    title_pg,
-                                    columns,
-                                    page_num,
-                                    section_type,
-                                    footnote_props,
-                                    endnote_props,
-                                });
+                                out_sections.push(taken.into_section(
+                                    sect_start_block,
+                                    end,
+                                    default_page_geometry,
+                                ));
                                 sect_start_block = end;
+                            } else {
+                                trailing_sect_without_blocks = Some(taken);
+                            }
+                            if in_block_container {
+                                tail_start = Some(end_byte);
                             }
                         }
                     }
@@ -1630,6 +1774,11 @@ pub fn parse_document_xml_with_warnings(
                         by the length of whichever run most recently closed. */
                         run_text.clear();
                         if start == end {
+                            /* Issue #120 — keep `prev_pos` current (the
+                            loop's tail is skipped): the next event may be
+                            a captured element whose slice starts here. */
+                            prev_pos = reader.buffer_position() as usize;
+                            buf.clear();
                             continue;
                         }
                         /* Issue #29 — spans carry only what the STYLE TABLE
@@ -1721,7 +1870,12 @@ pub fn parse_document_xml_with_warnings(
                             below. */
                             section_end: None,
                             bookmarks: std::mem::take(&mut para_bookmarks),
+                            /* Issue #120 — the block-level markup pending
+                            since the previous block (bookmarks, an sdt
+                            opener, whitespace) attaches before this one. */
+                            body_xml: envelopes.take_before(),
                         }));
+                        envelopes.note_block_end(p_end_byte);
                         /* Phase 6 — inline `<w:sectPr>` ends the section at this
                         paragraph. Emit a `Section` covering everything since
                         the last break; the next paragraph starts a fresh
@@ -1729,27 +1883,11 @@ pub fn parse_document_xml_with_warnings(
                         if let Some(sect) = pending_paragraph_sect.take() {
                             let end = out_blocks.len() as u32;
                             if end > sect_start_block {
-                                let header_refs = sect.header_refs.clone();
-                                let footer_refs = sect.footer_refs.clone();
-                                let title_pg = sect.title_pg;
-                                let columns = sect.columns.unwrap_or_default();
-                                let page_num = sect.page_num.unwrap_or_default();
-                                let section_type = sect.section_type;
-                                let footnote_props = sect.footnote_props;
-                                let endnote_props = sect.endnote_props;
-                                out_sections.push(Section {
-                                    geometry: sect.into_geometry(default_page_geometry),
-                                    start_block: sect_start_block,
-                                    end_block: end,
-                                    header_refs,
-                                    footer_refs,
-                                    title_pg,
-                                    columns,
-                                    page_num,
-                                    section_type,
-                                    footnote_props,
-                                    endnote_props,
-                                });
+                                out_sections.push(sect.into_section(
+                                    sect_start_block,
+                                    end,
+                                    default_page_geometry,
+                                ));
                                 sect_start_block = end;
                             }
                         }
@@ -1773,23 +1911,31 @@ pub fn parse_document_xml_with_warnings(
     no-op. */
     let total = out_blocks.len() as u32;
     if total > sect_start_block {
-        out_sections.push(Section {
-            geometry: default_page_geometry,
-            start_block: sect_start_block,
-            end_block: total,
-            header_refs: HeaderFooterRefs::default(),
-            footer_refs: HeaderFooterRefs::default(),
-            title_pg: false,
-            columns: engine::ColumnSpec::single(),
-            page_num: engine::PageNumType::default(),
-            section_type: engine::SectionType::default(),
-            footnote_props: engine::NoteProps::default(),
-            endnote_props: engine::NoteProps::default(),
-        });
+        out_sections.push(SectPrAccum::default().into_section(
+            sect_start_block,
+            total,
+            default_page_geometry,
+        ));
+    }
+    /* A part that never closed its block container (truncated input):
+    attach what is still pending rather than losing it. */
+    if in_block_container {
+        envelopes.finish(&mut out_blocks);
     }
 
+    let no_sections = out_sections.is_empty();
     let mut tree = DocumentTree::from_blocks_with_sections(out_blocks, out_sections);
+    if no_sections && let Some(acc) = trailing_sect_without_blocks {
+        tree.body_section =
+            engine::SectionProps::from(&acc.into_section(0, 0, default_page_geometry));
+    }
     tree.comment_ranges = out_comment_ranges;
+    /* Issue #112 — only a complete envelope (root tag, `<w:body>` tag and
+    a validated tail) is worth re-emitting; anything less means the
+    writer synthesizes the stock header + footer as before. */
+    if envelope.is_captured() && !envelope_invalid {
+        tree.document_envelope = envelope;
+    }
     Ok(tree)
 }
 
@@ -2086,11 +2232,12 @@ mod tests {
         }
     }
 
-    /// A `<wp:anchor>` around a shape / text box has no `<a:blip>`: it is
-    /// dropped exactly as before #69 (issue #119 owns text boxes), and the
-    /// paragraph text around it survives with NO stray sentinel.
+    /// A `<wp:anchor>` around a shape / text box has no `<a:blip>`: issue
+    /// #119 keeps it as an opaque object (its extent + anchor typed, no
+    /// picture, the bytes verbatim) instead of dropping it, and the
+    /// paragraph text around it survives with exactly one sentinel.
     #[test]
-    fn anchored_shape_without_blip_is_dropped_not_misread_as_a_picture() {
+    fn anchored_shape_without_blip_is_preserved_not_misread_as_a_picture() {
         let body = concat!(
             r#"<w:p><w:r><w:t>a</w:t></w:r><w:r><w:drawing>"#,
             r#"<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" "#,
@@ -2107,8 +2254,19 @@ mod tests {
         );
         let tree = parse_body(body);
         let p = tree.blocks[0].as_paragraph().expect("paragraph");
-        assert_eq!(p.text, "ab");
-        assert!(p.inline_objects.is_empty());
+        assert_eq!(p.text, "a\u{FFFC}b");
+        assert_eq!(p.inline_objects.len(), 1);
+        let obj = &p.inline_objects[0];
+        assert!(
+            matches!(&obj.kind, engine::InlineKind::Image { rel_id, width_emu: 100, height_emu: 100 } if rel_id.is_empty())
+        );
+        assert!(obj.anchor.is_some(), "the anchor placement is typed");
+        assert!(
+            obj.source_xml
+                .as_deref()
+                .is_some_and(|s| s.starts_with(b"<w:drawing>") && s.ends_with(b"</w:drawing>")),
+            "the whole drawing rides the object verbatim"
+        );
     }
 
     /// Issue #119 rider — a text box's `<w:txbxContent><w:p>` is a sub-
@@ -2144,6 +2302,12 @@ mod tests {
         assert_eq!(tree.blocks.len(), 2, "only the two body paragraphs");
         let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
         assert_eq!(p0.text, "a\u{FFFC}b");
+        assert_eq!(p0.inline_objects.len(), 1, "the text box is one object");
+        assert!(
+            matches!(&p0.inline_objects[0].kind, engine::InlineKind::TextBox { story, .. }
+                if story.source_xml.as_deref().is_some_and(|s| s.starts_with("<w:drawing>"))),
+            "issue #83 — a story-carrying shape is a text box with its container verbatim"
+        );
         let src = p0
             .source_xml
             .as_deref()
@@ -2313,6 +2477,16 @@ mod tests {
         assert_eq!(tree.blocks.len(), 1);
         let p0 = tree.blocks[0].as_paragraph().expect("paragraph 0");
         assert_eq!(p0.text, "a\u{FFFC}b");
+        assert_eq!(
+            p0.inline_objects.len(),
+            1,
+            "the AlternateContent is one object"
+        );
+        assert!(
+            matches!(&p0.inline_objects[0].kind, engine::InlineKind::TextBox { story, .. }
+                if story.source_xml.as_deref().is_some_and(|s| s.starts_with("<mc:AlternateContent") && s.ends_with("</mc:AlternateContent>"))),
+            "choice + fallback ride the text box's container verbatim"
+        );
         assert!(p0.source_xml.is_some(), "passthrough capture intact");
         /* Issue #83 — ONE text box (the choice); its container is the
         whole AlternateContent and both story elements are splice
@@ -2349,5 +2523,174 @@ mod tests {
             p0.source_xml.as_deref(),
             Some(b"<w:p><w:r><w:t>first</w:t></w:r></w:p>".as_slice()),
         );
+    }
+
+    /* ---------------------------------------------------------------
+    Issues #120 / #112 — block-level passthrough + the document envelope.
+    --------------------------------------------------------------- */
+
+    fn parse_full(xml: &str) -> DocumentTree {
+        let table = StyleTable::default();
+        let resolver = StyleResolver::new(&table);
+        parse_document_xml(xml.as_bytes(), &resolver).expect("parse")
+    }
+
+    #[test]
+    fn self_closing_paragraph_is_a_block_with_its_bytes() {
+        let tree = parse_body(
+            r#"<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p w:rsidR="00A1"/><w:p><w:r><w:t>c</w:t></w:r></w:p>"#,
+        );
+        assert_eq!(tree.blocks.len(), 3);
+        let p1 = tree.blocks[1].as_paragraph().expect("empty paragraph");
+        assert_eq!(p1.text, "");
+        assert!(!p1.dirty);
+        assert_eq!(
+            p1.source_xml.as_deref(),
+            Some(br#"<w:p w:rsidR="00A1"/>"#.as_slice())
+        );
+        assert_eq!(tree.blocks[2].as_paragraph().unwrap().text, "c");
+    }
+
+    #[test]
+    fn body_level_markup_lands_on_the_neighbouring_blocks() {
+        use engine::BodyFragment;
+        let tree = parse_body(concat!(
+            r#"<w:bookmarkStart w:id="0" w:name="b"/>"#,
+            r#"<w:sdt><w:sdtPr><w:rPr><w:b/></w:rPr></w:sdtPr><w:sdtContent>"#,
+            r#"<w:p><w:r><w:t>one</w:t></w:r></w:p>"#,
+            " ",
+            r#"<w:p><w:r><w:t>two</w:t></w:r></w:p>"#,
+            r#"</w:sdtContent></w:sdt>"#,
+            r#"<w:bookmarkEnd w:id="0"/>"#,
+            r#"<w:p><w:r><w:t>three</w:t></w:r></w:p>"#,
+            r#"<w:proofErr w:type="gramEnd"/>"#,
+        ));
+        assert_eq!(tree.blocks.len(), 3);
+        let p0 = tree.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p0.text, "one");
+        assert!(p0.spans.is_empty(), "the sdtPr rPr never leaks into runs");
+        let b0 = p0.body_xml.as_deref().expect("markup before block 0");
+        assert!(
+            matches!(&b0.before[0], BodyFragment::Verbatim { xml } if xml == br#"<w:bookmarkStart w:id="0" w:name="b"/>"#)
+        );
+        assert!(
+            matches!(&b0.before[1], BodyFragment::Open { id: 0, open_xml, close_xml }
+            if open_xml == b"<w:sdt><w:sdtPr><w:rPr><w:b/></w:rPr></w:sdtPr><w:sdtContent>"
+            && close_xml == b"</w:sdtContent></w:sdt>")
+        );
+        assert!(b0.after.is_empty());
+        let p1 = tree.blocks[1].as_paragraph().unwrap();
+        let b1 = p1.body_xml.as_deref().expect("markup around block 1");
+        assert!(matches!(&b1.before[..], [BodyFragment::Verbatim { xml }] if xml == b" "));
+        assert!(matches!(&b1.after[..], [BodyFragment::Close { id: 0 }]));
+        /* A marker between two blocks attaches BEFORE the following block;
+        only markup after the last block attaches after it. */
+        let p2 = tree.blocks[2].as_paragraph().unwrap();
+        let b2 = p2
+            .body_xml
+            .as_deref()
+            .expect("markup around the last block");
+        assert!(
+            matches!(&b2.before[..], [BodyFragment::Verbatim { xml }] if xml == br#"<w:bookmarkEnd w:id="0"/>"#)
+        );
+        assert!(
+            matches!(&b2.after[..], [BodyFragment::Verbatim { xml }] if xml == br#"<w:proofErr w:type="gramEnd"/>"#)
+        );
+    }
+
+    #[test]
+    fn document_envelope_and_section_source_are_captured_verbatim() {
+        let xml = concat!(
+            "\u{FEFF}<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n",
+            r#"<w:document xmlns:mc="urn:mc" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" mc:Ignorable="w14">"#,
+            "\r\n<w:body>",
+            r#"<w:p><w:r><w:t>x</w:t></w:r></w:p>"#,
+            r#"<w:sectPr w:rsidR="00B4"><w:pgSz w:w="11906" w:h="16838"/><w:docGrid w:linePitch="360"/></w:sectPr>"#,
+            "\r\n</w:body>\r\n</w:document>\r\n",
+        );
+        let tree = parse_full(xml);
+        let env = &tree.document_envelope;
+        assert!(env.is_captured());
+        assert_eq!(
+            env.prolog,
+            "\u{FEFF}<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n".as_bytes()
+        );
+        assert!(
+            env.root_tag.starts_with(b"<w:document xmlns:mc=")
+                && env.root_tag.ends_with(b"mc:Ignorable=\"w14\">")
+        );
+        assert_eq!(env.root_to_body, b"\r\n");
+        assert_eq!(env.body_tag, b"<w:body>");
+        assert_eq!(env.tail, b"\r\n</w:body>\r\n</w:document>\r\n");
+        let src = tree
+            .body_section
+            .source_xml
+            .as_deref()
+            .expect("trailing sectPr bytes");
+        assert!(src.starts_with(b"<w:sectPr w:rsidR=") && src.ends_with(b"</w:sectPr>"));
+        /* The re-parse used by the writer's verified passthrough agrees
+        with what the body parser lowered. */
+        assert_eq!(
+            parse_sect_pr_fragment(src, PageGeometry::a4()),
+            tree.body_section.without_source()
+        );
+        /* An engine-authored tree has no envelope. */
+        assert!(!DocumentTree::from_text("x").document_envelope.is_captured());
+        /* A tail that is not `</w:body></w:document>` is refused. */
+        assert!(valid_document_tail(b"\n</w:body >\n</w:document>\n"));
+        assert!(!valid_document_tail(b"<w:p/></w:body></w:document>"));
+        assert!(!valid_document_tail(b"</w:body></w:document><!-- x -->"));
+    }
+
+    /// Issue #119 — a text box (root-bound `wps`) is an object with its
+    /// extent, no picture and its verbatim bytes; a VML picture inside a
+    /// run is an object too (no longer skipped).
+    #[test]
+    fn drawing_objects_keep_their_source_and_extent() {
+        let root = concat!(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+            r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+            r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+            r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" "#,
+            r#"xmlns:v="urn:schemas-microsoft-com:vml">"#,
+        );
+        let text_box = concat!(
+            r#"<w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" "#,
+            r#"behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/>"#,
+            r#"<wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+            r#"<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#,
+            r#"<wp:extent cx="100" cy="200"/><wp:wrapSquare wrapText="bothSides"/><wp:docPr id="1" name="Text Box 1"/>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+            r#"<wps:wsp><wps:txbx><w:txbxContent><w:p><w:r><w:t>inside</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp>"#,
+            r#"</a:graphicData></a:graphic></wp:anchor></w:drawing>"#,
+        );
+        let pict = r#"<w:pict><v:shape id="i1" style="width:72pt;height:36pt"><v:imagedata r:id="rId8"/></v:shape></w:pict>"#;
+        let xml = format!(
+            r#"{root}<w:body><w:p><w:r><w:t>a</w:t></w:r><w:r>{text_box}</w:r><w:r>{pict}</w:r><w:r><w:t>b</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p></w:body></w:document>"#
+        );
+        let tree = parse_full(&xml);
+        assert_eq!(tree.blocks.len(), 2, "the text box story is not hoisted");
+        let p = tree.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.text, "a\u{FFFC}\u{FFFC}b");
+        assert_eq!(p.inline_objects.len(), 2);
+        let tb = &p.inline_objects[0];
+        /* Issue #83 — a story-carrying shape is a text box; its container
+        is the whole drawing, verbatim. */
+        assert!(
+            matches!(&tb.kind, engine::InlineKind::TextBox { width_emu: 100, height_emu: 200, story }
+                if story.source_xml.as_deref() == Some(text_box) && story.body.len() == 1),
+            "{:?}",
+            tb.kind
+        );
+        let a = tb.anchor.as_deref().expect("floating text box");
+        assert_eq!(a.wrap, engine::WrapKind::Square);
+        let vml = &p.inline_objects[1];
+        assert!(
+            matches!(&vml.kind, engine::InlineKind::Image { rel_id, width_emu: 914_400, height_emu: 457_200 } if rel_id == "rId8")
+        );
+        assert!(vml.anchor.is_none());
+        assert_eq!(vml.source_xml.as_deref(), Some(pict.as_bytes()));
+        assert_eq!(tree.blocks[1].as_paragraph().unwrap().text, "second");
     }
 }

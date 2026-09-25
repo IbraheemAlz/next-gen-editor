@@ -114,6 +114,7 @@ fn gen_table(u: &mut Unstructured) -> Table {
         rows,
         dirty: false,
         source_xml: None,
+        body_xml: None,
     }
 }
 

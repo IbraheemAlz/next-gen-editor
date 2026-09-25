@@ -655,6 +655,7 @@ fn parse_img(body: &str) -> Option<InlineObject> {
             height_emu,
         },
         anchor: None,
+        source_xml: None,
     })
 }
 
@@ -908,6 +909,7 @@ fn parse_table_html(table_str: &str) -> Option<Table> {
         /* Pasted tables are engine-synthesised — no source bytes. */
         dirty: true,
         source_xml: None,
+        body_xml: None,
     })
 }
 
@@ -1047,6 +1049,7 @@ impl ParaBuilder {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         })
     }
 }
@@ -1163,6 +1166,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(to_html(&[p]), "<p>hello</p>");
     }
@@ -1186,6 +1190,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(to_html(&[p]), "<p>a &lt; b &amp; c</p>");
     }
@@ -1217,6 +1222,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         assert_eq!(
             to_html(&[p]),
@@ -1251,6 +1257,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         }];
         let parsed = from_html(&to_html(&original));
         assert_eq!(parsed.len(), 1);
@@ -1345,6 +1352,7 @@ mod tests {
             rows: vec![row],
             dirty: true,
             source_xml: None,
+            body_xml: None,
         }
     }
 
@@ -1399,6 +1407,7 @@ mod tests {
                     height_emu: 1_524_000, // 160 px @ 96 DPI
                 },
                 anchor: None,
+                source_xml: None,
             }],
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
@@ -1407,6 +1416,7 @@ mod tests {
             direct_overrides: ParaProperties::default(),
             section_end: None,
             bookmarks: Vec::new(),
+            body_xml: None,
         };
         let html = to_html(&[p]);
         assert!(html.contains("data-rel-id=\"rId7\""));
