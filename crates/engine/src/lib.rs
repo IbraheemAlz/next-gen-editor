@@ -59,6 +59,7 @@ use im::Vector;
 use serde::{Deserialize, Serialize};
 
 mod block_remap;
+pub use block_remap::CellMove;
 pub mod fields;
 mod text_remap;
 pub use text_remap::TextEdit;
@@ -9188,6 +9189,25 @@ impl DocumentTree {
     /// receives a single resolved insert position in `usize` and
     /// performs no signed arithmetic of its own.
     pub fn insert_row(&self, table_path: BlockPath, at: usize) -> Self {
+        /* Issue #253 — rows at/after the insert point move down one. */
+        let remap = self.mutated_table_shape(&table_path).map(|(tp, t)| {
+            let insert_at = at.min(t.rows.len()) as u32;
+            (tp, insert_at)
+        });
+        let mut out = self.insert_row_unmapped(table_path, at);
+        if let Some((tp, insert_at)) = remap {
+            out.remap_table_cells(&tp, |row, col| {
+                if row >= insert_at {
+                    CellMove::To { row: row + 1, col }
+                } else {
+                    CellMove::Keep
+                }
+            });
+        }
+        out
+    }
+
+    fn insert_row_unmapped(&self, table_path: BlockPath, at: usize) -> Self {
         self.mutate_table(table_path, |t| {
             /* Prefer the grid width: a merged first row has FEWER cells
             than the table has logical columns, and a fresh row must
@@ -9207,12 +9227,55 @@ impl DocumentTree {
     }
 
     pub fn delete_row(&self, table_path: BlockPath, row: u32) -> Self {
-        self.mutate_table(table_path, |t| {
+        /* Issue #253 — anchors in the deleted row move to the start of the
+        neighbouring row's first cell (the row below, else the one above);
+        rows below shift up. */
+        let remap = self
+            .mutated_table_shape(&table_path)
+            .filter(|(_, t)| (row as usize) < t.rows.len())
+            .map(|(tp, t)| (tp, t.rows.len() as u32));
+        let out = self.mutate_table(table_path, |t| {
             let i = row as usize;
             if i < t.rows.len() {
                 t.rows.remove(i);
             }
-        })
+        });
+        let Some((tp, rows_before)) = remap else {
+            return out;
+        };
+        let mut out = out;
+        out.remap_table_cells(&tp, |r, col| {
+            if r < row {
+                CellMove::Keep
+            } else if r > row {
+                CellMove::To { row: r - 1, col }
+            } else if row + 1 < rows_before {
+                CellMove::Collapse {
+                    row,
+                    col: 0,
+                    at_end: false,
+                }
+            } else {
+                /* The last row went: the row above (`row - 1`); with no
+                row left at all the collapse falls back past the table. */
+                CellMove::Collapse {
+                    row: row.saturating_sub(1),
+                    col: 0,
+                    at_end: row == 0,
+                }
+            }
+        });
+        out
+    }
+
+    /// Issue #253 — the top-level table `mutate_table` would restructure
+    /// for `table_path` (it addresses the table by the path's FIRST block
+    /// step), with its path. `None` when the command is a no-op.
+    fn mutated_table_shape(&self, table_path: &BlockPath) -> Option<(BlockPath, &Table)> {
+        let idx = top_level_block_index(table_path)?;
+        let tp = BlockPath::top(idx);
+        let t = self.blocks.get(idx as usize)?.as_table()?;
+        Some((tp, t))
     }
 
     /// Insert a column at `at` (new column occupies that index; rows
@@ -9220,6 +9283,28 @@ impl DocumentTree {
     /// appended. Sprint 2 (UI Edition) hotfix — same rationale as
     /// [`Self::insert_row`].
     pub fn insert_column(&self, table_path: BlockPath, at: usize) -> Self {
+        /* Issue #253 — per row, cells at/after the row's insert index
+        (mirrors the clamp below) move right one. */
+        let remap = self.mutated_table_shape(&table_path).map(|(tp, t)| {
+            let insert_at = at.min(t.grid.len());
+            let per_row: Vec<u32> = t
+                .rows
+                .iter()
+                .map(|r| insert_at.min(r.cells.len()) as u32)
+                .collect();
+            (tp, per_row)
+        });
+        let mut out = self.insert_column_unmapped(table_path, at);
+        if let Some((tp, per_row)) = remap {
+            out.remap_table_cells(&tp, |row, col| match per_row.get(row as usize) {
+                Some(&cell_at) if col >= cell_at => CellMove::To { row, col: col + 1 },
+                _ => CellMove::Keep,
+            });
+        }
+        out
+    }
+
+    fn insert_column_unmapped(&self, table_path: BlockPath, at: usize) -> Self {
         self.mutate_table(table_path, |t| {
             let insert_at = at.min(t.grid.len());
             /* Re-divide the A4 content width across the new column
@@ -9239,6 +9324,40 @@ impl DocumentTree {
     }
 
     pub fn delete_column(&self, table_path: BlockPath, col: u32) -> Self {
+        /* Issue #253 — per row: anchors in the deleted cell move to the
+        start of the cell that slides into its place (else the end of the
+        cell to its left); cells to the right shift left. */
+        let remap = self.mutated_table_shape(&table_path).map(|(tp, t)| {
+            let lens: Vec<u32> = t.rows.iter().map(|r| r.cells.len() as u32).collect();
+            (tp, lens)
+        });
+        let mut out = self.delete_column_unmapped(table_path, col);
+        if let Some((tp, lens)) = remap {
+            out.remap_table_cells(&tp, |row, c| {
+                let len = lens.get(row as usize).copied().unwrap_or(0);
+                if col >= len || c < col {
+                    CellMove::Keep
+                } else if c > col {
+                    CellMove::To { row, col: c - 1 }
+                } else if col + 1 < len {
+                    CellMove::Collapse {
+                        row,
+                        col,
+                        at_end: false,
+                    }
+                } else {
+                    CellMove::Collapse {
+                        row,
+                        col: col.saturating_sub(1),
+                        at_end: true,
+                    }
+                }
+            });
+        }
+        out
+    }
+
+    fn delete_column_unmapped(&self, table_path: BlockPath, col: u32) -> Self {
         self.mutate_table(table_path, |t| {
             let c = col as usize;
             if c < t.grid.len() {
@@ -9278,6 +9397,61 @@ impl DocumentTree {
         } else {
             (to_col, from_col)
         };
+        /* Issue #253 — mirror the merge on the PRE-mutation shape: per
+        affected row, the cells `c0 + 1 ..= c0 + drop` are removed (their
+        anchors — and those of the vertical continuation cells — collapse
+        onto the end of the merged owner `(r0, c0)`), cells past them shift
+        left by `drop`. */
+        let remap = self.mutated_table_shape(&table_path).and_then(|(tp, t)| {
+            let rcount = t.rows.len() as u32;
+            let last = (t.rows.get(r0 as usize)?.cells.len() as u32).checked_sub(1)?;
+            if c0 > last {
+                return None;
+            }
+            /* (row, cells dropped) for the owner row and each continuation. */
+            let mut drops = vec![(r0, c1.min(last) - c0)];
+            for r in (r0 + 1)..=r1.min(rcount.saturating_sub(1)) {
+                let len = t.rows[r as usize].cells.len() as u32;
+                if c0 < len {
+                    drops.push((r, c1.min(len - 1) - c0));
+                }
+            }
+            Some((tp, drops))
+        });
+        let mut out = self.merge_cells_unmapped(table_path, r0, r1, c0, c1);
+        if let Some((tp, drops)) = remap {
+            out.remap_table_cells(&tp, |row, col| {
+                let Some(&(_, drop)) = drops.iter().find(|(r, _)| *r == row) else {
+                    return CellMove::Keep;
+                };
+                let owner = row == r0 && col == c0;
+                if col < c0 || owner {
+                    CellMove::Keep
+                } else if col <= c0 + drop {
+                    CellMove::Collapse {
+                        row: r0,
+                        col: c0,
+                        at_end: true,
+                    }
+                } else {
+                    CellMove::To {
+                        row,
+                        col: col - drop,
+                    }
+                }
+            });
+        }
+        out
+    }
+
+    fn merge_cells_unmapped(
+        &self,
+        table_path: BlockPath,
+        r0: u32,
+        r1: u32,
+        c0: u32,
+        c1: u32,
+    ) -> Self {
         self.mutate_table(table_path, |t| {
             let rcount = t.rows.len() as u32;
             if r0 >= rcount {
@@ -9360,7 +9534,33 @@ impl DocumentTree {
             }
             None
         }
-        self.mutate_table(table_path, |t| {
+        /* Issue #253 — the rows `restore_row` will widen and the cell index
+        it widens at, computed on the PRE-mutation shape exactly like the
+        walk below (restoring a row never changes a later row's cells):
+        anchors in cells past that index shift right by `span - 1`. */
+        let remap = self.mutated_table_shape(&table_path).and_then(|(tp, t)| {
+            let owner_row = t.rows.get(row as usize)?;
+            let owner = owner_row.cells.get(col as usize)?;
+            let span = owner.props.grid_span.max(1) as u32;
+            let owner_grid_col: usize = owner_row.cells[..col as usize]
+                .iter()
+                .map(|c| c.props.grid_span.max(1) as usize)
+                .sum();
+            let mut widened = vec![(row, col)];
+            if matches!(owner.props.v_merge, VMergeRole::Restart) {
+                for r in (row as usize + 1)..t.rows.len() {
+                    let Some(i) = cell_at_grid_col(&t.rows[r], owner_grid_col) else {
+                        break;
+                    };
+                    if !matches!(t.rows[r].cells[i].props.v_merge, VMergeRole::Continue) {
+                        break;
+                    }
+                    widened.push((r as u32, i as u32));
+                }
+            }
+            Some((tp, span, widened))
+        });
+        let mut out = self.mutate_table(table_path, |t| {
             let Some(owner_row) = t.rows.get(row as usize) else {
                 return;
             };
@@ -9385,7 +9585,19 @@ impl DocumentTree {
                     restore_row(&mut t.rows[r], i, span);
                 }
             }
-        })
+        });
+        if let Some((tp, span, widened)) = remap
+            && span > 1
+        {
+            out.remap_table_cells(&tp, |r, c| match widened.iter().find(|(wr, _)| *wr == r) {
+                Some(&(_, idx)) if c > idx => CellMove::To {
+                    row: r,
+                    col: c + span - 1,
+                },
+                _ => CellMove::Keep,
+            });
+        }
+        out
     }
 
     pub fn set_cell_shading(
