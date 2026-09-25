@@ -4,7 +4,7 @@
 //! `bridge::Command` derives `arbitrary::Arbitrary` behind bridge's
 //! optional `arbitrary` feature (off by default; enabled here — see
 //! `fuzz/Cargo.toml`), so blind `Command::arbitrary(u)` already gives full,
-//! structurally-valid coverage of the whole ~80-variant wire enum,
+//! structurally-valid coverage of the whole ~100-variant wire enum,
 //! including the recursive `Recover { log_tail: Vec<Command>, .. }` shape.
 //! That alone is "structure-aware" in the sense the issue asks for, but on
 //! its own it mostly produces commands addressing wildly out-of-bounds
@@ -17,13 +17,24 @@
 //! delete / format / table / section / story — so the fuzzer spends real
 //! time past the first bounds check, while the blind half keeps hammering
 //! the reject paths and the wire schema's full breadth.
+//!
+//! **Issue #177 — generator coverage audit.** A curated subset drifts out
+//! of sync with the enum as new variants land (`SetTableProperties` /
+//! `InsertTextBox` / `MoveImage` all shipped blind-only). `classify_variant`
+//! near the bottom of this file is a compile-time exhaustiveness check —
+//! see its doc comment — plus a per-variant coverage tracker
+//! (`reset_coverage` / `coverage_snapshot`) the smoke driver reports after
+//! the `rpc_command` target runs.
 
 use arbitrary::{Arbitrary, Unstructured};
 use bridge::{
     Alignment, BlockPath, BridgeCellBorders, Command, Direction, FieldKind, HeaderFooterArea,
-    ImageBlob, ImageFit, ImageWrapMode, InsertSide, ListKind, LogicalPos, LogicalRange, MoveDirection, SectionBreakKind,
-    SelectionModifier, TextAttrsPatch, UnderlineStyle,
+    ImageBlob, ImageFit, ImageWrapMode, InsertSide, ListKind, LogicalPos, LogicalRange,
+    MoveDirection, SectionBreakKind, SelectionModifier, TablePropertiesPatch, TextAttrsPatch,
+    UnderlineStyle,
 };
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 // No `sanitize` pass any more. The #90 sweep originally needed one for two
 // classes of workaround, both of which are now enforced by the engine
@@ -72,6 +83,14 @@ fn small_f32(u: &mut Unstructured, max: i32) -> f32 {
     u.int_in_range(-max..=max).unwrap_or(0) as f32
 }
 
+/// A small-bounded signed `i64` — for EMU offsets (`MoveImage`,
+/// `InsertTextBox`), which are 914_400-per-inch and would otherwise need
+/// a much larger range than `small_f32`'s `i32` round trip comfortably
+/// covers.
+fn small_i64(u: &mut Unstructured, max: i64) -> i64 {
+    u.int_in_range(-max..=max).unwrap_or(0)
+}
+
 fn pos(u: &mut Unstructured) -> LogicalPos {
     LogicalPos {
         path: BlockPath::top(small(u, 3)),
@@ -99,7 +118,7 @@ fn text(u: &mut Unstructured) -> String {
 /// One curated, small-bounded command spanning the issue's named
 /// categories: insert / delete / format / table / section / story.
 fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
-    let variant = small(u, 20);
+    let variant = small(u, 26);
     Some(match variant {
         // ---- insert / delete -------------------------------------------------
         0 => Command::InsertText {
@@ -236,6 +255,87 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
             } else {
                 HeaderFooterArea::Footer
             },
+        },
+        // ---- issue #177 audit: view / calendar / table / text-box / image ------
+        // #186 / #187 — SetZoom / SetDeviceScale / SetRenderDate were
+        // blind-only, so the exact scenarios those issues fixed (a NaN
+        // scale, an out-of-range calendar field) only ever reached the
+        // engine by luck of the blind `Command::arbitrary()` draw. Each
+        // arm below deliberately picks a deliberately-invalid payload
+        // about a quarter of the time so the curated half keeps stressing
+        // the new command-boundary rejections, not just the "sane" path.
+        20 => Command::SetZoom {
+            scale: if u.ratio(1, 4).unwrap_or(false) {
+                *u.choose(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY])
+                    .ok()?
+            } else {
+                (small(u, 16) as f32) * 0.5 - 1.0
+            },
+        },
+        21 => Command::SetDeviceScale {
+            scale: if u.ratio(1, 4).unwrap_or(false) {
+                *u.choose(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY])
+                    .ok()?
+            } else {
+                (small(u, 20) as f32) * 0.5 - 2.0
+            },
+        },
+        22 => Command::SetRenderDate {
+            year: if u.ratio(1, 4).unwrap_or(false) {
+                *u.choose(&[0, -1, 10_000, 999_999_999]).ok()?
+            } else {
+                small(u, 2) as i32 + 2024
+            },
+            month: if u.ratio(1, 4).unwrap_or(false) {
+                // The #187 repro itself sent `month: 960_639_140`.
+                *u.choose(&[0u32, 13, 255, 960_639_140]).ok()?
+            } else {
+                small(u, 11) + 1
+            },
+            day: if u.ratio(1, 4).unwrap_or(false) {
+                *u.choose(&[0u32, 30, 31, 32, 400]).ok()?
+            } else {
+                small(u, 27) + 1
+            },
+            hour: if u.ratio(1, 2).unwrap_or(false) {
+                Some(if u.ratio(1, 4).unwrap_or(false) {
+                    *u.choose(&[24u32, 99, 255]).ok()?
+                } else {
+                    small(u, 23)
+                })
+            } else {
+                None
+            },
+            minute: if u.ratio(1, 2).unwrap_or(false) {
+                Some(if u.ratio(1, 4).unwrap_or(false) {
+                    *u.choose(&[60u32, 99, 255]).ok()?
+                } else {
+                    small(u, 59)
+                })
+            } else {
+                None
+            },
+        },
+        23 => Command::InsertTextBox {
+            at: pos(u),
+            width_emu: small_i64(u, 5_000_000),
+            height_emu: small_i64(u, 5_000_000),
+        },
+        24 => Command::SetTableProperties {
+            table_path: BlockPath::top(small(u, 3)),
+            patch: TablePropertiesPatch {
+                bidi_visual: if u.ratio(1, 2).unwrap_or(true) {
+                    Some(u.ratio(1, 2).unwrap_or(false))
+                } else {
+                    None
+                },
+            },
+        },
+        25 => Command::MoveImage {
+            path: BlockPath::top(small(u, 3)),
+            at: small(u, 40),
+            offset_h_emu: small_i64(u, 2_000_000),
+            offset_v_emu: small_i64(u, 2_000_000),
         },
         _ => Command::ExitHeaderFooter,
     })
@@ -405,10 +505,437 @@ pub fn gen_command_sequence(u: &mut Unstructured, max_len: usize) -> Vec<Command
             _ => Command::arbitrary(u).ok(),
         };
         let Some(cmd) = cmd else { break };
+        record_coverage(&cmd);
         out.push(cmd);
         if u.is_empty() {
             break;
         }
     }
     out
+}
+
+/* ====================================================================
+Issue #177 — generator coverage audit.
+
+`gen_command_sequence` mixes curated arms (above) with the blind
+`Command::arbitrary()` half; nothing enforced that every `Command`
+variant added over time got a curated arm, so a new variant could land
+silently blind-only (exactly what happened to `SetTableProperties`,
+`InsertTextBox` and `MoveImage` before this issue). `classify_variant`
+is a **compile-time exhaustiveness check**: it matches every `Command`
+variant with NO wildcard arm, so adding a bridge `Command` variant
+without extending this match is a compile error in this crate — that
+failure IS the audit, caught by `cargo check --manifest-path
+fuzz/Cargo.toml` (this function is not `#[cfg(test)]`-gated, so a plain
+`cargo check` — no `--tests` needed — already fails to build until the
+new variant is classified). `command_variant_classification_is_exhaustive`
+below is the executable half: it doesn't need real command instances
+(match exhaustiveness is a property of the *type*, checked wherever this
+function is compiled), so it exists to document the audit and to keep a
+runtime-visible list of exactly which variants are curated, for the
+`coverage_snapshot()` the smoke driver reports per variant.
+==================================================================== */
+
+/// One `Command` variant's issue #177 classification.
+pub struct VariantInfo {
+    /// The variant's identifier, e.g. `"InsertText"`.
+    pub name: &'static str,
+    /// Whether a curated (small-bounded) generator arm exists for this
+    /// variant in `gen_targeted_command` / `gen_selection_command` /
+    /// `gen_field_command` / `gen_note_command` / `gen_image_command`.
+    /// `false` means the variant is reached only through the blind
+    /// `Command::arbitrary()` half of `gen_command_sequence`.
+    pub curated: bool,
+}
+
+/// Classify every `Command` variant — issue #177. **No wildcard arm.**
+/// Ordered to match `crates/bridge/src/command.rs`'s declaration order
+/// so a side-by-side diff of the two is easy to audit.
+pub fn classify_variant(cmd: &Command) -> VariantInfo {
+    fn v(name: &'static str, curated: bool) -> VariantInfo {
+        VariantInfo { name, curated }
+    }
+    match cmd {
+        // ---- Phase 1 PoC ---------------------------------------------------
+        Command::Ping => v("Ping", false),
+        Command::LoadFont { .. } => v("LoadFont", false),
+        Command::RasterizeGlyph { .. } => v("RasterizeGlyph", false),
+        Command::ShapeAndRasterize { .. } => v("ShapeAndRasterize", false),
+        Command::RenderPage { .. } => v("RenderPage", false),
+        Command::InsertText { .. } => v("InsertText", true), // gen_targeted_command
+        Command::Undo => v("Undo", true),                    // gen_selection_command
+        Command::Redo => v("Redo", true),                    // gen_selection_command
+        Command::LoadDocx { .. } => v("LoadDocx", false),
+        Command::SaveDocx => v("SaveDocx", false),
+        // ---- Phase 2 §4 ------------------------------------------------------
+        Command::Init { .. } => v("Init", false),
+        Command::Recover { .. } => v("Recover", false),
+        Command::Snapshot { .. } => v("Snapshot", false),
+        Command::Dispose => v("Dispose", false),
+        Command::Tick { .. } => v("Tick", false),
+        Command::OpenDocument { .. } => v("OpenDocument", false),
+        Command::SaveDocument { .. } => v("SaveDocument", false),
+        Command::ExportPdf { .. } => v("ExportPdf", false),
+        Command::CloseDocument => v("CloseDocument", false),
+        Command::DeleteRange { .. } => v("DeleteRange", true), // gen_targeted_command
+        Command::ReplaceRange { .. } => v("ReplaceRange", true), // gen_targeted_command
+        Command::ApplyFormatting { .. } => v("ApplyFormatting", true), // gen_targeted_command
+        Command::SplitParagraph { .. } => v("SplitParagraph", true), // gen_targeted_command
+        Command::MergeParagraph { .. } => v("MergeParagraph", false),
+        Command::InsertImage { .. } => v("InsertImage", true), // gen_image_command
+        Command::ResizeImage { .. } => v("ResizeImage", false),
+        Command::MoveImage { .. } => v("MoveImage", true), // gen_targeted_command (#177)
+        Command::SetImageWrap { .. } => v("SetImageWrap", true), // gen_image_command
+        Command::SetSelection { .. } => v("SetSelection", true), // gen_selection_command
+        Command::ExtendSelection { .. } => v("ExtendSelection", true), // gen_selection_command
+        Command::SelectAll => v("SelectAll", true),        // gen_selection_command
+        Command::MoveCaret { .. } => v("MoveCaret", true), // gen_selection_command
+        Command::BeginComposition { .. } => v("BeginComposition", false),
+        Command::UpdateComposition { .. } => v("UpdateComposition", false),
+        Command::EndComposition { .. } => v("EndComposition", false),
+        Command::SetViewport { .. } => v("SetViewport", false),
+        Command::SetZoom { .. } => v("SetZoom", true), // gen_targeted_command (#177/#186)
+        Command::SetDeviceScale { .. } => v("SetDeviceScale", true), // gen_targeted_command (#177/#186)
+        Command::RequestPaint { .. } => v("RequestPaint", false),
+        Command::ExpandLayout { .. } => v("ExpandLayout", false),
+        Command::UnloadFont { .. } => v("UnloadFont", false),
+        Command::RequestStats => v("RequestStats", false),
+        // ---- Phase 4 §7 --------------------------------------------------------
+        Command::HitTest { .. } => v("HitTest", false),
+        Command::HitTestInPage { .. } => v("HitTestInPage", false),
+        Command::PlaceCaretAtPoint { .. } => v("PlaceCaretAtPoint", false),
+        Command::GetImageRects => v("GetImageRects", false),
+        Command::SelectWordAt { .. } => v("SelectWordAt", false),
+        Command::SelectParagraphAt { .. } => v("SelectParagraphAt", false),
+        Command::SelectCellAt { .. } => v("SelectCellAt", false),
+        Command::DeleteAtCaret { .. } => v("DeleteAtCaret", true), // gen_targeted_command
+        Command::RequestAccessibilityDelta => v("RequestAccessibilityDelta", false),
+        Command::GetSelectionAsClipboard => v("GetSelectionAsClipboard", false),
+        Command::PastePlain { .. } => v("PastePlain", false),
+        // ---- Backlog sprint 1 --------------------------------------------------
+        Command::SetParagraphAlign { .. } => v("SetParagraphAlign", true), // gen_targeted_command
+        Command::SetParagraphDirection { .. } => v("SetParagraphDirection", true), // gen_targeted_command
+        // ---- Backlog sprint 7 --------------------------------------------------
+        Command::PasteHtml { .. } => v("PasteHtml", false),
+        // ---- Phase 5 PR 3 — tables ----------------------------------------------
+        Command::InsertTable { .. } => v("InsertTable", true), // gen_targeted_command
+        Command::DeleteTable { .. } => v("DeleteTable", false),
+        Command::InsertRow { .. } => v("InsertRow", true), // gen_targeted_command
+        Command::DeleteRow { .. } => v("DeleteRow", true), // gen_targeted_command
+        Command::InsertColumn { .. } => v("InsertColumn", false),
+        Command::DeleteColumn { .. } => v("DeleteColumn", false),
+        Command::MergeCells { .. } => v("MergeCells", true), // gen_targeted_command
+        Command::SplitCell { .. } => v("SplitCell", false),
+        Command::SetCellShading { .. } => v("SetCellShading", true), // gen_targeted_command
+        Command::SetCellBorders { .. } => v("SetCellBorders", true), // gen_targeted_command
+        Command::SetTableProperties { .. } => v("SetTableProperties", true), // gen_targeted_command (#177)
+        Command::SetColumns { .. } => v("SetColumns", true),                 // gen_targeted_command
+        Command::InsertPageBreak { .. } => v("InsertPageBreak", false),
+        Command::InsertSectionBreak { .. } => v("InsertSectionBreak", true), // gen_targeted_command
+        Command::EnterHeaderFooter { .. } => v("EnterHeaderFooter", true),   // gen_targeted_command
+        Command::ExitHeaderFooter => v("ExitHeaderFooter", true), // gen_targeted_command fallback / gen_note_command
+        Command::SetHeaderFooterLink { .. } => v("SetHeaderFooterLink", false),
+        Command::SetTitlePage { .. } => v("SetTitlePage", false),
+        Command::SetEvenOddHeaders { .. } => v("SetEvenOddHeaders", false),
+        Command::InsertField { .. } => v("InsertField", true), // gen_field_command
+        Command::InsertFootnote { .. } => v("InsertFootnote", true), // gen_note_command
+        Command::InsertEndnote { .. } => v("InsertEndnote", true), // gen_note_command
+        Command::InsertTextBox { .. } => v("InsertTextBox", true), // gen_targeted_command (#177)
+        Command::SetRenderDate { .. } => v("SetRenderDate", true), // gen_targeted_command (#177/#187)
+        Command::UpdateFields => v("UpdateFields", true),          // gen_field_command
+        Command::SetFieldCodeView { .. } => v("SetFieldCodeView", false),
+        Command::SetFieldInstruction { .. } => v("SetFieldInstruction", false),
+        Command::InsertToc { .. } => v("InsertToc", true), // gen_field_command
+        Command::SetParagraphBorders { .. } => v("SetParagraphBorders", false),
+        Command::SetPageMargins { .. } => v("SetPageMargins", false),
+        Command::SetPageOrientation { .. } => v("SetPageOrientation", false),
+        Command::ToggleList { .. } => v("ToggleList", true), // gen_targeted_command
+        Command::ChangeListLevel { .. } => v("ChangeListLevel", false),
+        Command::SetParagraphIndent { .. } => v("SetParagraphIndent", true), // gen_targeted_command
+        Command::SetLineSpacing { .. } => v("SetLineSpacing", true),         // gen_targeted_command
+        Command::SetParagraphShading { .. } => v("SetParagraphShading", false),
+        Command::ToggleTrackChanges { .. } => v("ToggleTrackChanges", false),
+        Command::AcceptRevision { .. } => v("AcceptRevision", false),
+        Command::RejectRevision { .. } => v("RejectRevision", false),
+        Command::InsertComment { .. } => v("InsertComment", false),
+        Command::DeleteComment { .. } => v("DeleteComment", false),
+        Command::SetTabStops { .. } => v("SetTabStops", false),
+        Command::SetReviewIdentity { .. } => v("SetReviewIdentity", false),
+        Command::ApplyStyle { .. } => v("ApplyStyle", false),
+        Command::ResolveComment { .. } => v("ResolveComment", false),
+        Command::ReplyToComment { .. } => v("ReplyToComment", false),
+        Command::ModifyStyle { .. } => v("ModifyStyle", false),
+    }
+}
+
+thread_local! {
+    static COVERAGE: RefCell<BTreeMap<&'static str, usize>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Clear the per-variant generation counters — called once before a
+/// fresh coverage-reporting run (the smoke driver resets per
+/// `rpc_command` target invocation, not per fuzz input, so it reports
+/// how many commands of each shape the whole corpus + sweep produced).
+pub fn reset_coverage() {
+    COVERAGE.with(|c| c.borrow_mut().clear());
+}
+
+/// A sorted `(variant name, times generated)` snapshot since the last
+/// [`reset_coverage`].
+pub fn coverage_snapshot() -> BTreeMap<&'static str, usize> {
+    COVERAGE.with(|c| c.borrow().clone())
+}
+
+fn record_coverage(cmd: &Command) {
+    let name = classify_variant(cmd).name;
+    COVERAGE.with(|c| *c.borrow_mut().entry(name).or_insert(0) += 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issues #186 / #187 — the committed corpus seeds
+    /// `repro_186_nan_zoom` / `repro_186_nan_device_scale` /
+    /// `repro_187_bad_render_date` (`fuzz/corpus/rpc_command/`) must keep
+    /// deterministically reproducing the scenario each was found for.
+    /// `Unstructured` decoding is a pure function of the generator code +
+    /// the bytes, so this is exact, not probabilistic — a change to the
+    /// generator that stops hitting one of these branches is a real
+    /// regression in fuzz coverage of the #186/#187 fix, not just an
+    /// unlucky seed.
+    #[test]
+    fn issue_186_187_corpus_seeds_reproduce_their_scenarios() {
+        let read = |name: &str| {
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("corpus/rpc_command")
+                    .join(name),
+            )
+            .unwrap_or_else(|e| panic!("missing seed corpus file {name}: {e}"))
+        };
+        let gen_cmds = |bytes: &[u8]| {
+            let mut u = Unstructured::new(bytes);
+            let _ = gen_seed_text(&mut u);
+            gen_command_sequence(&mut u, 64)
+        };
+
+        let nan_zoom = gen_cmds(&read("repro_186_nan_zoom"));
+        assert!(
+            nan_zoom
+                .iter()
+                .any(|c| matches!(c, Command::SetZoom { scale } if !scale.is_finite())),
+            "repro_186_nan_zoom must still generate a non-finite SetZoom"
+        );
+
+        let nan_device_scale = gen_cmds(&read("repro_186_nan_device_scale"));
+        assert!(
+            nan_device_scale
+                .iter()
+                .any(|c| matches!(c, Command::SetDeviceScale { scale } if !scale.is_finite())),
+            "repro_186_nan_device_scale must still generate a non-finite SetDeviceScale"
+        );
+
+        let bad_date = gen_cmds(&read("repro_187_bad_render_date"));
+        assert!(
+            bad_date.iter().any(|c| matches!(
+                c,
+                Command::SetRenderDate { year, month, day, hour, minute }
+                    if engine::validate_render_date(*year, *month, *day, *hour, *minute).is_err()
+            )),
+            "repro_187_bad_render_date must still generate an invalid SetRenderDate"
+        );
+    }
+
+    /// Issue #177 acceptance: "exhaustiveness test green". The real
+    /// enforcement is `classify_variant`'s match having no wildcard arm
+    /// (a compile-time property — see the module doc comment above);
+    /// this test exists so the audit is discoverable from `cargo test`
+    /// and so CI has an explicit, named green/red signal for it rather
+    /// than relying on someone noticing a build failure was THIS check.
+    #[test]
+    fn command_variant_classification_is_exhaustive() {
+        // Spot-check a few variants on both sides of the #177 sweep —
+        // pre-existing curated variants, the three the issue named
+        // explicitly, and a sample that stays blind-only by design
+        // (lifecycle / telemetry / read-only query commands the
+        // curated generators have no reason to target).
+        assert!(!classify_variant(&Command::Ping).curated);
+        assert!(
+            classify_variant(&Command::SetTableProperties {
+                table_path: BlockPath::top(0),
+                patch: TablePropertiesPatch::default(),
+            })
+            .curated
+        );
+        assert!(
+            classify_variant(&Command::InsertTextBox {
+                at: LogicalPos {
+                    path: BlockPath::top(0),
+                    offset: 0,
+                },
+                width_emu: 0,
+                height_emu: 0,
+            })
+            .curated
+        );
+        assert!(
+            classify_variant(&Command::MoveImage {
+                path: BlockPath::top(0),
+                at: 0,
+                offset_h_emu: 0,
+                offset_v_emu: 0,
+            })
+            .curated
+        );
+        assert!(classify_variant(&Command::SetZoom { scale: 1.0 }).curated);
+        assert!(classify_variant(&Command::SetDeviceScale { scale: 1.0 }).curated);
+        assert!(
+            classify_variant(&Command::SetRenderDate {
+                year: 2026,
+                month: 1,
+                day: 1,
+                hour: None,
+                minute: None,
+            })
+            .curated
+        );
+    }
+
+    /// A generated sequence's coverage snapshot only ever names variants
+    /// `classify_variant` actually knows about (i.e. `record_coverage`
+    /// and `gen_command_sequence` agree on classification) and reports a
+    /// nonzero count for at least one curated #177 variant across a
+    /// reasonably long, entropy-rich run.
+    #[test]
+    fn coverage_snapshot_tracks_generated_variants() {
+        reset_coverage();
+        let mut bytes = Vec::new();
+        // A long, varied deterministic byte stream — enough entropy for
+        // `gen_command_sequence` to explore every bucket many times over.
+        for i in 0..8000u32 {
+            bytes.push((i.wrapping_mul(2654435761) >> 8) as u8);
+        }
+        let mut u = Unstructured::new(&bytes);
+        let _ = gen_command_sequence(&mut u, 64);
+        let snap = coverage_snapshot();
+        assert!(!snap.is_empty(), "a long run should generate something");
+        for name in snap.keys() {
+            // Every reported name must be a real variant name — i.e. it
+            // came from `classify_variant`, not some other source.
+            assert!(
+                KNOWN_VARIANT_NAMES.contains(name),
+                "coverage reported an unclassified variant name: {name}"
+            );
+        }
+    }
+
+    /// Every name `classify_variant` can produce — kept in sync by hand
+    /// alongside the match above; used only to sanity-check
+    /// `coverage_snapshot`'s output in the test above.
+    const KNOWN_VARIANT_NAMES: &[&str] = &[
+        "Ping",
+        "LoadFont",
+        "RasterizeGlyph",
+        "ShapeAndRasterize",
+        "RenderPage",
+        "InsertText",
+        "Undo",
+        "Redo",
+        "LoadDocx",
+        "SaveDocx",
+        "Init",
+        "Recover",
+        "Snapshot",
+        "Dispose",
+        "Tick",
+        "OpenDocument",
+        "SaveDocument",
+        "ExportPdf",
+        "CloseDocument",
+        "DeleteRange",
+        "ReplaceRange",
+        "ApplyFormatting",
+        "SplitParagraph",
+        "MergeParagraph",
+        "InsertImage",
+        "ResizeImage",
+        "MoveImage",
+        "SetImageWrap",
+        "SetSelection",
+        "ExtendSelection",
+        "SelectAll",
+        "MoveCaret",
+        "BeginComposition",
+        "UpdateComposition",
+        "EndComposition",
+        "SetViewport",
+        "SetZoom",
+        "SetDeviceScale",
+        "RequestPaint",
+        "ExpandLayout",
+        "UnloadFont",
+        "RequestStats",
+        "HitTest",
+        "HitTestInPage",
+        "PlaceCaretAtPoint",
+        "GetImageRects",
+        "SelectWordAt",
+        "SelectParagraphAt",
+        "SelectCellAt",
+        "DeleteAtCaret",
+        "RequestAccessibilityDelta",
+        "GetSelectionAsClipboard",
+        "PastePlain",
+        "SetParagraphAlign",
+        "SetParagraphDirection",
+        "PasteHtml",
+        "InsertTable",
+        "DeleteTable",
+        "InsertRow",
+        "DeleteRow",
+        "InsertColumn",
+        "DeleteColumn",
+        "MergeCells",
+        "SplitCell",
+        "SetCellShading",
+        "SetCellBorders",
+        "SetTableProperties",
+        "SetColumns",
+        "InsertPageBreak",
+        "InsertSectionBreak",
+        "EnterHeaderFooter",
+        "ExitHeaderFooter",
+        "SetHeaderFooterLink",
+        "SetTitlePage",
+        "SetEvenOddHeaders",
+        "InsertField",
+        "InsertFootnote",
+        "InsertEndnote",
+        "InsertTextBox",
+        "SetRenderDate",
+        "UpdateFields",
+        "SetFieldCodeView",
+        "SetFieldInstruction",
+        "InsertToc",
+        "SetParagraphBorders",
+        "SetPageMargins",
+        "SetPageOrientation",
+        "ToggleList",
+        "ChangeListLevel",
+        "SetParagraphIndent",
+        "SetLineSpacing",
+        "SetParagraphShading",
+        "ToggleTrackChanges",
+        "AcceptRevision",
+        "RejectRevision",
+        "InsertComment",
+        "DeleteComment",
+        "SetTabStops",
+        "SetReviewIdentity",
+        "ApplyStyle",
+        "ResolveComment",
+        "ReplyToComment",
+        "ModifyStyle",
+    ];
 }

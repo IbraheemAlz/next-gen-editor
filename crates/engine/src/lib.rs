@@ -35,6 +35,25 @@
 //!   helpers stay lenient (out-of-range → unchanged tree) for internal
 //!   callers; the `engine-wasm` command handlers use the checked
 //!   resolver so the shell gets an `Event::Error` it can show.
+//! - **Scales are rejected, not silently clamped, when non-finite**
+//!   ([`validate_finite_scale`], issue #186). `Command::SetZoom` /
+//!   `SetDeviceScale` carry an `f32` that lands in `RenderConfig.scale`
+//!   and, from there, every layout + DPR computation. `f32::clamp`
+//!   leaves a NaN `self` untouched (`NaN < min` and `NaN > max` are
+//!   both `false`), so a NaN wire value used to sail straight through
+//!   the existing `.clamp(MIN, MAX)` call. `±∞` already clamped
+//!   correctly (an out-of-range comparison against infinity is not
+//!   `false`), but is rejected too so the boundary has one rule:
+//!   finite in, or a typed `Event::Error`, never NaN/∞ out.
+//! - **Calendar fields are range-checked before they're cached**
+//!   ([`validate_render_date`], issue #187). `Command::SetRenderDate`
+//!   feeds `year`/`month`/`day`/`hour`/`minute` straight into
+//!   `render_date_time_picture`'s `format!` calls; nothing there
+//!   panics on a garbage value (issue #187's own repro was a fuzzer-
+//!   sent `month: 960_639_140`), but a nonsense date silently lands in
+//!   DATE/TIME field text on the next F9 or save. Rejected instead:
+//!   year `1..=9999`, month `1..=12`, day valid for that month (leap
+//!   years included), hour `0..=23`, minute `0..=59`.
 
 use im::Vector;
 use serde::{Deserialize, Serialize};
@@ -2440,6 +2459,21 @@ impl TabLeader {
     }
 }
 
+/// Issue #145 — one incoming `<w:pPr><w:tabs><w:tab>` entry for
+/// [`DocumentTree::set_tab_stops`]. `leader: None` means "keep this
+/// stop's existing leader" — the Ruler (and any other caller) that
+/// does not itself track leaders must not silently clear one every
+/// time it writes a position; `Some(TabLeader::None)` is the explicit
+/// clear. Resolution is positional: patch entry `i` inherits from the
+/// paragraph's *current* `tab_stops[i]` when present, else `TabLeader::
+/// None` (a brand-new stop has nothing to inherit).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabStopPatch {
+    pub position_pt: f32,
+    pub kind: TabKind,
+    pub leader: Option<TabLeader>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TabKind {
     /// Tab cursor jumps to `position_pt`; content lands right of it.
@@ -3703,6 +3737,152 @@ pub fn check_table_dims(rows: u32, cols: u32) -> Result<(), TableError> {
             requested: cells,
             max: MAX_TABLE_CELLS,
         });
+    }
+    Ok(())
+}
+
+/// Why a `SetZoom` / `SetDeviceScale` scale was rejected (issue #186).
+/// Maps to a typed `Event::Error` in `engine-wasm`; never a panic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScaleError {
+    /// NaN or ±infinity — `f32::clamp` would otherwise pass a NaN
+    /// straight through untouched (both clamp comparisons are `false`
+    /// for NaN), landing an unusable scale in the layout config.
+    NotFinite { value: f32 },
+}
+
+impl std::fmt::Display for ScaleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScaleError::NotFinite { value } => {
+                write!(f, "scale {value} is not finite (NaN or ±infinity)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScaleError {}
+
+/// Reject a non-finite `SetZoom` / `SetDeviceScale` scale before it
+/// reaches `.clamp()`. A finite value (including one outside the
+/// documented `[0.25, 4.0]` / `[0.5, 8.0]` bounds) is `Ok` — the
+/// existing `.clamp()` call in `do_set_zoom` / `do_set_device_scale`
+/// still handles range clamping; this only guards finiteness. Issue #186.
+pub fn validate_finite_scale(value: f32) -> Result<(), ScaleError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(ScaleError::NotFinite { value })
+    }
+}
+
+/// Why a `SetRenderDate` payload was rejected (issue #187). Maps to a
+/// typed `Event::Error` in `engine-wasm`; never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateError {
+    YearOutOfRange {
+        year: i32,
+    },
+    MonthOutOfRange {
+        month: u32,
+    },
+    /// `day` is out of range for `(year, month)` — leap years widen
+    /// February to 29 days.
+    DayOutOfRange {
+        year: i32,
+        month: u32,
+        day: u32,
+    },
+    HourOutOfRange {
+        hour: u32,
+    },
+    MinuteOutOfRange {
+        minute: u32,
+    },
+}
+
+impl std::fmt::Display for DateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DateError::YearOutOfRange { year } => {
+                write!(f, "year {year} is out of range (must be 1..=9999)")
+            }
+            DateError::MonthOutOfRange { month } => {
+                write!(f, "month {month} is out of range (must be 1..=12)")
+            }
+            DateError::DayOutOfRange { year, month, day } => write!(
+                f,
+                "day {day} is out of range for {year}-{month:02} \
+                 (has {} days)",
+                days_in_month(*year, *month)
+            ),
+            DateError::HourOutOfRange { hour } => {
+                write!(f, "hour {hour} is out of range (must be 0..=23)")
+            }
+            DateError::MinuteOutOfRange { minute } => {
+                write!(f, "minute {minute} is out of range (must be 0..=59)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DateError {}
+
+/// Proleptic Gregorian leap-year rule — divisible by 4, except
+/// centuries, except every 4th century.
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Days in `month` of `year` (1-based month); `0` for an out-of-range
+/// month — callers validate `month` first, so this is only reached with
+/// `1..=12` in practice, but stays total rather than panicking.
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Validate a `Command::SetRenderDate` payload — issue #187. `hour` /
+/// `minute` are the optional TIME half (`SetRenderDate`'s "both or
+/// neither" contract is enforced by the caller, not here); when
+/// present each is range-checked independently. Order matches the
+/// field order a fuzzer / UI is most likely to get wrong first (year,
+/// then month, since `day` validity depends on both).
+pub fn validate_render_date(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: Option<u32>,
+    minute: Option<u32>,
+) -> Result<(), DateError> {
+    if !(1..=9999).contains(&year) {
+        return Err(DateError::YearOutOfRange { year });
+    }
+    if !(1..=12).contains(&month) {
+        return Err(DateError::MonthOutOfRange { month });
+    }
+    if day < 1 || day > days_in_month(year, month) {
+        return Err(DateError::DayOutOfRange { year, month, day });
+    }
+    if let Some(h) = hour
+        && h > 23
+    {
+        return Err(DateError::HourOutOfRange { hour: h });
+    }
+    if let Some(m) = minute
+        && m > 59
+    {
+        return Err(DateError::MinuteOutOfRange { minute: m });
     }
     Ok(())
 }
@@ -6473,13 +6653,40 @@ impl DocumentTree {
     /// so the Ruler's drag-end dispatch produces exactly one undo
     /// entry per tab-stop edit (matches Word's "release commits"
     /// behaviour).
-    pub fn set_tab_stops(&self, start: LogicalPos, end: LogicalPos, stops: Vec<TabStop>) -> Self {
+    ///
+    /// Issue #145 — each `stops[i]` is a [`TabStopPatch`]: a `None`
+    /// leader inherits the paragraph's *own current* `tab_stops[i]`
+    /// leader (resolved per paragraph, since a multi-paragraph range
+    /// can carry different existing leaders); an explicit `Some` sets
+    /// or clears it. Without this, replacing the whole `<w:tabs>` list
+    /// on every write silently dropped a TOC entry's dot leader the
+    /// first time its stop was dragged.
+    pub fn set_tab_stops(
+        &self,
+        start: LogicalPos,
+        end: LogicalPos,
+        stops: Vec<TabStopPatch>,
+    ) -> Self {
         let (start, end) = order_positions(start, end);
         let mut blocks = self.blocks.clone();
         let apply = |para: &mut Paragraph| {
-            para.props.tab_stops = stops.clone();
+            let resolved: Vec<TabStop> = stops
+                .iter()
+                .enumerate()
+                .map(|(i, patch)| TabStop {
+                    position_pt: patch.position_pt,
+                    kind: patch.kind,
+                    leader: patch.leader.unwrap_or_else(|| {
+                        para.props
+                            .tab_stops
+                            .get(i)
+                            .map_or(TabLeader::None, |s| s.leader)
+                    }),
+                })
+                .collect();
+            para.props.tab_stops = resolved.clone();
             /* Sprint 12 (#11) — shadow into direct_overrides. */
-            para.direct_overrides.tab_stops = stops.clone();
+            para.direct_overrides.tab_stops = resolved;
         };
         if same_parent(&start.path, &end.path) {
             let Some(start_idx) = start.path.last_block_index() else {
@@ -12292,6 +12499,89 @@ mod tests {
         assert_eq!(d.blocks[0].as_paragraph().unwrap().props.line_height, None);
     }
 
+    /// Issue #145 — `SetTabStops` must not clobber an existing leader
+    /// when the wire omits it (a caller that only edits position, like
+    /// the Ruler drag path, and therefore sends `leader: None`). `None`
+    /// inherits per-index from the paragraph's *current* stops; an
+    /// explicit `Some` sets or clears; a genuinely new index (beyond
+    /// the old list) has nothing to inherit and resolves to
+    /// `TabLeader::None`.
+    #[test]
+    fn set_tab_stops_preserves_leader_when_wire_omits_it() {
+        let d = DocumentTree::from_text("hi");
+        let start = LogicalPos::new(BlockPath::top(0), 0);
+        let end = LogicalPos::new(BlockPath::top(0), 2);
+
+        /* Seed a dot-leadered right tab — the TOC entry shape. */
+        let d = d.set_tab_stops(
+            start.clone(),
+            end.clone(),
+            vec![TabStopPatch {
+                position_pt: 400.0,
+                kind: TabKind::Right,
+                leader: Some(TabLeader::Dot),
+            }],
+        );
+        let stop = d.blocks[0].as_paragraph().unwrap().props.tab_stops[0];
+        assert_eq!(stop.leader, TabLeader::Dot);
+
+        /* The Ruler drags the same stop to a new position without
+        itself tracking leaders, so it dispatches `leader: None`. The
+        dot leader must survive — this is the bug #145 fixes. */
+        let d = d.set_tab_stops(
+            start.clone(),
+            end.clone(),
+            vec![TabStopPatch {
+                position_pt: 420.0,
+                kind: TabKind::Right,
+                leader: None,
+            }],
+        );
+        let stop = d.blocks[0].as_paragraph().unwrap().props.tab_stops[0];
+        assert_eq!(stop.position_pt, 420.0, "position must still move");
+        assert_eq!(
+            stop.leader,
+            TabLeader::Dot,
+            "leader must survive an omitted patch"
+        );
+
+        /* An explicit `Some(TabLeader::None)` is the deliberate clear. */
+        let d = d.set_tab_stops(
+            start.clone(),
+            end.clone(),
+            vec![TabStopPatch {
+                position_pt: 420.0,
+                kind: TabKind::Right,
+                leader: Some(TabLeader::None),
+            }],
+        );
+        let stop = d.blocks[0].as_paragraph().unwrap().props.tab_stops[0];
+        assert_eq!(stop.leader, TabLeader::None);
+
+        /* A brand-new stop at an index beyond the old list has nothing
+        to inherit from — `None` must not pick up a stale leader from
+        some other index. */
+        let d = d.set_tab_stops(
+            start,
+            end,
+            vec![
+                TabStopPatch {
+                    position_pt: 100.0,
+                    kind: TabKind::Left,
+                    leader: Some(TabLeader::Hyphen),
+                },
+                TabStopPatch {
+                    position_pt: 420.0,
+                    kind: TabKind::Right,
+                    leader: None,
+                },
+            ],
+        );
+        let p = d.blocks[0].as_paragraph().unwrap();
+        assert_eq!(p.props.tab_stops[0].leader, TabLeader::Hyphen);
+        assert_eq!(p.props.tab_stops[1].leader, TabLeader::None);
+    }
+
     /// Issue #50 — ToggleList must stamp BOTH the marker text and the
     /// numbering level's indent; the indent is what layout consumes to
     /// park the bullet in the hanging gutter instead of underneath the
@@ -13711,6 +14001,82 @@ mod wire_validation_tests {
         let ok = doc.try_insert_table(BlockPath::top(0), 2, 3).unwrap();
         let t = ok.blocks[0].as_table().unwrap();
         assert_eq!((t.rows.len(), t.rows[0].cells.len()), (2, 3));
+    }
+
+    // ---- scale / render-date validation (#186 / #187) ----------------------
+
+    #[test]
+    fn validate_finite_scale_rejects_nan_and_infinity_only() {
+        assert!(matches!(
+            validate_finite_scale(f32::NAN),
+            Err(ScaleError::NotFinite { .. })
+        ));
+        assert!(matches!(
+            validate_finite_scale(f32::INFINITY),
+            Err(ScaleError::NotFinite { .. })
+        ));
+        assert!(matches!(
+            validate_finite_scale(f32::NEG_INFINITY),
+            Err(ScaleError::NotFinite { .. })
+        ));
+        // Finite is `Ok` regardless of whether it's inside the documented
+        // clamp range — `validate_finite_scale` only guards finiteness;
+        // `do_set_zoom` / `do_set_device_scale` still clamp the range.
+        for v in [0.0_f32, 1.0, 0.25, 4.0, 0.5, 8.0, -1.0, 1_000.0] {
+            assert_eq!(validate_finite_scale(v), Ok(()), "{v} is finite");
+        }
+    }
+
+    #[test]
+    fn validate_render_date_enforces_calendar_bounds() {
+        // The #187 repro: a fuzzer-sent `month: 960_639_140`.
+        assert!(matches!(
+            validate_render_date(2026, 960_639_140, 5, None, None),
+            Err(DateError::MonthOutOfRange { .. })
+        ));
+        assert!(matches!(
+            validate_render_date(0, 1, 1, None, None),
+            Err(DateError::YearOutOfRange { year: 0 })
+        ));
+        assert!(matches!(
+            validate_render_date(10_000, 1, 1, None, None),
+            Err(DateError::YearOutOfRange { year: 10_000 })
+        ));
+        assert!(matches!(
+            validate_render_date(2026, 0, 1, None, None),
+            Err(DateError::MonthOutOfRange { month: 0 })
+        ));
+        assert!(matches!(
+            validate_render_date(2026, 13, 1, None, None),
+            Err(DateError::MonthOutOfRange { month: 13 })
+        ));
+        // April has 30 days.
+        assert!(matches!(
+            validate_render_date(2026, 4, 31, None, None),
+            Err(DateError::DayOutOfRange { .. })
+        ));
+        // 2026 is not a leap year; 2024 is.
+        assert!(matches!(
+            validate_render_date(2026, 2, 29, None, None),
+            Err(DateError::DayOutOfRange { .. })
+        ));
+        assert_eq!(validate_render_date(2024, 2, 29, None, None), Ok(()));
+        assert!(matches!(
+            validate_render_date(2026, 1, 0, None, None),
+            Err(DateError::DayOutOfRange { day: 0, .. })
+        ));
+        assert!(matches!(
+            validate_render_date(2026, 7, 5, Some(24), Some(0)),
+            Err(DateError::HourOutOfRange { hour: 24 })
+        ));
+        assert!(matches!(
+            validate_render_date(2026, 7, 5, Some(0), Some(60)),
+            Err(DateError::MinuteOutOfRange { minute: 60 })
+        ));
+        assert_eq!(validate_render_date(2026, 7, 5, Some(23), Some(59)), Ok(()));
+        assert_eq!(validate_render_date(2026, 7, 5, None, None), Ok(()));
+        assert_eq!(validate_render_date(1, 1, 1, None, None), Ok(()));
+        assert_eq!(validate_render_date(9999, 12, 31, None, None), Ok(()));
     }
 
     #[test]

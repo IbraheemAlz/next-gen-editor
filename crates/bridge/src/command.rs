@@ -963,11 +963,21 @@ impl Default for TocSwitches {
 /// Sprint 11 (#13) — wire shape for one `<w:pPr><w:tabs><w:tab>`
 /// entry. `position_pt` is layout pt (1/72 in) at scale=1 — the
 /// engine model unit. Kind mirrors `engine::TabKind`.
+///
+/// Issue #145 — `leader` is additive: `None` (omitted / `undefined`
+/// from TS — see the `tsify-next` `Option<T>` convention) means
+/// "leave this stop's leader as it is," so a caller that only edits
+/// position (the Ruler drag path) can never silently clear a TOC
+/// entry's dot leader. An explicit `Some(BridgeTabLeader::None)` is
+/// the deliberate clear. The read-back (`EditorState.tab_stops`)
+/// always sends a concrete `Some` — this optionality only matters on
+/// the way in, through `Command::SetTabStops`.
 #[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct BridgeTabStop {
     pub position_pt: f32,
     pub kind: BridgeTabKind,
+    pub leader: Option<BridgeTabLeader>,
 }
 
 /// Sprint 11 (#13) — wire shape for `engine::TabKind`. `Decimal` is
@@ -984,6 +994,22 @@ pub enum BridgeTabKind {
     /// `<w:clear>` — explicit "no tab at this position", used to
     /// defeat an inherited tab stop from the style cascade.
     Clear,
+}
+
+/// Issue #145 — wire shape for `engine::TabLeader` (`<w:tab w:leader>`
+/// / `ST_TabTlc`). Mirrors the engine enum one-for-one so the Ruler can
+/// round-trip a TOC entry's dot / hyphen / underscore / heavy /
+/// middle-dot leader without lossy translation.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum BridgeTabLeader {
+    #[default]
+    None,
+    Dot,
+    Hyphen,
+    Underscore,
+    Heavy,
+    MiddleDot,
 }
 
 /// Sprint 2 (UI Edition) hotfix — anchor side for `InsertRow` /

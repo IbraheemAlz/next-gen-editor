@@ -614,7 +614,7 @@ async function handleInit(msg: InitMsg): Promise<void> {
             paintEvt = await dispatch({
                 type: 'SET_TAB_STOPS',
                 range: wholeRange,
-                stops: [{ position_pt: 250, kind: 'Center' }],
+                stops: [{ position_pt: 250, kind: 'Center', leader: undefined }],
             } as Command);
             break;
         }
@@ -638,7 +638,7 @@ async function handleInit(msg: InitMsg): Promise<void> {
             paintEvt = await dispatch({
                 type: 'SET_TAB_STOPS',
                 range: wholeRange,
-                stops: [{ position_pt: 300, kind: 'Right' }],
+                stops: [{ position_pt: 300, kind: 'Right', leader: undefined }],
             } as Command);
             break;
         }
@@ -701,7 +701,7 @@ async function handleInit(msg: InitMsg): Promise<void> {
             paintEvt = await dispatch({
                 type: 'SET_TAB_STOPS',
                 range: wholeRange,
-                stops: [{ position_pt: 250, kind: 'Decimal' }],
+                stops: [{ position_pt: 250, kind: 'Decimal', leader: undefined }],
             } as Command);
             break;
         }
