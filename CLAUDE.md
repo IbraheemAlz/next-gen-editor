@@ -179,6 +179,13 @@ D5.10 are external/human sign-offs, not code.
   - `fuzz/examples/smoke.rs` is a stable-only driver (no nightly needed)
     proving all four work: `cargo run --manifest-path fuzz/Cargo.toml
     --example smoke --release`.
+  - Issue #229 — the `rpc_command` corpus's #186/#187 regression seeds are
+    derived from `command_gen::Scenario`'s explicit builder (a fixed-prefix
+    fast path in `gen_targeted_command`, immune to unrelated arms' byte-
+    consumption changes) rather than hand-tuned raw bytes; regenerate them
+    with `cargo run --manifest-path fuzz/Cargo.toml --example regen-seeds`,
+    and `cargo test --manifest-path fuzz/Cargo.toml` (now also in `ci.yml`'s
+    `rust-native` job) fails loudly if they go stale.
 - **Telemetry (D5.7).** Schema in `crates/bridge/src/telemetry.rs`; the UI
   collector `ts/src/state/telemetry.ts` batches samples and `console.log`s
   them every 60 s — a **mock** transport (no live collector for the MVP).
@@ -280,6 +287,8 @@ Engine backlog" references a real issue.
 - `tools/visual-diff` on the goldens — every case ≤ **2 %** pixel diff (most cases 0.000 %).
 - `pnpm exec playwright test` (from `ts/`) — the 7 Phase 2 exit-gate e2e specs in `ts/e2e/` all green.
 - `cargo check --manifest-path fuzz/Cargo.toml` — the D5.5 fuzz crate compiles.
+- `cargo test --manifest-path fuzz/Cargo.toml` (issue #229) — the fuzz
+  crate's own unit tests, including the #186/#187 regression-seed checks.
 - The non-blocking `qa-harness` job runs the D5.1–D5.3 browser harnesses
   (`tools/visual-diff` farm, `tools/memory-profile`, `tools/perf`).
 
