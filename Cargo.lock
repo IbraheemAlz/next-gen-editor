@@ -220,6 +220,7 @@ dependencies = [
  "format-docx",
  "format-pdf",
  "layout",
+ "quick-xml",
  "serde",
  "serde_json",
  "text-pipeline",

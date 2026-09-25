@@ -5,9 +5,11 @@
 //! shared between every `parts::*` parser — writer-side serialization stays
 //! local to each part for now.
 
+pub mod block_envelope;
 pub mod ct_ppr;
 pub mod ct_rpr;
 pub mod ct_tbl;
+pub mod drawing;
 pub mod grab_bag;
 pub mod wp_anchor;
 

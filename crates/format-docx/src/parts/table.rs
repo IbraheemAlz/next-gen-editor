@@ -13,6 +13,8 @@
 //! render can paint correctly, never for write-back at PR 2.
 
 use crate::error::{DocxError, DocxWarning};
+use crate::parts::document::is_block_level_marker;
+use crate::schema::block_envelope::BlockEnvelopes;
 use crate::schema::ct_ppr::parse_jc;
 use crate::schema::ct_rpr::{attr_val, parse_hex_color, toggle_on};
 use crate::schema::ct_tbl;
@@ -127,11 +129,17 @@ fn parse_table_bytes_at(
 
     let mut prev_pos: usize = 0;
     let mut in_table = false;
+    /* Issue #120 — block-level passthrough inside the CURRENT cell (a
+    `<w:sdt>` around cell paragraphs, bookmarks / whitespace between
+    them); one tracker per `<w:tc>`, drained into the cell's blocks. */
+    let mut cell_env = BlockEnvelopes::new();
 
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) => {
                 let name = e.name().as_ref().to_owned();
+                let at_cell_level =
+                    nested_tbl_depth == 0 && cur_cell.is_some() && p_start_byte.is_none();
                 match name.as_slice() {
                     b"w:tbl" if !in_table => {
                         in_table = true;
@@ -140,6 +148,7 @@ fn parse_table_bytes_at(
                         /* Nested table inside a cell. */
                         if nested_tbl_depth == 0 {
                             nested_tbl_start = Some(prev_pos);
+                            cell_env.note_block_start(prev_pos);
                         }
                         nested_tbl_depth += 1;
                     }
@@ -148,9 +157,27 @@ fn parse_table_bytes_at(
                     }
                     b"w:tc" if nested_tbl_depth == 0 => {
                         cur_cell = Some(TableCell::default());
+                        cell_env = BlockEnvelopes::new();
                     }
                     b"w:p" if nested_tbl_depth == 0 && cur_cell.is_some() => {
                         p_start_byte = Some(prev_pos);
+                        cell_env.note_block_start(prev_pos);
+                    }
+                    b"w:sdt" | b"w:customXml" if at_cell_level => {
+                        cell_env.open_container(prev_pos);
+                        if let Some(cell) = cur_cell.as_ref() {
+                            cell_env.set_blocks_at_open(cell.blocks.len());
+                        }
+                    }
+                    b"w:sdtPr" | b"w:sdtEndPr" | b"w:customXmlPr"
+                        if at_cell_level && cell_env.in_container() =>
+                    {
+                        /* Property children of a cell-level container: never
+                        live properties, always inside the envelope bytes. */
+                        let _ = capture_subtree(xml, prev_pos, &mut reader, &e)?;
+                        prev_pos = reader.buffer_position() as usize;
+                        buf.clear();
+                        continue;
                     }
                     _ => {}
                 }
@@ -186,6 +213,37 @@ fn parse_table_bytes_at(
             }
             Event::Empty(e) => {
                 let name = e.name().as_ref().to_owned();
+                let at_cell_level =
+                    nested_tbl_depth == 0 && cur_cell.is_some() && p_start_byte.is_none();
+                if at_cell_level && name.as_slice() == b"w:p" {
+                    /* Issue #120 — a self-closing `<w:p …/>` cell paragraph
+                    (Word writes one for every empty cell): one `Empty`
+                    event, so the Start / End arms never see it. Same
+                    block as `<w:p></w:p>`, through the body parser. */
+                    let end = reader.buffer_position() as usize;
+                    cell_env.note_block_start(prev_pos);
+                    if let Some(raw) = slice_element(xml, prev_pos, end, b"w:p")
+                        && let Some(cell) = cur_cell.as_mut()
+                    {
+                        let mut p = parse_cell_paragraph(&raw, resolver, ns);
+                        p.body_xml = cell_env.take_before();
+                        cell.blocks.push(Block::Paragraph(p));
+                        cell_env.note_block_end(end);
+                    }
+                    prev_pos = end;
+                    buf.clear();
+                    continue;
+                }
+                if at_cell_level && is_block_level_marker(&name) {
+                    /* Issue #120 — a marker between two cell blocks. */
+                    let end = reader.buffer_position() as usize;
+                    if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                        cell_env.push_verbatim(frag);
+                    }
+                    prev_pos = end;
+                    buf.clear();
+                    continue;
+                }
                 if nested_tbl_depth == 0
                     && let Some(parent) = stack.last()
                     && ct_tbl::child_is_modeled(parent, &name) == Some(false)
@@ -238,7 +296,9 @@ fn parse_table_bytes_at(
                                         rows: Vec::new(),
                                         dirty: false,
                                         source_xml: Some(raw),
+                                        body_xml: cell_env.take_before(),
                                     }));
+                                    cell_env.note_block_end(end);
                                 } else if let Ok((g, p, r)) =
                                     parse_table_bytes_at(&raw, resolver, ns, depth + 1, warnings)
                                 {
@@ -248,7 +308,9 @@ fn parse_table_bytes_at(
                                         rows: r,
                                         dirty: false,
                                         source_xml: Some(raw),
+                                        body_xml: cell_env.take_before(),
                                     }));
+                                    cell_env.note_block_end(end);
                                 }
                             }
                         }
@@ -261,10 +323,23 @@ fn parse_table_bytes_at(
                             rows.push(row);
                         }
                     }
+                    /* Issue #120 — a cell-level container closes. */
+                    b"w:sdt" | b"w:customXml"
+                        if nested_tbl_depth == 0
+                            && cur_cell.is_some()
+                            && p_start_byte.is_none()
+                            && cell_env.in_container() =>
+                    {
+                        let end = reader.buffer_position() as usize;
+                        if let Some(cell) = cur_cell.as_mut() {
+                            cell_env.close_container(xml, end, &mut cell.blocks);
+                        }
+                    }
                     b"w:tc" if nested_tbl_depth == 0 => {
-                        if let Some(cell) = cur_cell.take()
+                        if let Some(mut cell) = cur_cell.take()
                             && let Some(row) = cur_row.as_mut()
                         {
+                            cell_env.finish(&mut cell.blocks);
                             row.cells.push(cell);
                         }
                     }
@@ -280,9 +355,10 @@ fn parse_table_bytes_at(
                                 /* Issue #101 — cell paragraphs parse
                                 through the body run parser (runs, rPr
                                 grab bags, pictures, source bytes). */
-                                cell.blocks.push(Block::Paragraph(parse_cell_paragraph(
-                                    &raw, resolver, ns,
-                                )));
+                                let mut p = parse_cell_paragraph(&raw, resolver, ns);
+                                p.body_xml = cell_env.take_before();
+                                cell.blocks.push(Block::Paragraph(p));
+                                cell_env.note_block_end(p_end);
                             }
                         }
                     }
@@ -290,6 +366,23 @@ fn parse_table_bytes_at(
                 }
                 if stack.last().map(|n| n.as_slice()) == Some(name.as_slice()) {
                     stack.pop();
+                }
+            }
+            Event::Text(t)
+                if nested_tbl_depth == 0
+                    && cur_cell.is_some()
+                    && p_start_byte.is_none()
+                    && matches!(
+                        stack.last().map(Vec::as_slice),
+                        Some(b"w:tc" | b"w:sdtContent" | b"w:customXml")
+                    )
+                    && t.iter().all(u8::is_ascii_whitespace) =>
+            {
+                /* Issue #120 — whitespace between two cell blocks (a
+                pretty-printed part) rides the following block. */
+                let end = reader.buffer_position() as usize;
+                if let Some(frag) = slice_fragment(xml, prev_pos, end) {
+                    cell_env.push_verbatim(frag);
                 }
             }
             Event::Eof => break,
