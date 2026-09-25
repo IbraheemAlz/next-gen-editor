@@ -1471,7 +1471,7 @@ fn text_box_pictures_document_xml() -> String {
 }
 
 /// Issue #206 fixture builder. Rides the `--fixtures` passthrough at
-/// drift 0, the default harness's step 23 and the e2e spec.
+/// drift 0, the default harness's step 24 and the e2e spec.
 fn build_text_box_pictures_docx() -> Vec<u8> {
     pack_docx_with_png_bytes(&text_box_pictures_document_xml(), TBP_PNG)
 }
@@ -1508,14 +1508,14 @@ fn run_text_box_pictures_roundtrip() -> Result<()> {
     if !op.is_floating() || !ip.is_floating() || op.source_xml.is_none() {
         bail!("text-box pictures fixture: the story pictures must be floating with bytes");
     }
-    println!("[roundtrip] step 23a OK — pictures parse inside a box story and a nested box story");
+    println!("[roundtrip] step 24a OK — pictures parse inside a box story and a nested box story");
 
     let src = String::from_utf8(extract_doc_xml(&fixture)?).context("utf8 source")?;
     let zero = write_docx(&archive, doc).context("zero-edit write")?;
     if String::from_utf8(extract_doc_xml(&zero)?).context("utf8 zero")? != src {
         bail!("text-box pictures fixture: zero-edit save drifted");
     }
-    println!("[roundtrip] step 23b OK — zero-edit save is byte-identical");
+    println!("[roundtrip] step 24b OK — zero-edit save is byte-identical");
 
     let at0 = BlockPath::top(0);
     let edited = doc
@@ -1557,7 +1557,7 @@ fn run_text_box_pictures_roundtrip() -> Result<()> {
     if out.contains("<wp:wrapSquare wrapText=\"bothSides\"/><wp:docPr id=\"4\"") {
         bail!("text-box pictures fixture: the nested picture kept its stale wrap bytes");
     }
-    println!("[roundtrip] step 23c OK — box-story picture edits regenerate their drawings only");
+    println!("[roundtrip] step 24c OK — box-story picture edits regenerate their drawings only");
 
     let reread = read_docx(&bytes).context("re-read edited pictures")?;
     let (Some(op), Some(ip)) = (
@@ -1585,7 +1585,7 @@ fn run_text_box_pictures_roundtrip() -> Result<()> {
             ip.kind
         );
     }
-    println!("[roundtrip] step 23d OK — the moved / re-wrapped / resized pictures re-read");
+    println!("[roundtrip] step 24d OK — the moved / re-wrapped / resized pictures re-read");
     Ok(())
 }
 
@@ -4118,7 +4118,7 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
         nested story; the e2e spec clicks into it. */
         /* Issue #206 — floating pictures inside a text box's story and
         inside the box nested in it. Passthrough at drift 0; the default
-        harness's step 23 moves / re-wraps them; the e2e spec selects,
+        harness's step 24 moves / re-wraps them; the e2e spec selects,
         drags, resizes and re-wraps them. */
         PrebuiltFixture {
             name: "text_box_pictures.docx",
