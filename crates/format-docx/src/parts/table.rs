@@ -14,7 +14,7 @@
 
 use crate::error::{DocxError, DocxWarning};
 use crate::schema::ct_ppr::parse_jc;
-use crate::schema::ct_rpr::{attr_val, parse_hex_color};
+use crate::schema::ct_rpr::{attr_val, parse_hex_color, toggle_on};
 use crate::schema::ct_tbl;
 use crate::schema::grab_bag::{
     NamespaceScope, capture_subtree, slice_element, slice_fragment, stash,
@@ -577,6 +577,9 @@ fn handle_property_inner(
             b"w:jc" => {
                 props.alignment = attr_val(e, b"w:val").and_then(|v| parse_jc(&v));
             }
+            /* Issue #79 — `<w:bidiVisual/>` (ST_OnOff toggle; an
+            explicit `w:val="false"` reads as off). */
+            b"w:bidiVisual" => props.bidi_visual = toggle_on(e),
             /* Audit gap A.M8 — `<w:tblLayout w:type="autofit|fixed"/>`. */
             b"w:tblLayout" => {
                 props.layout = match attr_val(e, b"w:type").as_deref().map(str::trim) {

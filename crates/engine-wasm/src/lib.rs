@@ -3659,7 +3659,7 @@ fn layout_table_box(
     blank — the visual bug A.M8 / C.M1 covers. */
     accumulate_vmerge_heights(&mut rows_out);
 
-    TableBox {
+    let mut table_box = TableBox {
         origin: Point::default(),
         size: Size {
             width: table_width,
@@ -3668,7 +3668,15 @@ fn layout_table_box(
         columns,
         rows: rows_out,
         outer_borders: table.props.borders.clone().unwrap_or_default(),
+    };
+    /* Issue #79 — `<w:bidiVisual>`: everything above is the LTR layout
+    (grid, spans, vMerge, content); the RTL presentation is one visual
+    mirror of cell x-origins + start/end edge resolution. Geometry,
+    hit-testing, image rects, paint and PDF all follow the boxes. */
+    if table.props.bidi_visual {
+        layout::mirror_bidi_visual(&mut table_box);
     }
+    table_box
 }
 
 /// Audit gap A.M8 — autofit two-pass column distribution.
@@ -5652,6 +5660,9 @@ impl Engine {
             | Command::SplitCell { .. }
             | Command::SetCellShading { .. }
             | Command::SetCellBorders { .. }
+            /* Issue #79 — routes through `story_mutate` like the cell
+            property family above. */
+            | Command::SetTableProperties { .. }
             /* Issue #72 — `SelectCellAt` resolves through
             `document_geometry` (already story-aware) plus
             `cell_content_span`, which now reads `self.selection_doc()`
@@ -5952,6 +5963,9 @@ impl Engine {
                 col,
                 borders,
             } => self.do_set_cell_borders(table_path, row, col, borders),
+            Command::SetTableProperties { table_path, patch } => {
+                self.do_set_table_properties(table_path, patch)
+            }
 
             // Sprint 2 (UI Edition) — layout authoring commands.
             Command::SetColumns {
@@ -10181,9 +10195,18 @@ impl Engine {
     fn cell_properties_for_caret(&self, path: &BridgeBlockPath) -> Option<BridgeCellProperties> {
         let engine_path = bridge_path_to_engine(path);
         let cell = self.undo.current().innermost_cell_props_at(&engine_path)?;
+        /* Issue #79 — the owning TOP-LEVEL table's flag: the table the
+        context menu and `SetTableProperties` address. Read from the
+        selection's tree so a header/footer table reports its own. */
+        let table_bidi_visual = self.with_selection_doc(|d| {
+            let top = engine_path.steps.first().cloned()?;
+            let top_path = engine::BlockPath { steps: vec![top] };
+            d.table_at_path(&top_path).map(|t| t.props.bidi_visual)
+        });
         Some(BridgeCellProperties {
             shading: cell.shading.map(rgba_to_bridge_color),
             borders: engine_borders_to_bridge(cell.borders.as_ref()),
+            table_bidi_visual: table_bidi_visual.unwrap_or(false),
         })
     }
 
@@ -13895,6 +13918,50 @@ impl Engine {
         );
         self.push_table_edit(new_doc)
     }
+    /// Issue #79 — apply a [`bridge::TablePropertiesPatch`]. An empty
+    /// patch (or a path that is not a table) is a no-op that still
+    /// replies `SelectionChanged`, never an undo step.
+    fn do_set_table_properties(
+        &mut self,
+        path: bridge::BlockPath,
+        patch: bridge::TablePropertiesPatch,
+    ) -> Event {
+        let Some(bidi_visual) = patch.bidi_visual else {
+            return self.selection_changed();
+        };
+        let epath = bridge_to_engine_path(path);
+        if self.with_selection_doc(|d| d.table_at_path(&epath).is_none()) {
+            return Event::Error {
+                message: "SetTableProperties: path does not address a table".into(),
+            };
+        }
+        if self.story_active() {
+            let caret = self
+                .selection
+                .as_ref()
+                .map(|s| s.caret.clone())
+                .unwrap_or_else(|| bpos_top(0, 0));
+            return self.story_mutate(
+                move |d| d.set_table_bidi_visual(epath, bidi_visual),
+                caret,
+                true,
+            );
+        }
+        let new_doc = self
+            .undo
+            .current()
+            .set_table_bidi_visual(epath, bidi_visual);
+        self.announce(
+            AnnouncementPriority::Polite,
+            if bidi_visual {
+                "Table set to right-to-left"
+            } else {
+                "Table set to left-to-right"
+            },
+        );
+        self.push_table_edit(new_doc)
+    }
+
     fn do_set_cell_borders(
         &mut self,
         path: bridge::BlockPath,
@@ -18974,6 +19041,227 @@ mod tests {
         d
     }
 
+    /// Issue #79 — an RTL-direction document (every paragraph `<w:bidi/>`)
+    /// holding a 3-column × 2-row table; `bidi_visual` sets
+    /// `<w:bidiVisual/>`. Cell text `r{row}c{col}` (1-based, logical).
+    fn rtl_table_doc(bidi_visual: bool) -> DocumentTree {
+        let rtl = |text: &str| engine::Paragraph {
+            text: text.into(),
+            props: engine::ParaProperties {
+                direction: Some(engine::TextDirection::Rtl),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cell = |text: &str| engine::TableCell {
+            props: engine::CellProperties::default(),
+            blocks: vec![engine::Block::Paragraph(rtl(text))],
+        };
+        let mut d = DocumentTree::from_text("");
+        d.blocks.set(0, engine::Block::Paragraph(rtl("intro")));
+        let rows = (1..=2)
+            .map(|r| engine::TableRow {
+                props: engine::RowProperties::default(),
+                cells: (1..=3).map(|c| cell(&format!("r{r}c{c}"))).collect(),
+            })
+            .collect();
+        d.blocks.push_back(engine::Block::Table(engine::Table {
+            grid: vec![1800, 2400, 1800],
+            props: engine::TableProperties {
+                bidi_visual,
+                borders: Some(engine::default_word_borders()),
+                ..Default::default()
+            },
+            rows,
+            dirty: true,
+            source_xml: None,
+        }));
+        d.blocks.push_back(engine::Block::Paragraph(rtl("outro")));
+        d
+    }
+
+    fn first_table(pages: &[PageBox]) -> &TableBox {
+        pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .find_map(LayoutBlock::as_table)
+            .expect("a table")
+    }
+
+    /// Issue #79 — `<w:bidiVisual>` mirrors the column x-origins across
+    /// the table (grid column 1 rightmost), keeps widths / logical cell
+    /// order, swaps the visual start/end edges, and caret geometry +
+    /// hit-testing follow the mirrored cells while the paths stay logical.
+    #[test]
+    fn bidi_visual_table_mirrors_columns_geometry_and_hit_testing() {
+        let ltr = test_engine_with_doc(rtl_table_doc(false));
+        let rtl = test_engine_with_doc(rtl_table_doc(true));
+        let (ltr_pages, ..) = ltr.build_pages(1.0, false, None).expect("ltr");
+        let (rtl_pages, _, _, info) = rtl.build_pages(1.0, false, None).expect("rtl");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        let (lt, rt) = (first_table(&ltr_pages), first_table(&rtl_pages));
+        assert_eq!(lt.columns, rt.columns, "the grid is untouched");
+        assert_eq!(lt.size.width, rt.size.width);
+        for (lr, rr) in lt.rows.iter().zip(&rt.rows) {
+            let xs: Vec<f32> = rr.cells.iter().map(|c| c.origin.x).collect();
+            assert!(xs[0] > xs[1] && xs[1] > xs[2], "column 1 rightmost: {xs:?}");
+            for (lc, rc) in lr.cells.iter().zip(&rr.cells) {
+                assert_eq!(lc.size.width, rc.size.width);
+                assert!((rc.origin.x - (rt.size.width - lc.origin.x - lc.size.width)).abs() < 1e-3);
+                assert_eq!(
+                    (lc.padding_left, lc.padding_right),
+                    (rc.padding_right, rc.padding_left)
+                );
+            }
+            let first = &rr.cells[0];
+            assert!((first.origin.x + first.size.width - rt.size.width).abs() < 1e-3);
+        }
+        assert_eq!(
+            lt.outer_borders.left.is_some(),
+            rt.outer_borders.right.is_some()
+        );
+
+        /* Geometry + hit-testing: the cell-(0,0) line sits right of the
+        cell-(0,2) line; a click in the rightmost cell resolves to the
+        LOGICAL first cell. */
+        let geom = rtl.document_geometry().expect("geom");
+        let cell_line = |row: u32, col: u32| {
+            geom.iter()
+                .find(|g| {
+                    matches!(
+                        g.path.steps.get(1),
+                        Some(BridgePathStep::Cell { row: r, col: c }) if *r == row && *c == col
+                    )
+                })
+                .unwrap_or_else(|| panic!("line for cell ({row},{col})"))
+        };
+        let (c0, c2) = (cell_line(0, 0), cell_line(0, 2));
+        assert!(
+            c0.hit_left > c2.hit_left + c2.hit_width - 0.5,
+            "cell (0,0) at {} vs cell (0,2) at {}+{}",
+            c0.hit_left,
+            c2.hit_left,
+            c2.hit_width
+        );
+        let y = c0.y_top + c0.height / 2.0;
+        let hit = hit_test_geom(&geom, c0.hit_left + c0.hit_width - 2.0, y);
+        assert_eq!(
+            hit.path.steps.get(1),
+            Some(&BridgePathStep::Cell { row: 0, col: 0 })
+        );
+        let hit = hit_test_geom(&geom, c2.hit_left + 2.0, y);
+        assert_eq!(
+            hit.path.steps.get(1),
+            Some(&BridgePathStep::Cell { row: 0, col: 2 })
+        );
+    }
+
+    /// Issue #79 — text-order oracle (the differential `rtl_table.docx`
+    /// acceptance, stated natively): reading a row's cells by descending
+    /// absolute x — the order an RTL reader and LibreOffice's PDF text
+    /// extraction see them — yields the LOGICAL column order.
+    #[test]
+    fn bidi_visual_table_reads_in_logical_order_right_to_left() {
+        let rtl = test_engine_with_doc(rtl_table_doc(true));
+        let geom = rtl.document_geometry().expect("geom");
+        let doc = rtl.undo.current().clone();
+        for row in 0..2u32 {
+            let mut cells: Vec<(f32, String)> = geom
+                .iter()
+                .filter_map(|g| match g.path.steps.get(1) {
+                    Some(BridgePathStep::Cell { row: r, .. }) if *r == row => {
+                        let p = doc.paragraph_at_path(&bridge_path_to_engine(&g.path))?;
+                        Some((g.hit_left, p.text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            cells.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let texts: Vec<String> = cells.into_iter().map(|(_, t)| t).collect();
+            let r = row + 1;
+            assert_eq!(
+                texts,
+                vec![format!("r{r}c1"), format!("r{r}c2"), format!("r{r}c3")]
+            );
+        }
+    }
+
+    /// Issue #79 — `SetTableProperties` flips the flag as one undo step,
+    /// re-lays the table mirrored, and `SelectionChanged.cell_properties`
+    /// reports the state for the caret's table.
+    #[test]
+    fn set_table_properties_toggles_bidi_visual_with_undo_and_readback() {
+        let mut e = test_engine_with_doc(rtl_table_doc(false));
+        let in_cell = BridgeLogicalPos {
+            path: BridgeBlockPath {
+                steps: vec![
+                    BridgePathStep::Block { idx: 1 },
+                    BridgePathStep::Cell { row: 0, col: 0 },
+                    BridgePathStep::Block { idx: 0 },
+                ],
+            },
+            offset: 0,
+        };
+        e.selection = Some(SelectionState {
+            anchor: in_cell.clone(),
+            caret: in_cell,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let bidi_of = |evt: &Event| match evt {
+            Event::SelectionChanged {
+                cell_properties, ..
+            } => cell_properties.as_ref().map(|c| c.table_bidi_visual),
+            other => panic!("{other:?}"),
+        };
+        let x0 = |e: &Engine| {
+            let (pages, ..) = e.build_pages(1.0, false, None).expect("layout");
+            first_table(&pages).rows[0].cells[0].origin.x
+        };
+        assert_eq!(bidi_of(&e.selection_changed()), Some(false));
+        let before = x0(&e);
+        let evt = e.do_set_table_properties(
+            BridgeBlockPath::top(1),
+            bridge::TablePropertiesPatch {
+                bidi_visual: Some(true),
+            },
+        );
+        assert_eq!(bidi_of(&evt), Some(true));
+        assert!(
+            e.undo.current().blocks[1]
+                .as_table()
+                .unwrap()
+                .props
+                .bidi_visual
+        );
+        assert!(x0(&e) > before, "column 1 moved to the right edge");
+        /* Empty patch: no-op, no undo step. */
+        let depth = e.undo.depth();
+        let evt = e.do_set_table_properties(
+            BridgeBlockPath::top(1),
+            bridge::TablePropertiesPatch::default(),
+        );
+        assert_eq!(bidi_of(&evt), Some(true));
+        assert_eq!(e.undo.depth(), depth);
+        /* A non-table path is an honest error. */
+        let evt = e.do_set_table_properties(
+            BridgeBlockPath::top(0),
+            bridge::TablePropertiesPatch {
+                bidi_visual: Some(true),
+            },
+        );
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        e.do_undo();
+        assert!(
+            !e.undo.current().blocks[1]
+                .as_table()
+                .unwrap()
+                .props
+                .bidi_visual
+        );
+        assert_eq!(x0(&e), before);
+    }
+
     fn table_doc() -> DocumentTree {
         let mut d = DocumentTree::from_text("intro");
         d.blocks.push_back(engine::Block::Table(one_row_table(vec![
@@ -19044,6 +19332,11 @@ mod tests {
             .build_pages(1.0, false, Some(1200.0))
             .expect("prose band");
         out.push(("prose_300_band_1200", pages, info.degradations));
+
+        /* Issue #79 — RTL document, 3-column `<w:bidiVisual>` table. */
+        let engine = test_engine_with_doc(rtl_table_doc(true));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("rtl table");
+        out.push(("rtl_bidi_visual_table", pages, info.degradations));
         out
     }
 
@@ -19102,6 +19395,9 @@ mod tests {
         ("autofit_table", 0x92435b9636de4c72),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),
+        /* Issue #79 — recorded with the `<w:bidiVisual>` mirror in place
+        (column 1 rightmost); every value above is unchanged by it. */
+        ("rtl_bidi_visual_table", 0xa105472832896e3f),
     ];
 
     /// Issue #95 — the same fixtures with widow / orphan control at its

@@ -1386,19 +1386,25 @@ fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
         || props.borders.is_some()
         || props.table_style_id.is_some()
         || props.grab_bag.is_some()
+        || props.bidi_visual
         || has_margins
         || has_layout_override;
     if !has_content {
         return;
     }
     /* Issue #84 — CT_TblPrBase is a strict sequence; the sink orders the
-    modeled children (tblStyle, tblW, jc, tblInd, tblBorders, tblLayout,
-    tblCellMar) and slots grab-bag fragments (`<w:bidiVisual>`,
-    `<w:tblLook>`, `<w:tblpPr>`, …) at their own rank. */
+    modeled children (tblStyle, bidiVisual, tblW, jc, tblInd, tblBorders,
+    tblLayout, tblCellMar) and slots grab-bag fragments (`<w:tblLook>`,
+    `<w:tblpPr>`, …) at their own rank. */
     let rank = tbl_pr_child_rank;
     let mut ch = PrChildren::new();
     if let Some(id) = &props.table_style_id {
         ch.push(rank(b"w:tblStyle"), format!("<w:tblStyle w:val=\"{id}\"/>"));
+    }
+    /* Issue #79 — the RTL-table flag; absent ⇔ off, so only the on
+    state is written. */
+    if props.bidi_visual {
+        ch.push(rank(b"w:bidiVisual"), "<w:bidiVisual/>".into());
     }
     if let Some(w) = props.width {
         let mut s = String::new();
@@ -3782,6 +3788,61 @@ mod tests {
         assert!(!xml.contains("w14:"), "{xml}");
     }
 
+    /// Issue #79 — `<w:bidiVisual>` is modeled: read on/off (including an
+    /// explicit `w:val="false"`), emitted at its schema rank for a dirty
+    /// table, never duplicated through the grab bag.
+    #[test]
+    fn bidi_visual_is_modeled_and_regenerated_at_its_rank() {
+        let on = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:bidiVisual/><w:tblW w:w="0" w:type="auto"/><w:tblLook w:val="04A0"/></w:tblPr><w:tblGrid><w:gridCol w:w="1440"/><w:gridCol w:w="1440"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t xml:space="preserve">a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">b</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/></w:body></w:document>"#;
+        let (parsed, xml) = regenerate_dirty(on);
+        let t = parsed
+            .document
+            .blocks
+            .iter()
+            .find_map(|b| b.as_table())
+            .unwrap();
+        assert!(t.props.bidi_visual);
+        assert_eq!(
+            engine::GrabBag::fragments_of(&t.props.grab_bag),
+            &[br#"<w:tblLook w:val="04A0"/>"#.to_vec()]
+        );
+        assert!(
+            xml.contains(
+                r#"<w:tblPr><w:tblStyle w:val="TableGrid"/><w:bidiVisual/><w:tblW w:w="0" w:type="auto"/><w:tblLook w:val="04A0"/></w:tblPr>"#
+            ),
+            "{xml}"
+        );
+        assert_eq!(xml.matches("<w:bidiVisual").count(), 1, "{xml}");
+
+        for off in [
+            r#"<w:bidiVisual w:val="false"/>"#,
+            r#"<w:bidiVisual w:val="0"/>"#,
+        ] {
+            let doc = on.replace("<w:bidiVisual/>", off);
+            let (parsed, xml) = regenerate_dirty(&doc);
+            let t = parsed
+                .document
+                .blocks
+                .iter()
+                .find_map(|b| b.as_table())
+                .unwrap();
+            assert!(!t.props.bidi_visual, "{off} reads as off");
+            assert!(!xml.contains("bidiVisual"), "off ⇔ absent: {xml}");
+        }
+    }
+
+    /// Issue #79 — a flag set on an engine-synthesised table (no source
+    /// `<w:tblPr>` at all) still produces a `<w:tblPr>` carrying it.
+    #[test]
+    fn bidi_visual_set_by_the_engine_is_emitted() {
+        let doc = engine::DocumentTree::from_text("x")
+            .insert_table(engine::BlockPath::top(1), 1, 2)
+            .set_table_bidi_visual(engine::BlockPath::top(1), true);
+        let xml = build_document_xml(&doc, &HashMap::new());
+        assert!(xml.contains("<w:tblPr><w:bidiVisual/>"), "{xml}");
+    }
+
     #[test]
     fn table_property_grab_bags_survive_regeneration_in_schema_order() {
         let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -3800,11 +3861,10 @@ mod tests {
         );
         assert_eq!(
             engine::GrabBag::fragments_of(&table.props.grab_bag),
-            &[
-                br#"<w:tblLook w:val="04A0"/>"#.to_vec(),
-                b"<w:bidiVisual/>".to_vec()
-            ]
+            &[br#"<w:tblLook w:val="04A0"/>"#.to_vec()],
+            "issue #79 — bidiVisual is modeled, no longer bagged"
         );
+        assert!(table.props.bidi_visual);
         assert_eq!(
             engine::GrabBag::fragments_of(&table.rows[0].props.grab_bag),
             &[

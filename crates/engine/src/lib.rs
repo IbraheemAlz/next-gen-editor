@@ -3149,8 +3149,16 @@ pub struct TableProperties {
     /// Default `Autofit` matches Word's behaviour when the element
     /// is absent.
     pub layout: TableLayout,
+    /// Issue #79 — `<w:tblPr><w:bidiVisual/>` (ECMA-376 §17.4.1): the
+    /// table is presented right-to-left — grid column 1 is the visually
+    /// rightmost column, and the start/end (`left`/`right`) cell edges
+    /// (borders, margins) resolve to the right/left visual edges. Purely
+    /// visual: the grid, spans, the logical cell order in `rows` (and so
+    /// Tab order) are unchanged. `false` when the element is absent or
+    /// explicitly off.
+    pub bidi_visual: bool,
     /// Issue #84 — unmodeled `<w:tblPr>` children (`<w:tblLook>`,
-    /// `<w:bidiVisual>`, `<w:tblpPr>`, …), verbatim. See [`GrabBag`].
+    /// `<w:tblpPr>`, …), verbatim. See [`GrabBag`].
     pub grab_bag: Option<Box<GrabBag>>,
 }
 
@@ -7729,6 +7737,13 @@ impl DocumentTree {
         })
     }
 
+    /// Issue #79 — set the table's `<w:bidiVisual>` flag (visual
+    /// right-to-left column order). Flips `dirty` like every table edit
+    /// so the writer regenerates `<w:tblPr>` with the flag.
+    pub fn set_table_bidi_visual(&self, table_path: BlockPath, bidi_visual: bool) -> Self {
+        self.mutate_table(table_path, |t| t.props.bidi_visual = bidi_visual)
+    }
+
     /// Helper — open `table_path`'s `Block::Table`, run `f`, flip dirty,
     /// drop source bytes, write back.
     fn mutate_table<F>(&self, path: BlockPath, f: F) -> Self
@@ -11833,6 +11848,24 @@ mod tests {
                 .iter()
                 .all(|c| c.props.grid_span.max(1) == 1 && c.props.v_merge == VMergeRole::None)
         );
+    }
+
+    #[test]
+    fn set_table_bidi_visual_flips_flag_and_dirty() {
+        let d = DocumentTree::from_text("hi").insert_table(BlockPath::top(1), 1, 3);
+        assert!(!d.blocks[1].as_table().unwrap().props.bidi_visual);
+        let d = d.set_table_bidi_visual(BlockPath::top(1), true);
+        let t = d.blocks[1].as_table().unwrap();
+        assert!(t.props.bidi_visual);
+        assert!(t.dirty);
+        assert!(t.source_xml.is_none());
+        /* Logical cell order is untouched — the flag is purely visual. */
+        assert_eq!(t.rows[0].cells.len(), 3);
+        let d = d.set_table_bidi_visual(BlockPath::top(1), false);
+        assert!(!d.blocks[1].as_table().unwrap().props.bidi_visual);
+        /* A non-table path is a no-op. */
+        let d2 = d.set_table_bidi_visual(BlockPath::top(0), true);
+        assert!(d2.blocks[0].as_table().is_none());
     }
 
     #[test]

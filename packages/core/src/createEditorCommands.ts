@@ -40,6 +40,7 @@ import type {
     BlockPath,
     Color,
     BridgeCellBorders,
+    TablePropertiesPatch,
     BridgeTabStop,
     InsertSide,
     PageOrientation,
@@ -223,6 +224,14 @@ export interface EditorCommands {
         col: number,
         borders: BridgeCellBorders,
     ): Promise<Event>;
+    /** Issue #79 — patch table-level properties (`<w:tblPr>`) of the
+     *  top-level table at `tablePath`; `undefined` fields are left as is.
+     *  Replies `SelectionChanged` (its `cell_properties.table_bidi_visual`
+     *  carries the new RTL state). */
+    setTableProperties(tablePath: BlockPath, patch: TablePropertiesPatch): Promise<Event>;
+    /** Issue #79 — convenience: toggle `<w:bidiVisual>` (right-to-left
+     *  visual column order; grid column 1 becomes the rightmost). */
+    setTableBidiVisual(tablePath: BlockPath, bidiVisual: boolean): Promise<Event>;
 
     /* Layout authoring (Sprint 2 UI Edition — shipped with the
      * matching Rust bridge additions in `crates/bridge/src/command.rs`
@@ -604,6 +613,14 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 row,
                 col,
                 borders,
+            }),
+        setTableProperties: (table_path, patch) =>
+            dispatch({ type: 'SET_TABLE_PROPERTIES', table_path, patch }),
+        setTableBidiVisual: (table_path, bidi_visual) =>
+            dispatch({
+                type: 'SET_TABLE_PROPERTIES',
+                table_path,
+                patch: { bidi_visual },
             }),
 
         setColumns: (at, count, gutter_pt) =>

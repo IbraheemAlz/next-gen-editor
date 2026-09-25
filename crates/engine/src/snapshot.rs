@@ -452,6 +452,19 @@ mod tests {
         assert_eq!(encode(&d).unwrap(), bytes);
     }
 
+    /// Issue #79 — the `<w:bidiVisual>` flag survives crash recovery.
+    #[test]
+    fn table_bidi_visual_round_trips() {
+        let doc = DocumentTree::from_text("x")
+            .insert_table(crate::BlockPath::top(1), 1, 3)
+            .set_table_bidi_visual(crate::BlockPath::top(1), true);
+        let bytes = encode(&doc).unwrap();
+        let back: Decoded<DocumentTree> = decode(&bytes).unwrap();
+        let t = back.payload.blocks[1].as_table().unwrap();
+        assert!(t.props.bidi_visual);
+        assert_eq!(encode(&back.payload).unwrap(), bytes);
+    }
+
     #[test]
     fn document_encoding_is_deterministic_across_map_insertion_orders() {
         let a = rich_document();

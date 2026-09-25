@@ -473,6 +473,16 @@ pub enum Command {
         col: u32,
         borders: BridgeCellBorders,
     },
+    /// Issue #79 — patch table-level properties of the table at
+    /// `table_path` (a top-level table, like every table command). Every
+    /// `None` field of the patch leaves that property untouched. Flips
+    /// the table dirty (one undo step) and replies
+    /// `Event::SelectionChanged` — its `cell_properties.table_bidi_visual`
+    /// reflects the new state.
+    SetTableProperties {
+        table_path: BlockPath,
+        patch: TablePropertiesPatch,
+    },
     /// Sprint 2 (UI Edition) — set the multi-column layout of the
     /// section containing `at`. `count == 1` collapses to single
     /// column (gutter ignored); `count >= 2` enables snake-flow
@@ -797,6 +807,18 @@ pub enum Command {
         style_id: String,
         properties: BridgeStyleProperties,
     },
+}
+
+/// Issue #79 — additive patch for [`Command::SetTableProperties`]. Each
+/// field is optional; `None` = leave as is. Grows one optional field per
+/// newly-authorable `<w:tblPr>` property.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[serde(default)]
+pub struct TablePropertiesPatch {
+    /// `<w:bidiVisual>` — right-to-left visual column order (grid
+    /// column 1 rightmost). Purely visual: logical cell order is kept.
+    pub bidi_visual: Option<bool>,
 }
 
 /// Wire shape for `engine::CellBorders` — per-edge strokes for one

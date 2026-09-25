@@ -14,6 +14,7 @@ pub fn tbl_pr_child_is_modeled(name: &[u8]) -> bool {
     matches!(
         name,
         b"w:tblStyle"
+            | b"w:bidiVisual"
             | b"w:tblW"
             | b"w:jc"
             | b"w:tblInd"
@@ -156,6 +157,8 @@ mod tests {
     fn modeled_predicates_match_the_writer_surface() {
         assert!(tbl_pr_child_is_modeled(b"w:tblW"));
         assert!(!tbl_pr_child_is_modeled(b"w:tblLook"));
+        /* Issue #79 — modeled (`TableProperties::bidi_visual`), no longer bagged. */
+        assert!(tbl_pr_child_is_modeled(b"w:bidiVisual"));
         assert!(tr_pr_child_is_modeled(b"w:trHeight"));
         assert!(!tr_pr_child_is_modeled(b"w:jc"));
         assert!(tc_pr_child_is_modeled(b"w:tcMar"));

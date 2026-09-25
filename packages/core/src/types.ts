@@ -27,6 +27,7 @@ export type {
     BridgeBorderStyle,
     BridgeCellBorders,
     BridgeBorderStroke,
+    TablePropertiesPatch,
     InsertSide,
     PageOrientation,
     SectionBreakKind,

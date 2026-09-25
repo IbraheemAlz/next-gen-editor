@@ -490,7 +490,7 @@ fn build_table_box(
         y += row_height;
     }
 
-    TableBox {
+    let mut table_box = TableBox {
         origin: Point::default(),
         size: Size {
             width: total_width,
@@ -499,7 +499,13 @@ fn build_table_box(
         columns: col_widths,
         rows: rows_out,
         outer_borders: t.props.borders.clone().unwrap_or_default(),
+    };
+    /* Issue #79 — `<w:bidiVisual>` RTL tables: the same visual mirror
+    the production layout applies. */
+    if t.props.bidi_visual {
+        layout::mirror_bidi_visual(&mut table_box);
     }
+    table_box
 }
 
 #[cfg(test)]
