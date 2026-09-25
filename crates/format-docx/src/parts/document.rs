@@ -1021,6 +1021,7 @@ pub fn parse_document_xml_with_warnings(
                                             rel_id,
                                             width_emu,
                                             height_emu,
+                                            media_key: None,
                                         },
                                         anchor: scan.anchor,
                                         source_xml: keep_source.then_some(frag),
@@ -2051,6 +2052,7 @@ mod tests {
                 rel_id,
                 width_emu,
                 height_emu,
+                ..
             } => {
                 assert_eq!(rel_id, "rId5");
                 assert_eq!((*width_emu, *height_emu), (914_400, 457_200));
@@ -2258,7 +2260,7 @@ mod tests {
         assert_eq!(p.inline_objects.len(), 1);
         let obj = &p.inline_objects[0];
         assert!(
-            matches!(&obj.kind, engine::InlineKind::Image { rel_id, width_emu: 100, height_emu: 100 } if rel_id.is_empty())
+            matches!(&obj.kind, engine::InlineKind::Image { rel_id, width_emu: 100, height_emu: 100, .. } if rel_id.is_empty())
         );
         assert!(obj.anchor.is_some(), "the anchor placement is typed");
         assert!(
@@ -2687,7 +2689,7 @@ mod tests {
         assert_eq!(a.wrap, engine::WrapKind::Square);
         let vml = &p.inline_objects[1];
         assert!(
-            matches!(&vml.kind, engine::InlineKind::Image { rel_id, width_emu: 914_400, height_emu: 457_200 } if rel_id == "rId8")
+            matches!(&vml.kind, engine::InlineKind::Image { rel_id, width_emu: 914_400, height_emu: 457_200, .. } if rel_id == "rId8")
         );
         assert!(vml.anchor.is_none());
         assert_eq!(vml.source_xml.as_deref(), Some(pict.as_bytes()));

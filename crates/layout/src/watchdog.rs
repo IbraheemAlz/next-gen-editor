@@ -72,6 +72,18 @@ pub enum DegradeReason {
     /// A keep-with-next chain could not move to the next page (already at
     /// a page top, or stage (a) in force); the constraint was released.
     KeepChainDropped,
+    /// Issue #180 — a `<w:keepLines>` paragraph could not move whole to
+    /// the next page/column (already at a page top, or stage (a) in
+    /// force); the constraint was released and it split where it stood.
+    /// Distinct from [`Self::KeepChainDropped`] (a keep-*next* chain)
+    /// even though both are `keep_adjusted_split`'s stage-(a) response.
+    KeepLinesDropped,
+    /// Issue #180 — a widow/orphan-controlled paragraph's split could not
+    /// be adjusted to avoid leaving a single line on either side
+    /// (unsatisfiable, or stage (a) in force); the constraint was
+    /// released and the plain split stood. Distinct from
+    /// [`Self::KeepChainDropped`] / [`Self::KeepLinesDropped`].
+    WidowControlDropped,
     /// Repeated table header rows left no room for a body row on a
     /// continuation page; the repeat was suppressed for that page.
     HeaderRepeatDropped,
@@ -118,6 +130,8 @@ impl DegradeReason {
         match self {
             DegradeReason::OversizeLine => "OVERSIZE_LINE",
             DegradeReason::KeepChainDropped => "KEEP_CHAIN_DROPPED",
+            DegradeReason::KeepLinesDropped => "KEEP_LINES_DROPPED",
+            DegradeReason::WidowControlDropped => "WIDOW_CONTROL_DROPPED",
             DegradeReason::HeaderRepeatDropped => "HEADER_REPEAT_DROPPED",
             DegradeReason::FootnoteOverflow => "FOOTNOTE_OVERFLOW",
             DegradeReason::FrozenPlacement => "FROZEN_PLACEMENT",

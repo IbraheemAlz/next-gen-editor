@@ -182,10 +182,13 @@ pub struct DocumentTree {
     /// blocks produce.
     #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub footers: std::collections::HashMap<String, Vec<Block>>,
-    /// Phase 7 — image blobs keyed by their relationship id (`r:id`). The
-    /// archive reader fills this from `word/media/*` for every image rel
-    /// the document references. Inline images look up by the `rel_id`
-    /// their [`InlineKind::Image`] carries.
+    /// Phase 7 — image blobs keyed by MEDIA KEY. Issue #188 — the archive
+    /// reader keys them by the resolved target entry name
+    /// (`word/media/image2.png`), registering the picture rels of every
+    /// part it parses (body, headers, footers, notes) — never by the bare
+    /// relationship id, which is scoped per part. Engine-inserted blobs
+    /// (and pre-#188 snapshots) are keyed by their `rel_id`. Pictures
+    /// look up through [`InlineKind::image_media_key`].
     #[serde(serialize_with = "crate::snapshot::ser_sorted_map")]
     pub media: std::collections::HashMap<String, ImageBlob>,
     /// Issue #80 — `word/footnotes.xml` note stories keyed by the OOXML
@@ -923,7 +926,14 @@ impl HfDirty {
 /// Document-wide flags pulled from `word/settings.xml`. Phase 2 — only
 /// the header/footer parity toggle is modelled; later phases grow the
 /// struct as more setting elements get typed support.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Default` is hand-written (not derived) because [`Self::
+/// widow_control_default`] must default to `true` — a derived
+/// `#[serde(default)]` struct-level attribute fills missing fields from
+/// `DocumentSettings::default()`, so the manual impl IS what `read_docx`
+/// (unversioned) and any `#[serde(default)]` deserialize of a partial
+/// settings blob fall back to.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct DocumentSettings {
     /// `<w:evenAndOddHeaders/>` — when `true`, even-numbered pages render
@@ -942,6 +952,28 @@ pub struct DocumentSettings {
     /// stays inspectable after parsing. `read_docx` (unchanged) always
     /// leaves this at the `#[default]` `A4`.
     pub default_page_size: DefaultPageSize,
+    /// Issue #179 — the effective `<w:widowControl>` when a paragraph's
+    /// resolved [`ParaProperties::widow_control`] is `None` (never
+    /// specified anywhere in the cascade). ECMA-376 says an absent
+    /// element means the constraint is NOT applied; #95 chose `true`
+    /// instead — Word's actual application default, and what every
+    /// pinned fingerprint assumes. This is a per-host override of that
+    /// choice (like [`Self::default_page_size`]), never read FROM the
+    /// archive: `read_docx` always leaves it at the `#[default]` `true`,
+    /// and only a host calling `format_docx::read_docx_with_settings`
+    /// with the strict ECMA-376 reading sets it `false`.
+    pub widow_control_default: bool,
+}
+
+impl Default for DocumentSettings {
+    fn default() -> Self {
+        Self {
+            even_and_odd_headers: false,
+            author: None,
+            default_page_size: DefaultPageSize::default(),
+            widow_control_default: true,
+        }
+    }
 }
 
 /* ============================================================
@@ -1650,10 +1682,23 @@ pub enum InlineKind {
     /// `rel_id` is the OOXML relationship id from the `<a:blip r:embed=...>`
     /// pointing to the `word/media/*` archive entry. `width_emu` /
     /// `height_emu` come from `<wp:extent cx="..." cy="..."/>`.
+    ///
+    /// Issue #188 — `rel_id` is scoped to the OPC part the picture lives
+    /// in (`word/_rels/header1.xml.rels` and `document.xml.rels` may both
+    /// declare `rId5` for different targets), so it is kept only as the
+    /// part-local serialization id the writer re-emits as `r:embed`.
+    /// `media_key` is the [`DocumentTree::media`] key the picture paints
+    /// from: the reader resolves the rel against its own part's rels and
+    /// stores the target part name (`word/media/image2.png`), so equal
+    /// targets share one blob. `None` ⇒ `rel_id` doubles as the media key
+    /// (engine-inserted pictures, pre-#188 snapshots). Read it through
+    /// [`InlineKind::image_media_key`].
     Image {
         rel_id: String,
         width_emu: i64,
         height_emu: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_key: Option<String>,
     },
     /// `<w:footnoteReference w:id="N"/>` — Phase 8a / issue #80. `id` is
     /// the OOXML footnote id (a key into
@@ -1693,6 +1738,47 @@ pub enum InlineKind {
         height_emu: i64,
         story: Box<TextBoxStory>,
     },
+}
+
+impl InlineKind {
+    /// Issue #188 — the [`DocumentTree::media`] key a picture paints
+    /// from: its resolved `media_key`, else its `rel_id`. `None` for every
+    /// non-picture kind.
+    pub fn image_media_key(&self) -> Option<&str> {
+        match self {
+            InlineKind::Image {
+                rel_id, media_key, ..
+            } => Some(media_key.as_deref().unwrap_or(rel_id)),
+            _ => None,
+        }
+    }
+}
+
+/// Issue #188 — visit every picture ([`InlineKind::Image`]) in `blocks`,
+/// recursing into table cells (any depth) and text-box stories. The
+/// callback gets the whole kind so it can read or rewrite `rel_id` /
+/// `media_key` together.
+pub fn for_each_image_mut(blocks: &mut [Block], f: &mut dyn FnMut(&mut InlineKind)) {
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) => {
+                for io in &mut p.inline_objects {
+                    match &mut io.kind {
+                        k @ InlineKind::Image { .. } => f(k),
+                        InlineKind::TextBox { story, .. } => for_each_image_mut(&mut story.body, f),
+                        _ => {}
+                    }
+                }
+            }
+            Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        for_each_image_mut(&mut cell.blocks, f);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Issue #83 — vertical anchoring of a text box story inside the shape's
@@ -2509,8 +2595,18 @@ pub struct ParaProperties {
     pub spacing: Spacing,
     pub direction: Option<TextDirection>,
     pub line_height: Option<LineHeight>,
-    pub keep_next: bool,
-    pub keep_lines: bool,
+    /// Issue #178 — `<w:keepNext>` resolved through the style cascade.
+    /// `Option`, like [`Self::widow_control`], so a paragraph's explicit
+    /// `w:val="0"` can switch an inherited style's ON back off (a plain
+    /// bool merged with OR could never do that). `None` means never
+    /// specified (OOXML default: off). Unlike `widow_control`, the
+    /// direct element is fully modeled (not grab-bagged) — it round-trips
+    /// through this field on both styles and direct paragraphs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_next: Option<bool>,
+    /// Issue #178 — `<w:keepLines>`, same contract as [`Self::keep_next`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_lines: Option<bool>,
     pub page_break_before: bool,
     /// Audit gap A.M4 — `<w:pPr><w:pBdr>` border strokes painted around
     /// the paragraph bounding rectangle. Mirror of the table-cell
@@ -2552,19 +2648,36 @@ pub struct ParaProperties {
     /// Issue #95 — `<w:widowControl>` resolved through the style
     /// cascade: `Some(false)` is an explicit `w:val="0"` (which must be
     /// able to switch an inherited ON off, hence `Option`), `None` means
-    /// never specified. Layout reads `None` as ON — Word's application
-    /// default, which diverges from the spec's "not applied". READ-ONLY
-    /// on the paragraph model like [`Self::outline_level`]: the direct
-    /// element rides the grab bag verbatim; style definitions emit it.
+    /// never specified. Layout reads `None` through
+    /// [`Self::widow_control_on`] against the host-configurable
+    /// [`DocumentSettings::widow_control_default`] (issue #179) — Word's
+    /// application default is ON, which diverges from the spec's "not
+    /// applied"; a host that wants the strict ECMA-376 reading sets the
+    /// document setting off instead of patching every paragraph.
+    /// READ-ONLY on the paragraph model like [`Self::outline_level`]: the
+    /// direct element rides the grab bag verbatim; style definitions
+    /// emit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub widow_control: Option<bool>,
 }
 
 impl ParaProperties {
-    /// Issue #95 — the effective widow / orphan control (Word default:
-    /// on).
-    pub fn widow_control_on(&self) -> bool {
-        self.widow_control.unwrap_or(true)
+    /// Issue #95 / #179 — the effective widow / orphan control. `default_on`
+    /// is [`DocumentSettings::widow_control_default`] (Word's own default:
+    /// on) — read from the *document* the paragraph belongs to, since
+    /// OOXML has no such element to read from the paragraph itself.
+    pub fn widow_control_on(&self, default_on: bool) -> bool {
+        self.widow_control.unwrap_or(default_on)
+    }
+
+    /// Issue #178 — the effective `<w:keepNext>` (OOXML default: off).
+    pub fn keep_next_on(&self) -> bool {
+        self.keep_next.unwrap_or(false)
+    }
+
+    /// Issue #178 — the effective `<w:keepLines>` (OOXML default: off).
+    pub fn keep_lines_on(&self) -> bool {
+        self.keep_lines.unwrap_or(false)
     }
 
     /// Overlay `patch` onto `self` using OOXML cascade semantics: a child
@@ -2594,8 +2707,11 @@ impl ParaProperties {
             },
             direction: patch.direction.or(self.direction),
             line_height: patch.line_height.or(self.line_height),
-            keep_next: patch.keep_next || self.keep_next,
-            keep_lines: patch.keep_lines || self.keep_lines,
+            /* Issue #178 — last explicit wins: the direct override
+            (`patch`) always beats the inherited style when it set the
+            field at all, `Some(false)` included. */
+            keep_next: patch.keep_next.or(self.keep_next),
+            keep_lines: patch.keep_lines.or(self.keep_lines),
             page_break_before: patch.page_break_before || self.page_break_before,
             /* Audit gap A.M4 — `<w:pBdr>` overlay: patch's borders win
             when set; otherwise inherit. */
@@ -7240,6 +7356,7 @@ impl DocumentTree {
                     rel_id: rel_id_for_inline.clone(),
                     width_emu,
                     height_emu,
+                    media_key: None,
                 },
             );
         });
@@ -9987,6 +10104,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 0,
                     height_emu: 0,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -10007,6 +10125,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 914_400,
                     height_emu: 914_400,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -10036,6 +10155,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 100,
                     height_emu: 100,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -10072,6 +10192,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 914_400,
                     height_emu: 914_400,
+                    media_key: None,
                 },
                 anchor: Some(Box::new(anchor)),
                 source_xml: None,
@@ -10155,6 +10276,7 @@ mod tests {
                     rel_id: "rId1".into(),
                     width_emu: 100,
                     height_emu: 100,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
@@ -10261,6 +10383,7 @@ mod tests {
                 rel_id: "r".into(),
                 width_emu: 1,
                 height_emu: 2,
+                media_key: None,
             },
             anchor: Some(Box::new(FloatAnchor {
                 wrap: WrapKind::Square,
@@ -10288,6 +10411,7 @@ mod tests {
                         rel_id: "a".into(),
                         width_emu: 1,
                         height_emu: 1,
+                        media_key: None,
                     },
                     anchor: None,
                     source_xml: None,
@@ -10298,6 +10422,7 @@ mod tests {
                         rel_id: "b".into(),
                         width_emu: 1,
                         height_emu: 1,
+                        media_key: None,
                     },
                     anchor: None,
                     source_xml: None,
@@ -10323,6 +10448,7 @@ mod tests {
                     rel_id: "c".into(),
                     width_emu: 1,
                     height_emu: 1,
+                    media_key: None,
                 },
                 anchor: None,
                 source_xml: None,
