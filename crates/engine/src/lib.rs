@@ -1616,6 +1616,123 @@ impl InlineObject {
     pub fn is_floating(&self) -> bool {
         self.anchor.is_some()
     }
+
+    /// Issue #165 — the accessible `(name, description)` of a text box:
+    /// its `<wp:docPr name descr>` (read from the anchor's verbatim
+    /// `doc_pr_xml`, else from the first `<wp:docPr>` in the box's
+    /// verbatim source container — an in-line box keeps it there), or
+    /// the VML `<v:shape alt>` as the description for a bare VML box.
+    /// Blank values are `None`; `None` for anything but a text box.
+    pub fn text_box_label(&self) -> Option<(Option<String>, Option<String>)> {
+        let InlineKind::TextBox { story, .. } = &self.kind else {
+            return None;
+        };
+        let from_anchor = self
+            .anchor
+            .as_deref()
+            .and_then(|a| a.doc_pr_xml.as_deref())
+            .and_then(|x| start_tag(x, "<wp:docPr"));
+        let from_source = || {
+            story
+                .source_xml
+                .as_deref()
+                .and_then(|x| start_tag(x, "<wp:docPr"))
+        };
+        if let Some(tag) = from_anchor.or_else(from_source) {
+            return Some((xml_attr(tag, "name"), xml_attr(tag, "descr")));
+        }
+        let alt = story
+            .source_xml
+            .as_deref()
+            .and_then(|x| start_tag(x, "<v:shape"))
+            .and_then(|tag| xml_attr(tag, "alt"));
+        Some((None, alt))
+    }
+}
+
+/// Issue #165 — the first start tag in `xml` opening with `open` (e.g.
+/// `"<wp:docPr"`), up to its `>`: the element name must end right after
+/// `open` (so `<v:shape` never matches `<v:shapetype`).
+fn start_tag<'a>(xml: &'a str, open: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(rel) = xml[from..].find(open) {
+        let start = from + rel;
+        let after = start + open.len();
+        let next = xml[after..].chars().next()?;
+        if next.is_whitespace() || next == '>' || next == '/' {
+            let end = after + xml[after..].find('>')?;
+            return Some(&xml[start..end]);
+        }
+        from = after;
+    }
+    None
+}
+
+/// Issue #165 — the unescaped value of attribute `key` in a start tag
+/// (`"` or `'` quoted); `None` when absent or blank.
+fn xml_attr(tag: &str, key: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = tag[from..].find(key) {
+        let at = from + rel;
+        from = at + key.len();
+        let preceded = at > 0 && bytes[at - 1].is_ascii_whitespace();
+        let rest = tag[from..].trim_start();
+        if !preceded || !rest.starts_with('=') {
+            continue;
+        }
+        let rest = rest[1..].trim_start();
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let body = &rest[1..];
+        let value = &body[..body.find(quote)?];
+        let value = xml_unescape(value);
+        let value = value.trim();
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    None
+}
+
+/// The five predefined XML entities plus numeric character references.
+fn xml_unescape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let Some(semi) = tail.find(';') else {
+            out.push_str(tail);
+            return out;
+        };
+        let ent = &tail[1..semi];
+        let ch = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => ent
+                .strip_prefix("#x")
+                .or_else(|| ent.strip_prefix("#X"))
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| ent.strip_prefix('#').and_then(|d| d.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match ch {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Issue #69 — horizontal reference frame of a floating object
@@ -12825,6 +12942,72 @@ mod tests {
             d.paragraph_at_path(&first).is_some(),
             "deep path resolves to a real paragraph"
         );
+    }
+}
+
+/// Issue #165 — accessible labels of text boxes from `<wp:docPr>`.
+#[cfg(test)]
+mod text_box_label_tests {
+    use super::*;
+
+    fn text_box(anchor_doc_pr: Option<&str>, source: Option<&str>) -> InlineObject {
+        InlineObject {
+            at: 0,
+            kind: InlineKind::TextBox {
+                width_emu: 914_400,
+                height_emu: 457_200,
+                story: Box::new(TextBoxStory {
+                    source_xml: source.map(str::to_string),
+                    ..TextBoxStory::default()
+                }),
+            },
+            anchor: anchor_doc_pr.map(|x| {
+                Box::new(FloatAnchor {
+                    doc_pr_xml: Some(x.to_string()),
+                    ..FloatAnchor::default()
+                })
+            }),
+        }
+    }
+
+    #[test]
+    fn anchor_doc_pr_names_and_describes_the_box() {
+        let io = text_box(
+            Some(r#"<wp:docPr id="3" name="Callout &amp; note" descr='Side &#x2014; bar'/>"#),
+            None,
+        );
+        assert_eq!(
+            io.text_box_label(),
+            Some((
+                Some("Callout & note".to_string()),
+                Some("Side \u{2014} bar".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn inline_box_reads_the_outer_doc_pr_from_its_source() {
+        let src = r#"<w:drawing><wp:inline><wp:docPrX name="no"/><wp:docPr id="1" name="Outer" descr="  "/><wps:txbx><w:txbxContent><wp:docPr id="2" name="Inner"/></w:txbxContent></wps:txbx></wp:inline></w:drawing>"#;
+        let io = text_box(None, Some(src));
+        assert_eq!(io.text_box_label(), Some((Some("Outer".to_string()), None)));
+    }
+
+    #[test]
+    fn vml_alt_is_the_description_and_non_boxes_have_no_label() {
+        let src = r#"<w:pict><v:shapetype alt="x"/><v:shape id="s" alt="Pull quote"><v:textbox/></v:shape></w:pict>"#;
+        assert_eq!(
+            text_box(None, Some(src)).text_box_label(),
+            Some((None, Some("Pull quote".to_string())))
+        );
+        assert_eq!(text_box(None, None).text_box_label(), Some((None, None)));
+        let pic = InlineObject {
+            at: 0,
+            kind: InlineKind::NoteSelfRef {
+                kind: NoteKind::Footnote,
+            },
+            anchor: None,
+        };
+        assert_eq!(pic.text_box_label(), None);
     }
 }
 

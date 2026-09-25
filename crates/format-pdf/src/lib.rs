@@ -349,7 +349,8 @@ pub fn export_pdf_with_media(
         /* Issue #83 — text-box stories embed their fonts too. */
         for f in &page.floats {
             if let Some(tb) = f.text_box.as_deref() {
-                for_each_paragraph(&tb.blocks, &mut collect);
+                /* Issue #165 — nested stories too. */
+                tb.for_each_story_blocks(&mut |blocks| for_each_paragraph(blocks, &mut collect));
             }
         }
     }
@@ -835,15 +836,37 @@ fn build_page_content(page: &PageBox, res: &Res<'_>) -> Vec<u8> {
     content.finish().to_vec()
 }
 
-/// Issue #83 / #121 — one z-order group of the page's floating objects
-/// (the scene's `paint_floats` twin: `behind` selects the `behindDoc`
-/// group, sorted stably by z-order). A picture paints its image XObject
-/// into the float's wrap-independent rect; a text box paints shape fill,
-/// the story clipped to the shape rect, outline.
+/// Issue #83 / #121 / #165 — one z-order group of the page's floating
+/// objects (the scene's `paint_floats` twin: `behind` selects the
+/// `behindDoc` group, sorted stably by z-order).
 fn emit_floats(content: &mut Content, page: &PageBox, behind: bool, res: &Res<'_>) {
-    let page_h = page.size.height;
-    let mut group: Vec<&layout::FloatBox> = page
-        .floats
+    emit_float_group(
+        content,
+        page.size.height,
+        &page.floats,
+        0.0,
+        0.0,
+        behind,
+        res,
+    );
+}
+
+/// One z-order group of `floats` whose origins are relative to
+/// `(base_x, base_y)` in layout space — the page for page floats, the
+/// parent's content rect for nested boxes (issue #165). A picture paints
+/// its image XObject into the float's wrap-independent rect (issue #121);
+/// a text box paints shape fill, the story clipped to the shape rect
+/// (with its own nested boxes), outline (issue #83).
+fn emit_float_group(
+    content: &mut Content,
+    page_h: f32,
+    floats: &[layout::FloatBox],
+    base_x: f32,
+    base_y: f32,
+    behind: bool,
+    res: &Res<'_>,
+) {
+    let mut group: Vec<&layout::FloatBox> = floats
         .iter()
         .filter(|f| f.behind_doc == behind && !f.hidden)
         .collect();
@@ -853,12 +876,17 @@ fn emit_floats(content: &mut Content, page: &PageBox, behind: bool, res: &Res<'_
             continue;
         }
         match f.text_box.as_deref() {
-            Some(tb) => emit_text_box(content, page_h, f, tb, res),
+            Some(tb) => emit_text_box(content, page_h, f, tb, base_x, base_y, res),
             None => emit_image(
                 content,
                 page_h,
                 &f.rel_id,
-                [f.origin.x, f.origin.y, f.size.width, f.size.height],
+                [
+                    base_x + f.origin.x,
+                    base_y + f.origin.y,
+                    f.size.width,
+                    f.size.height,
+                ],
                 res,
             ),
         }
@@ -889,17 +917,21 @@ fn emit_image(
     content.restore_state();
 }
 
-/// Issue #83 — one text box: shape fill, the story clipped to the shape
-/// rect, outline.
+/// Issue #83 — one text box: shape fill, the clipped story (with its
+/// nested boxes — the `behindDoc` group under the story text, the rest
+/// over it, issue #165), outline. Origins are relative to
+/// `(base_x, base_y)` in layout space.
 fn emit_text_box(
     content: &mut Content,
     page_h: f32,
     f: &layout::FloatBox,
     tb: &layout::TextBoxFrame,
+    base_x: f32,
+    base_y: f32,
     res: &Res<'_>,
 ) {
-    let (x, w, h) = (f.origin.x, f.size.width, f.size.height);
-    let pdf_y = page_h - (f.origin.y + h);
+    let (x, w, h) = (base_x + f.origin.x, f.size.width, f.size.height);
+    let pdf_y = page_h - (base_y + f.origin.y + h);
     if let Some([r, g, b, _]) = tb.source.fill {
         content.save_state();
         content.set_fill_rgb(
@@ -912,26 +944,29 @@ fn emit_text_box(
         content.restore_state();
     }
     if let Some((origin, _)) = f.text_box_content_rect() {
+        let (cx, cy) = (base_x + origin.x, base_y + origin.y);
         content.save_state();
         content.rect(x, pdf_y, w, h);
         content.clip_nonzero();
         content.end_path();
+        emit_float_group(content, page_h, &tb.floats, cx, cy, true, res);
         for block in &tb.blocks {
-            emit_block_shading(content, page_h, origin.x, origin.y, block);
+            emit_block_shading(content, page_h, cx, cy, block);
         }
         for block in &tb.blocks {
             match block {
                 LayoutBlock::Paragraph(p) => {
-                    emit_paragraph_text(content, page_h, origin.x, origin.y, p, res);
+                    emit_paragraph_text(content, page_h, cx, cy, p, res);
                 }
                 LayoutBlock::Table(t) => {
-                    emit_table_text(content, page_h, origin.x, origin.y, t, res);
+                    emit_table_text(content, page_h, cx, cy, t, res);
                 }
             }
         }
         for block in &tb.blocks {
-            emit_block_borders(content, page_h, origin.x, origin.y, block);
+            emit_block_borders(content, page_h, cx, cy, block);
         }
+        emit_float_group(content, page_h, &tb.floats, cx, cy, false, res);
         content.restore_state();
     }
     if let Some(([r, g, b, _], lw)) = tb.source.outline
@@ -1671,7 +1706,8 @@ fn collect_to_unicode_pages(
         page.endnotes.for_each_paragraph(&mut collect);
         for f in &page.floats {
             if let Some(tb) = f.text_box.as_deref() {
-                for_each_paragraph(&tb.blocks, &mut collect);
+                /* Issue #165 — nested stories too. */
+                tb.for_each_story_blocks(&mut |blocks| for_each_paragraph(blocks, &mut collect));
             }
         }
     }

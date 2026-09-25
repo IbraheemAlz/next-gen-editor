@@ -898,6 +898,8 @@ function mutatesDocument(cmd: Command): boolean {
         case 'APPLY_FORMATTING':
         case 'SET_PARAGRAPH_ALIGN':
         case 'INSERT_IMAGE':
+        /* Issue #165 — a new text box is a new a11y region. */
+        case 'INSERT_TEXT_BOX':
         case 'PASTE_PLAIN':
         case 'PASTE_HTML':
         case 'END_COMPOSITION':

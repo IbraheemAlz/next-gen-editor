@@ -42,7 +42,9 @@
 //! self-defense refactor is provably output-identical on the nominal
 //! path.
 
-use crate::boxes::{FootnoteEntry, LayoutBlock, NoteBand, PageBox, ParagraphBox, TableBox};
+use crate::boxes::{
+    FootnoteEntry, LayoutBlock, NoteBand, PageBox, ParagraphBox, TableBox, TextBoxFrame,
+};
 use std::hash::{Hash, Hasher};
 
 /// Escalation ladder. Ordered: a later stage is a stronger response.
@@ -499,6 +501,33 @@ fn block_geometry_eq(a: &LayoutBlock, b: &LayoutBlock) -> bool {
     }
 }
 
+/// Issue #83 — a text box pins its laid-out story. Issue #165 — nested
+/// boxes join ONLY when present (a leading tag, then each nested box's
+/// geometry and frame, recursively), so every pre-#165 value holds.
+fn hash_text_box_frame(h: &mut std::collections::hash_map::DefaultHasher, tb: &TextBoxFrame) {
+    0x7b_u8.hash(h);
+    (tb.blocks.len() as u64).hash(h);
+    for b in &tb.blocks {
+        hash_block(h, b);
+    }
+    if !tb.floats.is_empty() {
+        0xa5_u8.hash(h);
+        (tb.floats.len() as u64).hash(h);
+        for f in &tb.floats {
+            hash_f32(h, f.origin.x);
+            hash_f32(h, f.origin.y);
+            hash_f32(h, f.size.width);
+            hash_f32(h, f.size.height);
+            f.at.hash(h);
+            f.z_order.hash(h);
+            f.behind_doc.hash(h);
+            if let Some(inner) = f.text_box.as_deref() {
+                hash_text_box_frame(h, inner);
+            }
+        }
+    }
+}
+
 /* ===================================================================
 Geometry fingerprint — the regression anchor for "output-identical"
 ==================================================================== */
@@ -563,11 +592,7 @@ pub fn geometry_fingerprint(pages: &[PageBox]) -> u64 {
                 /* Issue #83 — a text box pins its laid-out story; a
                 picture hashes nothing more, so pre-#83 values hold. */
                 if let Some(tb) = f.text_box.as_deref() {
-                    0x7b_u8.hash(&mut h);
-                    (tb.blocks.len() as u64).hash(&mut h);
-                    for b in &tb.blocks {
-                        hash_block(&mut h, b);
-                    }
+                    hash_text_box_frame(&mut h, tb);
                 }
             }
         }
