@@ -256,7 +256,8 @@ fn deleted_row_is_a_pure_deletion() {
 
 /// A merge regenerates only the owner's `<w:tcPr>` (now carrying the
 /// `gridSpan`) — its unchanged children adopt their source spelling, the
-/// `w:themeFill` included — and drops the merged-away cell; `<w:tblPr>`,
+/// `w:themeFill` included — and folds the merged-away cell's content into
+/// the owner (issue #263: Word appends it, row-major); `<w:tblPr>`,
 /// `<w:tblPrEx>` and `<w:trPr>` stay verbatim.
 #[test]
 fn merge_regenerates_the_owner_tcpr_only() {
@@ -274,7 +275,17 @@ fn merge_regenerates_the_owner_tcpr_only() {
     ] {
         assert!(out.contains(kept), "{kept} lost:\n{out}");
     }
-    assert!(!out.contains(">B1<"), "the merged-away cell is gone");
+    /* Issue #263 — the merged-away cell's paragraph now lives in the owner
+    cell, so its text survives while the `<w:tc>` itself is gone. */
+    assert!(
+        out.contains(">B1<"),
+        "merged-away content kept (#263):\n{out}"
+    );
+    assert_eq!(
+        out.matches("<w:tc>").count(),
+        xml.matches("<w:tc>").count() - 1,
+        "exactly one cell fewer after the merge:\n{out}"
+    );
     assert!(xml.contains(">B1<"));
 }
 

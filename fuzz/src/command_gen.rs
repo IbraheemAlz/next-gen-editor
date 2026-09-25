@@ -863,6 +863,8 @@ classify_variants! {
     ToggleTrackChanges { .. } => false,
     AcceptRevision { .. } => false,
     RejectRevision { .. } => false,
+    AcceptAllRevisions => false,
+    RejectAllRevisions => false,
     InsertComment { .. } => false,
     DeleteComment { .. } => false,
     SetTabStops { .. } => false,
@@ -1092,7 +1094,7 @@ mod tests {
                 "duplicate variant name in ALL_VARIANT_NAMES: {name}"
             );
         }
-        const EXPECTED_VARIANT_COUNT: usize = 104;
+        const EXPECTED_VARIANT_COUNT: usize = 106;
         assert_eq!(
             ALL_VARIANT_NAMES.len(),
             EXPECTED_VARIANT_COUNT,

@@ -482,14 +482,7 @@ fn push_escaped_attr(text: &str, out: &mut String) {
 /// Word requires `w:id` on every wrapper, the value must be unique within
 /// the document, but is otherwise opaque.
 fn emit_revision_open(rev: &Revision, fallback_id: u32, out: &mut String) {
-    let tag = match rev.kind {
-        RevisionKind::Insert => "w:ins",
-        RevisionKind::Delete => "w:del",
-        /* FormatChange should never reach the text-wrap path — caller
-        filters it. Defensive default to ins so a stray entry never
-        produces malformed XML. */
-        RevisionKind::FormatChange => "w:ins",
-    };
+    let tag = revision_tag(rev.kind);
     let id = rev.id.unwrap_or(fallback_id);
     out.push_str(&format!("<{tag} w:id=\"{id}\""));
     if !rev.author.is_empty() {
@@ -506,12 +499,24 @@ fn emit_revision_open(rev: &Revision, fallback_id: u32, out: &mut String) {
 }
 
 fn emit_revision_close(kind: RevisionKind, out: &mut String) {
-    let tag = match kind {
+    let tag = revision_tag(kind);
+    out.push_str(&format!("</{tag}>"));
+}
+
+/// The wrapper element of a run-wrapping revision kind.
+fn revision_tag(kind: RevisionKind) -> &'static str {
+    match kind {
         RevisionKind::Insert => "w:ins",
         RevisionKind::Delete => "w:del",
+        /* Issue #247 — tracked moves. `<w:moveFrom>` content keeps
+        `<w:t>` (only `<w:del>` switches to `<w:delText>`). */
+        RevisionKind::MoveFrom => "w:moveFrom",
+        RevisionKind::MoveTo => "w:moveTo",
+        /* FormatChange should never reach the text-wrap path — callers
+        filter it. Defensive default to ins so a stray entry never
+        produces malformed XML. */
         RevisionKind::FormatChange => "w:ins",
-    };
-    out.push_str(&format!("</{tag}>"));
+    }
 }
 
 /// `<w:jc w:val="…"/>` token for an `Alignment`. Word emits writing-direction-
@@ -834,6 +839,11 @@ fn serialize_paragraph(
     } else {
         std::borrow::Cow::Borrowed(&para.props)
     };
+    /* Issue #262 — the paragraph-mark revision re-enters the mark's rPr. */
+    let props = match &para.mark_revision {
+        Some(rev) => std::borrow::Cow::Owned(with_mark_revision(&props, rev)),
+        None => props,
+    };
     match source_ppr {
         /* Verified passthrough: the model still holds exactly what these
         bytes produced, so they are the most faithful serialization (and
@@ -1012,6 +1022,47 @@ fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
         && sp.props == para.props
         && sp.style_id == para.style_id
         && sp.list_item == para.list_item
+        /* Issue #262 — the bytes spell the paragraph-mark revision. */
+        && sp.mark_revision == para.mark_revision
+}
+
+/// Issue #262 — `props` with the paragraph-mark revision `rev` put back
+/// into the mark's `<w:rPr>` (which rides the pPr grab bag): first child of
+/// the recorded rPr fragment (CT_ParaRPr opens with the track-change
+/// elements), or a fresh `<w:rPr>` fragment when the mark had none.
+fn with_mark_revision(props: &ParaProperties, rev: &Revision) -> ParaProperties {
+    let mut el = String::new();
+    emit_revision_open(rev, 0, &mut el);
+    /* `<w:ins …>` → `<w:ins …/>`: the mark element is empty. */
+    el.pop();
+    el.push_str("/>");
+    let mut p = props.clone();
+    let bag = p.grab_bag.get_or_insert_with(Default::default);
+    let rpr = bag
+        .fragments
+        .iter_mut()
+        .find(|f| fragment_qname(f) == b"w:rPr");
+    match rpr {
+        Some(frag) => {
+            let Some(gt) = frag.iter().position(|&b| b == b'>') else {
+                return props.clone();
+            };
+            if frag[..gt].ends_with(b"/") {
+                /* `<w:rPr …/>` → `<w:rPr …>REV</w:rPr>`. */
+                let mut out = frag[..gt - 1].to_vec();
+                out.push(b'>');
+                out.extend_from_slice(el.as_bytes());
+                out.extend_from_slice(b"</w:rPr>");
+                *frag = out;
+            } else {
+                frag.splice(gt + 1..gt + 1, el.bytes());
+            }
+        }
+        None => bag
+            .fragments
+            .push(format!("<w:rPr>{el}</w:rPr>").into_bytes()),
+    }
+    p
 }
 
 /// Issue #81 — a stable `w:id` for an engine-emitted bookmark. Ids are
@@ -1191,12 +1242,22 @@ fn emit_styled_runs_with_objects(
     `<w:ins>` / `<w:del>`; `FormatChange` rides on `<w:rPr>` via
     `<w:rPrChange>` (emitted by `serialize_run`'s rPr block, NOT
     here), so the text-wrap stack must filter it out. */
-    let mut sorted_revs: Vec<&Revision> = para
+    let mut sorted_revs: Vec<(usize, &Revision)> = para
         .revisions
         .iter()
-        .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+        .enumerate()
+        .filter(|(_, r)| r.kind.wraps_text())
         .collect();
-    sorted_revs.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    /* Issue #247 — two wrappers over the SAME range (`<w:moveTo><w:del>`
+    in Tika-792) open in source order: the reader records a wrapper when
+    it CLOSES, so the outer one sits later in `revisions`. */
+    sorted_revs.sort_by(|(ia, a), (ib, b)| {
+        a.start
+            .cmp(&b.start)
+            .then(b.end.cmp(&a.end))
+            .then(ib.cmp(ia))
+    });
+    let sorted_revs: Vec<&Revision> = sorted_revs.into_iter().map(|(_, r)| r).collect();
 
     /* Issue #60 — hyperlinks sorted the same way as revisions. Nesting
     model: hyperlinks wrap revisions (`<w:hyperlink><w:ins>...` when a
@@ -1480,7 +1541,7 @@ fn wrapper_ranges(para: &Paragraph) -> Vec<(usize, usize)> {
         .chain(
             para.revisions
                 .iter()
-                .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+                .filter(|r| r.kind.wraps_text())
                 .map(|r| clamp(r.start, r.end)),
         )
         .chain(
@@ -1789,7 +1850,7 @@ fn simple_field_nests(f: &Field, para: &Paragraph) -> bool {
         && para
             .revisions
             .iter()
-            .filter(|r| matches!(r.kind, RevisionKind::Insert | RevisionKind::Delete))
+            .filter(|r| r.kind.wraps_text())
             .all(|r| outer_ok(r.start, r.end))
         && para.fields.iter().filter(|g| g.is_local()).all(|g| {
             std::ptr::eq(g, f)
@@ -4730,6 +4791,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4772,6 +4834,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4818,6 +4881,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4878,6 +4942,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4924,6 +4989,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -5010,6 +5076,7 @@ mod tests {
                     date: "2026-01-01T00:00:00Z".into(),
                     id: Some(7),
                     prev_attrs: None,
+                    move_name: None,
                 },
                 Revision {
                     start: 6,
@@ -5019,6 +5086,7 @@ mod tests {
                     date: "2026-01-02T00:00:00Z".into(),
                     id: Some(8),
                     prev_attrs: None,
+                    move_name: None,
                 },
             ],
             fields: Vec::new(),
@@ -5028,6 +5096,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -6892,6 +6961,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -6943,6 +7013,7 @@ mod tests {
                 date: String::new(),
                 id: None,
                 prev_attrs: None,
+                move_name: None,
             }],
             fields: Vec::new(),
             style_id: None,
@@ -6951,6 +7022,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7078,6 +7150,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -7109,6 +7182,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -7168,6 +7242,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -7848,6 +7923,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -8489,6 +8565,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");

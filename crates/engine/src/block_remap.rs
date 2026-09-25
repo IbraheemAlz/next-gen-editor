@@ -49,6 +49,18 @@ pub enum CellMove {
     /// start (`at_end == false`) or the end of the content of the cell at
     /// `(row, col)`.
     Collapse { row: u32, col: u32, at_end: bool },
+    /// Issue #263 — the cell is gone, but its blocks were not discarded:
+    /// they were appended whole (paragraph for paragraph) into the cell at
+    /// `(row, col)` starting at block index `block_offset`. An anchor at
+    /// block `k` (offset unchanged) now lives at block `k + block_offset`
+    /// of the target cell — `merge_cells` uses this so a comment on a
+    /// merged-away cell's text stays on that text instead of collapsing to
+    /// a single point.
+    Absorbed {
+        row: u32,
+        col: u32,
+        block_offset: u32,
+    },
 }
 
 impl DocumentTree {
@@ -224,6 +236,18 @@ impl DocumentTree {
             CellMove::Collapse { row, col, at_end } => self
                 .cell_edge(table, row, col, at_end)
                 .unwrap_or_else(|| self.beside_block(table)),
+            CellMove::Absorbed {
+                row,
+                col,
+                block_offset,
+            } => {
+                let mut out = pos.clone();
+                out.path.steps[d] = PathStep::Cell { row, col };
+                if let PathStep::Block(k) = out.path.steps[d + 1] {
+                    out.path.steps[d + 1] = PathStep::Block(k + block_offset);
+                }
+                out
+            }
         }
     }
 
@@ -602,21 +626,98 @@ mod tests {
         let doc = table_doc(2, 3, 0, 0).merge_cells(table_path(), 0, 0, 0, 1);
         assert_eq!(anchor_cell(&doc), ((0, 0, 0), (0, 0, 4)));
         assert_eq!(commented_text(&doc), "r0c0");
-        /* Anchor in a merged-away partner: onto the owner. */
+        /* Anchor in a merged-away partner: issue #263 — its text is
+        appended into the owner (not discarded), so the anchor follows
+        onto that same appended paragraph, still covering "r0c1" — it no
+        longer collapses to a zero-width point at the owner's end. */
         let doc = table_doc(2, 3, 0, 1).merge_cells(table_path(), 0, 0, 0, 1);
-        assert_eq!(anchor_cell(&doc), ((0, 0, 4), (0, 0, 4)));
+        assert_eq!(anchor_cell(&doc), ((0, 0, 0), (0, 0, 4)));
+        assert_eq!(commented_text(&doc), "r0c1");
         /* Anchor right of the merge: shifts left with its cell. */
         let doc = table_doc(2, 3, 0, 2).merge_cells(table_path(), 0, 0, 0, 1);
         assert_eq!(anchor_cell(&doc), ((0, 1, 0), (0, 1, 4)));
         assert_eq!(commented_text(&doc), "r0c2");
-        /* Vertical merge: the continuation cell's anchor joins the owner;
-        a cell right of the merged block in the continuation row shifts. */
+        /* Vertical merge: the continuation cell's own content is also
+        appended into the owner (issue #263) — its anchor follows onto
+        that paragraph, still covering "r1c0"; a cell right of the merged
+        block in the continuation row shifts instead. */
         let doc = table_doc(2, 3, 1, 0).merge_cells(table_path(), 0, 0, 1, 1);
         let ((r, c, _), _) = anchor_cell(&doc);
         assert_eq!((r, c), (0, 0));
+        assert_eq!(commented_text(&doc), "r1c0");
         let doc = table_doc(2, 3, 1, 2).merge_cells(table_path(), 0, 0, 1, 1);
         assert_eq!(anchor_cell(&doc), ((1, 1, 0), (1, 1, 4)));
         assert_eq!(commented_text(&doc), "r1c2");
+    }
+
+    /// Issue #263 — merging a 2×2 range with text in all four cells
+    /// appends every cell's paragraph into the owner in row-major order
+    /// (Word's behaviour); no content is lost, and each cell's anchor
+    /// follows its own text onto the block it landed on.
+    #[test]
+    fn merge_2x2_appends_all_four_cells_in_row_major_order() {
+        let doc = table_doc(2, 2, 0, 0).merge_cells(table_path(), 0, 0, 1, 1);
+        let owner = doc.table_at_path(&table_path()).unwrap().rows[0].cells[0]
+            .blocks
+            .iter()
+            .map(|b| b.as_paragraph().unwrap().text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(owner, vec!["r0c0", "r0c1", "r1c0", "r1c1"]);
+        /* The merged-away cells are gone; the continuation cell survives
+        with a single blank paragraph. */
+        let row0 = &doc.table_at_path(&table_path()).unwrap().rows[0];
+        assert_eq!(row0.cells.len(), 1);
+        let row1 = &doc.table_at_path(&table_path()).unwrap().rows[1];
+        assert_eq!(row1.cells.len(), 1);
+        assert_eq!(row1.cells[0].blocks.len(), 1);
+        assert_eq!(row1.cells[0].blocks[0].as_paragraph().unwrap().text, "");
+        /* An anchor on each of the four original cells follows its own
+        text onto the block it landed on inside the owner. */
+        for (r, c, text, block) in [
+            (0u32, 0u32, "r0c0", 0u32),
+            (0, 1, "r0c1", 1),
+            (1, 0, "r1c0", 2),
+            (1, 1, "r1c1", 3),
+        ] {
+            let doc = table_doc(2, 2, r, c).merge_cells(table_path(), 0, 0, 1, 1);
+            let want = LogicalPos::new(
+                BlockPath {
+                    steps: vec![
+                        PathStep::Block(1),
+                        PathStep::Cell { row: 0, col: 0 },
+                        PathStep::Block(block),
+                    ],
+                },
+                0,
+            );
+            assert_eq!(doc.comment_ranges[0].start, want, "anchor for ({r},{c})");
+            assert_eq!(commented_text(&doc), text);
+        }
+    }
+
+    /// Issue #263 acceptance — undo restores the pre-merge table shape,
+    /// each cell's own text, AND the comment anchor exactly.
+    #[test]
+    fn undo_restores_the_pre_merge_cells_and_anchor() {
+        let pre = table_doc(2, 2, 0, 1);
+        let mut undo = UndoStack::new(pre.clone(), 100);
+        undo.push(pre.merge_cells(table_path(), 0, 0, 1, 1));
+        assert_eq!(anchor_cell(undo.current()), ((0, 0, 0), (0, 0, 4)));
+        assert!(undo.undo());
+        let restored = undo.current();
+        for (r, c, text) in [
+            (0u32, 0u32, "r0c0"),
+            (0, 1, "r0c1"),
+            (1, 0, "r1c0"),
+            (1, 1, "r1c1"),
+        ] {
+            assert_eq!(
+                restored.paragraph_at_path(&cell(r, c, 0)).unwrap().text,
+                text
+            );
+        }
+        assert_eq!(anchor_cell(restored), anchor_cell(&pre));
+        assert_eq!(commented_text(restored), "r0c1");
     }
 
     #[test]

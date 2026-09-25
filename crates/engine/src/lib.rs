@@ -61,6 +61,9 @@ use serde::{Deserialize, Serialize};
 mod block_remap;
 pub use block_remap::CellMove;
 pub mod fields;
+#[cfg(test)]
+mod revision_tests;
+mod revisions;
 mod text_remap;
 pub use text_remap::TextEdit;
 pub mod html;
@@ -1485,6 +1488,11 @@ pub struct SourcePPr {
     pub props: ParaProperties,
     pub style_id: Option<String>,
     pub list_item: Option<ListItem>,
+    /// Issue #262 — the paragraph-mark revision `xml` spells (its
+    /// `<w:rPr><w:ins/>`): the bytes are re-emitted only while the
+    /// paragraph still carries exactly this one. Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark_revision: Option<Revision>,
 }
 
 /// Issues #199 / #106 — one source `<w:r>` covering the text bytes
@@ -2953,6 +2961,47 @@ pub enum RevisionKind {
     /// Payload-free here to keep `RevisionKind: Copy`, which a dozen
     /// existing match sites rely on.
     FormatChange,
+    /// Issue #247 — `<w:moveFrom>`: the SOURCE side of a tracked move.
+    /// Text semantics are a deletion's (accept drops it, reject keeps
+    /// it); the reviewer sees it as moved-away text. The source spells
+    /// it with `<w:t>` (not `<w:delText>`). The pairing with its
+    /// destination rides [`Revision::move_name`].
+    MoveFrom,
+    /// Issue #247 — `<w:moveTo>`: the DESTINATION side of a tracked
+    /// move. Text semantics are an insertion's (accept keeps it, reject
+    /// drops it).
+    MoveTo,
+}
+
+impl RevisionKind {
+    /// Issue #247 — `true` when ACCEPTING this revision removes its
+    /// text (`Delete`, `MoveFrom`).
+    pub fn removes_on_accept(self) -> bool {
+        matches!(self, Self::Delete | Self::MoveFrom)
+    }
+
+    /// Issue #247 — `true` when REJECTING this revision removes its
+    /// text (`Insert`, `MoveTo`).
+    pub fn removes_on_reject(self) -> bool {
+        matches!(self, Self::Insert | Self::MoveTo)
+    }
+
+    /// Issue #247 — `true` for the kinds that wrap runs in the source
+    /// (`<w:ins>` / `<w:del>` / `<w:moveFrom>` / `<w:moveTo>`);
+    /// `FormatChange` rides the run's `<w:rPr>` instead.
+    pub fn wraps_text(self) -> bool {
+        !matches!(self, Self::FormatChange)
+    }
+
+    /// Issue #247 — the text is removed by exactly one of accept /
+    /// reject: `accept == true` asks for the accept outcome.
+    pub fn removes_text(self, accept: bool) -> bool {
+        if accept {
+            self.removes_on_accept()
+        } else {
+            self.removes_on_reject()
+        }
+    }
 }
 
 /// Phase 8b — one `<w:ins>` / `<w:del>` / `<w:rPrChange>` overlay on a
@@ -2975,6 +3024,15 @@ pub struct Revision {
     /// original look. `None` for `Insert` / `Delete` revisions where
     /// the attribute is irrelevant.
     pub prev_attrs: Option<SpanStyle>,
+    /// Issue #247 — for a `MoveFrom` / `MoveTo` revision, the `w:name`
+    /// of the enclosing `<w:moveFromRangeStart>` / `<w:moveToRangeStart>`
+    /// (the pair's shared name links a move's two halves). `None` for
+    /// every other kind and for a move read outside a named range. The
+    /// range markers themselves ride the paragraph's source markup as
+    /// positioned verbatim markers. Skipped when `None`, so a pre-#247
+    /// snapshot encodes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_name: Option<String>,
 }
 
 /// Phase 7 — a media blob stashed for the renderer to decode.
@@ -3410,6 +3468,22 @@ pub struct Paragraph {
     /// paragraphs. Boxed: `Paragraph` clones constantly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_markup: Option<Box<SourceMarkup>>,
+    /// Issue #262 — a tracked change on the paragraph MARK
+    /// (`<w:pPr><w:rPr><w:ins/>` / `<w:del/>` / `<w:moveFrom/>` /
+    /// `<w:moveTo/>`): an inserted mark is a tracked paragraph SPLIT, a
+    /// deleted one a tracked MERGE with the following paragraph. Only
+    /// `kind` / `author` / `date` / `id` / `move_name` are meaningful —
+    /// `start` / `end` are unused (0). Accepting a deleted (or moved-
+    /// away) mark, or rejecting an inserted (or moved-in) one, merges
+    /// this paragraph with the next ([`DocumentTree::resolve_all_revisions`]).
+    ///
+    /// Travel rules: the mark belongs to the paragraph END, so
+    /// `split_at` gives it to the RIGHT half (the left half gets a fresh
+    /// mark) and `concat` keeps the TAIL's (like `section_end`);
+    /// clipboard fragments clear it. Skipped when `None`, so a pre-#262
+    /// snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark_revision: Option<Revision>,
 }
 
 /// Issue #81 — one paragraph-scoped bookmark. `id` is the source
@@ -3559,6 +3633,7 @@ impl Paragraph {
             /* Issues #199 / #106 — no offset moves; the writer verifies
             each run's recorded `<w:rPr>` against the new style. */
             source_markup: self.source_markup.clone(),
+            mark_revision: self.mark_revision.clone(),
         }
     }
 
@@ -3746,6 +3821,8 @@ impl Paragraph {
             bookmarks: self.bookmarks.clone(),
             body_xml: self.body_xml.clone(),
             source_markup: markup,
+            /* Issue #262 — the paragraph mark is untouched. */
+            mark_revision: self.mark_revision.clone(),
         }
     }
 
@@ -3863,6 +3940,8 @@ impl Paragraph {
                 a content control wrapping the paragraph wraps both halves. */
                 body_xml: BodyPassthrough::before_only(&self.body_xml),
                 source_markup: markup_left,
+                /* Issue #262 — a fresh mark for the left half. */
+                mark_revision: None,
             },
             Paragraph {
                 text: self.text[at as usize..].to_owned(),
@@ -3885,6 +3964,8 @@ impl Paragraph {
                 bookmarks: Vec::new(),
                 body_xml: BodyPassthrough::after_only(&self.body_xml),
                 source_markup: markup_right,
+                /* Issue #262 — the original mark ends the right half. */
+                mark_revision: self.mark_revision.clone(),
             },
         )
     }
@@ -3974,6 +4055,9 @@ impl Paragraph {
                 &other.source_markup,
                 other.text.len() as u32,
             ),
+            /* Issue #262 — the head's mark is the one deleted: the
+            surviving mark (and its tracked change) is the tail's. */
+            mark_revision: other.mark_revision.clone(),
         }
     }
 
@@ -4863,6 +4947,7 @@ impl DocumentTree {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         }));
         Self {
             blocks,
@@ -4915,6 +5000,7 @@ impl DocumentTree {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             }));
         }
         Self {
@@ -5947,29 +6033,19 @@ impl DocumentTree {
             let pre_text_len = (para.text.len() as u32).saturating_sub(len);
             let off = off_input.min(pre_text_len);
 
-            /* Detect boundary state BEFORE shifting revisions so the
-            classifier sees the pre-insert geometry. */
-            let inside_insert_same_author = para.revisions.iter().any(|r| {
+            /* Detect boundary state on the PRE-insert geometry (the
+            same paragraph of `self`). `insert_text` already shifted the
+            revisions by `len` (issue #247): revisions starting at or
+            after `off` slid right; revisions containing `off` grew. */
+            let pre_revisions = self
+                .paragraph_at_path(&target_path)
+                .map_or(&[][..], |p| p.revisions.as_slice());
+            let inside_insert_same_author = pre_revisions.iter().any(|r| {
                 r.kind == RevisionKind::Insert && r.start < off && off < r.end && r.author == author
             });
-            let inside_delete = para
-                .revisions
+            let inside_delete = pre_revisions
                 .iter()
                 .any(|r| r.kind == RevisionKind::Delete && r.start <= off && off < r.end);
-
-            /* Shift trailing revisions by `len`. Mirrors the span-shift
-            in `insert_text`: revisions starting at or after `off`
-            slide right; revisions containing `off` grow (end +=
-            len). Inline `objects` + `hyperlinks` shifts are deferred
-            to a future sprint — Sprint 14 keeps the surface bounded. */
-            for r in &mut para.revisions {
-                if r.start >= off {
-                    r.start += len;
-                }
-                if r.end > off {
-                    r.end += len;
-                }
-            }
 
             /* If we landed inside a Delete, the shift above grew the
             Delete to span both halves. Split it back into the two
@@ -5993,6 +6069,7 @@ impl DocumentTree {
                             date: r.date.clone(),
                             id: None,
                             prev_attrs: None,
+                            move_name: None,
                         });
                     }
                     /* Right half [off + len, r.end) — note r.end was
@@ -6007,6 +6084,7 @@ impl DocumentTree {
                             date: r.date,
                             id: None,
                             prev_attrs: None,
+                            move_name: None,
                         });
                     }
                 }
@@ -6034,6 +6112,7 @@ impl DocumentTree {
                         date: date.clone(),
                         id: None,
                         prev_attrs: None,
+                        move_name: None,
                     });
                 }
             }
@@ -6093,49 +6172,35 @@ impl DocumentTree {
         let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
             /* Range entirely inside a same-author Insert? If so, undo
             the Insert (remove text + shrink the Insert overlay). */
-            let owning_insert = para.revisions.iter().position(|r| {
+            let owning_insert = para.revisions.iter().any(|r| {
                 r.kind == RevisionKind::Insert
                     && r.author == author
                     && r.start <= s_off
                     && e_off <= r.end
             });
-            if let Some(idx) = owning_insert {
+            if owning_insert {
                 let s = s_off.min(para.text.len() as u32);
                 let e = e_off.min(para.text.len() as u32);
                 let removed_len = e.saturating_sub(s);
                 if e > s {
                     /* Issues #250 / #252 — one splice drives the source
-                    markup and (below) the comment anchors. */
-                    removed_edit = Some(para.splice_text(s, removed_len, ""));
-                }
-                /* Shrink the owning Insert by removed_len; shift
-                trailing revisions left by removed_len. */
-                let owning = &mut para.revisions[idx];
-                owning.end -= removed_len;
-                let owning_empty = owning.end <= owning.start;
-                /* Now shift everything else after e_off. */
-                for (i, r) in para.revisions.iter_mut().enumerate() {
-                    if i == idx {
-                        continue;
-                    }
-                    if r.start >= e_off {
-                        r.start = r.start.saturating_sub(removed_len);
-                    }
-                    if r.end > e_off {
-                        r.end = r.end.saturating_sub(removed_len);
-                    }
-                }
-                if owning_empty {
-                    para.revisions.remove(idx);
-                }
-                /* Shift spans + their byte-offset relatives. */
-                for s in &mut para.spans {
-                    if s.start >= e_off {
-                        s.start = s.start.saturating_sub(removed_len);
-                    }
-                    if s.end > e_off {
-                        s.end = s.end.saturating_sub(removed_len);
-                    }
+                    markup and (below) the comment anchors. Issue #265 —
+                    the SAME (at, removed) window then drives every other
+                    byte-offset table through `shift_paragraph_offsets_after`
+                    (spans, hyperlinks, fields, inline objects, and the
+                    revisions themselves): the owning Insert satisfies
+                    `start <= s && e <= end`, so the shared gap-shift rule
+                    shrinks its `end` by `removed_len` and leaves `start`
+                    alone — exactly the old bespoke shrink — and drops it
+                    outright if that shrinks it to empty, via the same
+                    `retain` every other overlay gets. This is the
+                    `apply_revision_decision` (accept/reject) bookkeeping,
+                    reused so a field, hyperlink or picture inside a
+                    reviewer's own removed insertion leaves no stale
+                    offsets. */
+                    let edit = para.splice_text(s, removed_len, "");
+                    shift_paragraph_offsets_after(para, edit.at, edit.removed);
+                    removed_edit = Some(edit);
                 }
                 para.dirty = true;
                 return;
@@ -6159,6 +6224,7 @@ impl DocumentTree {
                     date: date.clone(),
                     id: None,
                     prev_attrs: None,
+                    move_name: None,
                 });
             }
             para.dirty = true;
@@ -6252,6 +6318,7 @@ impl DocumentTree {
                     date: date_local,
                     id: None,
                     prev_attrs: Some(prev_local),
+                    move_name: None,
                 });
                 para.dirty = true;
             });
@@ -6314,6 +6381,7 @@ impl DocumentTree {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             }));
             return Self {
                 blocks,
@@ -6395,8 +6463,7 @@ impl DocumentTree {
             a stale range would repaint the wrong bytes). Typing at a
             field's start boundary stays outside (shift); strictly inside
             grows the field (the cached result was hand-edited — the next
-            resolution overwrites it wholesale). Revisions keep their
-            pre-existing #56 limitation. */
+            resolution overwrites it wholesale). */
             for f in &mut para.fields {
                 if f.start >= off {
                     f.start += len;
@@ -6415,6 +6482,20 @@ impl DocumentTree {
                     h.end += len;
                 } else if h.end > off {
                     h.end += len;
+                }
+            }
+            /* Issue #247 — tracked-change overlays (a move, an ins / del
+            read from the file) follow their text like a span: typing at
+            a revision's start stays outside it (shift), strictly inside
+            grows it, at its end stays outside. `tracked_insert_text`
+            builds on this shift (a Delete it lands in grows and is split
+            back around the new insertion there). */
+            for r in &mut para.revisions {
+                if r.start >= off {
+                    r.start += len;
+                }
+                if r.end > off {
+                    r.end += len;
                 }
             }
             /* Issue #69 / #80 — inline-object anchors (images, note
@@ -7045,6 +7126,20 @@ impl DocumentTree {
     }
 
     fn apply_revision_decision(&self, block: u32, start: u32, end: u32, accept: bool) -> Self {
+        /* Issue #262 — a paragraph-MARK revision is addressed as the
+        empty range at the paragraph end (`revisions_snapshot` lists it
+        so); text revisions are never empty. */
+        if start == end
+            && let Some(p) = self
+                .blocks
+                .get(block as usize)
+                .and_then(Block::as_paragraph)
+            && p.mark_revision.is_some()
+            && start as usize == p.text.len()
+            && !p.revisions.iter().any(|r| r.start == start && r.end == end)
+        {
+            return self.resolve_mark_revision_at(block, accept);
+        }
         let mut blocks = self.blocks.clone();
         let path = BlockPath::top(block);
         let mut removed_edit = None;
@@ -7060,11 +7155,17 @@ impl DocumentTree {
              * helper does not also `retain`-drop it (which would make
              * any post-shift index lookup brittle). */
             let rev = para.revisions.remove(idx);
-            let delete_text = match (rev.kind, accept) {
-                (RevisionKind::Insert, false) => true, // Reject Insert
-                (RevisionKind::Delete, true) => true,  // Accept Delete
-                _ => false,                            // text stays live
-            };
+            /* Issue #262 — a rejected formatting change restores the
+            recorded style. */
+            if !accept
+                && rev.kind == RevisionKind::FormatChange
+                && let Some(prev) = &rev.prev_attrs
+            {
+                revisions::restyle(para, rev.start, rev.end, prev);
+            }
+            /* Reject Insert / MoveTo, accept Delete / MoveFrom (issue
+            #247): the text goes; otherwise it stays live. */
+            let delete_text = rev.kind.removes_text(accept);
             if delete_text {
                 let s = para.snap_offset(rev.start);
                 let e = para.snap_offset(rev.end);
@@ -9834,9 +9935,12 @@ impl DocumentTree {
     /// becomes the visual owner: its `grid_span` widens to cover the
     /// column range, every cell directly below in the column range
     /// becomes `VMergeRole::Continue`. Horizontal partners (same row,
-    /// columns to the right) are *removed* and their widths summed
-    /// into the owner's `grid_span`. PR 3 minimum implementation —
-    /// PR 3b extends for non-rectangular merges.
+    /// columns to the right) are *removed*, their widths summed into the
+    /// owner's `grid_span`; a continuation row's own cell is emptied to a
+    /// single blank paragraph. Issue #263 — none of that content is
+    /// dropped: every merged-away cell's blocks are appended into the
+    /// owner, in row-major order (Word's behaviour), by
+    /// [`Self::merge_cells_unmapped`].
     pub fn merge_cells(
         &self,
         table_path: BlockPath,
@@ -9855,29 +9959,61 @@ impl DocumentTree {
         } else {
             (to_col, from_col)
         };
-        /* Issue #253 — mirror the merge on the PRE-mutation shape: per
-        affected row, the cells `c0 + 1 ..= c0 + drop` are removed (their
-        anchors — and those of the vertical continuation cells — collapse
-        onto the end of the merged owner `(r0, c0)`), cells past them shift
-        left by `drop`. */
+        /* Issue #253 / #263 — mirror the merge on the PRE-mutation shape:
+        per affected row, the cells `c0 + 1 ..= c0 + drop` are removed and
+        (issue #263) a continuation row's own `c0` cell is also emptied —
+        every one of those cells' blocks lands, whole, inside the owner
+        `(r0, c0)`. `absorbed` records exactly where: `cursor` walks the
+        SAME row-major order `merge_cells_unmapped` appends in (row r0's
+        horizontal partners, then each continuation row's own cell
+        followed by its horizontal partners), so an anchor at block `k` of
+        an absorbed cell lands on block `cursor + k` of the owner. Cells
+        past the merged range shift left by `drop`. */
         let remap = self.mutated_table_shape(&table_path).and_then(|(tp, t)| {
             let rcount = t.rows.len() as u32;
-            let last = (t.rows.get(r0 as usize)?.cells.len() as u32).checked_sub(1)?;
+            let owner_row = t.rows.get(r0 as usize)?;
+            let last = (owner_row.cells.len() as u32).checked_sub(1)?;
             if c0 > last {
                 return None;
             }
+            let mut cursor = owner_row
+                .cells
+                .get(c0 as usize)
+                .map_or(0, |c| c.blocks.len() as u32);
+            let mut absorbed: Vec<(u32, u32, u32)> = Vec::new();
             /* (row, cells dropped) for the owner row and each continuation. */
-            let mut drops = vec![(r0, c1.min(last) - c0)];
-            for r in (r0 + 1)..=r1.min(rcount.saturating_sub(1)) {
-                let len = t.rows[r as usize].cells.len() as u32;
-                if c0 < len {
-                    drops.push((r, c1.min(len - 1) - c0));
-                }
+            let mut drops = Vec::new();
+            let c1_r0 = c1.min(last);
+            for c in (c0 + 1)..=c1_r0 {
+                let len = owner_row
+                    .cells
+                    .get(c as usize)
+                    .map_or(0, |cell| cell.blocks.len() as u32);
+                absorbed.push((r0, c, cursor));
+                cursor += len;
             }
-            Some((tp, drops))
+            drops.push((r0, c1_r0 - c0));
+            for r in (r0 + 1)..=r1.min(rcount.saturating_sub(1)) {
+                let row = &t.rows[r as usize];
+                let len = row.cells.len() as u32;
+                if c0 >= len {
+                    continue;
+                }
+                let own_len = row.cells[c0 as usize].blocks.len() as u32;
+                absorbed.push((r, c0, cursor));
+                cursor += own_len;
+                let c1_r = c1.min(len - 1);
+                for c in (c0 + 1)..=c1_r {
+                    let clen = row.cells[c as usize].blocks.len() as u32;
+                    absorbed.push((r, c, cursor));
+                    cursor += clen;
+                }
+                drops.push((r, c1_r - c0));
+            }
+            Some((tp, drops, absorbed))
         });
         let mut out = self.merge_cells_unmapped(table_path, r0, r1, c0, c1);
-        if let Some((tp, drops)) = remap {
+        if let Some((tp, drops, absorbed)) = remap {
             out.remap_table_cells(&tp, |row, col| {
                 let Some(&(_, drop)) = drops.iter().find(|(r, _)| *r == row) else {
                     return CellMove::Keep;
@@ -9886,10 +10022,20 @@ impl DocumentTree {
                 if col < c0 || owner {
                     CellMove::Keep
                 } else if col <= c0 + drop {
-                    CellMove::Collapse {
-                        row: r0,
-                        col: c0,
-                        at_end: true,
+                    match absorbed.iter().find(|(r, c, _)| *r == row && *c == col) {
+                        Some(&(_, _, block_offset)) => CellMove::Absorbed {
+                            row: r0,
+                            col: c0,
+                            block_offset,
+                        },
+                        /* Defensive fallback; every merged-away cell the
+                        classification reaches this branch for is also in
+                        `absorbed` by construction. */
+                        None => CellMove::Collapse {
+                            row: r0,
+                            col: c0,
+                            at_end: true,
+                        },
                     }
                 } else {
                     CellMove::To {
@@ -9902,6 +10048,12 @@ impl DocumentTree {
         out
     }
 
+    /// Issue #263 — physically restructure the table AND carry every
+    /// merged-away cell's blocks into the owner `(r0, c0)`, row-major
+    /// (owner row's horizontal partners, left to right, then each
+    /// continuation row's own cell followed by ITS horizontal partners) —
+    /// [`Self::merge_cells`]'s `absorbed` list mirrors this exact order so
+    /// a comment anchor lands on the same paragraph its text moved to.
     fn merge_cells_unmapped(
         &self,
         table_path: BlockPath,
@@ -9936,31 +10088,47 @@ impl DocumentTree {
             } else {
                 VMergeRole::Restart
             };
+            /* Issue #263 — Word appends every merged-away cell's blocks
+            into the owner instead of discarding them. `remove` always
+            takes whatever now sits right after the owner, so this loop
+            already visits the horizontal partners left to right. */
+            let mut appended: Vec<Block> = Vec::new();
             for _ in 0..drop_count {
                 if (c0 as usize + 1) < top_row.cells.len() {
-                    top_row.cells.remove(c0 as usize + 1);
+                    appended.extend(top_row.cells.remove(c0 as usize + 1).blocks);
                 }
             }
+            top_row.cells[c0 as usize].blocks.extend(appended);
             /* Vertical: rows r0+1..=r1 collapse to Word's on-disk shape —
             ONE cell per continuation row spanning the merged columns
             (`gridSpan = span`, `vMerge` continue), horizontal partners
             physically removed exactly like the top row. Anything else
             double-counts grid columns in the layout cursor walk and
             diverges from what the .docx reader produces for the same
-            merge authored in Word. */
+            merge authored in Word. Issue #263 — the continuation cell's
+            OWN blocks move into the owner too (Word never leaves content
+            behind a `vMerge="continue"` cell); it is left with a single
+            blank paragraph, same as a fresh cell elsewhere in the tree. */
             for r in (r0 + 1)..=r1.min(rcount - 1) {
-                let row = &mut t.rows[r as usize];
-                if (c0 as usize) >= row.cells.len() {
+                if (c0 as usize) >= t.rows[r as usize].cells.len() {
                     continue;
                 }
+                let row = &mut t.rows[r as usize];
+                let mut appended = std::mem::replace(
+                    &mut row.cells[c0 as usize].blocks,
+                    vec![Block::Paragraph(Paragraph::default())],
+                );
                 row.cells[c0 as usize].props.v_merge = VMergeRole::Continue;
                 row.cells[c0 as usize].props.grid_span = span.max(1);
                 let drop_count = (c1.min(row.cells.len() as u32 - 1) - c0) as usize;
                 for _ in 0..drop_count {
                     if (c0 as usize + 1) < row.cells.len() {
-                        row.cells.remove(c0 as usize + 1);
+                        appended.extend(row.cells.remove(c0 as usize + 1).blocks);
                     }
                 }
+                t.rows[r0 as usize].cells[c0 as usize]
+                    .blocks
+                    .extend(appended);
             }
         })
     }
@@ -10539,11 +10707,13 @@ fn walk_paragraphs<F: FnMut(&Paragraph)>(blocks: &Vector<Block>, f: &mut F) {
 /// field on `para` LEFT by `removed_len`, for every value at or
 /// after `from`. Mirrors the rightward shift performed by
 /// `insert_inline_image_at` in reverse. Used when a tracked-change
-/// revision is rejected (Insert) or accepted (Delete) and the
-/// covered text range is sliced out.
+/// revision is rejected (Insert) or accepted (Delete) — and (issue
+/// #265) when the reviewer's own pending insertion is removed by
+/// `tracked_delete_range` — and the covered text range is sliced out.
 fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u32) {
+    let to = from + removed_len;
     let shift = |v: &mut u32| {
-        if *v >= from + removed_len {
+        if *v >= to {
             *v -= removed_len;
         } else if *v > from {
             *v = from;
@@ -10554,9 +10724,19 @@ fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u
         shift(&mut s.end);
     }
     para.spans.retain(|s| s.start < s.end);
-    for io in &mut para.inline_objects {
-        shift(&mut io.at);
-    }
+    /* Issue #265 — an inline object is a single sentinel byte, not a
+    range: one whose sentinel lies inside the removed gap has nothing
+    left to clamp onto (unlike a span/field/hyperlink, which can be
+    clipped to the gap's edge) and is dropped, exactly like
+    `Paragraph::delete_text`'s rule for the same case. */
+    para.inline_objects.retain_mut(|io| {
+        if io.at >= to {
+            io.at -= removed_len;
+            true
+        } else {
+            io.at < from
+        }
+    });
     for h in &mut para.hyperlinks {
         shift(&mut h.start);
         shift(&mut h.end);
@@ -10589,6 +10769,8 @@ fn strip_section_marker(mut p: Paragraph) -> Paragraph {
     /* Issues #199 / #106 — nor the source paragraph's identity
     (`w14:paraId`) and rsids: a pasted copy is a new paragraph. */
     p.source_markup = None;
+    /* Issue #262 — nor a tracked change on the source paragraph's mark. */
+    p.mark_revision = None;
     p
 }
 
@@ -12228,6 +12410,88 @@ mod tests {
         assert_eq!(p.revisions[0].end, 7);
     }
 
+    /// Issue #265 — deleting the reviewer's own pending insertion must
+    /// remap EVERY byte-offset table, not just style spans and the
+    /// comment anchors (#252): a field, a hyperlink and a picture inside
+    /// the removed insertion must leave no stale offsets, and undo must
+    /// restore them.
+    #[test]
+    fn tracked_delete_own_insert_remaps_fields_hyperlinks_and_inline_objects() {
+        let base = tracked_doc();
+        let mut undo = UndoStack::new(base.clone(), 100);
+        let inserted =
+            base.tracked_insert_text(pos0(5), "PPPPLL\u{FFFC}", "Alice".into(), "t1".into());
+        undo.push(inserted.clone());
+        assert_eq!(
+            inserted.nth_paragraph(0).unwrap().text,
+            "helloPPPPLL\u{FFFC}"
+        );
+        /* Attach a field over "PPPP" [5, 9), a hyperlink over "LL"
+        [9, 11), and a picture at the sentinel [11, 14) — all inside the
+        pending Insert revision [5, 14) `tracked_insert_text` just
+        recorded. */
+        let mut blocks = inserted.blocks.clone();
+        if let Block::Paragraph(p) = &mut blocks[0] {
+            p.fields.push(Field {
+                start: 5,
+                end: 9,
+                instruction: "PAGE".into(),
+                span: None,
+                source: None,
+            });
+            p.hyperlinks.push(Hyperlink {
+                start: 9,
+                end: 11,
+                target: "https://example.com".into(),
+                ..Default::default()
+            });
+            p.inline_objects.push(InlineObject {
+                at: 11,
+                kind: InlineKind::Image {
+                    rel_id: "rId9".into(),
+                    width_emu: 100,
+                    height_emu: 100,
+                    media_key: None,
+                },
+                anchor: None,
+                source_xml: None,
+            });
+        }
+        let mut with_overlays = inserted;
+        with_overlays.blocks = blocks;
+        undo.push(with_overlays.clone());
+        /* Delete the WHOLE pending insertion — the own-insertion
+        (owning_insert) path. */
+        let deleted =
+            with_overlays.tracked_delete_range(pos0(5), pos0(14), "Alice".into(), "t2".into());
+        undo.push(deleted.clone());
+        let p = deleted.nth_paragraph(0).unwrap();
+        assert_eq!(p.text, "hello");
+        assert!(p.fields.is_empty(), "stale field: {:?}", p.fields);
+        assert!(
+            p.hyperlinks.is_empty(),
+            "stale hyperlink: {:?}",
+            p.hyperlinks
+        );
+        assert!(
+            p.inline_objects.is_empty(),
+            "stale inline object: {:?}",
+            p.inline_objects
+        );
+        assert!(
+            p.revisions.iter().all(|r| r.kind != RevisionKind::Insert),
+            "the fully-removed Insert must not survive: {:?}",
+            p.revisions
+        );
+        /* Undo restores the overlays and their text. */
+        assert!(undo.undo());
+        let restored = undo.current().nth_paragraph(0).unwrap();
+        assert_eq!(restored.text, "helloPPPPLL\u{FFFC}");
+        assert_eq!(restored.fields.len(), 1);
+        assert_eq!(restored.hyperlinks.len(), 1);
+        assert_eq!(restored.inline_objects.len(), 1);
+    }
+
     #[test]
     fn tracked_delete_merges_adjacent_same_author_delete() {
         let d = tracked_doc();
@@ -12848,6 +13112,7 @@ mod tests {
             date: "2026-01-01T00:00:00Z".to_string(),
             id: Some(1),
             prev_attrs: None,
+            move_name: None,
         });
         doc.blocks[0] = Block::Paragraph(para);
 
@@ -13141,6 +13406,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(p.word_bounds(2), (0, 5));
         assert_eq!(p.word_bounds(0), (0, 5));
@@ -13171,6 +13437,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(p.word_bounds(4), (0, 10));
         assert_eq!(p.word_bounds(0), (0, 10));
@@ -13198,6 +13465,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(p.word_bounds(0), (0, 0));
     }
@@ -13303,6 +13571,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         assert_eq!(p.next_offset(0), 1);
         assert_eq!(p.next_offset(1), 3);
@@ -13344,6 +13613,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         /* Forward from 'a' jumps over the whole يً cluster, not just 'ي'. */
         assert_eq!(p.next_offset(1), 5, "forward must skip the FATHATAN");
@@ -13842,6 +14112,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         /* Slice "lo wor" (bytes 3-9) — the bold span clips to 3-6, local. */
@@ -13889,6 +14160,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         }];
         let (out, caret) = doc.insert_rich(
             LogicalPos {
@@ -13935,6 +14207,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             },
             Paragraph {
                 text: "two".into(),
@@ -13959,6 +14232,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             },
         ];
         let (out, caret) = doc.insert_rich(

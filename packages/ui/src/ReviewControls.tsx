@@ -6,8 +6,9 @@
  * to `state.isTrackingChanges()` (broadcast on every
  * `SELECTION_CHANGED`) — NOT a local Solid signal — so a tracked-
  * changes toggle issued by macro, undo, or another tab stays in
- * sync. New Comment + Accept/Reject All controls keep their Sprint 7
- * behaviour.
+ * sync. New Comment keeps its Sprint 7 behaviour; Accept/Reject All
+ * dispatch the engine's `ACCEPT_ALL_REVISIONS` / `REJECT_ALL_REVISIONS`
+ * (issue #262 — one undo step each).
  *
  * The author input also feeds `Command::SetReviewIdentity`, so
  * tracked revisions carry the typed author instead of the engine's
@@ -117,6 +118,7 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
                 (evt.message.includes('ToggleTrackChanges') ||
                     evt.message.includes('AcceptRevision') ||
                     evt.message.includes('RejectRevision') ||
+                    evt.message.includes('AllRevisions') ||
                     evt.message.includes('Comment'))
             ) {
                 setError(evt.message);
@@ -148,24 +150,19 @@ export const ReviewControls: Component<ReviewControlsProps> = (props) => {
         focusEditorInput();
     };
 
+    /* Issue #262 — one engine command each: the engine walks the
+     * document in order (paragraph-mark revisions merge paragraphs),
+     * keeps comment anchors in step and pushes ONE undo step. (These
+     * used to loop over per-row accepts: neither atomic nor able to
+     * resolve a tracked paragraph merge.) */
     const acceptAll = async () => {
-        if (inStory() || !engine.revisionsSnapshot) return;
-        const rows = await engine.revisionsSnapshot();
-        /* Walk in reverse document order so earlier-row mutations
-         * don't shift later rows' byte offsets. */
-        for (let i = rows.length - 1; i >= 0; i--) {
-            const r = rows[i]!;
-            await cmd.acceptRevision(r.block, r.start, r.end);
-        }
+        if (inStory()) return;
+        await cmd.acceptAllRevisions();
     };
 
     const rejectAll = async () => {
-        if (inStory() || !engine.revisionsSnapshot) return;
-        const rows = await engine.revisionsSnapshot();
-        for (let i = rows.length - 1; i >= 0; i--) {
-            const r = rows[i]!;
-            await cmd.rejectRevision(r.block, r.start, r.end);
-        }
+        if (inStory()) return;
+        await cmd.rejectAllRevisions();
     };
 
     return (
