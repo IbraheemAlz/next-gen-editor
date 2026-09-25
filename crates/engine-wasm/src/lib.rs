@@ -914,6 +914,18 @@ pub struct Engine {
     pending_zoom: Option<f32>,
     /// Issue #239 — the `SetDeviceScale` mirror of `pending_zoom`.
     pending_base_scale: Option<f32>,
+    /// Issue #231 — monotonic "a repaint just produced fresh page
+    /// geometry" counter, bumped once per completed `render_document`
+    /// call (both the Vello and Canvas2D branches, at the same
+    /// chokepoint that refreshes `last_paint_dims`). `SetZoom` /
+    /// `SetDeviceScale` / `ExpandLayout` change page geometry without
+    /// bumping `mutation_seq` (the document didn't change), so the
+    /// worker's mutation-seq gate alone never re-broadcasts `Painted`
+    /// for them and the overlays / page tops stay stale until the next
+    /// edit. The worker compares THIS counter separately (`paint_dims()`
+    /// carries it) and re-broadcasts on a move, independent of whether
+    /// the document itself changed.
+    paint_geometry_seq: u64,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -970,6 +982,7 @@ fn assemble_engine(
         mutation_seq: 0,
         pending_zoom: None,
         pending_base_scale: None,
+        paint_geometry_seq: 0,
     }
 }
 
@@ -1114,6 +1127,7 @@ impl Engine {
             layout_degraded: dims.layout_degraded,
             paint_ms: dims.paint_ms,
             mutation_seq: self.mutation_seq,
+            paint_geometry_seq: self.paint_geometry_seq,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
     }
@@ -1127,6 +1141,20 @@ impl Engine {
     /// a `BigInt`.
     pub fn document_mutation_seq(&self) -> f64 {
         self.mutation_seq as f64
+    }
+
+    /// Issue #231 — the engine's own "a repaint just produced fresh page
+    /// geometry" signal (see the `paint_geometry_seq` field): a monotonic
+    /// counter bumped once per completed `render_document` call,
+    /// independent of `document_mutation_seq` (a zoom / device-scale /
+    /// `ExpandLayout` repaint moves this WITHOUT moving that one — the
+    /// document didn't change, only its painted scale or laid-out
+    /// extent). The worker compares this across a command the same way it
+    /// compares `document_mutation_seq`, and re-broadcasts `Painted` on a
+    /// move so the overlays never read stale `page_tops` / `page_heights`
+    /// after a pure zoom change.
+    pub fn paint_geometry_seq(&self) -> f64 {
+        self.paint_geometry_seq as f64
     }
 
     /// Sprint 10 — drain queued `aria-live` announcements as
@@ -1237,6 +1265,11 @@ struct PaintDimsOut {
     mutation_seq: u64,
     /// Issue #86 — mirrors `Event::Painted.paint_ms` (see `LastPaintDims`).
     paint_ms: f32,
+    /// Issue #231 — mirrors `Engine::paint_geometry_seq()`: bumped on
+    /// every completed repaint independent of `mutation_seq`, so the
+    /// worker can re-broadcast `Painted` after a pure zoom / device-scale
+    /// change even though the document itself did not move.
+    paint_geometry_seq: u64,
 }
 
 #[derive(::serde::Serialize)]
@@ -9277,6 +9310,10 @@ impl Engine {
                 layout_degraded: stats.layout_degraded.clone(),
                 paint_ms: self.last_paint_ms,
             };
+            /* Issue #231 — a completed repaint, independent of whether the
+            DOCUMENT changed (mutation_seq). The worker uses this to
+            re-broadcast `Painted` after a zoom / device-scale change. */
+            self.paint_geometry_seq += 1;
             return Ok(stats);
         }
 
@@ -9338,6 +9375,8 @@ impl Engine {
             layout_degraded: stats.layout_degraded.clone(),
             paint_ms: self.last_paint_ms,
         };
+        /* Issue #231 — see the Vello branch above. */
+        self.paint_geometry_seq += 1;
         Ok(stats)
     }
 
@@ -16388,6 +16427,7 @@ mod tests {
             mutation_seq: 0,
             pending_zoom: None,
             pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -17236,6 +17276,7 @@ mod tests {
             mutation_seq: 0,
             pending_zoom: None,
             pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -17295,6 +17336,7 @@ mod tests {
             mutation_seq: 0,
             pending_zoom: None,
             pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -17345,6 +17387,7 @@ mod tests {
             mutation_seq: 0,
             pending_zoom: None,
             pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -17472,6 +17515,7 @@ mod tests {
             mutation_seq: 0,
             pending_zoom: None,
             pending_base_scale: None,
+            paint_geometry_seq: 0,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -18020,6 +18064,7 @@ mod tests {
                 mutation_seq: 0,
                 pending_zoom: None,
                 pending_base_scale: None,
+                paint_geometry_seq: 0,
             }
         }
 
@@ -21604,6 +21649,7 @@ mod tests {
             mutation_seq: 0,
             pending_zoom: None,
             pending_base_scale: None,
+            paint_geometry_seq: 0,
         }
     }
 
@@ -22269,6 +22315,41 @@ mod tests {
         );
         /* A device-scale change keeps the user zoom and says so. */
         assert_eq!(zoom_of(engine.do_set_device_scale(2.0)), 4.0);
+    }
+
+    /// Issue #231 — `SetZoom` / `SetDeviceScale` repaint (bumping
+    /// `paint_geometry_seq`, the engine's own "fresh page geometry"
+    /// signal) WITHOUT mutating the document (`mutation_seq` stays put).
+    /// The worker uses exactly this split to broadcast a fresh `Painted`
+    /// after a pure zoom / device-scale change without triggering a
+    /// spurious accessibility-tree rebuild (the visible text didn't
+    /// change, only its painted scale).
+    #[test]
+    fn set_zoom_and_set_device_scale_bump_paint_geometry_seq_not_mutation_seq() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello"));
+        let mutation_before = engine.mutation_seq;
+        let geometry_before = engine.paint_geometry_seq;
+
+        assert!(matches!(
+            engine.do_set_zoom(1.5),
+            Event::SelectionChanged { .. }
+        ));
+        assert_eq!(
+            engine.mutation_seq, mutation_before,
+            "zoom does not mutate the document"
+        );
+        assert!(
+            engine.paint_geometry_seq > geometry_before,
+            "zoom repaints — the geometry counter must move"
+        );
+
+        let geometry_before = engine.paint_geometry_seq;
+        assert!(matches!(
+            engine.do_set_device_scale(2.0),
+            Event::SelectionChanged { .. }
+        ));
+        assert_eq!(engine.mutation_seq, mutation_before);
+        assert!(engine.paint_geometry_seq > geometry_before);
     }
 
     #[test]

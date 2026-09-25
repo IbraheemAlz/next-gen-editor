@@ -184,6 +184,14 @@ function countOpaqueInk(surface: OffscreenCanvas): number {
    worker every time) starts at 0, matching this. */
 let broadcastMutationSeq = 0;
 
+/* Issue #231 — the engine `paint_geometry_seq` the last synthetic
+   `Painted` side-channel was broadcast for. Tracked separately from
+   `broadcastMutationSeq` because a zoom / device-scale / expand-layout
+   repaint moves this WITHOUT moving that one (the document didn't
+   change). A fresh engine (INIT, crash recovery) starts at 0, matching
+   this. */
+let broadcastGeometrySeq = 0;
+
 /* Highest `version` seen on a real `Painted` event — synthetic paint-dims
    broadcasts reuse it so `paintVersion` consumers never see a reset to 0. */
 let lastPaintVersion = 0;
@@ -963,6 +971,10 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
                 self.postMessage({ evt: delta });
                 /* Issue #194 — the replace covers every replayed edit. */
                 broadcastMutationSeq = engine.document_mutation_seq();
+                /* Issue #231 — same idea for the geometry counter: whatever
+                   repainting the replay itself triggered is already
+                   reflected in the state the shell just rebuilt from. */
+                broadcastGeometrySeq = engine.paint_geometry_seq();
             }
         }
     } catch (e: unknown) {
@@ -1067,6 +1079,31 @@ async function handleClientCommand(msg: ClientCommandMsg): Promise<void> {
                render dimensions so the canvas grows when the paginator
                emits more pages. */
             broadcastPaintDims();
+            broadcastGeometrySeq = engine.paint_geometry_seq();
+        } else {
+            /* Issue #231 — `SET_ZOOM` / `SET_DEVICE_SCALE` (and, via
+               `ExpandLayout`'s own `RequestPaint`, `EXPAND_LAYOUT`) repaint
+               a fresh `page_tops` / `page_heights` / `document_height`
+               WITHOUT mutating the document, so the `mutationSeq` gate
+               above never fires for them and the overlays + page geometry
+               stayed stale until the next real edit. `paint_geometry_seq`
+               is the engine's own "a repaint just happened" counter,
+               independent of `document_mutation_seq` (see
+               `Engine::paint_geometry_seq`); broadcast whenever it moved.
+               No accessibility delta here — the document's text didn't
+               change, only its painted scale / laid-out extent. */
+            const geometrySeq = engine.paint_geometry_seq();
+            if (geometrySeq !== broadcastGeometrySeq) {
+                broadcastGeometrySeq = geometrySeq;
+                /* `REQUEST_PAINT` / `EXPAND_LAYOUT` already answer with a
+                   real `Painted` event, which `EngineClient.handle()` fans
+                   out to every subscriber same as this synthetic one —
+                   broadcasting again here would just be a redundant
+                   re-render with identical numbers. */
+                if (evt.type !== 'PAINTED') {
+                    broadcastPaintDims();
+                }
+            }
         }
         /* Sprint 10 — drain queued aria-live announcements (queued by
            the engine's mutation handlers via `Engine::announce`). Each
