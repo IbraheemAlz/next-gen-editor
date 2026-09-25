@@ -182,6 +182,25 @@ pub struct DocumentTree {
     /// `word/settings.xml` in place. Mirror of `styles_dirty` /
     /// `NumberingDefinitions.dirty`. Never set by reads.
     pub settings_dirty: bool,
+    /// Issue #100 — every attribute of the source part root
+    /// (`<w:document>`), `(name, escaped value)` in document order: the
+    /// `xmlns:*` bindings (`w14`, `w15`, `mc`, … — Word declares ~30) plus
+    /// `mc:Ignorable`. The `.docx` reader fills it; it is empty for an
+    /// engine-authored document. Every `.docx` writer synthesizes its own
+    /// part roots (`word/document.xml`, regenerated header/footer parts)
+    /// and re-declares these on them, so passthrough paragraphs carrying
+    /// `w14:paraId` and root-bound grab-bag fragments stay
+    /// namespace-well-formed — including on the live editor's save path,
+    /// which has only this tree, not the source `DocxArchive`.
+    pub document_root_attrs: Vec<(String, String)>,
+    /// Issue #100 — root attributes of the OTHER parts the writer may
+    /// regenerate from the tree alone, keyed by archive entry name
+    /// (`word/footnotes.xml`, `word/endnotes.xml`). A note part's root can
+    /// bind prefixes the document root does not (`w14` for a note
+    /// paragraph's `w14:paraId`); the UI save path has no archive to read
+    /// them from, so the reader records them here. Empty for an
+    /// engine-authored document.
+    pub part_root_attrs: std::collections::BTreeMap<String, Vec<(String, String)>>,
 }
 
 /// Sprint 12 (#11) — one `<w:style w:type="paragraph">` entry,
@@ -2845,6 +2864,8 @@ impl DocumentTree {
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
             settings_dirty: false,
+            document_root_attrs: Vec::new(),
+            part_root_attrs: Default::default(),
         }
     }
 
@@ -2889,6 +2910,8 @@ impl DocumentTree {
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
             settings_dirty: false,
+            document_root_attrs: Vec::new(),
+            part_root_attrs: Default::default(),
         }
     }
 
@@ -2935,6 +2958,8 @@ impl DocumentTree {
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
             settings_dirty: false,
+            document_root_attrs: Vec::new(),
+            part_root_attrs: Default::default(),
         }
     }
 
@@ -2966,6 +2991,8 @@ impl DocumentTree {
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
             settings_dirty: false,
+            document_root_attrs: Vec::new(),
+            part_root_attrs: Default::default(),
         }
     }
 
@@ -2997,6 +3024,8 @@ impl DocumentTree {
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
             settings_dirty: false,
+            document_root_attrs: Vec::new(),
+            part_root_attrs: Default::default(),
         }
     }
 
@@ -3081,6 +3110,8 @@ impl DocumentTree {
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
             settings_dirty: false,
+            document_root_attrs: Vec::new(),
+            part_root_attrs: Default::default(),
         }
     }
 
@@ -4017,6 +4048,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4096,6 +4129,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4148,6 +4183,8 @@ impl DocumentTree {
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
                 settings_dirty: self.settings_dirty,
+                document_root_attrs: self.document_root_attrs.clone(),
+                part_root_attrs: self.part_root_attrs.clone(),
             };
         }
         let target = if self.paragraph_at_path(&at.path).is_some() {
@@ -4223,6 +4260,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4282,6 +4321,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4318,6 +4359,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4373,6 +4416,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4434,6 +4479,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4500,6 +4547,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4629,6 +4678,8 @@ impl DocumentTree {
             numbering: split.numbering.clone(),
             hf_dirty: split.hf_dirty.clone(),
             settings_dirty: split.settings_dirty,
+            document_root_attrs: split.document_root_attrs.clone(),
+            part_root_attrs: split.part_root_attrs.clone(),
         }
     }
 
@@ -4733,6 +4784,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4813,6 +4866,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -4878,6 +4933,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         };
         (doc, new_id)
     }
@@ -4955,6 +5012,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         };
         Some((doc, new_id))
     }
@@ -5011,6 +5070,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5043,6 +5104,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5128,6 +5191,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5225,6 +5290,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5330,6 +5397,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5384,6 +5453,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5441,6 +5512,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5495,6 +5568,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5617,6 +5692,8 @@ impl DocumentTree {
             numbering: next_numbering,
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5688,6 +5765,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5738,6 +5817,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -5851,6 +5932,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -5904,6 +5987,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -6013,6 +6098,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -6051,6 +6138,8 @@ impl DocumentTree {
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
                 settings_dirty: self.settings_dirty,
+                document_root_attrs: self.document_root_attrs.clone(),
+                part_root_attrs: self.part_root_attrs.clone(),
             };
         }
         if !same_parent(&start.path, &end.path) {
@@ -6176,6 +6265,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -6210,6 +6301,8 @@ impl DocumentTree {
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
                 settings_dirty: self.settings_dirty,
+                document_root_attrs: self.document_root_attrs.clone(),
+                part_root_attrs: self.part_root_attrs.clone(),
             };
         }
         let Some(p) = self.paragraph_at_path(&at.path) else {
@@ -6239,6 +6332,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
         .with_list_markers_refreshed()
     }
@@ -6397,6 +6492,8 @@ impl DocumentTree {
                     numbering: self.numbering.clone(),
                     hf_dirty: self.hf_dirty.clone(),
                     settings_dirty: self.settings_dirty,
+                    document_root_attrs: self.document_root_attrs.clone(),
+                    part_root_attrs: self.part_root_attrs.clone(),
                 }
                 .with_list_markers_refreshed(),
                 caret,
@@ -6445,6 +6542,8 @@ impl DocumentTree {
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
                 settings_dirty: self.settings_dirty,
+                document_root_attrs: self.document_root_attrs.clone(),
+                part_root_attrs: self.part_root_attrs.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -6640,6 +6739,8 @@ impl DocumentTree {
                 numbering: self.numbering.clone(),
                 hf_dirty: self.hf_dirty.clone(),
                 settings_dirty: self.settings_dirty,
+                document_root_attrs: self.document_root_attrs.clone(),
+                part_root_attrs: self.part_root_attrs.clone(),
             }
             .with_list_markers_refreshed(),
             caret,
@@ -6789,6 +6890,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -6823,6 +6926,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 
@@ -7106,6 +7211,8 @@ impl DocumentTree {
             numbering: self.numbering.clone(),
             hf_dirty: self.hf_dirty.clone(),
             settings_dirty: self.settings_dirty,
+            document_root_attrs: self.document_root_attrs.clone(),
+            part_root_attrs: self.part_root_attrs.clone(),
         }
     }
 }
@@ -11121,6 +11228,8 @@ mod tests {
             numbering: numbering::NumberingDefinitions::default(),
             hf_dirty: HfDirty::default(),
             settings_dirty: false,
+            document_root_attrs: Vec::new(),
+            part_root_attrs: Default::default(),
         };
         let d = d.set_cell_shading(BlockPath::top(1), 0, 0, Some([0xFF, 0, 0, 0xFF]));
         let t = d.blocks[1].as_table().unwrap();

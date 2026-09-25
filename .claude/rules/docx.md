@@ -66,6 +66,20 @@ The `tools/roundtrip/` harness asserts:
   content. A fragment relying on a prefix bound only on an intermediate
   ancestor is dropped at capture (`grab_bag::bound_by_root`) rather than
   written unbound.
+- **Two save paths (issue #100).** The live editor saves through
+  `build_minimal_docx(&DocumentTree)` (engine-wasm `SaveDocx` /
+  `SaveDocument`) — it has no `DocxArchive`. So the reader ALSO records the
+  roots on the tree: `DocumentTree::document_root_attrs` (document + header/
+  footer roots) and `DocumentTree::part_root_attrs` (per-entry, e.g. note
+  parts whose root binds prefixes the document root does not). Any part a
+  writer regenerates from the tree alone must re-declare the matching
+  entry. `check_document_xml_well_formed` / `check_part_xml_well_formed`
+  are namespace-aware: an unbound prefix fails the guard.
+- **Cell paragraphs (issue #101)** parse through the body run parser
+  (`parts::table::parse_cell_paragraph` re-roots the `<w:p>` under the
+  part's namespace scope and calls `parse_document_xml`), so cells carry
+  the same spans / grab bags / pictures / fields as body paragraphs. Never
+  grow a second, cell-only run parser.
 - Harness: `tools/roundtrip` default mode step 9 edits
   `grab_bag_exotic.docx` and asserts the regenerated `document.xml` is
   byte-identical to the source plus the inserted text.
