@@ -11329,21 +11329,33 @@ impl Engine {
 
     /// Sprint 10 — project the innermost cell's shading + borders into
     /// the wire shape; `None` outside any table.
+    ///
+    /// Issue #174 — both the cell lookup AND the owning top-level table's
+    /// `bidi_visual` flag must resolve against the story adapter
+    /// (`with_selection_doc`), the same pattern `table_bidi_visual` (issue
+    /// #79) already used here. Previously only the `bidi_visual` half went
+    /// through the adapter; `innermost_cell_props_at` still read
+    /// unconditionally from the BODY document, so a caret inside a
+    /// header/footer (or note / text-box) table's cell reported the body
+    /// document's cell at that same path — wrong shading/borders, or
+    /// `None` when the body has no table there at all.
     fn cell_properties_for_caret(&self, path: &BridgeBlockPath) -> Option<BridgeCellProperties> {
         let engine_path = bridge_path_to_engine(path);
-        let cell = self.undo.current().innermost_cell_props_at(&engine_path)?;
-        /* Issue #79 — the owning TOP-LEVEL table's flag: the table the
-        context menu and `SetTableProperties` address. Read from the
-        selection's tree so a header/footer table reports its own. */
-        let table_bidi_visual = self.with_selection_doc(|d| {
+        self.with_selection_doc(|d| {
+            let cell = d.innermost_cell_props_at(&engine_path)?;
+            /* The owning TOP-LEVEL table's flag: the table the context
+            menu and `SetTableProperties` address. */
             let top = engine_path.steps.first().cloned()?;
             let top_path = engine::BlockPath { steps: vec![top] };
-            d.table_at_path(&top_path).map(|t| t.props.bidi_visual)
-        });
-        Some(BridgeCellProperties {
-            shading: cell.shading.map(rgba_to_bridge_color),
-            borders: engine_borders_to_bridge(cell.borders.as_ref()),
-            table_bidi_visual: table_bidi_visual.unwrap_or(false),
+            let table_bidi_visual = d
+                .table_at_path(&top_path)
+                .map(|t| t.props.bidi_visual)
+                .unwrap_or(false);
+            Some(BridgeCellProperties {
+                shading: cell.shading.map(rgba_to_bridge_color),
+                borders: engine_borders_to_bridge(cell.borders.as_ref()),
+                table_bidi_visual,
+            })
         })
     }
 
@@ -22320,6 +22332,61 @@ mod tests {
                 .bidi_visual
         );
         assert_eq!(x0(&e), before);
+    }
+
+    /// Issue #174 — `cell_properties_for_caret` must resolve through the
+    /// story adapter (`with_selection_doc`), the same pattern
+    /// `table_bidi_visual` (issue #79) already followed for the OWNING
+    /// table's flag. Body block 0 is a plain paragraph — not a table — at
+    /// the same top-level index the header story's table occupies, so
+    /// before the fix (`self.undo.current().innermost_cell_props_at(...)`,
+    /// unconditionally the BODY doc) the readback resolved against the
+    /// body's paragraph instead of the header's real, shaded cell and
+    /// reported `None` for a caret sitting inside a header table.
+    #[test]
+    fn cell_properties_for_caret_reads_the_active_story_not_the_body() {
+        let mut body = DocumentTree::from_text("body paragraph, not a table");
+        let mut header_cell = cell_with_text("header cell");
+        header_cell.props.shading = Some([0xff, 0x00, 0x00, 0xff]); // red
+        let mut header_table = one_row_table(vec![header_cell]);
+        header_table.props.bidi_visual = true;
+        body.headers.insert(
+            "rIdHeader".to_string(),
+            vec![engine::Block::Table(header_table)],
+        );
+
+        let mut e = test_engine_with_doc(body);
+        let path = BridgeBlockPath {
+            steps: vec![
+                BridgePathStep::Block { idx: 0 },
+                BridgePathStep::Cell { row: 0, col: 0 },
+                BridgePathStep::Block { idx: 0 },
+            ],
+        };
+
+        /* Body mode: the same path addresses the body's plain paragraph at
+        block 0 — no table there, so the honest answer is `None`, never a
+        leaked header cell. */
+        assert!(e.cell_properties_for_caret(&path).is_none());
+
+        e.active_story = StoryTarget::Header {
+            rid: "rIdHeader".to_string(),
+            page: 0,
+            section_block: 0,
+            role: engine::HeaderFooterRole::Default,
+        };
+        let props = e
+            .cell_properties_for_caret(&path)
+            .expect("header table cell reports its own properties");
+        let shading = props.shading.expect("header cell's own shading");
+        assert_eq!(
+            (shading.r, shading.g, shading.b, shading.a),
+            (0xff, 0, 0, 0xff)
+        );
+        assert!(
+            props.table_bidi_visual,
+            "header table's own bidiVisual flag, not the body's"
+        );
     }
 
     fn table_doc() -> DocumentTree {
