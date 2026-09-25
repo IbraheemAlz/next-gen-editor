@@ -7552,6 +7552,12 @@ impl Engine {
         }
     }
 
+    /// Issue #52 — the user zoom fraction the engine renders at; `1.0`
+    /// (the `RenderPage` default) before any layout config exists.
+    fn user_zoom(&self) -> f32 {
+        self.layout_cfg.as_ref().map_or(1.0, |c| c.zoom)
+    }
+
     /// Issue #66 — the backend this instance actually paints with.
     fn renderer_name(&self) -> &'static str {
         if self.vello.is_some() {
@@ -11119,6 +11125,7 @@ impl Engine {
             editing_story: self.bridge_story_ref(),
             field_code_view: self.field_code_view,
             field_at_caret: self.field_ref_at_selection(&sel),
+            zoom: self.user_zoom(),
         }
     }
 
@@ -21376,6 +21383,26 @@ mod tests {
         let evt = engine.do_set_zoom(100.0);
         assert!(!matches!(evt, Event::Error { .. }));
         assert_eq!(engine.layout_cfg.as_ref().unwrap().zoom, 4.0);
+    }
+
+    /// Issue #52 — `SetZoom` answers with a `SelectionChanged` that
+    /// carries the engine's (clamped) zoom, so every zoom control can
+    /// mirror one engine-owned value.
+    #[test]
+    fn selection_changed_reports_the_engine_zoom() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("x"));
+        let zoom_of = |evt: Event| match evt {
+            Event::SelectionChanged { zoom, .. } => zoom,
+            other => panic!("expected SelectionChanged, got {other:?}"),
+        };
+        assert_eq!(zoom_of(engine.do_set_zoom(1.5)), 1.5);
+        assert_eq!(
+            zoom_of(engine.do_set_zoom(9.0)),
+            4.0,
+            "clamped to the engine's range"
+        );
+        /* A device-scale change keeps the user zoom and says so. */
+        assert_eq!(zoom_of(engine.do_set_device_scale(2.0)), 4.0);
     }
 
     #[test]

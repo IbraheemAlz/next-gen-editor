@@ -9,6 +9,12 @@ use crate::common::{
     SelectionKind, TextAttrs,
 };
 
+/// `serde(default)` for the user-zoom fields: an absent value means the
+/// engine's cold default (100 %), never `0.0`.
+fn default_zoom() -> f32 {
+    1.0
+}
+
 /// An event emitted by the engine. Serialized internally-tagged
 /// (`{ "type": "PAINTED", ... }`).
 ///
@@ -324,6 +330,13 @@ pub enum Event {
         /// at the caret, else the one starting there. `None` otherwise.
         /// Drives the field-code editor + the "Update field" affordance.
         field_at_caret: Option<BridgeFieldRef>,
+        /// Issue #52 — the engine's current user zoom fraction
+        /// (`SetZoom`, clamped to `[0.25, 4.0]`; `1.0` before the first
+        /// `RenderPage`). `SetZoom` / `SetDeviceScale` answer with this
+        /// event, so every zoom control mirrors the ENGINE's value — one
+        /// source of truth instead of one local signal per widget.
+        #[serde(default = "default_zoom")]
+        zoom: f32,
     },
 
     /* IME */

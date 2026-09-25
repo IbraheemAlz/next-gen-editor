@@ -15,8 +15,8 @@
  *   - `PAINTED` carries: dirty, version, paint_ms, document_height,
  *     page_count, is_full_layout, estimated_document_height.
  */
-import { createSignal, onCleanup, type Accessor } from 'solid-js';
-import { useEngine } from './EngineProvider';
+import { createRoot, createSignal, onCleanup, type Accessor } from 'solid-js';
+import { useEngine, type EngineHandle } from './EngineProvider';
 import type {
     Alignment,
     AttrsMixed,
@@ -157,10 +157,57 @@ export interface EditorState {
      * "Update fields" affordance in `FieldButtons`.
      */
     fieldAtCaret: Accessor<BridgeFieldRef | undefined>;
+    /**
+     * Issue #52 — the ENGINE's user zoom fraction (`1` = 100 %), read
+     * back from `SELECTION_CHANGED.zoom` (every `SET_ZOOM` /
+     * `SET_DEVICE_SCALE` answers with one). Shared by every
+     * `createEditorState()` on the same engine — see `viewStateFor` — so
+     * two zoom widgets can never disagree, and a widget mounted late
+     * starts from the live value instead of 100 %.
+     */
+    zoom: Accessor<number>;
+}
+
+/**
+ * Engine-wide view state (issue #52). Unlike the per-call signals in
+ * `createEditorState`, these are ONE set of signals per engine handle:
+ * they are the single source of truth every zoom control reads, and they
+ * must outlive any one component (a widget mounted after the last
+ * `SELECTION_CHANGED` would otherwise start stale at 100 %). Created
+ * lazily under a detached root; the subscription lives as long as the
+ * engine handle, which the shell keeps for the page lifetime.
+ */
+interface ViewState {
+    zoom: Accessor<number>;
+}
+
+const viewStates = new WeakMap<EngineHandle, ViewState>();
+
+/** f32 → f64 noise (`1.100000023841858`) would defeat the `<select>`'s
+ *  preset matching; four decimals is far below any zoom step. */
+function roundZoom(z: number): number {
+    return Math.round(z * 10_000) / 10_000;
+}
+
+function viewStateFor(engine: EngineHandle): ViewState {
+    const existing = viewStates.get(engine);
+    if (existing) return existing;
+    const state = createRoot(() => {
+        const [zoom, setZoom] = createSignal(1);
+        engine.subscribe((evt: Event) => {
+            if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
+                setZoom(roundZoom(evt.zoom));
+            }
+        });
+        return { zoom };
+    });
+    viewStates.set(engine, state);
+    return state;
 }
 
 export function createEditorState(): EditorState {
     const engine = useEngine();
+    const view = viewStateFor(engine);
 
     const [selection, setSelection] = createSignal<LogicalRange | undefined>(undefined);
     const [caret, setCaret] = createSignal<Rect | undefined>(undefined);
@@ -292,5 +339,6 @@ export function createEditorState(): EditorState {
         editingStory,
         fieldCodeView,
         fieldAtCaret,
+        zoom: view.zoom,
     };
 }
