@@ -87,6 +87,9 @@ export interface RevisionSnapshot {
     date: string;
     /** Issue #247 — the move's range name; both halves share it. */
     move_name?: string;
+    /** Issue #262 — a paragraph-MARK revision (a tracked paragraph split
+     *  or merge), addressed by the empty range at the paragraph end. */
+    mark?: boolean;
 }
 
 /** Issue #85 — what the most recent `recover()` achieved. */

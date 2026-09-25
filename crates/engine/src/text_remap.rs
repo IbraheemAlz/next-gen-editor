@@ -504,8 +504,8 @@ mod tests {
 
     /// Issue #253 — "Accept all" (the UI walks every revision in reverse
     /// document order through `accept_revision_at`) keeps a comment on its
-    /// text across several paragraphs' deletions. (A paragraph-MARK
-    /// revision is not modelled yet, so no accept merges paragraphs.)
+    /// text across several paragraphs' deletions. (The engine-side
+    /// accept-all and its paragraph-MARK merges: `revision_tests`, #262.)
     #[test]
     fn accept_all_keeps_the_comment_on_its_text() {
         let base = with_markup(DocumentTree::from_paragraphs([

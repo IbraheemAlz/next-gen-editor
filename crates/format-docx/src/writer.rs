@@ -832,6 +832,11 @@ fn serialize_paragraph(
     } else {
         std::borrow::Cow::Borrowed(&para.props)
     };
+    /* Issue #262 — the paragraph-mark revision re-enters the mark's rPr. */
+    let props = match &para.mark_revision {
+        Some(rev) => std::borrow::Cow::Owned(with_mark_revision(&props, rev)),
+        None => props,
+    };
     match source_ppr {
         /* Verified passthrough: the model still holds exactly what these
         bytes produced, so they are the most faithful serialization (and
@@ -1007,6 +1012,47 @@ fn source_ppr_is_current(sp: &SourcePPr, para: &Paragraph) -> bool {
         && sp.props == para.props
         && sp.style_id == para.style_id
         && sp.list_item == para.list_item
+        /* Issue #262 — the bytes spell the paragraph-mark revision. */
+        && sp.mark_revision == para.mark_revision
+}
+
+/// Issue #262 — `props` with the paragraph-mark revision `rev` put back
+/// into the mark's `<w:rPr>` (which rides the pPr grab bag): first child of
+/// the recorded rPr fragment (CT_ParaRPr opens with the track-change
+/// elements), or a fresh `<w:rPr>` fragment when the mark had none.
+fn with_mark_revision(props: &ParaProperties, rev: &Revision) -> ParaProperties {
+    let mut el = String::new();
+    emit_revision_open(rev, 0, &mut el);
+    /* `<w:ins …>` → `<w:ins …/>`: the mark element is empty. */
+    el.pop();
+    el.push_str("/>");
+    let mut p = props.clone();
+    let bag = p.grab_bag.get_or_insert_with(Default::default);
+    let rpr = bag
+        .fragments
+        .iter_mut()
+        .find(|f| fragment_qname(f) == b"w:rPr");
+    match rpr {
+        Some(frag) => {
+            let Some(gt) = frag.iter().position(|&b| b == b'>') else {
+                return props.clone();
+            };
+            if frag[..gt].ends_with(b"/") {
+                /* `<w:rPr …/>` → `<w:rPr …>REV</w:rPr>`. */
+                let mut out = frag[..gt - 1].to_vec();
+                out.push(b'>');
+                out.extend_from_slice(el.as_bytes());
+                out.extend_from_slice(b"</w:rPr>");
+                *frag = out;
+            } else {
+                frag.splice(gt + 1..gt + 1, el.bytes());
+            }
+        }
+        None => bag
+            .fragments
+            .push(format!("<w:rPr>{el}</w:rPr>").into_bytes()),
+    }
+    p
 }
 
 /// Issue #81 — a stable `w:id` for an engine-emitted bookmark. Ids are
@@ -4460,6 +4506,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4502,6 +4549,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4548,6 +4596,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4608,6 +4657,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4654,6 +4704,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -4760,6 +4811,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -6622,6 +6674,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             };
             let doc = DocumentTree::from_rich_paragraphs([para]);
             let bytes = build_minimal_docx(&doc).expect("build");
@@ -6682,6 +6735,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -6785,6 +6839,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");
@@ -6816,6 +6871,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let xml = build_document_xml(&doc, &HashMap::new());
@@ -6875,6 +6931,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let xml = build_document_xml(&DocumentTree::from_rich_paragraphs([para]), &HashMap::new());
         let p = xml.find("<w:pPr>").unwrap();
@@ -7555,6 +7612,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let mut blocks = doc.blocks.clone();
         blocks.set(0, Block::Paragraph(para));
@@ -8196,6 +8254,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let doc = DocumentTree::from_rich_paragraphs([para]);
         let bytes = build_minimal_docx(&doc).expect("build");

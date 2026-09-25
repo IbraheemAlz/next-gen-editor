@@ -7,7 +7,7 @@ use super::{
     rewritten_region, write_docx,
 };
 use anyhow::{Context, Result, bail};
-use engine::{BlockPath, LogicalPos, RevisionKind};
+use engine::{Alignment, BlockPath, DocumentTree, LogicalPos, RevisionKind};
 
 const STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
@@ -162,5 +162,135 @@ pub(crate) fn run_tracked_moves_roundtrip() -> Result<()> {
         }
     }
     println!("[roundtrip] step 30c OK — accept keeps the destination, reject the source");
+    Ok(())
+}
+
+/// Paragraph-mark revisions (issue #262): the first paragraph's mark is a
+/// tracked deletion (a merge with the next) next to other mark formatting,
+/// the second's a tracked insertion (a split).
+const MARKS_BODY: &str = concat!(
+    r#"<w:p w:rsidR="00A1B2C3"><w:pPr><w:jc w:val="center"/><w:rPr><w:del w:id="10" w:author="A" w:date="2026-01-01T00:00:00Z"/><w:b/></w:rPr></w:pPr>"#,
+    r#"<w:del w:id="11" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText xml:space="preserve">gone </w:delText></w:r></w:del>"#,
+    r#"<w:r><w:t xml:space="preserve">head </w:t></w:r></w:p>"#,
+    r#"<w:p w:rsidR="00D4E5F6"><w:pPr><w:rPr><w:ins w:id="12" w:author="B" w:date="2026-01-02T00:00:00Z"/></w:rPr></w:pPr><w:r><w:t>tail</w:t></w:r></w:p>"#,
+    r#"<w:p><w:r><w:t>last</w:t></w:r></w:p>"#,
+);
+
+fn texts(doc: &DocumentTree) -> Vec<String> {
+    doc.blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .map(|p| p.text.clone())
+        .collect()
+}
+
+fn marks(doc: &DocumentTree) -> Vec<Option<(RevisionKind, Option<u32>)>> {
+    doc.blocks
+        .iter()
+        .filter_map(engine::Block::as_paragraph)
+        .map(|p| p.mark_revision.as_ref().map(|r| (r.kind, r.id)))
+        .collect()
+}
+
+/// Issue #262 — step 31: paragraph-mark revisions + engine accept-all.
+///
+/// a. `<w:pPr><w:rPr><w:del/>` / `<w:ins/>` read as
+///    `Paragraph::mark_revision`; an untouched save is byte-identical.
+/// b. An edit in a paragraph with a tracked mark is a pure insertion
+///    (the verified source `<w:pPr>` carries the mark).
+/// c. A regenerated `<w:pPr>` (alignment change) re-injects the mark
+///    revision into the mark's `<w:rPr>`; it re-reads.
+/// d. Accept-all merges the deleted mark's paragraph, keeps the inserted
+///    break; reject-all the reverse. Both save with no revision left.
+pub(crate) fn run_paragraph_mark_revisions_roundtrip() -> Result<()> {
+    let xml = document(MARKS_BODY);
+    let bytes = build_styled_docx(STYLES_XML, &xml);
+    let archive = read_docx(&bytes).context("read mark-revision fixture")?;
+    let doc = &archive.document;
+    let want = vec![
+        Some((RevisionKind::Delete, Some(10))),
+        Some((RevisionKind::Insert, Some(12))),
+        None,
+    ];
+    if marks(doc) != want {
+        bail!("step 31a: marks read as {:?}", marks(doc));
+    }
+    let untouched = write_docx(&archive, doc).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != xml.as_bytes() {
+        bail!("step 31a: untouched mark-revision document drifted");
+    }
+    println!(
+        "[roundtrip] step 31a OK — paragraph-mark ins / del modeled, untouched save byte-identical"
+    );
+
+    for (block, offset) in [(0u32, "gone head".len()), (1, 2)] {
+        let edited = doc.insert_text(at(block, offset), INSERT_TEXT);
+        for (path, out) in [
+            (
+                "write_docx",
+                write_docx(&archive, &edited).context("write")?,
+            ),
+            (
+                "save_docx",
+                format_docx::save_docx(&edited).context("ui save")?,
+            ),
+        ] {
+            assert_document_xml_well_formed(&out)
+                .with_context(|| format!("step 31b {path} {block}:{offset}"))?;
+            let got = extract_doc_xml(&out)?;
+            let (_, rewritten, _) = rewritten_region(xml.as_bytes(), &got);
+            if rewritten != 0 {
+                bail!(
+                    "step 31b {path}: edit at {block}:{offset} rewrote {rewritten} source bytes\n{}",
+                    String::from_utf8_lossy(&got)
+                );
+            }
+        }
+    }
+    println!("[roundtrip] step 31b OK — edits in tracked-mark paragraphs are pure insertions");
+
+    let realigned = doc
+        .set_alignment(at(0, 0), at(1, 0), Alignment::End)
+        .insert_text(at(2, 0), INSERT_TEXT);
+    let out = write_docx(&archive, &realigned).context("realigned save")?;
+    assert_document_xml_well_formed(&out).context("step 31c")?;
+    let got = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
+    for needle in [
+        r#"<w:rPr><w:del w:id="10" w:author="A" w:date="2026-01-01T00:00:00Z"/><w:b/></w:rPr>"#,
+        r#"<w:rPr><w:ins w:id="12" w:author="B" w:date="2026-01-02T00:00:00Z"/></w:rPr>"#,
+    ] {
+        if !got.contains(needle) {
+            bail!("step 31c: regenerated pPr lost {needle}\n{got}");
+        }
+    }
+    let reread = read_docx(&out).context("re-read realigned")?;
+    if marks(&reread.document) != want {
+        bail!("step 31c: marks re-read as {:?}", marks(&reread.document));
+    }
+    println!("[roundtrip] step 31c OK — a regenerated pPr re-injects the mark revision");
+
+    for (accept, expect) in [
+        (true, vec!["head tail", "last"]),
+        (false, vec!["gone head ", "taillast"]),
+    ] {
+        let resolved = doc.resolve_all_revisions(accept);
+        if texts(&resolved) != expect {
+            bail!("step 31d (accept={accept}): {:?}", texts(&resolved));
+        }
+        let out = format_docx::save_docx(&resolved).context("save resolved")?;
+        assert_document_xml_well_formed(&out).with_context(|| format!("step 31d {accept}"))?;
+        let got = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
+        if got.contains("<w:del ") || got.contains("<w:ins ") || got.contains("<w:delText") {
+            bail!("step 31d (accept={accept}): a revision survived\n{got}");
+        }
+        let reread = read_docx(&out).context("re-read resolved")?;
+        if reread.document.has_revisions() || texts(&reread.document) != expect {
+            bail!(
+                "step 31d (accept={accept}): re-read {:?}",
+                texts(&reread.document)
+            );
+        }
+    }
+    println!("[roundtrip] step 31d OK — accept-all / reject-all resolve marks, save clean");
     Ok(())
 }

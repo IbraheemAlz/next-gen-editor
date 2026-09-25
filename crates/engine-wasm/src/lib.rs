@@ -1171,6 +1171,23 @@ impl Engine {
                         author: r.author.clone(),
                         date: r.date.clone(),
                         move_name: r.move_name.clone(),
+                        mark: false,
+                    });
+                }
+                /* Issue #262 — the paragraph-mark revision, addressed as
+                the empty range at the paragraph end (what
+                `AcceptRevision` / `RejectRevision` resolve it by). */
+                if let Some(r) = &p.mark_revision {
+                    let end = p.text.len() as u32;
+                    rows.push(RevisionOut {
+                        block: block_idx as u32,
+                        start: end,
+                        end,
+                        kind: revision_kind_label(r.kind),
+                        author: r.author.clone(),
+                        date: r.date.clone(),
+                        move_name: r.move_name.clone(),
+                        mark: true,
                     });
                 }
             }
@@ -1255,6 +1272,10 @@ struct RevisionOut {
     /// the two halves of one move share it.
     #[serde(skip_serializing_if = "Option::is_none")]
     move_name: Option<String>,
+    /// Issue #262 — a paragraph-MARK revision (a tracked split / merge),
+    /// addressed by the empty range `start == end == text length`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mark: bool,
 }
 
 /// The `revisions_snapshot()` wire label of a revision kind.
@@ -1865,6 +1886,18 @@ const REVISION_DELETE_COLOR: [u8; 4] = [0xCC, 0x00, 0x00, 0xFF];
 /// Issue #247 — tracked moves get their own tint (both halves), so a
 /// move reads differently from an unrelated insert / delete pair.
 const REVISION_MOVE_COLOR: [u8; 4] = [0x6A, 0x1B, 0x9A, 0xFF];
+
+/// Issue #262 — the pilcrow colour of a paragraph whose MARK carries a
+/// tracked change (paint-only review decoration), in the same tint as
+/// the matching text revision.
+fn review_mark_color(para: &engine::Paragraph) -> Option<[u8; 4]> {
+    para.mark_revision.as_ref().map(|r| match r.kind {
+        engine::RevisionKind::Insert => REVISION_INSERT_COLOR,
+        engine::RevisionKind::Delete => REVISION_DELETE_COLOR,
+        engine::RevisionKind::MoveFrom | engine::RevisionKind::MoveTo => REVISION_MOVE_COLOR,
+        engine::RevisionKind::FormatChange => REVISION_INSERT_COLOR,
+    })
+}
 
 /// Phase 8b — overlay each revision range so insertions render with
 /// `underline = true` + the insert colour and deletions render with
@@ -3242,6 +3275,7 @@ fn layout_story_blocks_cut(
                 };
                 p.borders = para.props.borders.clone();
                 p.shading = para.props.shading;
+                p.review_mark = review_mark_color(para);
                 LayoutBlock::Paragraph(p)
             }
             engine::Block::Table(t) => LayoutBlock::Table(layout_table_box(
@@ -7198,6 +7232,8 @@ impl Engine {
             Command::RejectRevision { block, start, end } => {
                 self.do_reject_revision(block, start, end)
             }
+            Command::AcceptAllRevisions => self.do_resolve_all_revisions(true),
+            Command::RejectAllRevisions => self.do_resolve_all_revisions(false),
             Command::InsertComment {
                 range,
                 text,
@@ -9086,6 +9122,8 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
+                        /* Issue #262 — the pilcrow of a tracked mark. */
+                        para_box.review_mark = review_mark_color(para);
                         /* Issue #95 / #178 / #179 — pagination
                         constraints from the resolved (style-cascaded)
                         properties. keepNext/keepLines are tri-state
@@ -14588,6 +14626,45 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #262 — `Command::AcceptAllRevisions` /
+    /// `RejectAllRevisions`: every tracked change of the body resolved in
+    /// one tree edit, pushed as ONE undo step. Nothing to resolve → no
+    /// undo step. The selection is clamped back into the (possibly
+    /// merged / shortened) paragraphs.
+    fn do_resolve_all_revisions(&mut self, accept: bool) -> Event {
+        let doc = self.undo.current();
+        if !doc.has_revisions() {
+            self.announce(AnnouncementPriority::Polite, "No tracked changes");
+            return self.selection_changed();
+        }
+        let new_doc = doc.resolve_all_revisions(accept);
+        self.undo.push(new_doc);
+        /* Merged / shortened paragraphs: keep the caret on real text. */
+        if let Some(sel) = self.selection.clone() {
+            let doc = self.undo.current();
+            self.selection = Some(SelectionState {
+                anchor: clamp_pos(doc, sel.anchor),
+                caret: clamp_pos(doc, sel.caret),
+                ideal_x: None,
+                kind: sel.kind,
+            });
+        }
+        self.layout_cache.get_mut().clear();
+        self.dirty.invalidate(full_page_rect(self.scale()));
+        if let Err(e) = self.maybe_repaint_result() {
+            return *e;
+        }
+        self.announce(
+            AnnouncementPriority::Polite,
+            if accept {
+                "All tracked changes accepted"
+            } else {
+                "All tracked changes rejected"
+            },
+        );
+        self.selection_changed()
+    }
+
     /// `Command::InsertComment` (Sprint 7 UI Edition). Stamped with the
     /// engine clock via `current_review_date` (issue #118 — the
     /// `SetReviewIdentity` override wins, else `Date` / `SystemTime`).
@@ -17040,6 +17117,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let a = para("hello world");
         /* Identical content + config -> identical key. */
@@ -17193,6 +17271,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         /* Compose 3 bytes at offset 3 — splits the one committed span. */
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 3, 16.0, 1.0);
@@ -17231,6 +17310,7 @@ mod tests {
             bookmarks: Vec::new(),
             body_xml: None,
             source_markup: None,
+            mark_revision: None,
         };
         let spans = composition_layout_spans(&p, empty_sctx(), 3, 2, 16.0, 1.0);
         assert_eq!(spans.len(), 2);
@@ -18388,6 +18468,7 @@ mod tests {
                 bookmarks: Vec::new(),
                 body_xml: None,
                 source_markup: None,
+                mark_revision: None,
             })],
         }
     }
@@ -25990,6 +26071,9 @@ mod block_remap_tests;
 
 #[cfg(test)]
 mod text_remap_tests;
+
+#[cfg(test)]
+mod revision_command_tests;
 
 #[cfg(test)]
 mod story_tab_tests;
