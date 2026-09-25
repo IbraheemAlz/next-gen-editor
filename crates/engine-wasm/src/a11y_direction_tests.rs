@@ -247,3 +247,146 @@ fn region_paragraphs_resolve_independently() {
         "{header:?}"
     );
 }
+
+/* ---- Issue #202 — direction inherited from a paragraph style ---- */
+
+/// A `.docx` whose `RtlBase` style sets `<w:bidi/>` and whose `RtlBody`
+/// inherits it via `basedOn`. Paragraphs: (0) RtlBody, Latin-first
+/// text; (1) RtlBody with a direct `<w:bidi w:val="0"/>` over Arabic-
+/// first text; (2) unstyled Latin; (3) RtlBody, digits first.
+fn style_bidi_docx() -> Vec<u8> {
+    use engine::TextDirection::{Ltr, Rtl};
+    let mut d = doc_of(vec![
+        para("Word مرحبا", None),
+        para("مرحبا Word", None),
+        para("plain", None),
+        para("2026 Word", None),
+    ]);
+    d.styles.insert(
+        "RtlBase".into(),
+        engine::ParagraphStyle {
+            id: "RtlBase".into(),
+            name: "RTL Base".into(),
+            para: engine::ParaProperties {
+                direction: Some(Rtl),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    d.styles.insert(
+        "RtlBody".into(),
+        engine::ParagraphStyle {
+            id: "RtlBody".into(),
+            name: "RTL Body".into(),
+            based_on: Some("RtlBase".into()),
+            ..Default::default()
+        },
+    );
+    d.styles_dirty = true;
+    let styles = d.styles.clone();
+    let defaults = d.style_defaults.clone();
+    let mut blocks: Vec<engine::Block> = d.blocks.iter().cloned().collect();
+    for (i, b) in blocks.iter_mut().enumerate() {
+        let engine::Block::Paragraph(p) = b else {
+            unreachable!()
+        };
+        if i != 2 {
+            p.style_id = Some("RtlBody".into());
+        }
+        if i == 1 {
+            p.direct_overrides.direction = Some(Ltr);
+        }
+        engine::recompute_paragraph_props(p, &styles, &defaults);
+    }
+    d.blocks = blocks.into_iter().collect();
+    let bytes = format_docx::build_minimal_docx(&d).expect("build");
+    /* The fixture itself must carry the direction on the style only. */
+    let reread = format_docx::read_docx(&bytes).expect("reread");
+    let p0 = reread.document.nth_paragraph(0).unwrap();
+    assert_eq!(p0.style_id.as_deref(), Some("RtlBody"));
+    assert_eq!(p0.direct_overrides.direction, None, "bidi is style-only");
+    bytes
+}
+
+fn open_style_bidi(base: ShapingDirection) -> Engine {
+    let mut e = engine_with(doc_of(vec![para("", None)]), base);
+    let evt = apply(
+        &mut e,
+        Command::OpenDocument {
+            bytes: style_bidi_docx(),
+            format: DocFormat::Docx,
+            name: None,
+        },
+    );
+    assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+    e
+}
+
+fn layout_dirs(e: &Engine) -> Vec<ShapingDirection> {
+    let (pages, _, _, _) = e.build_pages(1.0, false, None).expect("layout");
+    pages
+        .iter()
+        .flat_map(|p| p.blocks.iter())
+        .filter_map(|b| b.as_paragraph().map(|p| p.direction))
+        .collect()
+}
+
+#[test]
+fn style_inherited_bidi_drives_layout_a11y_and_caret() {
+    for base in [ShapingDirection::Ltr, ShapingDirection::Rtl] {
+        let e = open_style_bidi(base);
+        let expected = vec![
+            ShapingDirection::Rtl, // style RTL beats the Latin first-strong
+            ShapingDirection::Ltr, // direct w:val="0" beats the style
+            ShapingDirection::Ltr, // unstyled Latin → first strong
+            ShapingDirection::Rtl, // style RTL, digits first
+        ];
+        assert_eq!(layout_dirs(&e), expected, "layout, base {base:?}");
+        let a11y: Vec<ShapingDirection> = paragraph_dirs(&e.build_a11y_nodes())
+            .iter()
+            .map(|d| match d.1 {
+                Direction::Rtl => ShapingDirection::Rtl,
+                Direction::Ltr => ShapingDirection::Ltr,
+            })
+            .collect();
+        assert_eq!(a11y, expected, "a11y, base {base:?}");
+        for (i, want) in expected.iter().enumerate() {
+            let path = bpos_top(i as u32, 0).path;
+            assert_eq!(e.paragraph_direction_at(&path), *want, "caret {i}");
+        }
+    }
+}
+
+/// Typing into / splitting a style-RTL paragraph keeps it RTL (the tail
+/// inherits the style), and applying the style to a Latin paragraph
+/// flips it RTL.
+#[test]
+fn style_inherited_bidi_survives_edits_and_apply_style() {
+    let mut e = open_style_bidi(ShapingDirection::Ltr);
+    let evt = apply(
+        &mut e,
+        Command::InsertText {
+            at: Some(bpos_top(0, 0)),
+            text: "A ".into(),
+        },
+    );
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    let evt = apply(&mut e, Command::SplitParagraph { at: bpos_top(0, 2) });
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    let evt = apply(
+        &mut e,
+        Command::ApplyStyle {
+            range: BridgeLogicalRange {
+                start: bpos_top(3, 0),
+                end: bpos_top(3, 0),
+            },
+            style_id: Some("RtlBody".into()),
+        },
+    );
+    assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+    let dirs = layout_dirs(&e);
+    assert_eq!(dirs[0], ShapingDirection::Rtl, "{dirs:?}");
+    assert_eq!(dirs[1], ShapingDirection::Rtl, "split tail {dirs:?}");
+    assert_eq!(dirs[3], ShapingDirection::Rtl, "restyled Latin {dirs:?}");
+}

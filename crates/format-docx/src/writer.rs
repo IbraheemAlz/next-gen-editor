@@ -695,10 +695,17 @@ fn serialize_paragraph(
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
     out.push_str("<w:p>");
-    let props = if para.props.outline_level.is_some() || para.props.widow_control.is_some() {
+    let inherited_bidi = direction_is_inherited(para);
+    let props = if para.props.outline_level.is_some()
+        || para.props.widow_control.is_some()
+        || inherited_bidi
+    {
         let mut p = para.props.clone();
         p.outline_level = None;
         p.widow_control = None;
+        if inherited_bidi {
+            p.direction = None;
+        }
         std::borrow::Cow::Owned(p)
     } else {
         std::borrow::Cow::Borrowed(&para.props)
@@ -745,6 +752,76 @@ fn serialize_paragraph(
         ));
     }
     out.push_str("</w:p>");
+}
+
+/// Issue #202 — the paragraph direction every style id resolves to
+/// through the cascade (`docDefaults` → `basedOn` chain), published for
+/// the duration of one [`write_docx`] whose output carries the style
+/// table (`serialize_paragraph` has no document in hand — the
+/// [`WRITE_DEFAULT_GEOMETRY`] pattern).
+struct InheritedDirections {
+    defaults: Option<TextDirection>,
+    by_style: HashMap<String, Option<TextDirection>>,
+}
+
+thread_local! {
+    static WRITE_INHERITED_DIRECTIONS: std::cell::RefCell<Option<InheritedDirections>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Clears [`WRITE_INHERITED_DIRECTIONS`] when the write ends (early
+/// `?` returns included).
+struct InheritedDirectionsScope;
+
+impl Drop for InheritedDirectionsScope {
+    fn drop(&mut self) {
+        WRITE_INHERITED_DIRECTIONS.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Publish `doc`'s cascade directions for this write. Only when the
+/// written file carries `styles.xml` (`styles_travel`): without the
+/// style table the inherited direction exists nowhere else in the file,
+/// so the resolved value stays baked on the paragraph (issue #134's
+/// style-less save path).
+fn publish_inherited_directions(
+    doc: &DocumentTree,
+    styles_travel: bool,
+) -> InheritedDirectionsScope {
+    let table = styles_travel.then(|| InheritedDirections {
+        defaults: doc.style_defaults.direction,
+        by_style: doc
+            .styles
+            .keys()
+            .map(|id| (id.clone(), doc.resolve_style_cascade(Some(id)).direction))
+            .collect(),
+    });
+    WRITE_INHERITED_DIRECTIONS.with(|c| *c.borrow_mut() = table);
+    InheritedDirectionsScope
+}
+
+/// Issue #202 — `true` when a regenerated paragraph's `<w:bidi>` would
+/// only restate what its style cascade already gives it: no direct
+/// direction was set (`direct_overrides`) and the resolved one equals
+/// the cascade's. Such a paragraph must not gain a direct `<w:bidi/>` —
+/// the reread resolves the same direction from `styles.xml`, and a later
+/// style edit keeps driving it. Lossless by construction: omitted only
+/// when the value is exactly the inherited one.
+fn direction_is_inherited(para: &Paragraph) -> bool {
+    if para.props.direction.is_none() || para.direct_overrides.direction.is_some() {
+        return false;
+    }
+    WRITE_INHERITED_DIRECTIONS.with(|c| {
+        c.borrow().as_ref().is_some_and(|t| {
+            let inherited = match para.style_id.as_deref() {
+                /* An id missing from the table breaks the chain at once:
+                the cascade is the defaults alone. */
+                Some(id) => t.by_style.get(id).copied().unwrap_or(t.defaults),
+                None => t.defaults,
+            };
+            inherited == para.props.direction
+        })
+    })
 }
 
 /// Issue #81 — a stable `w:id` for an engine-emitted bookmark. Ids are
@@ -2188,6 +2265,10 @@ pub fn write_docx(archive: &DocxArchive, doc: &DocumentTree) -> Result<Vec<u8>, 
             None
         };
         let styles_already_present = archive.other_entries.iter().any(|(n, _)| n == STYLES_XML);
+        /* Issue #202 — paragraphs only inheriting their direction keep it
+        on styles.xml, not as a direct `<w:bidi/>`. */
+        let _inherited_directions =
+            publish_inherited_directions(doc, styles_already_present || styles_bytes.is_some());
         /* Issue #74 — `SetEvenOddHeaders` flips `settings_dirty`; patch
         `word/settings.xml` IN PLACE (a full regenerate would drop every
         unmodeled sibling — zoom, proofState, compat). Synthesize a
@@ -5910,6 +5991,11 @@ mod tests {
 </w:styles>"#;
         let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="ChildStyle"/></w:pPr><w:r><w:t xml:space="preserve">hello cascade</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        build_docx_with_styles(styles_xml, document_xml)
+    }
+
+    /// A minimal `.docx` from a `styles.xml` + `document.xml` pair.
+    fn build_docx_with_styles(styles_xml: &str, document_xml: &str) -> Vec<u8> {
         let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -5945,6 +6031,119 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    /* ---- Issue #202: paragraph direction through the style cascade ---- */
+
+    /// `RtlBase` sets `<w:bidi/>`; `RtlBody` inherits it via `basedOn`
+    /// without restating it. Paragraphs: (0) RtlBody + Latin-first text,
+    /// (1) RtlBody + direct `<w:bidi w:val="0"/>`, (2) no style.
+    const BIDI_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:styleId="RtlBase"><w:name w:val="RTL Base"/><w:pPr><w:bidi/></w:pPr></w:style>
+<w:style w:type="paragraph" w:styleId="RtlBody"><w:name w:val="RTL Body"/><w:basedOn w:val="RtlBase"/><w:rPr><w:rtl/></w:rPr></w:style>
+</w:styles>"#;
+    const BIDI_DOCUMENT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="RtlBody"/></w:pPr><w:r><w:t xml:space="preserve">Word مرحبا</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="RtlBody"/><w:bidi w:val="0"/></w:pPr><w:r><w:t xml:space="preserve">مرحبا Word</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">plain</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+
+    #[test]
+    fn style_bidi_resolves_through_the_based_on_chain() {
+        let bytes = build_docx_with_styles(BIDI_STYLES_XML, BIDI_DOCUMENT_XML);
+        let doc = read_docx(&bytes).expect("read").document;
+        let p0 = doc.nth_paragraph(0).unwrap();
+        assert_eq!(p0.props.direction, Some(TextDirection::Rtl), "inherited");
+        assert_eq!(p0.direct_overrides.direction, None, "not direct");
+        let p1 = doc.nth_paragraph(1).unwrap();
+        assert_eq!(
+            p1.props.direction,
+            Some(TextDirection::Ltr),
+            "direct off wins"
+        );
+        assert_eq!(p1.direct_overrides.direction, Some(TextDirection::Ltr));
+        assert_eq!(doc.nth_paragraph(2).unwrap().props.direction, None);
+    }
+
+    #[test]
+    fn style_bidi_in_doc_defaults_resolves() {
+        let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:pPrDefault><w:pPr><w:bidi/></w:pPr></w:pPrDefault></w:docDefaults></w:styles>"#;
+        let bytes = build_docx_with_styles(styles, BIDI_DOCUMENT_XML);
+        let doc = read_docx(&bytes).expect("read").document;
+        assert_eq!(
+            doc.nth_paragraph(2).unwrap().props.direction,
+            Some(TextDirection::Rtl)
+        );
+        assert_eq!(
+            doc.nth_paragraph(1).unwrap().props.direction,
+            Some(TextDirection::Ltr)
+        );
+    }
+
+    /// An edited paragraph that only INHERITS bidi must not gain a direct
+    /// `<w:bidi/>`; untouched paragraphs stay byte-identical; a direct
+    /// override is still written; the reread resolves the same way.
+    #[test]
+    fn inherited_bidi_is_not_written_as_direct_formatting() {
+        let bytes = build_docx_with_styles(BIDI_STYLES_XML, BIDI_DOCUMENT_XML);
+        let archive = read_docx(&bytes).expect("read");
+        let edit = |doc: &engine::DocumentTree, idx: u32| {
+            doc.insert_text(
+                engine::LogicalPos {
+                    path: engine::BlockPath::top(idx),
+                    offset: 0,
+                },
+                "X",
+            )
+        };
+        let edited = edit(&edit(&archive.document, 0), 1);
+        let untouched = std::str::from_utf8(
+            edited
+                .nth_paragraph(2)
+                .unwrap()
+                .source_xml
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap()
+        .to_owned();
+        let saved = write_docx(&archive, &edited).expect("write");
+        let xml = document_xml_of(&saved);
+        let p0 = xml
+            .split("</w:p>")
+            .find(|p| p.contains("XWord"))
+            .expect("edited p0");
+        assert!(p0.contains("<w:pStyle w:val=\"RtlBody\"/>"), "{p0}");
+        assert!(!p0.contains("<w:bidi"), "inherited bidi leaked: {p0}");
+        let p1 = xml.split("</w:p>").nth(1).expect("p1");
+        assert!(p1.contains("<w:bidi w:val=\"false\"/>"), "{p1}");
+        let reread = read_docx(&saved).expect("reread").document;
+        let q0 = reread.nth_paragraph(0).unwrap();
+        assert_eq!(q0.props.direction, Some(TextDirection::Rtl));
+        assert_eq!(q0.direct_overrides.direction, None);
+        assert_eq!(
+            reread.nth_paragraph(1).unwrap().props.direction,
+            Some(TextDirection::Ltr)
+        );
+        /* The style-less live save path (issue #134 drops styles.xml)
+        keeps baking the resolved direction — the only place it could
+        survive — so the reread still reads RTL. */
+        let minimal = build_minimal_docx(&edited).expect("minimal");
+        let reread = read_docx(&minimal).expect("reread minimal").document;
+        assert_eq!(
+            reread.nth_paragraph(0).unwrap().props.direction,
+            Some(TextDirection::Rtl)
+        );
+        /* ModifyStyle regenerates styles.xml on that path: then the
+        inherited direction rides the style table again. */
+        let mut restyled = edited.clone();
+        restyled.styles_dirty = true;
+        let xml = document_xml_of(&build_minimal_docx(&restyled).expect("minimal"));
+        let p0 = xml.split("</w:p>").find(|p| p.contains("XWord")).unwrap();
+        assert!(!p0.contains("<w:bidi"), "{p0}");
+        assert!(
+            xml.contains(&untouched),
+            "untouched paragraph byte-identical"
+        );
     }
 
     #[test]

@@ -288,6 +288,7 @@ fn run_default() -> Result<()> {
     run_rtl_table_roundtrip()?;
     run_table_jc_tblind_roundtrip()?;
     run_body_passthrough_roundtrip()?;
+    run_style_bidi_roundtrip()?;
 
     println!("\nPASS");
     Ok(())
@@ -2341,6 +2342,106 @@ fn run_rtl_table_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/* ================================== style-inherited direction (#202) ==== */
+
+/// Issue #202 — `RtlBase` sets `<w:bidi/>`; `RtlBody` inherits it via
+/// `basedOn` (the Arabic-template "RTL Body" shape).
+const STYLE_BIDI_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:styleId="RtlBase"><w:name w:val="RTL Base"/><w:pPr><w:bidi/></w:pPr></w:style>
+<w:style w:type="paragraph" w:styleId="RtlBody"><w:name w:val="RTL Body"/><w:basedOn w:val="RtlBase"/></w:style>
+</w:styles>"#;
+
+/// The three paragraphs of `pPr_bidi_style.docx`, byte-for-byte: (0) a
+/// style-RTL paragraph that starts with a Latin word, (1) the same style
+/// under a direct `<w:bidi w:val="false"/>`, (2) an unstyled paragraph.
+/// Written in the writer's own regeneration shape, so an edited
+/// paragraph regenerates to exactly source + insert.
+const STYLE_BIDI_PARAGRAPHS: [&str; 3] = [
+    r#"<w:p><w:pPr><w:pStyle w:val="RtlBody"/></w:pPr><w:r><w:t xml:space="preserve">Word مرحبا</w:t></w:r></w:p>"#,
+    r#"<w:p><w:pPr><w:pStyle w:val="RtlBody"/><w:bidi w:val="false"/></w:pPr><w:r><w:t xml:space="preserve">Word مرحبا</w:t></w:r></w:p>"#,
+    r#"<w:p><w:r><w:t xml:space="preserve">plain</w:t></w:r></w:p>"#,
+];
+
+fn build_style_bidi_docx() -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{}{BARE_SECT_PR}</w:body></w:document>"#,
+        STYLE_BIDI_PARAGRAPHS.concat()
+    );
+    build_styled_docx(STYLE_BIDI_STYLES_XML, &document_xml)
+}
+
+/// Issue #202 — step 21: paragraph direction inherited from a style.
+///
+/// a. `bidi` resolves through the `basedOn` chain on read (RTL although
+///    the text starts with a Latin word) without becoming a direct
+///    override; a direct `w:val="false"` beats the style.
+/// b. An untouched save is byte-identical.
+/// c. Editing the style-RTL paragraph regenerates exactly source +
+///    insert — it does NOT gain a direct `<w:bidi/>` — the other two
+///    paragraphs pass through byte-identical, and the re-read still
+///    resolves RTL from styles.xml.
+fn run_style_bidi_roundtrip() -> Result<()> {
+    use engine::{BlockPath, LogicalPos, TextDirection};
+
+    type Dirs = Vec<(Option<TextDirection>, Option<TextDirection>)>;
+    let dirs = |doc: &DocumentTree| -> Dirs {
+        (0..3)
+            .filter_map(|i| doc.nth_paragraph(i))
+            .map(|p| (p.props.direction, p.direct_overrides.direction))
+            .collect()
+    };
+    let expected: Dirs = vec![
+        (Some(TextDirection::Rtl), None),
+        (Some(TextDirection::Ltr), Some(TextDirection::Ltr)),
+        (None, None),
+    ];
+
+    let fixture_bytes = build_style_bidi_docx();
+    let archive_a = read_docx(&fixture_bytes).context("read style-bidi fixture")?;
+    if dirs(&archive_a.document) != expected {
+        bail!(
+            "style bidi not resolved on read: {:?}",
+            dirs(&archive_a.document)
+        );
+    }
+    println!("[roundtrip] step 21a OK — bidi resolves through basedOn, direct off wins");
+
+    let doc_a = String::from_utf8(extract_doc_xml(&fixture_bytes)?).context("utf8 source")?;
+    let untouched = write_docx(&archive_a, &archive_a.document).context("untouched save")?;
+    if extract_doc_xml(&untouched)? != doc_a.as_bytes() {
+        bail!("untouched style-bidi document drifted");
+    }
+    println!("[roundtrip] step 21b OK — untouched save byte-identical");
+
+    let edited = archive_a.document.insert_text(
+        LogicalPos {
+            path: BlockPath::top(0),
+            offset: "Word".len() as u32,
+        },
+        INSERT_TEXT,
+    );
+    let expected_xml = doc_a.replacen("Word مرحبا", &format!("Word{INSERT_TEXT} مرحبا"), 1);
+    let bytes = write_docx(&archive_a, &edited).context("write edited style-bidi")?;
+    assert_document_xml_well_formed(&bytes).context("edited style-bidi .docx")?;
+    let xml = String::from_utf8(extract_doc_xml(&bytes)?).context("utf8 edited")?;
+    if xml != expected_xml {
+        bail!(
+            "edited style-RTL paragraph is not source + edit (inherited <w:bidi/> leaked?)\n--- expected ---\n{expected_xml}\n--- got ---\n{xml}"
+        );
+    }
+    let back = read_docx(&bytes).context("re-read edited style-bidi")?;
+    if dirs(&back.document) != expected {
+        bail!("direction lost on re-read: {:?}", dirs(&back.document));
+    }
+    let drift = expected_xml.len() - doc_a.len();
+    println!(
+        "[roundtrip] step 21c OK — edited style-RTL paragraph gains no direct <w:bidi/>, re-reads RTL (Δ {drift} B)"
+    );
+    Ok(())
+}
+
 /* ================================================ table placement (#173) ==== */
 
 /// Issue #173 — step 18: the `<w:jc>` / `<w:tblInd>` round-trip contract
@@ -3030,6 +3131,22 @@ fn prebuilt_fixtures() -> Vec<PrebuiltFixture> {
                 roundtrip: RoundtripBounds::default(),
             },
         },
+        /* Issue #202 — style-inherited paragraph direction. Passthrough
+        at drift 0; the default harness's step 21 edits the style-RTL
+        paragraph. */
+        PrebuiltFixture {
+            name: "pPr_bidi_style.docx",
+            bytes: build_style_bidi_docx(),
+            entry: FixtureEntry {
+                generator: "handcrafted".into(),
+                phase_introduced: 11,
+                asserts: FixtureAsserts {
+                    paragraph_count: 3,
+                    paragraph_texts: vec!["Word مرحبا".into(), "Word مرحبا".into(), "plain".into()],
+                },
+                roundtrip: RoundtripBounds::default(),
+            },
+        },
         PrebuiltFixture {
             name: "style_cascade.docx",
             bytes: build_style_cascade_docx(),
@@ -3475,9 +3592,6 @@ fn build_table_jc_tblind_docx() -> Vec<u8> {
 /// (italic, basedOn BaseStyle); the single `<w:p>` references ChildStyle
 /// and must round-trip with the cascade resolved to bold + italic.
 fn build_style_cascade_docx() -> Vec<u8> {
-    use std::io::Write;
-    use zip::write::{SimpleFileOptions, ZipWriter};
-
     let styles_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:style w:type="paragraph" w:styleId="BaseStyle"><w:name w:val="Base"/><w:rPr><w:b/></w:rPr></w:style>
@@ -3485,6 +3599,15 @@ fn build_style_cascade_docx() -> Vec<u8> {
 </w:styles>"#;
     let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="ChildStyle"/></w:pPr><w:r><w:t xml:space="preserve">hello cascade</w:t></w:r></w:p>"#.to_owned() + A4_SECT_PR_EXPLICIT + "</w:body></w:document>";
+    build_styled_docx(styles_xml, &document_xml)
+}
+
+/// Package a `word/styles.xml` + `word/document.xml` pair in the minimal
+/// OPC skeleton (styles relationship included).
+fn build_styled_docx(styles_xml: &str, document_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -3512,7 +3635,7 @@ fn build_style_cascade_docx() -> Vec<u8> {
             ("_rels/.rels", dot_rels),
             ("word/_rels/document.xml.rels", doc_rels),
             ("word/styles.xml", styles_xml),
-            ("word/document.xml", document_xml.as_str()),
+            ("word/document.xml", document_xml),
         ] {
             zip.start_file(name, opts).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
