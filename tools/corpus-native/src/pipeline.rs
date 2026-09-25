@@ -13,6 +13,7 @@
 //! batch — the entire point of the harness is to survive the crashes it is
 //! looking for.
 
+use crate::drift;
 use crate::nativelayout;
 use crate::panics::{self, CaughtPanic};
 use format_docx::DocxArchive;
@@ -89,6 +90,23 @@ pub struct DocResult {
     pub document_xml_unchanged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_xml_delta_noedit_bytes: Option<u64>,
+    /// Issue #112 — `document.xml` reproduced byte for byte by the
+    /// zero-edit resave (the size delta above can be 0 while the bytes
+    /// still differ).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_xml_byte_identical: Option<bool>,
+    /// Issue #112 — raw offset of the first differing byte (see
+    /// [`crate::drift`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_drift_offset: Option<usize>,
+    /// Issue #112 — innermost element of the ORIGINAL part the first
+    /// differing byte falls in (`w:sectPr`, `#text`, `<prolog>`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_drift_element: Option<String>,
+    /// Issue #112 — `parent/element` bucket key for the drift histogram
+    /// (`w:body/w:sdt`, `/w:document`, `<prolog>`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_drift_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pdf_bytes_len: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,6 +135,10 @@ impl DocResult {
             sibling_drift_bytes: None,
             document_xml_unchanged: None,
             document_xml_delta_noedit_bytes: None,
+            document_xml_byte_identical: None,
+            first_drift_offset: None,
+            first_drift_element: None,
+            first_drift_context: None,
             pdf_bytes_len: None,
             pdf_pages: None,
             edit_check: None,
@@ -304,6 +326,18 @@ pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: boo
         let delta = (doc_xml_resaved.len() as i64 - doc_xml_orig.len() as i64).unsigned_abs();
         rec.document_xml_unchanged = Some(delta == 0);
         rec.document_xml_delta_noedit_bytes = Some(delta);
+        /* Issue #112 — true byte identity + the construct the first
+        differing byte belongs to, so the corpus histograms by bucket. */
+        match drift::first_difference(&doc_xml_orig, &doc_xml_resaved) {
+            None => rec.document_xml_byte_identical = Some(true),
+            Some(offset) => {
+                let point = drift::locate(&doc_xml_orig, offset);
+                rec.document_xml_byte_identical = Some(false);
+                rec.first_drift_offset = Some(point.offset);
+                rec.first_drift_element = Some(point.element);
+                rec.first_drift_context = Some(point.context);
+            }
+        }
     }
 
     /* 6c. No text loss. */

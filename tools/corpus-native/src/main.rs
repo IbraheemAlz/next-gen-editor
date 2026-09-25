@@ -37,6 +37,7 @@
 //! tool failing. Exit is non-zero only for a setup problem (missing/empty
 //! corpus dir, or `--worker` invoked on an unreadable file).
 
+mod drift;
 mod fonts;
 mod nativelayout;
 mod panics;
@@ -352,6 +353,12 @@ fn main() -> ExitCode {
     let mut panicked = 0usize;
     let mut timed_out = 0usize;
     let mut crashed = 0usize;
+    /* Issue #112 — zero-edit `document.xml` drift, bucketed by the
+    construct the first differing byte falls in (see `drift.rs`). */
+    let mut noedit_checked = 0usize;
+    let mut noedit_identical = 0usize;
+    let mut drift_histogram: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
 
     for (i, path) in files.iter().enumerate() {
         let label = path
@@ -368,6 +375,18 @@ fn main() -> ExitCode {
             pipeline::Outcome::Panic => panicked += 1,
             pipeline::Outcome::Timeout => timed_out += 1,
             pipeline::Outcome::Crash => crashed += 1,
+        }
+        if let Some(identical) = rec.document_xml_byte_identical {
+            noedit_checked += 1;
+            if identical {
+                noedit_identical += 1;
+            } else {
+                let key = rec
+                    .first_drift_context
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".into());
+                *drift_histogram.entry(key).or_insert(0) += 1;
+            }
         }
 
         if let Err(e) = writeln!(
@@ -398,6 +417,18 @@ fn main() -> ExitCode {
         files.len(),
         run_start.elapsed().as_secs_f32()
     );
+    /* Issue #112 — the drift histogram, largest bucket first. */
+    println!(
+        "[corpus-native] zero-edit document.xml byte-identical: {noedit_identical}/{noedit_checked}"
+    );
+    if !drift_histogram.is_empty() {
+        let mut buckets: Vec<(&String, &usize)> = drift_histogram.iter().collect();
+        buckets.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        println!("[corpus-native] first-differing-element histogram (docs):");
+        for (key, count) in buckets {
+            println!("[corpus-native]   {count:5}  {key}");
+        }
+    }
     println!("[corpus-native] JSONL written to {}", args.out.display());
     ExitCode::SUCCESS
 }
