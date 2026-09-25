@@ -379,6 +379,13 @@ fn main() -> ExitCode {
     let mut ui_checked = 0usize;
     let mut ui_siblings_identical = 0usize;
     let mut ui_matches_write_docx = 0usize;
+    /* Issue #250 — pure-insertion edited saves (0 source bytes rewritten),
+    plain typing vs the same net edit in track-changes mode. */
+    let mut edit_checked = 0usize;
+    let mut pure_plain = 0usize;
+    let mut pure_tracked = 0usize;
+    let mut stale_plain = 0usize;
+    let mut stale_tracked = 0usize;
 
     for (i, path) in files.iter().enumerate() {
         let label = path
@@ -415,6 +422,14 @@ fn main() -> ExitCode {
                     .unwrap_or_else(|| "<unknown>".into());
                 *drift_histogram.entry(key).or_insert(0) += 1;
             }
+        }
+
+        if let Some(ec) = &rec.edit_check {
+            edit_checked += 1;
+            pure_plain += usize::from(ec.source_bytes_rewritten == 0);
+            pure_tracked += usize::from(ec.tracked_source_bytes_rewritten == Some(0));
+            stale_plain += usize::from(ec.markup_in_step == Some(false));
+            stale_tracked += usize::from(ec.tracked_markup_in_step == Some(false));
         }
 
         if let Some(identical) = rec.ui_save_siblings_identical {
@@ -454,6 +469,11 @@ fn main() -> ExitCode {
     println!(
         "[corpus-native] UI-path save (#134): siblings byte-identical {ui_siblings_identical}/{ui_checked}, \
          byte-identical to write_docx {ui_matches_write_docx}/{ui_checked}"
+    );
+    println!(
+        "[corpus-native] edited save pure insertion (#250): plain {pure_plain}/{edit_checked}, \
+         track-changes {pure_tracked}/{edit_checked}; stale source markup: plain {stale_plain}, \
+         track-changes {stale_tracked}"
     );
     /* Issue #112 — the drift histogram, largest bucket first. */
     println!(
