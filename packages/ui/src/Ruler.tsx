@@ -53,6 +53,7 @@ import {
     createEditorCommands,
     createEditorState,
     type BridgeTabKind,
+    type BridgeTabLeader,
     type BridgeTabStop,
 } from '@nge/core';
 import { focusEditorInput } from './focus';
@@ -115,6 +116,29 @@ function tabKindName(k: BridgeTabKind): string {
             return 'Decimal';
         default:
             return 'Left';
+    }
+}
+
+/**
+ * Issue #145 — human-readable leader name for the marker tooltip, so a
+ * TOC entry's dot leader is visible in the Ruler (not just silently
+ * preserved). `undefined` / `'None'` renders nothing — most tab stops
+ * carry no leader.
+ */
+function leaderName(l: BridgeTabLeader | undefined): string | null {
+    switch (l) {
+        case 'Dot':
+            return 'dot leader';
+        case 'Hyphen':
+            return 'hyphen leader';
+        case 'Underscore':
+            return 'underscore leader';
+        case 'Heavy':
+            return 'heavy leader';
+        case 'MiddleDot':
+            return 'middle-dot leader';
+        default:
+            return null;
     }
 }
 
@@ -375,7 +399,11 @@ export const Ruler: Component<RulerProps> = (props) => {
             }
             case 'tab-add': {
                 const stops = (localStops() ?? state.tabStops()).slice();
-                stops.push({ position_pt: d.livePt, kind: 'Left' });
+                /* A brand-new stop has nothing to inherit; `leader:
+                 * undefined` is the wire's "no leader" — not "keep
+                 * whatever was there," since there is no prior entry
+                 * at this index (issue #145). */
+                stops.push({ position_pt: d.livePt, kind: 'Left', leader: undefined });
                 stops.sort((a, b) => a.position_pt - b.position_pt);
                 void cmd.setTabStops(stops);
                 setLocalStops(null);
@@ -633,8 +661,13 @@ export const Ruler: Component<RulerProps> = (props) => {
                             type="button"
                             class="nge-ruler__tab"
                             data-kind={stop.kind}
+                            data-leader={leaderName(stop.leader) !== null ? 'true' : 'false'}
                             style={{ left: `${contentPtToLeftPx(stop.position_pt)}px` }}
-                            title={`${tabKindName(stop.kind)} tab stop — click to cycle kind, drag off ruler to remove`}
+                            title={`${tabKindName(stop.kind)} tab stop${
+                                leaderName(stop.leader) !== null
+                                    ? ` (${leaderName(stop.leader)})`
+                                    : ''
+                            } — click to cycle kind, drag off ruler to remove`}
                             onPointerDown={(e) => onTabPointerDown(e, i(), stop)}
                             onPointerUp={(e) => onTabPointerUp(e, i(), stop)}
                         >

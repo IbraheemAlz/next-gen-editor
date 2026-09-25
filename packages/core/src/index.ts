@@ -103,6 +103,7 @@ export type {
     BridgeCellProperties,
     BridgeTabStop,
     BridgeTabKind,
+    BridgeTabLeader,
     BridgeIndent,
     BridgeStyleProperties,
     BridgeSpanStylePatch,
