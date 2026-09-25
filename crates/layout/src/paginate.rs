@@ -26,7 +26,8 @@ use crate::boxes::{
 };
 use crate::page::Margins;
 use crate::table_split::{
-    recompute_vmerge_spans, restack_rows, restub_continuation, row_units, split_row_in_cells,
+    SplitRule, recompute_vmerge_spans, restack_rows, restub_continuation, row_cut_points,
+    row_units, split_row_in_cells,
 };
 use crate::watchdog::{BlockFingerprint, DegradeReason, DegradeStage, LayoutDegradation, Watchdog};
 use engine::{NoteAnchor, NotePosition};
@@ -69,6 +70,11 @@ impl HeaderBands {
 /// pt at scale=1. The renderer multiplies by `scale` if it needs device
 /// pixels.
 pub const FOOTNOTE_SEPARATOR_HEIGHT_PT: f32 = 12.0;
+
+/// Issue #155 — how far below a row part's height the next negotiation
+/// step sets its budget: enough to drop the deepest line of the tallest
+/// cell (line bottoms are compared with `<=`), far below any line height.
+const ROW_PART_SHRINK_PT: f32 = 0.01;
 
 /* ============================================================
 Issue #80 — footnote / endnote space negotiation.
@@ -1515,12 +1521,18 @@ impl Paginator {
     ///    vertical merge is one unit) and run through the #80 deadline
     ///    fitter, so a row's footnotes reserve band space when it lands
     ///    and a row whose note cannot fit moves on.
-    /// 2. **Split at a unit boundary** when at least one body row fits
-    ///    under the header rows: the head stays here, the tail — the
+    /// 2. **Split inside the first row that does not fit** (issue #155,
+    ///    Word's default "allow row to break across pages"): when it is a
+    ///    single body row that is not `<w:cantSplit>` and every cell with
+    ///    content keeps at least a line here, its first lines stay on this
+    ///    page and the rest continues under the repeated headers — see
+    ///    [`Self::negotiate_row_split`] (footnotes negotiated first).
+    ///    Otherwise **split at a unit boundary** when at least one body
+    ///    row fits under the header rows: the head stays here, the tail — the
     ///    header rows cloned on top (`<w:tblHeader>` repeat), then the
     ///    remaining rows — re-enters the flow on the next column / page.
-    ///    Rows are never cut below the page height: a row that does not
-    ///    fit the rest of the page moves whole (`<w:cantSplit>` or not).
+    ///    The row that did not fit moves whole: `<w:cantSplit>`, a merge
+    ///    group, or a row one of whose cells cannot place a line here.
     /// 3. **No body row fits on a page that already holds content**: the
     ///    whole table moves (with a keep-with-next chain ending before
     ///    it), exactly the pre-#91 behaviour.
@@ -1554,6 +1566,28 @@ impl Paginator {
             })
             .collect();
         let plan = self.fit_items(&items, budget, fresh);
+        /* Issue #155 — the first unit that does not land whole. Counted
+        by height as well as by the plan: the fresh-page note waiver can
+        force an over-height first unit into the plan (#160). */
+        let by_height = items.iter().take_while(|it| it.bottom <= budget).count();
+        let first_out = plan.count.min(by_height);
+        if first_out < units.len()
+            && let Some((cut, head_rows, tail_row, cut_plan)) =
+                self.negotiate_row_split(&table, &units, &items, &plan, first_out, budget, fresh)
+        {
+            self.commit_plan(cut_plan);
+            let repeat = table.rows[..lead_headers].to_vec();
+            self.emit_table_fragments(
+                &table,
+                cut,
+                Some((head_rows, Some(tail_row))),
+                repeat,
+                false,
+                after,
+                observe,
+            );
+            return;
+        }
         let fitted_rows = plan.count.checked_sub(1).map_or(0, |k| units[k].1);
         if fitted_rows >= table.rows.len() {
             /* Everything fits with its notes (a caller re-routed a table
@@ -1579,6 +1613,106 @@ impl Paginator {
         self.push_table_split_fresh(table, lead_headers, &units, fitted_rows, after, observe);
     }
 
+    /// Issue #155 — Word's default "allow row to break across pages": the
+    /// first unit that does not land whole (`units[k]`) is, when it is a
+    /// single splittable body row (not `<w:cantSplit>`, not a header, not
+    /// part of a vertical-merge group — groups move as units, #91), cut at
+    /// a line boundary so its first lines stay on this page. Returns the
+    /// exclusive cut row index, the head rows (every row before the cut
+    /// row, then its head part), the cut row's tail part and the note plan
+    /// to commit — or `None` for "move the row whole" (the caller's
+    /// pre-#155 paths).
+    ///
+    /// The part left here is negotiated against the footnote band before
+    /// the cut is chosen (#160): the deepest cut whose note references,
+    /// together with every unit above it, fit with their notes (the #80
+    /// fitter may still split the last note under its reference). A part
+    /// whose notes do not fit is cut one line shorter and re-fitted.
+    ///
+    /// The cut is only taken when every cell with content keeps at least
+    /// one line here ([`SplitRule::EveryCell`]) and something really
+    /// continues (a row that overruns only by its `<w:trHeight>` floor
+    /// moves whole). The fresh-page waiver is never used for the part
+    /// itself: a part that cannot fit with its notes falls back to the
+    /// existing paths ([`Self::push_table_split_fresh`] owns the waiver).
+    ///
+    /// Termination: each shrink step lowers the budget below the current
+    /// part's height, so the tallest head cell loses at least one line or
+    /// block; the loop is capped by [`row_cut_points`] and exhausting it
+    /// (or any rejection) is the nominal "move the row whole" outcome, not
+    /// a degradation — the paths it falls back to report their own.
+    #[allow(clippy::too_many_arguments)]
+    fn negotiate_row_split(
+        &self,
+        table: &TableBox,
+        units: &[(usize, usize)],
+        items: &[FlowItem],
+        plan: &FitPlan,
+        k: usize,
+        budget: f32,
+        fresh: bool,
+    ) -> Option<(usize, Vec<TableRowBox>, TableRowBox, FitPlan)> {
+        let (s, e) = units[k];
+        let row = &table.rows[s];
+        let lead_headers = table.rows.iter().take_while(|r| r.header).count();
+        if e != s + 1 || s < lead_headers || row.header || row.cant_split {
+            return None;
+        }
+        /* A note split above closed the band: nothing more lands here. */
+        if plan.count == k && !plan.carry.is_empty() {
+            return None;
+        }
+        let used = k.checked_sub(1).map_or(0.0, |i| items[i].bottom);
+        /* Start from the room the notes already reserved above leave. */
+        let reserved: f32 = if plan.count == k && !plan.notes.is_empty() {
+            let sep = if self.cur_notes.is_empty() {
+                FOOTNOTE_SEPARATOR_HEIGHT_PT
+            } else {
+                0.0
+            };
+            sep + plan.notes.iter().map(|n| n.height).sum::<f32>()
+        } else {
+            0.0
+        };
+        /* The waiver may cover a unit above the part, never the part. */
+        let waive = fresh && k > 0;
+        let mut avail = budget - used - reserved;
+        for _ in 0..=row_cut_points(row) {
+            if avail <= 0.0 {
+                return None;
+            }
+            let split = split_row_in_cells(row, avail, SplitRule::EveryCell)?;
+            let tail = split.tail?;
+            let head_h = split.head.size.height;
+            if head_h <= 0.0 {
+                return None;
+            }
+            let mut fit: Vec<FlowItem> = items[..k]
+                .iter()
+                .map(|it| FlowItem {
+                    bottom: it.bottom,
+                    anchors: it.anchors.clone(),
+                })
+                .collect();
+            fit.push(FlowItem {
+                bottom: used + head_h,
+                anchors: anchors_in_row(&split.head),
+            });
+            let cut_plan = self.fit_items(&fit, budget, waive);
+            if cut_plan.count == fit.len() {
+                let head_rows: Vec<TableRowBox> = table.rows[..s]
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(split.head))
+                    .collect();
+                return Some((s + 1, head_rows, tail, cut_plan));
+            }
+            /* The part's notes do not fit: one line shorter. */
+            avail = head_h - ROW_PART_SHRINK_PT;
+        }
+        None
+    }
+
     /// Issue #91 — step (4) of [`Self::push_table_split`]: a fresh page
     /// on which not one body unit fits under the header rows. Each branch
     /// places at least one row (or one row's first lines), so the flow
@@ -1594,8 +1728,11 @@ impl Paginator {
     /// - **A single row taller than the room a fresh page has under the
     ///   header rows** (the page itself when there are none): continued
     ///   inside its cells at a line boundary — the header rows stay above
-    ///   the head fragment and repeat above the tail. This is the only
-    ///   place a row is ever cut; below the page height rows move whole.
+    ///   the head fragment and repeat above the tail. Reached only when
+    ///   the #155 cut (step 2 of [`Self::push_table_split`]) declined:
+    ///   some cell cannot place a line even here, or the part's notes do
+    ///   not fit without the fresh-page waiver — so ANY cell progressing
+    ///   is accepted ([`SplitRule::AnyCell`]).
     /// - **That row is `<w:cantSplit>` but fits a page without the
     ///   headers**: the #87 release rule — the headers stay on this page
     ///   and the continuation drops the repeat, so it strictly shrinks.
@@ -1671,7 +1808,7 @@ impl Paginator {
         rows: continue it inside its cells. */
         let row = &table.rows[s];
         if !row.cant_split
-            && let Some(split) = split_row_in_cells(row, avail)
+            && let Some(split) = split_row_in_cells(row, avail, SplitRule::AnyCell)
         {
             let head_rows: Vec<TableRowBox> = table.rows[..s]
                 .iter()
@@ -4245,6 +4382,17 @@ mod tests {
         );
         finish("table_row_continued_in_its_cells", pag);
 
+        /* Issue #155 — a tall (shorter-than-a-page) row at the page
+        bottom: split at a line boundary vs. `<w:cantSplit>` moved whole. */
+        finish(
+            "table_tall_row_split_at_page_bottom",
+            tall_row_at_page_bottom(false),
+        );
+        finish(
+            "table_tall_cant_split_row_at_page_bottom",
+            tall_row_at_page_bottom(true),
+        );
+
         out
     }
 
@@ -4306,7 +4454,24 @@ mod tests {
             0xd5b58b9bb0471ac3,
             &[(DegradeReason::OversizeLine, 1)],
         ),
-        ("table_row_continued_in_its_cells", 0xa4fe91140b17173a, &[]),
+        /* Re-pinned by issue #155 (was 0xa4fe91140b17173a): the 960 pt
+        row no longer opens a fresh page under the header — it starts
+        right under row 1 on page 0 (41 lines), and its 19-line tail plus
+        the last row follow under the repeated header on page 1 (3 pages
+        → 2), Word's "allow row to break across pages" default. */
+        ("table_row_continued_in_its_cells", 0xde304d24ed830e95, &[]),
+        /* Issue #155 — a row shorter than a page at the page bottom
+        (recorded on the #155 paginator). */
+        (
+            "table_tall_row_split_at_page_bottom",
+            0x5ab8e8dca6d630e6,
+            &[],
+        ),
+        (
+            "table_tall_cant_split_row_at_page_bottom",
+            0xa307395d48653c5c,
+            &[],
+        ),
     ];
 
     #[test]
@@ -5125,10 +5290,11 @@ mod tests {
         assert_eq!(next_source, 201);
     }
 
-    /// Issue #91 — rows below the page height are never cut: a
-    /// `<w:cantSplit>` row at the page boundary moves whole, and so does
-    /// a plain row (identical geometry — the flag only matters for rows
-    /// taller than a page).
+    /// Issue #91 / #155 — a `<w:cantSplit>` row at the page boundary
+    /// moves whole, and so does a plain row when not even its first line
+    /// fits the 18 pt left (identical geometry). A plain row that CAN keep
+    /// lines here splits instead — see
+    /// `tall_row_at_page_bottom_splits_at_a_line_boundary_unless_cant_split`.
     #[test]
     fn cant_split_row_at_a_page_boundary_moves_whole() {
         let geom = a4_geometry();
@@ -5165,9 +5331,11 @@ mod tests {
     }
 
     /// Issue #91 — a row taller than a whole page continues inside its
-    /// cells: the head fragment fills the page under the header, the tail
-    /// fragment opens the next page under the repeated header, both map
-    /// to the same model row, and no degradation is reported.
+    /// cells; issue #155 — it starts right where it lands (Word's "allow
+    /// row to break across pages") instead of opening a fresh page: the
+    /// head fragment fills the rest of page 0 under the header and row 1,
+    /// the tail opens page 1 under the repeated header, both map to the
+    /// same model row, and no degradation is reported.
     #[test]
     fn row_taller_than_a_page_continues_inside_its_cells() {
         let t0 = Instant::now();
@@ -5186,21 +5354,18 @@ mod tests {
         let (pages, notes) = pag.finish_with_notes();
         assert!(t0.elapsed() < adversarial_budget());
         assert!(notes.is_empty(), "{notes:?}");
-        assert_eq!(pages.len(), 3);
-        /* Page 0: header + row 1; the 960 pt row does not fit the rest
-        and exceeds a page, so it opens page 1 under the header. */
-        assert_eq!(tables_on(&pages[0])[0].rows.len(), 2);
-        let mid = tables_on(&pages[1])[0];
-        assert_eq!(mid.rows.len(), 2);
-        assert!(mid.rows[0].header);
-        /* 698 − 20 = 678 pt under the header → 42 lines of 16. */
-        assert_eq!(cell_lines(&mid.rows[1]), 42);
-        assert_eq!(mid.rows[1].size.height, 672.0);
-        assert_eq!(mid.rows[1].source_row, 2);
-        let last = tables_on(&pages[2])[0];
+        assert_eq!(pages.len(), 2);
+        /* Page 0: header + row 1 + the first lines of the 960 pt row:
+        698 − 40 = 658 pt → 41 lines of 16. */
+        let first = tables_on(&pages[0])[0];
+        assert_eq!(first.rows.len(), 3);
+        assert_eq!(cell_lines(&first.rows[2]), 41);
+        assert_eq!(first.rows[2].size.height, 656.0);
+        assert_eq!(first.rows[2].source_row, 2);
+        let last = tables_on(&pages[1])[0];
         assert!(last.rows[0].header, "the header repeats over the tail");
-        assert_eq!(cell_lines(&last.rows[1]), 18);
-        assert_eq!(last.rows[1].size.height, 288.0);
+        assert_eq!(cell_lines(&last.rows[1]), 19);
+        assert_eq!(last.rows[1].size.height, 304.0);
         assert_eq!(last.rows[1].source_row, 2, "same model row");
         assert_eq!(
             last.rows[1].cells[0].content_offset, 0,
@@ -5429,5 +5594,211 @@ mod tests {
             "the note follows its row"
         );
         assert_eq!(pages[1].footnotes.entries[0].id, 1);
+    }
+
+    /* ================================================================
+    Issue #155 — rows below the page height break at a line boundary.
+    ================================================================ */
+
+    /// A body of 640 pt (58 pt left on the A4 page), then a table whose
+    /// first row fits and whose second — ten 16 pt lines — does not.
+    fn tall_row_at_page_bottom(cant: bool) -> Paginator {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        let mut tall = fake_row(10, 16.0, false);
+        tall.cant_split = cant;
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![
+                fake_row(1, 20.0, false),
+                tall,
+                fake_row(1, 20.0, false),
+            ])),
+            0.0,
+            0.0,
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        pag
+    }
+
+    /// Word's default: a row that does not fit the rest of the page keeps
+    /// the lines that do (38 pt → two 16 pt lines) and continues on the
+    /// next page; `<w:cantSplit>` moves the same row whole.
+    #[test]
+    fn tall_row_at_page_bottom_splits_at_a_line_boundary_unless_cant_split() {
+        let (pages, notes) = tall_row_at_page_bottom(false).finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        let head = tables_on(&pages[0]);
+        assert_eq!(head.len(), 1);
+        assert_eq!(head[0].rows.len(), 2);
+        assert_eq!(head[0].rows[1].source_row, 1);
+        assert_eq!(cell_lines(&head[0].rows[1]), 2, "the lines that fit stay");
+        assert_eq!(head[0].rows[1].size.height, 32.0);
+        assert_eq!(head[0].size.height, 52.0);
+        assert!(head[0].origin.y + head[0].size.height <= a4_geometry().content_height());
+        let tail = tables_on(&pages[1]);
+        assert_eq!(tail[0].rows.len(), 2);
+        assert_eq!(tail[0].rows[0].source_row, 1, "same model row");
+        assert_eq!(cell_lines(&tail[0].rows[0]), 8);
+        assert_eq!(tail[0].rows[0].size.height, 128.0);
+        assert_eq!(tail[0].rows[0].cells[0].content_offset, 0);
+        assert_eq!(tail[0].rows[1].source_row, 2);
+        assert_eq!(tail[0].origin.y, 0.0);
+
+        let (pages, notes) = tall_row_at_page_bottom(true).finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        let head = tables_on(&pages[0]);
+        assert_eq!(head[0].rows.len(), 1, "cantSplit: only the row that fits");
+        let tail = tables_on(&pages[1]);
+        assert_eq!(tail[0].rows[0].source_row, 1);
+        assert_eq!(cell_lines(&tail[0].rows[0]), 10, "moved whole");
+        assert_eq!(tail[0].rows[0].size.height, 160.0);
+    }
+
+    /// A two-cell row: cell 0 is `lines0` lines of 16 pt, cell 1 holds
+    /// `cell1`.
+    fn two_cell_row(lines0: usize, cell1: ParagraphBox) -> TableRowBox {
+        let h0 = lines0 as f32 * 16.0;
+        let h = h0.max(cell1.origin.y + cell1.size.height);
+        let mut c1 = fake_cell(1, 16.0, h, engine::VMergeRole::None, 100.0);
+        c1.content = vec![LayoutBlock::Paragraph(cell1)];
+        TableRowBox {
+            origin: Point::default(),
+            size: Size {
+                width: 200.0,
+                height: h,
+            },
+            cells: vec![
+                fake_cell(lines0, 16.0, h, engine::VMergeRole::None, 0.0),
+                c1,
+            ],
+            header: false,
+            cant_split: false,
+            source_row: 0,
+        }
+    }
+
+    fn row_at_page_bottom(row: TableRowBox) -> Vec<PageBox> {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_strict_watchdog(true);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![fake_row(1, 20.0, false), row])),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        pages
+    }
+
+    /// The cut is taken only when every cell with content keeps a line on
+    /// the page: a cell whose first line (50 pt) cannot fit the 38 pt left
+    /// sends the whole row on; a control whose second cell fits splits.
+    #[test]
+    fn row_splits_only_when_every_cell_places_a_line() {
+        let blocked = row_at_page_bottom(two_cell_row(10, fake_paragraph(1, 50.0)));
+        assert_eq!(tables_on(&blocked[0])[0].rows.len(), 1, "the row moves");
+        let moved = &tables_on(&blocked[1])[0].rows[0];
+        assert_eq!(moved.source_row, 1);
+        assert_eq!(cell_lines(moved), 11, "whole: 10 + 1 lines");
+
+        let split = row_at_page_bottom(two_cell_row(10, fake_paragraph(3, 16.0)));
+        let head = &tables_on(&split[0])[0].rows[1];
+        assert_eq!(head.source_row, 1);
+        assert_eq!(cell_lines(head), 4, "two lines per cell");
+        let tail = &tables_on(&split[1])[0].rows[0];
+        assert_eq!(cell_lines(tail), 9, "8 + 1 continue");
+
+        /* An empty cell places nothing and vetoes nothing. */
+        let mut row = two_cell_row(10, fake_paragraph(1, 16.0));
+        row.cells[1].content.clear();
+        let split = row_at_page_bottom(row);
+        assert_eq!(cell_lines(&tables_on(&split[0])[0].rows[1]), 2);
+    }
+
+    /// A `vAlign`-centred short cell sits mid-row (its content is shifted
+    /// down by the slack); the cut measures it from the cell top, so the
+    /// row still splits and the part keeps the label, top-aligned.
+    #[test]
+    fn centred_short_cell_does_not_block_the_split() {
+        let mut label = fake_paragraph(1, 16.0);
+        label.origin.y = 72.0;
+        let pages = row_at_page_bottom(two_cell_row(10, label));
+        let head = &tables_on(&pages[0])[0].rows[1];
+        assert_eq!(cell_lines(head), 3, "two lines + the label");
+        assert_eq!(head.cells[1].content[0].origin().y, 0.0);
+        let tail = &tables_on(&pages[1])[0].rows[0];
+        assert!(tail.cells[1].content.is_empty(), "the label went whole");
+    }
+
+    /// Issue #155 × #160 — the part left on the page is negotiated against
+    /// the footnote band: the reference on the row's third line cannot sit
+    /// above its 54 pt note in the 38 pt left, so the part keeps the two
+    /// reference-free lines and the reference line opens the next page
+    /// with its note.
+    #[test]
+    fn row_part_is_negotiated_against_the_footnote_band() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(1, 3, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None)
+            .with_note_bodies(bodies)
+            .with_strict_watchdog(true);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(40, 16.0)), 0.0, 0.0);
+        let mut noted = fake_row(10, 10.0, false);
+        noted.cells[0].content = vec![LayoutBlock::Paragraph(
+            fake_paragraph_with_footnote_ref_on_line(1, 2, 10, 10.0),
+        )];
+        pag.push_block(
+            LayoutBlock::Table(table_of(vec![fake_row(1, 20.0, false), noted])),
+            0.0,
+            0.0,
+        );
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(pages.len(), 2);
+        let head = &tables_on(&pages[0])[0].rows[1];
+        assert_eq!(cell_lines(head), 2, "the lines above the reference stay");
+        assert!(pages[0].footnotes.entries.is_empty());
+        let tail = &tables_on(&pages[1])[0].rows[0];
+        assert_eq!(cell_lines(tail), 8);
+        assert_eq!(pages[1].footnotes.entries.len(), 1);
+        assert_eq!(pages[1].footnotes.entries[0].id, 1);
+    }
+
+    /// Issue #160 — a row taller than a page, first on a fresh page, whose
+    /// note is referenced deep inside it: the part is cut short enough for
+    /// the band (the note may split under its reference) instead of being
+    /// placed under the fresh-page waiver with the note clipped.
+    #[test]
+    fn fresh_page_row_part_with_notes_does_not_clip_the_band() {
+        let geom = a4_geometry();
+        let bodies = fake_note_bodies(&[(1, 10, 14.0)]);
+        let mut pag = Paginator::with_default_bands(geom, None, None).with_note_bodies(bodies);
+        let mut noted = fake_row(60, 16.0, false);
+        noted.cells[0].content = vec![LayoutBlock::Paragraph(
+            fake_paragraph_with_footnote_ref_on_line(1, 40, 60, 16.0),
+        )];
+        pag.push_block(LayoutBlock::Table(table_of(vec![noted])), 0.0, 0.0);
+        let (pages, notes) = pag.finish_with_notes();
+        assert!(
+            !reasons(&notes).contains(&DegradeReason::FootnoteOverflow),
+            "{notes:?}"
+        );
+        let first = &tables_on(&pages[0])[0].rows[0];
+        assert!(
+            cell_lines(first) > 40,
+            "the reference line stays with its note"
+        );
+        assert_eq!(pages[0].footnotes.entries.len(), 1);
+        let total: usize = pages
+            .iter()
+            .flat_map(|p| tables_on(p).into_iter())
+            .flat_map(|t| t.rows.iter())
+            .map(cell_lines)
+            .sum();
+        assert_eq!(total, 60, "no line lost");
     }
 }

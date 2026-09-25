@@ -18,7 +18,8 @@
  * internals. See this directory's README.md.
  *
  * Usage:
- *   node run.mjs                        — the Arabic/RTL corpus +
+ *   node run.mjs                        — the Arabic/RTL corpus + the
+ *                                          table pagination corpus (#155) +
  *                                          crates/format-docx's existing
  *                                          .docx fixtures
  *   node run.mjs <dir-or-file.docx> ...  — explicit corpus paths
@@ -72,6 +73,7 @@ mkdirSync(OUT_DIR, { recursive: true });
 
 const DEFAULT_CORPUS_DIRS = [
     join(REPO, 'tools/differential/fixtures/arabic'),
+    join(REPO, 'tools/differential/fixtures/tables'),
     join(REPO, 'crates/format-docx/tests/fixtures'),
 ];
 

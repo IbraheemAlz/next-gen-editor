@@ -546,12 +546,14 @@ pub struct TableRowBox {
     /// continues onto after a split. Header rows still pay their own
     /// budget on the original page.
     pub header: bool,
-    /// Audit gap C.M2 — `<w:trPr><w:cantSplit/>` toggle. Issue #91: the
-    /// paginator moves every row that fits a page whole to the next page
-    /// (no mid-row split below the page height); a row taller than a
-    /// whole page continues cell-by-cell on the next page — unless this
-    /// flag is set, in which case it is placed atomically and clips
-    /// (`DegradeReason::OversizeLine`), Word's reading of the flag.
+    /// Audit gap C.M2 — `<w:trPr><w:cantSplit/>` toggle. Issue #155: a
+    /// row that does not fit the rest of the page is cut at a line
+    /// boundary (Word's default "allow row to break across pages") unless
+    /// this flag is set — then it moves whole to the next page; a flagged
+    /// row taller than a whole page is placed atomically and clips
+    /// (`DegradeReason::OversizeLine`, issue #91), Word's reading of the
+    /// flag. The layout pass also sets it for `<w:trHeight
+    /// w:hRule="exact">` rows: an exact-height row never breaks.
     pub cant_split: bool,
     /// Issue #91 — index of the model row (`engine::Table::rows`) this
     /// box renders. Equal to the row's position in an unsplit table; a
