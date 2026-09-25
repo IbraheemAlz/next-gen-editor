@@ -21,6 +21,13 @@ import type { Command, Event } from '../engine/types';
 
 type ErrorCode = 'ENGINE_TRAP' | 'DOCUMENT_PARSE' | 'FONT_LOAD' | 'RPC' | 'UNKNOWN';
 type RecoveryOutcome = 'RECOVERED' | 'FAILED' | 'PENDING';
+/** Mirror of `bridge::RendererDowngrade` (issue #99). */
+interface RendererDowngrade {
+    from: string;
+    to: string;
+    reason: 'CRASH_LOOP';
+    consecutive_traps: number;
+}
 
 type TelemetryKind =
     | { type: 'PAINT_TIMING'; p50: number; p95: number; p99: number }
@@ -44,6 +51,10 @@ type TelemetryKind =
           trap_message: string;
           recent_commands: string[];
           recovery_outcome: RecoveryOutcome;
+          /** Issue #99 — present when the recovery this trap triggered was
+           *  forced off Vello after a crash loop (omitted otherwise, like
+           *  the Rust `skip_serializing_if`). */
+          renderer_downgrade?: RendererDowngrade;
       }
     | { type: 'DOC_OPEN'; size_bytes: number; page_count: number; open_ms: number; backend: string };
 
@@ -196,12 +207,13 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
      *  timeout to emit a corrected follow-up. */
     const armCrashSample = (trapMessage: string): void => {
         const recentCommandsSnapshot = [...recentCommands];
-        const emit = (outcome: RecoveryOutcome): void => {
+        const emit = (outcome: RecoveryOutcome, downgrade?: RendererDowngrade): void => {
             queueAndFlush({
                 type: 'CRASH',
                 trap_message: trapMessage,
                 recent_commands: recentCommandsSnapshot,
                 recovery_outcome: outcome,
+                ...(downgrade ? { renderer_downgrade: downgrade } : {}),
             });
         };
         emit('PENDING');
@@ -212,7 +224,9 @@ export function startTelemetry(client: TelemetryClient, options: TelemetryOption
             settled = true;
             window.clearTimeout(timer);
             offRecovered();
-            emit('RECOVERED');
+            /* Issue #99 — the recovered engine echoes the crash-loop
+               downgrade the shell forced on this generation. */
+            emit('RECOVERED', e2.renderer_downgrade);
         });
         const timer = window.setTimeout(() => {
             if (settled) return;

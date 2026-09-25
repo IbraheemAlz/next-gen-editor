@@ -113,4 +113,6 @@ export type {
     BridgeStyleProperties,
     BridgeSpanStylePatch,
     BridgeParaPropertiesPatch,
+    RendererDowngrade,
+    RendererDowngradeReason,
 } from './types';

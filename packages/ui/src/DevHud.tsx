@@ -100,6 +100,21 @@ export const DevHud: Component<DevHudProps> = (props) => {
                     <dt>Renderer</dt>
                     <dd>{state.renderer()}</dd>
 
+                    {/* Issue #99 — why this session is no longer on Vello. */}
+                    <Show when={state.rendererDowngrade()}>
+                        {(d) => (
+                            <>
+                                <dt>Fallback</dt>
+                                <dd
+                                    class="nge-hud__warn"
+                                    title={`Recovery forced ${d().to} after ${d().consecutive_traps} consecutive traps on ${d().from}`}
+                                >
+                                    {d().from} → {d().to} ({d().consecutive_traps} traps)
+                                </dd>
+                            </>
+                        )}
+                    </Show>
+
                     <dt>WASM heap</dt>
                     <dd>{fmtBytes(state.stats()?.wasm_heap_bytes)}</dd>
 

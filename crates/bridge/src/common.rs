@@ -339,3 +339,32 @@ pub struct TextAttrs {
     /// `<w:smallCaps/>` — render lowercase as smaller uppercase glyphs.
     pub small_caps: bool,
 }
+
+/// Issue #99 — a crash-loop renderer downgrade. When the engine worker
+/// traps repeatedly while painting with Vello, the shell stops re-probing
+/// the GPU on recovery and boots the next worker generation on Canvas2D.
+/// The worker hands this record to `Command::Recover`; the engine echoes
+/// it on `Event::Recovered` so the shell (Dev HUD) and telemetry (the
+/// `Crash` sample) learn why the session no longer runs on Vello.
+#[derive(Serialize, Deserialize, Tsify, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct RendererDowngrade {
+    /// Backend the trapping generations painted with (`"vello"`).
+    pub from: String,
+    /// Backend the recovered generation was forced onto (`"canvas2d"`).
+    pub to: String,
+    pub reason: RendererDowngradeReason,
+    /// Consecutive traps on `from` that triggered the downgrade.
+    pub consecutive_traps: u32,
+}
+
+/// Issue #99 — why a [`RendererDowngrade`] happened. One arm today; the
+/// enum keeps the wire shape open for e.g. a lost-device downgrade.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RendererDowngradeReason {
+    /// N consecutive worker traps on the same GPU backend — re-probing it
+    /// on every recovery would crash-loop.
+    CrashLoop,
+}

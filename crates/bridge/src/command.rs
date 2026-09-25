@@ -5,7 +5,7 @@ use tsify_next::Tsify;
 
 use crate::common::{
     Alignment, BlockPath, Color, Direction, DocFormat, ImageWrapMode, LogicalPos, LogicalRange,
-    Point, Rect, TextBoxHop, UnderlineStyle, VerticalScript,
+    Point, Rect, RendererDowngrade, TextBoxHop, UnderlineStyle, VerticalScript,
 };
 
 /// A command issued to the engine. Serialized internally-tagged
@@ -112,6 +112,14 @@ pub enum Command {
         #[tsify(type = "Uint8Array")]
         snapshot: Vec<u8>,
         log_tail: Vec<Command>,
+        /// Issue #99 — the shell forced this generation off its probed
+        /// GPU backend after a crash loop. The engine does not act on it
+        /// (the worker already constructed the Canvas2D engine); it echoes
+        /// it on `Event::Recovered.renderer_downgrade` so the downgrade is
+        /// reported by the same event that reports the renderer.
+        #[serde(default)]
+        #[tsify(optional)]
+        renderer_downgrade: Option<RendererDowngrade>,
     },
     /// Issue #85 — serialize the whole engine session (document tree +
     /// styles + stories + undo window + selection + layout config) into a

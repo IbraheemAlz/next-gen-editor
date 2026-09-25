@@ -33,6 +33,7 @@ import type {
     LayoutDegraded,
     LogicalRange,
     Rect,
+    RendererDowngrade,
     SelectionKind,
     TextAttrs,
 } from './types';
@@ -173,6 +174,13 @@ export interface EditorState {
      * shell re-seeds it). Shared like `zoom`.
      */
     deviceScale: Accessor<number | undefined>;
+    /**
+     * Issue #99 — set when the current worker generation was forced onto
+     * Canvas2D after a crash loop on Vello (`RECOVERED.renderer_downgrade`);
+     * `undefined` otherwise. Surfaced in the Dev HUD next to `renderer`.
+     * Shared like `zoom`.
+     */
+    rendererDowngrade: Accessor<RendererDowngrade | undefined>;
 }
 
 /**
@@ -187,6 +195,7 @@ export interface EditorState {
 interface ViewState {
     zoom: Accessor<number>;
     deviceScale: Accessor<number | undefined>;
+    rendererDowngrade: Accessor<RendererDowngrade | undefined>;
 }
 
 const viewStates = new WeakMap<EngineHandle, ViewState>();
@@ -203,6 +212,9 @@ function viewStateFor(engine: EngineHandle): ViewState {
     const state = createRoot(() => {
         const [zoom, setZoom] = createSignal(1);
         const [deviceScale, setDeviceScale] = createSignal<number | undefined>(undefined);
+        const [rendererDowngrade, setRendererDowngrade] = createSignal<
+            RendererDowngrade | undefined
+        >(undefined);
         engine.subscribe((evt: Event) => {
             if (evt.type === 'SELECTION_CHANGED' && evt.zoom !== undefined) {
                 setZoom(roundZoom(evt.zoom));
@@ -213,9 +225,13 @@ function viewStateFor(engine: EngineHandle): ViewState {
                    whatever they showed before the trap. */
                 setZoom(roundZoom(evt.zoom ?? 1));
                 setDeviceScale(evt.device_scale);
+                /* Issue #99 — per generation: the client re-sends the
+                   downgrade on every forced recovery, so it stays set for
+                   the rest of the session once the crash loop tripped. */
+                setRendererDowngrade(evt.renderer_downgrade);
             }
         });
-        return { zoom, deviceScale };
+        return { zoom, deviceScale, rendererDowngrade };
     });
     viewStates.set(engine, state);
     return state;
@@ -357,5 +373,6 @@ export function createEditorState(): EditorState {
         fieldAtCaret,
         zoom: view.zoom,
         deviceScale: view.deviceScale,
+        rendererDowngrade: view.rendererDowngrade,
     };
 }

@@ -5,8 +5,8 @@ use tsify_next::Tsify;
 
 use crate::command::{BridgeCellBorders, BridgeTabStop, HeaderFooterArea, PageOrientation};
 use crate::common::{
-    Alignment, Color, Direction, DocFormat, ImageRect, LogicalPos, LogicalRange, Rect, Script,
-    SelectionKind, TextAttrs,
+    Alignment, Color, Direction, DocFormat, ImageRect, LogicalPos, LogicalRange, Rect,
+    RendererDowngrade, Script, SelectionKind, TextAttrs,
 };
 
 /// `serde(default)` for the user-zoom fields: an absent value means the
@@ -120,6 +120,13 @@ pub enum Event {
         #[serde(default)]
         #[tsify(optional)]
         device_scale: Option<f32>,
+        /// Issue #99 — set when this generation was forced off its probed
+        /// GPU backend after a crash loop (echo of
+        /// `Command::Recover.renderer_downgrade`). `None` on an ordinary
+        /// recovery.
+        #[serde(default)]
+        #[tsify(optional)]
+        renderer_downgrade: Option<RendererDowngrade>,
     },
     /// Reply to `Command::Snapshot` (issue #85): the versioned snapshot
     /// envelope (`engine::snapshot`, magic + format version + payload).

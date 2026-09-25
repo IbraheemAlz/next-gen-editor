@@ -6767,7 +6767,14 @@ impl Engine {
             // behavior lands in Phase 3 behind the RequestPaint pipeline.
             // ===============================================================
             Command::Init { .. } => phase3_stub("Init"),
-            Command::Recover { snapshot, log_tail } => self.do_recover(snapshot, log_tail).await,
+            Command::Recover {
+                snapshot,
+                log_tail,
+                renderer_downgrade,
+            } => {
+                self.do_recover(snapshot, log_tail, renderer_downgrade)
+                    .await
+            }
             Command::Snapshot { seq } => self.do_snapshot(seq),
             Command::Dispose => phase3_stub("Dispose"),
             Command::Tick { .. } => phase3_stub("Tick"),
@@ -7477,8 +7484,15 @@ impl Engine {
     /// `__renderer` cannot lie after a respawn (issue #66).
     ///
     /// Issue #97 — the reply carries the recovered `zoom` / `device_scale`
-    /// so the shell's zoom controls re-sync from the engine.
-    async fn do_recover(&mut self, snapshot: Vec<u8>, log_tail: Vec<Command>) -> Event {
+    /// so the shell's zoom controls re-sync from the engine. Issue #99 —
+    /// `renderer_downgrade` (the worker's crash-loop record) is echoed
+    /// verbatim on the reply.
+    async fn do_recover(
+        &mut self,
+        snapshot: Vec<u8>,
+        log_tail: Vec<Command>,
+        renderer_downgrade: Option<bridge::RendererDowngrade>,
+    ) -> Event {
         self.reset_session_state();
         let snapshot_restored = if snapshot.is_empty() {
             false
@@ -7540,6 +7554,7 @@ impl Engine {
             renderer: self.renderer_name().to_string(),
             zoom: self.user_zoom(),
             device_scale: self.layout_cfg.as_ref().map(|c| c.base_scale),
+            renderer_downgrade,
         }
     }
 
@@ -23681,6 +23696,7 @@ mod snapshot_tests {
             Command::Recover {
                 snapshot: bytes,
                 log_tail: vec![insert("X"), Command::SetZoom { scale: 2.0 }],
+                renderer_downgrade: None,
             },
         );
         match evt {
@@ -23690,6 +23706,7 @@ mod snapshot_tests {
                 renderer,
                 zoom,
                 device_scale,
+                renderer_downgrade,
             } => {
                 assert_eq!(applied_commands, 2);
                 assert!(snapshot_restored);
@@ -23699,6 +23716,7 @@ mod snapshot_tests {
                 restored boot device scale, so the shell re-syncs. */
                 assert_eq!(zoom, 2.0);
                 assert_eq!(device_scale, Some(1.5));
+                assert_eq!(renderer_downgrade, None);
             }
             other => panic!("expected Recovered, got {other:?}"),
         }
@@ -23736,6 +23754,7 @@ mod snapshot_tests {
             Command::Recover {
                 snapshot: b"definitely not a snapshot".to_vec(),
                 log_tail: vec![insert("hello"), insert(" world")],
+                renderer_downgrade: None,
             },
         );
         match evt {
@@ -23762,6 +23781,7 @@ mod snapshot_tests {
             Command::Recover {
                 snapshot: Vec::new(),
                 log_tail: Vec::new(),
+                renderer_downgrade: None,
             },
         );
         assert!(matches!(
@@ -23787,6 +23807,37 @@ mod snapshot_tests {
         assert!(b.layout_cfg.is_none());
         assert!(!b.tracking_changes);
         assert!(matches!(b.active_story, StoryTarget::Body));
+    }
+
+    /// Issue #99 — the worker's crash-loop downgrade record rides
+    /// `Command::Recover` and comes back verbatim on `Event::Recovered`.
+    #[test]
+    fn recover_echoes_the_renderer_downgrade() {
+        let downgrade = bridge::RendererDowngrade {
+            from: "vello".to_string(),
+            to: "canvas2d".to_string(),
+            reason: bridge::RendererDowngradeReason::CrashLoop,
+            consecutive_traps: 2,
+        };
+        let mut b = engine();
+        let evt = apply(
+            &mut b,
+            Command::Recover {
+                snapshot: seeded_engine().snapshot_bytes().unwrap(),
+                log_tail: Vec::new(),
+                renderer_downgrade: Some(downgrade.clone()),
+            },
+        );
+        let Event::Recovered {
+            renderer,
+            renderer_downgrade,
+            ..
+        } = evt
+        else {
+            panic!("expected Recovered, got {evt:?}");
+        };
+        assert_eq!(renderer, "canvas2d");
+        assert_eq!(renderer_downgrade, Some(downgrade));
     }
 
     #[test]
@@ -25010,6 +25061,7 @@ mod wire_validation_tests {
             Command::Recover {
                 snapshot: Vec::new(),
                 log_tail: Vec::new(),
+                renderer_downgrade: None,
             },
         );
         assert!(matches!(evt, Event::Recovered { .. }), "{evt:?}");

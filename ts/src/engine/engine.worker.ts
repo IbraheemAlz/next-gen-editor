@@ -1,7 +1,11 @@
 /// <reference lib="webworker" />
 
 import init, { Engine, detect_backend } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
-import type { Command, Event } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
+import type {
+    Command,
+    Event,
+    RendererDowngrade,
+} from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 import { openEventLog, appendCommand, persistSnapshot } from './event-log';
 /* Fonts are imported as Vite `?url` assets, NOT fetched from absolute
    `/fonts/...` paths. Absolute paths break under a deploy subpath (e.g.
@@ -37,6 +41,8 @@ type ClientInitMsg = {
     type: 'INIT';
     canvas: OffscreenCanvas;
     documentId: string;
+    /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
+    mockBackend?: 'vello';
 };
 type ClientRecoverMsg = {
     id: number;
@@ -46,6 +52,14 @@ type ClientRecoverMsg = {
     log: Command[];
     snapshotSeq: number;
     lastSeq: number;
+    /** Issue #99 — DEV-only backend mock (see `probeBackend`). */
+    mockBackend?: 'vello';
+    /** Issue #99 — crash-loop fallback: boot this generation on Canvas2D
+     *  without re-probing the GPU backend that kept trapping. */
+    forceRenderer?: 'canvas2d';
+    /** Issue #99 — the downgrade record, echoed by the engine on
+     *  `Event::Recovered.renderer_downgrade`. */
+    rendererDowngrade?: RendererDowngrade;
 };
 type ClientCommandMsg = { id: number; cmd: Command };
 /* Phase 8a — side-channel snapshot request. The reply carries the array
@@ -123,6 +137,32 @@ let trapAfterCommands: number | null = null;
    reads it; the engine owns the contexts. A fresh worker starts empty, so
    a page the shell failed to re-register after a trap is visibly absent. */
 const pageSurfaces = new Map<number, OffscreenCanvas>();
+
+/**
+ * Issue #99 — pick the backend for a fresh surface. `mock === 'vello'` is
+ * a DEV-only test hook (`?mockBackend=vello`, forwarded by EngineClient):
+ * the generation REPORTS Vello — to the client, on the INIT reply and on
+ * `Event::Recovered.renderer` — while actually painting with Canvas2D, so
+ * the crash-loop fallback can be exercised on GPU-less CI. A production
+ * build ignores it.
+ */
+async function probeBackend(
+    mock: 'vello' | undefined,
+): Promise<{ renderer: string; mocked: boolean }> {
+    if (import.meta.env.DEV && mock === 'vello') {
+        return { renderer: 'vello', mocked: true };
+    }
+    return { renderer: await detect_backend(), mocked: false };
+}
+
+async function constructEngine(
+    canvas: OffscreenCanvas,
+    probe: { renderer: string; mocked: boolean },
+): Promise<Engine> {
+    return probe.renderer === 'vello' && !probe.mocked
+        ? await Engine.with_vello(canvas)
+        : new Engine(canvas);
+}
 
 function countOpaqueInk(surface: OffscreenCanvas): number {
     /* Same context type the engine took → the SAME context back; a
@@ -810,11 +850,9 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
            (WebGPU) when a GPU device is available, else the Canvas2D fallback.
            transferControlToOffscreen is one-shot, so this choice is permanent
            for the canvas (Backlog #4). */
-        const renderer = await detect_backend();
-        engine =
-            renderer === 'vello'
-                ? await Engine.with_vello(msg.canvas)
-                : new Engine(msg.canvas);
+        const probe = await probeBackend(msg.mockBackend);
+        const renderer = probe.renderer;
+        engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
         await openEventLog(msg.documentId);
         /* Issue #43 — inject today's date so DATE fields resolve at
@@ -858,11 +896,15 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
            with on `Event::Recovered.renderer`; that value — never a
            remembered INIT-time one — is what the reply and the shell's
            `__renderer` carry. */
-        const probed = await detect_backend();
-        engine =
-            probed === 'vello'
-                ? await Engine.with_vello(msg.canvas)
-                : new Engine(msg.canvas);
+        /* Issue #99 — after a crash loop on the GPU backend the client
+           forces Canvas2D: no probe, so a failing WebGPU driver / shader
+           path cannot be re-selected and trap this generation too. */
+        const probe =
+            msg.forceRenderer === 'canvas2d'
+                ? { renderer: 'canvas2d', mocked: false }
+                : await probeBackend(msg.mockBackend);
+        const probed = probe.renderer;
+        engine = await constructEngine(msg.canvas, probe);
         pageSurfaces.set(0, msg.canvas);
         /* Resume the event-log sequence past what was already persisted, so
            post-recovery appends don't collide with or shadow prior rows. */
@@ -884,8 +926,13 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             type: 'RECOVER',
             snapshot: msg.snapshot,
             log_tail: msg.log,
+            ...(msg.rendererDowngrade ? { renderer_downgrade: msg.rendererDowngrade } : {}),
         });
         const recovered = evt.type === 'RECOVERED' ? evt : undefined;
+        /* DEV mock (issue #99): the engine truthfully says `canvas2d`;
+           the mocked generation must keep reporting the backend it
+           pretends to run, or the crash-loop policy never sees Vello. */
+        if (recovered && probe.mocked) recovered.renderer = probe.renderer;
         const renderer = recovered?.renderer ?? probed;
         const restored = recovered?.snapshot_restored === true;
         /* Issue #97 — the engine holds a live session when a snapshot was

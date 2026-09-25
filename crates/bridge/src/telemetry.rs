@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use tsify_next::Tsify;
 
-use crate::common::Script;
+use crate::common::{RendererDowngrade, Script};
 use crate::event::{EngineStats, LayoutDegradeReason};
 
 /// One telemetry sample. `doc_id` is anonymized — never a document title or
@@ -59,6 +59,14 @@ pub enum TelemetryKind {
         trap_message: String,
         recent_commands: Vec<String>,
         recovery_outcome: RecoveryOutcome,
+        /// Issue #99 — present when this trap tipped the session into a
+        /// crash-loop renderer downgrade (the recovery booted Canvas2D
+        /// instead of re-probing Vello). Backend names + a count only —
+        /// no document content. Omitted from the wire when `None`, so an
+        /// ordinary crash sample keeps its exact #86 shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[tsify(optional)]
+        renderer_downgrade: Option<RendererDowngrade>,
     },
     /// Issue #86 — one document-open latency sample. `size_bytes` is the
     /// `.docx` archive's byte length (not its content); `backend` is the
@@ -127,6 +135,7 @@ mod tests {
             trap_message: "RuntimeError: unreachable".to_string(),
             recent_commands: vec!["INSERT_TEXT".to_string(), "APPLY_FORMATTING".to_string()],
             recovery_outcome: RecoveryOutcome::Recovered,
+            renderer_downgrade: None,
         };
         let json = roundtrip(&kind);
         assert_eq!(
@@ -152,6 +161,7 @@ mod tests {
             trap_message: String::new(),
             recent_commands: vec![],
             recovery_outcome: RecoveryOutcome::Pending,
+            renderer_downgrade: None,
         };
         let json = serde_json::to_value(&kind).unwrap();
         let mut keys: Vec<&str> = json
@@ -170,6 +180,46 @@ mod tests {
                 "type"
             ]
         );
+    }
+
+    #[test]
+    fn crash_kind_carries_the_renderer_downgrade_when_one_happened() {
+        let kind = TelemetryKind::Crash {
+            trap_message: "RuntimeError: unreachable".to_string(),
+            recent_commands: vec!["PING".to_string()],
+            recovery_outcome: RecoveryOutcome::Recovered,
+            renderer_downgrade: Some(RendererDowngrade {
+                from: "vello".to_string(),
+                to: "canvas2d".to_string(),
+                reason: crate::common::RendererDowngradeReason::CrashLoop,
+                consecutive_traps: 2,
+            }),
+        };
+        let json = roundtrip(&kind);
+        assert_eq!(
+            json["renderer_downgrade"],
+            serde_json::json!({
+                "from": "vello",
+                "to": "canvas2d",
+                "reason": "CRASH_LOOP",
+                "consecutive_traps": 2,
+            })
+        );
+        /* A #86-era sample without the key still decodes. */
+        let legacy: TelemetryKind = serde_json::from_value(serde_json::json!({
+            "type": "CRASH",
+            "trap_message": "x",
+            "recent_commands": [],
+            "recovery_outcome": "FAILED",
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            TelemetryKind::Crash {
+                renderer_downgrade: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -227,6 +277,7 @@ mod tests {
                     trap_message: "unreachable".to_string(),
                     recent_commands: vec!["UNDO".to_string()],
                     recovery_outcome: RecoveryOutcome::Failed,
+                    renderer_downgrade: None,
                 },
                 timestamp_ms: 42.0,
             }],

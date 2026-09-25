@@ -72,6 +72,8 @@ export type {
     BridgeTabKind,
     BridgeTabLeader,
     BridgeIndent,
+    RendererDowngrade,
+    RendererDowngradeReason,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
 
 import type {
