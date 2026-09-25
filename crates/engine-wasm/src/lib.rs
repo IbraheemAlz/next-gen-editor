@@ -8110,13 +8110,15 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
-                        /* Issue #95 — pagination constraints from the
-                        resolved (style-cascaded) properties. Widow /
-                        orphan control defaults ON (Word). */
-                        para_box.keep_next = para.props.keep_next;
-                        para_box.flow.keep_lines = para.props.keep_lines;
+                        /* Issue #95 / #178 — pagination constraints from
+                        the resolved (style-cascaded) properties.
+                        keepNext/keepLines are tri-state (#178), OOXML
+                        default off. Widow / orphan control defaults ON
+                        (Word). */
+                        para_box.keep_next = para.props.keep_next_on();
+                        para_box.flow.keep_lines = para.props.keep_lines_on();
                         para_box.flow.widow_control = para.props.widow_control_on();
-                        after_keep_next = para.props.keep_next;
+                        after_keep_next = para.props.keep_next_on();
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(
@@ -20817,7 +20819,7 @@ mod tests {
         d.blocks.push_back(para_of(
             "Heading",
             engine::ParaProperties {
-                keep_next,
+                keep_next: Some(keep_next),
                 widow_control: widow,
                 ..Default::default()
             },

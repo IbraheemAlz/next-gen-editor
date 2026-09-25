@@ -2258,8 +2258,18 @@ pub struct ParaProperties {
     pub spacing: Spacing,
     pub direction: Option<TextDirection>,
     pub line_height: Option<LineHeight>,
-    pub keep_next: bool,
-    pub keep_lines: bool,
+    /// Issue #178 — `<w:keepNext>` resolved through the style cascade.
+    /// `Option`, like [`Self::widow_control`], so a paragraph's explicit
+    /// `w:val="0"` can switch an inherited style's ON back off (a plain
+    /// bool merged with OR could never do that). `None` means never
+    /// specified (OOXML default: off). Unlike `widow_control`, the
+    /// direct element is fully modeled (not grab-bagged) — it round-trips
+    /// through this field on both styles and direct paragraphs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_next: Option<bool>,
+    /// Issue #178 — `<w:keepLines>`, same contract as [`Self::keep_next`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_lines: Option<bool>,
     pub page_break_before: bool,
     /// Audit gap A.M4 — `<w:pPr><w:pBdr>` border strokes painted around
     /// the paragraph bounding rectangle. Mirror of the table-cell
@@ -2316,6 +2326,16 @@ impl ParaProperties {
         self.widow_control.unwrap_or(true)
     }
 
+    /// Issue #178 — the effective `<w:keepNext>` (OOXML default: off).
+    pub fn keep_next_on(&self) -> bool {
+        self.keep_next.unwrap_or(false)
+    }
+
+    /// Issue #178 — the effective `<w:keepLines>` (OOXML default: off).
+    pub fn keep_lines_on(&self) -> bool {
+        self.keep_lines.unwrap_or(false)
+    }
+
     /// Overlay `patch` onto `self` using OOXML cascade semantics: a child
     /// style with a *set* (non-default) field overrides the parent. Used by
     /// the Phase 3 `format_docx::style_resolver` to fold a basedOn chain
@@ -2343,8 +2363,11 @@ impl ParaProperties {
             },
             direction: patch.direction.or(self.direction),
             line_height: patch.line_height.or(self.line_height),
-            keep_next: patch.keep_next || self.keep_next,
-            keep_lines: patch.keep_lines || self.keep_lines,
+            /* Issue #178 — last explicit wins: the direct override
+            (`patch`) always beats the inherited style when it set the
+            field at all, `Some(false)` included. */
+            keep_next: patch.keep_next.or(self.keep_next),
+            keep_lines: patch.keep_lines.or(self.keep_lines),
             page_break_before: patch.page_break_before || self.page_break_before,
             /* Audit gap A.M4 — `<w:pBdr>` overlay: patch's borders win
             when set; otherwise inherit. */

@@ -67,8 +67,10 @@ fn gen_para_properties(u: &mut Unstructured) -> ParaProperties {
         ..Default::default()
     };
     props.page_break_before = u.ratio(1, 4).unwrap_or(false);
-    props.keep_next = u.ratio(1, 6).unwrap_or(false);
-    props.keep_lines = u.ratio(1, 6).unwrap_or(false);
+    /* Issue #178 — tri-state now; the generator still only exercises the
+    two explicit states (never `None`) to keep the existing bias. */
+    props.keep_next = Some(u.ratio(1, 6).unwrap_or(false));
+    props.keep_lines = Some(u.ratio(1, 6).unwrap_or(false));
     props
 }
 
