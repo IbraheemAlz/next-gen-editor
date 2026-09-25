@@ -1228,7 +1228,15 @@ fn emit_paragraph_text(
                         drew = emit_tab_leader_glyphs(content, page_h, &font, ch, x0, x1, baseline);
                     }
                     if !drew {
-                        emit_tab_leader_rule(content, page_h, kind, x0, x1, baseline, run.attrs.px_size);
+                        emit_tab_leader_rule(
+                            content,
+                            page_h,
+                            kind,
+                            x0,
+                            x1,
+                            baseline,
+                            run.attrs.px_size,
+                        );
                     }
                 }
                 pen += glyph.x_advance;
