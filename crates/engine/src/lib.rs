@@ -911,7 +911,14 @@ impl HfDirty {
 /// Document-wide flags pulled from `word/settings.xml`. Phase 2 — only
 /// the header/footer parity toggle is modelled; later phases grow the
 /// struct as more setting elements get typed support.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Default` is hand-written (not derived) because [`Self::
+/// widow_control_default`] must default to `true` — a derived
+/// `#[serde(default)]` struct-level attribute fills missing fields from
+/// `DocumentSettings::default()`, so the manual impl IS what `read_docx`
+/// (unversioned) and any `#[serde(default)]` deserialize of a partial
+/// settings blob fall back to.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct DocumentSettings {
     /// `<w:evenAndOddHeaders/>` — when `true`, even-numbered pages render
@@ -930,6 +937,28 @@ pub struct DocumentSettings {
     /// stays inspectable after parsing. `read_docx` (unchanged) always
     /// leaves this at the `#[default]` `A4`.
     pub default_page_size: DefaultPageSize,
+    /// Issue #179 — the effective `<w:widowControl>` when a paragraph's
+    /// resolved [`ParaProperties::widow_control`] is `None` (never
+    /// specified anywhere in the cascade). ECMA-376 says an absent
+    /// element means the constraint is NOT applied; #95 chose `true`
+    /// instead — Word's actual application default, and what every
+    /// pinned fingerprint assumes. This is a per-host override of that
+    /// choice (like [`Self::default_page_size`]), never read FROM the
+    /// archive: `read_docx` always leaves it at the `#[default]` `true`,
+    /// and only a host calling `format_docx::read_docx_with_settings`
+    /// with the strict ECMA-376 reading sets it `false`.
+    pub widow_control_default: bool,
+}
+
+impl Default for DocumentSettings {
+    fn default() -> Self {
+        Self {
+            even_and_odd_headers: false,
+            author: None,
+            default_page_size: DefaultPageSize::default(),
+            widow_control_default: true,
+        }
+    }
 }
 
 /* ============================================================
@@ -2535,19 +2564,26 @@ pub struct ParaProperties {
     /// Issue #95 — `<w:widowControl>` resolved through the style
     /// cascade: `Some(false)` is an explicit `w:val="0"` (which must be
     /// able to switch an inherited ON off, hence `Option`), `None` means
-    /// never specified. Layout reads `None` as ON — Word's application
-    /// default, which diverges from the spec's "not applied". READ-ONLY
-    /// on the paragraph model like [`Self::outline_level`]: the direct
-    /// element rides the grab bag verbatim; style definitions emit it.
+    /// never specified. Layout reads `None` through
+    /// [`Self::widow_control_on`] against the host-configurable
+    /// [`DocumentSettings::widow_control_default`] (issue #179) — Word's
+    /// application default is ON, which diverges from the spec's "not
+    /// applied"; a host that wants the strict ECMA-376 reading sets the
+    /// document setting off instead of patching every paragraph.
+    /// READ-ONLY on the paragraph model like [`Self::outline_level`]: the
+    /// direct element rides the grab bag verbatim; style definitions
+    /// emit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub widow_control: Option<bool>,
 }
 
 impl ParaProperties {
-    /// Issue #95 — the effective widow / orphan control (Word default:
-    /// on).
-    pub fn widow_control_on(&self) -> bool {
-        self.widow_control.unwrap_or(true)
+    /// Issue #95 / #179 — the effective widow / orphan control. `default_on`
+    /// is [`DocumentSettings::widow_control_default`] (Word's own default:
+    /// on) — read from the *document* the paragraph belongs to, since
+    /// OOXML has no such element to read from the paragraph itself.
+    pub fn widow_control_on(&self, default_on: bool) -> bool {
+        self.widow_control.unwrap_or(default_on)
     }
 
     /// Issue #178 — the effective `<w:keepNext>` (OOXML default: off).

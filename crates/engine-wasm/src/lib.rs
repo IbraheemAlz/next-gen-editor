@@ -8310,14 +8310,17 @@ impl Engine {
                         /* Sprint 6 (UI Edition) — propagate `<w:shd>`
                         paragraph shading into the laid-out box. */
                         para_box.shading = para.props.shading;
-                        /* Issue #95 / #178 — pagination constraints from
-                        the resolved (style-cascaded) properties.
-                        keepNext/keepLines are tri-state (#178), OOXML
-                        default off. Widow / orphan control defaults ON
-                        (Word). */
+                        /* Issue #95 / #178 / #179 — pagination
+                        constraints from the resolved (style-cascaded)
+                        properties. keepNext/keepLines are tri-state
+                        (#178), OOXML default off. Widow / orphan control
+                        defaults to the host-configurable
+                        `DocumentSettings::widow_control_default` (#179;
+                        Word's own default is ON). */
                         para_box.keep_next = para.props.keep_next_on();
                         para_box.flow.keep_lines = para.props.keep_lines_on();
-                        para_box.flow.widow_control = para.props.widow_control_on();
+                        para_box.flow.widow_control =
+                            para.props.widow_control_on(doc.settings.widow_control_default);
                         after_keep_next = para.props.keep_next_on();
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
@@ -21443,6 +21446,17 @@ mod tests {
         doc
     }
 
+    /// Issue #179 — the host-configurable document-level fallback:
+    /// every paragraph is left at `widow_control: None` (never specified
+    /// anywhere in the cascade) and `default_on` rides
+    /// `DocumentSettings::widow_control_default` instead, exercising
+    /// [`engine::ParaProperties::widow_control_on`]'s parameter rather
+    /// than a per-paragraph stamp.
+    fn with_widow_control_default(mut doc: DocumentTree, default_on: bool) -> DocumentTree {
+        doc.settings.widow_control_default = default_on;
+        doc
+    }
+
     /// Every engine-level nominal shape: the 50-page perf fixture (full
     /// layout and a culled band, both at DPR 2), a forced page break, an
     /// autofit table and a long multi-page prose doc. Fingerprints pinned
@@ -21516,6 +21530,70 @@ mod tests {
             out.push((name, pages, info.degradations));
         }
         out
+    }
+
+    /// Issue #179 — the same six widow/orphan-sensitive fixtures as
+    /// [`engine_nominal_fixtures_with`], but every paragraph's
+    /// `widow_control` stays `None` (unspecified) and `default_on` rides
+    /// [`DocumentSettings::widow_control_default`] instead of a
+    /// per-paragraph stamp — proving the host-configurable default takes
+    /// the same effect as the old hard-coded one it replaces.
+    fn engine_nominal_fixtures_with_document_widow_default(
+        default_on: bool,
+    ) -> Vec<(&'static str, Vec<PageBox>, Vec<LayoutDegraded>)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
+        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+        let archive = format_docx::read_docx(&bytes).expect("parse 50p.docx");
+        let engine = test_engine_with_doc(with_widow_control_default(archive.document, default_on));
+        let mut out = Vec::new();
+        let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
+        out.push(("50p_full_x2", pages, info.degradations));
+        let (pages, _, _, info) = engine.build_pages(2.0, false, Some(2000.0)).expect("band");
+        out.push(("50p_band_2000_x2", pages, info.degradations));
+
+        let engine = test_engine_with_doc(with_widow_control_default(
+            two_page_doc("alpha beta gamma", "delta epsilon"),
+            default_on,
+        ));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
+        out.push(("two_page_form_feed", pages, info.degradations));
+
+        let engine = test_engine_with_doc(with_widow_control_default(table_doc(), default_on));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
+        out.push(("autofit_table", pages, info.degradations));
+
+        let engine = test_engine_with_doc(with_widow_control_default(prose_doc(300), default_on));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("prose");
+        out.push(("prose_300_full", pages, info.degradations));
+        let (pages, _, _, info) = engine
+            .build_pages(1.0, false, Some(1200.0))
+            .expect("prose band");
+        out.push(("prose_300_band_1200", pages, info.degradations));
+        out
+    }
+
+    /// Issue #179 acceptance — `DocumentSettings::widow_control_default =
+    /// false` reproduces the pre-#95 fingerprints (the strict ECMA-376
+    /// reading: an absent `<w:widowControl>` is not applied).
+    #[test]
+    fn document_widow_control_default_off_reproduces_pre_95_fingerprints() {
+        assert_fixtures_pinned(
+            engine_nominal_fixtures_with_document_widow_default(false),
+            PINNED_ENGINE_FINGERPRINTS,
+        );
+    }
+
+    /// Issue #179 acceptance — `DocumentSettings::widow_control_default =
+    /// true` (the crate `#[default]`, matching Word's own application
+    /// default) reproduces the #95 ON fingerprints byte-for-byte, whether
+    /// the ON-ness comes from the host setting or (as `with_widow_control`
+    /// exercises) an explicit per-paragraph `None`.
+    #[test]
+    fn document_widow_control_default_on_reproduces_issue_95_fingerprints() {
+        assert_fixtures_pinned(
+            engine_nominal_fixtures_with_document_widow_default(true),
+            PINNED_WIDOW_DEFAULT_FINGERPRINTS,
+        );
     }
 
     /// Issue #91 — a table taller than a page splits at row boundaries
