@@ -1040,9 +1040,11 @@ pub enum NotePosition {
 }
 
 /// Issue #80 — `<w:numRestart w:val>` (§17.11.19). `EachPage` is
-/// footnote-only per the schema; it is parsed and round-tripped but
-/// numbered as `Continuous` by this build (per-page renumbering needs a
-/// post-pagination reshape — tracked as a follow-up).
+/// footnote-only per the schema. The document-order derivation
+/// ([`DocumentTree::note_markers`]) numbers it as `Continuous` — the page
+/// a reference lands on is only known after pagination — and the layout
+/// post-pass (issue #129) relabels the footnotes of every
+/// [`DocumentTree::each_page_note_numbering`] section per page.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NoteNumRestart {
     #[default]
@@ -4517,7 +4519,9 @@ impl DocumentTree {
     /// every section boundary under `eachSect`, formatted per `numFmt`.
     /// A custom-marked reference contributes no number and maps to an
     /// empty string (its mark is the author's following run). `eachPage`
-    /// numbers as `continuous` in this build (see [`NoteNumRestart`]).
+    /// numbers as `continuous` HERE (see [`NoteNumRestart`]); the layout
+    /// relabels those footnotes per page after pagination (issue #129,
+    /// driven by [`Self::each_page_note_numbering`]).
     pub fn note_markers(&self) -> std::collections::HashMap<NoteAnchor, String> {
         let sections = self.effective_sections();
         let refs = self.note_references();
@@ -4545,6 +4549,46 @@ impl DocumentTree {
                 out.entry(r.anchor)
                     .or_insert_with(|| props.num_format.render(n));
                 counter = Some(n.saturating_add(1));
+            }
+        }
+        out
+    }
+
+    /// Issue #129 — the restart rule layout needs for per-page footnote
+    /// numbering: every numbered (not custom-marked) footnote reference
+    /// whose section resolves `<w:numRestart w:val="eachPage"/>`, with
+    /// its section's `numStart` and `numFmt`. Empty — the default, and
+    /// every continuous / per-section document — means layout runs no
+    /// relabelling pass at all.
+    pub fn each_page_note_numbering(
+        &self,
+    ) -> std::collections::HashMap<NoteAnchor, (u32, PageNumFormat)> {
+        let mut out = std::collections::HashMap::new();
+        if self.footnote_stories.is_empty() {
+            return out;
+        }
+        let sections = self.effective_sections();
+        let each_page: Vec<Option<(u32, PageNumFormat)>> = sections
+            .iter()
+            .map(|s| {
+                let props = self.resolved_note_props(NoteKind::Footnote, Some(s));
+                (props.num_restart == NoteNumRestart::EachPage)
+                    .then_some((props.num_start, props.num_format))
+            })
+            .collect();
+        if each_page.iter().all(Option::is_none) {
+            return out;
+        }
+        for r in self.note_references() {
+            if r.anchor.kind != NoteKind::Footnote || r.custom_mark {
+                continue;
+            }
+            let si = sections
+                .iter()
+                .position(|s| r.top_block >= s.start_block && r.top_block < s.end_block)
+                .unwrap_or(sections.len().saturating_sub(1));
+            if let Some(Some(rule)) = each_page.get(si) {
+                out.entry(r.anchor).or_insert(*rule);
             }
         }
         out

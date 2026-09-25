@@ -28,7 +28,8 @@ pub use floats::{ColumnLayout, resolve_page_floats, story_frame_page};
 pub use page::{A4Page, Margins};
 pub use paginate::{
     FOOTNOTE_SEPARATOR_HEIGHT_PT, HeaderBands, HeaderRole, NoteBody,
-    PageGeometry as PaginatePageGeometry, Paginator, collect_note_anchors, split_paragraph_at_line,
+    PageGeometry as PaginatePageGeometry, Paginator, collect_note_anchors, page_note_ordinals,
+    split_paragraph_at_line,
 };
 pub use paragraph::{
     InlineObjectInfo, ParagraphConfig, layout_paragraph, layout_paragraph_wrapped,
@@ -37,8 +38,8 @@ pub use table_bidi::mirror_bidi_visual;
 pub use table_place::{place_table, resolve_table_placement};
 pub use watchdog::{
     BlockFingerprint, DegradeReason, DegradeStage, FastPathMismatch, LayoutDegradation,
-    PageRefConvergence, Watchdog, converge_page_refs, geometry_fingerprint, verify_prefix,
-    verify_prefix_open,
+    PageRefConvergence, Watchdog, converge_page_refs, converge_stamped, geometry_fingerprint,
+    verify_prefix, verify_prefix_open,
 };
 pub use wrap::{
     FloatKey, WrapConvergence, WrapCutout, WrapPlan, WrapVerdict, cutouts_for_float, derive_plan,

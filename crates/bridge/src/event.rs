@@ -666,6 +666,11 @@ pub enum LayoutDegradeReason {
     /// Issue #81 — the TOC page-number post-pass hit its re-run cap
     /// without a fixed point; the last observed numbers were stamped.
     PageRefCap,
+    /// Issue #129 — the per-page footnote renumbering pass
+    /// (`<w:numRestart w:val="eachPage"/>`) hit its one re-run without a
+    /// fixed point (the restarted labels' widths kept moving references
+    /// across pages); the last pass's labels were kept.
+    NoteRestartCap,
 }
 
 /// Issue #87 — one degradation note on `Event::Painted`. `page` is the
@@ -755,6 +760,8 @@ pub struct A11yNote {
     pub note_id: u32,
     /// Display marker in document order (`"1"`, `"iv"`, …); empty for a
     /// custom-marked reference (the author's own mark follows in text).
+    /// Issue #129 — a footnote of an `eachPage` section carries its
+    /// per-page label as painted by the current layout.
     pub marker: String,
     pub nodes: Vec<A11yNode>,
 }

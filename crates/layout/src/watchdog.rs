@@ -121,6 +121,12 @@ pub enum DegradeReason {
     /// reach a fixed point within its re-run budget: stamping the numbers
     /// kept moving the headings. The last observed numbers were accepted.
     PageRefCap,
+    /// Issue #129 — the per-page footnote renumbering post-pass
+    /// (`<w:numRestart w:val="eachPage"/>`) did not reach a fixed point
+    /// within its one re-run: the restarted labels' widths kept moving
+    /// references across pages. The last pass's labels were kept, so a
+    /// reference may show an ordinal counted against a neighbouring page.
+    NoteRestartCap,
 }
 
 impl DegradeReason {
@@ -143,6 +149,7 @@ impl DegradeReason {
             DegradeReason::WrapOscillation => "WRAP_OSCILLATION",
             DegradeReason::WrapPolygonFallback => "WRAP_POLYGON_FALLBACK",
             DegradeReason::PageRefCap => "PAGE_REF_CAP",
+            DegradeReason::NoteRestartCap => "NOTE_RESTART_CAP",
         }
     }
 }
@@ -213,6 +220,59 @@ pub fn converge_page_refs<T: PartialEq + Clone>(
         }
         reruns += 1;
         observed = next;
+    }
+}
+
+/// Issue #129 — the bounded fixed point behind a post-pagination
+/// relabelling pass whose labels are themselves a layout input (per-page
+/// footnote numbers: a restarted "1" is narrower than a continuous "10",
+/// which can pull a reference back onto the previous page).
+///
+/// `lay_out_and_observe(stamp)` lays the document out with `stamp`
+/// applied and returns the labels the resulting pages CALL FOR. Unlike
+/// [`converge_page_refs`] the initial stamp is a real, paintable guess
+/// (the document-order labels), so a document whose guess already
+/// agrees with its pages costs exactly one layout.
+///
+/// - pass 1 lays out `initial`; agreement ⇒ done;
+/// - pass 2 lays out the observation; agreement ⇒ done;
+/// - each further disagreement spends one re-run from `max_reruns`; when
+///   the budget is spent the LAST STAMP is kept (it is what the last
+///   layout painted, so the caller's pages and labels agree with each
+///   other) and a `reason` note is returned.
+///
+/// `refs` is always the stamp of the final call — the caller keeps that
+/// call's pages. Termination by construction: at most `2 + max_reruns`
+/// calls.
+pub fn converge_stamped<T: PartialEq + Clone>(
+    initial: T,
+    max_reruns: u32,
+    reason: DegradeReason,
+    mut lay_out_and_observe: impl FnMut(&T) -> T,
+) -> PageRefConvergence<T> {
+    let mut stamp = initial;
+    let mut rounds = 0;
+    loop {
+        let observed = lay_out_and_observe(&stamp);
+        rounds += 1;
+        if observed == stamp {
+            return PageRefConvergence {
+                refs: stamp,
+                rounds,
+                degraded: None,
+            };
+        }
+        if rounds >= 2 + max_reruns {
+            return PageRefConvergence {
+                refs: stamp,
+                rounds,
+                degraded: Some(LayoutDegradation {
+                    reason,
+                    page: rounds,
+                }),
+            };
+        }
+        stamp = observed;
     }
 }
 
@@ -1088,5 +1148,42 @@ mod tests {
         let d = out.degraded.expect("cap note");
         assert_eq!(d.reason, DegradeReason::PageRefCap);
         assert_eq!(d.reason.as_str(), "PAGE_REF_CAP");
+    }
+
+    /* ---------- issue #129 — per-page note relabelling ---------- */
+
+    #[test]
+    fn stamped_labels_that_already_agree_cost_one_layout() {
+        let mut calls = 0;
+        let out = converge_stamped(vec![1, 2], 1, DegradeReason::NoteRestartCap, |s| {
+            calls += 1;
+            s.clone()
+        });
+        assert_eq!((calls, out.rounds, out.refs), (1, 1, vec![1, 2]));
+        assert!(out.degraded.is_none());
+    }
+
+    #[test]
+    fn stamped_labels_converge_on_the_second_layout() {
+        /* Document order says [1, 2]; the pages call for [1, 1] (a
+        restart), and laying out [1, 1] still calls for [1, 1]. */
+        let out = converge_stamped(vec![1, 2], 1, DegradeReason::NoteRestartCap, |_| vec![1, 1]);
+        assert_eq!((out.rounds, out.refs), (2, vec![1, 1]));
+        assert!(out.degraded.is_none());
+    }
+
+    #[test]
+    fn oscillating_stamped_labels_rerun_once_then_keep_the_last_stamp() {
+        /* Every stamp moves a reference: n calls for n + 1 forever. */
+        let mut calls = 0u32;
+        let out = converge_stamped(0u32, 1, DegradeReason::NoteRestartCap, |s| {
+            calls += 1;
+            s + 1
+        });
+        assert_eq!(calls, 3, "2 + max_reruns layouts, never more");
+        assert_eq!(out.refs, 2, "the stamp the last layout painted");
+        let d = out.degraded.expect("cap note");
+        assert_eq!(d.reason, DegradeReason::NoteRestartCap);
+        assert_eq!(d.reason.as_str(), "NOTE_RESTART_CAP");
     }
 }
