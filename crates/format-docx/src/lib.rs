@@ -34,3 +34,24 @@ pub use opc::archive::{
     read_docx_with_settings,
 };
 pub use writer::{build_minimal_docx, save_docx, write_docx, write_docx_with_notes};
+
+/// Issue #213 — build a clipboard `.docx` fragment for `doc`, and — when
+/// the source document carries a retained package (`DocumentTree::
+/// source_package`, issue #134) — additively splice its `styles.xml` /
+/// `numbering.xml` / theme / `fontTable.xml` parts into the fragment
+/// (`opc::splice::add_style_parts`), so pasting the fragment into Word or
+/// another instance of this editor resolves the style and numbering
+/// definitions its paragraphs reference instead of silently falling back
+/// to plain defaults. A document with no retained package (never opened
+/// from `.docx`, or an in-memory-only tree) falls through byte-identical
+/// to [`build_minimal_docx`].
+pub fn build_clipboard_fragment_docx(
+    doc: &engine::DocumentTree,
+    source_package: Option<&engine::SourcePackage>,
+) -> Result<Vec<u8>, DocxError> {
+    let minimal = writer::build_minimal_docx(doc)?;
+    match source_package {
+        Some(package) => opc::splice::add_style_parts(&minimal, package),
+        None => Ok(minimal),
+    }
+}

@@ -21,7 +21,6 @@ use engine::{
     FontFamily as EngineFontFamily, LogicalPos as EnginePos, PathStep as EnginePathStep, SpanStyle,
     UndoStack,
 };
-use format_docx::writer::build_minimal_docx;
 use kurbo::Rect;
 use layout::{
     A4Page, LayoutBlock, LineBox, PageBox, ParagraphBox, ParagraphConfig, Point, Size, StyleSpan,
@@ -14297,10 +14296,20 @@ impl Engine {
         blocks. */
         let block_slice = doc.slice_blocks(estart.clone(), eend.clone());
         let html = engine::html::to_html_blocks(&block_slice);
-        /* Issue #57 — the shell's prefetch skips the ZIP build. */
+        /* Issue #57 — the shell's prefetch skips the ZIP build. Issue
+        #213 — when the source document carries a retained package
+        (issue #134), splice its styles/numbering/theme/fontTable parts
+        into the fragment additively so a paste target resolves the
+        styles the copied paragraphs reference instead of falling back
+        to plain defaults. The package is document-level (not per-story:
+        `selection_doc()` returns a synthetic story tree with no package
+        of its own — see `story_doc()`), so it is read off the real tree
+        even for a copy issued from inside a header/footer/note story. */
         let docx_fragment = if include_docx {
             let paragraph_slice = doc.slice(estart, eend);
-            build_minimal_docx(&DocumentTree::from_rich_paragraphs(paragraph_slice))
+            let fragment_doc = DocumentTree::from_rich_paragraphs(paragraph_slice);
+            let source_package = self.undo.current().source_package.clone();
+            format_docx::build_clipboard_fragment_docx(&fragment_doc, source_package.as_deref())
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -15158,11 +15167,19 @@ impl Engine {
     }
 
     /// Sprint 9 — serialize the current document to a standalone HTML5
-    /// blob via `format_html::to_html`. `String::into_bytes()` consumes
-    /// the buffer in place — no extra copy crossing the wasm bridge;
-    /// the resulting `Vec<u8>` flows back to TS as a single `Uint8Array`.
+    /// blob via `format_html::to_html_with_note_markers`. `String::
+    /// into_bytes()` consumes the buffer in place — no extra copy
+    /// crossing the wasm bridge; the resulting `Vec<u8>` flows back to TS
+    /// as a single `Uint8Array`. Issue #226 — footnote/endnote labels use
+    /// the PAINTED per-page markers when a live layout snapshot exists
+    /// (`painted_note_markers`, the same source `build_a11y_nodes` reads),
+    /// so an each-page-restart numbering scheme exports the number the
+    /// page actually shows; without a snapshot this falls back to the
+    /// plain document-order labels, exactly `format_html::to_html`.
     fn save_html_bytes(&self) -> Event {
-        let html = format_html::to_html(self.undo.current());
+        let doc = self.undo.current();
+        let markers = self.painted_note_markers(doc);
+        let html = format_html::to_html_with_note_markers(doc, &markers);
         let bytes = html.into_bytes();
         let size = bytes.len() as u32;
         Event::DocumentSaved { bytes, size }
@@ -16493,6 +16510,10 @@ struct RenderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /* Issue #213 — the clipboard fragment path now goes through
+    `format_docx::build_clipboard_fragment_docx`; `build_minimal_docx`
+    itself is only exercised directly by a couple of tests below. */
+    use format_docx::writer::build_minimal_docx;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -25586,6 +25607,100 @@ mod snapshot_tests {
         assert!(pkg.entry("word/settings.xml").is_some());
         let current_pkg = e.undo.current().source_package.clone().unwrap();
         assert_eq!(**pkg, *current_pkg);
+    }
+
+    /// Issue #213 — the clipboard `.docx` fragment always went through
+    /// `build_minimal_docx` alone, so copying a styled paragraph out of an
+    /// opened `.docx` produced a fragment with no `styles.xml`: pasting it
+    /// anywhere lost the style. Copy `word_package_parts.docx`'s "first
+    /// item" paragraph (`<w:pStyle w:val="ListParagraph">`) and check the
+    /// fragment carries `styles.xml` with the referenced style, and a
+    /// paste-target re-read resolves it. A document with no retained
+    /// package keeps the pre-#213 minimal fragment unchanged.
+    ///
+    /// The selection spans paragraph 0's end through paragraph 2's start
+    /// so paragraph 1 lands as a fully-contained middle paragraph of
+    /// `DocumentTree::slice` — cloned verbatim, `style_id` intact.
+    /// Selecting *within* a single paragraph goes through
+    /// `Paragraph::split_at` instead, which drops `style_id` on both
+    /// halves unconditionally (issue discovered by this task; see the
+    /// final report's "Discovered gaps").
+    #[test]
+    fn clipboard_docx_fragment_carries_the_source_packages_styles() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let len0 = e
+            .undo
+            .current()
+            .paragraph_text(0)
+            .expect("paragraph 0")
+            .len() as u32;
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(0, len0),
+            caret: bpos_top(2, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload { docx_fragment, .. } = e.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        assert!(!docx_fragment.is_empty());
+
+        let entries = zip_entries(&docx_fragment);
+        let styles = entries
+            .iter()
+            .find(|(n, _)| n == "word/styles.xml")
+            .map(|(_, b)| b.as_slice())
+            .expect("fragment carries styles.xml");
+        assert!(
+            std::str::from_utf8(styles)
+                .unwrap()
+                .contains("ListParagraph"),
+            "styles.xml carries the referenced style"
+        );
+
+        /* A paste-target re-read resolves the style on the paragraph that
+        actually referenced it. */
+        let reread = format_docx::read_docx(&docx_fragment).expect("re-read fragment");
+        assert_eq!(reread.document.paragraph_text(1), Some("first item"));
+        assert_eq!(
+            reread
+                .document
+                .nth_paragraph(1)
+                .unwrap()
+                .style_id
+                .as_deref(),
+            Some("ListParagraph")
+        );
+        assert!(
+            reread.document.styles.contains_key("ListParagraph"),
+            "the style definition itself resolves"
+        );
+
+        /* A document with no retained package never gains a styles.xml —
+        the no-package path stays exactly `build_minimal_docx`'s output. */
+        let mut plain = engine();
+        let evt = apply(&mut plain, insert("hello world"));
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        plain.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload {
+            docx_fragment: plain_fragment,
+            ..
+        } = plain.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        assert!(
+            !zip_entries(&plain_fragment)
+                .iter()
+                .any(|(n, _)| n == "word/styles.xml"),
+            "a document with no retained package never gains a styles.xml"
+        );
     }
 
     /// Issue #212 — `Command::Snapshot { detach_package }` output.
