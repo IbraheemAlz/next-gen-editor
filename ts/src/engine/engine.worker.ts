@@ -66,6 +66,9 @@ type RegisterPageCanvasMsg = { id: number; type: 'REGISTER_PAGE_CANVAS'; idx: nu
    → `{ trap: true }` → `self.close()` → respawn → `RECOVER` — instead of
    `EngineClient.forceTrap()`'s worker.terminate() shortcut. */
 type ArmTrapMsg = { id: number; type: 'ARM_TRAP'; after_commands: number };
+/* Issue #96 — DEV-only test hook: per-page opaque-ink counts read back
+   from the surfaces this worker holds (see the handler). */
+type ProbePageInkMsg = { id: number; type: 'PROBE_PAGE_INK' };
 
 type Msg =
     | InitMsg
@@ -76,7 +79,8 @@ type Msg =
     | GetCommentsMsg
     | GetRevisionsMsg
     | RegisterPageCanvasMsg
-    | ArmTrapMsg;
+    | ArmTrapMsg
+    | ProbePageInkMsg;
 
 const LATIN_ID = 'liberation-sans';
 const ARABIC_ID = 'noto-naskh-arabic';
@@ -113,6 +117,27 @@ let idleSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingLogWrites: Promise<unknown> = Promise.resolve();
 /* Issue #85 — fault-injection countdown; `null` = disarmed. */
 let trapAfterCommands: number | null = null;
+
+/* Issue #96 — every OffscreenCanvas this worker generation was handed, by
+   page index (0 = the INIT / RECOVER surface). Only the DEV paint probe
+   reads it; the engine owns the contexts. A fresh worker starts empty, so
+   a page the shell failed to re-register after a trap is visibly absent. */
+const pageSurfaces = new Map<number, OffscreenCanvas>();
+
+function countOpaqueInk(surface: OffscreenCanvas): number {
+    /* Same context type the engine took → the SAME context back; a
+       surface Vello claimed for WebGPU answers `null`. */
+    const ctx = surface.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+    if (!ctx || surface.width === 0 || surface.height === 0) return -1;
+    const d = ctx.getImageData(0, 0, surface.width, surface.height).data;
+    let ink = 0;
+    for (let p = 0; p < d.length; p += 4) {
+        const opaque = (d[p + 3] ?? 0) > 200;
+        const white = (d[p] ?? 255) >= 250 && (d[p + 1] ?? 255) >= 250 && (d[p + 2] ?? 255) >= 250;
+        if (opaque && !white) ink++;
+    }
+    return ink;
+}
 
 /* Issue #194 — the engine `document_mutation_seq` the last accessibility
    delta was broadcast for. A fresh engine (INIT, crash recovery — a new
@@ -790,6 +815,7 @@ async function handleClientInit(msg: ClientInitMsg): Promise<void> {
             renderer === 'vello'
                 ? await Engine.with_vello(msg.canvas)
                 : new Engine(msg.canvas);
+        pageSurfaces.set(0, msg.canvas);
         await openEventLog(msg.documentId);
         /* Issue #43 — inject today's date so DATE fields resolve at
            layout time (Word updates DATE on open/print). Single
@@ -837,6 +863,7 @@ async function handleClientRecover(msg: ClientRecoverMsg): Promise<void> {
             probed === 'vello'
                 ? await Engine.with_vello(msg.canvas)
                 : new Engine(msg.canvas);
+        pageSurfaces.set(0, msg.canvas);
         /* Resume the event-log sequence past what was already persisted, so
            post-recovery appends don't collide with or shadow prior rows. */
         logSequence = msg.lastSeq;
@@ -1182,6 +1209,29 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
        call aliases the engine while an in-flight `&mut self` dispatch
        future is parked at an await, and wasm-bindgen panics with
        "recursive use of an object". */
+    /* Issue #96 — DEV-only paint probe (test hook). Headless Chrome never
+       composites a transferred placeholder `<canvas>` for the full app,
+       so a main-thread `drawImage` readback cannot tell a painted page
+       from a blank one there. Read the pixels where they actually land —
+       the OffscreenCanvas surfaces this worker was handed — and count
+       OPAQUE non-white ink per page (an unpainted surface is transparent
+       black; alpha > 200 keeps it from counting as ink). `-1` = the
+       surface has no 2d context (Vello page 0) or is not registered. */
+    if (msg.type === 'PROBE_PAGE_INK') {
+        void enqueue(async () => {
+            if (!import.meta.env.DEV) {
+                self.postMessage({ id: msg.id, ok: false, error: 'PROBE_PAGE_INK is dev-only' });
+                return;
+            }
+            const ink: Record<number, number> = {};
+            for (const [idx, surface] of pageSurfaces) {
+                ink[idx] = countOpaqueInk(surface);
+            }
+            self.postMessage({ id: msg.id, ok: true, ink });
+        });
+        return;
+    }
+
     if (msg.type === 'GET_COMMENTS') {
         void enqueue(async () => {
             if (!engine) {
@@ -1219,7 +1269,12 @@ self.onmessage = (ev: MessageEvent<Msg>): void => {
                 return;
             }
             try {
+                /* Issue #96 — a respawned worker receives registrations for
+                   pages its restored layout already knows (the shell
+                   remounts every page canvas after a trap): the slot is
+                   simply (re)filled with the fresh surface. */
                 engine.set_page_canvas(msg.idx, msg.canvas);
+                pageSurfaces.set(msg.idx, msg.canvas);
                 self.postMessage({ id: msg.id, ok: true });
             } catch (e: unknown) {
                 replyError(msg.id, e);

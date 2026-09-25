@@ -34,6 +34,8 @@ type WorkerReply = {
     comments?: CommentSnapshot[];
     /** Phase 8b — payload of a `GET_REVISIONS` side-channel reply. */
     revisions?: RevisionSnapshot[];
+    /** Issue #96 — payload of the DEV-only `PROBE_PAGE_INK` reply. */
+    ink?: Record<number, number>;
 };
 
 /** Phase 8a — read-only snapshot row for the comments sidebar. */
@@ -214,6 +216,20 @@ export class EngineClient {
     async armTrap(afterCommands = 1): Promise<void> {
         const r = await this.send({ type: 'ARM_TRAP', after_commands: afterCommands });
         if (!r.ok) throw new Error(r.error);
+    }
+
+    /**
+     * Issue #96 test hook (DEV builds only; the worker refuses it in a
+     * production build): opaque non-white pixel count per page surface
+     * the CURRENT worker generation holds, read back worker-side — the
+     * only paint evidence headless Chrome offers for the full app. `-1`
+     * for a surface without a 2d context (Vello page 0); a page the
+     * shell never registered with this worker is absent.
+     */
+    async probePageInk(): Promise<Record<number, number>> {
+        const r = await this.send({ type: 'PROBE_PAGE_INK' });
+        if (!r.ok) throw new Error(r.error);
+        return r.ink ?? {};
     }
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {

@@ -148,6 +148,95 @@ test('document, caret and undo survive a real wasm trap; renderer reported truth
     expect(r.lastRecovery?.renderer).toBe(r.recoveredEvt.renderer);
 });
 
+/* Issue #96 — every page paints after a real trap, not just page 0.
+   Page ≥ 1 canvases were transferred to the worker that died; recovery
+   must remount each with a FRESH `<canvas>` (a transferred one can never
+   be transferred again) and register it with the respawned worker.
+   Paint evidence comes from the worker-side opaque-ink probe
+   (`EngineClient.probePageInk`) — headless Chrome never composites the
+   transferred placeholders, so a DOM `drawImage` readback would lie.
+   Run twice: recovery from the replayed tail alone, and from an idle
+   base snapshot + tail. */
+for (const withSnapshot of [false, true]) {
+    test(`all pages of a 3-page document repaint after a real trap (${
+        withSnapshot ? 'snapshot + tail' : 'tail only'
+    })`, async ({ page }) => {
+        test.setTimeout(90_000);
+        await page.goto('/');
+        await page.waitForFunction(() => (window as any).__paintIdle === true, undefined, {
+            timeout: 15_000,
+        });
+
+        /* Grow the document until the paginator reports ≥ 3 pages. */
+        const lines = Array.from(
+            { length: 40 },
+            (_, i) => `Line ${i + 1}: the quick brown fox jumps over the lazy dog.`,
+        ).join('\n');
+        for (let i = 0; i < 6; i++) {
+            const pages = await page.evaluate(async (text: string) => {
+                const dispatch = (window as any).__dispatch;
+                await dispatch({ type: 'PASTE_PLAIN', text });
+                const evt = await dispatch({
+                    type: 'REQUEST_PAINT',
+                    viewport: { x: 0, y: 0, w: 0, h: 0 },
+                    dirty: undefined,
+                });
+                return evt.type === 'PAINTED' ? evt.page_count : 0;
+            }, `${lines}\n`);
+            if (pages >= 3) break;
+        }
+        await expect(page.locator('.editor-page')).not.toHaveCount(0);
+        await expect
+            .poll(() => page.locator('.editor-page canvas').count(), { timeout: 10_000 })
+            .toBeGreaterThanOrEqual(3);
+
+        const inkOf = (): Promise<Record<number, number>> =>
+            page.evaluate(() => (window as any).__engineClient.probePageInk());
+        /* The least-inked of pages 0–2 (`-1` when one is not registered). */
+        const minInk = async (): Promise<number> => {
+            const ink = await inkOf();
+            return Math.min(...[0, 1, 2].map((i) => ink[i] ?? -1));
+        };
+
+        /* Baseline: all three pages carry ink before the trap. */
+        await expect.poll(minInk, { timeout: 10_000 }).toBeGreaterThan(500);
+
+        /* The worker's idle snapshot fires 1.5 s after the last logged command. */
+        if (withSnapshot) await page.waitForTimeout(2_500);
+        await page.evaluate(() => {
+            (window as any).__prePageCanvases = Array.from(
+                document.querySelectorAll('.editor-page canvas'),
+            );
+        });
+        await page.evaluate(async () => {
+            const client = (window as any).__engineClient;
+            await client.armTrap(1);
+            await (window as any).__dispatch({ type: 'PING' }).catch(() => undefined);
+            for (let i = 0; i < 600 && (window as any).__recovered !== true; i++) {
+                await new Promise((r) => setTimeout(r, 50));
+            }
+        });
+        expect(await page.evaluate(() => (window as any).__recovered)).toBe(true);
+        const info = await page.evaluate(() => (window as any).__engineClient.lastRecovery);
+        expect(info.restored, 'base snapshot restored').toBe(withSnapshot);
+        expect(info.layoutRestored, 'session kept, not re-seeded').toBe(true);
+
+        /* Every page canvas is a brand-new element, registered with the NEW
+           worker (its probe only sees surfaces it was handed), and painted. */
+        await expect
+            .poll(() => page.locator('.editor-page canvas').count(), { timeout: 10_000 })
+            .toBeGreaterThanOrEqual(3);
+        const reused = await page.evaluate(() => {
+            const pre = new Set((window as any).__prePageCanvases as Element[]);
+            return Array.from(document.querySelectorAll('.editor-page canvas')).filter((c) =>
+                pre.has(c),
+            ).length;
+        });
+        expect(reused, 'no transferred canvas survives into the new generation').toBe(0);
+        await expect.poll(minInk, { timeout: 10_000 }).toBeGreaterThan(500);
+    });
+}
+
 /* Issue #97 — zoom / device scale after a real trap. Set 150 % through the
    zoom control, trap, and prove the control, the engine's own report
    (`Event::Recovered.zoom` / `.device_scale`) and the painted page scale
