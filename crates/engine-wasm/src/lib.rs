@@ -8679,6 +8679,12 @@ impl Engine {
                             .props
                             .widow_control_on(doc.settings.widow_control_default);
                         after_keep_next = para.props.keep_next_on();
+                        /* Issue #75 — `<w:pageBreakBefore/>` (resolved
+                        through the style cascade like keepNext). Only
+                        this body-story loop stamps it: cell, header /
+                        footer, note and text-box paragraphs are laid
+                        out elsewhere and ignore it, as Word does. */
+                        para_box.flow.page_break_before = para.props.page_break_before;
                         let prev_pages_in_pag = pag.page_count_emitted();
                         pag.push_block(LayoutBlock::Paragraph(para_box), before_px, after_px);
                         attach_block_paths(
@@ -15040,20 +15046,51 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::InsertPageBreak` (Sprint 2 UI Edition) — flip
-    /// `ParaProperties.page_break_before` on the paragraph at `at`.
+    /// `Command::InsertPageBreak` — Word's `Ctrl+Enter`: insert a
+    /// manual page break (U+000C FORM FEED, which the writer emits as
+    /// `<w:br w:type="page"/>` and the paginator honours through
+    /// `page_break_after_line`) at the caret, replacing any non-empty
+    /// selection exactly like typed text (with a collapsed or absent
+    /// selection the break lands at `at`). Issue #75: this used to flip
+    /// `ParaProperties.page_break_before` — the *paragraph-format*
+    /// property (Word's "Page break before" checkbox), not what
+    /// `Ctrl+Enter` authors — which also broke before the whole caret
+    /// paragraph instead of at the caret. The property itself is now
+    /// honoured by the paginator for imported documents.
+    ///
+    /// Rejected inside a table cell (Word never paginates a cell's
+    /// FORM FEED; the paginator only scans body paragraphs), so the
+    /// Breaks menu greys the entry there and this error is the
+    /// Honest-UX backstop. Header/footer stories are rejected earlier
+    /// by `story_gate`.
     fn do_insert_page_break(&mut self, at: BridgeLogicalPos) -> Event {
-        let new_doc = self
-            .undo
-            .current()
-            .set_page_break_before(to_engine_pos(at), true);
-        self.undo.push(new_doc);
-        self.announce(AnnouncementPriority::Polite, "Page break inserted");
-        self.dirty.invalidate(full_page_rect(self.scale()));
-        if let Err(e) = self.maybe_repaint_result() {
-            return *e;
+        let at = self.with_selection_doc(|d| clamp_pos(d, at));
+        /* A non-empty selection is replaced, as typing would; a collapsed
+        (or absent) one yields to the explicit `at`. */
+        let replacing = self
+            .selection
+            .as_ref()
+            .filter(|sel| sel.anchor != sel.caret)
+            .map(|sel| ordered(sel.anchor.clone(), sel.caret.clone()));
+        let (start, end) = replacing.clone().unwrap_or((at.clone(), at.clone()));
+        if start.path.steps.len() != 1 || end.path.steps.len() != 1 {
+            return Event::Error {
+                message: "InsertPageBreak: page breaks inside table cells are not supported".into(),
+            };
         }
-        self.selection_changed()
+        if replacing.is_none() {
+            self.selection = Some(SelectionState {
+                anchor: at.clone(),
+                caret: at.clone(),
+                ideal_x: None,
+                kind: SelectionKind::Linear,
+            });
+        }
+        let evt = self.do_insert_text_interactive(at, "\u{000C}".into());
+        if !matches!(evt, Event::Error { .. }) {
+            self.announce(AnnouncementPriority::Polite, "Page break inserted");
+        }
+        evt
     }
 
     /// `Command::InsertSectionBreak` (Phase 3, #40) — split the caret
@@ -21035,6 +21072,164 @@ mod tests {
         d
     }
 
+    /// Issue #75 — body doc whose second paragraph carries ONLY
+    /// `<w:pageBreakBefore/>` (no FORM FEED anywhere).
+    fn page_break_before_doc(first: &str, second: &str) -> DocumentTree {
+        let mut d = DocumentTree::from_text(first);
+        d.blocks
+            .push_back(engine::Block::Paragraph(engine::Paragraph {
+                text: second.into(),
+                props: engine::ParaProperties {
+                    page_break_before: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        d
+    }
+
+    fn page_source_ids(pages: &[PageBox]) -> Vec<Vec<u32>> {
+        pages
+            .iter()
+            .map(|p| {
+                p.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        LayoutBlock::Paragraph(pb) => Some(pb.source_paragraph_id),
+                        LayoutBlock::Table(_) => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Issue #75 acceptance — `<w:pageBreakBefore/>` reaches the
+    /// paginator: the flagged paragraph opens page 2.
+    #[test]
+    fn page_break_before_paragraph_opens_a_new_page() {
+        let engine = test_engine_with_doc(page_break_before_doc("alpha beta", "gamma delta"));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("pages");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+
+        /* Imported: the same doc through `<w:pageBreakBefore/>` XML. */
+        let bytes =
+            format_docx::build_minimal_docx(&page_break_before_doc("alpha beta", "gamma delta"))
+                .expect("write");
+        let archive = format_docx::read_docx(&bytes).expect("read");
+        let engine = test_engine_with_doc(archive.document);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+    }
+
+    /// Issue #75 — Word never breaks at a page top: a flagged FIRST
+    /// paragraph (and a flagged paragraph right after a next-page
+    /// section break) does not mint an empty page.
+    #[test]
+    fn page_break_before_at_a_page_top_is_a_no_op() {
+        let mut d = page_break_before_doc("alpha", "beta");
+        if let engine::Block::Paragraph(p) = &mut d.blocks[0] {
+            p.props.page_break_before = true;
+        }
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+
+        /* The first paragraph of a next-page section: the section
+        already flushed, so the flag adds nothing. */
+        let mut d = DocumentTree::from_text("alpha beta").insert_section_break_at(
+            engine::LogicalPos {
+                path: engine::BlockPath::top(0),
+                offset: 5,
+            },
+            engine::SectionType::NextPage,
+        );
+        assert_eq!(d.blocks.len(), 2, "the break splits the paragraph in two");
+        if let engine::Block::Paragraph(p) = &mut d.blocks[1] {
+            p.props.page_break_before = true;
+        }
+        let engine = test_engine_with_doc(d);
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(page_source_ids(&pages), vec![vec![0], vec![1]]);
+    }
+
+    /// Issue #75 — `Command::InsertPageBreak` is Word's `Ctrl+Enter`: a
+    /// FORM FEED at the caret (saved as `<w:br w:type="page"/>`), not the
+    /// paragraph-format flag; the text after it starts page 2.
+    #[test]
+    fn insert_page_break_inserts_a_form_feed_at_the_caret() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("alpha beta"));
+        let evt = engine.do_insert_page_break(bpos_top(0, 5));
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let doc = engine.undo.current().clone();
+        let engine::Block::Paragraph(p) = &doc.blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "alpha\u{000C} beta");
+        assert!(!p.props.page_break_before, "the format flag stays off");
+        let sel = engine.selection.clone().expect("selection");
+        assert_eq!(sel.caret, bpos_top(0, 6), "caret lands after the break");
+        assert!(
+            engine
+                .pending_announcements
+                .iter()
+                .any(|(_, m)| m == "Page break inserted")
+        );
+        let (pages, _, _, _) = engine.build_pages(1.0, false, None).expect("pages");
+        assert_eq!(
+            pages.len(),
+            2,
+            "the break splits the paragraph across pages"
+        );
+
+        /* Saved as a real `<w:br w:type="page"/>`. */
+        let bytes = format_docx::build_minimal_docx(&doc).expect("write");
+        let back = format_docx::read_docx(&bytes).expect("read");
+        let engine::Block::Paragraph(p) = &back.document.blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "alpha\u{000C} beta");
+        assert!(!p.props.page_break_before);
+    }
+
+    /// Issue #75 — a table-cell caret is rejected loudly (Word never
+    /// paginates a cell's page break); the Breaks menu greys out there.
+    #[test]
+    fn insert_page_break_is_rejected_in_a_table_cell() {
+        let mut d = DocumentTree::from_text("intro");
+        d.blocks
+            .push_back(engine::Block::Table(one_row_table(vec![cell_with_text(
+                "cell",
+            )])));
+        let mut engine = test_engine_with_doc(d);
+        let cell_pos = BridgeLogicalPos {
+            path: BridgeBlockPath {
+                steps: vec![
+                    BridgePathStep::Block { idx: 1 },
+                    BridgePathStep::Cell { row: 0, col: 0 },
+                    BridgePathStep::Block { idx: 0 },
+                ],
+            },
+            offset: 2,
+        };
+        engine.selection = Some(SelectionState {
+            anchor: cell_pos.clone(),
+            caret: cell_pos.clone(),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let evt = engine.do_insert_page_break(cell_pos);
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(!engine.undo.can_undo(), "a rejected break pushes no edit");
+        let engine::Block::Table(t) = &engine.undo.current().blocks[1] else {
+            panic!("table expected");
+        };
+        let engine::Block::Paragraph(p) = &t.rows[0].cells[0].blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert_eq!(p.text, "cell");
+    }
+
     fn band_glyph_count(band: &layout::HeaderFooterBox) -> usize {
         let mut n = 0;
         band.for_each_paragraph(&mut |p| {
@@ -22360,6 +22555,15 @@ mod tests {
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("ff");
         out.push(("two_page_form_feed", pages, info.degradations));
 
+        /* Issue #75 — the same two pages from `<w:pageBreakBefore/>`
+        alone (no FORM FEED). */
+        let engine = test_engine_with_doc(with_widow_control(
+            page_break_before_doc("alpha beta gamma", "delta epsilon"),
+            widow,
+        ));
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("pbb");
+        out.push(("two_page_break_before", pages, info.degradations));
+
         let engine = test_engine_with_doc(with_widow_control(table_doc(), widow));
         let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("table");
         out.push(("autofit_table", pages, info.degradations));
@@ -22519,6 +22723,9 @@ mod tests {
         ("50p_full_x2", 0xf565e610ffdbc22d),
         ("50p_band_2000_x2", 0x3b2d3d53655395a1),
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        /* Issue #75 — `<w:pageBreakBefore/>` alone (new fixture, recorded
+        on the #75 adapter; every other value is unchanged by it). */
+        ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),
@@ -22542,6 +22749,7 @@ mod tests {
         ("50p_full_x2", 0xa7f584534ce2ac6f),
         ("50p_band_2000_x2", 0x25ddf363691ee633),
         ("two_page_form_feed", 0xd804a22dcd3af5fd),
+        ("two_page_break_before", 0xc9a32cc093e20dbd),
         ("autofit_table", 0x92435b9636de4c72),
         ("prose_300_full", 0xd3d662539c126b7d),
         ("prose_300_band_1200", 0x5e704685f3cc770c),

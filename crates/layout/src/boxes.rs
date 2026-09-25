@@ -576,6 +576,17 @@ pub struct ParaFlow {
     /// either side (Word's default is ON; the engine adapter resolves
     /// the default, this box-level flag defaults to off).
     pub widow_control: bool,
+    /// Issue #75 — `<w:pageBreakBefore/>`: the paragraph opens a new
+    /// page. [`crate::paginate::Paginator::push_block`] flushes the
+    /// current page first when it already holds content (Word: no
+    /// break at the top of a page, so a paragraph that already starts
+    /// a page — a section's first paragraph after a next-page break,
+    /// say — never double-breaks). Only the top-level push consults
+    /// it: a split tail, a relocated keep-chain block or a table-cell
+    /// paragraph never breaks, and the engine adapter only stamps it
+    /// on body-story paragraphs (header / footer / note / cell stories
+    /// ignore the property, as Word does).
+    pub page_break_before: bool,
 }
 
 impl ParagraphBox {

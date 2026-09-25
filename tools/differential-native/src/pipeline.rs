@@ -11,9 +11,6 @@
 //! - headers / footers, PAGE / NUMPAGES / DATE field evaluation, footnotes,
 //!   inline images, hyperlinks, tracked-change overlays, multi-column
 //!   sections, and custom `<w:tabs>` stops.
-//! - `<w:pageBreakBefore/>` — engine-wasm itself does not honour it during
-//!   pagination (only `<w:br w:type="page"/>` FORM FEED does), and this
-//!   pipeline mirrors that real behaviour rather than an idealized one.
 //! - table cell vertical alignment (always top) and vertical-merge height
 //!   synchronization across rows (a `Restart` cell's height comes only from
 //!   its own row; `Continue` cells render no content).
@@ -77,7 +74,7 @@ pub fn build_pages(doc: &mut DocumentTree, fonts: &FontStack) -> BuiltDoc {
             let Some(block) = doc.blocks.get(idx as usize) else {
                 continue;
             };
-            let lb = build_layout_block(
+            let mut lb = build_layout_block(
                 block,
                 doc,
                 fonts,
@@ -85,6 +82,11 @@ pub fn build_pages(doc: &mut DocumentTree, fonts: &FontStack) -> BuiltDoc {
                 &mut para_texts,
                 &mut next_id,
             );
+            /* Issue #75 mirror — `<w:pageBreakBefore/>` on a BODY
+            paragraph (cell paragraphs ignore it, as in engine-wasm). */
+            if let (Block::Paragraph(p), LayoutBlock::Paragraph(pb)) = (block, &mut lb) {
+                pb.flow.page_break_before = resolved_props(doc, p).page_break_before;
+            }
             let (before, after) = block_spacing(block, doc);
             pag.push_block(lb, before, after);
         }
