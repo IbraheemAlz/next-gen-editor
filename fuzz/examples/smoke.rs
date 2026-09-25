@@ -22,6 +22,13 @@
 //! Run with: `cargo run --manifest-path fuzz/Cargo.toml --example smoke --release`
 //! (debug works too; release matters once inputs start building large
 //! tables/documents — a few hundred iterations in debug can take minutes).
+//!
+//! Flags (all optional):
+//! - `--target <name>`     run only that target (`rpc_command`, …).
+//! - `--iterations <n>`    random-sweep inputs per target (default 500).
+//! - `--strict`            ALSO fail (exit 1) when the random sweep panics —
+//!   the post-#114–#118 contract for `rpc_command` is a clean sweep, so CI
+//!   can hold the line instead of just reporting.
 
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
@@ -138,18 +145,69 @@ fn run_target(
 
 type TargetFn = fn(&[u8]);
 
+struct Options {
+    only: Option<String>,
+    iterations: usize,
+    strict: bool,
+}
+
+fn parse_args() -> Options {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut opts = Options {
+        only: None,
+        iterations: 500,
+        strict: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target" => {
+                opts.only = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--iterations" => {
+                opts.iterations = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("smoke: --iterations needs a number");
+                        std::process::exit(2);
+                    });
+                i += 1;
+            }
+            "--strict" => opts.strict = true,
+            other => {
+                eprintln!("smoke: unknown flag {other} (see the module docs)");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    opts
+}
+
 fn main() {
+    let opts = parse_args();
     let targets: [(&str, TargetFn); 4] = [
         ("docx_reader", engine_fuzz::run_docx_reader),
         ("docx_roundtrip", engine_fuzz::run_docx_roundtrip),
         ("rpc_command", engine_fuzz::run_rpc_command),
         ("layout_paginate", engine_fuzz::run_layout_paginate),
     ];
+    if let Some(only) = &opts.only
+        && !targets.iter().any(|(name, _)| name == only)
+    {
+        eprintln!("smoke: unknown target {only}");
+        std::process::exit(2);
+    }
 
     let mut corpus_clean = true;
     let mut sweep_clean = true;
     for (name, run) in targets {
-        let (corpus_panics, sweep_panics) = run_target(name, 500, run);
+        if opts.only.as_deref().is_some_and(|only| only != name) {
+            continue;
+        }
+        let (corpus_panics, sweep_panics) = run_target(name, opts.iterations, run);
         corpus_clean &= corpus_panics.is_empty();
         sweep_clean &= sweep_panics.is_empty();
     }
@@ -161,10 +219,11 @@ fn main() {
     }
     println!("smoke: seed corpus clean on every target");
     if !sweep_clean {
-        println!(
-            "smoke: the random sweep found real panics above — expected, see the PR \
-             description for the writeup of each"
-        );
+        if opts.strict {
+            eprintln!("smoke: FAIL — --strict and the random sweep panicked (see above)");
+            std::process::exit(1);
+        }
+        println!("smoke: the random sweep found panics above — every one is a real finding to triage");
     } else {
         println!("smoke: random sweep also clean");
     }

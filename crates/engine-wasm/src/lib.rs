@@ -1231,6 +1231,52 @@ pub async fn detect_backend() -> String {
 const POC_BASELINE_X: f64 = 50.0;
 const POC_BASELINE_Y: f64 = 200.0;
 
+/// Issue #118 — the engine's single wall clock. ISO-8601 UTC with
+/// millisecond precision, byte-for-byte the shape of JavaScript's
+/// `Date.prototype.toISOString()`. In the browser it *is* `Date`; on a
+/// native target (unit tests, the D5.5 fuzz harness) it is `SystemTime`,
+/// so no handler ever calls a wasm-bindgen import off-wasm. Every
+/// timestamp the engine mints — tracked revisions, comments, replies —
+/// goes through `Engine::current_review_date`, which prefers the
+/// `SetReviewIdentity` override and falls back to this.
+fn now_iso8601() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::new_0()
+            .to_iso_string()
+            .as_string()
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format_iso8601_utc(since_epoch.as_secs(), since_epoch.subsec_millis())
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` from seconds since the Unix epoch — the
+/// proleptic-Gregorian days-to-civil conversion (Howard Hinnant's
+/// `civil_from_days`), so the native clock needs no date dependency.
+#[cfg(not(target_arch = "wasm32"))]
+fn format_iso8601_utc(secs: u64, millis: u32) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
+}
+
 fn to_engine_pos(p: BridgeLogicalPos) -> EnginePos {
     EnginePos {
         path: bridge_to_engine_path(p.path),
@@ -2291,6 +2337,42 @@ fn push_caps_spans(
     }
 }
 
+/// Hyperlink + revision ranges for a paragraph with an IME composition
+/// of `comp_len` bytes spliced in at `off` — shifted exactly like
+/// [`composition_layout_spans`] shifts the style spans, so the overlays
+/// cut the SPLICED text on the same boundaries. Issue #115 (fuzz-found):
+/// the unshifted model offsets used to cut the spliced text `comp_len`
+/// bytes early, landing mid-scalar in Arabic / emoji text and panicking
+/// the width probe (`measure_text`). A range that ends at `off` stays
+/// before the composition; one that straddles `off` covers it.
+fn composition_overlay_ranges(
+    para: &engine::Paragraph,
+    off: u32,
+    comp_len: u32,
+) -> (Vec<engine::Hyperlink>, Vec<engine::Revision>) {
+    let start = |p: u32| if p >= off { p + comp_len } else { p };
+    let end = |p: u32| if p > off { p + comp_len } else { p };
+    let hyperlinks = para
+        .hyperlinks
+        .iter()
+        .map(|h| engine::Hyperlink {
+            start: start(h.start),
+            end: end(h.end),
+            ..h.clone()
+        })
+        .collect();
+    let revisions = para
+        .revisions
+        .iter()
+        .map(|r| engine::Revision {
+            start: start(r.start),
+            end: end(r.end),
+            ..r.clone()
+        })
+        .collect();
+    (hyperlinks, revisions)
+}
+
 /// Style spans for a paragraph with an IME composition spliced in at `off`.
 ///
 /// The committed spans are shifted — and split where one straddles `off` — to
@@ -3128,6 +3210,8 @@ fn build_header_footer_box(
                     text.push_str(&para.text[..off]);
                     text.push_str(&c.text);
                     text.push_str(&para.text[off..]);
+                    let (links, revs) =
+                        composition_overlay_ranges(para, off as u32, c.text.len() as u32);
                     let spans = apply_revision_overlay(
                         apply_hyperlink_overlay(
                             composition_layout_spans(
@@ -3138,10 +3222,10 @@ fn build_header_footer_box(
                                 cfg.px_size,
                                 scale,
                             ),
-                            &para.hyperlinks,
+                            &links,
                             [0, 0, 0, 255],
                         ),
-                        &para.revisions,
+                        &revs,
                         [0, 0, 0, 255],
                     );
                     (text, spans)
@@ -5284,9 +5368,6 @@ fn ordered(a: BridgeLogicalPos, b: BridgeLogicalPos) -> (BridgeLogicalPos, Bridg
     if swap { (b, a) } else { (a, b) }
 }
 
-/// Clamp a position into `doc` — `path` resolved to a real paragraph
-/// (falling back to the document end), `offset` capped at the
-/// paragraph's UTF-8 length.
 /// Issue #77 — owned key for a `FieldStory` (body / header rid / footer
 /// rid) so page-field lookups can be collected before the restamp walk.
 fn story_key(story: &engine::FieldStory<'_>) -> (u8, String) {
@@ -5307,6 +5388,13 @@ fn file_base_name(name: &str) -> String {
         .to_string()
 }
 
+/// Clamp a position into `doc` — `path` resolved to a real paragraph
+/// (falling back to the document end), `offset` normalized by the
+/// engine's snap-down policy (`engine::snap_offset`, issue #115): capped
+/// at the paragraph's UTF-8 length AND floored to a char boundary, so a
+/// selection can never sit inside a multi-byte scalar. Idempotent —
+/// "unchanged by clamping" is exactly the validity test
+/// (`Engine::selection_is_valid`).
 fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
     /* Design review B6 — a TABLE-ONLY tree (a letterhead header whose
     sole block is a table) has paragraph_count() == 0 but real caret
@@ -5324,20 +5412,18 @@ fn clamp_pos(doc: &DocumentTree, pos: BridgeLogicalPos) -> BridgeLogicalPos {
         };
     }
     let engine_path = bridge_to_engine_path(pos.path.clone());
-    let (resolved_path, para_len) = match doc.paragraph_at_path(&engine_path) {
-        Some(p) => (engine_path, p.text.len() as u32),
+    let (resolved_path, offset) = match doc.paragraph_at_path(&engine_path) {
+        Some(p) => (engine_path, p.snap_offset(pos.offset)),
         None => {
             let fallback = doc
                 .path_to_last_paragraph_deep()
                 .unwrap_or(EngineBlockPath::top(0));
-            let len = doc
+            let offset = doc
                 .paragraph_at_path(&fallback)
-                .map(|p| p.text.len() as u32)
-                .unwrap_or(0);
-            (fallback, len)
+                .map_or(0, |p| p.snap_offset(pos.offset));
+            (fallback, offset)
         }
     };
-    let offset = pos.offset.min(para_len);
     BridgeLogicalPos {
         path: engine_to_bridge_path(resolved_path),
         offset,
@@ -6261,6 +6347,15 @@ impl Engine {
         range: Option<BridgeLogicalRange>,
         attrs: TextAttrsPatch,
     ) -> Event {
+        /* Issue #115 — an explicit range is a wire value: both ends must
+        address a paragraph, offsets snap to char boundaries. */
+        let range = match range {
+            Some(r) => match self.resolve_edit_range("ApplyFormatting", r) {
+                Ok((start, end)) => Some(BridgeLogicalRange { start, end }),
+                Err(e) => return *e,
+            },
+            None => None,
+        };
         if self.story_active() {
             return self.story_apply_formatting(range, attrs);
         }
@@ -6349,6 +6444,10 @@ impl Engine {
     fn do_undo(&mut self) -> Event {
         self.undo.undo();
         self.story_validity_guard();
+        /* Issue #117 — re-clamp BEFORE repainting: the tree has already
+        been swapped, so a failing repaint (early return below) must not
+        leave the selection pointing into the previous tree. */
+        self.reclamp_selection();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -6685,6 +6784,10 @@ impl Engine {
     fn do_redo(&mut self) -> Event {
         self.undo.redo();
         self.story_validity_guard();
+        /* Issue #117 — re-clamp BEFORE repainting: the tree has already
+        been swapped, so a failing repaint (early return below) must not
+        leave the selection pointing into the previous tree. */
+        self.reclamp_selection();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -7527,6 +7630,8 @@ impl Engine {
                             text.push_str(&para.text[..off]);
                             text.push_str(&c.text);
                             text.push_str(&para.text[off..]);
+                            let (links, revs) =
+                                composition_overlay_ranges(para, off as u32, c.text.len() as u32);
                             let spans = apply_revision_overlay(
                                 apply_hyperlink_overlay(
                                     composition_layout_spans(
@@ -7537,10 +7642,10 @@ impl Engine {
                                         cfg.px_size,
                                         scale,
                                     ),
-                                    &para.hyperlinks,
+                                    &links,
                                     [0, 0, 0, 255],
                                 ),
-                                &para.revisions,
+                                &revs,
                                 [0, 0, 0, 255],
                             );
                             let base_direction = resolve_base_direction(para, &cfg);
@@ -9412,20 +9517,39 @@ impl Engine {
 
     /// `Command::SetSelection` — set the selection to `range`, caret at `caret`.
     fn do_set_selection(&mut self, range: BridgeLogicalRange, caret: BridgeLogicalPos) -> Event {
+        /* Issue #117 — the wire range is a REQUEST. The engine owns the
+        selection and stores only positions that resolve in the document
+        the selection addresses (body, or the active story), exactly
+        like every other selection-mutating path. Decide which end the
+        caret names BEFORE clamping so both ends snapping onto each other
+        cannot flip the anchor.
+        Composition with issue #77 (atomic fields): clamp FIRST (path
+        resolution + char-boundary snap, so the field lookup below only
+        ever sees a position that resolves), THEN widen over fields.
+        Field offsets are stored model offsets on char boundaries, so
+        the widened range stays valid. */
+        let caret_is_start = caret == range.start;
+        let (start, end, caret) = self.with_selection_doc(|d| {
+            (
+                clamp_pos(d, range.start),
+                clamp_pos(d, range.end),
+                clamp_pos(d, caret),
+            )
+        });
         /* Issue #77 — atomic fields: a range never partially covers a
         field, and a collapsed caret strictly inside a field's result
         becomes the whole field (a click inside a field selects it —
         Word parity). The caret keeps its side; field-free input takes
         the historical path untouched. */
-        let (lo, hi) = ordered(range.start.clone(), range.end.clone());
+        let (lo, hi) = ordered(start.clone(), end.clone());
         let (lo2, hi2) = self.expand_over_fields(lo.clone(), hi.clone());
         let (anchor, caret) = if lo2 == lo && hi2 == hi {
-            if caret == range.start {
-                (range.end, caret)
+            if caret_is_start {
+                (end, caret)
             } else {
-                (range.start, caret)
+                (start, caret)
             }
-        } else if range.start != range.end && caret == range.start {
+        } else if start != end && caret_is_start {
             (hi2, lo2)
         } else {
             (lo2, hi2)
@@ -9450,6 +9574,8 @@ impl Engine {
 
     /// `Command::ExtendSelection` — keep the anchor, move the caret to `to`.
     fn do_extend_selection(&mut self, to: BridgeLogicalPos) -> Event {
+        /* Issue #117 — same clamp as `SetSelection`. */
+        let to = self.with_selection_doc(|d| clamp_pos(d, to));
         let anchor = self
             .selection
             .as_ref()
@@ -9579,23 +9705,39 @@ impl Engine {
     /// `Command::SelectAll` — anchor at the document start, caret at the very
     /// last paragraph's byte length. Empty document collapses to (0, 0).
     fn do_select_all(&mut self) -> Event {
-        let doc = self.undo.current();
-        let last_path = doc
-            .path_to_last_top_paragraph()
-            .unwrap_or(EngineBlockPath::top(0));
-        let last_len = doc
-            .paragraph_at_path(&last_path)
-            .map_or(0, |p| p.text.len() as u32);
+        /* Issue #117 — resolve against the document the selection
+        addresses (the story tree in header/footer mode) and anchor on a
+        real paragraph: a table-first document has no paragraph at
+        `top(0)`, and a selection endpoint must always resolve. */
+        let (anchor, caret) = self.with_selection_doc(|doc| {
+            let first = doc
+                .path_to_first_paragraph_deep()
+                .unwrap_or(EngineBlockPath::top(0));
+            let last = doc
+                .path_to_last_top_paragraph()
+                .or_else(|| doc.path_to_last_paragraph_deep())
+                .unwrap_or(EngineBlockPath::top(0));
+            let last_len = doc
+                .paragraph_at_path(&last)
+                .map_or(0, |p| p.text.len() as u32);
+            (
+                BridgeLogicalPos {
+                    path: engine_to_bridge_path(first),
+                    offset: 0,
+                },
+                BridgeLogicalPos {
+                    path: engine_to_bridge_path(last),
+                    offset: last_len,
+                },
+            )
+        });
         self.pending_format = None;
         /* Audit gap B.M4 — SelectAll is a non-arrow motion; reset
         affinity. */
         self.caret_affinity = CaretAffinity::default();
         self.selection = Some(SelectionState {
-            anchor: bpos_top(0, 0),
-            caret: BridgeLogicalPos {
-                path: engine_to_bridge_path(last_path),
-                offset: last_len,
-            },
+            anchor,
+            caret,
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
@@ -9666,7 +9808,18 @@ impl Engine {
                 line_end(self, &sel.caret).unwrap_or(sel.caret.clone()),
                 None,
             ),
-            MoveDirection::DocHome => (bpos_top(0, 0), None),
+            MoveDirection::DocHome => (
+                /* Issue #117 — the first PARAGRAPH, not block 0: a table-first
+                document (or story) has no paragraph at `top(0)`. */
+                doc.path_to_first_paragraph_deep().map_or_else(
+                    || bpos_top(0, 0),
+                    |p| BridgeLogicalPos {
+                        path: engine_to_bridge_path(p),
+                        offset: 0,
+                    },
+                ),
+                None,
+            ),
             MoveDirection::DocEnd => {
                 let last_path = doc
                     .path_to_last_top_paragraph()
@@ -9872,6 +10025,8 @@ impl Engine {
                 (new_caret, Some(ideal))
             }
         };
+        /* Issue #117 — clamp FIRST against the story-aware `doc`
+        (`selection_doc`), then the #77 field snap below. */
         let new_caret = clamp_pos(&doc, new_caret);
         /* Issue #77 — atomic fields: a horizontal step that lands
         strictly inside a field's result continues to the boundary in
@@ -12012,9 +12167,61 @@ impl Engine {
         self.selection_changed()
     }
 
+    /// Issue #115 — the single validated boundary for an EXPLICIT wire
+    /// position on an edit command (`DeleteRange`, `ReplaceRange`,
+    /// `ApplyFormatting { range: Some(_) }`, `SplitParagraph` with no
+    /// selection, `InsertComment`). The path must address a paragraph
+    /// in the document the selection addresses (body or active story)
+    /// — an API caller naming a block that is not there is rejected
+    /// with a typed `Event::Error`, never silently redirected to some
+    /// other paragraph (an edit that lands on the wrong text is worse
+    /// than one that fails loudly). The offset then follows the
+    /// engine's snap-down policy (`engine::snap_offset`). Selection
+    /// commands deliberately differ: they go through `clamp_pos`, because
+    /// a selection must always exist.
+    fn resolve_edit_pos(
+        &self,
+        cmd: &str,
+        pos: BridgeLogicalPos,
+    ) -> Result<BridgeLogicalPos, Box<Event>> {
+        let epath = bridge_to_engine_path(pos.path.clone());
+        let snapped = self.with_selection_doc(|d| {
+            d.paragraph_at_path(&epath)
+                .map(|p| p.snap_offset(pos.offset))
+        });
+        match snapped {
+            Some(offset) => Ok(BridgeLogicalPos {
+                path: pos.path,
+                offset,
+            }),
+            None => Err(Box::new(Event::Error {
+                message: format!(
+                    "{cmd}: position {:?} does not address a paragraph",
+                    pos.path.steps
+                ),
+            })),
+        }
+    }
+
+    /// [`Self::resolve_edit_pos`] for both ends of a range, returned in
+    /// document order.
+    fn resolve_edit_range(
+        &self,
+        cmd: &str,
+        range: BridgeLogicalRange,
+    ) -> Result<(BridgeLogicalPos, BridgeLogicalPos), Box<Event>> {
+        let start = self.resolve_edit_pos(cmd, range.start)?;
+        let end = self.resolve_edit_pos(cmd, range.end)?;
+        Ok(ordered(start, end))
+    }
+
     /// Interactive `InsertText` — replace any non-empty selection with `text`,
     /// then place the caret after it.
     fn do_insert_text_interactive(&mut self, at: BridgeLogicalPos, text: String) -> Event {
+        /* Issues #115/#117 — `at` only seeds the selection when none
+        exists, so it follows selection semantics: clamp into the
+        addressed document (path fallback + char-boundary snap). */
+        let at = self.with_selection_doc(|d| clamp_pos(d, at));
         if self.story_active() {
             return self.story_insert_text(at, text);
         }
@@ -12086,7 +12293,10 @@ impl Engine {
     /// text; sticky pending formatting is deliberately not applied
     /// (this is not a typing path).
     fn do_replace_range(&mut self, range: BridgeLogicalRange, text: String) -> Event {
-        let (start, end) = ordered(range.start, range.end);
+        let (start, end) = match self.resolve_edit_range("ReplaceRange", range) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
         let tracking = self.tracking_changes;
         let author = self.review_author.clone();
         let date = self.current_review_date();
@@ -12119,7 +12329,10 @@ impl Engine {
     /// Sprint 14 (#14) — when track-changes is on, mark the range as
     /// a `Delete` revision instead of removing text.
     fn do_delete_range(&mut self, range: BridgeLogicalRange) -> Event {
-        let (start, end) = ordered(range.start, range.end);
+        let (start, end) = match self.resolve_edit_range("DeleteRange", range) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
         let (new_doc, caret) = if self.tracking_changes {
             let d = self.undo.current().tracked_delete_range(
                 to_engine_pos(start.clone()),
@@ -12143,6 +12356,16 @@ impl Engine {
     /// `Command::SplitParagraph` — break the paragraph at the caret (replacing
     /// any non-empty selection first); the caret moves to the new paragraph.
     fn do_split_paragraph(&mut self, at: BridgeLogicalPos) -> Event {
+        /* Issue #115 — `at` is consulted only when no selection exists;
+        then it is an explicit wire position and must resolve. */
+        let at = if self.selection.is_none() {
+            match self.resolve_edit_pos("SplitParagraph", at) {
+                Ok(p) => p,
+                Err(e) => return *e,
+            }
+        } else {
+            at
+        };
         if self.story_active() {
             return self.story_split_paragraph(at);
         }
@@ -12373,22 +12596,36 @@ impl Engine {
         }
     }
 
+    /// Clamp the live selection into the document it addresses — after an
+    /// undo/redo swapped the tree, or any structural edit that may have
+    /// moved text under it. Issue #117 — clamp against the
+    /// document the selection addresses: after `story_validity_guard`
+    /// keeps a header / footer story alive, the selection's paths are
+    /// STORY paths and must not be resolved against the body tree.
+    /// Idempotent, so running it both before the repaint and again in
+    /// `after_history_change` is harmless.
+    fn reclamp_selection(&mut self) {
+        let Some(sel) = self.selection.clone() else {
+            return;
+        };
+        let (anchor, caret) =
+            self.with_selection_doc(|doc| (clamp_pos(doc, sel.anchor), clamp_pos(doc, sel.caret)));
+        let kind = derive_selection_kind(&anchor, &caret);
+        self.selection = Some(SelectionState {
+            anchor,
+            caret,
+            ideal_x: None,
+            kind,
+        });
+    }
+
     /// Re-emit selection after an undo/redo, clamping the caret into the
     /// restored document. Falls back to `UndoStateChanged` when no selection
     /// exists (the Phase-1 harness path).
     fn after_history_change(&mut self) -> Event {
-        match self.selection.clone() {
-            Some(sel) => {
-                let doc = self.undo.current();
-                let anchor = clamp_pos(doc, sel.anchor);
-                let caret = clamp_pos(doc, sel.caret);
-                let kind = derive_selection_kind(&anchor, &caret);
-                self.selection = Some(SelectionState {
-                    anchor,
-                    caret,
-                    ideal_x: None,
-                    kind,
-                });
+        match self.selection {
+            Some(_) => {
+                self.reclamp_selection();
                 self.selection_changed()
             }
             None => Event::UndoStateChanged {
@@ -12659,16 +12896,14 @@ impl Engine {
     /// `Command::AcceptRevision` (Sprint 7 UI Edition).
     /// Sprint 14 (#14) — best-effort current review date stamp.
     /// Prefers the explicit value `Command::SetReviewIdentity` set;
-    /// otherwise falls back to the worker thread's `Date.now()` via
-    /// `js_sys::Date::new_0().to_iso_string()`.
+    /// otherwise falls back to the engine clock (`now_iso8601`, issue
+    /// #118 — `Date` in the browser, `SystemTime` natively). The ONLY
+    /// timestamp source for every handler that stamps a date.
     fn current_review_date(&self) -> String {
         if !self.review_date.is_empty() {
             return self.review_date.clone();
         }
-        js_sys::Date::new_0()
-            .to_iso_string()
-            .as_string()
-            .unwrap_or_default()
+        now_iso8601()
     }
 
     /// Sprint 14 (#14) — `Command::ToggleTrackChanges`. Flips the
@@ -12730,20 +12965,22 @@ impl Engine {
         self.selection_changed()
     }
 
-    /// `Command::InsertComment` (Sprint 7 UI Edition). Uses an
-    /// ISO-8601 timestamp derived from `Date.now()` on the worker
-    /// thread (passed in via `js_sys::Date::new_0().to_iso_string()`)
-    /// when wired through; for the engine handler the date is the
-    /// current `wasm_bindgen` UTC epoch ms formatted as RFC 3339.
+    /// `Command::InsertComment` (Sprint 7 UI Edition). Stamped with the
+    /// engine clock via `current_review_date` (issue #118 — the
+    /// `SetReviewIdentity` override wins, else `Date` / `SystemTime`).
+    /// The range is an explicit wire range: both ends must address a
+    /// paragraph (issue #115) or the command is rejected.
     fn do_insert_comment(
         &mut self,
         range: BridgeLogicalRange,
         text: String,
         author: String,
     ) -> Event {
-        let now = js_sys::Date::new_0().to_iso_string();
-        let date = now.as_string().unwrap_or_default();
-        let (start, end) = ordered(range.start, range.end);
+        let date = self.current_review_date();
+        let (start, end) = match self.resolve_edit_range("InsertComment", range) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
         let (new_doc, _new_id) = self.undo.current().insert_comment(
             to_engine_pos(start),
             to_engine_pos(end),
@@ -12796,8 +13033,7 @@ impl Engine {
     /// invalidation, polite announcement). An unknown parent maps the
     /// engine's `None` to `Event::Error` instead of mutating the doc.
     fn do_reply_to_comment(&mut self, parent_id: u32, text: String, author: String) -> Event {
-        let now = js_sys::Date::new_0().to_iso_string();
-        let date = now.as_string().unwrap_or_default();
+        let date = self.current_review_date();
         let Some((new_doc, _new_id)) = self
             .undo
             .current()
@@ -13437,6 +13673,28 @@ impl Engine {
             content_type: image.mime,
             data: image.bytes,
         };
+        /* Issue #117 (fuzz-found) — resolve where the sentinel actually
+        lands, mirroring `insert_inline_image_at`: `at.path` when it
+        names a paragraph, else the last top-level paragraph; offset
+        snapped (issue #115). The live selection is then shifted past
+        the 3-byte U+FFFC like any other insertion — otherwise a caret
+        at/after the insertion point in that paragraph would end up
+        INSIDE the sentinel scalar. (InsertImage is story-gated, so the
+        selection always addresses the body here.) */
+        let (ins_path, ins_off) = {
+            let doc = self.undo.current();
+            let epath = bridge_to_engine_path(at.path.clone());
+            let path = if doc.paragraph_at_path(&epath).is_some() {
+                epath
+            } else {
+                doc.path_to_last_top_paragraph()
+                    .unwrap_or(EngineBlockPath::top(0))
+            };
+            let off = doc
+                .paragraph_at_path(&path)
+                .map_or(0, |p| p.snap_offset(at.offset));
+            (engine_to_bridge_path(path), off)
+        };
         let new_doc = self.undo.current().insert_inline_image_at(
             to_engine_pos(at),
             engine_blob,
@@ -13444,6 +13702,15 @@ impl Engine {
             h_emu,
         );
         self.undo.push(new_doc);
+        if let Some(sel) = self.selection.as_mut() {
+            const SENTINEL_LEN: u32 = '\u{FFFC}'.len_utf8() as u32;
+            for p in [&mut sel.anchor, &mut sel.caret] {
+                if p.path == ins_path && p.offset >= ins_off {
+                    p.offset += SENTINEL_LEN;
+                }
+            }
+        }
+        self.reclamp_selection();
         self.layout_cache.get_mut().clear();
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
@@ -13703,16 +13970,70 @@ impl Engine {
     selection refresh).
     =========================================================== */
 
+    /// Issue #116 — the single validated boundary for every table
+    /// command. Resolves `path` (+ optional `row` / `col`) through
+    /// `DocumentTree::resolve_table_target` against the document the
+    /// selection addresses (body, or the active story — headers and
+    /// footers hold tables too), then runs `extra` for command-specific
+    /// shape checks (growth caps, merge rectangles). Any failure is a
+    /// typed `Event::Error` and the handler returns BEFORE it pushes an
+    /// undo snapshot or announces anything.
+    fn validate_table_cmd(
+        &self,
+        cmd: &str,
+        path: &bridge::BlockPath,
+        row: Option<u32>,
+        col: Option<u32>,
+        extra: impl FnOnce(&engine::Table) -> Result<(), engine::TableError>,
+    ) -> Result<(), Box<Event>> {
+        let epath = bridge_to_engine_path(path.clone());
+        self.with_selection_doc(|d| d.resolve_table_target(&epath, row, col).and_then(extra))
+            .map_err(|e| {
+                Box::new(Event::Error {
+                    message: format!("{cmd}: {e}"),
+                })
+            })
+    }
+
     fn do_insert_table(&mut self, at: bridge::BlockPath, rows: u32, cols: u32) -> Event {
+        /* Issue #114 — validate the wire dimensions BEFORE anything
+        allocates. `engine::insert_table` clamps as a second line of
+        defence, but the shell gets a typed rejection rather than a
+        silently smaller table. */
+        if let Err(e) = engine::check_table_dims(rows, cols) {
+            return Event::Error {
+                message: format!("InsertTable: {e}"),
+            };
+        }
+        /* Issue #117 — Word parks the caret in the new table's first cell.
+        Doing so explicitly (instead of leaving the caret on the block
+        index the table now occupies, which resolves to no paragraph)
+        keeps the selection valid through the structural edit. The
+        engine clamps the insertion index to the block count, so mirror
+        that to name the cell the table actually lands in. */
+        let at_idx = match at.steps.first() {
+            Some(BridgePathStep::Block { idx }) => Some(*idx as usize),
+            _ => None,
+        };
+        let first_cell = |block_count: usize| -> BridgeLogicalPos {
+            let idx = at_idx.unwrap_or(block_count).min(block_count) as u32;
+            BridgeLogicalPos {
+                path: BridgeBlockPath {
+                    steps: vec![
+                        BridgePathStep::Block { idx },
+                        BridgePathStep::Cell { row: 0, col: 0 },
+                        BridgePathStep::Block { idx: 0 },
+                    ],
+                },
+                offset: 0,
+            }
+        };
         if self.story_active() {
+            let caret = first_cell(self.story_doc().map_or(0, |d| d.blocks.len()));
             let epath = bridge_to_engine_path(at);
-            let caret = self
-                .selection
-                .as_ref()
-                .map(|s| s.caret.clone())
-                .unwrap_or_else(|| bpos_top(0, 0));
             return self.story_mutate(move |d| d.insert_table(epath, rows, cols), caret, false);
         }
+        let caret = first_cell(self.undo.current().blocks.len());
         let new_doc = self
             .undo
             .current()
@@ -13721,9 +14042,12 @@ impl Engine {
             AnnouncementPriority::Polite,
             format!("Table inserted, {rows} rows by {cols} columns"),
         );
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, Some(caret))
     }
     fn do_delete_table(&mut self, path: bridge::BlockPath) -> Event {
+        if let Err(e) = self.validate_table_cmd("DeleteTable", &path, None, None, |_| Ok(())) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13738,7 +14062,7 @@ impl Engine {
             .current()
             .delete_table(bridge_to_engine_path(path));
         self.announce(AnnouncementPriority::Polite, "Table deleted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_insert_row(
         &mut self,
@@ -13759,6 +14083,13 @@ impl Engine {
             bridge::InsertSide::Before => row as usize,
             bridge::InsertSide::After => (row as usize).saturating_add(1),
         };
+        /* Issues #114/#116 — `row` must name an existing row, and the
+        table must have room for one more. */
+        if let Err(e) = self.validate_table_cmd("InsertRow", &path, Some(row), None, |t| {
+            t.check_growth(1, 0)
+        }) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13773,9 +14104,12 @@ impl Engine {
             .current()
             .insert_row(bridge_to_engine_path(path), at);
         self.announce(AnnouncementPriority::Polite, "Row inserted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_delete_row(&mut self, path: bridge::BlockPath, row: u32) -> Event {
+        if let Err(e) = self.validate_table_cmd("DeleteRow", &path, Some(row), None, |_| Ok(())) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13790,7 +14124,7 @@ impl Engine {
             .current()
             .delete_row(bridge_to_engine_path(path), row);
         self.announce(AnnouncementPriority::Polite, "Row deleted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_insert_column(
         &mut self,
@@ -13802,6 +14136,13 @@ impl Engine {
             bridge::InsertSide::Before => col as usize,
             bridge::InsertSide::After => (col as usize).saturating_add(1),
         };
+        /* Issues #114/#116 — `col` must name an existing logical column
+        (Word's 63-column ceiling applies to the result). */
+        if let Err(e) = self.validate_table_cmd("InsertColumn", &path, None, Some(col), |t| {
+            t.check_growth(0, 1)
+        }) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13816,9 +14157,13 @@ impl Engine {
             .current()
             .insert_column(bridge_to_engine_path(path), at);
         self.announce(AnnouncementPriority::Polite, "Column inserted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_delete_column(&mut self, path: bridge::BlockPath, col: u32) -> Event {
+        if let Err(e) = self.validate_table_cmd("DeleteColumn", &path, None, Some(col), |_| Ok(()))
+        {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13833,7 +14178,7 @@ impl Engine {
             .current()
             .delete_column(bridge_to_engine_path(path), col);
         self.announce(AnnouncementPriority::Polite, "Column deleted");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_merge_cells(
         &mut self,
@@ -13843,6 +14188,30 @@ impl Engine {
         to_row: u32,
         to_col: u32,
     ) -> Event {
+        /* Issue #116 — every corner of the rectangle must exist: both
+        rows, and both columns as physical cells of the TOP row (the row
+        `merge_cells` collapses into; continuation rows are clipped by
+        the engine). */
+        let (r0, r1) = (from_row.min(to_row), from_row.max(to_row));
+        let c1 = from_col.max(to_col);
+        if let Err(e) = self.validate_table_cmd("MergeCells", &path, Some(r1), None, |t| {
+            let top = t
+                .rows
+                .get(r0 as usize)
+                .ok_or(engine::TableError::RowOutOfRange {
+                    row: r0,
+                    rows: t.rows.len(),
+                })?;
+            if c1 as usize >= top.cells.len() {
+                return Err(engine::TableError::ColOutOfRange {
+                    col: c1,
+                    cols: top.cells.len(),
+                });
+            }
+            Ok(())
+        }) {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13864,9 +14233,14 @@ impl Engine {
             to_col,
         );
         self.announce(AnnouncementPriority::Polite, "Cells merged");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_split_cell(&mut self, path: bridge::BlockPath, row: u32, col: u32) -> Event {
+        if let Err(e) =
+            self.validate_table_cmd("SplitCell", &path, Some(row), Some(col), |_| Ok(()))
+        {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13881,7 +14255,7 @@ impl Engine {
             .current()
             .split_cell(bridge_to_engine_path(path), row, col);
         self.announce(AnnouncementPriority::Polite, "Cell split");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     fn do_set_cell_shading(
         &mut self,
@@ -13891,6 +14265,11 @@ impl Engine {
         color: Option<bridge::Color>,
     ) -> Event {
         let rgba = color.map(|c| [c.r, c.g, c.b, c.a]);
+        if let Err(e) =
+            self.validate_table_cmd("SetCellShading", &path, Some(row), Some(col), |_| Ok(()))
+        {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let caret = self
@@ -13916,7 +14295,7 @@ impl Engine {
                 "Cell shading cleared"
             },
         );
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
     /// Issue #79 — apply a [`bridge::TablePropertiesPatch`]. An empty
     /// patch (or a path that is not a table) is a no-op that still
@@ -13929,12 +14308,13 @@ impl Engine {
         let Some(bidi_visual) = patch.bidi_visual else {
             return self.selection_changed();
         };
-        let epath = bridge_to_engine_path(path);
-        if self.with_selection_doc(|d| d.table_at_path(&epath).is_none()) {
-            return Event::Error {
-                message: "SetTableProperties: path does not address a table".into(),
-            };
+        /* Issue #116 — the same validated boundary as every table
+        command (typed error for a non-table / nested path). */
+        if let Err(e) = self.validate_table_cmd("SetTableProperties", &path, None, None, |_| Ok(()))
+        {
+            return *e;
         }
+        let epath = bridge_to_engine_path(path);
         if self.story_active() {
             let caret = self
                 .selection
@@ -13959,7 +14339,7 @@ impl Engine {
                 "Table set to left-to-right"
             },
         );
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
 
     fn do_set_cell_borders(
@@ -13969,6 +14349,11 @@ impl Engine {
         col: u32,
         borders: bridge::BridgeCellBorders,
     ) -> Event {
+        if let Err(e) =
+            self.validate_table_cmd("SetCellBorders", &path, Some(row), Some(col), |_| Ok(()))
+        {
+            return *e;
+        }
         if self.story_active() {
             let epath = bridge_to_engine_path(path);
             let engine_borders = bridge_to_engine_borders(borders);
@@ -13990,14 +14375,54 @@ impl Engine {
             bridge_to_engine_borders(borders),
         );
         self.announce(AnnouncementPriority::Polite, "Cell borders updated");
-        self.push_table_edit(new_doc)
+        self.push_table_edit(new_doc, None)
     }
 
-    /// Common tail for every table command — push undo, invalidate +
-    /// repaint, fire a SelectionChanged event so the UI re-fetches
-    /// state.
-    fn push_table_edit(&mut self, new_doc: engine::DocumentTree) -> Event {
+    /// Common tail for every table command — push undo, re-resolve the
+    /// selection, invalidate + repaint, fire a SelectionChanged event so
+    /// the UI re-fetches state.
+    ///
+    /// Issue #117 — a structural edit can move or remove the block an
+    /// endpoint names (`InsertTable` shifts the caret's paragraph down a
+    /// slot; `DeleteRow` / `DeleteTable` remove the caret's cell), so the
+    /// invariant "the selection always resolves" has to be re-established
+    /// here, not left for the next text edit to heal. `Some(caret)`
+    /// collapses the selection there — the command knows where the caret
+    /// belongs (`InsertTable` → first cell); `None` keeps the current
+    /// selection, both ends re-clamped against the new tree.
+    fn push_table_edit(
+        &mut self,
+        new_doc: engine::DocumentTree,
+        caret: Option<BridgeLogicalPos>,
+    ) -> Event {
         self.undo.push(new_doc);
+        let doc = self.undo.current();
+        let resolved = match (caret, self.selection.clone()) {
+            (Some(c), _) => {
+                let c = clamp_pos(doc, c);
+                Some(SelectionState {
+                    anchor: c.clone(),
+                    caret: c,
+                    ideal_x: None,
+                    kind: SelectionKind::Linear,
+                })
+            }
+            (None, Some(sel)) => {
+                let anchor = clamp_pos(doc, sel.anchor);
+                let caret = clamp_pos(doc, sel.caret);
+                let kind = derive_selection_kind(&anchor, &caret);
+                Some(SelectionState {
+                    anchor,
+                    caret,
+                    ideal_x: sel.ideal_x,
+                    kind,
+                })
+            }
+            (None, None) => None,
+        };
+        if resolved.is_some() {
+            self.selection = resolved;
+        }
         self.dirty.invalidate(full_page_rect(self.scale()));
         if let Err(e) = self.maybe_repaint_result() {
             return *e;
@@ -14058,14 +14483,10 @@ impl Engine {
             ideal_x: None,
             kind: SelectionKind::Linear,
         });
-        /* Non-empty so `current_review_date` never reaches `js_sys::Date`,
-        which panics on native targets outside a browser (mirrors the
-        crate's own `test_engine_with_doc` test helper, below). Does NOT
-        cover `do_insert_comment` / `do_reply_to_comment`, which call
-        `js_sys::Date::new_0()` directly rather than through
-        `current_review_date` — the fuzz generator excludes
-        `Command::InsertComment` / `Command::ReplyToComment` for exactly
-        this reason (D5.5, issue #90). */
+        /* A fixed review date keeps fuzz runs deterministic. Not needed
+        for safety any more: since issue #118 every timestamp goes
+        through `now_iso8601`, which is native-safe, so `Recover` (which
+        resets this field) and the comment commands can all run here. */
         engine.review_date = "2026-01-01T00:00:00Z".to_string();
         engine
     }
@@ -14083,17 +14504,18 @@ impl Engine {
     }
 
     /// `true` when the live selection's anchor and caret both resolve to
-    /// a real position in the current document. `clamp_pos` (used by
-    /// `Command::SetSelection` itself) is idempotent on a valid position,
-    /// so "unchanged by clamping" is exactly the in-bounds check.
+    /// a real position in the document the selection addresses — the
+    /// body, or the active header/footer story (issue #117). `clamp_pos`
+    /// (used by `Command::SetSelection` itself) is idempotent on a valid
+    /// position, so "unchanged by clamping" is exactly the in-bounds +
+    /// on-a-char-boundary check.
     pub fn selection_is_valid(&self) -> bool {
         match &self.selection {
             None => true,
-            Some(sel) => {
-                let doc = self.undo.current();
+            Some(sel) => self.with_selection_doc(|doc| {
                 clamp_pos(doc, sel.anchor.clone()) == sel.anchor
                     && clamp_pos(doc, sel.caret.clone()) == sel.caret
-            }
+            }),
         }
     }
 
@@ -18094,8 +18516,8 @@ mod tests {
             pending_announcements: Vec::new(),
             tracking_changes: false,
             review_author: "You".to_string(),
-            /* Non-empty so `current_review_date` never reaches
-            `js_sys::Date`, which panics on native targets. */
+            /* A fixed date keeps stamped revisions deterministic in
+            tests (the clock itself is native-safe since issue #118). */
             review_date: "2026-01-01T00:00:00Z".to_string(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
@@ -20792,5 +21214,783 @@ mod snapshot_tests {
         b.restore_from_bytes(&e.snapshot_bytes().unwrap()).unwrap();
         format_docx::check_document_xml_well_formed(&saved(&mut b))
             .expect("recovered session saves well-formed");
+    }
+}
+
+/// Issues #114–#118 — every wire value is validated at the command
+/// boundary: typed `Event::Error`, never a panic, never an unbounded
+/// allocation, and the selection invariant holds after every command.
+#[cfg(test)]
+mod wire_validation_tests {
+    use super::*;
+    use bridge::{BlockPath as WirePath, InsertSide, SelectionModifier};
+
+    /// `Engine::apply` has no internal `.await`; poll once (mirrors the
+    /// `fuzz-native` `block_on_ready`, available without the feature).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut fut = Box::pin(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("Engine::apply suspended in a native test"),
+        }
+    }
+
+    /// A real font + a cached layout config, exactly like
+    /// `test_engine_with_doc`: `selection_changed` reports geometry, which
+    /// needs both. Also what the shell re-seeds after a recovery.
+    fn seed_layout(e: &mut Engine) {
+        let bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("test-latin".to_string(), bytes).expect("parse test font");
+        e.fonts.insert("test-latin".to_string(), Arc::new(font));
+        e.layout_cfg = Some(RenderConfig {
+            font_id: "test-latin".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 16.0,
+            line_height: 26.0,
+            alignment: Alignment::Start,
+            scale: 1.0,
+            base_scale: 1.0,
+            zoom: 1.0,
+        });
+    }
+
+    fn engine_with(doc: DocumentTree, caret: BridgeLogicalPos) -> Engine {
+        let mut e = assemble_engine(None, None);
+        seed_layout(&mut e);
+        e.undo = UndoStack::new(doc, 100);
+        e.selection = Some(SelectionState {
+            anchor: caret.clone(),
+            caret,
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        e.review_date = "2026-01-01T00:00:00Z".into();
+        e
+    }
+
+    fn text_engine(text: &str) -> Engine {
+        engine_with(DocumentTree::from_text(text), bpos_top(0, 0))
+    }
+
+    /// `[Table 2×2, Paragraph "tail"]` with the caret in the paragraph.
+    fn table_engine() -> Engine {
+        let doc = DocumentTree::from_text("tail").insert_table(EngineBlockPath::top(0), 2, 2);
+        engine_with(doc, bpos_top(1, 0))
+    }
+
+    fn apply(e: &mut Engine, cmd: Command) -> Event {
+        block_on(e.apply(cmd))
+    }
+
+    fn text(e: &Engine) -> String {
+        e.undo.current().to_plain_text()
+    }
+
+    fn selection_valid(e: &Engine) -> bool {
+        match &e.selection {
+            None => true,
+            Some(sel) => e.with_selection_doc(|d| {
+                clamp_pos(d, sel.anchor.clone()) == sel.anchor
+                    && clamp_pos(d, sel.caret.clone()) == sel.caret
+            }),
+        }
+    }
+
+    fn bold_patch() -> TextAttrsPatch {
+        TextAttrsPatch {
+            bold: Some(true),
+            italic: None,
+            underline: None,
+            strike: None,
+            font_family: None,
+            font_size: None,
+            color: None,
+            bg_color: None,
+            script: None,
+            language: None,
+            caps: None,
+            small_caps: None,
+        }
+    }
+
+    fn range(a: BridgeLogicalPos, b: BridgeLogicalPos) -> BridgeLogicalRange {
+        BridgeLogicalRange { start: a, end: b }
+    }
+
+    fn table(e: &Engine) -> engine::Table {
+        e.undo.current().blocks[0].as_table().unwrap().clone()
+    }
+
+    const ARABIC: &str = "السلام"; // 12 bytes, six 2-byte letters
+
+    // ---- #117 selection -------------------------------------------------------
+
+    #[test]
+    fn set_selection_clamps_out_of_range_paths_and_offsets() {
+        let mut e = text_engine("hello world");
+        let far = BridgeLogicalPos {
+            path: WirePath::top(9),
+            offset: 1234,
+        };
+        let evt = apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(7, 99), far.clone()),
+                caret: far,
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(selection_valid(&e));
+        let sel = e.selection.clone().unwrap();
+        assert_eq!(sel.caret, bpos_top(0, 11));
+        assert_eq!(sel.anchor, bpos_top(0, 11));
+    }
+
+    #[test]
+    fn set_selection_snaps_mid_scalar_offsets_and_keeps_the_caret_end() {
+        let mut e = text_engine(ARABIC);
+        /* 1 is inside the first letter (→ 0), 3 inside the second (→ 2). */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(0, 1), bpos_top(0, 3)),
+                caret: bpos_top(0, 1),
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (2, 0));
+        assert!(selection_valid(&e));
+    }
+
+    /// #117 × #77 — the clamp runs FIRST (path + char boundary), then the
+    /// atomic-field widening sees only a resolvable position.
+    #[test]
+    fn set_selection_clamps_then_widens_over_fields() {
+        /* "ال" + field "12" at [4, 6) + "سلام". */
+        let doc = DocumentTree::from_text(ARABIC).insert_field_at(
+            engine::LogicalPos {
+                path: EngineBlockPath::top(0),
+                offset: 4,
+            },
+            "PAGE",
+            "12",
+        );
+        let mut e = engine_with(doc, bpos_top(0, 0));
+        /* start 1 is mid-scalar (→ 0); end 5 is inside the field (→ 6). */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(0, 1), bpos_top(0, 5)),
+                caret: bpos_top(0, 1),
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (6, 0));
+        assert!(selection_valid(&e));
+        /* A collapsed caret on a bogus path: the path falls back to the
+        last paragraph (offset kept, snapped), which lands inside the
+        field — so the clamped position is then widened over it. */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(3, 5), bpos_top(3, 5)),
+                caret: bpos_top(3, 5),
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!(sel.caret.path, WirePath::top(0));
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (4, 6));
+        assert!(selection_valid(&e));
+        /* A collapsed caret strictly inside the field selects it whole. */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(0, 5), bpos_top(0, 5)),
+                caret: bpos_top(0, 5),
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (4, 6));
+        /* ExtendSelection: clamp, then snap away from the anchor. */
+        apply(
+            &mut e,
+            Command::SetSelection {
+                range: range(bpos_top(0, 0), bpos_top(0, 0)),
+                caret: bpos_top(0, 0),
+            },
+        );
+        apply(
+            &mut e,
+            Command::ExtendSelection {
+                to: bpos_top(0, 5),
+                modifier: SelectionModifier::Shift,
+            },
+        );
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (0, 6));
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn extend_selection_clamps() {
+        let mut e = text_engine("hello");
+        let evt = apply(
+            &mut e,
+            Command::ExtendSelection {
+                to: bpos_top(5, 77),
+                modifier: SelectionModifier::Shift,
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(selection_valid(&e));
+        assert_eq!(e.selection.clone().unwrap().caret, bpos_top(0, 5));
+    }
+
+    #[test]
+    fn select_all_on_a_table_first_document_stays_valid() {
+        let mut e = table_engine();
+        apply(&mut e, Command::SelectAll);
+        assert!(
+            selection_valid(&e),
+            "{:?}",
+            e.selection.as_ref().map(|s| (&s.anchor, &s.caret))
+        );
+    }
+
+    #[test]
+    fn doc_home_on_a_table_first_document_lands_in_the_first_cell() {
+        let mut e = table_engine();
+        let evt = apply(
+            &mut e,
+            Command::MoveCaret {
+                direction: MoveDirection::DocHome,
+                extend: false,
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert!(selection_valid(&e));
+        let caret = e.selection.clone().unwrap().caret;
+        assert_eq!(caret.path.steps.len(), 3, "{:?}", caret.path.steps);
+        assert_eq!(caret.offset, 0);
+    }
+
+    // ---- #115 char boundaries ------------------------------------------------
+
+    #[test]
+    fn delete_range_snaps_mid_scalar_offsets() {
+        let cases: &[(u32, u32, &str)] = &[
+            (1, 3, &ARABIC[2..]), // → [0, 2): the first letter goes
+            (3, 3, ARABIC),       // empty after snapping
+            (1, 200, ""),         // end clamps to len
+            (5, 1, &ARABIC[4..]), // reversed + snapped → [0, 4)
+        ];
+        for &(s, en, expected) in cases {
+            let mut e = text_engine(ARABIC);
+            let evt = apply(
+                &mut e,
+                Command::DeleteRange {
+                    range: range(bpos_top(0, s), bpos_top(0, en)),
+                },
+            );
+            assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+            assert_eq!(text(&e), expected, "DeleteRange({s}, {en})");
+            assert!(selection_valid(&e));
+        }
+    }
+
+    #[test]
+    fn replace_range_snaps_and_lands_the_caret_after_the_replacement() {
+        let mut e = text_engine(ARABIC);
+        apply(
+            &mut e,
+            Command::ReplaceRange {
+                range: range(bpos_top(0, 1), bpos_top(0, 3)),
+                text: "X".into(),
+            },
+        );
+        assert_eq!(text(&e), format!("X{}", &ARABIC[2..]));
+        assert_eq!(e.selection.clone().unwrap().caret, bpos_top(0, 1));
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn apply_formatting_with_an_explicit_mid_scalar_range_snaps() {
+        let mut e = text_engine(ARABIC);
+        let evt = apply(
+            &mut e,
+            Command::ApplyFormatting {
+                range: Some(range(bpos_top(0, 1), bpos_top(0, 5))),
+                attrs: bold_patch(),
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        let p = e.undo.current().blocks[0].as_paragraph().unwrap().clone();
+        assert_eq!((p.spans[0].start, p.spans[0].end), (0, 4));
+    }
+
+    #[test]
+    fn explicit_range_edits_on_a_missing_paragraph_are_typed_errors() {
+        let mut e = text_engine("hello");
+        let depth = e.undo.depth();
+        let bogus = range(bpos_top(5, 0), bpos_top(5, 2));
+        for cmd in [
+            Command::DeleteRange {
+                range: bogus.clone(),
+            },
+            Command::ReplaceRange {
+                range: bogus.clone(),
+                text: "x".into(),
+            },
+            Command::ApplyFormatting {
+                range: Some(bogus.clone()),
+                attrs: bold_patch(),
+            },
+            Command::InsertComment {
+                range: bogus,
+                text: "c".into(),
+                author: "a".into(),
+            },
+        ] {
+            let evt = apply(&mut e, cmd);
+            assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        }
+        e.selection = None;
+        let evt = apply(&mut e, Command::SplitParagraph { at: bpos_top(3, 0) });
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(text(&e), "hello");
+        assert_eq!(
+            e.undo.depth(),
+            depth,
+            "a rejected command pushes no undo step"
+        );
+    }
+
+    #[test]
+    fn interactive_insert_with_a_stale_caret_seed_is_clamped() {
+        let mut e = text_engine(ARABIC);
+        e.selection = None;
+        let evt = apply(
+            &mut e,
+            Command::InsertText {
+                at: Some(bpos_top(4, 3)),
+                text: "x".into(),
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(text(&e), format!("{}x{}", &ARABIC[..2], &ARABIC[2..]));
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn composition_overlays_shift_with_the_spliced_preview() {
+        /* "ورحمة " — a revision over the trailing space [10, 11). With a
+        2-byte composition at 6, the space sits at [12, 13) in the
+        spliced text; the old unshifted overlay cut at 11, inside 'ة'. */
+        let para = engine::Paragraph {
+            text: "ورحمة ".into(),
+            revisions: vec![engine::Revision {
+                start: 10,
+                end: 11,
+                kind: engine::RevisionKind::Insert,
+                author: "a".into(),
+                date: "d".into(),
+                id: None,
+                prev_attrs: None,
+            }],
+            hyperlinks: vec![
+                engine::Hyperlink {
+                    start: 0,
+                    end: 6,
+                    target: "x".into(),
+                },
+                engine::Hyperlink {
+                    start: 2,
+                    end: 8,
+                    target: "y".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let (links, revs) = composition_overlay_ranges(&para, 6, 2);
+        assert_eq!((revs[0].start, revs[0].end), (12, 13));
+        assert_eq!(
+            (links[0].start, links[0].end),
+            (0, 6),
+            "ends at off: stays before"
+        );
+        assert_eq!(
+            (links[1].start, links[1].end),
+            (2, 10),
+            "straddles: covers it"
+        );
+    }
+
+    #[test]
+    fn undo_with_a_failing_repaint_still_clamps_the_selection() {
+        let mut e = text_engine("hello");
+        apply(&mut e, Command::SplitParagraph { at: bpos_top(0, 5) });
+        assert_eq!(e.selection.clone().unwrap().caret, bpos_top(1, 0));
+        /* An unloaded font makes every repaint fail. */
+        if let Some(cfg) = e.layout_cfg.as_mut() {
+            cfg.font_id = "missing".into();
+        }
+        let evt = apply(&mut e, Command::Undo);
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert!(
+            selection_valid(&e),
+            "{:?}",
+            e.selection.as_ref().map(|s| &s.caret)
+        );
+    }
+
+    #[test]
+    fn insert_image_shifts_the_caret_past_the_sentinel() {
+        let mut e = text_engine("hello");
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(0, 1),
+            caret: bpos_top(0, 4),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        /* `at` names no paragraph → the image lands in the last one. */
+        let evt = apply(
+            &mut e,
+            Command::InsertImage {
+                at: bpos_top(7, 3),
+                image: bridge::ImageBlob {
+                    bytes: vec![0x89, b'P', b'N', b'G'],
+                    mime: "image/png".into(),
+                    width: 10,
+                    height: 10,
+                },
+                fit: ImageFit::Original,
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        let sel = e.selection.clone().unwrap();
+        assert_eq!((sel.anchor.offset, sel.caret.offset), (1, 7));
+        assert!(selection_valid(&e));
+    }
+
+    // ---- #114 / #116 tables --------------------------------------------------
+
+    #[test]
+    fn insert_table_rejects_oversized_or_empty_dimensions() {
+        let mut e = text_engine("x");
+        let depth = e.undo.depth();
+        for (rows, cols) in [
+            (u32::MAX, u32::MAX),
+            (0, 3),
+            (3, 0),
+            (1, 64),
+            (32_768, 1),
+            (2_000, 63),
+        ] {
+            let evt = apply(
+                &mut e,
+                Command::InsertTable {
+                    at: WirePath::top(0),
+                    rows,
+                    cols,
+                },
+            );
+            assert!(matches!(evt, Event::Error { .. }), "{rows}x{cols}: {evt:?}");
+        }
+        assert_eq!(e.undo.depth(), depth);
+        assert_eq!(e.undo.current().blocks.len(), 1);
+        let evt = apply(
+            &mut e,
+            Command::InsertTable {
+                at: WirePath::top(0),
+                rows: 2,
+                cols: 3,
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert_eq!(e.undo.current().blocks.len(), 2);
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn table_commands_reject_out_of_range_targets_without_side_effects() {
+        let mut e = table_engine();
+        let depth = e.undo.depth();
+        let before = table(&e);
+        let t = WirePath::top(0);
+        let cmds = vec![
+            Command::InsertRow {
+                table_path: t.clone(),
+                row: 2,
+                side: InsertSide::Before,
+            },
+            Command::DeleteRow {
+                table_path: t.clone(),
+                row: 5,
+            },
+            Command::InsertColumn {
+                table_path: t.clone(),
+                col: 2,
+                side: InsertSide::After,
+            },
+            Command::DeleteColumn {
+                table_path: t.clone(),
+                col: 9,
+            },
+            Command::MergeCells {
+                table_path: t.clone(),
+                from_row: 0,
+                from_col: 0,
+                to_row: 5,
+                to_col: 5,
+            },
+            Command::MergeCells {
+                table_path: t.clone(),
+                from_row: 1,
+                from_col: 2,
+                to_row: 0,
+                to_col: 0,
+            },
+            Command::SplitCell {
+                table_path: t.clone(),
+                row: 3,
+                col: 0,
+            },
+            Command::SetCellShading {
+                table_path: t.clone(),
+                row: 0,
+                col: 7,
+                color: None,
+            },
+            Command::SetCellBorders {
+                table_path: t.clone(),
+                row: 1,
+                col: 2,
+                borders: bridge::BridgeCellBorders::default(),
+            },
+            /* Wrong kind of block / nothing there. */
+            Command::DeleteTable {
+                path: WirePath::top(1),
+            },
+            Command::DeleteRow {
+                table_path: WirePath::top(9),
+                row: 0,
+            },
+            Command::SetCellShading {
+                table_path: WirePath::root(),
+                row: 0,
+                col: 0,
+                color: None,
+            },
+        ];
+        for cmd in cmds {
+            let label = format!("{cmd:?}");
+            let evt = apply(&mut e, cmd);
+            assert!(matches!(evt, Event::Error { .. }), "{label}: {evt:?}");
+        }
+        assert_eq!(
+            e.undo.depth(),
+            depth,
+            "rejected table commands push no undo step"
+        );
+        assert_eq!(table(&e).rows.len(), before.rows.len());
+        assert_eq!(e.undo.current().blocks.len(), 2);
+        assert!(selection_valid(&e));
+    }
+
+    #[test]
+    fn table_commands_accept_in_range_targets() {
+        let mut e = table_engine();
+        let t = WirePath::top(0);
+        let ok = |e: &mut Engine, cmd: Command| {
+            let label = format!("{cmd:?}");
+            let evt = apply(e, cmd);
+            assert!(
+                matches!(evt, Event::SelectionChanged { .. }),
+                "{label}: {evt:?}"
+            );
+            assert!(selection_valid(e));
+        };
+        ok(
+            &mut e,
+            Command::InsertRow {
+                table_path: t.clone(),
+                row: 1,
+                side: InsertSide::After,
+            },
+        );
+        assert_eq!(table(&e).rows.len(), 3);
+        ok(
+            &mut e,
+            Command::InsertColumn {
+                table_path: t.clone(),
+                col: 0,
+                side: InsertSide::Before,
+            },
+        );
+        assert_eq!(table(&e).column_count(), 3);
+        ok(
+            &mut e,
+            Command::MergeCells {
+                table_path: t.clone(),
+                from_row: 0,
+                from_col: 0,
+                to_row: 1,
+                to_col: 1,
+            },
+        );
+        ok(
+            &mut e,
+            Command::SplitCell {
+                table_path: t.clone(),
+                row: 0,
+                col: 0,
+            },
+        );
+        ok(
+            &mut e,
+            Command::SetCellShading {
+                table_path: t.clone(),
+                row: 2,
+                col: 2,
+                color: None,
+            },
+        );
+        ok(
+            &mut e,
+            Command::DeleteRow {
+                table_path: t.clone(),
+                row: 0,
+            },
+        );
+        ok(
+            &mut e,
+            Command::DeleteColumn {
+                table_path: t.clone(),
+                col: 0,
+            },
+        );
+        ok(&mut e, Command::DeleteTable { path: t });
+        assert_eq!(e.undo.current().blocks.len(), 1);
+    }
+
+    #[test]
+    fn insert_row_and_column_respect_the_growth_caps() {
+        let doc = DocumentTree::from_text("tail").insert_table(
+            EngineBlockPath::top(0),
+            1,
+            engine::MAX_TABLE_COLS,
+        );
+        let mut e = engine_with(doc, bpos_top(1, 0));
+        let evt = apply(
+            &mut e,
+            Command::InsertColumn {
+                table_path: WirePath::top(0),
+                col: 0,
+                side: InsertSide::After,
+            },
+        );
+        assert!(matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(table(&e).column_count(), engine::MAX_TABLE_COLS as usize);
+    }
+
+    // ---- #118 clock ---------------------------------------------------------------
+
+    #[test]
+    fn iso8601_formatting_matches_js_to_iso_string() {
+        assert_eq!(format_iso8601_utc(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_iso8601_utc(951_782_400, 7),
+            "2000-02-29T00:00:00.007Z"
+        );
+        assert_eq!(
+            format_iso8601_utc(1_700_000_000, 123),
+            "2023-11-14T22:13:20.123Z"
+        );
+        assert_eq!(
+            format_iso8601_utc(4_102_444_799, 999),
+            "2099-12-31T23:59:59.999Z"
+        );
+        let now = now_iso8601();
+        assert_eq!(now.len(), 24, "{now}");
+        assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
+    }
+
+    #[test]
+    fn comments_and_replies_run_natively_through_the_engine_clock() {
+        let mut e = text_engine("hello world");
+        e.review_date = String::new(); // force the clock fallback
+        let evt = apply(
+            &mut e,
+            Command::InsertComment {
+                range: range(bpos_top(0, 0), bpos_top(0, 5)),
+                text: "note".into(),
+                author: "me".into(),
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        let defs = e.undo.current().comment_defs.clone();
+        assert_eq!(defs.len(), 1);
+        let date = &defs.values().next().unwrap().date;
+        assert_eq!(date.len(), 24, "{date}");
+        let evt = apply(
+            &mut e,
+            Command::ReplyToComment {
+                parent_id: 1,
+                text: "reply".into(),
+                author: "you".into(),
+            },
+        );
+        assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+        assert_eq!(e.undo.current().comment_defs.len(), 2);
+        /* The override still wins when set. */
+        e.review_date = "2026-01-01T00:00:00Z".into();
+        apply(
+            &mut e,
+            Command::InsertComment {
+                range: range(bpos_top(0, 6), bpos_top(0, 11)),
+                text: "n2".into(),
+                author: "me".into(),
+            },
+        );
+        assert!(
+            e.undo
+                .current()
+                .comment_defs
+                .values()
+                .any(|d| d.date == "2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn recover_then_tracked_edit_stamps_natively() {
+        let mut e = text_engine("seed");
+        let evt = apply(
+            &mut e,
+            Command::Recover {
+                snapshot: Vec::new(),
+                log_tail: Vec::new(),
+            },
+        );
+        assert!(matches!(evt, Event::Recovered { .. }), "{evt:?}");
+        assert!(
+            e.review_date.is_empty(),
+            "recovery re-arms the clock fallback"
+        );
+        /* The shell re-loads fonts + re-asserts the device scale after a
+        recovery (`setupEngine(restored = true)`); mirror that. */
+        seed_layout(&mut e);
+        apply(&mut e, Command::ToggleTrackChanges { enabled: true });
+        let evt = apply(
+            &mut e,
+            Command::InsertText {
+                at: Some(bpos_top(0, 0)),
+                text: "abc".into(),
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        assert_eq!(text(&e), "abc");
+        assert!(selection_valid(&e));
     }
 }

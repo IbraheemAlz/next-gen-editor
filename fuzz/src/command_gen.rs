@@ -21,76 +21,26 @@
 use arbitrary::{Arbitrary, Unstructured};
 use bridge::{
     Alignment, BlockPath, BridgeCellBorders, Command, Direction, FieldKind, HeaderFooterArea,
-    InsertSide, ListKind, LogicalPos, LogicalRange, MoveDirection, SectionBreakKind,
+    ImageBlob, ImageFit, ImageWrapMode, InsertSide, ListKind, LogicalPos, LogicalRange, MoveDirection, SectionBreakKind,
     SelectionModifier, TextAttrsPatch, UnderlineStyle,
 };
 
-/// `engine::DocumentTree::insert_table` (`crates/engine/src/lib.rs`) does
-/// `Vec::with_capacity(rows.max(1))` of rows each doing
-/// `Vec::with_capacity(cols)` of cells, with NO upper bound on the
-/// wire-supplied `rows` / `cols` (`u32`) before either allocation (D5.5,
-/// issue #90 finding). Two large-but-plausible `u32`s (the derived
-/// `Arbitrary` impl happily produces values near `u32::MAX`) multiply into
-/// a multi-gigabyte-to-terabyte allocation request that ABORTS THE PROCESS
-/// via Rust's default OOM handler — not a panic, so
-/// `std::panic::catch_unwind` cannot save a caller from it (confirmed:
-/// this crashed `examples/smoke.rs` outright on iteration 1 before this
-/// clamp was added). This is a real, reproducible, unbounded-allocation
-/// DoS reachable directly from the untrusted RPC `Command` surface — see
-/// the PR description for the full writeup and a minimal repro. Clamped
-/// in `sanitize` (below) to keep a fuzzing SESSION alive long enough to
-/// find other bugs too, not to hide this one: `rows` / `cols` still cross
-/// realistic small-table boundaries (0, 1, a few dozen), just not far
-/// enough to OOM the harness on every single run.
-const MAX_TABLE_DIM: u32 = 40;
-
-/// Three commands are known, reproducible native-only dead ends (D5.5,
-/// issue #90 finding) — all three eventually reach a raw `js_sys::Date`
-/// call, which panics with "cannot call wasm-bindgen imported functions on
-/// non-wasm targets" outside a browser:
-///
-/// - `Command::InsertComment` / `ReplyToComment` — `do_insert_comment` /
-///   `do_reply_to_comment` call `js_sys::Date::new_0()` directly, unlike
-///   every OTHER timestamp site, which goes through
-///   `Engine::current_review_date`'s `review_date` override. Filtered to
-///   `Ping` — there is no field on either command that routes around it.
-/// - `Command::Recover` — `do_recover` (the cold-reset stub;
-///   `Command::Recover` is documented as still a stub in `CLAUDE.md`)
-///   unconditionally resets `review_date` to `""`, re-arming
-///   `current_review_date`'s `js_sys::Date` fallback for the next
-///   tracked-mutation command. `Recover`'s own fields (`snapshot`,
-///   `log_tail`) don't control `review_date`, so — unlike
-///   `SetReviewIdentity` below — there's no field-level fix; filtered to
-///   `Ping` as well.
-/// - `Command::SetReviewIdentity { date: "" }` — same `review_date` reset,
-///   but THIS command's own `date` field is exactly what's empty, so it's
-///   patched to a placeholder instead of filtered outright: `author` and a
-///   non-empty `date` are still real, exercised values.
-///
-/// None of this is a real product bug — a real browser session always has
-/// `Date` available — it's this harness's no-browser constraint. See the
-/// PR description for the full writeup.
-fn sanitize(cmd: Command) -> Command {
-    match cmd {
-        Command::InsertComment { .. }
-        | Command::ReplyToComment { .. }
-        | Command::Recover { .. } => Command::Ping,
-        Command::InsertTable { at, rows, cols } => Command::InsertTable {
-            at,
-            rows: rows.min(MAX_TABLE_DIM),
-            cols: cols.min(MAX_TABLE_DIM),
-        },
-        Command::SetReviewIdentity { author, date } => Command::SetReviewIdentity {
-            author,
-            date: if date.is_empty() {
-                "2026-01-01T00:00:00Z".to_string()
-            } else {
-                date
-            },
-        },
-        other => other,
-    }
-}
+// No `sanitize` pass any more. The #90 sweep originally needed one for two
+// classes of workaround, both of which are now enforced by the engine
+// itself and therefore MUST reach `Engine::apply_sync` unfiltered:
+//
+// - `Command::InsertTable { rows, cols }` was clamped to 40 × 40 because
+//   `DocumentTree::insert_table` allocated `rows × cols` cells from the raw
+//   wire `u32`s and a single command could abort the process (issue #114).
+//   The engine now rejects anything past Word's 63-column / 32 767-row
+//   limits (and a cell-count cap) with a typed `Event::Error` BEFORE
+//   allocating, so the blind `Arbitrary` half is free to hammer the full
+//   `u32` range — that is exactly the regression this target must catch.
+// - `InsertComment` / `ReplyToComment` / `Recover` were replaced by `Ping`
+//   (and an empty `SetReviewIdentity.date` patched) because they reached
+//   `js_sys::Date` directly, which panics off-wasm (issue #118). Every
+//   timestamp now goes through one native-safe clock, so the comment and
+//   recovery paths are in the sweep.
 
 /// A short, bounded seed string for `DocumentTree::from_text` — plain text
 /// only (no XML), so this stays independent of `docx_gen`'s schema-shaped
@@ -361,19 +311,81 @@ fn gen_field_command(u: &mut Unstructured) -> Option<Command> {
     })
 }
 
+/// Issue #80 notes — insert a footnote / endnote at a curated position
+/// (which ENTERS the new note story), or leave the story again. Paired so
+/// the story-aware selection / edit paths see real note stories, not just
+/// the blind half's rarely-well-formed positions.
+fn gen_note_command(u: &mut Unstructured) -> Option<Command> {
+    Some(match small(u, 2) {
+        0 => Command::InsertFootnote { at: pos(u) },
+        1 => Command::InsertEndnote { at: pos(u) },
+        _ => Command::ExitHeaderFooter,
+    })
+}
+
+/// Inline images + issue #82 text wrap. `InsertImage` lands a real
+/// image (tiny placeholder bytes — the native harness never decodes
+/// them; dimensions from tiny to `u32`-scale to stress the EMU math and
+/// the wrap geometry), then `SetImageWrap` addresses it by paragraph
+/// path + byte offset — curated so it actually hits an image often,
+/// with every wrap mode, instead of only the blind half's reject path.
+fn gen_image_command(u: &mut Unstructured) -> Option<Command> {
+    Some(match small(u, 2) {
+        0 => Command::InsertImage {
+            at: pos(u),
+            image: ImageBlob {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                mime: "image/png".to_string(),
+                width: if u.ratio(1, 8).unwrap_or(false) {
+                    u32::arbitrary(u).ok()?
+                } else {
+                    small(u, 2000)
+                },
+                height: if u.ratio(1, 8).unwrap_or(false) {
+                    u32::arbitrary(u).ok()?
+                } else {
+                    small(u, 2000)
+                },
+            },
+            fit: *u
+                .choose(&[ImageFit::Original, ImageFit::FitWidth, ImageFit::FitPage])
+                .ok()?,
+        },
+        _ => {
+            let at = pos(u);
+            Command::SetImageWrap {
+                path: at.path,
+                at: at.offset,
+                wrap: *u
+                    .choose(&[
+                        ImageWrapMode::Square,
+                        ImageWrapMode::Tight,
+                        ImageWrapMode::Through,
+                        ImageWrapMode::TopAndBottom,
+                        ImageWrapMode::BehindText,
+                        ImageWrapMode::InFrontOfText,
+                    ])
+                    .ok()?,
+            }
+        }
+    })
+}
+
 /// Build a sequence of up to `max_len` commands, mixing:
 /// - ~40% curated, small-bounded commands (`gen_targeted_command`) —
 ///   insert / delete / format / table / section / story, per issue #90.
 /// - ~15% selection / undo / caret motion (`gen_selection_command`).
-/// - ~5% field authoring (`gen_field_command`).
-/// - ~40% blind `Command::arbitrary` — full wire-schema breadth, including
+/// - ~3% field authoring (`gen_field_command`).
+/// - ~4% footnotes / endnotes (`gen_note_command`, issue #80).
+/// - ~5% images + wrap (`gen_image_command`, issue #82).
+/// - ~33% blind `Command::arbitrary` — full wire-schema breadth, including
 ///   variants the curated generator never touches (`LoadDocx`, `Recover`,
 ///   `SaveDocument`, viewport / zoom / IME commands, …) and out-of-range
 ///   addresses that stress the reject paths.
 ///
-/// Every command passes through `sanitize` before being pushed, so the two
-/// native-only-panicking comment variants never reach `Engine::apply_sync`
-/// (see `sanitize`'s doc comment).
+/// Nothing is filtered or clamped on the way out (see the note above where
+/// `sanitize` used to live): every generated command reaches
+/// `Engine::apply_sync` exactly as the wire would deliver it.
 pub fn gen_command_sequence(u: &mut Unstructured, max_len: usize) -> Vec<Command> {
     let mut out = Vec::new();
     for _ in 0..max_len {
@@ -384,14 +396,16 @@ pub fn gen_command_sequence(u: &mut Unstructured, max_len: usize) -> Vec<Command
         let cmd = match bucket {
             0..=39 => gen_targeted_command(u),
             40..=54 => gen_selection_command(u),
-            55..=59 => gen_field_command(u),
+            55..=57 => gen_field_command(u),
+            58..=61 => gen_note_command(u),
+            62..=66 => gen_image_command(u),
             // Blind, full-schema coverage — `Arbitrary::arbitrary` only
             // consumes what it needs from `u`, so the byte stream still has
             // entropy left for further loop iterations afterward.
             _ => Command::arbitrary(u).ok(),
         };
         let Some(cmd) = cmd else { break };
-        out.push(sanitize(cmd));
+        out.push(cmd);
         if u.is_empty() {
             break;
         }
