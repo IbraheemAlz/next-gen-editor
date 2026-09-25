@@ -355,6 +355,7 @@ impl DocumentTree {
             if same_result(&old, &fresh) {
                 continue;
             }
+            let inserted = fresh.len() as u32;
             let mut blocks = doc.blocks.clone();
             for _ in r.first..=r.last {
                 blocks.remove(r.first as usize);
@@ -363,6 +364,9 @@ impl DocumentTree {
                 blocks.insert(r.first as usize + k, Block::Paragraph(p));
             }
             doc.blocks = blocks;
+            /* Issue #152 — the result grew / shrank: blocks after it
+            moved, anchors inside it land on the fresh result. */
+            doc.remap_block_splice(&[], r.first, r.last - r.first + 1, inserted);
             changed = true;
         }
         (doc, changed)
@@ -574,6 +578,9 @@ impl DocumentTree {
         let at_idx = (insert_at as usize).min(blocks.len());
         blocks.insert(at_idx, Block::Paragraph(stub));
         doc.blocks = blocks;
+        /* Issue #152 — the stub is a new block (the split above already
+        remapped through `split_paragraph`). */
+        doc.remap_block_indices(at_idx as u32, 1);
         Some((doc, at_idx as u32))
     }
 
@@ -1011,6 +1018,63 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Issue #152 — inserting (and regenerating, growing and shrinking)
+    /// a TOC above a commented paragraph keeps the comment on it.
+    #[test]
+    fn toc_insertion_and_regeneration_keep_comments_on_their_paragraph() {
+        let mut doc = DocumentTree::from_text("");
+        doc.blocks = vec![
+            heading("Alpha", 1),
+            body("commented body"),
+            heading("Beta", 1),
+        ]
+        .into_iter()
+        .map(Block::Paragraph)
+        .collect();
+        let (doc, _) = doc.insert_comment(
+            LogicalPos::new(BlockPath::top(1), 0),
+            LogicalPos::new(BlockPath::top(1), 9),
+            "c".into(),
+            "A".into(),
+            "d".into(),
+        );
+        let covered = |d: &DocumentTree| {
+            let r = &d.comment_ranges[0];
+            d.text_range(r.start.clone(), r.end.clone())
+        };
+        assert_eq!(covered(&doc), "commented");
+        let (stub, at) = doc
+            .insert_toc_at(
+                &LogicalPos::new(BlockPath::top(0), 0),
+                &TocSwitches::default(),
+            )
+            .unwrap();
+        assert_eq!(at, 0);
+        assert_eq!(covered(&stub), "commented");
+        /* Stub (1 block) → heading + two entries: the result grows. */
+        let (grown, changed) = stub.regenerate_tocs(&|_| Some("1".into()));
+        assert!(changed);
+        assert!(grown.blocks.len() > stub.blocks.len());
+        assert_eq!(covered(&grown), "commented");
+        /* Drop a heading and regenerate: the result shrinks. */
+        let last = grown.blocks.len() - 1;
+        let mut fewer = grown.clone();
+        fewer.blocks.remove(last);
+        let (shrunk, changed) = fewer.regenerate_tocs(&|_| Some("1".into()));
+        assert!(changed);
+        assert!(shrunk.blocks.len() < fewer.blocks.len());
+        assert_eq!(covered(&shrunk), "commented");
+        /* Mid-paragraph insertion splits the caret paragraph first. */
+        let (split, at) = doc
+            .insert_toc_at(
+                &LogicalPos::new(BlockPath::top(0), 2),
+                &TocSwitches::default(),
+            )
+            .unwrap();
+        assert_eq!(at, 1);
+        assert_eq!(covered(&split), "commented");
     }
 
     #[test]

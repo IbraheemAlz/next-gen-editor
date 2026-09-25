@@ -58,6 +58,7 @@
 use im::Vector;
 use serde::{Deserialize, Serialize};
 
+mod block_remap;
 pub mod fields;
 pub mod html;
 pub mod numbering;
@@ -7991,7 +7992,7 @@ impl DocumentTree {
         let (left, right) = p.split_at(at.offset);
         replace_block_in_top(&mut blocks, &at.path, Block::Paragraph(left));
         insert_block_after_path_in_top(&mut blocks, &at.path, Block::Paragraph(right));
-        Self {
+        let mut split = Self {
             blocks,
             body_section: self.body_section.clone(),
             headers: self.headers.clone(),
@@ -8016,8 +8017,11 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
-        }
-        .with_list_markers_refreshed()
+        };
+        /* Issue #152 — the right half is a new block: comment anchors
+        behind the split point (and in every later block) follow it. */
+        split.remap_paragraph_split(&at.path, p.snap_offset(at.offset));
+        split.with_list_markers_refreshed()
     }
 
     /// Insert `text` at `at`, splitting it into separate paragraphs on every
@@ -8579,7 +8583,7 @@ impl DocumentTree {
         if needs_trailing {
             blocks.insert(insert_at + 1, Block::Paragraph(Paragraph::default()));
         }
-        Self {
+        let mut out = Self {
             blocks,
             body_section: self.body_section.clone(),
             headers: self.headers.clone(),
@@ -8604,7 +8608,11 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
-        }
+        };
+        /* Issue #152 — the table (+ its escape paragraph) slid every
+        later block down: keep comment anchors on their paragraphs. */
+        out.remap_block_indices(insert_at as u32, 1 + i64::from(needs_trailing));
+        out
     }
 
     /// Delete the table at `at.steps[0]` (top-level only at PR 3).
@@ -8614,10 +8622,11 @@ impl DocumentTree {
             None => return self.clone(),
         };
         let mut blocks = self.blocks.clone();
-        if idx < blocks.len() && matches!(blocks[idx], Block::Table(_)) {
+        let removed = idx < blocks.len() && matches!(blocks[idx], Block::Table(_));
+        if removed {
             blocks.remove(idx);
         }
-        Self {
+        let mut out = Self {
             blocks,
             body_section: self.body_section.clone(),
             headers: self.headers.clone(),
@@ -8642,7 +8651,12 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+        };
+        /* Issue #152 — later blocks slid up by one. */
+        if removed {
+            out.remap_block_indices(idx as u32, -1);
         }
+        out
     }
 
     /// Insert a fresh row at `at` (`at` is the index the new row will

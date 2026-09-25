@@ -24246,6 +24246,9 @@ mod a11y_note_tests;
 mod part_media_tests;
 
 #[cfg(test)]
+mod block_remap_tests;
+
+#[cfg(test)]
 mod wire_validation_tests {
     use super::*;
     use bridge::{BlockPath as WirePath, InsertSide, SelectionModifier};
