@@ -233,7 +233,8 @@ export interface EditorCommands {
      *  selection into the story; `state.editingStory()` flips truthy. */
     enterHeaderFooter(page: number, area: HeaderFooterArea): Promise<Event>;
     /** Phase 3 (#39) — leave header/footer editing; the stashed body
-     *  selection is restored (clamped). */
+     *  selection is restored (clamped). Issue #80: also leaves a
+     *  footnote / endnote story. */
     exitHeaderFooter(): Promise<Event>;
     /** Issue #70 — Word's "Link to Previous" for the ACTIVE story's
      *  slot: `false` forks a private copy owned by the story's
@@ -262,6 +263,16 @@ export interface EditorCommands {
      *  update (Word parity). `at` defaults to the live caret; pass
      *  `fieldAtCaret().end` to address a field explicitly. */
     setFieldInstruction(instruction: string, at?: LogicalPos): Promise<Event>;
+    /** Issue #80 — author a footnote referenced at the caret (body
+     *  paragraphs only; the engine rejects table cells and story
+     *  carets with `Event::Error`). The engine splices the reference,
+     *  renumbers every later marker and ENTERS the new note, so
+     *  `state.editingStory()?.area` becomes `'Footnote'`;
+     *  `exitHeaderFooter()` returns to the body after the reference. */
+    insertFootnote(at?: LogicalPos): Promise<Event>;
+    /** Issue #80 — endnote twin of `insertFootnote`; endnotes collect
+     *  at section / document end per `<w:endnotePr><w:pos>`. */
+    insertEndnote(at?: LogicalPos): Promise<Event>;
     setParagraphBorders(
         borders: BridgeCellBorders,
         range?: LogicalRange,
@@ -608,6 +619,10 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
                 at: at ?? currentCaret(),
                 instruction,
             }),
+        insertFootnote: (at) =>
+            dispatch({ type: 'INSERT_FOOTNOTE', at: at ?? currentCaret() }),
+        insertEndnote: (at) =>
+            dispatch({ type: 'INSERT_ENDNOTE', at: at ?? currentCaret() }),
         setParagraphBorders: (borders, range) =>
             dispatch({
                 type: 'SET_PARAGRAPH_BORDERS',

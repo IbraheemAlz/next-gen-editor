@@ -21,7 +21,13 @@ import type { EngineStore } from '../state/engine-store';
 
 export function StoryModeOverlay(props: { store: EngineStore; pageIdx: number }) {
     const dpr = () => window.devicePixelRatio || 1;
-    const story = () => props.store.editingStory();
+    /* Issue #80 — note stories live in the body's own page flow (Word
+       never dims the text around a footnote being edited); only the
+       margin-band stories get the dim + chip treatment. */
+    const story = () => {
+        const s = props.store.editingStory();
+        return s && (s.area === 'Header' || s.area === 'Footer') ? s : undefined;
+    };
     const marginTopCss = () => {
         const t = props.store.marginGeometry()?.tops[props.pageIdx];
         return t !== undefined ? t / dpr() : undefined;

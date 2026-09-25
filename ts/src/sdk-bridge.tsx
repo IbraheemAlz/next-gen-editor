@@ -49,6 +49,7 @@ import {
     InsertTableButton,
     HeaderFooterButtons,
     FieldButtons,
+    NoteButtons,
     HistoryButtons,
     CapsButtons,
 } from '@nge/ui';
@@ -107,6 +108,7 @@ export const SdkShelf: Component<SdkShelfProps> = (props) => {
                         <InsertTableButton />
                         <HeaderFooterButtons />
                         <FieldButtons />
+                        <NoteButtons />
                         <LayoutControls />
                         <ReviewControls />
                     </div>
