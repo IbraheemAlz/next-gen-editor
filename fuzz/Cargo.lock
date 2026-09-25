@@ -407,6 +407,7 @@ dependencies = [
  "flate2",
  "layout",
  "pdf-writer",
+ "png",
  "text-pipeline",
 ]
 

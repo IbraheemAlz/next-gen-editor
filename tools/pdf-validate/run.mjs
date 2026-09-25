@@ -174,6 +174,13 @@ function structuralMarkers(pdf) {
         'document /ID': body.includes('/ID'),
         'EOF marker': body.trimEnd().endsWith('%%EOF'),
     };
+    /* Issue #121 — image XObjects. PDF/A-1b (ISO 19005-1 §6.4) and
+       PDF/X-3:2003 forbid transparency, so format-pdf flattens PNG alpha
+       onto white there and must never emit an /SMask; PDF/A-1 also bans
+       JPEG 2000 (/JPXDecode). Vacuously true for image-free documents. */
+    const noTransparency = {
+        'no image /SMask (transparency)': !body.includes('/SMask'),
+    };
     switch (profile) {
         case '1b':
             return {
@@ -181,6 +188,8 @@ function structuralMarkers(pdf) {
                 'GTS_PDFA1 subtype': body.includes('GTS_PDFA1'),
                 'XMP pdfaid:part': body.includes('pdfaid:part>1'),
                 'XMP pdfaid:conformance': body.includes('pdfaid:conformance>B'),
+                'no JPEG 2000 (/JPXDecode)': !body.includes('/JPXDecode'),
+                ...noTransparency,
                 ...common,
             };
         case '2u':
@@ -201,6 +210,7 @@ function structuralMarkers(pdf) {
                 'Info /Trapped': body.includes('/Trapped /False'),
                 'Info dates': body.includes('/CreationDate') && body.includes('/ModDate'),
                 'per-page TrimBox': body.includes('/TrimBox'),
+                ...noTransparency,
                 ...common,
             };
         /* Unreachable — PROFILES gates the flag upfront. */

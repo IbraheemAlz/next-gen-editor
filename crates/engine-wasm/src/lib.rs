@@ -8354,12 +8354,27 @@ impl Engine {
         }
         para_texts.extend(tb_texts.iter().map(String::as_str));
         let mut bytes: Vec<u8> = Vec::new();
-        if let Err(e) =
-            format_pdf::export_pdf(&pages, &font_stack, &para_texts, profile, &mut bytes)
-        {
-            return Event::Error {
-                message: format!("ExportPdf: {e}"),
-            };
+        /* Issue #121 — images embed from the document's media parts. A
+        skipped image (missing / Tier-3 format / corrupt) is a console
+        warning, never a failed export. */
+        match format_pdf::export_pdf_with_media(
+            &pages,
+            &font_stack,
+            &para_texts,
+            &doc.media,
+            profile,
+            &mut bytes,
+        ) {
+            Ok(report) => {
+                for w in &report.warnings {
+                    warn_console(&format!("ExportPdf: {w:?}"));
+                }
+            }
+            Err(e) => {
+                return Event::Error {
+                    message: format!("ExportPdf: {e}"),
+                };
+            }
         }
         let pages_count = pages.len() as u32;
         Event::PdfExported {
@@ -17629,6 +17644,71 @@ mod tests {
             });
         }
         doc
+    }
+
+    /// Issue #121 — `ExportPdf` embeds the document's media parts: an
+    /// inline PNG with alpha, an inline JPEG and a behind-text floating
+    /// JPEG become three image XObjects. PDF/A-2u keeps the PNG alpha as
+    /// an `/SMask` (a fourth image object); PDF/A-1b flattens it and
+    /// carries no `/SMask` at all.
+    #[test]
+    fn export_pdf_embeds_inline_and_floating_images() {
+        use format_pdf::test_images;
+        /* Byte offsets: 'a' 0, U+FFFC 1..4, 'b' 4, U+FFFC 5..8, 'c' 8,
+        U+FFFC 9..12, 'd' 12. */
+        let mut doc = DocumentTree::from_text("a\u{FFFC}b\u{FFFC}c\u{FFFC}d");
+        let image =
+            |at: u32, rel: &str, anchor: Option<Box<engine::FloatAnchor>>| engine::InlineObject {
+                at,
+                kind: engine::InlineKind::Image {
+                    rel_id: rel.to_string(),
+                    width_emu: 457_200,
+                    height_emu: 228_600,
+                },
+                anchor,
+            };
+        let behind = engine::FloatAnchor {
+            behind_doc: true,
+            ..engine::FloatAnchor::default()
+        };
+        if let Some(p) = doc.blocks[0].as_paragraph_mut() {
+            p.inline_objects.push(image(1, "rIdPng", None));
+            p.inline_objects.push(image(5, "rIdJpg", None));
+            p.inline_objects
+                .push(image(9, "rIdFloat", Some(Box::new(behind))));
+        }
+        let blob = |content_type: &str, data: Vec<u8>| engine::ImageBlob {
+            content_type: content_type.to_string(),
+            data,
+        };
+        doc.media.insert(
+            "rIdPng".into(),
+            blob(
+                "image/png",
+                test_images::png_rgba(2, 1, &[255, 0, 0, 255, 0, 0, 255, 100]),
+            ),
+        );
+        doc.media.insert(
+            "rIdJpg".into(),
+            blob("image/jpeg", test_images::jpeg(16, 8, 3)),
+        );
+        doc.media.insert(
+            "rIdFloat".into(),
+            blob("image/jpeg", test_images::jpeg(24, 12, 1)),
+        );
+        let engine = test_engine_with_doc(doc);
+        let count =
+            |pdf: &[u8], needle: &[u8]| pdf.windows(needle.len()).filter(|w| *w == needle).count();
+        for (conformance, images, smasks) in
+            [(PdfConformance::A2u, 4, 1), (PdfConformance::A1b, 3, 0)]
+        {
+            let Event::PdfExported { bytes, .. } = engine.do_export_pdf(conformance) else {
+                panic!("ExportPdf must succeed");
+            };
+            assert_eq!(count(&bytes, b"/Subtype /Image"), images, "{conformance:?}");
+            assert_eq!(count(&bytes, b"/SMask"), smasks, "{conformance:?}");
+            assert_eq!(count(&bytes, b"/DCTDecode"), 2, "{conformance:?}");
+        }
     }
 
     /// `image_geometry()` surfaces a float positioned against its frame:

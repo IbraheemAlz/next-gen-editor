@@ -259,12 +259,14 @@ pub fn run_one(path_label: &str, bytes: &[u8], fonts: &FontStack, with_edit: boo
     /* 3. PDF export of every page (native "render" — `crates/format-pdf`). */
     let para_texts_refs: Vec<&str> = para_texts_a.iter().map(String::as_str).collect();
     let mut pdf_bytes: Vec<u8> = Vec::new();
+    /* Issue #121 — images embed from the document's media parts. */
     stage!(
         "pdf_export",
-        format_pdf::export_pdf(
+        format_pdf::export_pdf_with_media(
             &pages_a,
             fonts,
             &para_texts_refs,
+            &archive_a.document.media,
             format_pdf::PdfProfile::Plain,
             &mut pdf_bytes,
         )

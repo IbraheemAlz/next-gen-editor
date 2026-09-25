@@ -22,7 +22,7 @@ mod pipeline;
 
 use anyhow::{Context, Result};
 use format_docx::read_docx;
-use format_pdf::{PdfProfile, export_pdf};
+use format_pdf::{PdfProfile, export_pdf_with_media};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
@@ -95,10 +95,13 @@ fn run(input: &Path, output: &Path) -> Result<(usize, bool)> {
     let para_texts: Vec<&str> = built.para_texts.iter().map(String::as_str).collect();
 
     let mut pdf_bytes = Vec::new();
-    export_pdf(
+    /* Issue #121 — images embed from the document's media parts, so the
+    LibreOffice raster compare sees them. */
+    export_pdf_with_media(
         &built.pages,
         &fonts,
         &para_texts,
+        &doc.media,
         PdfProfile::Plain,
         &mut pdf_bytes,
     )
