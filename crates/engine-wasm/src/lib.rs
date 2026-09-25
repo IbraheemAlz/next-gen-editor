@@ -6623,7 +6623,7 @@ impl Engine {
             /* Issue #72 — rich copy. `do_get_selection_as_clipboard` now
             reads `self.selection_doc()` so a copy from inside a story
             serializes the story's paragraphs, not the body's. */
-            | Command::GetSelectionAsClipboard
+            | Command::GetSelectionAsClipboard { .. }
             /* Issue #85 — a snapshot is a read of the whole session (the
             active story included) and recovery rebuilds it wholesale. */
             | Command::Snapshot { .. }
@@ -6899,7 +6899,9 @@ impl Engine {
             },
 
             // Phase 4 §12 — clipboard. Backlog sprint 7 adds rich HTML paste.
-            Command::GetSelectionAsClipboard => self.do_get_selection_as_clipboard(),
+            Command::GetSelectionAsClipboard { include_docx } => {
+                self.do_get_selection_as_clipboard(include_docx.unwrap_or(true))
+            }
             Command::PastePlain { text } => self.do_paste_plain(text),
             Command::PasteHtml { html } => self.do_paste_html(html),
 
@@ -13825,8 +13827,10 @@ impl Engine {
     /// `Command::GetSelectionAsClipboard` — snapshot the selection as the
     /// three clipboard MIME payloads (Backlog #12): plain text, semantic
     /// HTML, and a minimal standalone `.docx`. An empty selection yields all
-    /// three empty.
-    fn do_get_selection_as_clipboard(&self) -> Event {
+    /// three empty. Issue #57 — `include_docx == false` (the shell's
+    /// debounced prefetch) skips the `.docx` ZIP build and leaves
+    /// `docx_fragment` empty; `plain` + `html` are identical either way.
+    fn do_get_selection_as_clipboard(&self, include_docx: bool) -> Event {
         let empty = Event::ClipboardPayload {
             plain: String::new(),
             html: String::new(),
@@ -13855,10 +13859,14 @@ impl Engine {
         blocks. */
         let block_slice = doc.slice_blocks(estart.clone(), eend.clone());
         let html = engine::html::to_html_blocks(&block_slice);
-        let paragraph_slice = doc.slice(estart, eend);
-        let docx_fragment =
+        /* Issue #57 — the shell's prefetch skips the ZIP build. */
+        let docx_fragment = if include_docx {
+            let paragraph_slice = doc.slice(estart, eend);
             build_minimal_docx(&DocumentTree::from_rich_paragraphs(paragraph_slice))
-                .unwrap_or_default();
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Event::ClipboardPayload {
             plain,
             html,
@@ -18300,6 +18308,43 @@ mod tests {
             panic!("expected CompositionUpdated");
         };
         assert_eq!(at, bpos_top(0, 2), "an explicit at is honoured verbatim");
+    }
+
+    /// Issue #57 — the prefetch flavour of `GetSelectionAsClipboard`
+    /// skips the `.docx` fragment but serializes the same plain + HTML.
+    #[test]
+    fn clipboard_payload_include_docx_false_skips_only_the_fragment() {
+        let mut engine = test_engine_with_doc(DocumentTree::from_text("hello world"));
+        engine.selection = Some(SelectionState {
+            anchor: bpos_top(0, 0),
+            caret: bpos_top(0, 5),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let Event::ClipboardPayload {
+            plain: p_full,
+            html: h_full,
+            docx_fragment: d_full,
+        } = engine.do_get_selection_as_clipboard(true)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        let Event::ClipboardPayload {
+            plain: p_lite,
+            html: h_lite,
+            docx_fragment: d_lite,
+        } = engine.do_get_selection_as_clipboard(false)
+        else {
+            panic!("expected ClipboardPayload");
+        };
+        assert_eq!(p_full, "hello");
+        assert_eq!(p_full, p_lite);
+        assert_eq!(h_full, h_lite);
+        assert!(
+            !d_full.is_empty(),
+            "the default copy still builds the .docx"
+        );
+        assert!(d_lite.is_empty(), "the prefetch skips the ZIP build");
     }
 
     /// Issue #51/#34 — table cell paragraphs must ride the layout LRU.

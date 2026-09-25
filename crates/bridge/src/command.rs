@@ -398,7 +398,15 @@ pub enum Command {
 
     /// Snapshot the current selection for the clipboard — the engine replies
     /// with `Event::ClipboardPayload` (PHASE_4_HEADLESS_UI.md §12).
-    GetSelectionAsClipboard,
+    /// Issue #57 — `include_docx` (absent ⇒ `true`) gates the `.docx`
+    /// fragment ZIP build: the shell's debounced clipboard prefetch passes
+    /// `false` (it only needs `plain` + `html` for the synchronous
+    /// `setData` path) and receives an empty `docx_fragment`.
+    GetSelectionAsClipboard {
+        #[serde(default)]
+        #[tsify(optional)]
+        include_docx: Option<bool>,
+    },
 
     /// Paste plain text at the caret, replacing any non-empty selection.
     PastePlain {
@@ -1251,4 +1259,34 @@ pub enum MoveDirection {
     DocHome,
     /// `Ctrl/Cmd + End` — caret to the last paragraph at `text.len`.
     DocEnd,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #57 — `GetSelectionAsClipboard` grew a struct body; the
+    /// pre-#57 wire shape (tag only) must still decode, as `None`
+    /// (⇒ `.docx` fragment included).
+    #[test]
+    fn get_selection_as_clipboard_accepts_the_legacy_tag_only_shape() {
+        let legacy: Command =
+            serde_json::from_value(serde_json::json!({ "type": "GET_SELECTION_AS_CLIPBOARD" }))
+                .expect("legacy shape decodes");
+        assert!(matches!(
+            legacy,
+            Command::GetSelectionAsClipboard { include_docx: None }
+        ));
+        let prefetch: Command = serde_json::from_value(serde_json::json!({
+            "type": "GET_SELECTION_AS_CLIPBOARD",
+            "include_docx": false,
+        }))
+        .expect("prefetch shape decodes");
+        assert!(matches!(
+            prefetch,
+            Command::GetSelectionAsClipboard {
+                include_docx: Some(false)
+            }
+        ));
+    }
 }

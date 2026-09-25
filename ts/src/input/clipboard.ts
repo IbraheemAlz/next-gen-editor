@@ -83,6 +83,23 @@ async function writeRich(plain: string, html: string): Promise<void> {
     }
 }
 
+/** Issue #57 — synchronous write inside the trusted copy/cut event, from
+ *  the prefetch cache (`clipboard-cache.ts`). The caller must already have
+ *  called `e.preventDefault()` (otherwise the browser copies the hidden
+ *  textarea's own empty selection over `setData`). Returns `false` when
+ *  the event carries no `clipboardData` — the caller then takes the async
+ *  path. Never awaits. */
+export function writeSync(
+    e: ClipboardEvent,
+    payload: { plain: string; html: string },
+): boolean {
+    const data = e.clipboardData;
+    if (!data) return false;
+    data.setData('text/plain', payload.plain);
+    data.setData('text/html', payload.html);
+    return true;
+}
+
 /** Copy the current selection to the system clipboard (plain + HTML).
  *  Rejects with `ClipboardWriteError` when the browser blocked every
  *  write tier — callers surface the failure to the user. */

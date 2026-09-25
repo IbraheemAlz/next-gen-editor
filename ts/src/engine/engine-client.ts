@@ -74,11 +74,29 @@ export interface RecoveryInfo {
 
 type Resolver = (v: WorkerReply) => void;
 
+/** Issue #57 — commands that can never move the selection or change the
+ *  document (pure read-backs + view probes). Everything else counts toward
+ *  `EngineClient.writesInFlight`, conservatively: a command missing here
+ *  only costs the synchronous clipboard path a cache miss, never a stale
+ *  copy. */
+const READ_ONLY_COMMANDS: ReadonlySet<Command['type']> = new Set<Command['type']>([
+    'PING',
+    'HIT_TEST',
+    'HIT_TEST_IN_PAGE',
+    'REQUEST_PAINT',
+    'REQUEST_ACCESSIBILITY_DELTA',
+    'GET_SELECTION_AS_CLIPBOARD',
+    'GET_IMAGE_RECTS',
+    'REQUEST_STATS',
+    'SNAPSHOT',
+]);
+
 export class EngineClient {
     private worker!: Worker;
     private nextId = 1;
     private pending = new Map<number, Resolver>();
     private subscribers = new Set<(e: Event) => void>();
+    private pendingWrites = 0;
     private documentId: string;
     private onCrash: () => void;
     private recovering = false;
@@ -199,9 +217,24 @@ export class EngineClient {
     }
 
     async dispatch(cmd: Command, transfer: Transferable[] = []): Promise<Event> {
-        const r = await this.send({ cmd }, transfer);
+        const write = !READ_ONLY_COMMANDS.has(cmd.type);
+        if (write) this.pendingWrites += 1;
+        let r: WorkerReply;
+        try {
+            r = await this.send({ cmd }, transfer);
+        } finally {
+            if (write) this.pendingWrites -= 1;
+        }
         if (!r.ok) throw new Error(r.error);
         return r.evt!;
+    }
+
+    /** Issue #57 — dispatched commands that may move the selection or
+     *  change the document and have not replied yet. While non-zero, the
+     *  main thread's view of the selection may be behind the engine's, so
+     *  the synchronous clipboard cache must not be trusted. */
+    get writesInFlight(): number {
+        return this.pendingWrites;
     }
 
     /**

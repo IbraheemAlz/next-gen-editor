@@ -533,7 +533,7 @@ fn query_cases() -> Vec<Case> {
             "clipboard: copy",
             text_doc,
             vec![Command::SelectAll],
-            Command::GetSelectionAsClipboard,
+            Command::GetSelectionAsClipboard { include_docx: None },
         ),
         case(
             "a11y: delta",

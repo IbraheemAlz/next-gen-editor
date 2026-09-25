@@ -430,7 +430,10 @@ export interface EditorCommands {
     closeDocument(): Promise<Event>;
 
     /* Clipboard */
-    getSelectionAsClipboard(): Promise<Event>;
+    /** Issue #57 — `{ includeDocx: false }` skips the engine's `.docx`
+     *  fragment ZIP build (`docx_fragment` comes back empty); omitted ⇒
+     *  the full payload. */
+    getSelectionAsClipboard(opts?: { includeDocx?: boolean }): Promise<Event>;
     pastePlain(text: string): Promise<Event>;
     pasteHtml(html: string): Promise<Event>;
 
@@ -853,7 +856,12 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             dispatch({ type: 'SAVE_DOCUMENT', format: 'plain_text' }),
         closeDocument: () => dispatch({ type: 'CLOSE_DOCUMENT' }),
 
-        getSelectionAsClipboard: () => dispatch({ type: 'GET_SELECTION_AS_CLIPBOARD' }),
+        getSelectionAsClipboard: (opts) =>
+            dispatch(
+                opts?.includeDocx === undefined
+                    ? { type: 'GET_SELECTION_AS_CLIPBOARD' }
+                    : { type: 'GET_SELECTION_AS_CLIPBOARD', include_docx: opts.includeDocx },
+            ),
         pastePlain: (text) => dispatch({ type: 'PASTE_PLAIN', text }),
         pasteHtml: (html) => dispatch({ type: 'PASTE_HTML', html }),
 

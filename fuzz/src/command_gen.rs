@@ -636,7 +636,7 @@ pub fn classify_variant(cmd: &Command) -> VariantInfo {
         Command::SelectCellAt { .. } => v("SelectCellAt", false),
         Command::DeleteAtCaret { .. } => v("DeleteAtCaret", true), // gen_targeted_command
         Command::RequestAccessibilityDelta => v("RequestAccessibilityDelta", false),
-        Command::GetSelectionAsClipboard => v("GetSelectionAsClipboard", false),
+        Command::GetSelectionAsClipboard { .. } => v("GetSelectionAsClipboard", false),
         Command::PastePlain { .. } => v("PastePlain", false),
         // ---- Backlog sprint 1 --------------------------------------------------
         Command::SetParagraphAlign { .. } => v("SetParagraphAlign", true), // gen_targeted_command

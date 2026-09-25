@@ -20,7 +20,8 @@ import {
     editingStoryForPointer,
     fieldCodeViewForKeys,
 } from '../state/engine-store';
-import { ClipboardWriteError, copy, cut, paste } from '../input/clipboard';
+import { ClipboardWriteError, copy, cut, paste, writeSync } from '../input/clipboard';
+import { createClipboardPrefetch } from '../input/clipboard-cache';
 
 /** Map a non-composition `InputEvent` to an engine command. */
 function mapInputEventToCommand(e: InputEvent): Command | null {
@@ -363,8 +364,23 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
        browser blocks every write tier; the rejection MUST be observed
        and surfaced, never `void`-discarded. On a failed cut nothing was
        deleted (write-before-delete invariant in `input/clipboard.ts`). */
+    /* Issue #57 — warm payload for the live selection, so copy/cut can
+       write synchronously inside the trusted event. `?clipboardPrefetch=0`
+       disables the prefetch (every copy then takes the async path). */
+    const prefetch = createClipboardPrefetch(
+        props.client,
+        props.store,
+        new URLSearchParams(window.location.search).get('clipboardPrefetch') !== '0',
+    );
+    window.__clipboardPrefetch = prefetch;
+
     const onCopy = (e: ClipboardEvent): void => {
         e.preventDefault();
+        /* Issue #57 — cache hit: setData synchronously, no await, no
+           focus dependency. A miss falls through to the #48 async path
+           unchanged. */
+        const hit = prefetch.take();
+        if (hit && (hit.plain === '' || writeSync(e, hit))) return;
         copy(props.client).catch((err: unknown) => {
             /* Only a ClipboardWriteError means the BROWSER blocked the
                write — anything else is an engine/dispatch failure and
@@ -379,6 +395,21 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
     };
     const onCut = (e: ClipboardEvent): void => {
         e.preventDefault();
+        /* Issue #57 — cache hit: the synchronous write already succeeded
+           when `writeSync` returns, so the delete may follow
+           (write-before-delete holds). The cache is only trusted with no
+           write in flight, so DELETE_AT_CARET removes exactly the range
+           that was just written. */
+        const hit = prefetch.take();
+        if (hit && hit.plain === '') return;
+        if (hit && writeSync(e, hit)) {
+            props.client
+                .dispatch({ type: 'DELETE_AT_CARET', forward: false, by_word: false })
+                .catch(() => {
+                    props.store.setUiError('Cut failed — an editor error occurred.');
+                });
+            return;
+        }
         cut(props.client).catch((err: unknown) => {
             /* ClipboardWriteError ⇒ the write was blocked and the delete
                was skipped (write-before-delete), so "nothing was deleted"
