@@ -13,7 +13,7 @@ paths:
 - Use `zip = "2"` with `default-features = false, features = ["deflate"]`. Compression method: `Deflated`.
 
 ## XML serialization
-- `<w:t xml:space="preserve">` on **every** text element. Without `preserve`, leading/trailing whitespace gets collapsed; matters for Arabic diacritics + RTL trailing space.
+- `<w:t xml:space="preserve">` on **every** engine-authored text element. Without `preserve`, leading/trailing whitespace gets collapsed; matters for Arabic diacritics + RTL trailing space. Exception (issue #199): a run regenerated inside a *source* run keeps the source `<w:t>`'s attributes, and a source bare `<w:t>` gains `preserve` only when its text now has edge whitespace — the invariant's purpose, without re-spelling every Word run.
 - XML escapes: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`. Quotes don't matter inside character data.
 - Header: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">`.
 - Footer: `<w:sectPr/></w:body></w:document>`.
@@ -132,6 +132,47 @@ the writer replays:
   (`InlineKind::TextBox`, issue #83) and splice through `parts::textbox`.
 - Known exception: a part with two `<w:body>` elements (POI's
   `MultipleBodyBug.docx`) gets the synthesized header.
+
+## Attribute-level grab bag + in-paragraph source markup (issues #199 / #106)
+
+A *regenerated* (dirty) paragraph stays close to its source bytes through
+`Paragraph::source_markup` (`engine::SourceMarkup`, captured by
+`schema::source_markup::MarkupCapture` in `parts::document`, replayed by
+`writer::serialize_paragraph` / `emit_styled_runs_with_objects`):
+
+- `<w:p>` / `<w:r>` / `<w:t>` attributes (rsids, `w14:paraId` /
+  `w14:textId`, `xml:space`) re-emit verbatim; a split gives the paragraph
+  identity (`w14:paraId` / `w14:textId`) to the LEFT half only; clipboard
+  fragments carry no markup.
+- Source run boundaries are writer cut points, so equally formatted
+  source runs come back as their own `<w:r>`; consecutive tab / break /
+  text segments of one source run share one `<w:r>`. A run's range grows
+  with an insertion strictly inside it OR at its end (typing continues the
+  run), so a split / extended run keeps its attributes on every piece —
+  the inserted text included (the engine mints no rsids).
+- **Verified** source bytes: the recorded `<w:pPr>` is re-emitted only
+  while `props` / `style_id` / `list_item` equal what it produced and no
+  section marker rides the paragraph; a run's `<w:rPr>` only while the
+  span style equals the recorded one. Only inside `write_docx` (the source
+  package, `styles.xml` included, travels); `build_minimal_docx`
+  regenerates. Otherwise the element regenerates and each regenerated
+  EMPTY child adopts its source twin when the twin only adds attributes
+  other than `w:val` (`schema::source_markup::adopt_source_children`) —
+  `<w:u w:color>` survives a bold toggle, a changed font never inherits a
+  stale `w:asciiTheme`.
+- Positioned verbatim markers (`<w:proofErr/>`, non-TOC bookmarks,
+  permission / move ranges, an empty `<w:fldSimple/>`, text-less runs with
+  only unmodeled content, pretty-print whitespace) re-emit at their
+  (remapped) text offset between runs. Comment anchors are deliberately
+  NOT markers (tree-level `comment_ranges`; a verbatim copy could
+  resurrect a deleted comment).
+- Offsets are remapped by `insert_text`, `delete_text`, `split_at`,
+  `concat`, inline-object splices and the revision accept/reject helper;
+  `SourceMarkup::text_len` makes any other text edit go *stale* (runs /
+  markers ignored, never misplaced).
+- `tools/corpus-native` reports `edit_check.source_bytes_rewritten` (bytes
+  of the original the edited save rewrote; 0 = pure insertion) next to the
+  size-delta bound.
 
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.
