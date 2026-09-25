@@ -1518,6 +1518,34 @@ pub struct SourceMarker {
     pub at: u32,
     #[serde(with = "serde_bytes")]
     pub xml: Vec<u8>,
+    /// Issue #243 — `Some` when the marker is a comment anchor: a
+    /// `<w:commentRangeStart/>` / `<w:commentRangeEnd/>` or the run holding
+    /// a `<w:commentReference/>`. Unlike every other marker it is NOT
+    /// replayed blindly: the writer checks it against the tree-level
+    /// [`DocumentTree::comment_ranges`] / [`DocumentTree::comment_defs`]
+    /// (a deleted comment's anchor is dropped, a moved one is re-emitted
+    /// where the tree says).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<CommentAnchor>,
+}
+
+/// Issue #243 — what a comment-anchor [`SourceMarker`] is.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CommentAnchor {
+    pub kind: CommentAnchorKind,
+    /// The comment's `w:id`.
+    pub id: u32,
+}
+
+/// Issue #243 — the three in-paragraph pieces of a comment's anchoring.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommentAnchorKind {
+    /// `<w:commentRangeStart/>`.
+    RangeStart,
+    /// `<w:commentRangeEnd/>`.
+    RangeEnd,
+    /// The run holding `<w:commentReference/>`.
+    Reference,
 }
 
 /// Issues #199 / #106 — attribute-level grab bag + in-paragraph source
@@ -1693,7 +1721,7 @@ impl SourceMarkup {
                 } else {
                     right.markers.push(SourceMarker {
                         at: mk.at - at,
-                        xml: mk.xml.clone(),
+                        ..mk.clone()
                     });
                 }
             }
@@ -1751,7 +1779,7 @@ impl SourceMarkup {
         for mk in &t.markers {
             out.markers.push(SourceMarker {
                 at: mk.at + head_len,
-                xml: mk.xml.clone(),
+                ..mk.clone()
             });
         }
         Some(Box::new(out))
@@ -15330,6 +15358,7 @@ mod source_markup_tests {
         SourceMarker {
             at,
             xml: b"<w:proofErr/>".to_vec(),
+            ..Default::default()
         }
     }
 

@@ -172,9 +172,18 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
 - Positioned verbatim markers (`<w:proofErr/>`, non-TOC bookmarks,
   permission / move ranges, an empty `<w:fldSimple/>`, text-less runs with
   only unmodeled content, pretty-print whitespace) re-emit at their
-  (remapped) text offset between runs. Comment anchors are deliberately
-  NOT markers (tree-level `comment_ranges`; a verbatim copy could
-  resurrect a deleted comment).
+  (remapped) text offset between runs.
+- **Comment anchors (issue #243)** are *verified* markers
+  (`SourceMarker::comment`, `schema::comment_anchors`): a
+  `<w:commentRangeStart/End/>` replays verbatim only where the tree-level
+  `comment_ranges` puts that end of that comment (a comment with no tree
+  range — cell anchors, unpaired ends — only while it exists), the
+  `<w:commentReference>` run only while the comment exists; a deleted
+  comment is never resurrected. Every tree endpoint no verbatim byte
+  carries (engine-minted comment, stale markup) is synthesized at its
+  offset, plus a `CommentReference`-styled reference run after the end
+  when the source has none. The plan is published per body write (the
+  paragraph serializer has no tree in hand).
 - `<w:hyperlink>` attributes ride the link itself (`Hyperlink::attrs`,
   issue #242) and re-emit in source order. The source `r:id` is kept only
   while the rels part still maps it to the link's target (*verified* —

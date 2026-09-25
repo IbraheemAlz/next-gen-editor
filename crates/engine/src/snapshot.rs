@@ -488,6 +488,7 @@ mod tests {
             markers: vec![SourceMarker {
                 at: 6,
                 xml: br#"<w:proofErr w:type="spellStart"/>"#.to_vec(),
+                ..Default::default()
             }],
         };
         let Some(crate::Block::Paragraph(p)) = doc.blocks.get(0).cloned() else {

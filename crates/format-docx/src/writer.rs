@@ -15,6 +15,7 @@ use crate::parts::document::parse_sect_pr_fragment;
 use crate::parts::footnotes::emit_note_pr;
 use crate::parts::numbering::build_numbering_xml;
 use crate::schema::block_envelope::EnvelopeStack;
+use crate::schema::comment_anchors;
 use crate::schema::ct_ppr::ppr_child_rank;
 use crate::schema::ct_rpr::rpr_child_rank;
 use crate::schema::ct_tbl::{tbl_pr_child_rank, tc_pr_child_rank, tr_pr_child_rank};
@@ -857,6 +858,9 @@ fn serialize_paragraph(
         && para.hyperlinks.is_empty()
         && !has_break
         && !has_source_runs
+        && comment_anchors::paragraph_anchors(para)
+            .synthesize
+            .is_empty()
     {
         serialize_run(&para.text, &SpanStyle::default(), out);
     } else {
@@ -1079,14 +1083,43 @@ fn emit_styled_runs_with_objects(
         .as_deref()
         .filter(|m| m.offsets_valid(len));
     let source_runs: &[SourceRun] = markup.map_or(&[], |m| m.runs.as_slice());
-    let mut markers: Vec<(usize, &[u8])> = markup.map_or_else(Vec::new, |m| {
-        m.markers
-            .iter()
-            .map(|mk| ((mk.at as usize).min(len), mk.xml.as_slice()))
-            .collect()
-    });
-    markers.sort_by_key(|(at, _)| *at);
+    /* Issue #243 — comment-anchor markers replay only when verified
+    against the tree; tree endpoints no verbatim byte carries are
+    synthesized at their offsets. */
+    let mut markers: Vec<(usize, &[u8], Option<engine::CommentAnchor>)> =
+        markup.map_or_else(Vec::new, |m| {
+            m.markers
+                .iter()
+                .filter(|mk| comment_anchors::keep_marker(para, mk))
+                .map(|mk| ((mk.at as usize).min(len), mk.xml.as_slice(), mk.comment))
+                .collect()
+        });
+    markers.sort_by_key(|(at, _, _)| *at);
     let mut marker_cursor = 0usize;
+    let synth = comment_anchors::paragraph_anchors(para).synthesize;
+    let mut synth_cursor = 0usize;
+    for a in &synth {
+        if para.text.is_char_boundary(a.at as usize) {
+            cuts.insert(a.at as usize);
+        }
+    }
+    /* One positioned piece: a verbatim marker (an END of a comment may
+    need its reference run synthesized right behind it) or a synthesized
+    tree endpoint. */
+    let push_marker = |xml: &[u8], comment: Option<engine::CommentAnchor>, out: &mut String| {
+        push_utf8(xml, out);
+        if let Some(c) = comment
+            && c.kind == engine::CommentAnchorKind::RangeEnd
+        {
+            comment_anchors::after_range_end(c.id, out);
+        }
+    };
+    let push_synth = |a: &comment_anchors::TreeAnchor, out: &mut String| {
+        comment_anchors::push_range_marker(a.kind, a.id, out);
+        if a.kind == engine::CommentAnchorKind::RangeEnd {
+            comment_anchors::after_range_end(a.id, out);
+        }
+    };
     for r in source_runs {
         for b in [r.start as usize, r.end as usize] {
             if b <= len && para.text.is_char_boundary(b) {
@@ -1094,7 +1127,7 @@ fn emit_styled_runs_with_objects(
             }
         }
     }
-    for (at, _) in &markers {
+    for (at, _, _) in &markers {
         if para.text.is_char_boundary(*at) {
             cuts.insert(*at);
         }
@@ -1273,12 +1306,20 @@ fn emit_styled_runs_with_objects(
         }
         /* Issues #199 / #106 — in-paragraph source markers due at `lo`
         (`<w:proofErr/>`, bookmarks, whitespace), between the closes above
-        and the opens below: always a legal run-level position. */
-        while let Some((at, xml)) = markers.get(marker_cursor) {
+        and the opens below: always a legal run-level position. Issue #243
+        — synthesized comment endpoints first. */
+        while let Some(a) = synth.get(synth_cursor) {
+            if a.at as usize > lo {
+                break;
+            }
+            push_synth(a, out);
+            synth_cursor += 1;
+        }
+        while let Some((at, xml, comment)) = markers.get(marker_cursor) {
             if *at > lo {
                 break;
             }
-            push_utf8(xml, out);
+            push_marker(xml, *comment, out);
             marker_cursor += 1;
         }
         /* Open any hyperlinks that should be active at `lo`. A target the
@@ -1399,9 +1440,12 @@ fn emit_styled_runs_with_objects(
         emit_span_event(f, out);
     }
     /* Markers at the paragraph end (a trailing `_GoBack` bookmark, the
-    whitespace before `</w:p>`). */
-    for (_, xml) in markers.iter().skip(marker_cursor) {
-        push_utf8(xml, out);
+    whitespace before `</w:p>`), synthesized comment endpoints first. */
+    for a in synth.iter().skip(synth_cursor) {
+        push_synth(a, out);
+    }
+    for (_, xml, comment) in markers.iter().skip(marker_cursor) {
+        push_marker(xml, *comment, out);
     }
 }
 
@@ -2131,7 +2175,11 @@ fn build_document_xml_with_root(
     let envelope = &doc.document_envelope;
     let captured = envelope.is_captured() && std::str::from_utf8(&envelope.root_tag).is_ok();
     let mut body = String::with_capacity(2048);
+    /* Issue #243 — comment anchors of regenerated paragraphs come from
+    the tree (verified source bytes where they still match). */
+    let comment_scope = comment_anchors::publish(doc);
     emit_blocks(doc.blocks.iter(), &mut body, hyperlink_rel_map);
+    drop(comment_scope);
     emit_trailing_sect_pr(doc, captured, &mut body);
     if captured {
         push_utf8(&envelope.prolog, &mut out);
@@ -9339,5 +9387,188 @@ mod tests {
         /* The untouched links keep their own rows. */
         assert!(out.contains(r#"r:id="rId4" w:tooltip="First &amp; best""#));
         assert!(out.contains(r#"r:id="rId6" w:anchor="part2" w:tgtFrame="_blank""#));
+    }
+
+    /// Issue #243 — a Word-shaped commented paragraph (range around
+    /// "comment ", reference run behind it with its own rsid and rPr) and
+    /// a paragraph holding only the reference of a second comment.
+    const COMMENT_P0: &str = concat!(
+        r#"<w:p w:rsidR="00B561CA"><w:r><w:t xml:space="preserve">this is a </w:t></w:r>"#,
+        r#"<w:commentRangeStart w:id="0"/><w:r><w:t xml:space="preserve">comment </w:t></w:r>"#,
+        r#"<w:commentRangeEnd w:id="0"/><w:r w:rsidR="002903BF"><w:rPr><w:rStyle w:val="a5"/></w:rPr><w:commentReference w:id="0"/></w:r>"#,
+        r#"<w:r><w:t>paragraph!</w:t></w:r></w:p>"#,
+    );
+    const COMMENT_P1: &str =
+        r#"<w:p><w:r><w:rPr></w:rPr><w:commentReference w:id="1"/></w:r></w:p>"#;
+    const COMMENTS_PART: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        r#"<w:comment w:id="0" w:author="A" w:date="2026-01-01T00:00:00Z"><w:p><w:r><w:t>first</w:t></w:r></w:p></w:comment>"#,
+        r#"<w:comment w:id="1" w:author="B" w:date="2026-01-01T00:00:00Z"><w:p><w:r><w:t>second</w:t></w:r></w:p></w:comment>"#,
+        r#"</w:comments>"#,
+    );
+
+    fn comment_archive() -> (String, DocxArchive) {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{COMMENT_P0}{COMMENT_P1}<w:sectPr/></w:body></w:document>"#
+        );
+        let rels = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/>"#,
+            r#"</Relationships>"#,
+        );
+        let content_types = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+            r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#,
+            r#"<Default Extension="xml" ContentType="application/xml"/>"#,
+            r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#,
+            r#"<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/>"#,
+            r#"</Types>"#,
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            for (name, body) in [
+                ("[Content_Types].xml", content_types),
+                ("_rels/.rels", DOT_RELS_XML),
+                ("word/_rels/document.xml.rels", rels),
+                ("word/comments.xml", COMMENTS_PART),
+                ("word/document.xml", xml.as_str()),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let archive = read_docx(&buf).expect("read comments");
+        (xml, archive)
+    }
+
+    /// Issue #243 — an edit before, inside and after a commented range
+    /// keeps `<w:commentRangeStart/>`, `<w:commentRangeEnd/>` and the
+    /// reference run (verbatim, own rsid + rPr) at the right offsets: the
+    /// saved part is exactly source + the inserted bytes.
+    #[test]
+    fn edited_paragraph_keeps_comment_anchors() {
+        let (xml, archive) = comment_archive();
+        assert_eq!(archive.document.comment_ranges.len(), 1);
+        assert_eq!(archive.document.comment_defs.len(), 2);
+        let zero = write_docx(&archive, &archive.document).expect("zero-edit");
+        assert_eq!(document_xml_of(&zero), xml);
+
+        for (offset, from, to) in [
+            (2, "this is", "thXis is"),
+            ("this is a co".len(), "comment ", "coXmment "),
+            (
+                "this is a comment paragraph!".len(),
+                "paragraph!",
+                "paragraph!X",
+            ),
+        ] {
+            let edited = archive.document.insert_text(at(0, offset), "X");
+            let bytes = write_docx(&archive, &edited).expect("write");
+            assert_eq!(
+                document_xml_of(&bytes),
+                xml.replacen(from, to, 1),
+                "insert at {offset}"
+            );
+            crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+            let back = read_docx(&bytes).expect("re-read");
+            let r = &back.document.comment_ranges[0];
+            let p = back.document.nth_paragraph(0).unwrap();
+            assert_eq!(
+                &p.text[r.start.offset as usize..r.end.offset as usize],
+                if offset == "this is a co".len() {
+                    "coXmment "
+                } else {
+                    "comment "
+                }
+            );
+        }
+    }
+
+    /// Issue #243 — a paragraph whose only content is a comment reference
+    /// keeps it when it regenerates (it used to save as `<w:p/>`).
+    #[test]
+    fn reference_only_paragraph_keeps_its_reference() {
+        let (xml, archive) = comment_archive();
+        let edited = archive.document.insert_text(at(1, 0), "X");
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert!(
+            out.contains(concat!(
+                r#"<w:p><w:r><w:t xml:space="preserve">X</w:t></w:r>"#,
+                r#"<w:r><w:rPr></w:rPr><w:commentReference w:id="1"/></w:r></w:p>"#
+            )),
+            "{out}"
+        );
+        /* Dirty without a text change: exactly the source. */
+        let mut doc = archive.document.clone();
+        if let Some(Block::Paragraph(p)) = doc.blocks.get_mut(1) {
+            p.dirty = true;
+        }
+        assert_eq!(
+            document_xml_of(&write_docx(&archive, &doc).expect("write")),
+            xml
+        );
+    }
+
+    /// Issue #243 — a deleted comment's anchors are never resurrected from
+    /// the recorded source bytes.
+    #[test]
+    fn deleted_comment_anchors_are_dropped() {
+        let (_, archive) = comment_archive();
+        let edited = archive
+            .document
+            .delete_comment(0)
+            .insert_text(at(0, 0), "X");
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert!(!out.contains(r#"w:id="0""#), "{out}");
+        assert!(out.contains(r#"<w:commentReference w:id="1"/>"#), "{out}");
+    }
+
+    /// Issue #243 — with no usable source bytes (engine-minted comment, or
+    /// markup gone stale) the anchors are synthesized from the tree,
+    /// including a `CommentReference`-styled reference run.
+    #[test]
+    fn tree_comment_anchors_are_synthesized_without_source_markup() {
+        let (_, archive) = comment_archive();
+        let mut doc = archive.document.insert_text(at(0, 0), "X");
+        if let Some(Block::Paragraph(p)) = doc.blocks.get_mut(0) {
+            p.source_markup = None;
+        }
+        let bytes = write_docx(&archive, &doc).expect("write");
+        let out = document_xml_of(&bytes);
+        assert!(
+            out.contains(concat!(
+                r#"<w:commentRangeStart w:id="0"/><w:r><w:t xml:space="preserve">comment </w:t></w:r>"#,
+                r#"<w:commentRangeEnd w:id="0"/><w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="0"/></w:r>"#
+            )),
+            "{out}"
+        );
+        crate::check_document_xml_well_formed(&bytes).expect("well-formed");
+
+        /* An engine-minted comment on a regenerated paragraph. */
+        let (minted, id) = archive.document.insert_comment(
+            at(0, 0),
+            at(0, 4),
+            "note".into(),
+            "C".into(),
+            String::new(),
+        );
+        let minted = minted.insert_text(at(0, 2), "Y");
+        let out = document_xml_of(&write_docx(&archive, &minted).expect("write"));
+        let start = format!(r#"<w:commentRangeStart w:id="{id}"/>"#);
+        let end = format!(r#"<w:commentRangeEnd w:id="{id}"/>"#);
+        let reference = format!(r#"<w:commentReference w:id="{id}"/>"#);
+        assert_eq!(out.matches(&start).count(), 1, "{out}");
+        assert_eq!(out.matches(&end).count(), 1, "{out}");
+        assert_eq!(out.matches(&reference).count(), 1, "{out}");
+        assert!(out.find(&start) < out.find("thY") && out.find(&end) > out.find("thY"));
     }
 }
