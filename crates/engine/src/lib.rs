@@ -335,6 +335,12 @@ pub struct ParagraphStyle {
     /// `<w:rPr>` overrides this style contributes — applied to spans
     /// during cascade resolution since issue #29 (closed).
     pub run: SpanStyle,
+    /// Issue #277 — `<w:next w:val>`: the style Word gives the NEW
+    /// paragraph when Enter is pressed at the very end of a paragraph
+    /// in this style (Heading 1 → Normal). `None` ⇒ the same style.
+    /// Skipped when `None`, so a pre-#277 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// Phase 8a — author + date + body for one entry of `word/comments.xml`.
@@ -1458,6 +1464,12 @@ impl GrabBag {
 pub struct SourceAttr {
     pub name: String,
     pub value: String,
+    /// Issue #248 — the whitespace written before the attribute when it
+    /// is not a single space (a pretty-printed start tag that breaks its
+    /// attributes over several lines). `None` = one space. Skipped when
+    /// `None`, so a pre-#248 snapshot encodes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ws: Option<String>,
 }
 
 /// Issues #199 / #106 — the paragraph's own `<w:pPr>` as read, plus the
@@ -2049,6 +2061,30 @@ pub struct SpanStyle {
 }
 
 impl SpanStyle {
+    /// Issue #276 — this run's formatting as continued by text typed
+    /// next to it: everything except revision records. A grab-bag
+    /// `<w:rPrChange>` (a tracked formatting change) belongs to the text
+    /// it was recorded on; copying it onto new text would forge a
+    /// revision and duplicate its `w:id`.
+    pub fn for_typing(&self) -> SpanStyle {
+        let Some(bag) = self.grab_bag.as_deref() else {
+            return self.clone();
+        };
+        let kept: Vec<Vec<u8>> = bag
+            .fragments
+            .iter()
+            .filter(|f| !f.starts_with(b"<w:rPrChange"))
+            .cloned()
+            .collect();
+        if kept.len() == bag.fragments.len() {
+            return self.clone();
+        }
+        SpanStyle {
+            grab_bag: (!kept.is_empty()).then(|| Box::new(GrabBag { fragments: kept })),
+            ..self.clone()
+        }
+    }
+
     /// Overlay `patch`'s set fields onto `self`.
     pub fn merged_with(self, patch: SpanStyle) -> SpanStyle {
         SpanStyle {
@@ -2385,6 +2421,37 @@ impl InlineObject {
         let alt = story
             .source_xml
             .as_deref()
+            .and_then(|x| start_tag(x, "<v:shape"))
+            .and_then(|tag| xml_attr(tag, "alt"));
+        Some((None, alt))
+    }
+
+    /// Issue #215 — the accessible `(name, description)` of a picture,
+    /// mirroring [`Self::text_box_label`]: its `<wp:docPr name descr>`
+    /// (read from the anchor's verbatim `doc_pr_xml` for a float, else
+    /// from the object's OWN verbatim `source_xml` — an inline picture
+    /// keeps it there), or the VML `<v:shape alt>` as the description for
+    /// a bare VML picture. Blank values are `None`; `None` for anything
+    /// but an image.
+    pub fn image_label(&self) -> Option<(Option<String>, Option<String>)> {
+        if !matches!(self.kind, InlineKind::Image { .. }) {
+            return None;
+        }
+        let source = || {
+            self.source_xml
+                .as_deref()
+                .and_then(|b| core::str::from_utf8(b).ok())
+        };
+        let from_anchor = self
+            .anchor
+            .as_deref()
+            .and_then(|a| a.doc_pr_xml.as_deref())
+            .and_then(|x| start_tag(x, "<wp:docPr"));
+        let from_source = || source().and_then(|x| start_tag(x, "<wp:docPr"));
+        if let Some(tag) = from_anchor.or_else(from_source) {
+            return Some((xml_attr(tag, "name"), xml_attr(tag, "descr")));
+        }
+        let alt = source()
             .and_then(|x| start_tag(x, "<v:shape"))
             .and_then(|tag| xml_attr(tag, "alt"));
         Some((None, alt))
@@ -3407,6 +3474,58 @@ impl Paragraph {
     /// merges the patch's set fields. Adjacent equal spans are coalesced and
     /// default-only spans dropped, so the representation stays minimal.
     pub fn apply_style(&self, start: u32, end: u32, patch: SpanStyle) -> Paragraph {
+        self.restyle_with(start, end, |style| style.merged_with(patch.clone()))
+    }
+
+    /// Issue #276 — the style typing at byte `at` produces (before any
+    /// sticky formatting): the character before `at`, or at the
+    /// paragraph start the character after it, never an inline-object anchor.
+    pub fn typing_style_at(&self, at: u32) -> SpanStyle {
+        self.inheriting_span(self.snap_offset(at))
+            .map_or_else(SpanStyle::default, |i| self.spans[i].style.for_typing())
+    }
+
+    /// Issue #276 — index of the style span an insertion at (snapped)
+    /// byte `off` continues: the one holding the character BEFORE `off`
+    /// (`start < off <= end`), or at the paragraph start the one holding
+    /// the character after it (`start == 0`). `None` ⇒ that character is
+    /// unstyled, so the inserted text is too. Mirrors
+    /// `SourceMarkup::note_insert`'s run choice.
+    ///
+    /// An inline-object anchor (image, note reference, text box — its
+    /// U+FFFC sentinel) never passes its run formatting on: typing after
+    /// a footnote reference must not come out superscript, nor text after
+    /// a picture inherit its `noProof` / language tagging.
+    fn inheriting_span(&self, off: u32) -> Option<usize> {
+        let donor = if off == 0 {
+            0
+        } else {
+            let before = self.text[..off as usize].chars().next_back()?;
+            off - before.len_utf8() as u32
+        };
+        if self.inline_objects.iter().any(|o| o.at == donor) {
+            return None;
+        }
+        if off == 0 {
+            self.spans.iter().position(|s| s.start == 0 && s.end > 0)
+        } else {
+            self.spans
+                .iter()
+                .position(|s| s.start < off && off <= s.end)
+        }
+    }
+
+    /// Issue #276 — return a copy whose bytes `[start, end)` carry
+    /// exactly `style` (replacing, not merging, whatever they had).
+    /// Typing over a selection gives the new text the formatting of the
+    /// first replaced character, as Word does.
+    pub fn set_style(&self, start: u32, end: u32, style: SpanStyle) -> Paragraph {
+        self.restyle_with(start, end, |_| style.clone())
+    }
+
+    /// Shared body of [`Self::apply_style`] / [`Self::set_style`]: every
+    /// sub-range of `[start, end)` gets `f(current style)`.
+    fn restyle_with(&self, start: u32, end: u32, f: impl Fn(SpanStyle) -> SpanStyle) -> Paragraph {
         let text_len = self.text.len() as u32;
         let start = self.snap_offset(start);
         let end = self.snap_offset(end);
@@ -3430,7 +3549,7 @@ impl Paragraph {
             let (a, b) = (win[0], win[1]);
             let mut style = self.style_at(a);
             if a >= start && b <= end {
-                style = style.merged_with(patch.clone());
+                style = f(style);
             }
             if style == SpanStyle::default() {
                 continue;
@@ -3651,8 +3770,12 @@ impl Paragraph {
             hyperlinks: Vec::new(),
             revisions: Vec::new(),
             fields,
-            style_id: None,
-            direct_overrides: ParaProperties::default(),
+            /* Issue #277 — the paragraph style binding and the direct
+            paragraph formatting are not offset-anchored (same class as
+            `apply_style`, issue #56): deleting characters inside a
+            Heading must not demote it to an unstyled paragraph. */
+            style_id: self.style_id.clone(),
+            direct_overrides: self.direct_overrides.clone(),
             /* Phase 3 (#40) — NOT cleared with the overlays above: the
             marker has no byte offsets and the paragraph mark survives
             an in-paragraph character deletion. */
@@ -3759,8 +3882,14 @@ impl Paragraph {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: fields_left,
-                style_id: None,
-                direct_overrides: ParaProperties::default(),
+                /* Issue #277 — both halves keep the paragraph style and
+                the direct paragraph formatting (Word: a mid-paragraph
+                split leaves two paragraphs in the same style). The
+                next-style rule for Enter at the paragraph END is
+                `DocumentTree::split_paragraph`'s business, not this
+                primitive's (a clipboard slice must keep the style). */
+                style_id: self.style_id.clone(),
+                direct_overrides: self.direct_overrides.clone(),
                 /* Phase 3 (#40) — the LEFT half receives a brand-new
                 paragraph mark; the original mark (and any section
                 marker riding it) belongs to the right half. */
@@ -3789,8 +3918,8 @@ impl Paragraph {
                 hyperlinks: Vec::new(),
                 revisions: Vec::new(),
                 fields: fields_right,
-                style_id: None,
-                direct_overrides: ParaProperties::default(),
+                style_id: self.style_id.clone(),
+                direct_overrides: self.direct_overrides.clone(),
                 /* Phase 3 (#40) — the ORIGINAL paragraph mark terminates
                 the right half, so a section marker travels with it. */
                 section_end: self.section_end.clone(),
@@ -4196,7 +4325,7 @@ pub enum RowHeight {
     Exact { twips: i32 },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct RowProperties {
     pub height: Option<RowHeight>,
@@ -4212,7 +4341,7 @@ pub struct RowProperties {
     pub grab_bag: Option<Box<GrabBag>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct CellProperties {
     pub grid_span: u8,
@@ -4242,7 +4371,7 @@ pub enum TableLayout {
     Fixed,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct TableProperties {
     pub width: Option<CellWidth>,
@@ -4276,6 +4405,11 @@ pub struct TableCell {
     /// 1-2 paragraphs, so persistent-vector overhead is not worth the
     /// structural-sharing win at that size (RFC §1.4).
     pub blocks: Vec<Block>,
+    /// Issue #248 — the source `<w:tc>` markup (see
+    /// [`CellSourceMarkup`]). Rides the cell object, so it follows the
+    /// cell through every table restructuring. Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_markup: Option<Box<CellSourceMarkup>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -4283,6 +4417,10 @@ pub struct TableCell {
 pub struct TableRow {
     pub props: RowProperties,
     pub cells: Vec<TableCell>,
+    /// Issue #248 — the source `<w:tr>` markup (see [`RowSourceMarkup`]).
+    /// Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_markup: Option<Box<RowSourceMarkup>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -4304,6 +4442,88 @@ pub struct Table {
     /// Issue #120 — block-level passthrough markup surrounding this table
     /// (see [`Paragraph::body_xml`]).
     pub body_xml: Option<Box<BodyPassthrough>>,
+    /// Issue #248 — the source `<w:tbl>` markup (see
+    /// [`TableSourceMarkup`]). Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_markup: Option<Box<TableSourceMarkup>>,
+}
+
+/// Issue #248 — one source property element of a table (`<w:tblPr>`,
+/// `<w:tblGrid>`, `<w:tblPrEx>`, `<w:trPr>`, `<w:tcPr>`) as read, with
+/// the model state it produced. `lead` is what the source wrote between
+/// the previous sibling (or the parent's start tag) and the element — the
+/// whitespace of a pretty-printed part — and is re-emitted whenever the
+/// element is written. `xml` is re-emitted verbatim only while the
+/// owner's live model still equals `model` (a *verified* passthrough, the
+/// `<w:pPr>` rule of #199); otherwise the element regenerates, adopting
+/// the source spelling of every unchanged empty child.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct SourceElement<T> {
+    #[serde(with = "serde_bytes")]
+    pub lead: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub xml: Vec<u8>,
+    pub model: T,
+}
+
+/// Issue #248 — attribute-level + whitespace source markup of a
+/// `<w:tbl>` read from a `.docx`, the table counterpart of
+/// [`SourceMarkup`]. A clean table never consults it (its `source_xml`
+/// passthrough wins); a regenerated one (any cell edit or table command)
+/// uses it to stay byte-close to the source: the `<w:tbl>` attributes,
+/// the verified `<w:tblPr>` bytes and the verified `<w:tblGrid>` bytes
+/// (`<w:tblGridChange>` included). What sits between rows (whitespace,
+/// bookmarks, a row-level `<w:sdt>` wrapper) rides each row's
+/// [`RowSourceMarkup::body_xml`].
+///
+/// Nothing here is offset-anchored: the row / cell markup lives ON the
+/// row / cell objects, so a row or column insert / delete, a merge or a
+/// split carries it with the content it describes (a fresh row or cell
+/// has none and is written plainly), and the property bytes are
+/// re-verified against the model at every write — so the markup can
+/// never land on the wrong element.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct TableSourceMarkup {
+    /// `<w:tbl>` attributes, source order.
+    pub attrs: Vec<SourceAttr>,
+    pub tbl_pr: Option<SourceElement<TableProperties>>,
+    pub grid: Option<SourceElement<Vec<i32>>>,
+}
+
+/// Issue #248 — source markup of one `<w:tr>` (see [`TableSourceMarkup`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct RowSourceMarkup {
+    /// `<w:tr>` attributes (`w:rsidR`, `w14:paraId`, …), source order.
+    pub attrs: Vec<SourceAttr>,
+    /// Row-level passthrough between the rows of the table: whitespace
+    /// and range markers before the `<w:tr>` (`before`), a `<w:sdt>` /
+    /// `<w:customXml>` wrapper around one or more rows as an
+    /// `Open` / `Close` pair (issue #245's `Bug66263-table.docx`), the
+    /// whitespace before `</w:tbl>` (`after` of the last row). Same
+    /// fragments and writer stack as the block level (issue #120).
+    pub body_xml: Option<Box<BodyPassthrough>>,
+    /// Issue #103 — the row's `<w:tblPrEx>` (table property exceptions),
+    /// unmodeled: always re-emitted verbatim (`model` unused).
+    pub tbl_pr_ex: Option<SourceElement<()>>,
+    pub tr_pr: Option<SourceElement<RowProperties>>,
+}
+
+/// Issue #248 — source markup of one `<w:tc>` (see [`TableSourceMarkup`]).
+/// The whitespace inside the cell around its blocks rides the blocks'
+/// own `body_xml` (issue #120).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct CellSourceMarkup {
+    /// `<w:tc>` attributes, source order.
+    pub attrs: Vec<SourceAttr>,
+    /// Cell-level passthrough between the cells of a row (whitespace,
+    /// markers, a cell-level `<w:sdt>` / `<w:customXml>` wrapper; the
+    /// whitespace before `</w:tr>` is the last cell's `after`).
+    pub body_xml: Option<Box<BodyPassthrough>>,
+    pub tc_pr: Option<SourceElement<CellProperties>>,
 }
 
 /* ===================================================================
@@ -6178,20 +6398,41 @@ impl DocumentTree {
         let off = at.offset;
         let mut edit = None;
         let mutated = mutate_paragraph_in_top(&mut blocks, &target, |para| {
+            /* Issue #276 — pick the span to continue on the PRE-edit
+            paragraph, at the offset `splice_text` snaps to. */
+            let grow = para.inheriting_span(para.snap_offset(off.min(para.text.len() as u32)));
             /* Issues #199 / #106 / #252 — ONE splice drives the source
             markup here and the comment anchors below. */
             let e = para.splice_text(off, 0, text);
             edit = Some(e);
-            /* Shift styled spans across the insertion point — a span
-            containing the point grows, spans wholly after it slide right. */
+            /* Issue #276 — the inserted text continues the formatting of
+            the character BEFORE the insertion point (at the paragraph
+            start: the character after it), as in Word: the span holding
+            that character grows over the insertion, every span at/after
+            the point slides right. This is exactly the source run
+            `SourceMarkup::note_insert` extends, so a save continues the
+            source `<w:r>` (rsids included, #199) instead of minting a
+            fresh unformatted one. Sticky (pending) formatting is layered
+            on top by the interactive caller. */
             let off = e.at;
             let len = text.len() as u32;
-            for s in &mut para.spans {
-                if s.start >= off {
-                    s.start += len;
-                }
-                if s.end > off {
+            let donor = grow.map(|i| para.spans[i].style.clone());
+            for (i, s) in para.spans.iter_mut().enumerate() {
+                if Some(i) == grow {
                     s.end += len;
+                } else if s.start >= off {
+                    s.start += len;
+                    s.end += len;
+                }
+            }
+            /* ... minus revision records: a donor run's tracked
+            formatting change (`<w:rPrChange>`, grab bag) describes an
+            edit of THAT text, not of the new text — and re-emitting it
+            would duplicate its `w:id`. */
+            if let Some(donor) = donor {
+                let typed = donor.for_typing();
+                if typed != donor {
+                    *para = para.set_style(off, off + len, typed);
                 }
             }
             /* Issue #43 — FIELD anchors shift too (they render live now;
@@ -6328,6 +6569,18 @@ impl DocumentTree {
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
         }
+    }
+
+    /// Issue #276 — give bytes `[at.offset, end)` of the paragraph at
+    /// `at.path` exactly `style` ([`Paragraph::set_style`]). Used to
+    /// restyle text just typed over a selection; a no-op when the path
+    /// does not address a paragraph.
+    pub fn set_span_style(&self, at: LogicalPos, end: u32, style: SpanStyle) -> Self {
+        let mut out = self.clone();
+        let _ = mutate_paragraph_in_top(&mut out.blocks, &at.path, |para| {
+            *para = para.set_style(at.offset, end, style);
+        });
+        out
     }
 
     fn apply_style_single(&self, start: LogicalPos, end: LogicalPos, patch: SpanStyle) -> Self {
@@ -7256,6 +7509,16 @@ impl DocumentTree {
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
         }
+    }
+
+    /// Issue #277 — the style a paragraph created by Enter at the end
+    /// of a `style_id` paragraph takes: the style's `<w:next>` when it
+    /// names a DIFFERENT style this document defines, else `None`
+    /// (keep the same style).
+    pub fn next_style_after(&self, style_id: Option<&str>) -> Option<String> {
+        let id = style_id?;
+        let next = self.styles.get(id)?.next.as_deref()?;
+        (next != id && self.styles.contains_key(next)).then(|| next.to_owned())
     }
 
     /// Sprint 12 (#11) — resolve the paragraph cascade for `style_id`
@@ -8676,7 +8939,19 @@ impl DocumentTree {
         let Some(p) = self.paragraph_at_path(&at.path) else {
             return self.clone();
         };
-        let (left, right) = p.split_at(at.offset);
+        let (left, mut right) = p.split_at(at.offset);
+        /* Issue #277 — Word's "next style" rule: Enter at the very END
+        of a paragraph gives the NEW paragraph its style's `<w:next>`
+        (Heading 1 → Normal); a split anywhere else keeps the style on
+        both halves (`split_at`). An unknown / absent next keeps the
+        same style. The direct paragraph formatting and the list binding
+        survive the switch, exactly as `set_paragraph_style` keeps them. */
+        if p.snap_offset(at.offset) as usize == p.text.len()
+            && let Some(next) = self.next_style_after(right.style_id.as_deref())
+        {
+            right.style_id = Some(next);
+            recompute_paragraph_props(&mut right, &self.styles, &self.style_defaults);
+        }
         replace_block_in_top(&mut blocks, &at.path, Block::Paragraph(left));
         insert_block_after_path_in_top(&mut blocks, &at.path, Block::Paragraph(right));
         let mut split = Self {
@@ -9316,6 +9591,7 @@ impl DocumentTree {
             row_vec.push(TableRow {
                 props: RowProperties::default(),
                 cells,
+                source_markup: None,
             });
         }
         let table = Table {
@@ -9333,6 +9609,7 @@ impl DocumentTree {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         };
         let mut blocks = self.blocks.clone();
         let insert_at = (idx as usize).min(blocks.len());
@@ -9466,6 +9743,7 @@ impl DocumentTree {
             let new_row = TableRow {
                 props: RowProperties::default(),
                 cells: (0..cols).map(|_| default_table_cell()).collect(),
+                source_markup: None,
             };
             let insert_at = at.min(t.rows.len());
             t.rows.insert(insert_at, new_row);
@@ -10196,6 +10474,7 @@ pub fn default_table_cell() -> TableCell {
             ..CellProperties::default()
         },
         blocks: vec![Block::Paragraph(Paragraph::default())],
+        source_markup: None,
     }
 }
 
@@ -11483,6 +11762,99 @@ mod tests {
     /// Issue #80 — typing before an inline anchor slides it right with
     /// its sentinel byte; typing after leaves it alone.
     #[test]
+    fn typing_after_a_note_reference_does_not_inherit_its_superscript() {
+        let mut d = DocumentTree::from_text("ab\u{FFFC}");
+        let sup = SpanStyle {
+            vert_align: Some(VertAlign::Superscript),
+            ..SpanStyle::default()
+        };
+        {
+            let p = d.blocks[0].as_paragraph_mut().unwrap();
+            p.inline_objects = vec![InlineObject {
+                at: 2,
+                kind: InlineKind::FootnoteRef {
+                    id: 1,
+                    custom_mark_follows: false,
+                },
+                anchor: None,
+                source_xml: None,
+            }];
+            p.spans = vec![StyleRun {
+                start: 2,
+                end: 5,
+                style: sup.clone(),
+            }];
+        }
+        let at = |o| LogicalPos {
+            path: BlockPath::top(0),
+            offset: o,
+        };
+        /* Issue #276 — the anchor's run formatting is not continued. */
+        assert_eq!(
+            d.nth_paragraph(0).unwrap().typing_style_at(5),
+            SpanStyle::default()
+        );
+        let after = d.insert_text(at(5), " more");
+        let p = after.nth_paragraph(0).unwrap();
+        assert_eq!(p.style_at(2), sup, "the reference keeps its own style");
+        assert_eq!(p.style_at(5), SpanStyle::default());
+        assert_eq!(p.style_at(9), SpanStyle::default());
+    }
+
+    /// Issue #276 — typed text continues a run's formatting but never its
+    /// tracked-formatting record (`<w:rPrChange>` in the grab bag).
+    #[test]
+    fn typing_after_a_run_with_a_format_change_drops_the_revision_record() {
+        let mut bag = None;
+        GrabBag::push_into(&mut bag, b"<w:lang w:val=\"de-DE\"/>".to_vec());
+        GrabBag::push_into(&mut bag, b"<w:rPrChange w:id=\"8\"/>".to_vec());
+        let donor = SpanStyle {
+            bold: Some(true),
+            grab_bag: bag,
+            ..SpanStyle::default()
+        };
+        let d = DocumentTree::from_text("ab cd").apply_style(
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 0,
+            },
+            LogicalPos {
+                path: BlockPath::top(0),
+                offset: 5,
+            },
+            donor.clone(),
+        );
+        let typed = donor.for_typing();
+        assert_eq!(typed.bold, Some(true));
+        assert_eq!(
+            GrabBag::fragments_of(&typed.grab_bag),
+            &[b"<w:lang w:val=\"de-DE\"/>".to_vec()]
+        );
+        for at in [5, 2] {
+            let after = d.insert_text(
+                LogicalPos {
+                    path: BlockPath::top(0),
+                    offset: at,
+                },
+                "XY",
+            );
+            let p = after.nth_paragraph(0).unwrap();
+            assert_eq!(p.style_at(at), typed, "typed text at {at}");
+            assert_eq!(p.style_at(at + 1), typed);
+            assert_eq!(p.style_at(0), donor, "the source text keeps it");
+            /* Mid-run: the tail of the split donor span keeps it too. */
+            assert_eq!(
+                p.style_at(6),
+                if at == 2 {
+                    donor.clone()
+                } else {
+                    typed.clone()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn insert_text_shifts_inline_anchors_past_the_insertion_point() {
         let mut d = DocumentTree::from_text("ab\u{FFFC}cd\u{FFFC}");
         d.blocks[0].as_paragraph_mut().unwrap().inline_objects = vec![
@@ -11568,6 +11940,7 @@ mod tests {
                 text: s.into(),
                 ..Default::default()
             })],
+            source_markup: None,
         };
         d.blocks.push_back(Block::Table(Table {
             grid: vec![6765, 6765],
@@ -11576,15 +11949,18 @@ mod tests {
                 TableRow {
                     props: RowProperties::default(),
                     cells: vec![cell("a"), cell("b")],
+                    source_markup: None,
                 },
                 TableRow {
                     props: RowProperties::default(),
                     cells: vec![cell("c"), cell("d")],
+                    source_markup: None,
                 },
             ],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         assert_eq!(d.to_plain_text(), "a\tb\nc\td");
     }
@@ -11684,6 +12060,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         d
@@ -11764,6 +12141,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         d.styles.insert(
@@ -11778,6 +12156,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         let p0 = LogicalPos {
@@ -12359,11 +12738,14 @@ mod tests {
                         text: "cell".into(),
                         ..Default::default()
                     })],
+                    source_markup: None,
                 }],
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         let cell_pos = LogicalPos::new(
             BlockPath::top(1)
@@ -12424,6 +12806,7 @@ mod tests {
                 text: "x".into(),
                 ..Default::default()
             })],
+            source_markup: None,
         };
         cell.props.shading = Some([0xff, 0, 0, 0xff]);
         d.blocks.push_back(Block::Table(Table {
@@ -12432,10 +12815,12 @@ mod tests {
             rows: vec![TableRow {
                 props: RowProperties::default(),
                 cells: vec![cell],
+                source_markup: None,
             }],
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }));
         let path = BlockPath {
             steps: vec![
@@ -12577,6 +12962,7 @@ mod tests {
                     ..Default::default()
                 },
                 run: SpanStyle::default(),
+                next: None,
             },
         );
         let mut para = doc.nth_paragraph(0).unwrap().clone();
@@ -14917,6 +15303,74 @@ mod text_box_label_tests {
     }
 }
 
+#[cfg(test)]
+mod image_label_tests {
+    use super::*;
+
+    fn image(anchor_doc_pr: Option<&str>, source: Option<&str>) -> InlineObject {
+        InlineObject {
+            at: 0,
+            kind: InlineKind::Image {
+                rel_id: "rId1".to_string(),
+                width_emu: 914_400,
+                height_emu: 914_400,
+                media_key: None,
+            },
+            anchor: anchor_doc_pr.map(|x| {
+                Box::new(FloatAnchor {
+                    doc_pr_xml: Some(x.to_string()),
+                    ..FloatAnchor::default()
+                })
+            }),
+            source_xml: source.map(|s| s.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn anchor_doc_pr_names_and_describes_the_picture() {
+        let io = image(
+            Some(r#"<wp:docPr id="4" name="Diagram" descr="A flow diagram"/>"#),
+            None,
+        );
+        assert_eq!(
+            io.image_label(),
+            Some((
+                Some("Diagram".to_string()),
+                Some("A flow diagram".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn inline_picture_reads_the_doc_pr_from_its_own_source() {
+        let src = r#"<w:drawing><wp:inline><wp:docPr id="2" name="Logo" descr="Company logo"/></wp:inline></w:drawing>"#;
+        let io = image(None, Some(src));
+        assert_eq!(
+            io.image_label(),
+            Some((Some("Logo".to_string()), Some("Company logo".to_string())))
+        );
+    }
+
+    #[test]
+    fn vml_alt_is_the_description_and_non_images_have_no_label() {
+        let src = r#"<w:pict><v:shape id="s" alt="Scanned page"><v:imagedata/></v:shape></w:pict>"#;
+        assert_eq!(
+            image(None, Some(src)).image_label(),
+            Some((None, Some("Scanned page".to_string())))
+        );
+        assert_eq!(image(None, None).image_label(), Some((None, None)));
+        let tb = InlineObject {
+            at: 0,
+            kind: InlineKind::NoteSelfRef {
+                kind: NoteKind::Footnote,
+            },
+            anchor: None,
+            source_xml: None,
+        };
+        assert_eq!(tb.image_label(), None);
+    }
+}
+
 /// Issue #85 — crash-recovery persistence of the undo stack.
 #[cfg(test)]
 mod undo_history_tests {
@@ -15563,6 +16017,7 @@ mod source_markup_tests {
             attrs: vec![SourceAttr {
                 name: "w:rsidR".into(),
                 value: rsid.into(),
+                ws: None,
             }],
             ..SourceRun::default()
         }
@@ -15586,10 +16041,12 @@ mod source_markup_tests {
                     SourceAttr {
                         name: "w14:paraId".into(),
                         value: "1A2B3C4D".into(),
+                        ws: None,
                     },
                     SourceAttr {
                         name: "w:rsidR".into(),
                         value: "00A1".into(),
+                        ws: None,
                     },
                 ],
                 ppr: None,
@@ -15635,6 +16092,47 @@ mod source_markup_tests {
             ranges(markup(d.nth_paragraph(0).unwrap())),
             vec![(0, 7), (7, 12)]
         );
+    }
+
+    /// Issue #276 — style spans follow the SAME run choice as the source
+    /// markup: the span holding the character before the insertion grows
+    /// over it (at the paragraph start: the span holding the first
+    /// character), so typed text continues that run's formatting.
+    #[test]
+    fn insert_continues_the_style_span_before_the_caret() {
+        let bold = SpanStyle {
+            bold: Some(true),
+            ..SpanStyle::default()
+        };
+        let mut p = para();
+        p.spans = vec![StyleRun {
+            start: 0,
+            end: 6,
+            style: bold.clone(),
+        }];
+        let doc = DocumentTree {
+            blocks: vec![Block::Paragraph(p)].into(),
+            ..DocumentTree::default()
+        };
+        let pos = |o| LogicalPos {
+            path: BlockPath::top(0),
+            offset: o,
+        };
+        /* At the bold span's end: it grows, exactly like source run 0. */
+        let d = doc.insert_text(pos(6), "XY");
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!((p.spans[0].start, p.spans[0].end), (0, 8));
+        assert_eq!(ranges(markup(p)), vec![(0, 8), (8, 13)]);
+        assert_eq!(p.typing_style_at(8), bold);
+        /* At the paragraph start: the first span. */
+        let d = doc.insert_text(pos(0), ">");
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!((p.spans[0].start, p.spans[0].end), (0, 7));
+        /* After unstyled text: stays unstyled. */
+        let d = doc.insert_text(pos(11), "!");
+        let p = d.nth_paragraph(0).unwrap();
+        assert_eq!(p.spans.len(), 1);
+        assert_eq!(p.style_at(11), SpanStyle::default());
     }
 
     #[test]

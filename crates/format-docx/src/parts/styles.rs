@@ -48,6 +48,9 @@ pub struct StyleDef {
     /// `<w:basedOn w:val="…"/>` — the parent style id. The resolver folds
     /// the cascade root-first along this chain.
     pub based_on: Option<String>,
+    /// Issue #277 — `<w:next w:val="…"/>`: the style of the paragraph
+    /// Enter creates at the end of one in this style.
+    pub next: Option<String>,
     pub para: ParaProperties,
     pub run: SpanStyle,
 }
@@ -130,6 +133,11 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                             s.based_on = attr_val(&e, b"w:val");
                         }
                     }
+                    b"w:next" => {
+                        if let Some(s) = cur_style.as_mut() {
+                            s.next = attr_val(&e, b"w:val");
+                        }
+                    }
                     n if in_rpr(&stack) && !pmark_rpr(&stack) => {
                         apply_to_rpr(n, &e, &mut table, &mut cur_style, in_doc_defaults);
                     }
@@ -155,6 +163,11 @@ pub fn parse_styles_xml(xml: &[u8]) -> Result<StyleTable, DocxError> {
                     b"w:basedOn" => {
                         if let Some(s) = cur_style.as_mut() {
                             s.based_on = attr_val(&e, b"w:val");
+                        }
+                    }
+                    b"w:next" => {
+                        if let Some(s) = cur_style.as_mut() {
+                            s.next = attr_val(&e, b"w:val");
                         }
                     }
                     n if in_rpr(&stack) && !pmark_rpr(&stack) => {
@@ -205,6 +218,7 @@ struct StyleScratch {
     id: Option<String>,
     kind: Option<StyleKind>,
     based_on: Option<String>,
+    next: Option<String>,
     para: ParaProperties,
     run: SpanStyle,
 }
@@ -215,6 +229,7 @@ impl StyleScratch {
             id: attr_val(e, b"w:styleId"),
             kind: attr_val(e, b"w:type").as_deref().and_then(parse_kind),
             based_on: None,
+            next: None,
             para: ParaProperties::default(),
             run: SpanStyle::default(),
         }
@@ -226,6 +241,7 @@ impl StyleScratch {
             id,
             kind,
             based_on: self.based_on,
+            next: self.next,
             para: self.para,
             run: self.run,
         })
@@ -315,6 +331,7 @@ mod tests {
   <w:style w:type="paragraph" w:styleId="ChildStyle">
     <w:name w:val="Child Style"/>
     <w:basedOn w:val="BaseStyle"/>
+    <w:next w:val="BaseStyle"/>
     <w:rPr><w:i/></w:rPr>
     <w:pPr><w:jc w:val="center"/></w:pPr>
   </w:style>
@@ -337,10 +354,13 @@ mod tests {
         let base = t.by_id.get("BaseStyle").unwrap();
         assert_eq!(base.kind, StyleKind::Paragraph);
         assert_eq!(base.based_on, None);
+        assert_eq!(base.next, None);
         assert_eq!(base.run.bold, Some(true));
 
         let child = t.by_id.get("ChildStyle").unwrap();
         assert_eq!(child.based_on.as_deref(), Some("BaseStyle"));
+        /* Issue #277 — `<w:next>` drives Enter-at-end. */
+        assert_eq!(child.next.as_deref(), Some("BaseStyle"));
         assert_eq!(child.run.italic, Some(true));
         assert_eq!(child.para.alignment, Some(Alignment::Center));
 

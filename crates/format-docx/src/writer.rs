@@ -568,6 +568,12 @@ pub(crate) fn build_styles_xml(doc: &engine::DocumentTree) -> Vec<u8> {
             push_escaped_attr(parent, &mut out);
             out.push_str("\"/>");
         }
+        /* Issue #277 — CT_Style order: name, aliases, basedOn, next. */
+        if let Some(next) = &def.next {
+            out.push_str("<w:next w:val=\"");
+            push_escaped_attr(next, &mut out);
+            out.push_str("\"/>");
+        }
         emit_ppr(&def.para, None, None, None, None, &mut out);
         emit_rpr(&def.run, &mut out);
         out.push_str("</w:style>");
@@ -2197,24 +2203,93 @@ fn emit_table(t: &Table, out: &mut String, hyperlink_rel_map: &HashMap<String, S
 /// with `<w:trPr>` and `<w:tc>` cells carrying `<w:tcPr>` (gridSpan,
 /// vMerge, tcW, shd, tcBorders, vAlign) and nested block content via
 /// `emit_block` for true recursion.
+///
+/// Issue #248 — a table read from `.docx` carries its source markup
+/// ([`engine::TableSourceMarkup`] and the row / cell twins): the
+/// `<w:tbl>` / `<w:tr>` / `<w:tc>` attributes, the whitespace before every
+/// property element, the passthrough between rows and between cells
+/// (whitespace, range markers, `<w:sdt>` wrappers — balanced by an
+/// [`EnvelopeStack`] per level) and `<w:tblPrEx>` are always re-emitted;
+/// the `<w:tblPr>` / `<w:tblGrid>` / `<w:trPr>` / `<w:tcPr>` bytes only
+/// while the live model still equals what they produced
+/// ([`source_element_current`]), else the element regenerates and adopts
+/// its unchanged empty children's source spelling.
 fn regenerate_table(t: &Table, out: &mut String, hyperlink_rel_map: &HashMap<String, String>) {
-    out.push_str("<w:tbl>");
-    emit_tbl_pr(&t.props, out);
-    /* `<w:tblGrid>` — one `<w:gridCol w:w="…"/>` per template column. */
-    if !t.grid.is_empty() {
-        out.push_str("<w:tblGrid>");
-        for w in &t.grid {
-            out.push_str(&format!("<w:gridCol w:w=\"{w}\"/>"));
+    let markup = t.source_markup.as_deref();
+    out.push_str("<w:tbl");
+    if let Some(m) = markup {
+        attrs_xml(&m.attrs, out);
+    }
+    out.push('>');
+    let source_pr = markup.and_then(|m| m.tbl_pr.as_ref());
+    emit_source_element(source_pr, &t.props, out, |src, s| {
+        emit_tbl_pr(&t.props, src, s)
+    });
+    let source_grid = markup.and_then(|m| m.grid.as_ref());
+    emit_source_element(source_grid, &t.grid, out, |_, s| {
+        /* `<w:tblGrid>` — one `<w:gridCol w:w="…"/>` per template column. */
+        if !t.grid.is_empty() {
+            s.push_str("<w:tblGrid>");
+            for w in &t.grid {
+                s.push_str(&format!("<w:gridCol w:w=\"{w}\"/>"));
+            }
+            s.push_str("</w:tblGrid>");
         }
-        out.push_str("</w:tblGrid>");
-    }
+    });
+    let mut envelopes = EnvelopeStack::new();
     for row in &t.rows {
+        let bx = row
+            .source_markup
+            .as_deref()
+            .and_then(|m| m.body_xml.as_deref());
+        if let Some(bx) = bx {
+            envelopes.emit(&bx.before, out);
+        }
         emit_table_row(row, out, hyperlink_rel_map);
+        if let Some(bx) = bx {
+            envelopes.emit(&bx.after, out);
+        }
     }
+    envelopes.finish(out);
     out.push_str("</w:tbl>");
 }
 
-fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
+/// Issue #248 — the source bytes of a table property element still
+/// describe the live model (the #199 verified-passthrough rule). Only
+/// inside [`write_docx`] ([`source_bytes_trusted`]): a `<w:tblStyle>` /
+/// `<w:cnfStyle>` leans on the source package's `styles.xml`.
+fn source_element_current<T: PartialEq>(el: &engine::SourceElement<T>, live: &T) -> bool {
+    source_bytes_trusted() && el.model == *live
+}
+
+/// Issue #248 — write one table property element: `lead` (the source
+/// whitespace before it) + its verified source bytes, else `regen` (which
+/// receives the source bytes to adopt from). A regeneration that writes
+/// nothing (the model went default) drops the `lead` too.
+fn emit_source_element<T: PartialEq>(
+    source: Option<&engine::SourceElement<T>>,
+    live: &T,
+    out: &mut String,
+    regen: impl FnOnce(Option<&[u8]>, &mut String),
+) {
+    match source {
+        Some(el) if source_element_current(el, live) => {
+            push_utf8(&el.lead, out);
+            push_utf8(&el.xml, out);
+        }
+        Some(el) => {
+            let mut s = String::new();
+            regen(Some(&el.xml), &mut s);
+            if !s.is_empty() {
+                push_utf8(&el.lead, out);
+                out.push_str(&s);
+            }
+        }
+        None => regen(None, out),
+    }
+}
+
+fn emit_tbl_pr(props: &engine::TableProperties, source: Option<&[u8]>, out: &mut String) {
     let has_margins = props.cell_margins != engine::CellMargins::default();
     let has_layout_override = matches!(props.layout, engine::TableLayout::Fixed);
     let has_content = props.width.is_some()
@@ -2277,19 +2352,48 @@ fn emit_tbl_pr(props: &engine::TableProperties, out: &mut String) {
         ch.push(rank(b"w:tblCellMar"), s);
     }
     ch.push_bag(&props.grab_bag, tbl_pr_child_rank);
+    ch.adopt(source);
     ch.finish("w:tblPr", out);
 }
 
 fn emit_table_row(row: &TableRow, out: &mut String, hyperlink_rel_map: &HashMap<String, String>) {
-    out.push_str("<w:tr>");
-    emit_tr_pr(&row.props, out);
-    for cell in &row.cells {
-        emit_table_cell(cell, out, hyperlink_rel_map);
+    let markup = row.source_markup.as_deref();
+    out.push_str("<w:tr");
+    if let Some(m) = markup {
+        attrs_xml(&m.attrs, out);
     }
+    out.push('>');
+    /* Issue #103 — `<w:tblPrEx>` (CT_Row: tblPrEx?, trPr?, cells) is
+    unmodeled: always its source bytes. */
+    if let Some(ex) = markup.and_then(|m| m.tbl_pr_ex.as_ref()) {
+        push_utf8(&ex.lead, out);
+        push_utf8(&ex.xml, out);
+    }
+    emit_source_element(
+        markup.and_then(|m| m.tr_pr.as_ref()),
+        &row.props,
+        out,
+        |src, s| emit_tr_pr(&row.props, src, s),
+    );
+    let mut envelopes = EnvelopeStack::new();
+    for cell in &row.cells {
+        let bx = cell
+            .source_markup
+            .as_deref()
+            .and_then(|m| m.body_xml.as_deref());
+        if let Some(bx) = bx {
+            envelopes.emit(&bx.before, out);
+        }
+        emit_table_cell(cell, out, hyperlink_rel_map);
+        if let Some(bx) = bx {
+            envelopes.emit(&bx.after, out);
+        }
+    }
+    envelopes.finish(out);
     out.push_str("</w:tr>");
 }
 
-fn emit_tr_pr(props: &engine::RowProperties, out: &mut String) {
+fn emit_tr_pr(props: &engine::RowProperties, source: Option<&[u8]>, out: &mut String) {
     let has =
         props.height.is_some() || props.cant_split || props.header || props.grab_bag.is_some();
     if !has {
@@ -2319,6 +2423,7 @@ fn emit_tr_pr(props: &engine::RowProperties, out: &mut String) {
         ch.push(rank(b"w:tblHeader"), "<w:tblHeader/>".into());
     }
     ch.push_bag(&props.grab_bag, tr_pr_child_rank);
+    ch.adopt(source);
     ch.finish("w:trPr", out);
 }
 
@@ -2327,8 +2432,18 @@ fn emit_table_cell(
     out: &mut String,
     hyperlink_rel_map: &HashMap<String, String>,
 ) {
-    out.push_str("<w:tc>");
-    emit_tc_pr(&cell.props, out);
+    let markup = cell.source_markup.as_deref();
+    out.push_str("<w:tc");
+    if let Some(m) = markup {
+        attrs_xml(&m.attrs, out);
+    }
+    out.push('>');
+    emit_source_element(
+        markup.and_then(|m| m.tc_pr.as_ref()),
+        &cell.props,
+        out,
+        |src, s| emit_tc_pr(&cell.props, src, s),
+    );
     /* A cell must contain at least one paragraph (Word repair dialog
     fires on empty cells); inject a default `<w:p>` when blocks are
     empty. */
@@ -2340,7 +2455,7 @@ fn emit_table_cell(
     out.push_str("</w:tc>");
 }
 
-fn emit_tc_pr(props: &engine::CellProperties, out: &mut String) {
+fn emit_tc_pr(props: &engine::CellProperties, source: Option<&[u8]>, out: &mut String) {
     let has = props.grid_span > 1
         || !matches!(props.v_merge, VMergeRole::None)
         || props.width.is_some()
@@ -2401,6 +2516,7 @@ fn emit_tc_pr(props: &engine::CellProperties, out: &mut String) {
         ch.push(rank(b"w:tcMar"), s);
     }
     ch.push_bag(&props.grab_bag, tc_pr_child_rank);
+    ch.adopt(source);
     ch.finish("w:tcPr", out);
 }
 
@@ -6793,6 +6909,30 @@ mod tests {
         assert!(!out.contains("widowControl"), "{out}");
     }
 
+    /// Issue #277 — a regenerated `styles.xml` keeps `<w:next>` (after
+    /// `<w:basedOn>`, CT_Style order) and the reader maps it back.
+    #[test]
+    fn styles_xml_round_trips_the_next_style() {
+        let mut doc = engine::DocumentTree::default();
+        doc.styles.insert(
+            "Heading1".into(),
+            engine::ParagraphStyle {
+                id: "Heading1".into(),
+                name: "heading 1".into(),
+                based_on: Some("Normal".into()),
+                next: Some("Normal".into()),
+                ..Default::default()
+            },
+        );
+        let xml = String::from_utf8(build_styles_xml(&doc)).expect("utf8");
+        assert!(
+            xml.contains(r#"<w:basedOn w:val="Normal"/><w:next w:val="Normal"/>"#),
+            "{xml}"
+        );
+        let table = crate::parts::styles::parse_styles_xml(xml.as_bytes()).expect("parse");
+        assert_eq!(table.by_id["Heading1"].next.as_deref(), Some("Normal"));
+    }
+
     #[test]
     fn round_trip_para_properties() {
         use engine::{Indent, LineHeight, Spacing, TextDirection};
@@ -9533,6 +9673,22 @@ mod tests {
         assert_eq!(back.document.paragraph_text(0), Some("Hello wr"));
     }
 
+    /// Issue #276 — typing at the END of a formatted run (the underlined
+    /// one) continues it: the typed text inherits the run's formatting, so
+    /// the save is exactly source + the inserted bytes inside that run —
+    /// same rsid, same verbatim `<w:rPr>` — instead of a fresh plain
+    /// `<w:r>` after it.
+    #[test]
+    fn typing_after_a_formatted_run_continues_it() {
+        let (xml, archive) = markup_archive();
+        let end = "Hello wrold underlined".len();
+        let edited = archive.document.insert_text(at(0, end), "ZZ");
+        let p = edited.nth_paragraph(0).unwrap();
+        assert!(p.style_at(end as u32 + 1).underline.is_some());
+        let out = document_xml_of(&write_docx(&archive, &edited).expect("write"));
+        assert_eq!(out, xml.replacen(" underlined<", " underlinedZZ<", 1));
+    }
+
     /// Issues #199 / #106 — a minimal package ships no `styles.xml`, so the
     /// recorded source pPr / rPr bytes are not reused there: the resolved
     /// properties are baked instead (the docDefaults spacing appears).
@@ -9551,3 +9707,8 @@ mod tests {
 #[cfg(test)]
 #[path = "writer_inline_span_tests.rs"]
 mod inline_span_tests;
+
+/// Issue #248 — table source markup.
+#[cfg(test)]
+#[path = "writer_table_markup_tests.rs"]
+mod table_markup_tests;

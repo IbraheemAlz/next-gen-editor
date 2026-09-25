@@ -45,7 +45,7 @@ pub(crate) const TIKA_792_BODY: &str = concat!(
     r#"</w:p>"#,
 );
 
-/// Issue #247 — step 30: tracked moves.
+/// Issue #247 — step 31: tracked moves.
 ///
 /// a. The move wrappers read as `MoveTo` / `MoveFrom` revisions named by
 ///    their range; an untouched save is byte-identical.
@@ -75,17 +75,17 @@ pub(crate) fn run_tracked_moves_roundtrip() -> Result<()> {
         || !kinds(1).contains(&(RevisionKind::MoveFrom, 0, 1, name.clone()))
     {
         bail!(
-            "step 30a: moves not modeled: {:?} / {:?}",
+            "step 31a: moves not modeled: {:?} / {:?}",
             kinds(0),
             kinds(1)
         );
     }
     let untouched = write_docx(&archive, &archive.document).context("untouched save")?;
     if extract_doc_xml(&untouched)? != xml.as_bytes() {
-        bail!("step 30a: untouched tracked-move document drifted");
+        bail!("step 31a: untouched tracked-move document drifted");
     }
     println!(
-        "[roundtrip] step 30a OK — moves read as MoveTo / MoveFrom, untouched save byte-identical"
+        "[roundtrip] step 31a OK — moves read as MoveTo / MoveFrom, untouched save byte-identical"
     );
 
     for (block, offset) in [(0u32, 1usize), (1, 1), (1, 0)] {
@@ -101,12 +101,12 @@ pub(crate) fn run_tracked_moves_roundtrip() -> Result<()> {
             ),
         ] {
             assert_document_xml_well_formed(&out)
-                .with_context(|| format!("step 30b {path} {block}:{offset}"))?;
+                .with_context(|| format!("step 31b {path} {block}:{offset}"))?;
             let got = extract_doc_xml(&out)?;
             let (_, rewritten, _) = rewritten_region(xml.as_bytes(), &got);
             if rewritten != 0 {
                 bail!(
-                    "step 30b {path}: edit at {block}:{offset} rewrote {rewritten} source bytes\n{}",
+                    "step 31b {path}: edit at {block}:{offset} rewrote {rewritten} source bytes\n{}",
                     String::from_utf8_lossy(&got)
                 );
             }
@@ -122,12 +122,12 @@ pub(crate) fn run_tracked_moves_roundtrip() -> Result<()> {
                 .iter()
                 .any(|r| r.kind == want && r.move_name == name)
             {
-                bail!("step 30b {path}: the move did not survive the edit at {block}:{offset}");
+                bail!("step 31b {path}: the move did not survive the edit at {block}:{offset}");
             }
         }
     }
     println!(
-        "[roundtrip] step 30b OK — edits beside a move are pure insertions, the move re-reads"
+        "[roundtrip] step 31b OK — edits beside a move are pure insertions, the move re-reads"
     );
 
     /* c. A one-paragraph move: the source half first, the destination
@@ -148,20 +148,20 @@ pub(crate) fn run_tracked_moves_roundtrip() -> Result<()> {
         || rejected.paragraph_text(0) != Some("moved stay ")
     {
         bail!(
-            "step 30c: accept kept {:?}, reject kept {:?}",
+            "step 31c: accept kept {:?}, reject kept {:?}",
             accepted.paragraph_text(0),
             rejected.paragraph_text(0)
         );
     }
     for (what, doc) in [("accepted", &accepted), ("rejected", &rejected)] {
         let out = format_docx::save_docx(doc).context("save resolved move")?;
-        assert_document_xml_well_formed(&out).with_context(|| format!("step 30c {what}"))?;
+        assert_document_xml_well_formed(&out).with_context(|| format!("step 31c {what}"))?;
         let xml = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
         if xml.contains("<w:moveFrom ") || xml.contains("<w:moveTo ") {
-            bail!("step 30c: the {what} move still carries a wrapper:\n{xml}");
+            bail!("step 31c: the {what} move still carries a wrapper:\n{xml}");
         }
     }
-    println!("[roundtrip] step 30c OK — accept keeps the destination, reject the source");
+    println!("[roundtrip] step 31c OK — accept keeps the destination, reject the source");
     Ok(())
 }
 
@@ -192,7 +192,7 @@ fn marks(doc: &DocumentTree) -> Vec<Option<(RevisionKind, Option<u32>)>> {
         .collect()
 }
 
-/// Issue #262 — step 31: paragraph-mark revisions + engine accept-all.
+/// Issue #262 — step 32: paragraph-mark revisions + engine accept-all.
 ///
 /// a. `<w:pPr><w:rPr><w:del/>` / `<w:ins/>` read as
 ///    `Paragraph::mark_revision`; an untouched save is byte-identical.
@@ -213,14 +213,14 @@ pub(crate) fn run_paragraph_mark_revisions_roundtrip() -> Result<()> {
         None,
     ];
     if marks(doc) != want {
-        bail!("step 31a: marks read as {:?}", marks(doc));
+        bail!("step 32a: marks read as {:?}", marks(doc));
     }
     let untouched = write_docx(&archive, doc).context("untouched save")?;
     if extract_doc_xml(&untouched)? != xml.as_bytes() {
-        bail!("step 31a: untouched mark-revision document drifted");
+        bail!("step 32a: untouched mark-revision document drifted");
     }
     println!(
-        "[roundtrip] step 31a OK — paragraph-mark ins / del modeled, untouched save byte-identical"
+        "[roundtrip] step 32a OK — paragraph-mark ins / del modeled, untouched save byte-identical"
     );
 
     for (block, offset) in [(0u32, "gone head".len()), (1, 2)] {
@@ -236,38 +236,38 @@ pub(crate) fn run_paragraph_mark_revisions_roundtrip() -> Result<()> {
             ),
         ] {
             assert_document_xml_well_formed(&out)
-                .with_context(|| format!("step 31b {path} {block}:{offset}"))?;
+                .with_context(|| format!("step 32b {path} {block}:{offset}"))?;
             let got = extract_doc_xml(&out)?;
             let (_, rewritten, _) = rewritten_region(xml.as_bytes(), &got);
             if rewritten != 0 {
                 bail!(
-                    "step 31b {path}: edit at {block}:{offset} rewrote {rewritten} source bytes\n{}",
+                    "step 32b {path}: edit at {block}:{offset} rewrote {rewritten} source bytes\n{}",
                     String::from_utf8_lossy(&got)
                 );
             }
         }
     }
-    println!("[roundtrip] step 31b OK — edits in tracked-mark paragraphs are pure insertions");
+    println!("[roundtrip] step 32b OK — edits in tracked-mark paragraphs are pure insertions");
 
     let realigned = doc
         .set_alignment(at(0, 0), at(1, 0), Alignment::End)
         .insert_text(at(2, 0), INSERT_TEXT);
     let out = write_docx(&archive, &realigned).context("realigned save")?;
-    assert_document_xml_well_formed(&out).context("step 31c")?;
+    assert_document_xml_well_formed(&out).context("step 32c")?;
     let got = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
     for needle in [
         r#"<w:rPr><w:del w:id="10" w:author="A" w:date="2026-01-01T00:00:00Z"/><w:b/></w:rPr>"#,
         r#"<w:rPr><w:ins w:id="12" w:author="B" w:date="2026-01-02T00:00:00Z"/></w:rPr>"#,
     ] {
         if !got.contains(needle) {
-            bail!("step 31c: regenerated pPr lost {needle}\n{got}");
+            bail!("step 32c: regenerated pPr lost {needle}\n{got}");
         }
     }
     let reread = read_docx(&out).context("re-read realigned")?;
     if marks(&reread.document) != want {
-        bail!("step 31c: marks re-read as {:?}", marks(&reread.document));
+        bail!("step 32c: marks re-read as {:?}", marks(&reread.document));
     }
-    println!("[roundtrip] step 31c OK — a regenerated pPr re-injects the mark revision");
+    println!("[roundtrip] step 32c OK — a regenerated pPr re-injects the mark revision");
 
     for (accept, expect) in [
         (true, vec!["head tail", "last"]),
@@ -275,22 +275,22 @@ pub(crate) fn run_paragraph_mark_revisions_roundtrip() -> Result<()> {
     ] {
         let resolved = doc.resolve_all_revisions(accept);
         if texts(&resolved) != expect {
-            bail!("step 31d (accept={accept}): {:?}", texts(&resolved));
+            bail!("step 32d (accept={accept}): {:?}", texts(&resolved));
         }
         let out = format_docx::save_docx(&resolved).context("save resolved")?;
-        assert_document_xml_well_formed(&out).with_context(|| format!("step 31d {accept}"))?;
+        assert_document_xml_well_formed(&out).with_context(|| format!("step 32d {accept}"))?;
         let got = String::from_utf8(extract_doc_xml(&out)?).context("utf8")?;
         if got.contains("<w:del ") || got.contains("<w:ins ") || got.contains("<w:delText") {
-            bail!("step 31d (accept={accept}): a revision survived\n{got}");
+            bail!("step 32d (accept={accept}): a revision survived\n{got}");
         }
         let reread = read_docx(&out).context("re-read resolved")?;
         if reread.document.has_revisions() || texts(&reread.document) != expect {
             bail!(
-                "step 31d (accept={accept}): re-read {:?}",
+                "step 32d (accept={accept}): re-read {:?}",
                 texts(&reread.document)
             );
         }
     }
-    println!("[roundtrip] step 31d OK — accept-all / reject-all resolve marks, save clean");
+    println!("[roundtrip] step 32d OK — accept-all / reject-all resolve marks, save clean");
     Ok(())
 }

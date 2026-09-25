@@ -86,8 +86,8 @@ fn each_part_paints_its_own_picture_on_canvas_and_in_pdf() {
         .cmds
         .iter()
         .filter_map(|c| match c {
-            render::scene::DisplayCmd::DrawImage { rect, rel_id } => {
-                Some((rel_id.clone(), rect.y0))
+            render::scene::DisplayCmd::DrawImage { rect, media_key } => {
+                Some((media_key.clone(), rect.y0))
             }
             _ => None,
         })

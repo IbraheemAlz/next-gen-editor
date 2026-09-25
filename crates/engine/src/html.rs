@@ -891,6 +891,7 @@ fn parse_table_html(table_str: &str) -> Option<Table> {
             cells_out.push(TableCell {
                 props,
                 blocks: final_blocks,
+                source_markup: None,
             });
         }
         if cells_out.is_empty() {
@@ -900,6 +901,7 @@ fn parse_table_html(table_str: &str) -> Option<Table> {
         rows.push(TableRow {
             props: RowProperties::default(),
             cells: cells_out,
+            source_markup: None,
         });
     }
     if rows.is_empty() {
@@ -918,6 +920,7 @@ fn parse_table_html(table_str: &str) -> Option<Table> {
         dirty: true,
         source_xml: None,
         body_xml: None,
+        source_markup: None,
     })
 }
 
@@ -1363,6 +1366,7 @@ mod tests {
         let row = TableRow {
             props: RowProperties::default(),
             cells: vec![cell],
+            source_markup: None,
         };
         Table {
             grid: vec![6765],
@@ -1371,6 +1375,7 @@ mod tests {
             dirty: true,
             source_xml: None,
             body_xml: None,
+            source_markup: None,
         }
     }
 
