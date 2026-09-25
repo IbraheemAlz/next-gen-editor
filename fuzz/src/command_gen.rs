@@ -31,7 +31,7 @@ use bridge::{
     Alignment, BlockPath, BridgeCellBorders, Command, Direction, FieldKind, HeaderFooterArea,
     ImageBlob, ImageFit, ImageWrapMode, InsertSide, ListKind, LogicalPos, LogicalRange,
     MoveDirection, SectionBreakKind, SelectionModifier, TablePropertiesPatch, TextAttrsPatch,
-    UnderlineStyle,
+    TextBoxHop, UnderlineStyle,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -336,6 +336,7 @@ fn gen_targeted_command(u: &mut Unstructured) -> Option<Command> {
             at: small(u, 40),
             offset_h_emu: small_i64(u, 2_000_000),
             offset_v_emu: small_i64(u, 2_000_000),
+            story: story_chain(u),
         },
         _ => Command::ExitHeaderFooter,
     })
@@ -466,9 +467,29 @@ fn gen_image_command(u: &mut Unstructured) -> Option<Command> {
                         ImageWrapMode::InFrontOfText,
                     ])
                     .ok()?,
+                story: story_chain(u),
             }
         }
     })
+}
+
+/// Issue #206 — an image command's text-box story chain: mostly the body
+/// (empty), sometimes one or two small hops (a real box at `(0, 0)` is
+/// the common authored shape) and rarely a chain past the nesting cap, so
+/// the story resolver's reject paths are exercised too.
+fn story_chain(u: &mut Unstructured) -> Vec<TextBoxHop> {
+    let n = match small(u, 8) {
+        0..=4 => 0,
+        5 | 6 => 1,
+        7 => 2,
+        _ => 3,
+    };
+    (0..n)
+        .map(|_| TextBoxHop {
+            path: BlockPath::top(small(u, 3)),
+            at: small(u, 40),
+        })
+        .collect()
 }
 
 /// Build a sequence of up to `max_len` commands, mixing:
@@ -785,6 +806,7 @@ mod tests {
                 at: 0,
                 offset_h_emu: 0,
                 offset_v_emu: 0,
+                story: Vec::new(),
             })
             .curated
         );

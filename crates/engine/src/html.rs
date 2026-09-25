@@ -299,6 +299,7 @@ fn emit_inline_object(obj: &InlineObject, out: &mut String) {
             rel_id,
             width_emu,
             height_emu,
+            media_key,
         } => {
             let w_px = emu_to_css_px(*width_emu);
             let h_px = emu_to_css_px(*height_emu);
@@ -312,6 +313,12 @@ fn emit_inline_object(obj: &InlineObject, out: &mut String) {
             // round-trip.
             out.push_str("<img src=\"\" data-rel-id=\"");
             escape_into(rel_id, out);
+            /* Issue #188 — `rel_id` is part-scoped; the media key is what
+            the pasted copy paints from. */
+            if let Some(key) = media_key {
+                out.push_str("\" data-media-key=\"");
+                escape_into(key, out);
+            }
             out.push_str(&format!(
                 "\" data-width-emu=\"{width_emu}\" data-height-emu=\"{height_emu}\" width=\"{w_px}\" height=\"{h_px}\"/>"
             ));
@@ -653,6 +660,7 @@ fn parse_img(body: &str) -> Option<InlineObject> {
             rel_id,
             width_emu,
             height_emu,
+            media_key: extract_attr(body, "data-media-key"),
         },
         anchor: None,
         source_xml: None,
@@ -1405,6 +1413,7 @@ mod tests {
                     rel_id: "rId7".into(),
                     width_emu: 1_905_000,  // 200 px @ 96 DPI
                     height_emu: 1_524_000, // 160 px @ 96 DPI
+                    media_key: Some("word/media/image7.png".into()),
                 },
                 anchor: None,
                 source_xml: None,
@@ -1430,8 +1439,14 @@ mod tests {
                 rel_id,
                 width_emu,
                 height_emu,
+                media_key,
             } => {
                 assert_eq!(rel_id, "rId7");
+                assert_eq!(
+                    media_key.as_deref(),
+                    Some("word/media/image7.png"),
+                    "issue #188 — the part-resolved media key survives the clipboard"
+                );
                 assert_eq!(*width_emu, 1_905_000, "EMU is lossless via data-*-emu");
                 assert_eq!(*height_emu, 1_524_000);
             }

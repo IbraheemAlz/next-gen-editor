@@ -210,25 +210,43 @@ impl DocxArchive {
 }
 
 /// Read a `.docx` byte blob → parsed document + stashed sibling entries.
-/// Fallback page geometry for a `<w:sectPr>` missing `<w:pgSz>` is A4 —
-/// see [`read_docx_with_settings`] to override it.
+/// Fallback page geometry for a `<w:sectPr>` missing `<w:pgSz>` is A4, and
+/// a paragraph with no resolved `<w:widowControl>` anywhere in the cascade
+/// reads as widow/orphan control ON (Word's application default) — see
+/// [`read_docx_with_settings`] to override either.
 pub fn read_docx(bytes: &[u8]) -> Result<DocxArchive, DocxError> {
-    read_docx_with_settings(bytes, engine::DefaultPageSize::default())
+    let defaults = engine::DocumentSettings::default();
+    read_docx_with_settings(
+        bytes,
+        defaults.default_page_size,
+        defaults.widow_control_default,
+    )
 }
 
-/// [`read_docx`], with a host-chosen [`engine::DefaultPageSize`] fallback
-/// for any `<w:sectPr>` that omits `<w:pgSz>` (issue #109 — ECMA-376
-/// requires `pgSz`, but the Apache POI / docx4j "wild document" corpus
-/// ships files that skip it; `read_docx` itself always resolves those to
-/// A4, unchanged, so every pinned `layout::geometry_fingerprint` fixture
-/// keeps its geometry). An embedding host that defaults new/underspecified
-/// documents to US Letter calls this directly with
-/// `engine::DefaultPageSize::Letter`. The choice is stamped onto
-/// `DocumentTree.settings.default_page_size` for inspection — it is never
-/// read FROM the archive, since OOXML has no such element.
+/// [`read_docx`], with host-chosen fallbacks for two settings OOXML never
+/// carries an element for — the values are stamped onto
+/// `DocumentTree.settings` for inspection, never read FROM the archive:
+///
+/// - `default_page_size` ([`engine::DefaultPageSize`], issue #109) — the
+///   fallback for any `<w:sectPr>` that omits `<w:pgSz>` (ECMA-376 requires
+///   `pgSz`, but the Apache POI / docx4j "wild document" corpus ships files
+///   that skip it). An embedding host that defaults new/underspecified
+///   documents to US Letter calls this directly with
+///   `engine::DefaultPageSize::Letter`.
+/// - `widow_control_default` (issue #179) — the effective
+///   `<w:widowControl>` for a paragraph whose resolved
+///   `engine::ParaProperties::widow_control` is `None`. #95 chose `true`
+///   (Word's application default); ECMA-376 itself reads an absent element
+///   as "not applied" (`false`). A host that wants the strict spec reading
+///   passes `false` here instead of stamping every paragraph.
+///
+/// `read_docx` itself always resolves both to their `#[default]`s (`A4`,
+/// `true`), unchanged, so every pinned `layout::geometry_fingerprint`
+/// fixture keeps its geometry.
 pub fn read_docx_with_settings(
     bytes: &[u8],
     default_page_size: engine::DefaultPageSize,
+    widow_control_default: bool,
 ) -> Result<DocxArchive, DocxError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
     let mut other_entries: Vec<(String, Vec<u8>)> = Vec::new();
@@ -268,6 +286,7 @@ pub fn read_docx_with_settings(
         default_page_size.geometry(),
     )?;
     document.settings.default_page_size = default_page_size;
+    document.settings.widow_control_default = widow_control_default;
 
     /* Phase 4 — `word/numbering.xml` rides the pass-through and feeds the
     numbering resolver. Second pass over the parsed paragraphs fills each
@@ -367,6 +386,17 @@ pub fn read_docx_with_settings(
       or resolve them, leaving raw `rId` strings as targets. Resolve
       against the part-local table; unresolved links drop, exactly the
       body semantics. */
+    /* Phase 7 / issue #188 — image blobs out of `word/media/`, keyed by
+    the resolved TARGET entry name (`word/media/image2.png`), never by
+    the bare relationship id: rel ids are scoped per part, so a header's
+    `rId5` and the body's `rId5` may name different pictures. Each part
+    registers its own rels (body here, header / footer below, notes
+    further down) and every picture is stamped with the media key its
+    part-local `r:embed` resolves to (`InlineKind::Image::media_key`). The
+    relationship `Type` would be the canonical filter (`.../image`), but
+    the pass is lenient — any rel resolving into `word/media/` counts. */
+    let mut media: HashMap<String, ImageBlob> = HashMap::new();
+    let body_media_keys = register_part_media(&other_entries, DOC_XML, &rels, &mut media);
     for (rid, blocks) in headers.iter_mut().chain(footers.iter_mut()) {
         if !numbering.num_instances.is_empty() {
             resolve_markers_blocks(blocks, &numbering);
@@ -384,54 +414,30 @@ pub fn read_docx_with_settings(
                 .cloned()
                 .map(|b| resolve_hyperlinks_block(b, &part_rels))
                 .collect();
+            /* Issue #188 / #78 — part-local picture rels. */
+            let keys = register_part_media(&other_entries, &entry, &part_rels, &mut media);
+            stamp_media_keys(blocks, &keys);
         }
     }
     document = document.with_header_footer_parts(headers, footers);
 
-    // Phase 7 — pull image blobs out of word/media/ keyed by the
-    // relationship id every inline image's <a:blip r:embed="..."/>
-    // references. Also rewrite each hyperlink's `target` field from its
-    // rId to the actual URL the rels table holds (the document parser
-    // leaves the rId in place until rels are available).
-    let mut media: std::collections::HashMap<String, ImageBlob> = std::collections::HashMap::new();
-    /* Iterate every relationship; for each image media entry, fetch the
-    blob bytes via the same resolver header/footer used. The
-    relationship `Type` field would be the canonical filter
-    (`.../image`), but the parser is lenient — any rel pointing into
-    `word/media/` is treated as media. */
-    for (rid, target) in &rels {
-        let entry = resolve_target(target);
-        if !entry.starts_with("word/media/") {
-            continue;
-        }
-        if let Some(bytes) = other_entries
-            .iter()
-            .find(|(n, _)| n == &entry)
-            .map(|(_, b)| b.clone())
-        {
-            let content_type = guess_image_mime(&entry).to_string();
-            media.insert(
-                rid.clone(),
-                ImageBlob {
-                    content_type,
-                    data: bytes,
-                },
-            );
-        }
-    }
-    /* Resolve hyperlink targets across every paragraph. Phase 3 (#40) —
-    a straight block-list replacement: section markers ride the
-    paragraphs (resolve_hyperlinks_block preserves every non-hyperlink
-    field), and body_section / headers / footers / comment_ranges never
-    leave `document`, so the old take/rebuild/restore dance (issue #61)
-    is gone. */
+    /* Resolve hyperlink targets across every paragraph (and stamp each
+    body picture's media key). Phase 3 (#40) — a straight block-list
+    replacement: section markers ride the paragraphs
+    (resolve_hyperlinks_block preserves every non-hyperlink field), and
+    body_section / headers / footers / comment_ranges never leave
+    `document`, so the old take/rebuild/restore dance (issue #61) is
+    gone. */
     document.blocks = document
         .blocks
         .iter()
         .cloned()
-        .map(|b| resolve_hyperlinks_block(b, &rels))
+        .map(|b| {
+            let mut b = resolve_hyperlinks_block(b, &rels);
+            stamp_media_keys(std::slice::from_mut(&mut b), &body_media_keys);
+            b
+        })
         .collect();
-    document.media = media;
 
     /* Sprint 12 (#11) — mirror the `StyleTable` into the engine model
     so the live editor can apply / re-resolve styles without the
@@ -502,6 +508,8 @@ pub fn read_docx_with_settings(
             .find(|(n, _)| n == &rels_name)
             .and_then(|(_, b)| parse_rels_xml(b).ok())
             .unwrap_or_default();
+        /* Issue #188 — note pictures resolve against the note part's rels. */
+        let note_media_keys = register_part_media(&other_entries, entry, &part_rels, &mut media);
         let mut stories: HashMap<i32, engine::NoteStory> = HashMap::with_capacity(part.notes.len());
         for mut story in part.notes {
             if !numbering.num_instances.is_empty() {
@@ -512,6 +520,7 @@ pub fn read_docx_with_settings(
                 .into_iter()
                 .map(|b| resolve_hyperlinks_block(b, &part_rels))
                 .collect();
+            stamp_media_keys(&mut story.body, &note_media_keys);
             stories.insert(story.id, story);
         }
         match kind {
@@ -519,6 +528,7 @@ pub fn read_docx_with_settings(
             engine::NoteKind::Endnote => document.endnote_stories = stories,
         }
     }
+    document.media = media;
     // Phase 8a — parse comments.xml if present, attach to the document.
     // The XML part still rides other_entries verbatim so the passthrough
     // writer round-trips it byte-identical.
@@ -631,6 +641,98 @@ fn guess_image_mime(entry: &str) -> &'static str {
         "webp" => "image/webp",
         _ => "application/octet-stream",
     }
+}
+
+/// Issue #188 — resolve a relationship `Target` against its SOURCE part
+/// (OPC, ECMA-376 Part 2 §9.3: a relative reference is resolved against
+/// the source part's name). `media/image1.png` from `word/document.xml`
+/// or `word/header1.xml` → `word/media/image1.png`; `../media/x.png`
+/// collapses; a leading `/` is package-absolute. Returns the archive
+/// entry name (no leading slash).
+pub(crate) fn resolve_part_relative_target(source_part: &str, target: &str) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    if !target.starts_with('/')
+        && let Some((dir, _)) = source_part.rsplit_once('/')
+    {
+        segs.extend(dir.split('/').filter(|s| !s.is_empty()));
+    }
+    for s in target.split('/') {
+        match s {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    segs.join("/")
+}
+
+/// Issue #188 — register every picture relationship of ONE part (`rels`
+/// is that part's own rels table, `source_part` its entry name) into
+/// `media`, keyed by the resolved target entry name, and return the
+/// part-local `rel id → media key` map. Identical targets reached from
+/// different parts (or under different ids) share one blob. Lenient
+/// like the pre-#188 pass: any relationship whose target resolves into
+/// `word/media/` and exists in the archive counts as a picture.
+fn register_part_media(
+    entries: &[(String, Vec<u8>)],
+    source_part: &str,
+    rels: &HashMap<String, String>,
+    media: &mut HashMap<String, ImageBlob>,
+) -> HashMap<String, String> {
+    let mut keys: HashMap<String, String> = HashMap::new();
+    let exists = |name: &str| entries.iter().any(|(n, _)| n == name);
+    for (rid, target) in rels {
+        let mut entry = resolve_part_relative_target(source_part, target);
+        /* Pre-#188 leniency: a malformed `word/media/…` target written
+        package-relative without its leading slash still resolves. */
+        if !exists(&entry) {
+            let legacy = resolve_target(target);
+            if exists(&legacy) {
+                entry = legacy;
+            }
+        }
+        if !entry.starts_with("word/media/") {
+            continue;
+        }
+        if !media.contains_key(&entry) {
+            let Some(bytes) = entries
+                .iter()
+                .find(|(n, _)| n == &entry)
+                .map(|(_, b)| b.clone())
+            else {
+                continue;
+            };
+            media.insert(
+                entry.clone(),
+                ImageBlob {
+                    content_type: guess_image_mime(&entry).to_string(),
+                    data: bytes,
+                },
+            );
+        }
+        keys.insert(rid.clone(), entry);
+    }
+    keys
+}
+
+/// Issue #188 — stamp each picture in `blocks` (tables and text-box
+/// stories included) with the media key its part-local `rel_id` resolves
+/// to. A picture whose rel is unknown keeps `media_key: None`.
+fn stamp_media_keys(blocks: &mut [engine::Block], keys: &HashMap<String, String>) {
+    if keys.is_empty() {
+        return;
+    }
+    engine::for_each_image_mut(blocks, &mut |kind| {
+        if let engine::InlineKind::Image {
+            rel_id, media_key, ..
+        } = kind
+            && let Some(key) = keys.get(rel_id.as_str())
+        {
+            *media_key = Some(key.clone());
+        }
+    });
 }
 
 /// Issue #72 — the OPC rels entry name for a part: relationships of
@@ -752,6 +854,57 @@ mod tests {
     use super::*;
     use std::io::Write;
     use zip::write::{SimpleFileOptions, ZipWriter};
+
+    /// Issue #188 — rel targets resolve against the SOURCE part's name.
+    #[test]
+    fn part_relative_targets_resolve_against_the_source_part() {
+        let r = resolve_part_relative_target;
+        assert_eq!(
+            r("word/document.xml", "media/image1.png"),
+            "word/media/image1.png"
+        );
+        assert_eq!(
+            r("word/header1.xml", "media/image2.png"),
+            "word/media/image2.png"
+        );
+        assert_eq!(
+            r("word/header1.xml", "/word/media/image1.png"),
+            "word/media/image1.png"
+        );
+        assert_eq!(r("word/sub/part.xml", "../media/a.png"), "word/media/a.png");
+        assert_eq!(r("word/document.xml", "./media/b.png"), "word/media/b.png");
+    }
+
+    /// Issue #188 — a body picture and a header picture declared under
+    /// the SAME part-local id land as two blobs keyed by target path, a
+    /// footer re-using the body's target dedupes onto it, and every
+    /// picture carries its part-resolved media key.
+    #[test]
+    fn media_is_keyed_by_part_resolved_target_not_rel_id() {
+        let docx = crate::test_fixtures::part_scoped_media_docx(b"BODY", b"HEADER");
+        let doc = read_docx(&docx).expect("read").document;
+        let mut keys: Vec<&str> = doc.media.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["word/media/image1.jpeg", "word/media/image2.jpeg"]);
+        assert_eq!(doc.media["word/media/image1.jpeg"].data, b"BODY");
+        assert_eq!(doc.media["word/media/image2.jpeg"].data, b"HEADER");
+        let key_of = |blocks: &[engine::Block]| {
+            blocks[0].as_paragraph().unwrap().inline_objects[0]
+                .kind
+                .image_media_key()
+                .map(str::to_string)
+        };
+        let body: Vec<engine::Block> = doc.blocks.iter().cloned().collect();
+        assert_eq!(key_of(&body).as_deref(), Some("word/media/image1.jpeg"));
+        assert_eq!(
+            key_of(&doc.headers["rId7"]).as_deref(),
+            Some("word/media/image2.jpeg")
+        );
+        assert_eq!(
+            key_of(&doc.footers["rId8"]).as_deref(),
+            Some("word/media/image1.jpeg")
+        );
+    }
 
     /// Minimal package: just `word/document.xml` with the given bytes.
     fn package(document_xml: &[u8]) -> Vec<u8> {
