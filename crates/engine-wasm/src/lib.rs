@@ -855,6 +855,16 @@ pub struct Engine {
     /// mutation, the explicit `RequestPaint` path, and the IME preview
     /// repaint all count as "the most recent paint".
     last_paint_ms: f32,
+    /// Issue #194 — monotonic "the document changed" counter: bumped once
+    /// per `apply` whose command changed the document (the undo stack's
+    /// revision moved — push / undo / redo / replace — or a whole new stack
+    /// was installed by a load / reset / restore). Never decreases, never
+    /// resets (a reload restarts the undo revision at 0; this does not
+    /// follow it down). The worker compares it across a command to decide
+    /// whether to broadcast an accessibility delta + synthetic `Painted`,
+    /// replacing a hand-kept per-command allowlist; `Event::Painted`
+    /// carries it too.
+    mutation_seq: u64,
 }
 
 /// Capacity of the paragraph layout cache — comfortably covers a 50-page
@@ -908,6 +918,7 @@ fn assemble_engine(
         review_date: String::new(),
         last_command_ms: 0.0,
         last_paint_ms: 0.0,
+        mutation_seq: 0,
     }
 }
 
@@ -1049,8 +1060,20 @@ impl Engine {
             page_content_bottoms: dims.page_content_bottoms,
             layout_degraded: dims.layout_degraded,
             paint_ms: dims.paint_ms,
+            mutation_seq: self.mutation_seq,
         })
         .map_err(|e| JsValue::from_str(&format!("encode paint dims: {e}")))
+    }
+
+    /// Issue #194 — the engine's own "the document changed" signal: a
+    /// monotonic counter bumped once per command that changed the
+    /// document (see the `mutation_seq` field). The worker reads it after
+    /// every command and broadcasts an accessibility delta whenever it
+    /// moved past the last value it broadcast for — no per-command
+    /// allowlist. An `f64` (exact below 2^53) so JS sees a `number`, not
+    /// a `BigInt`.
+    pub fn document_mutation_seq(&self) -> f64 {
+        self.mutation_seq as f64
     }
 
     /// Sprint 10 — drain queued `aria-live` announcements as
@@ -1156,6 +1179,9 @@ struct PaintDimsOut {
     page_content_bottoms: Vec<f32>,
     /// Issue #87 — degradation notes (mirrors `Event::Painted`).
     layout_degraded: Vec<LayoutDegraded>,
+    /// Issue #194 — the document mutation counter (mirrors
+    /// `Event::Painted.mutation_seq`).
+    mutation_seq: u64,
     /// Issue #86 — mirrors `Event::Painted.paint_ms` (see `LastPaintDims`).
     paint_ms: f32,
 }
@@ -6158,7 +6184,30 @@ impl Engine {
         }
     }
 
+    /// The production dispatcher: [`Engine::apply_command`] plus the
+    /// issue-#194 mutation signal. The document changed iff the undo
+    /// stack's revision moved (every document edit goes through
+    /// `push` / `undo` / `redo` / `replace_current`) or a new stack was
+    /// installed ([`Engine::install_undo_stack`] bumps the seq itself).
     async fn apply(&mut self, cmd: Command) -> Event {
+        let seq_before = self.mutation_seq;
+        let revision_before = self.undo.revision();
+        let evt = self.apply_command(cmd).await;
+        if self.mutation_seq == seq_before && self.undo.revision() != revision_before {
+            self.mutation_seq += 1;
+        }
+        evt
+    }
+
+    /// Issue #194 — replace the whole undo stack (load / reset / restore).
+    /// A fresh stack restarts its revision at 0, which `apply`'s revision
+    /// comparison cannot see, so the swap is itself a mutation.
+    fn install_undo_stack(&mut self, stack: UndoStack) {
+        self.undo = stack;
+        self.mutation_seq += 1;
+    }
+
+    async fn apply_command(&mut self, cmd: Command) -> Event {
         if let Some(rejected) = self.story_gate(&cmd) {
             return rejected;
         }
@@ -6659,7 +6708,7 @@ impl Engine {
     /// `cfg` so subsequent InsertText/Undo/Redo commands repaint without
     /// re-specifying params, then paint the first frame.
     fn render_page(&mut self, text: String, cfg: RenderConfig) -> Event {
-        self.undo = UndoStack::new(DocumentTree::from_text(&text), 100);
+        self.install_undo_stack(UndoStack::new(DocumentTree::from_text(&text), 100));
         self.layout_cfg = Some(cfg);
         /* A RenderPage reset is a fresh document; a surviving selection
         or IME preview from the previous session would be load-bearing
@@ -6925,7 +6974,7 @@ impl Engine {
     /// context, which cannot be re-transferred.
     fn reset_session_state(&mut self) {
         self.fonts.clear();
-        self.undo = UndoStack::new(DocumentTree::new(), UNDO_CAP);
+        self.install_undo_stack(UndoStack::new(DocumentTree::new(), UNDO_CAP));
         self.layout_cfg = None;
         self.selection = None;
         self.composition = None;
@@ -7103,7 +7152,11 @@ impl Engine {
     }
 
     fn restore_snapshot(&mut self, s: EngineSnapshotV1) {
-        self.undo = UndoStack::from_history(s.doc_history, s.undo_cursor as usize, UNDO_CAP);
+        self.install_undo_stack(UndoStack::from_history(
+            s.doc_history,
+            s.undo_cursor as usize,
+            UNDO_CAP,
+        ));
         self.layout_cfg = s.layout_cfg.and_then(LayoutCfgSnapshot::restore);
         self.active_story = s.active_story;
         self.selection = s.selection;
@@ -8767,6 +8820,7 @@ impl Engine {
             page_content_tops: dims.page_content_tops,
             page_content_bottoms: dims.page_content_bottoms,
             layout_degraded: dims.layout_degraded,
+            mutation_seq: self.mutation_seq,
         }
     }
 
@@ -8830,6 +8884,7 @@ impl Engine {
             page_content_tops: stats.page_content_tops,
             page_content_bottoms: stats.page_content_bottoms,
             layout_degraded: stats.layout_degraded,
+            mutation_seq: self.mutation_seq,
         }
     }
 
@@ -13847,7 +13902,7 @@ impl Engine {
         match format_docx::read_docx(bytes) {
             Ok(archive) => {
                 let paragraph_count = archive.document.paragraph_count();
-                self.undo = UndoStack::new(archive.document, 100);
+                self.install_undo_stack(UndoStack::new(archive.document, 100));
                 self.selection = Some(SelectionState {
                     anchor: bpos_top(0, 0),
                     caret: bpos_top(0, 0),
@@ -15170,6 +15225,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         let cmd_js = serde_wasm_bindgen::to_value(&Command::Ping).expect("encode ping");
         let evt_js = engine
@@ -15989,6 +16045,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         e.do_move_caret(MoveDirection::DocHome, false);
         assert_eq!(e.selection.as_ref().unwrap().caret.offset, 0);
@@ -16045,6 +16102,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         e.do_move_caret(MoveDirection::Right, false);
         /* RTL flip: visual-Right is logical-backward, so 4 → 2. */
@@ -16092,6 +16150,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         e.do_move_caret(MoveDirection::Left, false);
         /* RTL flip: visual-Left is logical-forward, so 4 → 6. */
@@ -16216,6 +16275,7 @@ mod tests {
             review_date: String::new(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         };
         e.do_delete_at_caret(false, true);
         /* "done" deleted → "isn't " remains. The whitespace-classifier
@@ -16761,6 +16821,7 @@ mod tests {
                 review_date: String::new(),
                 last_command_ms: 0.0,
                 last_paint_ms: 0.0,
+                mutation_seq: 0,
             }
         }
 
@@ -19238,6 +19299,7 @@ mod tests {
             review_date: "2026-01-01T00:00:00Z".to_string(),
             last_command_ms: 0.0,
             last_paint_ms: 0.0,
+            mutation_seq: 0,
         }
     }
 
@@ -22116,6 +22178,9 @@ mod snapshot_tests {
 /// Issues #114–#118 — every wire value is validated at the command
 /// boundary: typed `Event::Error`, never a panic, never an unbounded
 /// allocation, and the selection invariant holds after every command.
+#[cfg(test)]
+mod mutation_signal_tests;
+
 #[cfg(test)]
 mod wire_validation_tests {
     use super::*;
