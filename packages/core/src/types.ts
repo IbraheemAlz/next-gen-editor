@@ -14,6 +14,8 @@ export type {
     Command,
     Event,
     DocFormat,
+    DocumentDefaults,
+    DefaultPageSize,
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,

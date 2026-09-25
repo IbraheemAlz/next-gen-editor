@@ -8,8 +8,9 @@ use bridge::{
     A11yCell, A11yNode, A11yParagraph, A11yPatch, A11yRow, A11yRun, A11yTable, A11yTree,
     Alignment as BridgeAlignment, AnnouncementPriority, BlockPath as BridgeBlockPath,
     BridgeBorderStroke, BridgeBorderStyle, BridgeCellBorders, BridgeCellProperties, BridgeIndent,
-    BridgeSectionGeometry, BridgeStyleProperties, Color, Command, Direction, DocFormat,
-    EngineStats, Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
+    BridgeSectionGeometry, BridgeStyleProperties, Color, Command,
+    DefaultPageSize as BridgeDefaultPageSize, Direction, DocFormat, DocumentDefaults, EngineStats,
+    Event, FontMetrics as BridgeMetrics, ImageBlob as BridgeImageBlob, ImageFit,
     LayoutDegradeReason, LayoutDegraded, LogicalPos as BridgeLogicalPos,
     LogicalRange as BridgeLogicalRange, MoveDirection, PageOrientation as BridgePageOrientation,
     PathStep as BridgePathStep, PdfConformance, Point as BridgePoint, Rect as BridgeRect,
@@ -7007,7 +7008,7 @@ impl Engine {
             Command::Undo => self.do_undo(),
             Command::Redo => self.do_redo(),
 
-            Command::LoadDocx { bytes } => self.load_docx_bytes(&bytes, "LoadDocx"),
+            Command::LoadDocx { bytes } => self.load_docx_bytes(&bytes, "LoadDocx", None),
 
             Command::SaveDocx => self.save_docx_bytes("SaveDocx"),
 
@@ -7046,6 +7047,7 @@ impl Engine {
                 bytes,
                 format,
                 name,
+                defaults,
             } => match format {
                 DocFormat::Docx => {
                     /* Issue #77 — FILENAME resolves to the opened file's
@@ -7054,7 +7056,7 @@ impl Engine {
                         .as_deref()
                         .map(file_base_name)
                         .filter(|n| !n.is_empty());
-                    self.load_docx_bytes(&bytes, "OpenDocument")
+                    self.load_docx_bytes(&bytes, "OpenDocument", defaults)
                 }
                 other => Event::Error {
                     message: format!(
@@ -15243,8 +15245,26 @@ impl Engine {
     /// `LoadDocx` and the new `OpenDocument { format: Docx }`
     /// commands. Replaces the active document, resets the caret,
     /// invalidates layout and repaints.
-    fn load_docx_bytes(&mut self, bytes: &[u8], origin: &'static str) -> Event {
-        match format_docx::read_docx(bytes) {
+    ///
+    /// Issue #221 — `defaults` is `OpenDocument`'s host-facing mirror of
+    /// `format_docx::read_docx_with_settings`'s two knobs (issues #109 /
+    /// #179); `LoadDocx` always passes `None`, which resolves to the same
+    /// `A4` / widow-control-ON pair `format_docx::read_docx` uses, so the
+    /// legacy Phase-1 harness path is byte-for-byte unaffected.
+    fn load_docx_bytes(
+        &mut self,
+        bytes: &[u8],
+        origin: &'static str,
+        defaults: Option<DocumentDefaults>,
+    ) -> Event {
+        let default_page_size = match defaults.as_ref().and_then(|d| d.page_size) {
+            Some(BridgeDefaultPageSize::A4) => engine::DefaultPageSize::A4,
+            Some(BridgeDefaultPageSize::Letter) => engine::DefaultPageSize::Letter,
+            None => engine::DefaultPageSize::default(),
+        };
+        let widow_control_default = defaults.and_then(|d| d.widow_control).unwrap_or(true);
+        match format_docx::read_docx_with_settings(bytes, default_page_size, widow_control_default)
+        {
             Ok(archive) => {
                 let paragraph_count = archive.document.paragraph_count();
                 self.install_undo_stack(UndoStack::new(archive.document, 100));
@@ -18831,7 +18851,7 @@ mod tests {
             text: "stale ime preview".to_string(),
         });
 
-        let evt = engine.load_docx_bytes(&bytes, "test");
+        let evt = engine.load_docx_bytes(&bytes, "test", None);
         assert!(
             matches!(evt, Event::DocumentLoaded { .. }),
             "load must succeed, got {evt:?}"
@@ -24871,6 +24891,92 @@ mod tests {
             });
             assert!(engine.undo_depth() <= 100, "undo depth exceeded its bound");
         }
+    }
+
+    /// Issue #221 — `OpenDocument.defaults.page_size` reaches
+    /// `format_docx::read_docx_with_settings` through the REAL bridge
+    /// dispatcher (`Engine::apply`, not a direct `load_docx_bytes` call):
+    /// a `<w:sectPr/>` with no `<w:pgSz>` at all (`test_fixtures::
+    /// no_pgsz_docx`) lays out its first page at the Letter preset
+    /// instead of the crate default A4.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn open_document_bridge_defaults_page_size_letter_reaches_the_parser() {
+        let bytes = format_docx::test_fixtures::no_pgsz_docx("hello");
+        let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+
+        let evt = engine.apply_sync(Command::OpenDocument {
+            bytes,
+            format: DocFormat::Docx,
+            name: None,
+            defaults: Some(DocumentDefaults {
+                page_size: Some(BridgeDefaultPageSize::Letter),
+                widow_control: None,
+            }),
+        });
+        assert!(
+            matches!(evt, Event::DocumentLoaded { .. }),
+            "expected DocumentLoaded, got {evt:?}"
+        );
+
+        let (pages, ..) = engine.build_pages(1.0, false, None).expect("layout");
+        let letter_width_pt = engine::PageGeometry::letter().width;
+        let a4_width_pt = engine::PageGeometry::a4().width;
+        assert!(
+            (pages[0].size.width - letter_width_pt).abs() < 0.01,
+            "expected Letter width {letter_width_pt}, got {} (A4 would be {a4_width_pt})",
+            pages[0].size.width
+        );
+    }
+
+    /// Issue #221 — `OpenDocument.defaults.widow_control: Some(false)`
+    /// reaches `DocumentSettings::widow_control_default` through the REAL
+    /// bridge dispatcher and reproduces the pinned pre-#95 fingerprints
+    /// (the strict ECMA-376 reading) for the two 50p.docx-derived
+    /// fixtures `engine_nominal_fixtures_with_document_widow_default`
+    /// already pins natively — this proves the SAME outcome is reachable
+    /// end to end from `Command::OpenDocument`, not just from a direct
+    /// `DocumentSettings` stamp.
+    #[cfg(feature = "fuzz-native")]
+    #[test]
+    fn open_document_bridge_widow_control_false_reproduces_pinned_pre_95_fingerprints() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/perf/50p.docx");
+        let bytes = std::fs::read(path).expect("read 50p.docx fixture");
+        let mut engine = Engine::new_headless(DocumentTree::from_text("seed"));
+
+        let evt = engine.apply_sync(Command::OpenDocument {
+            bytes,
+            format: DocFormat::Docx,
+            name: None,
+            defaults: Some(DocumentDefaults {
+                page_size: None,
+                widow_control: Some(false),
+            }),
+        });
+        assert!(
+            matches!(evt, Event::DocumentLoaded { .. }),
+            "expected DocumentLoaded, got {evt:?}"
+        );
+
+        let (pages, _, _, info) = engine.build_pages(2.0, false, None).expect("full");
+        assert!(info.degradations.is_empty());
+        let fp = layout::geometry_fingerprint(&pages);
+        let want = PINNED_ENGINE_FINGERPRINTS
+            .iter()
+            .find(|(n, _)| *n == "50p_full_x2")
+            .map(|(_, v)| *v)
+            .expect("50p_full_x2 pinned");
+        assert_eq!(fp, want, "50p_full_x2 fingerprint moved");
+
+        let (pages, _, _, info) = engine.build_pages(2.0, false, Some(2000.0)).expect("band");
+        assert!(info.degradations.is_empty());
+        let fp = layout::geometry_fingerprint(&pages);
+        let want = PINNED_ENGINE_FINGERPRINTS
+            .iter()
+            .find(|(n, _)| *n == "50p_band_2000_x2")
+            .map(|(_, v)| *v)
+            .expect("50p_band_2000_x2 pinned");
+        assert_eq!(fp, want, "50p_band_2000_x2 fingerprint moved");
     }
 
     /* ================================================================
