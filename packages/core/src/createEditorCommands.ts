@@ -27,6 +27,7 @@ import type {
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,
+    FormattingToggle,
     Alignment,
     Direction,
     PdfConformance,
@@ -157,6 +158,15 @@ export interface EditorCommands {
     setCaps(value: boolean, range?: LogicalRange): Promise<Event>;
     /** `<w:smallCaps/>` — render lowercase as smaller uppercase glyphs. */
     setSmallCaps(value: boolean, range?: LogicalRange): Promise<Event>;
+    /**
+     * Issue #286 — flip `attr` on the engine's LIVE selection. The engine
+     * computes the target state from its own style at the caret (+ any
+     * armed pending style), never from this shell's mirrored toolbar
+     * state, which lags the reply at typing speed. Toolbar toggles and
+     * keyboard shortcuts must use this, not `setBold(!isBold())`.
+     * `underlineStyle` is the style used when underline turns ON.
+     */
+    toggleFormatting(attr: FormattingToggle, underlineStyle?: UnderlineStyle): Promise<Event>;
 
     /* Paragraph — `range` defaults to current selection. */
     setParagraphAlign(align: Alignment, range?: LogicalRange): Promise<Event>;
@@ -555,6 +565,8 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             fmt({ bg_color: { r, g, b, a } }, range),
         setCaps: (value, range) => fmt({ caps: value }, range),
         setSmallCaps: (value, range) => fmt({ small_caps: value }, range),
+        toggleFormatting: (attr, underlineStyle) =>
+            dispatch({ type: 'TOGGLE_FORMATTING', attr, underline_style: underlineStyle }),
 
         setParagraphAlign: (align, range) =>
             dispatch({

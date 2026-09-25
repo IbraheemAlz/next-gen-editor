@@ -6,14 +6,8 @@
  * (pointer-events:none). `beforeinput` is captured and mapped to engine
  * commands; the textarea itself never accumulates text. */
 import { createEffect, onCleanup, onMount } from 'solid-js';
-import { emptyPatch } from '@nge/core';
 import type { EngineClient } from '../engine/engine-client';
-import type {
-    Command,
-    MoveDirection,
-    TextAttrs,
-    TextAttrsPatch,
-} from '../engine/types';
+import type { Command, FormattingToggle, MoveDirection } from '../engine/types';
 import type { EngineStore } from '../state/engine-store';
 import {
     clearSelectedImage,
@@ -329,30 +323,26 @@ export function HiddenInput(props: { client: EngineClient; store: EngineStore })
             void paste(props.client, true);
         } else if (e.code === 'KeyB' && !e.shiftKey) {
             e.preventDefault();
-            toggleFormat((a) => ({ bold: !a.bold }));
+            toggleFormat('Bold');
         } else if (e.code === 'KeyI' && !e.shiftKey) {
             e.preventDefault();
-            toggleFormat((a) => ({ italic: !a.italic }));
+            toggleFormat('Italic');
         } else if (e.code === 'KeyU' && !e.shiftKey) {
             e.preventDefault();
-            toggleFormat((a) => ({
-                underline: a.underline === 'None' ? 'Single' : 'None',
-            }));
+            toggleFormat('Underline');
         }
     };
 
-    /* Ctrl/Cmd+B/I/U — toggle relative to the engine-reported caret attrs.
-       `range: undefined` binds the patch to the engine-owned live selection
-       (never the async UI mirror), matching the facade helpers. */
-    const toggleFormat = (
-        patch: (a: TextAttrs) => Partial<TextAttrsPatch>,
-    ): void => {
-        const attrs = props.store.attrsAtCaret();
-        if (!attrs) return;
+    /* Ctrl/Cmd+B/I/U — issue #286: posted synchronously with NO state
+       read. The engine derives the target from its own style at the live
+       caret (+ any armed pending style); the mirrored `attrsAtCaret()`
+       lags the reply at typing speed, so toggling against it lost the
+       second Ctrl+B of "Ctrl+B, type, Ctrl+B, type". */
+    const toggleFormat = (attr: FormattingToggle): void => {
         void props.client.dispatch({
-            type: 'APPLY_FORMATTING',
-            range: undefined,
-            attrs: { ...emptyPatch(), ...patch(attrs) },
+            type: 'TOGGLE_FORMATTING',
+            attr,
+            underline_style: undefined,
         });
     };
 

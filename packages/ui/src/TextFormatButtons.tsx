@@ -8,6 +8,11 @@
  * State source: `attrsAtCaret()` for the resolved value at the caret.
  * `attrsMixed()` flips the visual to "mixed" (partial highlight) when
  * the selection straddles a boundary — Word's convention.
+ *
+ * Issue #286 — the pressed state only MIRRORS `SELECTION_CHANGED`; a
+ * click posts `TOGGLE_FORMATTING` and the engine derives the target
+ * from its own live state, so a click racing an in-flight keystroke
+ * never toggles against a stale mirror.
  */
 import { type Component } from 'solid-js';
 import { createEditorCommands, createEditorState } from '@nge/core';
@@ -36,7 +41,7 @@ export const TextFormatButtons: Component = () => {
                 data-mixed={mixedBold()}
                 disabled={!ready()}
                 title="Bold (Ctrl+B)"
-                onClick={() => void cmd.setBold(!isBold())}
+                onClick={() => void cmd.toggleFormatting('Bold')}
             >
                 B
             </button>
@@ -49,7 +54,7 @@ export const TextFormatButtons: Component = () => {
                 data-mixed={mixedItalic()}
                 disabled={!ready()}
                 title="Italic (Ctrl+I)"
-                onClick={() => void cmd.setItalic(!isItalic())}
+                onClick={() => void cmd.toggleFormatting('Italic')}
             >
                 I
             </button>
@@ -62,7 +67,7 @@ export const TextFormatButtons: Component = () => {
                 data-mixed={mixedStrike()}
                 disabled={!ready()}
                 title="Strikethrough"
-                onClick={() => void cmd.setStrike(!isStrike())}
+                onClick={() => void cmd.toggleFormatting('Strike')}
             >
                 S
             </button>
