@@ -336,7 +336,6 @@ dependencies = [
  "bridge",
  "console_error_panic_hook",
  "engine",
- "flate2",
  "format-docx",
  "format-html",
  "format-pdf",

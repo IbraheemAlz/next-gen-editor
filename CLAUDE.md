@@ -197,8 +197,14 @@ D5.10 are external/human sign-offs, not code.
   pixel-reproducibility on the GitHub runner is unproven across machines;
   `tools/memory-profile` / `tools/perf` are not wired into `ci.yml` at all
   (their heavier fixtures blew the runner's time cap — run them locally or
-  on a nightly schedule). The Playwright e2e suite (`ts/e2e/`) became a
-  **blocking** `e2e` job later, issue #230 — see the Validation section.
+  on a nightly schedule). Issue #258 added `tools/pdf-validate --corpus
+  tier-a --profile 1b` to the same job (~9 s locally for all 6 documents,
+  reusing the wasm build the visual-diff step already needs) — veraPDF
+  itself is not installed on the runner, so only the structural PDF/A
+  marker check runs there; the full veraPDF conformance gate is local-only
+  (`node tools/pdf-validate/run.mjs`). The Playwright e2e suite (`ts/e2e/`)
+  became a **blocking** `e2e` job later, issue #230 — see the Validation
+  section.
 
 ## SDK architecture — the "Monaco Standard" (post-`beta.3`)
 
@@ -310,10 +316,12 @@ Engine backlog" references a real issue.
   --workspace` + the two fuzz-crate steps above), `wasm` (build + size
   budget + `wasm-pack test` + the `engine-wasm-pkg` artifact upload),
   `e2e` (this suite, issue #230). Non-blocking (`continue-on-error: true`):
-  `qa-harness` runs `tools/visual-diff --tier A` only (capped at 3 min) —
-  non-blocking because golden pixel-reproducibility on the GitHub runner's
-  Chrome is still unproven across machines. `tools/memory-profile` and
-  `tools/perf` are **not** wired into `ci.yml` at all — the heavier
+  `qa-harness` runs `tools/visual-diff --tier A` (capped at 3 min) then
+  `tools/pdf-validate --corpus tier-a --profile 1b` (issue #258, capped at
+  1 min; structural-only on this runner — no veraPDF installed) — the whole
+  job stays non-blocking because golden pixel-reproducibility on the GitHub
+  runner's Chrome is still unproven across machines. `tools/memory-profile`
+  and `tools/perf` are **not** wired into `ci.yml` at all — the heavier
   fixtures (100p/250p/500p) blew the runner's time cap; run them locally
   (`node tools/memory-profile/run.mjs --budgets`, `node tools/perf/run.mjs
   --strict`) or against a dedicated nightly runner.

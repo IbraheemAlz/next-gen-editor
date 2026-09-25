@@ -105,6 +105,12 @@ pub use image::test_images;
 use image::{AlphaMode, ImageColor, ImageEncoding, PreparedImage};
 pub use image::{ImageSkipReason, MAX_IMAGE_PIXELS};
 
+/// Issue #258 — the shared PDF content-stream / string-literal decoder.
+/// See the module's own doc comment for why it lives here rather than in
+/// `engine-wasm`'s test tree.
+#[doc(hidden)]
+pub mod test_support;
+
 /// The synthesized sRGB ICC profile the PDF/A-1b output intent embeds. Built by
 /// `build.rs` — see this module's docs for why it is generated, not vendored.
 const SRGB_ICC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/srgb-v2-micro.icc"));
@@ -1381,13 +1387,27 @@ fn show_run(
             pen += glyph.x_advance;
             continue;
         }
-        let gx = run_x + pen + glyph.x_offset;
-        /* Invert the y axis: PDF origin is bottom-left. `<w:vertAlign>`
-        baseline shift lifts (positive) / drops (negative) the run. */
-        let gy = page_h - (baseline - glyph.y_offset - run.attrs.baseline_shift_px);
-        content.set_text_matrix([1.0, 0.0, shear, 1.0, gx, gy]);
-        let id = glyph.id;
-        content.show(Str(&[(id >> 8) as u8, (id & 0xff) as u8]));
+        /* Issue #258 (found via the tier-a `toc-leaders.docx` corpus
+        fixture — veraPDF flagged it under PDF/A-2u, ISO 19005-2 §6.2.11.8,
+        "the document contains a reference to the .notdef glyph") — a
+        control character with no visual form in the run's font (the
+        engine's own `\u{000C}` FORM FEED encoding of `<w:br
+        w:type="page"/>` is the case that surfaced this; any character a
+        face can't shape hits the same path) shapes to glyph id 0. `render/
+        scene.rs`'s Canvas2D paint already skips it ("glyph id 0 is
+        .notdef — advance the pen, draw nothing"); this mirrors that
+        exactly — PDF/A-1 and -2 both forbid `.notdef` in ANY text-showing
+        operator, so it must never reach a `Tj`, not even one a viewer
+        would render as nothing. */
+        if glyph.id != 0 {
+            let gx = run_x + pen + glyph.x_offset;
+            /* Invert the y axis: PDF origin is bottom-left. `<w:vertAlign>`
+            baseline shift lifts (positive) / drops (negative) the run. */
+            let gy = page_h - (baseline - glyph.y_offset - run.attrs.baseline_shift_px);
+            content.set_text_matrix([1.0, 0.0, shear, 1.0, gx, gy]);
+            let id = glyph.id;
+            content.show(Str(&[(id >> 8) as u8, (id & 0xff) as u8]));
+        }
         pen += glyph.x_advance;
     }
     if run.attrs.faux_bold {
@@ -1987,6 +2007,7 @@ fn collect_to_unicode_pages(
                     let map = out.entry(run.font.clone()).or_default();
                     add_run_mappings(run, text, map);
                     add_leader_mappings(run, fonts, map);
+                    add_kashida_mappings(run, fonts, map);
                 }
             }
         };
@@ -2033,8 +2054,14 @@ fn add_run_mappings(run: &VisualRun, text: &str, map: &mut BTreeMap<u16, Vec<cha
     bounds.dedup();
 
     for g in &run.glyphs {
-        /* A synthetic Kashida tatweel is justification ink, not content —
-        leaving it unmapped lets a viewer drop it on copy. */
+        /* A synthetic glyph (a Kashida tatweel, a tab leader placeholder)
+        carries no source cluster — nothing here to look up. Issue #258:
+        the tatweel case still gets a `/ToUnicode` entry, just via
+        `add_kashida_mappings` (mapped to the real character it draws,
+        U+0640 TATWEEL) rather than a cluster lookup — PDF/A-1b/2u (ISO
+        19005 §6.2.11.7.2) requires every used glyph code to map to
+        Unicode, with no "decorative ink" exception, and U+0640 is not a
+        fiction: it is the actual Unicode character the glyph shapes. */
         if g.synthetic {
             continue;
         }
@@ -2078,6 +2105,35 @@ fn add_leader_mappings(run: &VisualRun, fonts: &FontStack, map: &mut BTreeMap<u1
             continue;
         };
         map.entry(gid).or_insert_with(|| vec![ch]);
+    }
+}
+
+/// Issue #258 (found via the `tools/pdf-validate` tier-a Arabic-Kashida
+/// corpus fixture — veraPDF flagged it under PDF/A-2u, ISO 19005-2
+/// §6.2.11.7.2, "glyph can not be mapped to Unicode") — `inject_kashida`
+/// (`crates/layout/src/paragraph.rs`) synthesizes a real Tatweel glyph
+/// (U+0640) to elongate a justified Arabic line; it is marked
+/// `synthetic: true` (no source cluster, like a tab leader) so
+/// `add_run_mappings` skips it, which otherwise left it out of
+/// `/ToUnicode` entirely. Re-derive the same font's Tatweel glyph id
+/// `inject_kashida` used and map every synthetic occurrence of it straight
+/// to `'\u{0640}'` — the same "map the placeholder to the real character it
+/// draws" technique `add_leader_mappings` already uses for tab leaders, and
+/// the correct Unicode value (not a guess): a Tatweel elongation genuinely
+/// IS U+0640, so copy-paste extracting it is accurate, not decorative
+/// noise. A no-op when the run's font has no Tatweel glyph (nothing to
+/// match) or the run injected none.
+fn add_kashida_mappings(run: &VisualRun, fonts: &FontStack, map: &mut BTreeMap<u16, Vec<char>>) {
+    let Some(face) = fonts.face(&run.font) else {
+        return;
+    };
+    let Some(tatweel_gid) = face.glyph_id('\u{0640}') else {
+        return;
+    };
+    for glyph in &run.glyphs {
+        if glyph.synthetic && glyph.leader.is_none() && glyph.id == tatweel_gid {
+            map.entry(glyph.id).or_insert_with(|| vec!['\u{0640}']);
+        }
     }
 }
 

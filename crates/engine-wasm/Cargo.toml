@@ -32,10 +32,6 @@ unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
-# Issue #210 — the TOC → PDF integration test decompresses the exported
-# PDF's `/FlateDecode` content streams to verify entry text / page numbers /
-# leader glyphs reached the real bytes, not just the layout box tree.
-flate2 = { workspace = true }
 # Issue #250 — run the engine's source-markup-in-step assertion on every
 # `UndoStack::push` this crate's tests commit (dev-only; never in the
 # wasm artifact).

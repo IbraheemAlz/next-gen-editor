@@ -3779,8 +3779,14 @@ pub fn build_minimal_docx(doc: &DocumentTree) -> Result<Vec<u8>, DocxError> {
     ];
     /* One `word/media/<filename>` entry per image blob the engine
     holds, named after the relationship id so the `<a:blip r:embed>`
-    lookups in `word/document.xml` agree with the rels target. */
-    for (rel_id, blob) in &doc.media {
+    lookups in `word/document.xml` agree with the rels target. Issue
+    #258 — sorted by rel_id so the zip entry order (and so the archive's
+    bytes) is deterministic across process runs, same as
+    `media_extensions` / `build_doc_rels`. */
+    let mut rel_ids: Vec<&String> = doc.media.keys().collect();
+    rel_ids.sort_unstable();
+    for rel_id in rel_ids {
+        let blob = &doc.media[rel_id];
         let filename = media_filename(rel_id, &blob.content_type);
         other_entries.push((format!("word/media/{filename}"), blob.data.clone()));
     }
@@ -3916,9 +3922,20 @@ fn media_filename(rel_id: &str, content_type: &str) -> String {
 /// Distinct media extensions referenced by `doc.media`. Used to emit
 /// one `<Default Extension="png" ContentType="image/png"/>` per type
 /// in `[Content_Types].xml`.
+///
+/// Issue #258 — `doc.media` is a `HashMap`, so a plain `.values()` walk
+/// visits blobs in a different order every process run; that leaked
+/// straight into `[Content_Types].xml`'s `<Default>` order, making
+/// `build_minimal_docx` non-deterministic for any document with more than
+/// one distinct image extension (a `--check-fixtures`-style "regenerate and
+/// diff" gate needs byte-identical output for the same input). Walking the
+/// keys sorted first fixes the order without changing the dedup logic.
 fn media_extensions(doc: &DocumentTree) -> Vec<(&'static str, &'static str)> {
+    let mut rel_ids: Vec<&String> = doc.media.keys().collect();
+    rel_ids.sort_unstable();
     let mut out: Vec<(&'static str, &'static str)> = Vec::new();
-    for blob in doc.media.values() {
+    for rel_id in rel_ids {
+        let blob = &doc.media[rel_id];
         let ext = media_extension(&blob.content_type);
         let mime: &'static str = match ext {
             "png" => "image/png",
@@ -3964,7 +3981,12 @@ fn build_doc_rels(doc: &DocumentTree) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n",
     );
-    for (rel_id, blob) in &doc.media {
+    /* Issue #258 — sort by rel_id so this is deterministic across process
+    runs (see `media_extensions`'s doc comment). */
+    let mut rel_ids: Vec<&String> = doc.media.keys().collect();
+    rel_ids.sort_unstable();
+    for rel_id in rel_ids {
+        let blob = &doc.media[rel_id];
         let filename = media_filename(rel_id, &blob.content_type);
         out.push_str(&format!(
             "<Relationship Id=\"{rel_id}\" \
