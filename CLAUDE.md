@@ -362,7 +362,7 @@ screenshot.** Headless screenshots are valid only for the `?test=` harness.
 - **Working dir drifts** between Bash tool calls. Use absolute paths or `cd /home/ibrahim/Desktop/code/next-gen-editor &&` at the top of every multi-step command.
 - Long-running processes (vite dev, wasm-pack build) run in `run_in_background: true`.
 - Don't `git add .` blindly. Stage by explicit path.
-- Commit messages: heredoc + `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
+- Commit messages: heredoc + a `Co-Authored-By:` trailer naming the model that wrote the change (e.g. `Claude Fable 5.1`, `Claude Opus 5.5`, `Claude Sonnet 5`, each `<noreply@anthropic.com>`); the session that merges adds its `Claude-Session:` link.
 - **Parallel agents in git worktrees.** A shared `CARGO_TARGET_DIR` across
   worktrees is *unsound*: cargo fingerprints workspace-relative paths, so a
   sibling worktree's stale rlib (built from different sources) satisfies your
