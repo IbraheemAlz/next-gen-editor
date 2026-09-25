@@ -184,6 +184,19 @@ struct EngineSnapshotV1 {
     /// Issue #77 — the opened file's name (FILENAME fields). Absent in
     /// pre-#77 snapshots → `None` → cached text stands.
     document_name: Option<String>,
+    /// Issue #134 — the current document's source `.docx` package
+    /// (`DocumentTree::source_package`), persisted ONCE: every history
+    /// entry of one undo stack shares the same package (it is set at open
+    /// and never mutated), so [`Engine::capture_snapshot`] strips it from
+    /// the entries and [`Engine::restore_snapshot`] re-attaches it. Absent
+    /// in pre-#134 snapshots and for engine-authored documents → the
+    /// recovered session saves through the minimal-package writer, exactly
+    /// as it did before.
+    #[serde(
+        with = "engine::package::arc_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    source_package: Option<Arc<engine::SourcePackage>>,
 }
 
 impl EngineSnapshotV1 {
@@ -7438,8 +7451,30 @@ impl Engine {
 
     /// Issue #85 — assemble the session state the snapshot persists.
     fn capture_snapshot(&self) -> EngineSnapshotV1 {
-        let (doc_history, undo_cursor) = self.undo.history_window(self.snapshot_undo_entries());
+        let (mut doc_history, undo_cursor) = self.undo.history_window(self.snapshot_undo_entries());
+        /* Issue #134 — the package rides the envelope once, not once per
+        undo entry (the entries share one `Arc`). */
+        let current = doc_history.get(undo_cursor);
+        let source_package = current.and_then(|d| d.source_package.clone());
+        /* Media parts ride by reference to the current entry's `media`
+        (the same bytes) — see `engine::package`'s snapshot-size notes. */
+        let persisted_package = current.and_then(|d| {
+            d.source_package
+                .as_ref()
+                .map(|p| Arc::new(p.deduplicated_against(&d.media)))
+        });
+        if let Some(pkg) = &source_package {
+            for d in &mut doc_history {
+                if d.source_package
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(p, pkg) || **p == **pkg)
+                {
+                    d.source_package = None;
+                }
+            }
+        }
         EngineSnapshotV1 {
+            source_package: persisted_package,
             doc_history,
             undo_cursor: undo_cursor as u32,
             selection: self.selection.clone(),
@@ -7473,7 +7508,23 @@ impl Engine {
         Ok(decoded.version)
     }
 
-    fn restore_snapshot(&mut self, s: EngineSnapshotV1) {
+    fn restore_snapshot(&mut self, mut s: EngineSnapshotV1) {
+        /* Issue #134 — re-attach the once-persisted source package to every
+        history entry (see `EngineSnapshotV1::source_package`). */
+        /* Media entries were persisted by reference to the current
+        entry's `media`; an unresolvable reference drops the package (the
+        session then saves through the minimal-package writer). */
+        let package = s.source_package.take().and_then(|p| {
+            let media = &s.doc_history.get(s.undo_cursor as usize)?.media;
+            p.rehydrated_from(media).map(Arc::new)
+        });
+        if let Some(pkg) = &package {
+            for d in &mut s.doc_history {
+                if d.source_package.is_none() {
+                    d.source_package = Some(pkg.clone());
+                }
+            }
+        }
         self.install_undo_stack(UndoStack::from_history(
             s.doc_history,
             s.undo_cursor as usize,
@@ -14416,7 +14467,11 @@ impl Engine {
         The in-memory document is untouched — F9 is the user's explicit
         update; this is the file's. */
         let (doc, _changed) = self.restamped_document(false);
-        match build_minimal_docx(&doc) {
+        /* Issue #134 — a document opened from `.docx` saves against its
+        retained source package (`write_docx`: every sibling part
+        byte-identical); an engine-authored one through the minimal-package
+        writer. */
+        match format_docx::save_docx(&doc) {
             Ok(bytes) => {
                 let size = bytes.len() as u32;
                 Event::DocumentSaved { bytes, size }
@@ -23224,6 +23279,275 @@ mod snapshot_tests {
         b.restore_from_bytes(&e.snapshot_bytes().unwrap()).unwrap();
         format_docx::check_document_xml_well_formed(&saved(&mut b))
             .expect("recovered session saves well-formed");
+    }
+
+    /// Issue #134 — an engine in the interactive state (font + layout
+    /// config) with `fixture` opened through `Command::LoadDocx`.
+    fn opened_engine(fixture: &[u8]) -> Engine {
+        let mut e = engine();
+        e.review_date = "2026-01-01T00:00:00Z".into();
+        let font_bytes = include_bytes!("../../../ts/fonts/LiberationSans-Regular.ttf").to_vec();
+        let font = LoadedFont::parse("test-latin".to_string(), font_bytes).expect("font");
+        e.fonts.insert("test-latin".to_string(), Arc::new(font));
+        e.layout_cfg = Some(RenderConfig {
+            font_id: "test-latin".to_string(),
+            base_direction: ShapingDirection::Ltr,
+            px_size: 16.0,
+            line_height: 26.0,
+            alignment: Alignment::Start,
+            scale: 2.0,
+            base_scale: 2.0,
+            zoom: 1.0,
+        });
+        let evt = apply(
+            &mut e,
+            Command::LoadDocx {
+                bytes: fixture.to_vec(),
+            },
+        );
+        assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+        e
+    }
+
+    fn ui_save(e: &mut Engine) -> Vec<u8> {
+        match apply(e, Command::SaveDocx) {
+            Event::DocumentSaved { bytes, .. } => bytes,
+            other => panic!("expected DocumentSaved, got {other:?}"),
+        }
+    }
+
+    /// Every entry of a saved package except `word/document.xml`.
+    fn zip_entries(docx: &[u8]) -> Vec<(String, Vec<u8>)> {
+        format_docx::read_docx(docx).expect("read").other_entries
+    }
+
+    const PACKAGE_FIXTURE: &[u8] =
+        include_bytes!("../../format-docx/tests/fixtures/word_package_parts.docx");
+
+    /// Issue #134 (P0) — the live editor's save path used to synthesize a
+    /// minimal package from the tree alone, dropping every unedited part:
+    /// the header/footer parts the `sectPr` still referenced (Word reports
+    /// a corrupt file), styles, numbering, settings, theme, fontTable,
+    /// comments, custom XML. Open a Word-shaped package, type through the
+    /// live caret, `SaveDocx`: every sibling part is byte-identical, every
+    /// `headerReference` / `footerReference` resolves, the parts are
+    /// namespace-well-formed and the edit re-reads. A crash-recovered
+    /// session saves the identical file.
+    #[test]
+    fn ui_save_of_an_opened_package_keeps_every_sibling_part() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(4, 4),
+            caret: bpos_top(4, 4),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        let evt = apply(&mut e, insert(" edited"));
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        let bytes = ui_save(&mut e);
+
+        let source = zip_entries(PACKAGE_FIXTURE);
+        let out = zip_entries(&bytes);
+        for (name, data) in &source {
+            let saved = out
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("UI save dropped {name}"));
+            assert_eq!(&saved.1, data, "{name} is not byte-identical");
+        }
+        assert_eq!(out.len(), source.len(), "no stray parts");
+
+        format_docx::check_document_xml_well_formed(&bytes).expect("document.xml well-formed");
+        for part in ["word/header1.xml", "word/footer1.xml", "word/styles.xml"] {
+            format_docx::check_part_xml_well_formed(&bytes, part).expect(part);
+        }
+        let reread = format_docx::read_docx(&bytes).expect("re-read");
+        assert_eq!(
+            reread.document.paragraph_text(4),
+            Some("last edited paragraph")
+        );
+        /* Every header / footer reference resolves to a part in the file. */
+        let rels = format_docx::parts::rels::parse_rels_xml(
+            reread
+                .part_by_name("word/_rels/document.xml.rels")
+                .expect("rels"),
+        )
+        .expect("rels parse");
+        let mut refs = 0;
+        for s in reread.document.effective_sections() {
+            for rid in [
+                &s.header_refs.default,
+                &s.header_refs.first,
+                &s.header_refs.even,
+                &s.footer_refs.default,
+                &s.footer_refs.first,
+                &s.footer_refs.even,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let target = rels.get(rid).unwrap_or_else(|| panic!("{rid} unresolved"));
+                let entry = format_docx::parts::rels::resolve_target(target);
+                assert!(reread.part_by_name(&entry).is_some(), "{entry} missing");
+                refs += 1;
+            }
+        }
+        assert_eq!(refs, 2, "header + footer references");
+        assert_eq!(reread.document.headers.len(), 1);
+        assert_eq!(reread.document.footers.len(), 1);
+        assert_eq!(reread.document.comment_defs.len(), 1);
+        assert!(reread.document.styles.contains_key("Heading1"));
+        assert!(!reread.document.numbering.num_instances.is_empty());
+
+        /* Crash recovery: the package rides the snapshot, so the recovered
+        session writes the identical file. */
+        let mut b = engine();
+        b.restore_from_bytes(&e.snapshot_bytes().unwrap()).unwrap();
+        assert_eq!(
+            ui_save(&mut b),
+            bytes,
+            "recovered session saves the same file"
+        );
+    }
+
+    /// Issues #134 / #135 — a picture inserted through the UI command into
+    /// an opened package lands as a third media part with its own
+    /// relationship; the two originals stay byte-identical.
+    #[test]
+    fn ui_save_after_insert_image_adds_media_to_the_retained_package() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        let evt = apply(
+            &mut e,
+            Command::InsertImage {
+                at: bpos_top(0, 0),
+                image: BridgeImageBlob {
+                    bytes: b"GIF89a\x01\x00\x01\x00".to_vec(),
+                    mime: "image/gif".into(),
+                    width: 1,
+                    height: 1,
+                },
+                fit: ImageFit::Original,
+            },
+        );
+        assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        let bytes = ui_save(&mut e);
+        format_docx::check_document_xml_well_formed(&bytes).expect("well-formed");
+        let out = zip_entries(&bytes);
+        let source = zip_entries(PACKAGE_FIXTURE);
+        let media: Vec<&str> = out
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| n.starts_with("word/media/"))
+            .collect();
+        assert_eq!(
+            media,
+            vec![
+                "word/media/image1.png",
+                "word/media/image2.png",
+                "word/media/image3.gif"
+            ]
+        );
+        for name in [
+            "word/media/image1.png",
+            "word/media/image2.png",
+            "word/styles.xml",
+        ] {
+            let a = source.iter().find(|(n, _)| n == name).unwrap();
+            let b = out.iter().find(|(n, _)| n == name).unwrap();
+            assert_eq!(a.1, b.1, "{name}");
+        }
+        let reread = format_docx::read_docx(&bytes).expect("re-read");
+        assert_eq!(reread.document.media.len(), 3);
+    }
+
+    /// Issue #134 — the package is persisted ONCE per snapshot, however
+    /// deep the undo window (every entry shares one `Arc`), and survives
+    /// undo after restore.
+    #[test]
+    fn snapshot_persists_the_source_package_once() {
+        let mut e = opened_engine(PACKAGE_FIXTURE);
+        e.selection = Some(SelectionState {
+            anchor: bpos_top(4, 0),
+            caret: bpos_top(4, 0),
+            ideal_x: None,
+            kind: SelectionKind::Linear,
+        });
+        for word in ["a", "b", "c"] {
+            let evt = apply(&mut e, insert(word));
+            assert!(!matches!(evt, Event::Error { .. }), "{evt:?}");
+        }
+        let bytes = e.snapshot_bytes().unwrap();
+        /* A marker that exists only in `word/settings.xml`. */
+        let needle = b"compatibilityMode";
+        let hits = bytes.windows(needle.len()).filter(|w| w == needle).count();
+        assert_eq!(hits, 1, "settings.xml persisted exactly once");
+
+        let mut b = engine();
+        b.restore_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            b.snapshot_bytes().unwrap(),
+            bytes,
+            "byte-stable re-snapshot"
+        );
+        apply(&mut b, Command::Undo);
+        let doc = b.undo.current();
+        let pkg = doc.source_package.as_ref().expect("package re-attached");
+        assert!(pkg.entry("word/settings.xml").is_some());
+        let current_pkg = e.undo.current().source_package.clone().unwrap();
+        assert_eq!(**pkg, *current_pkg);
+    }
+
+    /// Issue #134 — informational: snapshot size and codec time with the
+    /// retained package, for the 50-page perf fixture and the package
+    /// fixture (the corpus numbers are in the PR report).
+    #[test]
+    fn snapshot_cost_with_the_source_package_reference() {
+        let mut fixtures: Vec<(String, Vec<u8>)> = vec![
+            (
+                "50p.docx".into(),
+                include_bytes!("../../../tests/perf/50p.docx").to_vec(),
+            ),
+            ("word_package_parts.docx".into(), PACKAGE_FIXTURE.to_vec()),
+        ];
+        /* Optional: `NGE_SNAPSHOT_COST_DOCX=a.docx:b.docx` adds real
+        documents (media-heavy corpus files) to the report. */
+        if let Ok(list) = std::env::var("NGE_SNAPSHOT_COST_DOCX") {
+            for path in list.split(':').filter(|p| !p.is_empty()) {
+                if let Ok(bytes) = std::fs::read(path) {
+                    fixtures.push((path.to_string(), bytes));
+                }
+            }
+        }
+        for (label, fixture) in fixtures {
+            let mut e = engine();
+            let evt = apply(&mut e, Command::LoadDocx { bytes: fixture });
+            assert!(matches!(evt, Event::DocumentLoaded { .. }), "{evt:?}");
+            let t0 = std::time::Instant::now();
+            let with = e.snapshot_bytes().unwrap();
+            let enc = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let mut b = engine();
+            b.restore_from_bytes(&with).unwrap();
+            let dec = t1.elapsed();
+            let pkg_bytes = e
+                .undo
+                .current()
+                .source_package
+                .as_ref()
+                .map_or(0, |p| p.byte_len());
+            let mut stripped = e.undo.current().clone();
+            stripped.source_package = None;
+            e.install_undo_stack(UndoStack::new(stripped, UNDO_CAP));
+            let without = e.snapshot_bytes().unwrap();
+            eprintln!(
+                "[snapshot #134] {label}: {} B with package ({pkg_bytes} B of entries), \
+                 {} B without (+{} B), encode {enc:?}, restore {dec:?}",
+                with.len(),
+                without.len(),
+                with.len() - without.len()
+            );
+            assert!(with.len() >= without.len());
+        }
     }
 }
 
