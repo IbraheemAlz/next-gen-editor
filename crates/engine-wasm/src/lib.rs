@@ -1418,51 +1418,77 @@ fn enclosing_table_path(path: &BridgeBlockPath) -> Option<BridgeBlockPath> {
     None
 }
 
+/// Issue #76 — what a Tab / Shift+Tab step resolves to. [`cell_tab_step`]
+/// is pure over the document the selection addresses (body or story
+/// tree); the caller applies an [`CellTabStep::AppendRowAndMoveTo`]
+/// through the mutation path of the active mode (body undo push, or the
+/// #72 story adapter) so a story table's new row lands in its part.
+#[derive(Debug, Clone, PartialEq)]
+enum CellTabStep {
+    /// Pure caret move (also the no-op: the caret itself).
+    MoveTo(BridgeLogicalPos),
+    /// Tab in the table's last cell: append a row at `at_row` to the
+    /// table at `table_path`, then land on `caret` (its first cell).
+    AppendRowAndMoveTo {
+        table_path: BridgeBlockPath,
+        at_row: usize,
+        caret: BridgeLogicalPos,
+    },
+}
+
 /// Tab / Shift+Tab cell navigation. Inside a table the caret jumps
 /// to the next (or previous) cell in row-major order, landing on the
-/// first paragraph at offset 0; at the table's last cell, Tab inserts
+/// first paragraph at offset 0; at the table's last cell, Tab asks for
 /// a fresh row and lands at its first cell (Word default). Outside a
-/// table the caret stays put.
-fn cell_tab_step(
-    undo: &mut UndoStack,
-    caret: &BridgeLogicalPos,
-    forward: bool,
-) -> BridgeLogicalPos {
+/// table the caret stays put. `doc` is the tree the caret's path
+/// addresses (the selection doc).
+fn cell_tab_step(doc: &DocumentTree, caret: &BridgeLogicalPos, forward: bool) -> CellTabStep {
+    let stay = || CellTabStep::MoveTo(caret.clone());
     let Some(table_path) = enclosing_table_path(&caret.path) else {
-        return caret.clone();
+        return stay();
     };
     let Some((r, c)) = cell_of(&caret.path, &table_path) else {
-        return caret.clone();
+        return stay();
     };
     let engine_table = bridge_to_engine_path(table_path.clone());
-    let Some(table) = undo.current().table_at_path(&engine_table) else {
-        return caret.clone();
+    let Some(table) = doc.table_at_path(&engine_table) else {
+        return stay();
     };
     let n_rows = table.rows.len() as u32;
     if n_rows == 0 || table.rows.iter().all(|r| r.cells.is_empty()) {
-        return caret.clone();
+        return stay();
     }
     /* Row-aware traversal over CELL indices (merged rows carry fewer
     cells than the table has grid columns), skipping vMerge-Continue
     landing spots — Word tabs through visible cells only. */
-    let row_cols = |undo: &UndoStack, rr: u32| -> u32 {
-        undo.current()
-            .table_at_path(&engine_table)
-            .and_then(|t| t.rows.get(rr as usize))
+    let row_cols = |rr: u32| -> u32 {
+        table
+            .rows
+            .get(rr as usize)
             .map(|row| row.cells.len() as u32)
             .unwrap_or(0)
     };
-    let is_continue = |undo: &UndoStack, rr: u32, cc: u32| -> bool {
-        undo.current()
-            .table_at_path(&engine_table)
-            .and_then(|t| t.rows.get(rr as usize))
+    let is_continue = |rr: u32, cc: u32| -> bool {
+        table
+            .rows
+            .get(rr as usize)
             .and_then(|row| row.cells.get(cc as usize))
             .is_some_and(|cell| matches!(cell.props.v_merge, engine::VMergeRole::Continue))
     };
+    /* Address the first paragraph of a destination cell. */
+    let cell_start = |row: u32, col: u32| {
+        let mut steps = table_path.steps.clone();
+        steps.push(BridgePathStep::Cell { row, col });
+        steps.push(BridgePathStep::Block { idx: 0 });
+        BridgeLogicalPos {
+            path: BridgeBlockPath { steps },
+            offset: 0,
+        }
+    };
     let (mut rr, mut cc) = (r, c);
-    let (next_r, next_c) = loop {
+    loop {
         if forward {
-            if cc + 1 < row_cols(undo, rr) {
+            if cc + 1 < row_cols(rr) {
                 cc += 1;
             } else if rr + 1 < n_rows {
                 rr += 1;
@@ -1471,34 +1497,23 @@ fn cell_tab_step(
                 /* Last cell + forward → append a fresh row and land on
                 its first cell (Word default). `at = n_rows` lands after
                 the current last row under the post-hotfix signature. */
-                let new_doc = undo
-                    .current()
-                    .insert_row(bridge_to_engine_path(table_path.clone()), n_rows as usize);
-                undo.push(new_doc);
-                break (n_rows, 0);
+                return CellTabStep::AppendRowAndMoveTo {
+                    table_path: table_path.clone(),
+                    at_row: n_rows as usize,
+                    caret: cell_start(n_rows, 0),
+                };
             }
         } else if cc > 0 {
             cc -= 1;
         } else if rr > 0 {
             rr -= 1;
-            cc = row_cols(undo, rr).saturating_sub(1);
+            cc = row_cols(rr).saturating_sub(1);
         } else {
-            return caret.clone();
+            return stay();
         }
-        if !is_continue(undo, rr, cc) {
-            break (rr, cc);
+        if !is_continue(rr, cc) {
+            return CellTabStep::MoveTo(cell_start(rr, cc));
         }
-    };
-    /* Address the first paragraph of the destination cell. */
-    let mut steps = table_path.steps.clone();
-    steps.push(BridgePathStep::Cell {
-        row: next_r,
-        col: next_c,
-    });
-    steps.push(BridgePathStep::Block { idx: 0 });
-    BridgeLogicalPos {
-        path: BridgeBlockPath { steps },
-        offset: 0,
     }
 }
 
@@ -10805,18 +10820,39 @@ impl Engine {
                 )
             }
             MoveDirection::NextCell | MoveDirection::PrevCell => {
-                if self.story_active() {
-                    /* No tables inside stories — Tab is a no-op. */
-                    return self.selection_changed();
+                /* Issue #76 — resolve against the tree the caret
+                addresses (story tables included), then apply a row
+                append through the active mode's mutation path. */
+                let forward = direction == MoveDirection::NextCell;
+                match cell_tab_step(&doc, &sel.caret, forward) {
+                    CellTabStep::MoveTo(pos) => (pos, None),
+                    CellTabStep::AppendRowAndMoveTo {
+                        table_path,
+                        at_row,
+                        caret,
+                    } => {
+                        let epath = bridge_to_engine_path(table_path);
+                        if self.story_active() {
+                            /* One undo step, in the active part only;
+                            the fresh row is empty, so the collapsed
+                            caret IS its first cell's content span. */
+                            return self.story_mutate(
+                                move |d| d.insert_row(epath, at_row),
+                                caret,
+                                false,
+                            );
+                        }
+                        let new_doc = self.undo.current().insert_row(epath, at_row);
+                        self.undo.push(new_doc);
+                        /* Paint the new row (the story adapter does
+                        the same inside `story_mutate`). */
+                        self.dirty.invalidate(full_page_rect(self.scale()));
+                        if let Err(e) = self.maybe_repaint_result() {
+                            return *e;
+                        }
+                        (caret, None)
+                    }
                 }
-                (
-                    cell_tab_step(
-                        &mut self.undo,
-                        &sel.caret,
-                        direction == MoveDirection::NextCell,
-                    ),
-                    None,
-                )
             }
             MoveDirection::Up | MoveDirection::Down => {
                 let geom = match self.document_geometry() {
@@ -10994,9 +11030,12 @@ impl Engine {
                 (new_caret, Some(ideal))
             }
         };
-        /* Issue #117 — clamp FIRST against the story-aware `doc`
-        (`selection_doc`), then the #77 field snap below. */
-        let new_caret = clamp_pos(&doc, new_caret);
+        /* Issue #117 — clamp FIRST against the story-aware selection
+        doc, then the #77 field snap below. Issue #76 — read it FRESH:
+        a body Tab past the last cell has just appended a row, and the
+        pre-move `doc` snapshot would clamp the new cell's caret out of
+        the table. */
+        let new_caret = self.with_selection_doc(|d| clamp_pos(d, new_caret));
         /* Issue #77 — atomic fields: a horizontal step that lands
         strictly inside a field's result continues to the boundary in
         the direction of travel (one caret step per field); vertical
@@ -11020,12 +11059,14 @@ impl Engine {
         select the destination cell's ENTIRE content (which collapses
         naturally in a freshly-appended empty row). No-op steps
         (outside a table, Shift+Tab in the first cell) keep plain
-        caret semantics. Read the doc fresh — `cell_tab_step` may have
-        just appended a row. */
+        caret semantics. Read the doc fresh — a body Tab may have just
+        appended a row. Issue #76 — through the selection doc, so a
+        story table's cell resolves against its part. */
         if matches!(direction, MoveDirection::NextCell | MoveDirection::PrevCell)
             && !extend
             && new_caret != sel.caret
-            && let Some((start, end)) = cell_content_span(self.undo.current(), &new_caret.path)
+            && let Some((start, end)) =
+                self.with_selection_doc(|d| cell_content_span(d, &new_caret.path))
         {
             self.pending_format = None;
             self.caret_affinity = new_affinity;
@@ -16272,22 +16313,40 @@ mod tests {
             .insert_table(EngineBlockPath::top(1), 2, 2)
             .merge_cells(EngineBlockPath::top(1), 0, 0, 1, 0);
         let mut undo = UndoStack::new(doc, 16);
-        let s1 = cell_tab_step(&mut undo, &cell_pos(0, 0), true);
+        let moved = |step: CellTabStep| match step {
+            CellTabStep::MoveTo(p) => p,
+            other => panic!("expected a pure move, got {other:?}"),
+        };
+        let s1 = moved(cell_tab_step(undo.current(), &cell_pos(0, 0), true));
         assert_eq!(cell_of_pos(&s1), (0, 1));
         /* Forward wrap to row 1 — cell 0 is a Continue, skip to (1,1). */
-        let s2 = cell_tab_step(&mut undo, &s1, true);
+        let s2 = moved(cell_tab_step(undo.current(), &s1, true));
         assert_eq!(cell_of_pos(&s2), (1, 1));
-        /* Last cell + forward appends a full-width row, lands on (2,0). */
-        let s3 = cell_tab_step(&mut undo, &s2, true);
+        /* Last cell + forward asks for a row append and lands on (2,0);
+        the step itself never mutates. */
+        let CellTabStep::AppendRowAndMoveTo {
+            table_path,
+            at_row,
+            caret: s3,
+        } = cell_tab_step(undo.current(), &s2, true)
+        else {
+            panic!("expected a row append");
+        };
         assert_eq!(cell_of_pos(&s3), (2, 0));
+        assert_eq!(at_row, 2);
+        assert_eq!(undo.current().blocks[1].as_table().unwrap().rows.len(), 2);
+        let appended = undo
+            .current()
+            .insert_row(bridge_to_engine_path(table_path), at_row);
+        undo.push(appended);
         let t = undo.current().blocks[1].as_table().unwrap();
         assert_eq!(t.rows.len(), 3, "Tab in the last cell appends a row");
         assert_eq!(t.rows[2].cells.len(), 2, "appended row is full grid width");
         /* Backward from (1,1) skips the Continue at (1,0) → (0,1). */
-        let b = cell_tab_step(&mut undo, &s2, false);
+        let b = moved(cell_tab_step(undo.current(), &s2, false));
         assert_eq!(cell_of_pos(&b), (0, 1));
         /* Backward from the very first cell is a no-op. */
-        let stay = cell_tab_step(&mut undo, &cell_pos(0, 0), false);
+        let stay = moved(cell_tab_step(undo.current(), &cell_pos(0, 0), false));
         assert_eq!(cell_of_pos(&stay), (0, 0));
     }
 
@@ -24247,6 +24306,9 @@ mod part_media_tests;
 
 #[cfg(test)]
 mod block_remap_tests;
+
+#[cfg(test)]
+mod story_tab_tests;
 
 #[cfg(test)]
 mod wire_validation_tests {
