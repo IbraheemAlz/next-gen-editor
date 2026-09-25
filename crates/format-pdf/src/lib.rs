@@ -261,6 +261,12 @@ pub fn export_pdf(
         }
         page.footnotes.for_each_paragraph(&mut collect);
         page.endnotes.for_each_paragraph(&mut collect);
+        /* Issue #83 — text-box stories embed their fonts too. */
+        for f in &page.floats {
+            if let Some(tb) = f.text_box.as_deref() {
+                for_each_paragraph(&tb.blocks, &mut collect);
+            }
+        }
     }
 
     let mut pdf = Pdf::new();
@@ -455,6 +461,9 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
     let content_y = page.margins.top;
     let mut content = Content::new();
 
+    /* Issue #83 — behind-text text boxes paint first (scene.rs order). */
+    emit_text_boxes(&mut content, page, true, font_objs);
+
     /* Issue #71 — header band BEFORE body (mirrors
     `render/scene.rs::build_document_scene` ordering: header, body,
     footnotes, footer). Band origin comes from the SAME shared
@@ -553,7 +562,86 @@ fn build_content(page: &PageBox, font_objs: &[(String, FontObj)]) -> Vec<u8> {
         );
     }
 
+    /* Issue #83 — in-front text boxes close the page. */
+    emit_text_boxes(&mut content, page, false, font_objs);
+
     content.finish().to_vec()
+}
+
+/// Issue #83 — one z-order group of the page's text boxes (the scene's
+/// `paint_floats` twin: `behind` selects the `behindDoc` group, sorted by
+/// z-order): shape fill, the story clipped to the shape rect, outline.
+fn emit_text_boxes(
+    content: &mut Content,
+    page: &PageBox,
+    behind: bool,
+    font_objs: &[(String, FontObj)],
+) {
+    let page_h = page.size.height;
+    let mut group: Vec<&layout::FloatBox> = page
+        .floats
+        .iter()
+        .filter(|f| f.text_box.is_some() && f.behind_doc == behind && !f.hidden)
+        .collect();
+    group.sort_by_key(|f| f.z_order);
+    for f in group {
+        let Some(tb) = f.text_box.as_deref() else {
+            continue;
+        };
+        if f.size.width <= 0.0 || f.size.height <= 0.0 {
+            continue;
+        }
+        let (x, w, h) = (f.origin.x, f.size.width, f.size.height);
+        let pdf_y = page_h - (f.origin.y + h);
+        if let Some([r, g, b, _]) = tb.source.fill {
+            content.save_state();
+            content.set_fill_rgb(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+            );
+            content.rect(x, pdf_y, w, h);
+            content.fill_nonzero();
+            content.restore_state();
+        }
+        if let Some((origin, _)) = f.text_box_content_rect() {
+            content.save_state();
+            content.rect(x, pdf_y, w, h);
+            content.clip_nonzero();
+            content.end_path();
+            for block in &tb.blocks {
+                emit_block_shading(content, page_h, origin.x, origin.y, block);
+            }
+            for block in &tb.blocks {
+                match block {
+                    LayoutBlock::Paragraph(p) => {
+                        emit_paragraph_text(content, page_h, origin.x, origin.y, p, font_objs);
+                    }
+                    LayoutBlock::Table(t) => {
+                        emit_table_text(content, page_h, origin.x, origin.y, t, font_objs);
+                    }
+                }
+            }
+            for block in &tb.blocks {
+                emit_block_borders(content, page_h, origin.x, origin.y, block);
+            }
+            content.restore_state();
+        }
+        if let Some(([r, g, b, _], lw)) = tb.source.outline
+            && lw > 0.0
+        {
+            content.save_state();
+            content.set_stroke_rgb(
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+            );
+            content.set_line_width(lw);
+            content.rect(x, pdf_y, w, h);
+            content.stroke();
+            content.restore_state();
+        }
+    }
 }
 
 /// Issue #71 — one header/footer band: the same shading → text →
@@ -1245,6 +1333,11 @@ fn collect_to_unicode_pages(
         }
         page.footnotes.for_each_paragraph(&mut collect);
         page.endnotes.for_each_paragraph(&mut collect);
+        for f in &page.floats {
+            if let Some(tb) = f.text_box.as_deref() {
+                for_each_paragraph(&tb.blocks, &mut collect);
+            }
+        }
     }
     out
 }

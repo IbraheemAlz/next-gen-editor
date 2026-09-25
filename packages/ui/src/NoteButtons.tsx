@@ -35,6 +35,7 @@ export const NoteButtons: Component = () => {
     const canInsert = createMemo(() => ready() && !inCell() && story() === undefined);
 
     const why = (): string | undefined => {
+        if (story()?.area === 'TextBox') return 'Close the text box first';
         if (story() !== undefined) return 'Close the header or footer first';
         if (inCell()) return 'Notes inside table cells aren’t supported yet';
         return undefined;

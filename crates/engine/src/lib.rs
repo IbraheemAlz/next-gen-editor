@@ -1412,6 +1412,132 @@ pub enum InlineKind {
     /// round-trips the element on a regenerated body. Only meaningful
     /// inside a [`NoteStory`]; body paragraphs never carry one.
     NoteSelfRef { kind: NoteKind },
+    /// Issue #83 — a text box: a `<wps:wsp>` shape carrying a
+    /// `<wps:txbx><w:txbxContent>` story (or its VML twin, a `<v:shape>`
+    /// with a `<v:textbox>`). The shape extent is `width_emu` ×
+    /// `height_emu` (`<wp:extent>`); placement rides the owning
+    /// [`InlineObject::anchor`] exactly like a floating picture (`None` ⇒
+    /// an in-line `<wp:inline>` box). The story is the body's own block
+    /// model, so the story adapter, layout and the writer reuse every body
+    /// code path — see [`TextBoxStory`].
+    TextBox {
+        width_emu: i64,
+        height_emu: i64,
+        story: Box<TextBoxStory>,
+    },
+}
+
+/// Issue #83 — vertical anchoring of a text box story inside the shape's
+/// inset rect (`<wps:bodyPr anchor="t|ctr|b">`, VML `v-text-anchor`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TextBoxVAlign {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
+/// Issue #83 — a shape outline (`<a:ln w="…"><a:solidFill>`): RGBA colour
+/// plus stroke width in EMU.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(default)]
+pub struct ShapeOutline {
+    pub color: [u8; 4],
+    pub width_emu: i64,
+}
+
+/// Issue #83 — the story + shape of one text box.
+///
+/// **Round-trip contract.** `source_xml` is the verbatim container the
+/// shape was read from — `<mc:AlternateContent>` (DrawingML choice + VML
+/// fallback), `<w:drawing>` or a bare VML `<w:pict>` — so everything this
+/// model does not type (geometry presets, effects, `docPr`, the VML
+/// duplicate) survives. `story_ranges` locate every `<w:txbxContent>`
+/// element inside it (the choice AND the fallback: both carry the same
+/// story). A clean box re-emits `source_xml` as-is; a `dirty` one splices
+/// the regenerated story into each range. `host_range` locates the
+/// container inside the HOST paragraph's `source_xml`, so an edit that
+/// only touched the story keeps the host paragraph on its passthrough
+/// bytes with just the container swapped (bounded drift). An
+/// engine-authored box (`source_xml == None`) is synthesized from the
+/// typed fields.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct TextBoxStory {
+    /// The story blocks (`<w:txbxContent>` children).
+    pub body: Vec<Block>,
+    /// `<wps:bodyPr lIns tIns rIns bIns>` (EMU). Word's defaults are
+    /// 0.1" left/right and 0.05" top/bottom.
+    pub inset_left_emu: i64,
+    pub inset_top_emu: i64,
+    pub inset_right_emu: i64,
+    pub inset_bottom_emu: i64,
+    pub v_align: TextBoxVAlign,
+    /// `<wps:spPr><a:solidFill>` — `None` ⇒ no fill (transparent).
+    pub fill: Option<[u8; 4]>,
+    /// `<wps:spPr><a:ln>` — `None` ⇒ no outline.
+    pub outline: Option<ShapeOutline>,
+    /// `<a:spAutoFit/>` — the shape grows to fit its text. Word stores
+    /// the fitted extent on save, so layout uses the extent; the flag
+    /// only rides the round-trip and the synthesized XML.
+    pub auto_fit: bool,
+    /// Verbatim source container (see the type docs).
+    pub source_xml: Option<String>,
+    /// Byte ranges `[start, end)` of every `<w:txbxContent>` element
+    /// inside `source_xml`, in document order.
+    pub story_ranges: Vec<(u32, u32)>,
+    /// Byte range of the container inside the host paragraph's
+    /// `source_xml`, when the host was read from a `.docx`.
+    pub host_range: Option<(u32, u32)>,
+    /// `true` once the engine mutated the story: the writer regenerates
+    /// the `<w:txbxContent>` elements.
+    pub dirty: bool,
+}
+
+impl Default for TextBoxStory {
+    fn default() -> Self {
+        Self {
+            body: vec![Block::Paragraph(Paragraph::default())],
+            inset_left_emu: 91_440,
+            inset_top_emu: 45_720,
+            inset_right_emu: 91_440,
+            inset_bottom_emu: 45_720,
+            v_align: TextBoxVAlign::Top,
+            fill: None,
+            outline: None,
+            auto_fit: false,
+            source_xml: None,
+            story_ranges: Vec::new(),
+            host_range: None,
+            dirty: false,
+        }
+    }
+}
+
+/// Structural equality through the snapshot encoding: the block model
+/// carries `f32` geometry and no `PartialEq` derive of its own, so two
+/// stories compare equal exactly when they serialize identically (the
+/// snapshot codec sorts maps, so equal states are byte-identical).
+impl PartialEq for TextBoxStory {
+    fn eq(&self, other: &Self) -> bool {
+        match (rmp_serde::to_vec(self), rmp_serde::to_vec(other)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TextBoxStory {}
+
+impl TextBoxStory {
+    /// A content hash over the snapshot encoding (deterministic: maps
+    /// serialize sorted) — the layout cache key for the story.
+    pub fn content_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rmp_serde::to_vec(self).unwrap_or_default().hash(&mut h);
+        h.finish()
+    }
 }
 
 /// A non-text inline node anchored at a single byte offset in a paragraph.
@@ -6311,6 +6437,150 @@ impl DocumentTree {
         }
     }
 
+    /// Issue #83 — the text box anchored at byte `at` of the paragraph
+    /// at `host` (body-rooted, cells included).
+    pub fn text_box_at(&self, host: &BlockPath, at: u32) -> Option<&TextBoxStory> {
+        self.paragraph_at_path(host)?
+            .inline_objects
+            .iter()
+            .find_map(|io| match &io.kind {
+                InlineKind::TextBox { story, .. } if io.at == at => Some(story.as_ref()),
+                _ => None,
+            })
+    }
+
+    /// Issue #83 — replace the story of the text box at `(host, at)` and
+    /// mark it dirty for the writer. The HOST paragraph keeps its
+    /// passthrough bytes when it is a top-level paragraph: the writer
+    /// splices the regenerated container in through
+    /// [`TextBoxStory::host_range`], so a story edit never regenerates
+    /// the surrounding runs. (A host inside a table cell dirties the
+    /// table, like every cell mutation.) Section markers are stripped —
+    /// a story is not the body. A no-op clone when nothing is there.
+    pub fn with_updated_text_box(&self, host: &BlockPath, at: u32, body: Vec<Block>) -> Self {
+        let body = strip_section_markers(body);
+        let mut blocks = self.blocks.clone();
+        let update = |para: &mut Paragraph| {
+            for io in &mut para.inline_objects {
+                if io.at == at
+                    && let InlineKind::TextBox { story, .. } = &mut io.kind
+                {
+                    story.body = body.clone();
+                    story.dirty = true;
+                }
+            }
+        };
+        if host.steps.len() == 1 {
+            let _ = mutate_paragraph_keep_source(&mut blocks, host, update);
+        } else {
+            let _ = mutate_paragraph_in_top(&mut blocks, host, update);
+        }
+        Self {
+            blocks,
+            ..self.clone()
+        }
+    }
+
+    /// Issue #83 — insert an engine-authored floating text box at `pos`:
+    /// a U+FFFC anchor carrying an [`InlineKind::TextBox`] with one empty
+    /// paragraph, `width_emu` × `height_emu`, a black 0.75 pt outline,
+    /// white fill, square wrap, positioned column-relative at the anchor
+    /// paragraph's top (Word's "Draw Text Box" defaults). Returns the new
+    /// tree plus the `(host, at)` address of the box.
+    pub fn insert_text_box_at(
+        &self,
+        pos: LogicalPos,
+        width_emu: i64,
+        height_emu: i64,
+    ) -> (Self, BlockPath, u32) {
+        let target = if self.paragraph_at_path(&pos.path).is_some() {
+            pos.path.clone()
+        } else {
+            self.path_to_last_top_paragraph()
+                .unwrap_or(BlockPath::top(0))
+        };
+        let mut blocks = self.blocks.clone();
+        let mut placed_at = 0u32;
+        let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
+            let mut off = (pos.offset as usize).min(para.text.len());
+            while !para.text.is_char_boundary(off) {
+                off -= 1;
+            }
+            placed_at = off as u32;
+            splice_inline_object(
+                para,
+                off as u32,
+                InlineKind::TextBox {
+                    width_emu: width_emu.max(1),
+                    height_emu: height_emu.max(1),
+                    story: Box::new(TextBoxStory {
+                        fill: Some([255, 255, 255, 255]),
+                        outline: Some(ShapeOutline {
+                            color: [0, 0, 0, 255],
+                            width_emu: 9_525,
+                        }),
+                        dirty: true,
+                        ..TextBoxStory::default()
+                    }),
+                },
+            );
+            if let Some(io) = para
+                .inline_objects
+                .iter_mut()
+                .find(|io| io.at == placed_at && matches!(io.kind, InlineKind::TextBox { .. }))
+            {
+                io.anchor = Some(Box::new(FloatAnchor {
+                    wrap: WrapKind::Square,
+                    dist_left_emu: 114_300,
+                    dist_right_emu: 114_300,
+                    ..FloatAnchor::default()
+                }));
+            }
+        });
+        (
+            Self {
+                blocks,
+                ..self.clone()
+            },
+            target,
+            placed_at,
+        )
+    }
+
+    /// Issue #83 — every text box in the body (cells included), as
+    /// `(host path, anchor byte)` in document order.
+    pub fn text_box_addresses(&self) -> Vec<(BlockPath, u32)> {
+        fn walk(blocks: &[Block], prefix: &BlockPath, out: &mut Vec<(BlockPath, u32)>) {
+            for (i, b) in blocks.iter().enumerate() {
+                let path = prefix.clone().push(PathStep::Block(i as u32));
+                match b {
+                    Block::Paragraph(p) => {
+                        for io in &p.inline_objects {
+                            if matches!(io.kind, InlineKind::TextBox { .. }) {
+                                out.push((path.clone(), io.at));
+                            }
+                        }
+                    }
+                    Block::Table(t) => {
+                        for (r, row) in t.rows.iter().enumerate() {
+                            for (c, cell) in row.cells.iter().enumerate() {
+                                let cp = path.clone().push(PathStep::Cell {
+                                    row: r as u32,
+                                    col: c as u32,
+                                });
+                                walk(&cell.blocks, &cp, out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let top: Vec<Block> = self.blocks.iter().cloned().collect();
+        let mut out = Vec::new();
+        walk(&top, &BlockPath::root(), &mut out);
+        out
+    }
+
     /// Issue #69 — count the floating (`<wp:anchor>`) images in the body.
     pub fn count_floating_images(&self) -> u32 {
         let mut n = 0u32;
@@ -7541,6 +7811,18 @@ fn push_paragraph_plain(p: &Paragraph, out: &mut String) {
             InlineKind::FootnoteRef { .. } => out.push_str("[footnote]"),
             InlineKind::EndnoteRef { .. } => out.push_str("[endnote]"),
             InlineKind::NoteSelfRef { .. } => {}
+            /* Issue #83 — the story flattens inline, one line per
+            paragraph, so a copy never loses text-box content. */
+            InlineKind::TextBox { story, .. } => {
+                for (i, b) in story.body.iter().enumerate() {
+                    if let Block::Paragraph(sp) = b {
+                        if i > 0 {
+                            out.push('\n');
+                        }
+                        push_paragraph_plain(sp, out);
+                    }
+                }
+            }
         }
         /* Skip the 3-byte U+FFFC sentinel. */
         cursor = at.saturating_add(3).min(p.text.len());
@@ -7992,7 +8274,9 @@ fn walk_block_note_refs(block: &Block, top: u32, out: &mut Vec<NoteReference>) {
                         },
                         *custom_mark_follows,
                     ),
-                    InlineKind::Image { .. } | InlineKind::NoteSelfRef { .. } => continue,
+                    InlineKind::Image { .. }
+                    | InlineKind::NoteSelfRef { .. }
+                    | InlineKind::TextBox { .. } => continue,
                 };
                 out.push(NoteReference {
                     top_block: top,
@@ -8021,6 +8305,27 @@ fn strip_section_markers(blocks: Vec<Block>) -> Vec<Block> {
             table => table,
         })
         .collect()
+}
+
+/// Issue #83 — [`mutate_paragraph_in_top`] for a TOP-LEVEL paragraph
+/// that keeps its passthrough capture (`dirty` / `source_xml` untouched):
+/// the only caller is a text-box story edit, whose writer path splices
+/// the regenerated container into the host bytes.
+fn mutate_paragraph_keep_source<F>(top: &mut Vector<Block>, path: &BlockPath, f: F) -> Option<()>
+where
+    F: FnOnce(&mut Paragraph),
+{
+    let [PathStep::Block(n)] = path.steps.as_slice() else {
+        return None;
+    };
+    let n = *n as usize;
+    let mut block = top.get(n)?.clone();
+    let Block::Paragraph(ref mut p) = block else {
+        return None;
+    };
+    f(p);
+    top.set(n, block);
+    Some(())
 }
 
 /// Mutate the paragraph addressed by `path` in `top` (the

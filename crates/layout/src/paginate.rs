@@ -2846,6 +2846,7 @@ mod tests {
                         height: 50.0,
                         spec,
                         wrap: crate::boxes::FloatWrap::default(),
+                        text_box: None,
                     }),
                 ),
                 glyph(4, 10.0, None),

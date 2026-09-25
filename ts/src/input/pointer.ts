@@ -19,9 +19,11 @@ import {
 } from '../state/engine-store';
 
 /** Issue #80 — footnote / endnote stories ride the header/footer story
- *  protocol (`editing_story`) but live in the body's page flow. */
+ *  protocol (`editing_story`) but live in the body's page flow. Issue
+ *  #83 — text-box stories too: the engine routes every press itself
+ *  (inside a box → that box, elsewhere → back to the body). */
 function isNoteArea(area: string): boolean {
-    return area === 'Footnote' || area === 'Endnote';
+    return area === 'Footnote' || area === 'Endnote' || area === 'TextBox';
 }
 
 /**

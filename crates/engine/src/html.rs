@@ -337,6 +337,21 @@ fn emit_inline_object(obj: &InlineObject, out: &mut String) {
             /* The self-mark inside a note body carries no number of its
             own on the clipboard. */
         }
+        InlineKind::TextBox { story, .. } => {
+            /* Issue #83 — a text box copies as its story text in an
+            inline-block frame (not a paste target: text boxes are
+            authored through `InsertTextBox`). */
+            out.push_str("<span data-nge-text-box=\"1\">");
+            for (i, b) in story.body.iter().enumerate() {
+                if let crate::Block::Paragraph(sp) = b {
+                    if i > 0 {
+                        out.push_str("<br/>");
+                    }
+                    escape_into(&sp.text.replace('\u{FFFC}', ""), out);
+                }
+            }
+            out.push_str("</span>");
+        }
     }
 }
 
