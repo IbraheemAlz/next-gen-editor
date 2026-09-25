@@ -42,7 +42,16 @@ paths:
 ## Round-trip diff bounds
 The `tools/roundtrip/` harness asserts:
 1. **Sibling entries byte-identical** — zero drift on non-`document.xml` entries.
-2. **`document.xml` delta ≤ 2 × UTF-8 byte size of the inserted text.** Tighter is suspicious (probably overwrote unrelated regions). Looser means whitespace creep.
+2. **Primary (issue #251): `source_bytes_rewritten == 0`.** An edited save
+   must not respell or drop a single ORIGINAL byte; the whole delta must be
+   insertion. Superseded the old size-only check, which couldn't tell a
+   faithful insertion (which may legitimately mint a new `<w:r>`) from a
+   lossy regeneration landing in bounds by coincidence.
+3. **Secondary, informational: `document.xml` delta ≤ 2 × UTF-8 byte size
+   of the inserted text + a per-new-run allowance** (48 B/run — see
+   `tools/corpus-native/src/pipeline.rs::NEW_RUN_ALLOWANCE_BYTES`). The
+   bare `≤ 2×N` number (no allowance) is kept as an informational column
+   only (`EditCheck::bound_bytes` / `within_bound`).
 
 ## In-part grab bags (issue #84)
 - A dirty paragraph / table regenerates from the typed model. Every
@@ -171,8 +180,12 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   `SourceMarkup::text_len` makes any other text edit go *stale* (runs /
   markers ignored, never misplaced).
 - `tools/corpus-native` reports `edit_check.source_bytes_rewritten` (bytes
-  of the original the edited save rewrote; 0 = pure insertion) next to the
-  size-delta bound.
+  of the original the edited save rewrote; 0 = pure insertion) — the
+  primary bound since issue #251, see "Round-trip diff bounds" above — next
+  to the informational size-delta bound, and (when `> 0`) a cheap
+  `rewrite_cause` tag (`hyperlink` / `comment anchor` / `form field` /
+  `sdt` / `fldSimple` / `move` / `table` / `rPr` / `other`) tracking the
+  corpus against issues #242–#249.
 
 ## Don't add scope you can't preserve
 - Phase 1 doesn't preserve formatting runs. Adding partial run support without proper preservation will fail the round-trip diff bound on existing fixtures.
