@@ -60,6 +60,8 @@ use serde::{Deserialize, Serialize};
 
 mod block_remap;
 pub mod fields;
+mod text_remap;
+pub use text_remap::TextEdit;
 pub mod html;
 pub mod numbering;
 pub mod package;
@@ -1567,6 +1569,7 @@ impl SourceMarkup {
         if len == 0 {
             return;
         }
+        text_remap::debug_assert_in_step(m, old_len);
         if m.text_len != old_len {
             m.text_len = STALE_TEXT_LEN;
             return;
@@ -1608,6 +1611,7 @@ impl SourceMarkup {
         if s >= e {
             return;
         }
+        text_remap::debug_assert_in_step(m, old_len);
         if m.text_len != old_len {
             m.text_len = STALE_TEXT_LEN;
             return;
@@ -1645,6 +1649,7 @@ impl SourceMarkup {
         let Some(m) = slot.as_deref() else {
             return (None, None);
         };
+        text_remap::debug_assert_in_step(m, old_len);
         let valid = m.text_len == old_len;
         let mut left = Self {
             text_len: at,
@@ -1714,6 +1719,12 @@ impl SourceMarkup {
         let empty = Self::default();
         let h = head.as_deref().unwrap_or(&empty);
         let t = tail.as_deref().unwrap_or(&empty);
+        if head.is_some() {
+            text_remap::debug_assert_in_step(h, head_len);
+        }
+        if tail.is_some() {
+            text_remap::debug_assert_in_step(t, tail_len);
+        }
         let h_ok = head.is_none() || h.text_len == head_len;
         let t_ok = tail.is_none() || t.text_len == tail_len;
         let mut out = Self {
@@ -4996,11 +5007,15 @@ impl DocumentTree {
                 custom_mark_follows: false,
             },
         };
+        let mut edit = None;
         let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
-            splice_inline_object(para, pos.offset, reference);
+            edit = Some(splice_inline_object(para, pos.offset, reference));
         });
         let mut next = self.clone();
         next.blocks = blocks;
+        if let Some(e) = edit {
+            next.remap_text_edit_record(&target, e);
+        }
         let mut body_para = Paragraph {
             text: format!("{}{}", '\u{FFFC}', ' '),
             dirty: true,
@@ -5686,6 +5701,7 @@ impl DocumentTree {
             return self.clone();
         }
         let mut blocks = self.blocks.clone();
+        let mut removed_edit = None;
         let _ = mutate_paragraph_in_top(&mut blocks, &target_path, |para| {
             /* Range entirely inside a same-author Insert? If so, undo
             the Insert (remove text + shrink the Insert overlay). */
@@ -5696,11 +5712,13 @@ impl DocumentTree {
                     && e_off <= r.end
             });
             if let Some(idx) = owning_insert {
-                let s = (s_off as usize).min(para.text.len());
-                let e = (e_off as usize).min(para.text.len());
-                let removed_len = (e - s) as u32;
+                let s = s_off.min(para.text.len() as u32);
+                let e = e_off.min(para.text.len() as u32);
+                let removed_len = e.saturating_sub(s);
                 if e > s {
-                    para.text.replace_range(s..e, "");
+                    /* Issues #250 / #252 — one splice drives the source
+                    markup and (below) the comment anchors. */
+                    removed_edit = Some(para.splice_text(s, removed_len, ""));
                 }
                 /* Shrink the owning Insert by removed_len; shift
                 trailing revisions left by removed_len. */
@@ -5757,7 +5775,7 @@ impl DocumentTree {
             }
             para.dirty = true;
         });
-        Self {
+        let mut out = Self {
             blocks,
             body_section: self.body_section.clone(),
             headers: self.headers.clone(),
@@ -5782,7 +5800,11 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+        };
+        if let Some(e) = removed_edit {
+            out.remap_text_edit_record(&target_path, e);
         }
+        out
     }
 
     /// Sprint 14 (#14) — track-changes-aware format-change stamp.
@@ -5942,20 +5964,15 @@ impl DocumentTree {
                 .unwrap_or(BlockPath::top(0))
         };
         let off = at.offset;
+        let mut edit = None;
         let mutated = mutate_paragraph_in_top(&mut blocks, &target, |para| {
-            let offset = para.snap_offset(off) as usize;
-            let old_len = para.text.len() as u32;
-            para.text.insert_str(offset, text);
-            /* Issues #199 / #106 — source runs / markers travel too. */
-            SourceMarkup::note_insert(
-                &mut para.source_markup,
-                old_len,
-                offset as u32,
-                text.len() as u32,
-            );
+            /* Issues #199 / #106 / #252 — ONE splice drives the source
+            markup here and the comment anchors below. */
+            let e = para.splice_text(off, 0, text);
+            edit = Some(e);
             /* Shift styled spans across the insertion point — a span
             containing the point grows, spans wholly after it slide right. */
-            let off = offset as u32;
+            let off = e.at;
             let len = text.len() as u32;
             for s in &mut para.spans {
                 if s.start >= off {
@@ -5992,7 +6009,7 @@ impl DocumentTree {
         if mutated.is_none() {
             return self.clone();
         }
-        Self {
+        let mut out = Self {
             blocks,
             body_section: self.body_section.clone(),
             headers: self.headers.clone(),
@@ -6017,7 +6034,11 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+        };
+        if let Some(e) = edit {
+            out.remap_text_edit_record(&target, e);
         }
+        out
     }
 
     /// Apply a style `patch` over the logical range `[start, end)`. Splits and
@@ -6592,6 +6613,7 @@ impl DocumentTree {
     fn apply_revision_decision(&self, block: u32, start: u32, end: u32, accept: bool) -> Self {
         let mut blocks = self.blocks.clone();
         let path = BlockPath::top(block);
+        let mut removed_edit = None;
         let _ = mutate_paragraph_in_top(&mut blocks, &path, |para| {
             let Some(idx) = para
                 .revisions
@@ -6610,17 +6632,19 @@ impl DocumentTree {
                 _ => false,                            // text stays live
             };
             if delete_text {
-                let s = para.snap_offset(rev.start) as usize;
-                let e = para.snap_offset(rev.end) as usize;
+                let s = para.snap_offset(rev.start);
+                let e = para.snap_offset(rev.end);
                 if s < e {
-                    let removed_len = (e - s) as u32;
-                    para.text.replace_range(s..e, "");
-                    shift_paragraph_offsets_after(para, rev.start, removed_len);
+                    /* Issues #250 / #252 — one splice drives the source
+                    markup and (below) the comment anchors. */
+                    let edit = para.splice_text(s, e - s, "");
+                    shift_paragraph_offsets_after(para, edit.at, edit.removed);
+                    removed_edit = Some(edit);
                 }
             }
             para.dirty = true;
         });
-        Self {
+        let mut out = Self {
             blocks,
             body_section: self.body_section.clone(),
             headers: self.headers.clone(),
@@ -6645,7 +6669,11 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+        };
+        if let Some(e) = removed_edit {
+            out.remap_text_edit_record(&path, e);
         }
+        out
     }
 
     /// Sprint 7 (UI Edition) — append a new comment anchored to a
@@ -7729,8 +7757,9 @@ impl DocumentTree {
         };
         let off = pos.offset;
         let rel_id_for_inline = rel_id.clone();
+        let mut edit = None;
         let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
-            splice_inline_object(
+            edit = Some(splice_inline_object(
                 para,
                 off,
                 InlineKind::Image {
@@ -7739,10 +7768,10 @@ impl DocumentTree {
                     height_emu,
                     media_key: None,
                 },
-            );
+            ));
         });
 
-        Self {
+        let mut out = Self {
             blocks,
             body_section: self.body_section.clone(),
             headers: self.headers.clone(),
@@ -7767,7 +7796,11 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
+        };
+        if let Some(e) = edit {
+            out.remap_text_edit_record(&target, e);
         }
+        out
     }
 
     /// Issue #44 — overwrite the display extent of the inline image
@@ -8007,13 +8040,14 @@ impl DocumentTree {
         };
         let mut blocks = self.blocks.clone();
         let mut placed_at = 0u32;
+        let mut edit = None;
         let _ = mutate_paragraph_in_top(&mut blocks, &target, |para| {
             let mut off = (pos.offset as usize).min(para.text.len());
             while !para.text.is_char_boundary(off) {
                 off -= 1;
             }
             placed_at = off as u32;
-            splice_inline_object(
+            edit = Some(splice_inline_object(
                 para,
                 off as u32,
                 InlineKind::TextBox {
@@ -8029,7 +8063,7 @@ impl DocumentTree {
                         ..TextBoxStory::default()
                     }),
                 },
-            );
+            ));
             if let Some(io) = para
                 .inline_objects
                 .iter_mut()
@@ -8043,14 +8077,14 @@ impl DocumentTree {
                 }));
             }
         });
-        (
-            Self {
-                blocks,
-                ..self.clone()
-            },
-            target,
-            placed_at,
-        )
+        let mut out = Self {
+            blocks,
+            ..self.clone()
+        };
+        if let Some(e) = edit {
+            out.remap_text_edit_record(&target, e);
+        }
+        (out, target, placed_at)
     }
 
     /// Issue #83 — every text box in the body (cells included), as
@@ -8169,10 +8203,21 @@ impl DocumentTree {
         }
         if start.path == end.path {
             let mut blocks = self.blocks.clone();
+            let mut edit = None;
             let _ = mutate_paragraph_in_top(&mut blocks, &start.path, |para| {
+                /* Issue #252 — the same snapped gap `delete_text` removes
+                (and remaps the source markup over) drives the anchors. */
+                let (s, e) = (para.snap_offset(start.offset), para.snap_offset(end.offset));
+                if s < e {
+                    edit = Some(TextEdit {
+                        at: s,
+                        removed: e - s,
+                        inserted: 0,
+                    });
+                }
                 *para = para.delete_text(start.offset, end.offset);
             });
-            return Self {
+            let mut out = Self {
                 blocks,
                 body_section: self.body_section.clone(),
                 headers: self.headers.clone(),
@@ -8198,6 +8243,10 @@ impl DocumentTree {
                 document_envelope: self.document_envelope.clone(),
                 source_package: self.source_package.clone(),
             };
+            if let Some(e) = edit {
+                out.remap_text_edit_record(&start.path, e);
+            }
+            return out;
         }
         if !same_parent(&start.path, &end.path) {
             /* Cross-container delete clamps to the start endpoint —
@@ -8220,6 +8269,14 @@ impl DocumentTree {
         let Some(container) = parent_container_snapshot(self, &start.path) else {
             return self.clone();
         };
+        /* Issue #252 — the snapped merge point, for the anchor remap. */
+        let snap_in = |idx: u32, off: u32| {
+            container
+                .get(idx as usize)
+                .and_then(|b| b.as_paragraph())
+                .map_or(0, |p| p.snap_offset(off))
+        };
+        let (s_snap, e_snap) = (snap_in(sp_idx, start.offset), snap_in(ep_idx, end.offset));
         let head = container
             .get(sp_idx as usize)
             .and_then(|b| b.as_paragraph())
@@ -8301,7 +8358,7 @@ impl DocumentTree {
                 body_section.footer_refs.inherit_missing_from(&dropped_f);
             }
         }
-        Self {
+        let mut merged_doc = Self {
             blocks,
             body_section,
             headers: self.headers.clone(),
@@ -8326,8 +8383,11 @@ impl DocumentTree {
             part_root_attrs: self.part_root_attrs.clone(),
             document_envelope: self.document_envelope.clone(),
             source_package: self.source_package.clone(),
-        }
-        .with_list_markers_refreshed()
+        };
+        /* Issue #252 — the merge removed blocks `sp+1..=ep` and spliced
+        `ep`'s tail onto `sp`: anchors follow their text. */
+        merged_doc.remap_paragraph_merge(&sp_path, s_snap, ep_idx, e_snap);
+        merged_doc.with_list_markers_refreshed()
     }
 
     /// Split the paragraph at `at`, the break falling between the two halves.
@@ -8500,6 +8560,45 @@ impl DocumentTree {
     /// path may ever transplant a section break, regardless of which
     /// producer built the fragment.
     pub fn insert_rich(&self, at: LogicalPos, paras: &[Paragraph]) -> (Self, LogicalPos) {
+        let (mut out, caret) = self.insert_rich_unmapped(at.clone(), paras);
+        /* Issue #252 — comment anchors follow the text around the paste:
+        the target splits at the paste point, the fragment's middle
+        paragraphs land between the halves, and its first / last
+        paragraphs are spliced onto the head / tail (the source markup
+        rode `split_at` / `concat`). */
+        let Some((target, at_snap)) = self.rich_paste_target(&at) else {
+            return (out, caret);
+        };
+        match paras {
+            [] => {}
+            [only] => out.remap_text_edit(&target, at_snap, 0, only.text.len() as u32),
+            [first, .., last] => {
+                let n = paras.len() as u32;
+                out.remap_paragraph_split(&target, at_snap);
+                let (container, idx) = split_block_path(&target);
+                out.remap_block_splice(&container, idx + 1, 0, n - 2);
+                let tail = block_path_in(&container, idx + n - 1);
+                out.remap_text_edit(&tail, 0, 0, last.text.len() as u32);
+                out.remap_text_edit(&target, at_snap, 0, first.text.len() as u32);
+            }
+        }
+        (out, caret)
+    }
+
+    /// Issue #252 — the paragraph a rich paste at `at` lands in and the
+    /// snapped paste offset (the same resolution `insert_rich_unmapped`
+    /// applies); `None` when no paragraph is addressable.
+    fn rich_paste_target(&self, at: &LogicalPos) -> Option<(BlockPath, u32)> {
+        let target = if self.paragraph_at_path(&at.path).is_some() {
+            at.path.clone()
+        } else {
+            self.path_to_last_top_paragraph()?
+        };
+        let p = self.paragraph_at_path(&target)?;
+        Some((target.clone(), p.snap_offset(at.offset)))
+    }
+
+    fn insert_rich_unmapped(&self, at: LogicalPos, paras: &[Paragraph]) -> (Self, LogicalPos) {
         if paras.is_empty() {
             return (self.clone(), at.clone());
         }
@@ -8693,6 +8792,46 @@ impl DocumentTree {
     /// the last input block + the target's tail. Returns the new tree
     /// and the caret at the end of the inserted content.
     pub fn insert_rich_blocks(&self, at: LogicalPos, blocks_in: &[Block]) -> (Self, LogicalPos) {
+        /* The all-paragraph shape delegates to `insert_rich`, which
+        remaps the anchors itself. */
+        if blocks_in.iter().all(|b| matches!(b, Block::Paragraph(_))) {
+            return self.insert_rich_blocks_unmapped(at, blocks_in);
+        }
+        let (mut out, caret) = self.insert_rich_blocks_unmapped(at.clone(), blocks_in);
+        /* Issue #252 — see `insert_rich`: split at the paste point, the
+        blocks between the head and the tail are inserted, a leading /
+        trailing fragment paragraph is spliced onto the head / tail. */
+        let Some((target, at_snap)) = self.rich_paste_target(&at) else {
+            return (out, caret);
+        };
+        let n = blocks_in.len() as u32;
+        let first_para = blocks_in.first().and_then(Block::as_paragraph);
+        let last_para = if n >= 2 {
+            blocks_in.last().and_then(Block::as_paragraph)
+        } else {
+            None
+        };
+        let between = u32::from(first_para.is_none())
+            + n.saturating_sub(2)
+            + u32::from(n >= 2 && last_para.is_none());
+        out.remap_paragraph_split(&target, at_snap);
+        let (container, idx) = split_block_path(&target);
+        out.remap_block_splice(&container, idx + 1, 0, between);
+        if let Some(last) = last_para {
+            let tail = block_path_in(&container, idx + 1 + between);
+            out.remap_text_edit(&tail, 0, 0, last.text.len() as u32);
+        }
+        if let Some(first) = first_para {
+            out.remap_text_edit(&target, at_snap, 0, first.text.len() as u32);
+        }
+        (out, caret)
+    }
+
+    fn insert_rich_blocks_unmapped(
+        &self,
+        at: LogicalPos,
+        blocks_in: &[Block],
+    ) -> (Self, LogicalPos) {
         if blocks_in.is_empty() {
             return (self.clone(), at.clone());
         }
@@ -8747,7 +8886,7 @@ impl DocumentTree {
         /* Middle blocks (everything between the first and last input
         block) splice in verbatim. */
         let last_idx = blocks_in.len() - 1;
-        for b in &blocks_in[1..last_idx] {
+        for b in blocks_in.get(1..last_idx).unwrap_or(&[]) {
             insert_block_after_path_in_top(&mut blocks, &after_path, b.clone());
             after_path = bump_last_block_index(&after_path);
         }
@@ -8766,7 +8905,7 @@ impl DocumentTree {
                 let offset = p.text.len() as u32;
                 (Block::Paragraph(p.concat(&tail)), offset)
             }
-            (Some(Block::Table(t)), _) => {
+            (Some(Block::Table(t)), false) => {
                 /* Splice the table, then append the tail as a fresh
                 paragraph BELOW it so the caret has a logical home. */
                 insert_block_after_path_in_top(&mut blocks, &after_path, Block::Table(t.clone()));
@@ -9341,6 +9480,22 @@ impl DocumentTree {
     }
 }
 
+/// Issue #252 — `(container steps, last block index)` of a paragraph path
+/// (`(root, 0)` for a path that does not end in a block step).
+fn split_block_path(path: &BlockPath) -> (Vec<PathStep>, u32) {
+    match path.steps.split_last() {
+        Some((PathStep::Block(i), container)) => (container.to_vec(), *i),
+        _ => (Vec::new(), 0),
+    }
+}
+
+/// Issue #252 — the path of block `idx` inside `container`.
+fn block_path_in(container: &[PathStep], idx: u32) -> BlockPath {
+    let mut steps = container.to_vec();
+    steps.push(PathStep::Block(idx));
+    BlockPath { steps }
+}
+
 /// Extract the top-level block index from a `BlockPath` (first step
 /// must be `PathStep::Block(N)`; nested-cell paths return `None`
 /// at PR 3 — full nested-table mutation is PR 3b).
@@ -9746,15 +9901,8 @@ fn shift_paragraph_offsets_after(para: &mut Paragraph, from: u32, removed_len: u
         shift(&mut f.end);
     }
     para.fields.retain(|f| f.start < f.end);
-    /* Issues #199 / #106 — the text itself was already sliced by the
-    caller, so the pre-edit length is the current one plus the gap. */
-    let now = para.text.len() as u32;
-    SourceMarkup::note_delete(
-        &mut para.source_markup,
-        now + removed_len,
-        from,
-        from + removed_len,
-    );
+    /* Issues #199 / #106 / #250 — the source markup was remapped by the
+    caller's `Paragraph::splice_text`, together with the text. */
 }
 
 /// Phase 3 (#40) — clipboard fragments are never section-marker
@@ -9782,15 +9930,14 @@ fn strip_section_marker(mut p: Paragraph) -> Paragraph {
 /// `offset` (clamped to the text length), shifting every overlay at or
 /// past the anchor by the sentinel's 3 bytes. Shared by inline images
 /// (Phase 7) and note references (issue #80).
-fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) {
-    const SENTINEL: char = '\u{FFFC}';
-    let sentinel_len = SENTINEL.len_utf8() as u32;
-    /* Issue #115 — the crate's single offset policy (module docs). */
-    let offset = para.snap_offset(offset) as usize;
-    let old_len = para.text.len() as u32;
-    para.text.insert(offset, SENTINEL);
-    let off = offset as u32;
-    SourceMarkup::note_insert(&mut para.source_markup, old_len, off, sentinel_len);
+fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) -> TextEdit {
+    const SENTINEL: &str = "\u{FFFC}";
+    let sentinel_len = SENTINEL.len() as u32;
+    /* Issue #115 — the crate's single offset policy (module docs);
+    issues #250 / #252 — the splice remaps the source markup and returns
+    the record the caller feeds to `remap_text_edit`. */
+    let edit = para.splice_text(offset, 0, SENTINEL);
+    let off = edit.at;
     for s in &mut para.spans {
         if s.start >= off {
             s.start += sentinel_len;
@@ -9836,6 +9983,7 @@ fn splice_inline_object(para: &mut Paragraph, offset: u32, kind: InlineKind) {
     });
     para.inline_objects.sort_by_key(|i| i.at);
     para.dirty = true;
+    edit
 }
 
 /// Issue #80 — collect every note reference inside `block` (cells
@@ -10289,11 +10437,15 @@ impl UndoStack {
     }
 
     pub fn replace_current(&mut self, doc: DocumentTree) {
+        text_remap::debug_assert_tree_in_step(&doc);
         self.snapshots[self.cursor] = doc;
         self.revision += 1;
     }
 
     pub fn push(&mut self, doc: DocumentTree) {
+        /* Issue #250 — test builds: no committed mutation may leave a
+        paragraph's source markup out of step with its text. */
+        text_remap::debug_assert_tree_in_step(&doc);
         /* Truncate any redo branch. */
         if self.cursor + 1 < self.snapshots.len() {
             self.snapshots.truncate(self.cursor + 1);
@@ -15055,7 +15207,10 @@ mod source_markup_tests {
         let mut p = para();
         p.text.push_str(" more");
         assert!(!markup(&p).offsets_valid(p.text.len()));
-        /* A later remap keeps it stale. */
+        /* A later remap keeps an explicitly stale record stale. (A remap
+        over a SILENTLY out-of-step record trips the issue #250 test
+        assertion instead — see `text_remap::tests`.) */
+        p.source_markup.as_deref_mut().unwrap().text_len = STALE_TEXT_LEN;
         let q = p.delete_text(0, 1);
         assert!(!markup(&q).offsets_valid(q.text.len()));
     }

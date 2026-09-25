@@ -68,6 +68,63 @@ pub struct EditCheck {
     /// inserted text plus whatever markup carries it).
     #[serde(default)]
     pub edited_region_bytes: u64,
+    /// Issue #250 — [`Self::source_bytes_rewritten`] for the SAME net edit
+    /// made in track-changes mode (tracked insertion of the marker plus a
+    /// few extra bytes, then a tracked delete of those extra bytes — the
+    /// "backspace over my own insertion" path that removes text). A
+    /// regenerated paragraph whose source markup went stale loses its
+    /// source runs, so this count tracks the plain one only while every
+    /// tracked edit path keeps `Paragraph::source_markup` in step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked_source_bytes_rewritten: Option<u64>,
+    /// Issue #250 — the edited paragraph's source markup is still in step
+    /// with its text after the plain / tracked edit (`None`: the paragraph
+    /// carries no source markup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markup_in_step: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked_markup_in_step: Option<bool>,
+}
+
+/// Issue #250 — `Some(in step)` for the paragraph at `pos`, `None` when it
+/// carries no source markup.
+fn markup_in_step(doc: &engine::DocumentTree, pos: &engine::LogicalPos) -> Option<bool> {
+    let p = doc.paragraph_at_path(&pos.path)?;
+    let m = p.source_markup.as_deref()?;
+    Some(m.offsets_valid(p.text.len()))
+}
+
+/// Issue #250 — the scripted edit made in track-changes mode: a tracked
+/// insertion of the marker plus a few extra bytes, then a tracked delete
+/// of the extra bytes (inside the reviewer's own pending insertion, so the
+/// text is removed rather than marked). The net text equals the plain
+/// edit's. `None` when the tracked pipeline panicked or failed to write.
+fn tracked_edit(
+    archive: &DocxArchive,
+    end: engine::LogicalPos,
+) -> Option<(engine::DocumentTree, Vec<u8>)> {
+    const TRACKED_EXTRA: &str = "xyz";
+    let author = String::from("corpus-native");
+    let date = String::from("2026-01-01T00:00:00Z");
+    panics::catch(|| {
+        let doc = archive.document.tracked_insert_text(
+            end.clone(),
+            &format!("{EDIT_MARKER}{TRACKED_EXTRA}"),
+            author.clone(),
+            date.clone(),
+        );
+        let from = end.offset + EDIT_MARKER.len() as u32;
+        let doc = doc.tracked_delete_range(
+            engine::LogicalPos::new(end.path.clone(), from),
+            engine::LogicalPos::new(end.path.clone(), from + TRACKED_EXTRA.len() as u32),
+            author,
+            date,
+        );
+        let bytes = format_docx::write_docx(archive, &doc).ok()?;
+        Some((doc, bytes))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Issue #199 — `(original, edited)` lengths of the region between the
@@ -448,7 +505,7 @@ pub fn run_one(
         let end = stage_infallible!("edit_end_of_document", archive_a.document.end_of_document());
         let edited_doc = stage_infallible!(
             "edit_insert_text",
-            archive_a.document.insert_text(end, EDIT_MARKER)
+            archive_a.document.insert_text(end.clone(), EDIT_MARKER)
         );
         let edited_bytes: Vec<u8> = stage!(
             "edit_write_docx",
@@ -478,6 +535,17 @@ pub fn run_one(
                 dump("edit-orig", &doc_xml_orig);
                 dump("edited", &doc_xml_edited);
             }
+            /* Issue #250 — the same net edit in track-changes mode. */
+            let (tracked_source_bytes_rewritten, tracked_markup_in_step) =
+                match tracked_edit(&archive_a, end.clone()) {
+                    Some((doc, bytes)) => (
+                        extract_doc_xml(&bytes)
+                            .ok()
+                            .map(|x| rewritten_region(&doc_xml_orig, &x).0),
+                        markup_in_step(&doc, &end),
+                    ),
+                    None => (None, None),
+                };
             rec.edit_check = Some(EditCheck {
                 inserted_bytes: EDIT_MARKER.len(),
                 document_xml_delta_bytes: delta,
@@ -485,6 +553,9 @@ pub fn run_one(
                 within_bound: delta <= bound,
                 source_bytes_rewritten,
                 edited_region_bytes,
+                tracked_source_bytes_rewritten,
+                markup_in_step: markup_in_step(&edited_doc, &end),
+                tracked_markup_in_step,
             });
         }
     }

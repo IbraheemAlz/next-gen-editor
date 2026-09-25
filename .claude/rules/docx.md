@@ -166,10 +166,17 @@ A *regenerated* (dirty) paragraph stays close to its source bytes through
   (remapped) text offset between runs. Comment anchors are deliberately
   NOT markers (tree-level `comment_ranges`; a verbatim copy could
   resurrect a deleted comment).
-- Offsets are remapped by `insert_text`, `delete_text`, `split_at`,
-  `concat`, inline-object splices and the revision accept/reject helper;
-  `SourceMarkup::text_len` makes any other text edit go *stale* (runs /
-  markers ignored, never misplaced).
+- Offsets are remapped by `delete_text`, `split_at`, `concat` and — for
+  every in-place text change — `Paragraph::splice_text` (`engine::
+  text_remap`, issues #250 / #252), which returns the `TextEdit` the
+  caller also feeds to `DocumentTree::remap_text_edit`, so the source
+  markup and the tree-level `comment_ranges` see ONE edit record
+  (insert / tracked insert + own-insertion delete / inline objects /
+  accept-reject / rich paste / field restamp all route through it).
+  `SourceMarkup::text_len` still makes an unaware edit go *stale* in a
+  release build (runs / markers ignored, never misplaced); test builds
+  (`engine` feature `markup-assert`, on in `cfg(test)` and engine-wasm's
+  dev-deps) assert on every `UndoStack::push` that nothing went stale.
 - `tools/corpus-native` reports `edit_check.source_bytes_rewritten` (bytes
   of the original the edited save rewrote; 0 = pure insertion) next to the
   size-delta bound.
