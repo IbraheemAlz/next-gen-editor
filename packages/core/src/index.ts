@@ -13,7 +13,7 @@
 export { EditorSurface } from './EditorSurface';
 export type { EditorSurfaceProps, EditorSurfaceHandle } from './EditorSurface';
 
-export { EngineProvider, useEngine } from './EngineProvider';
+export { EngineProvider, useEngine, useDocumentDefaults } from './EngineProvider';
 export type { EngineProviderProps, EngineHandle } from './EngineProvider';
 
 export {
@@ -21,6 +21,7 @@ export {
     DEFAULT_TOC_SWITCHES,
     STYLE_PRESETS,
     emptyPatch,
+    emptyDocumentDefaults,
 } from './createEditorCommands';
 export type { EditorCommands, ParagraphStyleId } from './createEditorCommands';
 
@@ -57,6 +58,8 @@ export type {
     Command,
     Event,
     DocFormat,
+    DocumentDefaults,
+    DefaultPageSize,
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,

@@ -133,3 +133,55 @@ pub fn part_scoped_media_docx(body_image: &[u8], header_image: &[u8]) -> Vec<u8>
     }
     buf
 }
+
+/// Issue #221 — a minimal one-paragraph package whose `<w:sectPr>` is
+/// entirely empty: no `<w:pgSz>` at all (ECMA-376 requires it, but real
+/// "wild" documents skip it — issue #109's original finding). Deliberately
+/// NOT added to `crates/format-docx/tests/fixtures/` — issue #109 pinned
+/// an explicit A4 `<w:pgSz>` onto every fixture in that shared corpus
+/// specifically so `tools/roundtrip --fixtures` never silently exercises
+/// the reader's fallback path (see `tools/roundtrip/src/main.rs`'s
+/// `A4_SECT_PR_EXPLICIT` doc comment). This fixture exists to prove the
+/// opposite: that a host's chosen `engine::DefaultPageSize`, threaded
+/// through the bridge `OpenDocument.defaults` surface, reaches
+/// `read_docx_with_settings`'s fallback end to end.
+pub fn no_pgsz_docx(paragraph_text: &str) -> Vec<u8> {
+    let ns = ns_decls();
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <w:document {ns}><w:body>\
+         <w:p><w:r><w:t xml:space=\"preserve\">{paragraph_text}</w:t></w:r></w:p>\
+         <w:sectPr/></w:body></w:document>"
+    );
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+</Types>";
+    let dot_rels = rels(&[(
+        "rId1",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+        "word/document.xml",
+    )]);
+    let doc_rels = rels(&[]);
+
+    let entries: Vec<(&str, &[u8])> = vec![
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", dot_rels.as_bytes()),
+        ("word/document.xml", document.as_bytes()),
+        ("word/_rels/document.xml.rels", doc_rels.as_bytes()),
+    ];
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            zip.start_file(name, opts).expect("zip entry");
+            zip.write_all(bytes).expect("zip write");
+        }
+        zip.finish().expect("zip finish");
+    }
+    buf
+}

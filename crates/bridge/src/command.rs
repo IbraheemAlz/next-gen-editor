@@ -171,6 +171,33 @@ pub enum Command {
         bytes: Vec<u8>,
         format: DocFormat,
         name: Option<String>,
+        /// Issue #221 — host-chosen fallbacks for the two settings OOXML
+        /// never carries an element for (`engine::DefaultPageSize`, issue
+        /// #109; the widow/orphan `<w:widowControl>` default, issue #179).
+        /// Both were crate-level knobs on `format_docx::
+        /// read_docx_with_settings` with no bridge surface — an embedding
+        /// host (a Letter-locale product, or one that wants the strict
+        /// ECMA-376 "absent means not applied" widow-control reading)
+        /// could not reach them. `#[serde(default)]` + `None` (the
+        /// pre-#221 shape, and every field of [`DocumentDefaults`] left
+        /// unset) reproduces `read_docx` byte-for-byte — this stays
+        /// **zero-copy**: `bytes` is still the one `Transferable` in the
+        /// command, `defaults` is a few scalar fields riding the same
+        /// structured-clone envelope, not a second buffer. A separate
+        /// `Command::SetDocumentDefaults` applied before the next
+        /// `OpenDocument` was considered and rejected: it would let the
+        /// two commands race out of order through the worker's queue (a
+        /// `SetDocumentDefaults` that lands after a concurrently-issued
+        /// `OpenDocument` silently opens with the WRONG fallback), and it
+        /// would need its own persisted "sticky until changed" state on
+        /// `Engine` for every later `OpenDocument` to consult — exactly
+        /// the kind of implicit cross-command state issue #53 / #64 spent
+        /// effort removing from the caret path. A field on `OpenDocument`
+        /// itself is atomic with the open it configures and needs no new
+        /// engine-side state.
+        #[serde(default)]
+        #[tsify(optional)]
+        defaults: Option<DocumentDefaults>,
     },
     SaveDocument {
         format: DocFormat,
@@ -1180,6 +1207,40 @@ pub enum PdfConformance {
     X3,
 }
 
+/// Issue #221 — the host-facing mirror of `engine::DefaultPageSize`
+/// (issue #109): the page-size preset [`OpenDocument`]'s `defaults` field
+/// selects as the fallback for any `<w:sectPr>` that omits `<w:pgSz>`.
+/// `engine-wasm` maps this 1:1 onto the engine type when routing into
+/// `format_docx::read_docx_with_settings`; kept as its own bridge enum
+/// (rather than re-exporting the engine one) because `bridge` does not
+/// depend on `engine` — see the crate's dependency list.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum DefaultPageSize {
+    #[default]
+    A4,
+    Letter,
+}
+
+/// Issue #221 — host-chosen fallbacks for [`OpenDocument`], threaded to
+/// `format_docx::read_docx_with_settings` (issues #109 / #179). Every
+/// field `None` (the `#[default]`, and what an omitted `OpenDocument.
+/// defaults` behaves as) reproduces the plain `read_docx` entry point
+/// byte-for-byte — no behaviour change for a caller that never sets this.
+#[derive(Serialize, Deserialize, Tsify, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct DocumentDefaults {
+    /// The [`DefaultPageSize`] fallback for a `<w:sectPr>` missing
+    /// `<w:pgSz>`. `None` ⇒ the crate default (`A4`).
+    pub page_size: Option<DefaultPageSize>,
+    /// The effective `<w:widowControl>` for a paragraph whose resolved
+    /// widow/orphan control is never specified anywhere in the cascade.
+    /// `None` ⇒ the crate default (`true`, Word's own application
+    /// default); `Some(false)` is the strict ECMA-376 reading (an absent
+    /// element is NOT applied).
+    pub widow_control: Option<bool>,
+}
+
 /// A sparse patch of inline text attributes — `None` fields are left
 /// Issue #21 — patch for a style's `<w:pPr>` half. A pragmatic subset
 /// of the paragraph surface (alignment / direction / line spacing /
@@ -1383,6 +1444,48 @@ mod tests {
             Command::GetSelectionAsClipboard {
                 include_docx: Some(false)
             }
+        ));
+    }
+
+    /// Issue #221 — `OpenDocument` grew `defaults`; the pre-#221 wire
+    /// shape (no `defaults` key at all) must still decode, as `None`
+    /// (⇒ `format_docx::read_docx` behaviour, unchanged).
+    #[test]
+    fn open_document_accepts_the_legacy_no_defaults_shape() {
+        let legacy: Command = serde_json::from_value(serde_json::json!({
+            "type": "OPEN_DOCUMENT",
+            "bytes": [1, 2, 3],
+            "format": "docx",
+        }))
+        .expect("legacy shape decodes");
+        assert!(matches!(
+            legacy,
+            Command::OpenDocument {
+                bytes,
+                format: DocFormat::Docx,
+                name: None,
+                defaults: None,
+            } if bytes == vec![1, 2, 3]
+        ));
+
+        let with_defaults: Command = serde_json::from_value(serde_json::json!({
+            "type": "OPEN_DOCUMENT",
+            "bytes": [1, 2, 3],
+            "format": "docx",
+            "name": "report.docx",
+            "defaults": { "page_size": "Letter", "widow_control": false },
+        }))
+        .expect("issue #221 shape decodes");
+        assert!(matches!(
+            with_defaults,
+            Command::OpenDocument {
+                name: Some(ref n),
+                defaults: Some(DocumentDefaults {
+                    page_size: Some(DefaultPageSize::Letter),
+                    widow_control: Some(false),
+                }),
+                ..
+            } if n == "report.docx"
         ));
     }
 }

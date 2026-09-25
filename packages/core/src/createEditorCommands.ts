@@ -18,12 +18,13 @@
  * helpers still resolve from an internal `createEditorState` subscription.
  * Pass an explicit `range` to override.
  */
-import { useEngine, type EngineHandle } from './EngineProvider';
+import { useEngine, useDocumentDefaults, type EngineHandle } from './EngineProvider';
 import { createEditorState, type EditorState } from './createEditorState';
 import type {
     Command,
     Event,
     DocFormat,
+    DocumentDefaults,
     TextAttrsPatch,
     UnderlineStyle,
     VerticalScript,
@@ -92,6 +93,16 @@ export function emptyPatch(): TextAttrsPatch {
         caps: undefined,
         small_caps: undefined,
     };
+}
+
+/** Issue #221 — canonical empty `DocumentDefaults`, every field
+ *  `undefined`. `exactOptionalPropertyTypes` requires both keys present
+ *  (as a value or explicit `undefined`) on any object typed as
+ *  `DocumentDefaults`, so a partial override spreads onto this — e.g.
+ *  `{ ...emptyDocumentDefaults(), page_size: 'Letter' }` — the same
+ *  pattern `emptyPatch()` provides for `TextAttrsPatch`. */
+export function emptyDocumentDefaults(): DocumentDefaults {
+    return { page_size: undefined, widow_control: undefined };
 }
 
 export interface EditorCommands {
@@ -447,11 +458,18 @@ export interface EditorCommands {
      *  Issue #239 — `opts.initialZoom`, when given, dispatches `SET_ZOOM`
      *  before `OPEN_DOCUMENT` so a host can request a starting zoom from
      *  this one call; the engine queues it even if no `RenderPage` has
-     *  run yet. */
+     *  run yet.
+     *  Issue #221 — `opts.defaults` (page size / widow control fallbacks
+     *  for a `<w:sectPr>` / paragraph OOXML never carries an element for)
+     *  rides straight onto `OPEN_DOCUMENT.defaults`; omitted, it falls
+     *  back to the `<EngineProvider documentDefaults={...}>` host default
+     *  (`useDocumentDefaults()`), and omitted there too, the wire field is
+     *  left out entirely — `format_docx::read_docx`'s unchanged A4 /
+     *  widow-control-ON behaviour. */
     openDocument(
         bytes: Uint8Array,
         name?: string,
-        opts?: { initialZoom?: number },
+        opts?: { initialZoom?: number; defaults?: DocumentDefaults },
     ): Promise<Event>;
     saveDocument(format: DocFormat): Promise<Event>;
     saveDocx(): Promise<Event>;
@@ -475,7 +493,11 @@ export interface EditorCommands {
     raw(cmd: Command, transfer?: Transferable[]): Promise<Event>;
 }
 
-function build(engine: EngineHandle, state: EditorState): EditorCommands {
+function build(
+    engine: EngineHandle,
+    state: EditorState,
+    documentDefaults?: DocumentDefaults,
+): EditorCommands {
     const dispatch = (cmd: Command, transfer: Transferable[] = []) =>
         engine.dispatch(cmd, transfer);
 
@@ -888,13 +910,25 @@ function build(engine: EngineHandle, state: EditorState): EditorCommands {
             if (opts?.initialZoom !== undefined) {
                 await dispatch({ type: 'SET_ZOOM', scale: opts.initialZoom });
             }
+            /* Issue #221 — an explicit `opts.defaults` wins; otherwise
+               fall back to the host's `<EngineProvider documentDefaults>`
+               default. Neither set ⇒ the `defaults` key is left off the
+               wire object entirely (the pre-#221 shape) — `defaults` on
+               `Command::OpenDocument` is `#[tsify(optional)]`, so under
+               `exactOptionalPropertyTypes` the key must be OMITTED, not
+               set to `undefined` (see `getSelectionAsClipboard` above for
+               the same pattern with `include_docx`). */
+            const defaults = opts?.defaults ?? documentDefaults;
             return dispatch(
-                {
-                    type: 'OPEN_DOCUMENT',
-                    bytes,
-                    format: 'docx',
-                    name: name ?? undefined,
-                },
+                defaults === undefined
+                    ? { type: 'OPEN_DOCUMENT', bytes, format: 'docx', name: name ?? undefined }
+                    : {
+                          type: 'OPEN_DOCUMENT',
+                          bytes,
+                          format: 'docx',
+                          name: name ?? undefined,
+                          defaults,
+                      },
                 [bytes.buffer as ArrayBuffer],
             );
         },
@@ -940,5 +974,9 @@ export const DEFAULT_TOC_SWITCHES: TocSwitches = {
 export function createEditorCommands(): EditorCommands {
     const engine = useEngine();
     const state = createEditorState();
-    return build(engine, state);
+    /* Issue #221 — the host's `<EngineProvider documentDefaults={...}>`
+     * fallback for `openDocument`'s `defaults` option; `undefined` outside
+     * any provider, which is the common, non-error case here. */
+    const documentDefaults = useDocumentDefaults();
+    return build(engine, state, documentDefaults);
 }

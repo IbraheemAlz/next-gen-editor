@@ -13,6 +13,7 @@
 import type {
     Command,
     DocFormat,
+    DocumentDefaults,
     Event,
     RendererDowngrade,
 } from '../../../crates/engine-wasm/pkg/engine_wasm.js';
@@ -654,11 +655,25 @@ export class EngineClient {
 
     /**
      * D2.4: dispatch `OpenDocument`, transferring the document buffer zero-copy.
+     * Issue #221 — `defaults` (page size / widow control fallbacks) rides
+     * straight onto `OPEN_DOCUMENT.defaults`; omitted, the wire field is
+     * left out entirely (`format_docx::read_docx`'s unchanged behaviour).
      */
-    async openDocument(bytes: Uint8Array, format: DocFormat, name?: string): Promise<Event> {
-        return this.dispatch({ type: 'OPEN_DOCUMENT', bytes, format, name }, [
-            bytes.buffer as ArrayBuffer,
-        ]);
+    async openDocument(
+        bytes: Uint8Array,
+        format: DocFormat,
+        name?: string,
+        defaults?: DocumentDefaults,
+    ): Promise<Event> {
+        /* `defaults` on `Command::OpenDocument` is `#[tsify(optional)]`;
+           under `exactOptionalPropertyTypes` the key must be OMITTED when
+           unset, not set to `undefined`. */
+        return this.dispatch(
+            defaults === undefined
+                ? { type: 'OPEN_DOCUMENT', bytes, format, name }
+                : { type: 'OPEN_DOCUMENT', bytes, format, name, defaults },
+            [bytes.buffer as ArrayBuffer],
+        );
     }
 
     /**
