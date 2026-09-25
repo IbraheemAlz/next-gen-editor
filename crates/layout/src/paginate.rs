@@ -2630,6 +2630,51 @@ fn split_table_rows_at(t: &TableBox, n: usize) -> (Option<TableBox>, Option<Tabl
     (Some(build(&t.rows[..n])), Some(build(&t.rows[n..])))
 }
 
+/// Issue #129 — per-page ordinals for footnotes whose numbering restarts
+/// on every page (`<w:numRestart w:val="eachPage"/>`), read off settled
+/// pages. A note is numbered on the page carrying its HEAD entry — the
+/// deadline invariant puts that on the page of its reference line; a
+/// continuation entry (`continued_from_previous`) never counts. Band
+/// order is reference order, so the ordinals follow the page's reading
+/// order.
+///
+/// `first_number(anchor)` is the restart rule: `Some(start)` when the
+/// note restarts per page with the sequence starting at `start`
+/// (`<w:numStart>`), `None` when it does not take part (continuous or
+/// per-section numbering, a custom mark, an endnote). The page counter
+/// starts at the first participating note's `start` and counts only
+/// participating notes. Returns `(anchor, ordinal)` in page order, each
+/// anchor once (its first head wins).
+pub fn page_note_ordinals(
+    pages: &[PageBox],
+    mut first_number: impl FnMut(NoteAnchor) -> Option<u32>,
+) -> Vec<(NoteAnchor, u32)> {
+    let mut out: Vec<(NoteAnchor, u32)> = Vec::new();
+    let mut seen: std::collections::HashSet<NoteAnchor> = std::collections::HashSet::new();
+    for page in pages {
+        let mut next: Option<u32> = None;
+        for entry in &page.footnotes.entries {
+            if entry.continued_from_previous {
+                continue;
+            }
+            let anchor = NoteAnchor {
+                kind: entry.kind,
+                id: entry.id,
+            };
+            let Some(start) = first_number(anchor) else {
+                continue;
+            };
+            if !seen.insert(anchor) {
+                continue;
+            }
+            let n = next.unwrap_or(start);
+            out.push((anchor, n));
+            next = Some(n.saturating_add(1));
+        }
+    }
+    out
+}
+
 /// Issue #80 — scan a laid-out block for note reference anchors. Returns
 /// `(anchor, marker text)` for every reference the block carries, in
 /// document order, duplicates preserved (the fitter dedupes).
@@ -6189,5 +6234,63 @@ mod tests {
             .map(cell_lines)
             .sum();
         assert_eq!(total, 60, "no line lost");
+    }
+
+    /* ---------- issue #129 — per-page footnote ordinals ---------- */
+
+    fn note_page(entries: &[(u32, bool)]) -> PageBox {
+        let g = a4_geometry();
+        PageBox {
+            size: Size {
+                width: g.width,
+                height: g.height,
+            },
+            margins: g.margins,
+            blocks: Vec::new(),
+            header: None,
+            footer: None,
+            header_offset: g.header_offset,
+            footer_offset: g.footer_offset,
+            footnotes: NoteBand {
+                entries: entries
+                    .iter()
+                    .map(|&(id, continued)| FootnoteEntry {
+                        id,
+                        kind: engine::NoteKind::Footnote,
+                        marker: String::new(),
+                        origin: Point { x: 0.0, y: 0.0 },
+                        blocks: Vec::new(),
+                        first_block_index: 0,
+                        continued_from_previous: continued,
+                        continues_on_next: false,
+                    })
+                    .collect(),
+                y: 700.0,
+                continuation: false,
+            },
+            endnotes: NoteBand::default(),
+            hf_role: HeaderRole::Default,
+            page_number: 1,
+            floats: Vec::new(),
+        }
+    }
+
+    /// Every page restarts at `numStart`; a continuation entry (a note
+    /// cut on the previous page) never takes a number; non-participating
+    /// notes neither take nor consume one.
+    #[test]
+    fn page_note_ordinals_restart_on_every_page() {
+        let pages = [
+            note_page(&[(1, false), (2, false), (3, false)]),
+            note_page(&[(3, true), (4, false), (5, false)]),
+        ];
+        /* Note 2 is custom-marked (does not participate). */
+        let got = page_note_ordinals(&pages, |a| (a.id != 2).then_some(1));
+        let ids: Vec<(u32, u32)> = got.iter().map(|(a, n)| (a.id, *n)).collect();
+        assert_eq!(ids, vec![(1, 1), (3, 2), (4, 1), (5, 2)]);
+        /* `numStart` = 5 starts each page's sequence at 5. */
+        let got = page_note_ordinals(&pages[1..], |_| Some(5));
+        let ids: Vec<(u32, u32)> = got.iter().map(|(a, n)| (a.id, *n)).collect();
+        assert_eq!(ids, vec![(4, 5), (5, 6)]);
     }
 }

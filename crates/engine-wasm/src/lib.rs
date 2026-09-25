@@ -464,6 +464,7 @@ fn bridge_degradation(d: layout::LayoutDegradation) -> LayoutDegraded {
         R::WrapOscillation => LayoutDegradeReason::WrapOscillation,
         R::WrapPolygonFallback => LayoutDegradeReason::WrapPolygonFallback,
         R::PageRefCap => LayoutDegradeReason::PageRefCap,
+        R::NoteRestartCap => LayoutDegradeReason::NoteRestartCap,
     };
     LayoutDegraded {
         reason,
@@ -3317,6 +3318,25 @@ fn build_note_bodies(
             )
         });
     (bodies, notice)
+}
+
+/// Issue #129 — the note labels a settled layout calls for: `base` (the
+/// document-order labels) with every footnote of an `eachPage` section
+/// (`rules`: anchor → `(numStart, numFmt)`) relabelled by its ordinal on
+/// the page carrying its head entry. A footnote not laid out (a culled
+/// band) keeps its `base` label.
+fn page_restart_note_markers(
+    base: &HashMap<engine::NoteAnchor, String>,
+    rules: &HashMap<engine::NoteAnchor, (u32, engine::PageNumFormat)>,
+    pages: &[PageBox],
+) -> HashMap<engine::NoteAnchor, String> {
+    let mut out = base.clone();
+    for (anchor, n) in layout::page_note_ordinals(pages, |a| rules.get(&a).map(|r| r.0)) {
+        if let Some((_, fmt)) = rules.get(&anchor) {
+            out.insert(anchor, fmt.render(n));
+        }
+    }
+    out
 }
 
 /// Issue #130 — one note table: the referenced note bodies laid out at
@@ -7959,34 +7979,91 @@ impl Engine {
         ),
         Box<Event>,
     > {
-        let mut plan = layout::WrapPlan::new();
-        let mut built =
-            self.build_pages_pass(doc.clone(), scale, with_composition, target_y, mode, &plan)?;
-        let slab = self
-            .layout_cfg
-            .as_ref()
-            .map_or(12.0, |c| c.line_height * scale);
-        let mut conv = layout::WrapConvergence::new(slab);
-        loop {
-            match conv.observe(&built.0, &plan) {
-                layout::WrapVerdict::Converged | layout::WrapVerdict::Capped => break,
-                layout::WrapVerdict::Continue(next) => {
-                    plan = next;
-                    built = self.build_pages_pass(
-                        doc.clone(),
-                        scale,
-                        with_composition,
-                        target_y,
-                        mode,
-                        &plan,
-                    )?;
+        /* One full wrap-converged layout with `markers` (None = the
+        document-order note markers). */
+        let wrap_converged = |markers: Option<&HashMap<engine::NoteAnchor, String>>| {
+            let mut plan = layout::WrapPlan::new();
+            let mut built = self.build_pages_pass(
+                doc.clone(),
+                scale,
+                with_composition,
+                target_y,
+                mode,
+                &plan,
+                markers,
+            )?;
+            let slab = self
+                .layout_cfg
+                .as_ref()
+                .map_or(12.0, |c| c.line_height * scale);
+            let mut conv = layout::WrapConvergence::new(slab);
+            loop {
+                match conv.observe(&built.0, &plan) {
+                    layout::WrapVerdict::Converged | layout::WrapVerdict::Capped => break,
+                    layout::WrapVerdict::Continue(next) => {
+                        plan = next;
+                        built = self.build_pages_pass(
+                            doc.clone(),
+                            scale,
+                            with_composition,
+                            target_y,
+                            mode,
+                            &plan,
+                            markers,
+                        )?;
+                    }
                 }
             }
-        }
-        built
-            .3
-            .degradations
-            .extend(conv.take_notes().into_iter().map(bridge_degradation));
+            built
+                .3
+                .degradations
+                .extend(conv.take_notes().into_iter().map(bridge_degradation));
+            Ok::<_, Box<Event>>(built)
+        };
+        /* Issue #129 — `<w:numRestart w:val="eachPage"/>`: the page a
+        footnote reference lands on is only known once pagination has
+        settled, so the labels are a post-pass. Lay out with the
+        document-order labels, read the per-page ordinals off the pages
+        (`layout::page_note_ordinals`), and — when they differ — lay out
+        again with them (they re-shape every reference mark and note
+        self-mark through the marker-aware paragraph cache key). A
+        narrower label can move a reference across a page break, so the
+        observation is re-checked: one re-run under the bounded fixed
+        point (`layout::converge_stamped`), then the last pass is kept
+        with a `NoteRestartCap` note. Documents without the rule (the
+        default) take the single-pass path untouched. */
+        let restart_rules = doc.each_page_note_numbering();
+        let mut built = if restart_rules.is_empty() {
+            wrap_converged(None)?
+        } else {
+            let base = doc.note_markers();
+            let mut last = None;
+            let mut failure = None;
+            let conv = layout::converge_stamped(
+                base.clone(),
+                1,
+                layout::DegradeReason::NoteRestartCap,
+                |stamp| match wrap_converged(Some(stamp)) {
+                    Ok(b) => {
+                        let observed = page_restart_note_markers(&base, &restart_rules, &b.0);
+                        last = Some(b);
+                        observed
+                    }
+                    Err(e) => {
+                        /* Echo the stamp: the fixed point ends the loop. */
+                        failure = Some(e);
+                        stamp.clone()
+                    }
+                },
+            );
+            if let Some(e) = failure {
+                return Err(e);
+            }
+            let mut b = last.expect("converge_stamped lays out at least once");
+            b.3.degradations
+                .extend(conv.degraded.into_iter().map(bridge_degradation));
+            b
+        };
         /* Issue #83 — the boxes are final: lay every text box's story
         into its content rect. */
         let nested_notes = self.attach_text_box_frames(
@@ -8107,8 +8184,9 @@ impl Engine {
 
     /// One layout pass of [`Self::build_pages_of`] against the wrap
     /// `plan` (cutouts keyed by `ParagraphBox::source_paragraph_id`, the
-    /// walk-order id this pass assigns; empty ⇒ nothing is cut).
-    #[allow(clippy::type_complexity)]
+    /// walk-order id this pass assigns; empty ⇒ nothing is cut), with the
+    /// note labels `markers` (issue #129; `None` = document order).
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn build_pages_pass(
         &self,
         doc: DocumentTree,
@@ -8117,6 +8195,7 @@ impl Engine {
         target_y: Option<f32>,
         mode: FieldMode,
         plan: &layout::WrapPlan,
+        markers: Option<&HashMap<engine::NoteAnchor, String>>,
     ) -> Result<
         (
             Vec<PageBox>,
@@ -8143,9 +8222,17 @@ impl Engine {
         /* Per-script font stack; the cached `font_id` is the fallback root. */
         let font_stack = FontStack::from_faces(self.fonts.clone(), &cfg.font_id);
         /* Issue #80 — document-order note markers are a layout input
-        (shaped into every reference and self-mark). */
-        let note_markers = doc.note_markers();
-        let sctx = StyleContext::of(&doc).with_note_markers(&note_markers);
+        (shaped into every reference and self-mark); issue #129 — the
+        per-page relabelling pass hands its own table in. */
+        let doc_markers;
+        let note_markers: &HashMap<engine::NoteAnchor, String> = match markers {
+            Some(m) => m,
+            None => {
+                doc_markers = doc.note_markers();
+                &doc_markers
+            }
+        };
+        let sctx = StyleContext::of(&doc).with_note_markers(note_markers);
         let mut cache = self.layout_cache.borrow_mut();
         let composition = if with_composition {
             self.composition.as_ref()
@@ -8772,7 +8859,7 @@ impl Engine {
                         note_comp,
                     )
                     .0,
-                    &note_markers,
+                    note_markers,
                     &mut endnotes_placed,
                 );
                 pag.push_trailing_notes(entries);
@@ -8799,7 +8886,7 @@ impl Engine {
                     note_comp,
                 )
                 .0,
-                &note_markers,
+                note_markers,
                 &mut endnotes_placed,
             );
             pag.push_trailing_notes(entries);
@@ -12173,9 +12260,7 @@ impl Engine {
         self.caret_affinity = CaretAffinity::default();
         self.pending_format = None;
         let marker = self
-            .undo
-            .current()
-            .note_markers()
+            .painted_note_markers(self.undo.current())
             .get(&anchor)
             .cloned()
             .unwrap_or_else(|| anchor.id.to_string());
@@ -13762,7 +13847,7 @@ impl Engine {
             markers: if doc.footnote_stories.is_empty() && doc.endnote_stories.is_empty() {
                 HashMap::new()
             } else {
-                doc.note_markers()
+                self.painted_note_markers(doc)
             },
             emitted: RefCell::new(std::collections::HashSet::new()),
         };
@@ -13809,6 +13894,37 @@ impl Engine {
             }
         }
         nodes
+    }
+
+    /// Issue #129 — the note labels as PAINTED: the document-order
+    /// markers, with every `eachPage` footnote relabelled from the head
+    /// entry of the current layout snapshot (the label its band entry and
+    /// reference mark were shaped with). Without a snapshot of the current
+    /// revision — or for a footnote beyond a culled band — the
+    /// document-order label stands.
+    fn painted_note_markers(&self, doc: &DocumentTree) -> HashMap<engine::NoteAnchor, String> {
+        let mut markers = doc.note_markers();
+        let rules = doc.each_page_note_numbering();
+        if rules.is_empty() {
+            return markers;
+        }
+        let snap = self.layout_snapshot.borrow();
+        let Some(snap) = snap
+            .as_ref()
+            .filter(|s| s.doc_revision == self.undo.revision() && !s.code_view)
+        else {
+            return markers;
+        };
+        for entry in snap.pages.iter().flat_map(|p| p.footnotes.entries.iter()) {
+            let anchor = engine::NoteAnchor {
+                kind: entry.kind,
+                id: entry.id,
+            };
+            if !entry.continued_from_previous && rules.contains_key(&anchor) {
+                markers.insert(anchor, entry.marker.clone());
+            }
+        }
+        markers
     }
 
     /// Build an incremental accessibility delta (Backlog #10). The first call
@@ -18622,6 +18738,149 @@ mod tests {
 
     /// Recorded on this change via `--nocapture` (issue #130).
     const PINNED_NOTE_SECTION_WIDTHS: u64 = 0xd6cfac1cc9cef805;
+
+    /* ================================================================
+    Issue #129 — `<w:numRestart w:val="eachPage"/>` footnote numbering.
+    ================================================================ */
+
+    /// Every note marker shaped into `block` (reference marks in the body,
+    /// the self-mark heading a note body), in line order.
+    fn shaped_note_marks(block: &LayoutBlock) -> Vec<String> {
+        block
+            .as_paragraph()
+            .map(|p| {
+                p.lines
+                    .iter()
+                    .flat_map(|l| l.runs.iter())
+                    .flat_map(|r| r.glyphs.iter())
+                    .filter_map(|g| g.inline_footnote_marker.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Two pages (a FORM FEED ends page 1), two footnotes per page, the
+    /// document-level footnote props restarting `eachPage`.
+    fn each_page_restart_doc(restart: engine::NoteNumRestart) -> Engine {
+        let mut d = DocumentTree::from_text("Page one body text.\u{000C}");
+        d.blocks.push_back(para_of(
+            "Page two body text.",
+            engine::ParaProperties::default(),
+        ));
+        d.footnote_props.num_restart = Some(restart);
+        let mut engine = test_engine_with_doc(d);
+        /* Later offsets first: a spliced reference shifts what follows. */
+        for (block, offset, text) in [
+            (0_u32, 13_u32, "Second note on page one."),
+            (0, 4, "First note on page one."),
+            (1, 13, "Second note on page two."),
+            (1, 4, "First note on page two."),
+        ] {
+            let evt = engine.do_insert_note(bpos_top(block, offset), engine::NoteKind::Footnote);
+            assert!(matches!(evt, Event::SelectionChanged { .. }), "{evt:?}");
+            let caret = engine.selection.as_ref().unwrap().caret.clone();
+            engine.do_insert_text_interactive(caret, text.to_string());
+            engine.do_exit_header_footer();
+        }
+        engine
+    }
+
+    /// Per page: (band entry markers, body reference marks, note
+    /// self-marks).
+    fn page_note_labels(pages: &[PageBox]) -> Vec<(Vec<String>, Vec<String>, Vec<String>)> {
+        pages
+            .iter()
+            .map(|page| {
+                let entries = page
+                    .footnotes
+                    .entries
+                    .iter()
+                    .map(|e| e.marker.clone())
+                    .collect();
+                let refs = page.blocks.iter().flat_map(shaped_note_marks).collect();
+                let selfs = page
+                    .footnotes
+                    .entries
+                    .iter()
+                    .filter_map(|e| e.blocks.first().map(shaped_note_marks))
+                    .filter_map(|m| m.into_iter().next())
+                    .collect();
+                (entries, refs, selfs)
+            })
+            .collect()
+    }
+
+    /// Acceptance (#129): page 2's first footnote is "1" — in its band
+    /// entry, its body reference mark and its note's self-mark — and the
+    /// fixture is pinned.
+    #[test]
+    fn each_page_restart_numbers_footnotes_per_page() {
+        let engine = each_page_restart_doc(engine::NoteNumRestart::EachPage);
+        let (pages, _, _, info) = engine.build_pages(1.0, false, None).expect("layout");
+        assert!(info.degradations.is_empty(), "{:?}", info.degradations);
+        assert_eq!(pages.len(), 2);
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let one_two = s(&["1", "2"]);
+        for (i, (entries, refs, selfs)) in page_note_labels(&pages).into_iter().enumerate() {
+            assert_eq!(entries, one_two, "page {} band", i + 1);
+            assert_eq!(refs, one_two, "page {} reference marks", i + 1);
+            assert_eq!(selfs, one_two, "page {} self-marks", i + 1);
+        }
+        let fp = layout::geometry_fingerprint(&pages);
+        eprintln!("NOTE RESTART FINGERPRINT each_page = {fp:#x}");
+        assert_eq!(
+            fp, PINNED_NOTE_EACH_PAGE,
+            "eachPage fixture geometry changed"
+        );
+    }
+
+    /// Recorded on this change via `--nocapture` (issue #129).
+    const PINNED_NOTE_EACH_PAGE: u64 = 0x34081f7fb7e9e11c;
+
+    /// Continuous stays the default: the same document numbers 1–4, and
+    /// no relabelling pass runs (the rule table is empty).
+    #[test]
+    fn continuous_numbering_is_untouched_by_the_restart_pass() {
+        let engine = each_page_restart_doc(engine::NoteNumRestart::Continuous);
+        assert!(engine.undo.current().each_page_note_numbering().is_empty());
+        let (pages, ..) = engine.build_pages(1.0, false, None).expect("layout");
+        let labels = page_note_labels(&pages);
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(labels[0].0, s(&["1", "2"]));
+        assert_eq!(labels[1].0, s(&["3", "4"]));
+        assert_eq!(labels[1].1, s(&["3", "4"]));
+    }
+
+    /// The a11y mirror reads the restarted label: page 2's first note
+    /// region and its reference mark say "1", not the document-order "3".
+    #[test]
+    fn a11y_note_markers_show_the_per_page_label() {
+        let engine = each_page_restart_doc(engine::NoteNumRestart::EachPage);
+        engine
+            .ensure_layout_snapshot(engine.scale(), false, None)
+            .expect("layout");
+        let nodes = engine.build_a11y_nodes();
+        let markers: Vec<String> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                A11yNode::Note(note) => Some(note.marker.clone()),
+                _ => None,
+            })
+            .collect();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(markers, s(&["1", "2", "1", "2"]));
+        let refs: Vec<String> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                A11yNode::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .flat_map(|p| p.runs.iter())
+            .filter(|r| r.note_ref.is_some())
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(refs, s(&["1", "2", "1", "2"]));
+    }
 
     /// Issue #130 — a CONTINUOUS break into a section with wider margins
     /// swaps the note table in place: the page flushes with the second
