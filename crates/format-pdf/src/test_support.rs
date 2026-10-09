@@ -28,6 +28,34 @@ pub fn content_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Issue #360 — `pdf` as (lossy) text for marker assertions, with the
+/// objects of every object stream inflated and appended: a tagged PDF 1.5+
+/// export packs its dictionaries (catalog, pages, structure tree, …) into
+/// one (`crate::objstm`), so a plain byte search no longer sees them.
+pub fn searchable_text(pdf: &[u8]) -> String {
+    let mut out = String::from_utf8_lossy(pdf).into_owned();
+    let mut cursor = 0usize;
+    while let Some(rel) = find(&pdf[cursor..], b"/Type /ObjStm") {
+        let at = cursor + rel;
+        let Some(s) = find(&pdf[at..], b"stream\n").map(|p| at + p + 7) else {
+            break;
+        };
+        let Some(e) = find(&pdf[s..], b"\nendstream").map(|p| s + p) else {
+            break;
+        };
+        let mut decoded = Vec::new();
+        if flate2::read::ZlibDecoder::new(&pdf[s..e])
+            .read_to_end(&mut decoded)
+            .is_ok()
+        {
+            out.push('\n');
+            out.push_str(&String::from_utf8_lossy(&decoded));
+        }
+        cursor = e;
+    }
+    out
+}
+
 /// Every `/FlateDecode` stream in `pdf` that inflates cleanly, in file order.
 fn inflated_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
     const MARKER: &[u8] = b">>\nstream\n";

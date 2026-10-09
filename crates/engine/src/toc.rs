@@ -119,8 +119,10 @@ fn heading_style_level(id_or_name: &str) -> Option<u8> {
     (1..=9).contains(&n).then_some(n)
 }
 
-/// Fold a heading paragraph's text into entry text.
-fn entry_text(p: &Paragraph) -> String {
+/// Fold a heading paragraph's text into entry text (tabs, breaks and
+/// form feeds become spaces, object sentinels vanish, edges trimmed) —
+/// the TOC entry text, and (issue #360) the PDF outline entry title.
+pub fn entry_text(p: &Paragraph) -> String {
     let mut out = String::with_capacity(p.text.len());
     for ch in p.text.chars() {
         match ch {
@@ -243,6 +245,21 @@ impl DocumentTree {
         }?;
         let (lo, hi) = switches.outline_levels.unwrap_or((1, 9));
         (lo..=hi).contains(&level).then_some(level)
+    }
+
+    /// Issue #360 — the 1-based outline level of `p` as a document
+    /// heading, for the PDF outline and tagging (`H1`–`H6`): the direct
+    /// `<w:outlineLvl>`, else the style cascade's, else the built-in
+    /// `Heading N` style id / name — every source a `TOC \o "1-9" \u`
+    /// collects. `None` for body text (outline level 9 / unset).
+    pub fn outline_heading_level(&self, p: &Paragraph) -> Option<u8> {
+        let all_levels = TocSwitches {
+            outline_levels: Some((1, 9)),
+            use_outline_levels: true,
+            custom_styles: Vec::new(),
+            ..TocSwitches::default()
+        };
+        self.toc_level_of(p, &all_levels)
     }
 
     /// Headings a TOC with `switches` collects, in document order.
@@ -835,6 +852,24 @@ mod tests {
             "Methodology\t1"
         );
         assert_eq!(re.toc_regions()[0].last, 4);
+    }
+
+    /// Issue #360 — the PDF outline level: `Heading N` by id or name, the
+    /// direct `<w:outlineLvl>`, nothing for body text.
+    #[test]
+    fn outline_heading_level_reads_styles_and_direct_levels() {
+        let d = DocumentTree::from_text("");
+        assert_eq!(d.outline_heading_level(&heading("A", 2)), Some(2));
+        let mut by_name = heading("B", 1);
+        by_name.style_id = Some("heading 4".into());
+        assert_eq!(d.outline_heading_level(&by_name), Some(4));
+        let mut direct = body("C");
+        direct.direct_overrides.outline_level = Some(2);
+        assert_eq!(d.outline_heading_level(&direct), Some(3));
+        assert_eq!(d.outline_heading_level(&body("D")), None);
+        let mut normal = body("E");
+        normal.style_id = Some("Normal".into());
+        assert_eq!(d.outline_heading_level(&normal), None);
     }
 
     #[test]

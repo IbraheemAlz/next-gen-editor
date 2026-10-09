@@ -188,21 +188,38 @@ impl PartNames {
             pick(&format!("{REL_BASE}theme"), &mut names.theme);
         }
         /* 3. Core properties hang off the package root, not the main part. */
-        if let Some(rels) = &root_rels {
-            for rel in rels
-                .by_type(REL_CORE_PROPS)
-                .filter(|r| r.target_mode == TargetMode::Internal)
-            {
-                if let Ok(cs) = target_candidates("", &rel.target)
-                    && let Some(found) = cs.into_iter().find(|c| exists(c))
-                {
-                    names.core_props = found;
-                    break;
-                }
-            }
+        if let Some(found) = core_props_target(root_rels.as_ref(), &exists) {
+            names.core_props = found;
         }
         Ok(names)
     }
+
+    /// Issue #360 — just the core-properties part name ([`Self::
+    /// discover`]'s step 3, with the same fixed fallback) for a caller
+    /// that holds a retained package rather than the reader's entry list
+    /// (the PDF exporter's `/Info`). `get` looks an entry up by name.
+    pub fn core_props_name<'d>(get: &dyn Fn(&str) -> Option<&'d [u8]>) -> String {
+        let root_rels = get("_rels/.rels").and_then(|b| parse_relationships(b).ok());
+        core_props_target(root_rels.as_ref(), &|name: &str| get(name).is_some())
+            .unwrap_or_else(|| CORE_PROPS_XML.to_string())
+    }
+}
+
+/// The first internal core-properties relationship target of the package
+/// root's rels that names an existing part.
+fn core_props_target(
+    root_rels: Option<&crate::opc::relationships::Relationships>,
+    exists: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    root_rels?
+        .by_type(REL_CORE_PROPS)
+        .filter(|r| r.target_mode == TargetMode::Internal)
+        .find_map(|rel| {
+            target_candidates("", &rel.target)
+                .ok()?
+                .into_iter()
+                .find(|c| exists(c))
+        })
 }
 
 /// `%XX` escapes decoded; an invalid escape or a result that is not UTF-8
@@ -433,5 +450,26 @@ mod tests {
                 target: "../../styles.xml".into()
             }]
         );
+    }
+
+    #[test]
+    fn core_props_name_follows_the_root_relationship() {
+        let entries = [
+            (
+                "_rels/.rels".to_string(),
+                rels(&[(REL_CORE_PROPS, "/meta/props.xml")]),
+            ),
+            ("meta/props.xml".to_string(), b"<c/>".to_vec()),
+        ];
+        let get = |name: &str| {
+            entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, b)| b.as_slice())
+        };
+        assert_eq!(PartNames::core_props_name(&get), "meta/props.xml");
+        /* No (usable) relationship: the fixed name. */
+        let none = |_: &str| -> Option<&[u8]> { None };
+        assert_eq!(PartNames::core_props_name(&none), CORE_PROPS_XML);
     }
 }
