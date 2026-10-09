@@ -721,6 +721,16 @@ impl Paginator {
         &self.pages
     }
 
+    /// Issue #181 — a footnote cut on the page in progress (or a
+    /// continuation cut again on it) is still waiting for the next
+    /// page's band. A flow that stops here — a viewport-culled band —
+    /// drains it in [`Self::finish`] onto notes-only pages that a longer
+    /// flow fills with body text, so the page in progress and every page
+    /// after it are provisional.
+    pub fn has_pending_note_continuation(&self) -> bool {
+        !self.footnote_carry.is_empty()
+    }
+
     /// The blocks placed on the in-progress page so far.
     pub fn current_blocks(&self) -> &[LayoutBlock] {
         &self.cur_blocks
@@ -5904,6 +5914,38 @@ mod tests {
             .map(|b| b.as_paragraph().map_or(0, |p| p.lines.len()))
             .sum();
         assert_eq!(total, 30, "every endnote line painted once");
+    }
+
+    /// Issue #181 — the culled-band hook: a footnote cut under its
+    /// reference is pending while its page is in progress (a band that
+    /// stops here drains it onto notes-only pages), and settled once the
+    /// next page opens with the continuation.
+    #[test]
+    fn pending_note_continuation_is_visible_until_the_next_page_opens() {
+        let geom = a4_geometry();
+        let mut pag = Paginator::with_default_bands(geom, None, None)
+            .with_note_bodies(fake_note_bodies(&[(1, 40, 14.0)]))
+            .with_strict_watchdog(true);
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(10, 16.0)), 0.0, 0.0);
+        assert!(!pag.has_pending_note_continuation());
+        pag.push_block(
+            LayoutBlock::Paragraph(fake_paragraph_with_footnote_ref(1, 1, 16.0)),
+            0.0,
+            0.0,
+        );
+        assert_eq!(pag.page_count_emitted(), 0, "still on the reference page");
+        assert!(
+            pag.has_pending_note_continuation(),
+            "the 560 pt note was cut under its reference"
+        );
+        pag.push_block(LayoutBlock::Paragraph(fake_paragraph(2, 16.0)), 0.0, 0.0);
+        assert_eq!(pag.page_count_emitted(), 1, "the follower opened page 2");
+        assert!(
+            !pag.has_pending_note_continuation(),
+            "page 2's band took the continuation"
+        );
+        let pages = pag.finish();
+        assert!(pages[1].footnotes.continuation);
     }
 
     /// Issue #317 — an endnote reference reserves nothing in the page's
